@@ -182,14 +182,18 @@ notification precedes the quiesce response; the SDK client serially delivers
 the notification before resolving the response, so the gate drain also covers
 it. This is an ordering handshake, not a sleep or a dropped-event workaround.
 
-If staging/promotion fails or the old child live-applies the change, Core opens
-the gate first and invokes `external-ingress-resume` with the same id. A
-replacement owns a new child and does not resume the retired producer. A
-mismatched id, malformed acknowledgment, timeout, cross-loop operation, or
-cancellation-ambiguous lifecycle result fails closed and leaves the exact child
-under the established terminal/reaping ownership rules. Services which do not
-advertise both names, including legacy SDK/services, keep the existing safe
-replacement path unchanged.
+If staging/promotion fails or the old child live-applies the change, Core
+invokes `external-ingress-resume` with the same id **while its traffic gate is
+still closed**. The service must return the strict `resumed` response before it
+starts polling or produces another callback; only after Core receives that
+response does it reopen the gate. A first callback produced immediately after
+the response is held by the closed-gate deferred-ingress path, so it cannot be
+lost in the response/reopen handoff. A replacement owns a new child and does
+not resume the retired producer. A mismatched id, malformed acknowledgment,
+timeout, cross-loop operation, or cancellation-ambiguous lifecycle result
+fails closed and leaves the exact child under the established terminal/reaping
+ownership rules. Services which do not advertise both names, including legacy
+SDK/services, keep the existing safe replacement path unchanged.
 
 ### 3.4 Layout (same repo, two venvs)
 

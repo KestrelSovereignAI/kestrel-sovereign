@@ -76,6 +76,12 @@ class DurableSignalEvent:
     mode: str
     payload: Any
     session_id: Optional[str]
+    # ``caller_identity`` is an opaque, dispatcher-produced ciphertext for a
+    # persistence-allowed caller (or the ``v1:none`` sentinel).  It is never a
+    # raw caller identifier in storage.  Payload-elided rows deliberately
+    # leave it NULL and bind the caller only through their keyed integrity
+    # proof plus the verified live retry envelope.
+    caller_identity: Optional[str]
     visibility: str
     urgency: str
     dedupe_key: Optional[str]
@@ -211,6 +217,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 mode TEXT NOT NULL,
                 payload {json_type} NOT NULL,
                 session_id TEXT,
+                caller_identity TEXT,
                 visibility TEXT NOT NULL,
                 urgency TEXT NOT NULL,
                 dedupe_key TEXT,
@@ -277,6 +284,11 @@ class DurableSignalStore(UnifiedStoreBase):
             );
             """
         )
+        # ``CREATE TABLE IF NOT EXISTS`` cannot evolve an existing durable
+        # ledger.  Keep the caller representation additive: legacy rows lack
+        # it and are rejected for caller-bearing replay rather than silently
+        # accepting an unbound live caller.
+        await self.add_column_if_missing(self.EVENTS, "caller_identity", "TEXT")
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.EVENTS}_scope_retention "
             f"ON {self.EVENTS}(agent_id, source, retention_until)"
@@ -380,6 +392,7 @@ class DurableSignalStore(UnifiedStoreBase):
         transient_selector_payload: Any = _PERSISTED_PAYLOAD,
         initial_lease_owner: Optional[str] = None,
         integrity_binding: Optional[str] = None,
+        caller_identity: Optional[str] = None,
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
     ) -> DurableEventPersistence:
@@ -425,6 +438,8 @@ class DurableSignalStore(UnifiedStoreBase):
             or re.fullmatch(r"[0-9a-f]{64}", integrity_binding) is None
         ):
             raise ValueError("integrity_binding must be a SHA-256 hex digest")
+        if caller_identity is not None and type(caller_identity) is not str:
+            raise ValueError("caller_identity must be an opaque string when set")
         source_event_id = self._normalize_source_event_id(source_event_id)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
@@ -441,9 +456,10 @@ class DurableSignalStore(UnifiedStoreBase):
                     f"""
                     INSERT OR IGNORE INTO {self.EVENTS} (
                         event_id, source_event_id, agent_id, target_agent, source, kind, mode,
-                        payload, session_id, visibility, urgency, dedupe_key,
-                        causation_chain, arrived_at, committed_at, retention_until
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload, session_id, caller_identity, visibility, urgency,
+                        dedupe_key, causation_chain, arrived_at, committed_at,
+                        retention_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal.id,
@@ -455,6 +471,7 @@ class DurableSignalStore(UnifiedStoreBase):
                         signal.mode.value,
                         payload_json,
                         signal.session_id,
+                        caller_identity,
                         signal.visibility.value,
                         signal.urgency.value,
                         signal.dedupe_key,
@@ -491,6 +508,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     signal,
                     agent_id=agent_id,
                     source_event_id=source_event_id,
+                    caller_identity=caller_identity,
                     committed_at=now,
                     retention_until=retention_until,
                 )
@@ -1597,7 +1615,7 @@ class DurableSignalStore(UnifiedStoreBase):
         rows = await self._backend.fetch_all(
             f"""
             SELECT event_id, source_event_id, agent_id, target_agent, source, kind, mode, payload,
-                   session_id, visibility, urgency, dedupe_key,
+                   session_id, caller_identity, visibility, urgency, dedupe_key,
                    causation_chain, arrived_at, committed_at, retention_until
             FROM {self.EVENTS}
             WHERE agent_id = ? AND source = ? AND retention_until >= ?
@@ -1666,6 +1684,7 @@ class DurableSignalStore(UnifiedStoreBase):
         *,
         agent_id: str,
         source_event_id: Optional[str],
+        caller_identity: Optional[str],
         committed_at: datetime,
         retention_until: datetime,
     ) -> DurableSignalEvent:
@@ -1679,6 +1698,7 @@ class DurableSignalStore(UnifiedStoreBase):
             mode=signal.mode.value,
             payload=signal.payload,
             session_id=signal.session_id,
+            caller_identity=caller_identity,
             visibility=signal.visibility.value,
             urgency=signal.urgency.value,
             dedupe_key=signal.dedupe_key,
@@ -1699,13 +1719,14 @@ class DurableSignalStore(UnifiedStoreBase):
             mode=row[6],
             payload=_json_load(row[7]),
             session_id=row[8],
-            visibility=row[9],
-            urgency=row[10],
-            dedupe_key=row[11],
-            causation_chain=_json_load(row[12]),
-            arrived_at=_as_utc(self.from_timestamp_field(row[13])),
-            committed_at=_as_utc(self.from_timestamp_field(row[14])),
-            retention_until=_as_utc(self.from_timestamp_field(row[15])),
+            caller_identity=row[9],
+            visibility=row[10],
+            urgency=row[11],
+            dedupe_key=row[12],
+            causation_chain=_json_load(row[13]),
+            arrived_at=_as_utc(self.from_timestamp_field(row[14])),
+            committed_at=_as_utc(self.from_timestamp_field(row[15])),
+            retention_until=_as_utc(self.from_timestamp_field(row[16])),
         )
 
     @staticmethod
@@ -1741,7 +1762,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 d.acknowledged_at, d.terminal_at, d.created_at, d.updated_at,
                 e.event_id, e.source_event_id, e.agent_id, e.target_agent,
                 e.source, e.kind, e.mode, e.payload, e.session_id,
-                e.visibility, e.urgency, e.dedupe_key, e.causation_chain,
+                e.caller_identity, e.visibility, e.urgency, e.dedupe_key,
+                e.causation_chain,
                 e.arrived_at, e.committed_at, e.retention_until
             FROM {self.DELIVERIES} d
             JOIN {self.EVENTS} e ON e.event_id = d.event_id

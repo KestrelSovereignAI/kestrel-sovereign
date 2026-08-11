@@ -79,6 +79,7 @@ import asyncio
 import contextvars
 import copy
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -111,6 +112,12 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
+from kestrel_sovereign.security.encryption import (
+    DecryptionError,
+    MasterKeyNotConfiguredError,
+    get_agent_fernet,
+    get_agent_key,
+)
 from kestrel_sovereign.signals.constitution_canary import (
     CanaryStatus,
     build_canary_instruction,
@@ -154,6 +161,10 @@ logger = logging.getLogger(__name__)
 # envelope.  This marker preserves an observable event/consumer handoff while
 # proving that a volatile privacy mode did not retain user-authored content.
 _DURABLE_PRIVACY_GATED_MARKER = "_privacy_gated"
+_DURABLE_CALLER_IDENTITY_NONE = "v1:none"
+_DURABLE_CALLER_IDENTITY_PREFIX = "v1:"
+_DURABLE_CALLER_IDENTITY_AAD_PREFIX = b"kestrel:durable-signal-caller:v1:"
+_DURABLE_INTEGRITY_CONTEXT = b"kestrel:durable-signal-integrity:v1"
 
 
 _PROMPT_TEMPLATE_HASH_ATTR = "_kestrel_prompt_template_hash"
@@ -551,6 +562,10 @@ class SignalDispatcher:
         self._runtime_owner_stale_after = runtime_owner_stale_after
         self._runtime_owner_heartbeat_timer: Optional[asyncio.TimerHandle] = None
         self._runtime_owner_heartbeat_task: Optional[asyncio.Task] = None
+        # A transient ledger outage must not silently orphan this runtime's
+        # ownership heartbeat.  Backoff is capped so repeated errors retain a
+        # bounded future retry rather than either hot-looping or giving up.
+        self._runtime_owner_heartbeat_failures = 0
         self._durable_shutdown = False
         # This is intentionally dispatcher-local.  It is not a second durable
         # queue and must disappear on shutdown/restart; ``delivery_id`` is
@@ -1392,13 +1407,27 @@ class SignalDispatcher:
                 *(asyncio.shield(repair) for repair in repairs),
             )
 
-    def _schedule_runtime_owner_heartbeat(self) -> None:
-        """Keep owner liveness separate from delivery lease countdowns."""
+    def _schedule_runtime_owner_heartbeat(self, *, retry: bool = False) -> None:
+        """Keep owner liveness separate from delivery lease countdowns.
+
+        ``retry`` uses an exponential-but-capped delay after a storage error.
+        Crucially it still creates a future timer: an exception is observable,
+        but never changes into a silent end to runtime ownership heartbeats.
+        """
         if self._durable_shutdown:
             return
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
         interval = max(0.01, self._runtime_owner_stale_after.total_seconds() / 3)
+        if retry:
+            # Cap retries at the normal interval. This gives a failing backend
+            # breathing room without permitting one outage to leave an owner
+            # unsupervised for longer than its ordinary heartbeat cadence.
+            interval = min(
+                interval,
+                max(0.01, interval / 8)
+                * (2 ** min(self._runtime_owner_heartbeat_failures, 3)),
+            )
         self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
             interval, self._start_runtime_owner_heartbeat
         )
@@ -1472,6 +1501,13 @@ class SignalDispatcher:
         if self._runtime_owner_heartbeat_task is task:
             self._runtime_owner_heartbeat_task = None
         if task.cancelled():
+            if not self._durable_shutdown:
+                self._runtime_owner_heartbeat_failures += 1
+                logger.warning(
+                    "Durable signal runtime-owner heartbeat was cancelled; "
+                    "scheduling bounded retry"
+                )
+                self._schedule_runtime_owner_heartbeat(retry=True)
             return
         try:
             task.result()
@@ -1482,9 +1518,13 @@ class SignalDispatcher:
             return
         except Exception:
             logger.exception("Durable signal runtime-owner heartbeat failed")
+            if not self._durable_shutdown:
+                self._runtime_owner_heartbeat_failures += 1
+                self._schedule_runtime_owner_heartbeat(retry=True)
             return
         if self._durable_shutdown:
             return
+        self._runtime_owner_heartbeat_failures = 0
         self._schedule_runtime_owner_heartbeat()
 
     def _discard_expired_transient_durable_handoffs(self) -> None:
@@ -1634,20 +1674,27 @@ class SignalDispatcher:
             return anonymize(value)
         return value
 
-    @staticmethod
     def _volatile_source_integrity_binding(
-        signal: Signal, source_event_id: Optional[str]
+        self, signal: Signal, source_event_id: Optional[str]
     ) -> str:
         """Bind a live privacy-mode retry to its normalized original input.
 
         The durable event intentionally elides user content in volatile privacy
-        modes. A fixed SHA-256 digest gives a restart-safe equality proof for a
+        modes. A per-agent keyed MAC gives a restart-safe equality proof for a
         provider redelivery without persisting sender/content or another raw
         payload projection. The event UUID is deliberately excluded because a
         provider retry creates a fresh signal object for the same source event.
+
+        ``conversations`` is the existing per-agent HKDF branch.  We derive a
+        purpose-separated MAC key from it rather than using either a public DID
+        or an unkeyed content hash.  If that key hierarchy is unavailable, a
+        payload-elided event cannot safely become durable retry work and fails
+        closed at the persistence boundary.
         """
 
+        agent_id = self._durable_agent_id()
         envelope = {
+            "agent_id": agent_id,
             "source_event_id": source_event_id,
             "source": signal.source,
             "kind": signal.kind,
@@ -1672,11 +1719,105 @@ class SignalDispatcher:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        try:
+            base_key = get_agent_key(agent_id, "conversations")
+        except (MasterKeyNotConfiguredError, ValueError) as exc:
+            raise RuntimeError(
+                "Payload-elided durable signal delivery requires the configured "
+                "per-agent key hierarchy"
+            ) from exc
+        mac_key = hmac.new(base_key, _DURABLE_INTEGRITY_CONTEXT, hashlib.sha256).digest()
+        return hmac.new(mac_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _durable_agent_id(self) -> str:
+        """Return the sole tenant identity allowed to bind durable data."""
+
+        agent_id = getattr(self._agent, "did", None)
+        if type(agent_id) is not str or not agent_id:
+            raise RuntimeError("Durable signal delivery requires a non-empty agent DID")
+        return agent_id
+
+    def _durable_caller_identity_aad(self, event_id: str) -> bytes:
+        """Bind encrypted caller identity to this tenant and durable event."""
+
+        return (
+            _DURABLE_CALLER_IDENTITY_AAD_PREFIX
+            + self._durable_agent_id().encode("utf-8")
+            + b":"
+            + event_id.encode("utf-8")
+        )
 
     @staticmethod
-    def _signal_from_durable_event(event) -> Signal:
-        """Reconstruct the canonical persisted envelope for a retry turn."""
+    def _canonical_caller_identity(caller: Any) -> Optional[str]:
+        """Validate the opaque caller identity before it enters a MAC/cipher.
+
+        Caller IDs come from source-owned normalizers.  Treating arbitrary
+        objects as strings here would make object ``__str__`` behavior part of
+        the security boundary and would make retry identity nondeterministic.
+        """
+
+        if caller is None:
+            return None
+        if type(caller) is not str or not caller or len(caller) > 2048:
+            raise ValueError("Signal caller must be a non-empty opaque string")
+        return caller
+
+    def _protect_durable_caller_identity(self, signal: Signal) -> str:
+        """Return tenant/event-bound encrypted caller storage for a normal row."""
+
+        caller = self._canonical_caller_identity(signal.caller)
+        if caller is None:
+            return _DURABLE_CALLER_IDENTITY_NONE
+        cipher = get_agent_fernet(self._durable_agent_id())
+        if cipher is None:
+            raise RuntimeError(
+                "Durable caller identity persistence requires the configured "
+                "per-agent key hierarchy"
+            )
+        return _DURABLE_CALLER_IDENTITY_PREFIX + cipher.encrypt(
+            caller.encode("utf-8"), aad=self._durable_caller_identity_aad(signal.id)
+        ).decode("ascii")
+
+    def _recover_durable_caller_identity(self, event) -> Optional[str]:
+        """Decrypt the canonical caller, refusing legacy/unbound raw state."""
+
+        stored = event.caller_identity
+        if stored == _DURABLE_CALLER_IDENTITY_NONE:
+            return None
+        if type(stored) is not str or not stored.startswith(
+            _DURABLE_CALLER_IDENTITY_PREFIX
+        ):
+            raise RuntimeError(
+                "Durable source event lacks a protected canonical caller identity"
+            )
+        cipher = get_agent_fernet(self._durable_agent_id())
+        if cipher is None:
+            raise RuntimeError(
+                "Durable caller identity recovery requires the configured "
+                "per-agent key hierarchy"
+            )
+        try:
+            caller = cipher.decrypt(
+                stored.removeprefix(_DURABLE_CALLER_IDENTITY_PREFIX).encode("ascii"),
+                aad=self._durable_caller_identity_aad(event.event_id),
+            ).decode("utf-8")
+        except (DecryptionError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                "Durable source event caller identity could not be verified"
+            ) from exc
+        return self._canonical_caller_identity(caller)
+
+    def _signal_from_durable_event(
+        self, event, *, dispatch_signal: Signal
+    ) -> Signal:
+        """Reconstruct one canonical retry with this dispatch's fresh ID.
+
+        The durable event/source identity stays in the ledger (and in its
+        immutable ``source_event_id``); a retry attempt must nevertheless get
+        a new signal/outcome identity.  Reusing ``event_id`` here made a retry
+        report a result that disagreed with its public handle and collapsed
+        distinct outcome-log rows into one ID.
+        """
 
         chain = [
             CausationFrame(
@@ -1697,13 +1838,14 @@ class SignalDispatcher:
             target_agent=event.target_agent,
             visibility=Visibility(event.visibility),
             session_id=event.session_id,
+            caller=self._recover_durable_caller_identity(event),
             urgency=Urgency(event.urgency),
             dedupe_key=event.dedupe_key,
             # Source registration reasserts its trust ceiling before routing.
             origin_trust=Trust.UNTRUSTED,
             causation_chain=chain,
-            id=event.event_id,
-            arrived_at=event.arrived_at,
+            id=dispatch_signal.id,
+            arrived_at=dispatch_signal.arrived_at,
         )
 
     @asynccontextmanager
@@ -1867,6 +2009,12 @@ class SignalDispatcher:
             async with optional_transition_lock(
                 _resolve_transition_lock(self._agent)
             ):
+                # Normalize the opaque caller once before either the protected
+                # normal-row representation or an elided row's keyed MAC sees
+                # it. This makes caller identity stable across retries and
+                # prevents a user-defined ``__str__`` from entering either
+                # security boundary.
+                signal.caller = self._canonical_caller_identity(signal.caller)
                 durable_projection = self._signal_for_durable_persistence(signal)
                 # Snapshot the normalized payload before the durable commit so
                 # a deepcopy failure cannot leave a committed marker with no
@@ -1885,6 +2033,15 @@ class SignalDispatcher:
                     self._volatile_source_integrity_binding(signal, source_event_id)
                     if durable_projection.payload_elided
                     else None
+                )
+                # Persisted caller identity is independent of the audit log's
+                # redacted display field.  It is encrypted and AAD-bound to
+                # this tenant/event for normal rows; privacy-elided rows retain
+                # no caller at all and instead bind it through the live MAC.
+                caller_identity = (
+                    None
+                    if durable_projection.payload_elided
+                    else self._protect_durable_caller_identity(signal)
                 )
                 committed_reservations = None
 
@@ -1949,6 +2106,7 @@ class SignalDispatcher:
                         else None
                     ),
                     "integrity_binding": volatile_integrity_binding,
+                    "caller_identity": caller_identity,
                     "before_commit": (
                         install_transient_handoffs
                         if durable_projection.payload_elided
@@ -2075,22 +2233,45 @@ class SignalDispatcher:
                 )
             )
 
-        if durable_projection.payload_elided and not persisted.created:
+        # The row that already exists controls replay authority.  A retry can
+        # cross a privacy transition (EPHEMERAL -> NORMAL or back again), so
+        # the retry's *current* projection cannot decide whether live content
+        # is safe to use.  Presence of the persisted integrity row means the
+        # original event deliberately elided content and requires this exact
+        # keyed-MAC-verified live envelope.
+        recorded_binding = None
+        use_verified_live_signal = False
+        if not persisted.created:
             recorded_binding = await self._durable_store.get_event_integrity(
                 agent_id=self._agent.did, event_id=persisted.event_id
             )
-            if (
-                recorded_binding is None
-                or volatile_integrity_binding is None
-                or not secrets.compare_digest(recorded_binding, volatile_integrity_binding)
-            ):
+            if recorded_binding is not None:
+                live_integrity_binding = (
+                    volatile_integrity_binding
+                    or self._volatile_source_integrity_binding(signal, source_event_id)
+                )
+                if not secrets.compare_digest(recorded_binding, live_integrity_binding):
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.FAILED,
+                        error=(
+                            "Privacy-elided durable source event did not match its "
+                            "original normalized integrity binding"
+                        ),
+                        registration=registration,
+                    )
+                use_verified_live_signal = True
+            elif durable_projection.payload_elided:
+                # A new privacy-elided retry must never attach live caller or
+                # content to a legacy/non-elided event with no MAC row.
                 return self._fail(
                     signal,
                     start,
                     Status.FAILED,
                     error=(
-                        "Privacy-elided durable source event did not match its "
-                        "original normalized integrity binding"
+                        "Privacy-elided durable source event lacks its required "
+                        "integrity binding"
                     ),
                     registration=registration,
                 )
@@ -2103,7 +2284,10 @@ class SignalDispatcher:
                 persisted_event_id=persisted.event_id,
                 consumer_id=durable_delivery_consumer_id,
                 durable_admission=durable_admission,
-                use_live_signal=durable_projection.payload_elided,
+                use_live_signal=(
+                    durable_projection.payload_elided and persisted.created
+                )
+                or use_verified_live_signal,
             )
 
         if not persisted.created:
@@ -2176,7 +2360,13 @@ class SignalDispatcher:
         # durable envelope, not whatever a duplicate provider callback happens
         # to carry. Volatile privacy modes retain no content in the ledger, so
         # their live callback is usable only after the integrity check above.
-        routing_signal = signal if use_live_signal else self._signal_from_durable_event(delivery.event)
+        routing_signal = (
+            signal
+            if use_live_signal
+            else self._signal_from_durable_event(
+                delivery.event, dispatch_signal=signal
+            )
+        )
         async with self._renew_durable_cognition_lease(delivery):
             result = await self._route_after_durable_persistence(
                 routing_signal, registration, start

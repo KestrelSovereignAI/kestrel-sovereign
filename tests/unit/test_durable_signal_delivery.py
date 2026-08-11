@@ -140,6 +140,7 @@ def _channel_signal(agent_id: str, message_id: str) -> Signal:
             "metadata": {},
         },
         target_agent=agent_id,
+        caller="555",
         dedupe_key=f"telegram:{message_id}",
     )
 
@@ -492,7 +493,8 @@ async def test_cognition_retry_uses_canonical_persisted_channel_input(tmp_path):
             source_event_id=source_event_id,
             consumer_id=consumer.consumer_id,
         )
-        assert (await first.wait()).status is Status.FAILED
+        first_result = await first.wait()
+        assert first_result.status is Status.FAILED
         assert (await dispatcher.list_durable_deliveries())[0].status == RETRY
 
         # The first failed turn recorded the normal coalescing key. A provider
@@ -504,11 +506,209 @@ async def test_cognition_retry_uses_canonical_persisted_channel_input(tmp_path):
             source_event_id=source_event_id,
             consumer_id=consumer.consumer_id,
         )
-        assert (await retry.wait()).status is Status.OK
+        retry_result = await retry.wait()
+        assert retry_result.status is Status.OK
+        # A delivery's source event remains durable identity, but a provider
+        # retry is a distinct dispatch/outcome with the same ID its public
+        # handle promised to the callback owner.
+        assert retry_result.signal_id == retry.signal_id
+        assert retry_result.signal_id != first_result.signal_id
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert deliveries[0].event.event_id == first.signal_id
+        assert deliveries[0].event.source_event_id == source_event_id
+        outcome_ids = {
+            row[0]
+            for row in await backend.fetch_all(
+                "SELECT id FROM signal_log WHERE source = 'channel.message'"
+            )
+        }
+        assert {first_result.signal_id, retry_result.signal_id}.issubset(outcome_ids)
         assert len(prompts) == 2
         assert "original Telegram content" in prompts[1]
         assert "attacker replacement content" not in prompts[1]
         assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_elided_row_allows_verified_live_redelivery_after_privacy_becomes_normal(
+    tmp_path,
+):
+    """The persisted MAC row, not the retry's mode, authorizes live content."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "ephemeral-to-normal-live-retry.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="core.channel-cognition-v1",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = "telegram:update:ephemeral-to-normal"
+    prompts: list[str] = []
+
+    async def fail_once_then_record(prompt: str):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise RuntimeError("retry after privacy transition")
+        return "ok"
+
+    agent.process_input = fail_once_then_record
+    original = _channel_signal(agent.did, "ephemeral-to-normal")
+    original.payload["content"] = "live private content survives the verified retry"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            original,
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await first.wait()).status is Status.FAILED
+        persisted = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE event_id = ?",
+            (first.signal_id,),
+        )
+        binding = await backend.fetch_one(
+            "SELECT integrity_binding FROM durable_signal_event_integrity WHERE event_id = ?",
+            (first.signal_id,),
+        )
+        assert persisted is not None and "live private content" not in persisted[0]
+        assert binding is not None
+
+        # The redelivery happened after a legitimate mode transition. It must
+        # compare against the row's HMAC and retain the live content instead of
+        # reconstructing the old marker-only payload.
+        agent.privacy_config = get_privacy_preset("normal")
+        dispatcher._coalescing.reset()
+        retry_signal = _channel_signal(agent.did, "ephemeral-to-normal")
+        retry_signal.payload["content"] = "live private content survives the verified retry"
+        retry = await dispatcher.enqueue_durable_cognition(
+            retry_signal,
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await retry.wait()).status is Status.OK
+        assert "live private content survives the verified retry" in prompts[-1]
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_durable_caller_identity_is_tenant_bound_encrypted_and_reconstructed(tmp_path):
+    """A retry uses the stored canonical caller, never a duplicate's claim."""
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "durable-caller-identity.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="core.channel-cognition-v1",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = "telegram:update:caller-identity"
+    original = _channel_signal(agent.did, "caller-identity")
+    original.caller = "telegram-user-original"
+    changed = _channel_signal(agent.did, "caller-identity")
+    changed.caller = "telegram-user-attacker"
+    attempts = 0
+
+    async def fail_once(_prompt: str):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("retry")
+        return "ok"
+
+    agent.process_input = fail_once
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            original, source_event_id=source_event_id, consumer_id=consumer.consumer_id
+        )
+        assert (await first.wait()).status is Status.FAILED
+        row = await backend.fetch_one(
+            "SELECT caller_identity FROM durable_signal_events WHERE event_id = ?",
+            (first.signal_id,),
+        )
+        assert row is not None and row[0] is not None
+        assert "telegram-user-original" not in row[0]
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert dispatcher._signal_from_durable_event(
+            delivery.event, dispatch_signal=changed
+        ).caller == "telegram-user-original"
+
+        dispatcher._coalescing.reset()
+        retry = await dispatcher.enqueue_durable_cognition(
+            changed, source_event_id=source_event_id, consumer_id=consumer.consumer_id
+        )
+        assert (await retry.wait()).status is Status.OK
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_elided_retry_integrity_is_keyed_to_the_agent_hierarchy(
+    monkeypatch, tmp_path
+):
+    """An unkeyed payload hash would accept this key-rotation reproduction."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", "durable-integrity-key-one")
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "keyed-elided-integrity.db", "did:agent:one"
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="core.channel-cognition-v1",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = "telegram:update:keyed-integrity"
+    original = _channel_signal(agent.did, "keyed-integrity")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            original, source_event_id=source_event_id, consumer_id=consumer.consumer_id
+        )
+        assert (await first.wait()).status is Status.OK
+
+        # Reopen the delivery only for this integrity proof. A different
+        # hierarchy key must reject byte-for-byte identical live data; an
+        # unkeyed SHA-256 binding would incorrectly accept it.
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        await backend.execute(
+            "UPDATE durable_signal_deliveries SET status = ?, acknowledged_at = NULL, "
+            "terminal_at = NULL, next_attempt_at = NULL WHERE delivery_id = ?",
+            (RETRY, delivery.delivery_id),
+        )
+        monkeypatch.setenv("KESTREL_DATA_KEY", "durable-integrity-key-two")
+        dispatcher._coalescing.reset()
+        retry = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "keyed-integrity"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await retry.wait()).status is Status.FAILED
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
@@ -551,10 +751,11 @@ async def test_privacy_elided_retry_requires_identical_live_input_after_restart(
         assert (await first.wait()).status is Status.FAILED
         assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
         row = await backend_a.fetch_one(
-            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            "SELECT payload, caller_identity FROM durable_signal_events WHERE agent_id = ?",
             (agent_a.did,),
         )
         assert row is not None and "original private content" not in row[0]
+        assert row[1] is None
         await dispatcher_a.shutdown_durable_delivery()
     finally:
         await _close(backend_a, agent_a)
@@ -569,8 +770,8 @@ async def test_privacy_elided_retry_requires_identical_live_input_after_restart(
 
     agent_b.process_input = record_cognition
     changed = _channel_signal(agent_b.did, "privacy-integrity")
-    changed.payload["sender"] = "different-sender"
-    changed.payload["content"] = "changed private content"
+    changed.caller = "different-telegram-caller"
+    changed.payload["content"] = "the original private content"
     identical = _channel_signal(agent_b.did, "privacy-integrity")
     identical.payload["content"] = "the original private content"
     try:
@@ -1534,6 +1735,45 @@ async def test_heartbeat_recovers_reservation_that_becomes_stale_after_restart(t
         assert replay is not None
         assert replay.event.payload == {"_privacy_gated": "none"}
     finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_path):
+    """A transient owner-heartbeat exception cannot silently abandon liveness."""
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "owner-heartbeat-retry.db", "did:agent:one"
+    )
+    original = dispatcher._durable_store.heartbeat_runtime_owner
+    attempts = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary durable store outage")
+        return await original(*args, **kwargs)
+
+    dispatcher._durable_store.heartbeat_runtime_owner = fail_once
+    try:
+        dispatcher._start_runtime_owner_heartbeat()
+        task = dispatcher._runtime_owner_heartbeat_task
+        assert task is not None
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        retry_timer = dispatcher._runtime_owner_heartbeat_timer
+        assert attempts == 1
+        assert dispatcher._runtime_owner_heartbeat_failures == 1
+        assert retry_timer is not None and not retry_timer.cancelled()
+        # The retry is deliberately bounded below the normal stale-owner
+        # cadence, so a storage outage is observable without a hot loop.
+        assert 0 < retry_timer.when() - asyncio.get_running_loop().time() <= (
+            dispatcher._runtime_owner_stale_after.total_seconds() / 3
+        )
+    finally:
+        dispatcher._durable_store.heartbeat_runtime_owner = original
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 

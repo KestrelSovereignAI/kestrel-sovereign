@@ -98,6 +98,7 @@ _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
 _EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
 _EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
 _EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
+_EVENT_INGRESS_ATTEMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 # Polling is sequential: an acknowledged source cannot emit its next update
 # until Core acknowledges the current one. Retaining one current-child event
 # during a finite gate close therefore preserves no-loss startup without
@@ -6706,7 +6707,8 @@ class ProxyFeature(Feature):
         )
         if request is None or type(request.payload) is not dict:
             return message, None
-        if set(request.payload) != {"dedupe_key"}:
+        payload_keys = set(request.payload)
+        if payload_keys not in ({"dedupe_key"}, {"dedupe_key", "attempt_token"}):
             return message, None
         message_metadata = message.get("metadata")
         dedupe_key = (
@@ -6718,6 +6720,12 @@ class ProxyFeature(Feature):
             type(dedupe_key) is not str
             or message.get("id") != dedupe_key
             or request.payload.get("dedupe_key") != dedupe_key
+        ):
+            return message, None
+        attempt_token = request.payload.get("attempt_token")
+        if attempt_token is not None and (
+            type(attempt_token) is not str
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
         ):
             return message, None
         return message, request
@@ -6755,8 +6763,16 @@ class ProxyFeature(Feature):
         )
         if (
             type(dedupe_key) is not str
-            or set(request.payload) != {"dedupe_key"}
+            or set(request.payload) not in (
+                {"dedupe_key"}, {"dedupe_key", "attempt_token"}
+            )
             or request.payload.get("dedupe_key") != dedupe_key
+        ):
+            return None
+        attempt_token = request.payload.get("attempt_token")
+        if attempt_token is not None and (
+            type(attempt_token) is not str
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
         ):
             return None
         return request
