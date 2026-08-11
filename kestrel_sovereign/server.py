@@ -2370,14 +2370,25 @@ async def _lifespan_startup(app: FastAPI):
     # get_agent dependency), aggregate their host-scoped UI, build the fleet
     # HostContext, and run their host lifecycle. Mounted UNCONDITIONALLY after
     # agent setup — host features are host-scoped and independent of single- vs
-    # multi-agent mode. Isolated in try/except so a host-feature failure never
-    # blocks the host from serving agents.
+    # multi-agent mode. Reversible imperative failures remain isolated; an
+    # invalid complete contribution set fails startup before mounted state is
+    # changed.
     from kestrel_sovereign import host_features as _hf
+    from kestrel_sdk.features import ContributionContractError
+    from kestrel_sovereign.features.contribution_runtime import (
+        FeatureContributionRuntimeError,
+    )
     from kestrel_sovereign.paths import project_dir as _host_project_dir
 
-    app.state.host_features = []
-    app.state.host_context = None
-    app.state.host_ui_manifest = []
+    if not hasattr(app.state, "host_features"):
+        app.state.host_features = []
+    if not hasattr(app.state, "host_context"):
+        app.state.host_context = None
+    if not hasattr(app.state, "host_ui_manifest"):
+        app.state.host_ui_manifest = []
+    replacing_host_state = bool(app.state.host_features)
+    candidate_ctx = None
+    candidate_started = []
     try:
         # Resolve the host manifest from the resolved PROJECT_DIR (KESTREL_HOME /
         # marker walk-up / ~/.kestrel), NOT Path.cwd(). A service launched under
@@ -2387,19 +2398,46 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
-        app.state.host_features = features
         if features:
             host_cfg = getattr(app.state, "multi_agent_config", None)
             ctx = await _hf.build_host_context(
                 config=_host_config_mapping(host_cfg)
             )
+            candidate_ctx = ctx
+            # Validate and activate the complete prospective contribution set
+            # before changing any already-valid mounted host surface.
+            started_features = await _hf.start_host_features(features, ctx)
+            # Backward-compatible with host integrations that still return
+            # ``None`` from the lifecycle hook: the canonical runtime returns
+            # the exact successfully-started set.
+            if started_features is None:
+                started_features = features
+            candidate_started = list(started_features)
+            if replacing_host_state:
+                _hf.unmount_host_features(app)
+            _hf.mount_host_feature_routers(app, candidate_started)
+            _hf.mount_host_feature_ui(app, candidate_started)
+            app.state.host_features = list(started_features)
             app.state.host_context = ctx
-            _hf.mount_host_feature_routers(app, features)
-            _hf.mount_host_feature_ui(app, features)
-            await _hf.start_host_features(features, ctx)
-            logger.info("Host features initialized: %d", len(features))
+            runtime = getattr(ctx, "feature_contribution_runtime", None)
+            if runtime is not None:
+                app.state.host_operator_registry = runtime.operator_registry
+                app.state.host_wait_registry = runtime.wait_registry
+                app.state.host_signal_registry = runtime.source_registry
+                app.state.host_permission_defaults_registry = (
+                    runtime.permission_defaults_registry
+                )
+                app.state.host_setup_step_registry = runtime.setup_step_registry
+            logger.info("Host features initialized: %d", len(started_features))
+    except (ContributionContractError, FeatureContributionRuntimeError):
+        # Complete prospective-set rejection is a startup failure, not an
+        # optional-feature warning. No candidate was mounted and prior valid
+        # state remains visible.
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Host feature initialization failed: %s", exc)
+        if candidate_ctx is not None and candidate_started:
+            await _hf.stop_host_features(candidate_started, candidate_ctx)
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)

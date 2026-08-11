@@ -1161,6 +1161,15 @@ class KestrelAgent(
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
         self.wallet = None  # Set by WalletFeature.initialize()
         self.sleep_hooks = []  # *SleepHook instances; features append in post_all_features_loaded()
+        # Declarative SDK contributions are wired lazily once the existing
+        # per-agent wait/signal registries exist.  The operator registry is the
+        # single service/workflow registry for this agent lifecycle.
+        from kestrel_sovereign.operator import OperatorRuntimeRegistry
+
+        self.operator_registry = OperatorRuntimeRegistry()
+        self.feature_contribution_runtime = None
+        self.permission_defaults_registry = None
+        self.setup_step_registry = None
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)
@@ -2109,6 +2118,7 @@ class KestrelAgent(
         # post_all_features_loaded; the generic `wait("<kind>:<handle>")`
         # tool resolves kinds here. Mirrors signal_registry.
         self.wait_registry = WaitRegistry()
+        self._ensure_feature_contribution_runtime()
         self.signal_log_store = signal_log_store
         self.dispatcher = SignalDispatcher(
             agent=self,
@@ -2770,10 +2780,22 @@ class KestrelAgent(
         # every feature already initialized — each feature.initialize() may have
         # opened connections or started workers.
         ctx.on_rollback("features", self._boot_teardown_features)
-        for feature in discovered_features:
-            if feature.name in disabled_features:
-                continue
-            await self._register_feature(feature)
+        enabled_discovered_features = tuple(
+            feature
+            for feature in discovered_features
+            if feature.name not in disabled_features
+        )
+        prepared_contributions = self._prepare_feature_contribution_transition(
+            enabled_discovered_features
+        )
+        prepared_by_feature = {
+            id(item.feature): item for item in prepared_contributions
+        }
+        for feature in enabled_discovered_features:
+            await self._register_feature(
+                feature,
+                prepared_contributions=prepared_by_feature[id(feature)],
+            )
         verify_mandatory_feature_set(
             self.features,
             stage="agent readiness",
@@ -4047,6 +4069,80 @@ class KestrelAgent(
             return
         await store.clear(self.did, kind, name)
 
+    def _ensure_feature_contribution_runtime(self):
+        """Return the contribution controller bound to this agent's registries.
+
+        Bare lifecycle tests attach wait/signal registries after construction,
+        while a fully booted agent creates them in the durable-runtime phase.
+        Laziness supports both without creating a competing registry.
+        """
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionRuntime,
+        )
+        from kestrel_sovereign.signals import SourceRegistry
+        from kestrel_sovereign.waits import WaitRegistry
+
+        signal_registry = getattr(self, "signal_registry", None)
+        if signal_registry is None:
+            signal_registry = SourceRegistry()
+            self.signal_registry = signal_registry
+        wait_registry = getattr(self, "wait_registry", None)
+        if wait_registry is None:
+            wait_registry = WaitRegistry()
+            self.wait_registry = wait_registry
+
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is not None:
+            if (
+                runtime.wait_registry is wait_registry
+                and runtime.source_registry is signal_registry
+            ):
+                return runtime
+            if runtime.active_owners():
+                raise RuntimeError(
+                    "cannot replace contribution registries while features are active"
+                )
+
+        runtime = FeatureContributionRuntime(
+            operator_registry=self.operator_registry,
+            wait_registry=wait_registry,
+            source_registry=signal_registry,
+        )
+        self.feature_contribution_runtime = runtime
+        self.permission_defaults_registry = runtime.permission_defaults_registry
+        self.setup_step_registry = runtime.setup_step_registry
+        return runtime
+
+    def _prepare_feature_contribution_transition(self, features):
+        """Collect and prevalidate one complete feature activation transition."""
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionCollectionError,
+        )
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        try:
+            return self._ensure_feature_contribution_runtime().prepare_transition(
+                features
+            )
+        except FeatureContributionCollectionError as exc:
+            feature_class_name = type(exc.feature).__name__
+            cause = exc.__cause__
+            if feature_class_name in MANDATORY_FEATURES:
+                if exc.stage == "tool collection":
+                    stage = "registration"
+                    problem = "could not register its tools"
+                else:
+                    stage = "contribution registration"
+                    problem = "could not register its SDK contributions"
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    stage,
+                    problem,
+                ) from cause
+            if cause is None:  # Defensive: collection failures always chain.
+                raise
+            raise cause.with_traceback(cause.__traceback__) from cause.__cause__
+
     async def _shutdown_failed_feature(self, feature: Feature) -> None:
         """Drain EVERY registration of a feature whose registration failed mid-way.
 
@@ -4087,12 +4183,21 @@ class KestrelAgent(
                 exc,
             )
 
-    async def _register_feature(self, feature: Feature):
+    async def _register_feature(
+        self,
+        feature: Feature,
+        *,
+        prepared_contributions=None,
+    ):
         """Register a feature with A2A TaskManager for unified command routing."""
         from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         feature_class_name = type(feature).__name__
         mandatory = feature_class_name in MANDATORY_FEATURES
+        if prepared_contributions is None:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                (feature,)
+            )[0]
         try:
             await feature.initialize()
         except Exception as exc:
@@ -4105,6 +4210,20 @@ class KestrelAgent(
                 ) from exc
             raise
         self.features[feature.name] = feature
+
+        try:
+            self._ensure_feature_contribution_runtime().activate(
+                prepared_contributions
+            )
+        except Exception as exc:
+            await self._shutdown_failed_feature(feature)
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "contribution registration",
+                    "could not register its SDK contributions",
+                ) from exc
+            raise
 
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
@@ -4161,6 +4280,27 @@ class KestrelAgent(
                 f"'{feature.name}'"
             )
 
+    async def _register_runtime_feature_permissions(self, feature: "Feature") -> None:
+        """Apply one runtime-enabled feature's permissions before exposure.
+
+        Boot uses ``SecurityFeature.post_all_features_loaded`` once discovery
+        is complete. A soft-disabled feature's SDK contributions, however, are
+        absent from that pass and become active only during runtime enable.
+        Route that transition through SecurityFeature's same per-feature seam
+        after contribution activation and before hooks, A2A, or direct tools
+        are wired, so hard defaults cannot temporarily degrade to fallback ASK.
+        """
+        from kestrel_sovereign.features.security.feature import SecurityFeature
+
+        security = self.features.get("SecurityFeature")
+        if (
+            not isinstance(security, SecurityFeature)
+            or security is feature
+            or not bool(getattr(security, "enabled", True))
+        ):
+            return
+        await security.register_feature_tools(feature.name, feature)
+
     def _wire_feature_a2a(self, feature: "Feature") -> None:
         """Register a feature as an A2A agent with the TaskManager.
 
@@ -4211,7 +4351,12 @@ class KestrelAgent(
                 self._register_explored_feature_tools(feature)
                 self._pinned_features.add(feature.tool_name)
 
-    async def _activate_feature_runtime(self, feature: "Feature") -> None:
+    async def _activate_feature_runtime(
+        self,
+        feature: "Feature",
+        *,
+        prepared_contributions=None,
+    ) -> None:
         """Bring an already-loaded feature fully live — the inverse of
         :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
 
@@ -4221,6 +4366,8 @@ class KestrelAgent(
 
         * ``initialize()`` — re-registers the feature's owned **signal sources**
           (talon registers ``talon.job_complete`` etc. here);
+        * contributed permission defaults through SecurityFeature, before any
+          callable surface is exposed;
         * hooks from ``get_hooks()`` (via :meth:`_wire_feature_hooks`);
         * the ``on_enable`` lifecycle;
         * the A2A TaskManager agent registration (via :meth:`_wire_feature_a2a`);
@@ -4245,8 +4392,16 @@ class KestrelAgent(
         :meth:`_register_feature` (which additionally handles first-load
         discovery and the mandatory-feature readiness contract).
         """
+        if prepared_contributions is None:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                (feature,)
+            )[0]
         try:
             await feature.initialize()
+            self._ensure_feature_contribution_runtime().activate(
+                prepared_contributions
+            )
+            await self._register_runtime_feature_permissions(feature)
             self._wire_feature_hooks(feature)
             await feature.on_enable()
             self._wire_feature_a2a(feature)
@@ -4330,6 +4485,19 @@ class KestrelAgent(
         )
         feature_tool_name = getattr(feature, "tool_name", feature_key)
         errors: List[Exception] = []
+
+        # Declarative contributions are exact lifecycle capabilities. Remove
+        # them independently even when the feature's imperative hooks fail.
+        try:
+            runtime = self._ensure_feature_contribution_runtime()
+            runtime.deactivate(feature)
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' SDK contribution teardown failed; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
 
         # Lifecycle inverse of on_enable (run during activation). Independent of
         # every teardown step below, so its failure must not skip them.

@@ -4,9 +4,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from kestrel_sdk.features import FeatureContributionSet
 
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import FeaturePackageInfo, FeatureStatus
+from kestrel_sovereign.features.contribution_runtime import (
+    PreparedFeatureContributions,
+)
 from kestrel_sovereign.ui_capabilities import (
     compute_feature_capabilities,
     render_multi_agent_host_config_script,
@@ -48,6 +52,27 @@ def _make_feature(enabled=True):
 def _make_agent(features=None):
     agent = MagicMock()
     agent.features = features or {}
+    prepared_by_feature = {}
+
+    def _prepare_feature_contribution_transition(features):
+        prepared = tuple(
+            PreparedFeatureContributions(
+                feature=feature,
+                owner=f"test:{id(feature)}",
+                feature_name=type(feature).__name__,
+                contributions=FeatureContributionSet(
+                    services=(),
+                    wait_providers=(),
+                    workflows=(),
+                    permission_defaults=None,
+                    setup_steps=(),
+                ),
+            )
+            for feature in features
+        )
+        prepared_by_feature.clear()
+        prepared_by_feature.update({id(item.feature): item for item in prepared})
+        return prepared
 
     async def _unregister_feature_runtime(feature, *, unload=False):
         await feature.on_disable()
@@ -56,7 +81,10 @@ def _make_agent(features=None):
                 agent.hooks_manager.unregister(hook)
         feature.enabled = False
 
-    async def _activate_feature_runtime(feature):
+    async def _activate_feature_runtime(feature, *, prepared_contributions=None):
+        if prepared_contributions is not None:
+            assert prepared_contributions is prepared_by_feature[id(feature)]
+            assert prepared_contributions.feature is feature
         if agent.hooks_manager:
             for hook in feature.get_hooks() or []:
                 agent.hooks_manager.register(hook)
@@ -72,6 +100,9 @@ def _make_agent(features=None):
     # exercise the post-transition state rather than a non-awaitable mock.
     agent._unregister_feature_runtime = AsyncMock(
         side_effect=_unregister_feature_runtime
+    )
+    agent._prepare_feature_contribution_transition = MagicMock(
+        side_effect=_prepare_feature_contribution_transition
     )
     agent._activate_feature_runtime = AsyncMock(side_effect=_activate_feature_runtime)
     return agent
@@ -310,6 +341,26 @@ class TestLifecyclePushesCapabilities:
         assert body["status"] == "disabled"
         assert body["capabilities"]["voice"] is False
         assert feature.enabled is False
+
+    @patch("kestrel_sovereign.ui_capabilities.get_registry")
+    def test_disable_rollback_can_reactivate_without_prepared_handle(
+        self, mock_registry
+    ):
+        feature = _make_feature(enabled=True)
+        feature.get_hooks.return_value = []
+        feature.on_disable = AsyncMock(side_effect=RuntimeError("disable failed"))
+        mock_registry.return_value = _registry(voice_enabled=True, spawn_enabled=True)
+        agent = _make_agent({"VoiceFeature": feature})
+        agent.hooks_manager = None
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/VoiceFeature/disable")
+
+        assert resp.status_code == 500
+        agent._activate_feature_runtime.assert_awaited_once_with(feature)
+        feature.on_enable.assert_awaited_once()
+        assert feature.enabled is True
 
     @patch("kestrel_sovereign.ui_capabilities.get_registry")
     def test_enable_sets_flag_and_returns_map(self, mock_registry):

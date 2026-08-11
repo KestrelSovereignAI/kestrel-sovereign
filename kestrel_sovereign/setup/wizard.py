@@ -15,14 +15,25 @@ import shutil
 import time
 from pathlib import Path
 
+from kestrel_sdk.features import SetupStepClassification
+
 from kestrel_sovereign.setup.context import Flow, SetupContext
-from kestrel_sovereign.setup.steps import BY_NAME, ORDERED
+from kestrel_sovereign.setup.contributions import (
+    DiscoveredSetupSteps,
+    SetupContributionDiscoveryError,
+    discover_core_setup_steps,
+    discover_setup_steps,
+    missing_setup_step_message,
+    run_setup_step,
+)
 
 
 def run_wizard(
     ctx: SetupContext,
     *,
     only_step: str | None = None,
+    setup_steps: DiscoveredSetupSteps | None = None,
+    core_only: bool = False,
 ) -> int:
     """Run the wizard.
 
@@ -34,6 +45,41 @@ def run_wizard(
     upfront with a clear error; this guard catches anyone calling
     ``run_wizard`` directly (e.g. tests, embedders).
     """
+    core_steps = discover_core_setup_steps()
+    core_selection = (
+        core_steps.selected(only_step) if only_step is not None else None
+    )
+    if ctx.flow is Flow.CHECK and only_step is not None and not core_selection:
+        ctx.block(
+            "Contributed setup steps are not executed by --check: Python plugin "
+            "code is not sandboxed, so Sovereign cannot enforce the read-only "
+            "contract. Run the provider's checker outside `kestrel setup "
+            "--check` or select a built-in recovery step."
+        )
+        return 1
+
+    try:
+        # Built-in recovery selections and CHECK never import provider code.
+        # Normal all-step setup still validates the complete prospective set
+        # atomically, as required by the SDK ordering contract.
+        discovered = (
+            core_steps
+            if core_only or ctx.flow is Flow.CHECK or core_selection
+            else (setup_steps or discover_setup_steps())
+        )
+        selected = (
+            discovered.selected(only_step) if only_step is not None else None
+        )
+    except SetupContributionDiscoveryError as exc:
+        ctx.block(str(exc))
+        if ctx.flow is not Flow.CHECK:
+            _print_summary(ctx)
+        return 1
+
+    if only_step is not None and not selected:
+        ctx.prompter.info(missing_setup_step_message(only_step, discovered))
+        return 1
+
     if ctx.reset and ctx.flow is Flow.CHECK:
         ctx.block(
             "refused to reset in --check mode (read-only by contract)"
@@ -41,26 +87,35 @@ def run_wizard(
     elif ctx.reset:
         _reset_config_files(ctx)
 
-    if only_step is not None:
-        if only_step not in BY_NAME:
-            ctx.prompter.info(
-                f"Unknown step: {only_step!r}. "
-                f"Valid: {', '.join(name for name, _ in ORDERED)}"
+    registrations = (
+        selected
+        if selected is not None
+        else tuple(
+            registration
+            for registration in discovered.registry.ordered()
+            if registration.classification is SetupStepClassification.DEFAULT
+        )
+    )
+    for registration in registrations:
+        if only_step is None:
+            ctx.prompter.info(f"\n— {registration.name} —")
+        try:
+            run_setup_step(registration, ctx)
+        except Exception as exc:  # noqa: BLE001 - third-party setup boundary
+            reason = (
+                f"Setup step {registration.name!r} failed "
+                f"({type(exc).__name__}: {exc})"
             )
-            return 1
-        BY_NAME[only_step](ctx)
-    else:
-        for name, step_fn in ORDERED:
-            ctx.prompter.info(f"\n— {name} —")
-            step_fn(ctx)
-            if ctx.halted:
-                # A step (e.g. ``keys`` on a KESTREL_DATA_KEY custody conflict)
-                # declared the whole workflow unsafe to continue. Stop before any
-                # later, key-dependent step mutates state under it (#2468).
-                ctx.prompter.info(
-                    f"\nHalting setup — {ctx.halt_reason}"
-                )
-                break
+            ctx.block(reason)
+            ctx.halt(reason)
+        if ctx.halted:
+            # A step (e.g. ``keys`` on a KESTREL_DATA_KEY custody conflict)
+            # declared the whole workflow unsafe to continue. Stop before any
+            # later, key-dependent step mutates state under it (#2468).
+            ctx.prompter.info(
+                f"\nHalting setup — {ctx.halt_reason}"
+            )
+            break
 
     if ctx.flow is not Flow.CHECK:
         _print_summary(ctx)

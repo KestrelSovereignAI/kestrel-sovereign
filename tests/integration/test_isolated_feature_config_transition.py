@@ -260,7 +260,7 @@ async def test_cancelled_host_ingress_keeps_real_sdk_rpc_admitted_until_child_se
     """A cancelled host waiter cannot retire a live SDK service callback.
 
     This crosses the public SDK's real in-memory JSON-RPC client/service wire.
-    SDK 0.35.1 deliberately drops a locally cancelled request waiter without
+    SDK 0.36.0 deliberately drops a locally cancelled request waiter without
     sending a cancellation message to the service, so the host proxy must keep
     its traffic gate admitted until the child handler's late response settles.
     """
@@ -627,7 +627,7 @@ async def test_shutdown_cannot_orphan_subprocess_during_unhealthy_supervisor_sto
 ):
     """The supervisor's owned stop reaches SIGKILL despite its cancellation.
 
-    SDK 0.35.1 detaches ``process`` before awaiting graceful shutdown. This
+    SDK 0.36.0 detaches ``process`` before awaiting graceful shutdown. This
     drives a real unhealthy-supervisor stop, then overlaps normal shutdown
     while that exact stop is in flight.  The service wedges its event loop and
     ignores SIGTERM, so observing the original process's SIGKILL proves this

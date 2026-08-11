@@ -96,6 +96,12 @@ class FeaturePackageInfo:
     command: Optional[str] = None
     provider_for: Optional[str] = None
     companion: Optional[str] = None
+    # Narrow migration seam for replacing one bundled lifecycle class with an
+    # extracted package before the catalog ownership boundary itself moves.
+    # Both values are required together and are valid only for a bundled row
+    # that declares exactly one Feature class.
+    extracted_replacement_package: Optional[str] = None
+    extracted_replacement_module_prefix: Optional[str] = None
     skills: List[SkillInfo] = field(default_factory=list)
     status: FeatureStatus = FeatureStatus.AVAILABLE
     # Frontend capability keys this feature's UI panels gate on (#2041). The
@@ -328,6 +334,32 @@ def validate_registry(
                     f"{name}: companion must reference a standalone-tool row"
                 )
 
+        replacement_values = (
+            info.extracted_replacement_package,
+            info.extracted_replacement_module_prefix,
+        )
+        if any(replacement_values) and not all(replacement_values):
+            errors.append(
+                f"{name}: extracted replacement package and module prefix "
+                "must be declared together"
+            )
+        elif all(replacement_values):
+            if boundary is not PackageBoundary.BUNDLED:
+                errors.append(
+                    f"{name}: extracted replacement is valid only on a "
+                    "bundled row"
+                )
+            if len(info.features) != 1:
+                errors.append(
+                    f"{name}: extracted replacement requires exactly one "
+                    "bundled Feature class"
+                )
+            if info.extracted_replacement_package == info.package:
+                errors.append(
+                    f"{name}: extracted replacement package must differ from "
+                    "the bundled owner"
+                )
+
     if bundled_feature_classes is not None:
         missing = sorted(bundled_feature_classes - bundled_declared)
         stale = sorted(bundled_declared - bundled_feature_classes)
@@ -415,12 +447,45 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
             command=entry.get("command"),
             provider_for=entry.get("provider_for"),
             companion=entry.get("companion"),
+            extracted_replacement_package=entry.get(
+                "extracted_replacement_package"
+            ),
+            extracted_replacement_module_prefix=entry.get(
+                "extracted_replacement_module_prefix"
+            ),
             skills=skills,
             ui_capabilities=entry.get("ui_capabilities", []),
         )
 
     validate_registry(registry)
     return registry
+
+
+@dataclass(frozen=True)
+class ExtractedFeatureReplacement:
+    """Registry-authorized external implementation for one bundled class."""
+
+    class_name: str
+    bundled_distribution: str
+    extracted_distribution: str
+    module_prefix: str
+
+
+def get_extracted_feature_replacements() -> Dict[str, ExtractedFeatureReplacement]:
+    """Return the explicit extracted-over-bundled discovery allowlist."""
+
+    replacements: Dict[str, ExtractedFeatureReplacement] = {}
+    for info in load_registry().values():
+        if not info.extracted_replacement_package:
+            continue
+        class_name = info.features[0]
+        replacements[class_name] = ExtractedFeatureReplacement(
+            class_name=class_name,
+            bundled_distribution=info.package,
+            extracted_distribution=info.extracted_replacement_package,
+            module_prefix=info.extracted_replacement_module_prefix or "",
+        )
+    return replacements
 
 
 def _entrypoint_class_name(ep_value: str, ep_name: str) -> str:

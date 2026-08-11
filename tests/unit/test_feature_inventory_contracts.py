@@ -8,8 +8,11 @@ Tests run in two configurations:
 import importlib
 from unittest.mock import Mock, MagicMock, patch
 
+import pytest
+
 from kestrel_sovereign.features import (
     DISABLED_FEATURES_ENV,
+    FeatureDiscoveryAmbiguityError,
     discover_feature_modules,
     discover_features,
     discover_entrypoint_feature_classes,
@@ -188,8 +191,8 @@ def test_entrypoint_features_included_in_combined_inventory():
     assert "_SyntheticExternalFeature" in names
 
 
-def test_combined_inventory_has_no_duplicates():
-    """Combined: no duplicate class names even when entry_point overlaps with core."""
+def test_combined_inventory_rejects_unregistered_local_external_duplicates():
+    """Combined inventory fails instead of silently choosing either owner."""
     # Use a core feature name to simulate a collision
     core_classes, _ = _discoverable_feature_classes()
     assert core_classes, "Need at least one core feature for this test"
@@ -207,21 +210,15 @@ def test_combined_inventory_has_no_duplicates():
     CollidingFeature.__name__ = colliding_name
 
     ep = _make_entry_point(colliding_name, CollidingFeature)
+    ep.dist.name = "unexpected-external-owner"
     mock_eps = MagicMock()
     mock_eps.select.return_value = [ep]
 
     with patch(
         "kestrel_sovereign.features.importlib.metadata.entry_points",
         return_value=mock_eps,
-    ):
-        features = discover_features(_mock_agent())
-
-    # Count occurrences of the colliding name
-    matches = [f for f in features if f.__class__.__name__ == colliding_name]
-    assert len(matches) == 1, f"Expected exactly 1 {colliding_name}, got {len(matches)}"
-
-    # The winner should be the core version, not the entry_point version
-    assert matches[0].__class__ is not CollidingFeature
+    ), pytest.raises(FeatureDiscoveryAmbiguityError):
+        discover_features(_mock_agent())
 
 
 def test_combined_inventory_respects_disabled_env():
@@ -250,6 +247,26 @@ def test_core_only_inventory_stable_without_entrypoints():
     actual = {f.__class__.__name__ for f in features}
 
     assert actual == expected
+
+
+def test_talon_replacement_rule_does_not_move_static_package_boundary():
+    """Discovery migration precedes the later catalog ownership cutover."""
+    from kestrel_sovereign.feature_registry import (
+        PackageBoundary,
+        get_extracted_feature_replacements,
+        load_registry,
+    )
+
+    talon = load_registry()["talon"]
+    replacement = get_extracted_feature_replacements()[
+        "TalonCoordinatorFeature"
+    ]
+
+    assert talon.boundary is PackageBoundary.BUNDLED
+    assert talon.package == "kestrel-sovereign"
+    assert replacement.bundled_distribution == "kestrel-sovereign"
+    assert replacement.extracted_distribution == "kestrel-feature-talon"
+    assert replacement.module_prefix == "kestrel_feature_talon"
 
 
 def test_multiple_entrypoint_packages_all_discovered():

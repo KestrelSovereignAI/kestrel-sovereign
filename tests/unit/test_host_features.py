@@ -311,9 +311,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert events == [
             "agents-load",
             "context-build",
+            "host-start",
             "host-router-mount",
             "host-ui-mount",
-            "host-start",
         ]
 
     assert events[-5:] == [
