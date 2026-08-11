@@ -6217,6 +6217,40 @@ Expected Duration: {expected_duration}
             )
             await self._ensure_durable_shutdown_continuation(dispatcher)
 
+    def handoff_shutdown_to_reaper(
+        self, shutdown_task: "asyncio.Future[object]"
+    ) -> "asyncio.Future[None]":
+        """Transfer a timed-out lifecycle join to a retained control-plane reaper.
+
+        A durable cognition turn can legally outlive the user-facing shutdown
+        deadline: its delivery lease and the storage connection it uses must
+        remain with that original execution until it either commits or is
+        safely retried.  Lifecycle callers nevertheless need a finite control
+        plane operation so they can withdraw routing and revoke a delegated
+        budget.  This method gives them one explicit handoff boundary.
+
+        The returned coroutine *never* closes storage early.  It first joins
+        the exact ``shutdown_task`` the caller already owns, then joins this
+        agent's continuation (if the bounded tail created one).  An
+        :class:`~kestrel_sovereign.multi_agent.agent_manager.AgentManager`
+        retains that coroutine in its observable quarantine registry rather
+        than awaiting it on the DELETE/restart path.
+        """
+        if not isinstance(shutdown_task, asyncio.Future):
+            raise TypeError("shutdown reaper handoff requires an asyncio future")
+
+        async def reap() -> None:
+            _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                raise failure
+            await self.wait_for_shutdown_completion()
+
+        return asyncio.create_task(
+            reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
+        )
+
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
     # - _maybe_evict_direct_tools, _build_features_prompt_section

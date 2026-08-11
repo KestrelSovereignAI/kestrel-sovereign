@@ -287,6 +287,24 @@ async def test_hold_release_no_spend():
     assert parent_main == Decimal("90")  # 90 - 25 + 25 = original
 
 
+@pytest.mark.asyncio
+async def test_release_revokes_late_quarantined_spending():
+    """A removed child cannot spend after its unspent hold returns to parent."""
+    parent_wallet = WalletAgent(agent_id="parent-reaper", initial_balance=Decimal("100"))
+    await parent_wallet.initialize()
+    delegated = await create_delegated_wallet(
+        parent_wallet=parent_wallet,
+        parent_did="did:parent:reaper",
+        child_did="did:child:reaper",
+        budget=Decimal("25"),
+    )
+
+    assert await release_delegated_wallet(delegated, parent_wallet) == Decimal("25")
+    assert delegated.can_afford(Decimal("1")) is False
+    with pytest.raises(BudgetExceededError):
+        await delegated.spend(Decimal("1"), "late quarantined cognition")
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------

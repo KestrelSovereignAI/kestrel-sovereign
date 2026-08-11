@@ -69,6 +69,31 @@ class _CancellationTailWithoutContinuation:
             raise
 
 
+class _CancellationHostileShutdownAgent:
+    """Lifecycle double whose active cognition suppresses every cancellation."""
+
+    agent_id = "did:test:cancellation-hostile-cognition"
+
+    def __init__(self) -> None:
+        self.shutdown_entered = asyncio.Event()
+        self.allow_shutdown_finish = asyncio.Event()
+        self.cancellation_attempts = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_entered.set()
+        while not self.allow_shutdown_finish.is_set():
+            try:
+                await self.allow_shutdown_finish.wait()
+            except asyncio.CancelledError:
+                self.cancellation_attempts += 1
+
+    def handoff_shutdown_to_reaper(self, shutdown_task):
+        async def reap() -> None:
+            await asyncio.shield(shutdown_task)
+
+        return asyncio.create_task(reap())
+
+
 class _FailOnceDispatcher:
     def __init__(self, fail_stage: str) -> None:
         self.fail_stage = fail_stage
@@ -1009,6 +1034,50 @@ async def test_manager_unpublishes_a_cancelled_terminal_shutdown_without_continu
     assert await asyncio.wait_for(removal, timeout=1.0) is True
     assert agent.storage_closed.is_set()
     assert manager.get_agent("terminal") is None
+
+
+@pytest.mark.asyncio
+async def test_manager_quarantines_cancellation_hostile_cognition_within_shutdown_bound(
+    monkeypatch,
+) -> None:
+    """A hostile cognition turn cannot indefinitely retain routing or its budget.
+
+    Before the control-plane handoff, ``remove_agent`` cancelled this task and
+    then joined it forever.  The retained reaper now owns that join while the
+    manager completes removal and the delegated-budget release inside the
+    advertised shutdown timeout.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+    manager = AgentManager()
+    agent = _CancellationHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    released: list[str] = []
+
+    async def release_budget(name: str) -> None:
+        released.append(name)
+
+    manager._release_child_budget = release_budget
+    removal = asyncio.create_task(manager.remove_agent("hostile"))
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+
+    assert await asyncio.wait_for(removal, timeout=0.2) is True
+    assert manager.get_agent("hostile") is None
+    assert released == ["hostile"]
+    quarantined = manager.quarantined_shutdowns()
+    assert len(quarantined) == 1
+    assert next(iter(quarantined.values()))["pending"] is True
+    assert agent.cancellation_attempts >= 1
+
+    # Do not leave the deliberately hostile fixture running beyond this test.
+    agent.allow_shutdown_finish.set()
+    for _ in range(100):
+        if not next(iter(manager.quarantined_shutdowns().values()))["pending"]:
+            break
+        await asyncio.sleep(0)
+    assert next(iter(manager.quarantined_shutdowns().values()))["pending"] is False
 
 
 @pytest.mark.asyncio

@@ -917,8 +917,10 @@ class SignalDispatcher:
     ) -> SignalDispatchHandle:
         """Enqueue cursor-owning cognition behind one durable delivery lease.
 
-        Its admission receipt resolves only after this exact consumer delivery
-        is durably acknowledged, never merely when the event row is written.
+        Its admission receipt resolves once the event and its selected durable
+        delivery have committed.  Cognition runs in the dispatcher-owned
+        durable executor afterwards; an external cursor must never wait for a
+        full LLM turn merely to learn that its work survived process loss.
         """
         durable_admission: asyncio.Future[DurableAdmissionResult] = (
             asyncio.get_running_loop().create_future()
@@ -2615,6 +2617,23 @@ class SignalDispatcher:
                     )
 
         if durable_delivery_consumer_id is not None:
+            # The event transaction has atomically materialized the selected
+            # consumer delivery.  This is the producer receipt boundary: the
+            # durable executor below owns cognition, lease renewal, and any
+            # retry/NACK transition independently of a Telegram poll cursor.
+            # A duplicate points at that same durable row, so it is equally
+            # safe for the producer to advance without creating another turn.
+            if durable_admission is not None and not durable_admission.done():
+                durable_admission.set_result(
+                    DurableAdmissionResult(
+                        (
+                            DurableAdmissionDisposition.COMMITTED
+                            if persisted.created
+                            else DurableAdmissionDisposition.DUPLICATE
+                        ),
+                        signal.id,
+                    )
+                )
             return await self._route_durable_cognition_delivery(
                 signal,
                 registration,

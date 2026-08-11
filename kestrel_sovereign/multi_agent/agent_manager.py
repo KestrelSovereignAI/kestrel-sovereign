@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import logging
 import os
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -54,6 +55,25 @@ class A2AHostedPolicy:
     authorizer: object
     router: object
     requester: object
+
+
+@dataclass
+class QuarantinedShutdownReaper:
+    """Observable ownership record for cleanup that outlived agent removal.
+
+    The control plane has already withdrawn this generation from routing and
+    released any delegated budget.  The reaper still retains the exact agent
+    shutdown task, so its durable signal owner and storage cannot be reclaimed
+    or garbage-collected underneath cancellation-resistant cognition.
+    """
+
+    reaper_id: str
+    agent_name: str
+    agent_id: str
+    task: "asyncio.Future[object]"
+    started_monotonic: float
+    completed_monotonic: Optional[float] = None
+    failure: Optional[str] = None
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -135,6 +155,18 @@ def _has_shutdown_completion_contract(agent: object) -> bool:
     )
 
 
+def _has_shutdown_reaper_handoff_contract(agent: object) -> bool:
+    """Whether an agent can safely retain its own timed-out shutdown task.
+
+    Only the concrete agent lifecycle supplies this contract.  Looking on the
+    class avoids accidentally treating a ``MagicMock``-fabricated attribute as
+    proof that an arbitrary test/legacy object can keep its durable storage
+    alive after the manager withdraws it from routing.
+    """
+
+    return callable(getattr(type(agent), "handoff_shutdown_to_reaper", None))
+
+
 def _loaded_agent_did(agent: object) -> Optional[str]:
     """Return a concrete agent DID without trusting a dynamic test proxy."""
 
@@ -172,6 +204,12 @@ class AgentManager:
         self._a2a_lifecycle_lock = AsyncReaderWriterLock()
         self._a2a_policy_generation = 0
         self._a2a_hosted_policies: dict[str, A2AHostedPolicy] = {}
+        # A timed-out agent is no longer routable, but its exact shutdown task
+        # may still own an active durable cognition delivery and its storage.
+        # Retain those tasks independently of ``_agents`` so removal/restart
+        # has a finite control-plane bound without abandoning durable state.
+        self._quarantined_shutdown_reapers: dict[str, QuarantinedShutdownReaper] = {}
+        self._next_shutdown_reaper_id = 0
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
         # port is taken by the HOST" without starving every port below it.
@@ -1426,6 +1464,91 @@ class AgentManager:
                     self._restore_scheduler_authority(agent_id, revoked)
                 return removed
 
+    def _handoff_shutdown_to_quarantined_reaper(
+        self,
+        *,
+        name: str,
+        agent: KestrelAgent,
+        shutdown_task: "asyncio.Future[object]",
+    ) -> bool:
+        """Retain durable shutdown cleanup without extending a DELETE timeout.
+
+        The handoff is deliberately opt-in.  A legacy/test agent without the
+        concrete lifecycle contract continues through the conservative join
+        path below; only an agent that explicitly promises to preserve its
+        durable owner/storage may be withdrawn while its reaper is live.
+        """
+        if not _has_shutdown_reaper_handoff_contract(agent):
+            return False
+        handoff = getattr(type(agent), "handoff_shutdown_to_reaper")
+        reaper_task = handoff(agent, shutdown_task)
+        if not isinstance(reaper_task, asyncio.Future):
+            raise TypeError(
+                "agent shutdown reaper handoff must return an asyncio future"
+            )
+
+        self._next_shutdown_reaper_id += 1
+        reaper_id = f"{name}:{self._next_shutdown_reaper_id}"
+        record = QuarantinedShutdownReaper(
+            reaper_id=reaper_id,
+            agent_name=name,
+            agent_id=_loaded_agent_did(agent) or "<unknown>",
+            task=reaper_task,
+            started_monotonic=time.monotonic(),
+        )
+        self._quarantined_shutdown_reapers[reaper_id] = record
+
+        def observe_reaper_completion(task: "asyncio.Future[object]") -> None:
+            record.completed_monotonic = time.monotonic()
+            if task.cancelled():
+                record.failure = "shutdown reaper was cancelled"
+            else:
+                failure = task.exception()
+                if failure is not None:
+                    record.failure = f"{type(failure).__name__}: {failure}"
+            if record.failure is None:
+                logger.info(
+                    "Quarantined shutdown reaper %s completed for agent %r",
+                    record.reaper_id,
+                    record.agent_name,
+                )
+            else:
+                logger.error(
+                    "Quarantined shutdown reaper %s remains unsafe for agent %r: %s",
+                    record.reaper_id,
+                    record.agent_name,
+                    record.failure,
+                )
+
+        reaper_task.add_done_callback(observe_reaper_completion)
+        logger.warning(
+            "Handed agent %r to quarantined shutdown reaper %s; routing is "
+            "withdrawn but durable owner/storage remain retained until it settles.",
+            name,
+            reaper_id,
+        )
+        return True
+
+    def quarantined_shutdowns(self) -> dict[str, dict[str, object]]:
+        """Return operational status for cleanup retained after removal.
+
+        This is intentionally metadata-only: it exposes neither the agent's
+        storage handle nor a foreign tenant's signal payload, while allowing a
+        host operator to distinguish a still-draining reaper from a completed
+        or failed one.
+        """
+        return {
+            reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": not record.task.done(),
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for reaper_id, record in self._quarantined_shutdown_reapers.items()
+        }
+
     async def _remove_agent_without_scheduler_lifecycle(self, name: str) -> bool:
         """Shutdown and remove an agent.
 
@@ -1477,6 +1600,7 @@ class AgentManager:
             )
             caller_cancelled = False
             shutdown_timed_out = False
+            shutdown_handed_off = False
             try:
                 await asyncio.wait_for(
                     asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
@@ -1485,19 +1609,39 @@ class AgentManager:
                 caller_cancelled = asyncio.current_task().cancelling() > 0
                 if not shutdown_task.done():
                     shutdown_task.cancel()
-                logger.warning(
-                    "Agent '%s' shutdown was cancelled; joining its actual "
-                    "shutdown task and durable cleanup before unpublishing.",
-                    name,
+                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                    name=name, agent=agent, shutdown_task=shutdown_task
                 )
+                if shutdown_handed_off:
+                    logger.warning(
+                        "Agent '%s' shutdown was cancelled; durable cleanup is "
+                        "quarantined while control-plane removal continues.",
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "Agent '%s' shutdown was cancelled; joining its actual "
+                        "shutdown task and durable cleanup before unpublishing.",
+                        name,
+                    )
             except asyncio.TimeoutError:
                 shutdown_timed_out = True
                 shutdown_task.cancel()
-                logger.warning(
-                    "Agent '%s' shutdown timed out; joining its actual "
-                    "shutdown task before deciding removal.",
-                    name,
+                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                    name=name, agent=agent, shutdown_task=shutdown_task
                 )
+                if shutdown_handed_off:
+                    logger.warning(
+                        "Agent '%s' exceeded its shutdown bound; durable cleanup "
+                        "is quarantined while control-plane removal continues.",
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "Agent '%s' shutdown timed out; joining its actual "
+                        "shutdown task before deciding removal.",
+                        name,
+                    )
             except Exception as exc:
                 # A normal shutdown error has no general proof that the agent
                 # reached its cancellation tail.  Keep the historical safe
@@ -1512,45 +1656,48 @@ class AgentManager:
                 )
                 return False
 
-            join_cancelled, shutdown_failure = await await_lifecycle_task_completion(
-                shutdown_task
-            )
-            caller_cancelled = caller_cancelled or join_cancelled
-            if shutdown_failure is not None and not isinstance(
-                shutdown_failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Agent '%s' shutdown task failed; retaining it until "
-                    "cleanup can be confirmed: %s",
-                    name,
-                    shutdown_failure,
-                    exc_info=(
-                        type(shutdown_failure),
+            if not shutdown_handed_off:
+                join_cancelled, shutdown_failure = await await_lifecycle_task_completion(
+                    shutdown_task
+                )
+                caller_cancelled = caller_cancelled or join_cancelled
+                if shutdown_failure is not None and not isinstance(
+                    shutdown_failure, asyncio.CancelledError
+                ):
+                    logger.warning(
+                        "Agent '%s' shutdown task failed; retaining it until "
+                        "cleanup can be confirmed: %s",
+                        name,
                         shutdown_failure,
-                        shutdown_failure.__traceback__,
-                    ),
-                )
-                return False
-            if shutdown_timed_out and shutdown_failure is None:
-                logger.warning(
-                    "Agent '%s' exceeded its shutdown budget but completed "
-                    "while being joined; continuing durable cleanup.",
-                    name,
-                )
+                        exc_info=(
+                            type(shutdown_failure),
+                            shutdown_failure,
+                            shutdown_failure.__traceback__,
+                        ),
+                    )
+                    return False
+                if shutdown_timed_out and shutdown_failure is None:
+                    logger.warning(
+                        "Agent '%s' exceeded its shutdown budget but completed "
+                        "while being joined; continuing durable cleanup.",
+                        name,
+                    )
 
-            # A tail that spent its dispatcher guard continues in the
-            # agent-owned completion task.  Do not unpublish the agent or
-            # release its delegated budget until that task has released the
-            # owner and closed storage. This also handles a bounded outer
-            # timeout: the one removal call remains the lifecycle owner.
-            if _has_shutdown_completion_contract(agent):
-                caller_cancelled = (
-                    await await_agent_shutdown_completion(agent)
-                ) or caller_cancelled
+                # A tail that spent its dispatcher guard continues in the
+                # agent-owned completion task.  Do not unpublish the agent or
+                # release its delegated budget until that task has released the
+                # owner and closed storage. Legacy lifecycle implementations
+                # remain on this conservative path; KestrelAgent's explicit
+                # handoff contract above is what permits bounded removal.
+                if _has_shutdown_completion_contract(agent):
+                    caller_cancelled = (
+                        await await_agent_shutdown_completion(agent)
+                    ) or caller_cancelled
 
-            # Only publish removal after all agent-owned durable cleanup has
-            # completed.  In particular, this keeps the manager as the
-            # lifecycle owner while a SQLite worker is still draining.
+            # Publish removal only after cleanup completed, or after the
+            # explicit reaper handoff above retained that exact cleanup task.
+            # In the latter case the quarantined record, not a routable agent,
+            # remains the lifecycle owner while durable cognition/storage drain.
             self._agents.pop(name, None)
             self._agent_names.pop(agent.agent_id, None)
             self._revoke_a2a_hosted_policy(agent)

@@ -1108,6 +1108,7 @@ class DurableSignalStore(UnifiedStoreBase):
             return None
         requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             # The transaction may wait behind a real database writer. Sample
             # time only after that contention has cleared and immediately
             # before the activation write; this is the first live delivery
@@ -1162,6 +1163,7 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             # Entering this transaction may wait behind a real writer.  A
             # default timestamp is liveness evidence, so sample it only after
             # that contention clears rather than publishing an old heartbeat.
@@ -1182,6 +1184,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
+            # Recovery uses this exact scope before it decides whether a
+            # managed lease owner is stale.  Without the common lock a
+            # PostgreSQL recovery snapshot can classify the old heartbeat as
+            # stale while this refresh is concurrently committing.
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             # See register_runtime_owner: a heartbeat taken before waiting on
             # this transaction is not trustworthy liveness evidence.
             touch_now = requested_now or self.now_utc()
@@ -1209,6 +1216,7 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("owner_id", owner_id)
         now = _as_utc(now or self.now_utc())
         async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             released = await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}
@@ -1315,6 +1323,7 @@ class DurableSignalStore(UnifiedStoreBase):
         stale_before = _as_utc(stale_before)
         now = _as_utc(now or self.now_utc())
         async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             released = await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}
@@ -1369,6 +1378,7 @@ class DurableSignalStore(UnifiedStoreBase):
         now = _as_utc(now or self.now_utc())
         timestamp = self._timestamp_placeholder()
         async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
             released = await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}
@@ -1830,6 +1840,35 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
+    async def _lock_runtime_owner_scope(self, *, agent_id: str) -> None:
+        """Serialize liveness heartbeats and recovery for one tenant.
+
+        The durable owner row is read by recovery predicates but updated by a
+        separate heartbeat transaction.  PostgreSQL's statement snapshots do
+        not make that read/update pair mutually exclusive on their own, so
+        both paths take one transaction-scoped advisory key.  SQLite reserves
+        its single writer before either path inspects owner liveness.  This is
+        intentionally tenant-wide: recovery can assess several dispatcher
+        generations in one statement, and a per-owner lock would leave the
+        predicate race open for every other owner it scans.
+        """
+        if self.is_postgres:
+            await self._backend.fetch_val(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                (f"durable-signal-runtime-owner:{agent_id}",),
+            )
+            return
+        if self._backend.backend_type == "sqlite":
+            await self._backend.execute(
+                f"UPDATE {self.RUNTIME_OWNERS} SET updated_at = updated_at WHERE agent_id = ?",
+                (agent_id,),
+            )
+            return
+        raise RuntimeError(
+            "Durable runtime-owner serialization does not support backend "
+            f"{self._backend.backend_type!r}"
+        )
+
     async def _lock_initial_delivery_transfer(
         self, *, agent_id: str, consumer_id: str, delivery_id: str
     ) -> Optional[tuple[Any, ...]]:
@@ -1949,6 +1988,10 @@ class DurableSignalStore(UnifiedStoreBase):
         stopped or its heartbeat is stale.
         """
 
+        # Claim/recovery calls this inside their existing transaction.  Take
+        # the same tenant liveness scope as heartbeat before evaluating the
+        # managed-owner predicate.
+        await self._lock_runtime_owner_scope(agent_id=agent_id)
         timestamp = self._timestamp_placeholder()
         await self._backend.execute(
             f"""

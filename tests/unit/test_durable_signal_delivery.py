@@ -330,8 +330,8 @@ async def test_source_event_dedup_prevents_duplicate_delivery_and_side_effect(tm
 
 
 @pytest.mark.asyncio
-async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_ack(tmp_path):
-    """A rate limit cannot turn a persisted Telegram update into a duplicate loss."""
+async def test_cursor_owned_cognition_rate_limit_keeps_durable_retry_after_admission(tmp_path):
+    """A rate limit cannot turn committed Telegram work into a duplicate loss."""
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / "cursor-rate-limit.db",
         "did:agent:one",
@@ -367,7 +367,7 @@ async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_
         )
         assert (
             await limited.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ).disposition is DurableAdmissionDisposition.COMMITTED
         assert (await limited.wait()).status is Status.DROPPED_RATE_LIMIT
         limited_delivery = next(
             delivery
@@ -379,9 +379,9 @@ async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_
         assert limited_delivery.status == RETRY
         assert limited_delivery.max_attempts == 0
 
-        # Redelivery is the provider's normal retry. Reset test-only policy
-        # windows rather than sleeping, then prove the same source key gets a
-        # cognition ACK instead of an early duplicate receipt.
+        # Reset test-only policy windows rather than sleeping, then drive the
+        # retained delivery again. The provider had already received a durable
+        # admission receipt; this duplicate only wakes the durable executor.
         dispatcher._rate.reset()
         dispatcher._coalescing.reset()
         retried = await dispatcher.enqueue_durable_cognition(
@@ -391,7 +391,7 @@ async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_
         )
         assert (
             await retried.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.COMMITTED
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
         assert (await retried.wait()).status is Status.OK
         completed = next(
             delivery
@@ -402,6 +402,56 @@ async def test_cursor_owned_cognition_rate_limit_stays_retryable_until_delivery_
         )
         assert completed.status == ACKNOWLEDGED
     finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_cursor_owned_admission_resolves_before_a_hung_cognition_turn(tmp_path):
+    """A Telegram cursor ACK never waits for the full durable cognition turn."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "cursor-immediate-admission.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    cognition_started = asyncio.Event()
+    release_cognition = asyncio.Event()
+
+    async def hung_cognition(_prompt: str):
+        cognition_started.set()
+        await release_cognition.wait()
+        return "eventually processed"
+
+    agent.process_input = hung_cognition
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "hung-turn"),
+            source_event_id="telegram:update:hung-turn",
+            consumer_id=consumer.consumer_id,
+        )
+
+        receipt = await asyncio.wait_for(handle.wait_for_durable_admission(), timeout=0.1)
+        assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
+        await asyncio.wait_for(cognition_started.wait(), timeout=1)
+        assert handle.task.done() is False
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert delivery.status == LEASED
+
+        release_cognition.set()
+        assert (await handle.wait()).status is Status.OK
+        assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        release_cognition.set()
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
@@ -575,7 +625,7 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
         assert (await first.wait()).status is Status.DROPPED_VALIDATION
         assert (
             await first.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.TERMINAL
+        ).disposition is DurableAdmissionDisposition.COMMITTED
         stored = await dispatcher.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
             event_id=first.signal_id,
@@ -591,7 +641,7 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
         )
         assert (
             await redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.TERMINAL
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
         assert (await redelivery.wait()).status is Status.COALESCED
         replayed = await dispatcher.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
@@ -630,7 +680,7 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
         )
         assert (
             await ordinary_redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
         assert (await ordinary_redelivery.wait()).status is Status.FAILED
     finally:
         await dispatcher.shutdown_durable_delivery()
@@ -688,7 +738,7 @@ async def test_expired_terminal_nack_uses_managed_token_before_provider_receipt(
         assert (await first.wait()).status is Status.DROPPED_VALIDATION
         assert (
             await first.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.TERMINAL
+        ).disposition is DurableAdmissionDisposition.COMMITTED
         stored = await dispatcher.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
             event_id=first.signal_id,
@@ -704,7 +754,7 @@ async def test_expired_terminal_nack_uses_managed_token_before_provider_receipt(
         )
         assert (
             await redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.TERMINAL
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
 
         async def ordinary_failure(signal, _registration, start):
             return dispatcher._failure_result(
@@ -725,7 +775,7 @@ async def test_expired_terminal_nack_uses_managed_token_before_provider_receipt(
         assert (await ordinary.wait()).status is Status.FAILED
         assert (
             await ordinary.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ).disposition is DurableAdmissionDisposition.COMMITTED
         ordinary_delivery = await dispatcher.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
             event_id=ordinary.signal_id,
@@ -1123,7 +1173,7 @@ async def test_caller_recovery_failure_after_claim_releases_retry_and_logs_outco
         )
         assert (
             await retry.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
         assert (await retry.wait()).status is Status.FAILED
         recovered = (await dispatcher.list_durable_deliveries())[0]
         # Attempt two proves failure happened after this retry claimed the
@@ -1741,11 +1791,9 @@ async def test_simultaneous_route_success_and_lease_loss_finalizes_once(
         admission = await handle.wait_for_durable_admission()
         result = await handle.wait()
         assert result.status is (Status.OK if acknowledged else Status.FAILED)
-        assert admission.disposition is (
-            DurableAdmissionDisposition.COMMITTED
-            if acknowledged
-            else DurableAdmissionDisposition.NOT_ADMITTED
-        )
+        # Admission records the committed delivery before either terminal ACK
+        # outcome races the lease-renewal result.
+        assert admission.disposition is DurableAdmissionDisposition.COMMITTED
         assert len(acknowledgements) == 1
         assert nacks == []
         assert (await dispatcher.list_durable_deliveries())[0].status == (
@@ -1803,7 +1851,7 @@ async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ac
             await interrupted.task
         assert (
             await interrupted.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ).disposition is DurableAdmissionDisposition.COMMITTED
         stale_at = datetime.now(timezone.utc) - timedelta(minutes=3)
         await backend_a.execute(
             "UPDATE durable_signal_runtime_owners SET heartbeat_at = ? "
@@ -1830,7 +1878,7 @@ async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ac
         )
         assert (
             await recovered.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.COMMITTED
+        ).disposition is DurableAdmissionDisposition.DUPLICATE
         assert (await recovered.wait()).status is Status.OK
         delivery = (await dispatcher_b.list_durable_deliveries())[0]
         assert delivery.status == ACKNOWLEDGED
@@ -3697,6 +3745,7 @@ async def test_postgres_durable_owner_and_recovery_binds_preserve_aware_utc_inst
 
     class _PostgresBackend:
         backend_type = "postgres"
+        fetch_val = AsyncMock(return_value=None)
 
         @asynccontextmanager
         async def transaction(self):

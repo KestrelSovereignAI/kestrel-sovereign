@@ -37,6 +37,12 @@ def _signal(agent_id: str) -> Signal:
     )
 
 
+def _dispatcher_owner_id() -> str:
+    """Return the same managed-owner shape a production dispatcher emits."""
+
+    return f"dispatcher:{uuid4().hex}"
+
+
 class _DispatcherAgent:
     """Minimal live-dispatch agent for the PostgreSQL commit-boundary race."""
 
@@ -492,7 +498,7 @@ async def test_unactivated_reservation_survives_a_long_paused_commit_and_owner_a
         await peer_store.initialize()
         agent_id = f"did:test:durable-paused-commit:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
+        owner_id = _dispatcher_owner_id()
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
                 consumer_id=consumer_id,
@@ -590,7 +596,7 @@ async def test_startup_recovers_only_a_stale_unactivated_owner_as_marker_work(
         consumer_id = "workflow-wait"
         # Recovery deliberately considers only managed dispatcher owners;
         # arbitrary executor namespaces must never be stolen as crashed hosts.
-        owner_id = "dispatcher:crashed-dispatcher"
+        owner_id = _dispatcher_owner_id()
         now = datetime.now(timezone.utc)
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
@@ -657,8 +663,8 @@ async def test_live_runtime_owner_cannot_be_recovered_by_a_concurrent_dispatcher
         await peer_store.initialize()
         agent_id = f"did:test:durable-live-owner:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "live-dispatcher"
-        peer_owner_id = "other-live-dispatcher"
+        owner_id = _dispatcher_owner_id()
+        peer_owner_id = _dispatcher_owner_id()
         now = datetime.now(timezone.utc)
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
@@ -726,8 +732,8 @@ async def test_delayed_runtime_heartbeat_cannot_regress_owner_liveness_or_releas
         await peer_store.initialize()
         agent_id = f"did:test:durable-monotonic-heartbeat:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
-        recovering_owner_id = "concurrent-dispatcher"
+        owner_id = _dispatcher_owner_id()
+        recovering_owner_id = _dispatcher_owner_id()
         base = datetime(2040, 1, 1, tzinfo=timezone.utc)
         older = base + timedelta(seconds=1)
         newer = base + timedelta(seconds=10)
@@ -784,6 +790,111 @@ async def test_delayed_runtime_heartbeat_cannot_regress_owner_liveness_or_releas
             executor_id="peer-worker",
         ) is None
     finally:
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_recovery_waits_for_overlapping_live_runtime_heartbeat(
+    db_backend,
+):
+    """A PostgreSQL recovery cannot classify a heartbeat mid-transaction stale."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL advisory-lock overlap regression")
+
+    peer_backend = await _independent_backend(db_backend)
+    heartbeat_task = None
+    recovery_task = None
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        recovering_store = DurableSignalStore(peer_backend)
+        await emitting_store.initialize()
+        await recovering_store.initialize()
+        agent_id = f"did:test:durable-heartbeat-overlap:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = _dispatcher_owner_id()
+        recovering_owner_id = _dispatcher_owner_id()
+        base = datetime.now(timezone.utc)
+        stale = base - timedelta(minutes=5)
+        now = base + timedelta(seconds=1)
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=stale
+        )
+        await recovering_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=recovering_owner_id, now=now
+        )
+        marker = _signal(agent_id)
+        persisted = await emitting_store.persist_signal(
+            marker,
+            agent_id=agent_id,
+            source_event_id=f"heartbeat-overlap:{uuid4()}",
+            retention_days=7,
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+        activated = await emitting_store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner=owner_id,
+            initial_lease_token=reservation.reservation_token,
+            now=stale,
+        )
+        assert activated is not None and activated.status == "leased"
+
+        heartbeat_updated = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+        original_touch = emitting_store._touch_runtime_owner_locked
+
+        async def pause_after_owner_touch(**kwargs):
+            await original_touch(**kwargs)
+            heartbeat_updated.set()
+            await release_heartbeat.wait()
+
+        emitting_store._touch_runtime_owner_locked = pause_after_owner_touch
+        heartbeat_task = asyncio.create_task(
+            emitting_store.heartbeat_runtime_owner(
+                agent_id=agent_id, owner_id=owner_id, now=now
+            )
+        )
+        await asyncio.wait_for(heartbeat_updated.wait(), timeout=2)
+        recovery_task = asyncio.create_task(
+            recovering_store.recover_abandoned_leases(
+                agent_id=agent_id,
+                recovering_owner_id=recovering_owner_id,
+                stale_before=base,
+                now=now,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert recovery_task.done() is False
+
+        release_heartbeat.set()
+        await heartbeat_task
+        assert await recovery_task == 0
+        delivery = await recovering_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert delivery is not None and delivery.status == "leased"
+    finally:
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+        await asyncio.gather(
+            *(task for task in (heartbeat_task, recovery_task) if task is not None),
+            return_exceptions=True,
+        )
         await peer_backend.close()
 
 
@@ -1013,7 +1124,7 @@ async def test_initial_worker_transfer_does_not_publish_an_expired_lease_after_c
         await peer_store.initialize()
         agent_id = f"did:test:durable-initial-transfer:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
+        owner_id = _dispatcher_owner_id()
         base = datetime(2040, 1, 1, tzinfo=timezone.utc)
         current_time = {"value": base}
         store.now_utc = lambda: current_time["value"]

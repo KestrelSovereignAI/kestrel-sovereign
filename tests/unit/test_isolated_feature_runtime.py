@@ -34,6 +34,9 @@ from kestrel_sovereign.features.isolated_runtime import (
     SchedulerExecutionContextUnavailable,
     SchedulerTerminalAdmissionError,
 )
+from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteOwnershipStore,
+)
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     ScheduledTask,
@@ -1845,6 +1848,122 @@ def test_build_client_injects_telegram_acknowledged_ingress_capability(tmp_path)
     assert feature._host_config["_kestrel_host_runtime_capabilities"] == [
         "untrusted-user-value"
     ]
+
+
+@pytest.mark.asyncio
+async def test_build_client_injects_durably_claimed_telegram_startup_fence(tmp_path):
+    """The launch-only fence requires a durable route claim, never config."""
+
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "route-ownership.db"))
+    await backend.connect()
+    feature = ProxyFeature(
+        Mock(did=_TEST_AGENT_DID, features={}), runtime, client_factory=client_factory
+    )
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = tmp_path / "test-service"
+    feature._host_config = {"enabled": True}
+
+    try:
+        assert await feature.reconcile_hosted_telegram_route_claim(
+            ownership_store=ChannelRouteOwnershipStore(backend),
+            canonical_bot_identity="telegram-bot:123456",
+        ) is True
+        feature._build_client()
+
+        assert captured["config"] == {
+            "enabled": True,
+            "_kestrel_host_runtime_capabilities": [
+                "channel-inbound-acknowledgement-v1",
+                "telegram-hosted-ingress-owner-v1",
+            ],
+        }
+        assert feature._host_config == {"enabled": True}
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_attestation_requires_exclusive_claim_and_reconciles(
+    tmp_path,
+):
+    """A loser never gets the child capability until the winner releases it."""
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "shared-routes.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    first_capture: dict = {}
+    second_capture: dict = {}
+
+    def first_factory(**kwargs):
+        first_capture.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    def second_factory(**kwargs):
+        second_capture.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    first = ProxyFeature(
+        Mock(did="did:test:telegram-first", features={}),
+        runtime,
+        client_factory=first_factory,
+    )
+    second = ProxyFeature(
+        Mock(did="did:test:telegram-second", features={}),
+        runtime,
+        client_factory=second_factory,
+    )
+    for feature in (first, second):
+        feature._venv_path = tmp_path / "svc-venv"
+        feature._bin_path = tmp_path / "test-service"
+        feature._host_config = {"enabled": True}
+
+    try:
+        assert await first.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            canonical_bot_identity="telegram-bot:123456",
+        ) is True
+        assert await second.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            canonical_bot_identity="telegram-bot:123456",
+        ) is False
+        first._build_client()
+        second._build_client()
+        assert "telegram-hosted-ingress-owner-v1" in first_capture["config"][
+            "_kestrel_host_runtime_capabilities"
+        ]
+        assert "telegram-hosted-ingress-owner-v1" not in second_capture["config"][
+            "_kestrel_host_runtime_capabilities"
+        ]
+
+        assert await first.release_hosted_telegram_route_claim(
+            ownership_store=store,
+            canonical_bot_identity="telegram-bot:123456",
+        ) is True
+        assert await second.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            canonical_bot_identity="telegram-bot:123456",
+        ) is True
+    finally:
+        await backend.close()
 
 
 class _FakeStorage:
@@ -4107,7 +4226,7 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_apply_blocks_tools_and_channel_but_retains_legacy_inbound_until_promotion(
+async def test_live_apply_blocks_tools_and_drops_stale_legacy_inbound_until_promotion(
     monkeypatch, tmp_path
 ):
     """No host-visible effect may observe an applied candidate before its CAS.
@@ -4116,8 +4235,8 @@ async def test_live_apply_blocks_tools_and_channel_but_retains_legacy_inbound_un
     Promotion is then held at the durable write boundary while a direct tool,
     the generic channel adapter, and an SDK inbound callback all try to enter.
     Tool/channel calls wait for the finite transition. The legacy SDK callback
-    has no producer cursor or NACK, so it remains in Core's bounded serial
-    queue and is delivered only after the promoted configuration is durable.
+    has no producer cursor or NACK, so a callback from the old child is stale
+    once the live gate closes and must not replay under the promoted config.
     """
 
     from kestrel_sdk.channels import ChannelMessage, MessageDirection
@@ -4207,12 +4326,8 @@ async def test_live_apply_blocks_tools_and_channel_but_retains_legacy_inbound_un
         assert (await channel_send).status.value == "success"
         await inbound_callback
         assert client.effects == [("ping", "next"), ("whatsapp_send", "next")]
-        for _ in range(20):
-            if channel_feature.inbound:
-                break
-            await asyncio.sleep(0)
-        assert len(channel_feature.inbound) == 1
-        assert channel_feature.inbound[0].content == "hello"
+        await asyncio.sleep(0)
+        assert channel_feature.inbound == []
     finally:
         release_promotion.set()
         if update is not None and not update.done():
@@ -6932,10 +7047,10 @@ async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(m
 
 
 @pytest.mark.asyncio
-async def test_legacy_inbound_events_queue_in_order_across_a_closed_gate(
+async def test_legacy_inbound_events_drop_across_a_closed_live_transition(
     monkeypatch, tmp_path
 ):
-    """A non-cursor source retains its first and second blocked callbacks."""
+    """Old non-cursor callbacks never replay after a live gate closes."""
 
     delivered = []
     agent = Mock(did=_TEST_AGENT_DID, features={})
@@ -6960,23 +7075,64 @@ async def test_legacy_inbound_events_queue_in_order_across_a_closed_gate(
         feature._route_inbound = record  # type: ignore[method-assign]
         await feature._close_traffic_gate()
 
-        # Let the first queue worker enter the closed gate before the second
-        # callback arrives. Both handlers must return without turning either
-        # notification into an unbounded detached route task.
+        # Both callbacks originate from the old child while a live transition
+        # owns the closed gate. They must be retired rather than replayed.
         await client.event_handler(legacy_event("first"))
         await asyncio.sleep(0)
         await client.event_handler(legacy_event("second"))
         assert delivered == []
-        assert len(feature._event_ingress_tasks) == 1
-        assert len(feature._non_cursor_event_ingress_queues) == 1
 
         await feature._reopen_traffic_gate()
+        await asyncio.sleep(0)
+        assert delivered == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_inbound_events_are_serial_and_backpressured_while_gate_open(
+    monkeypatch, tmp_path
+):
+    """Open-gate legacy callbacks retain arrival order without task fan-out."""
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    delivered = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    async def record(message):
+        delivered.append(message["id"])
+        if message["id"] == "first":
+            first_started.set()
+            await release_first.wait()
+        return SimpleNamespace(durably_admitted=True)
+
+    def legacy_event(message_id):
+        return {
+            "type": "channel.inbound",
+            "payload": {"id": message_id, "content": message_id},
+        }
+
+    try:
+        await feature.initialize()
+        feature._route_inbound = record  # type: ignore[method-assign]
+        await feature._client.event_handler(legacy_event("first"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await feature._client.event_handler(legacy_event("second"))
+        assert delivered == ["first"]
+        assert len(feature._event_ingress_tasks) == 1
+        release_first.set()
         for _ in range(20):
             if delivered == ["first", "second"]:
                 break
             await asyncio.sleep(0)
         assert delivered == ["first", "second"]
     finally:
+        release_first.set()
         await feature.shutdown()
 
 

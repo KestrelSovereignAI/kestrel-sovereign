@@ -1158,7 +1158,7 @@ class TestAgentManagerBasics:
         agent2.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_remove_agent_joins_deferred_durable_close_before_unpublishing(
+    async def test_remove_agent_quarantines_deferred_durable_close_before_unpublishing(
         self, tmp_path
     ):
         """One production removal call drains the real SQLite worker (#2713)."""
@@ -1216,24 +1216,29 @@ class TestAgentManagerBasics:
 
         try:
             # The manager's normal outer timeout cancels the bounded agent
-            # shutdown. It must then join the agent-owned continuation rather
-            # than removing this routing entry or releasing its resources.
+            # shutdown. It withdraws the routing entry within that advertised
+            # bound, while a retained quarantine reaper remains the sole owner
+            # of the dispatcher release and SQLite close.
             with patch(
                 "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
                 0.05,
             ):
                 remove_task = asyncio.create_task(manager.remove_agent("Managed"))
                 await asyncio.wait_for(release_entered.wait(), timeout=1.0)
-                await asyncio.sleep(0.1)
-
-                assert manager.get_agent("Managed") is agent
-                assert not remove_task.done()
-                assert storage_closed == []
-
-                allow_release.set()
                 assert await asyncio.wait_for(remove_task, timeout=1.0) is True
 
-            assert manager.get_agent("Managed") is None
+                assert manager.get_agent("Managed") is None
+                assert storage_closed == []
+                quarantined = manager.quarantined_shutdowns()
+                assert len(quarantined) == 1
+                assert next(iter(quarantined.values()))["pending"] is True
+
+                allow_release.set()
+                for _ in range(100):
+                    if not next(iter(manager.quarantined_shutdowns().values()))["pending"]:
+                        break
+                    await asyncio.sleep(0)
+
             assert storage_closed == [True]
             assert backend._connection is None
             for _ in range(100):

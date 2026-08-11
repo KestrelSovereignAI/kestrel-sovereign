@@ -53,6 +53,9 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
+from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteOwnershipStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +122,10 @@ _EVENT_INGRESS_ACK_BACKOFF = 0.1
 # guessing Core versions from an arbitrary client name.
 _HOST_RUNTIME_CAPABILITIES_FIELD = "_kestrel_host_runtime_capabilities"
 _ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY = "channel-inbound-acknowledgement-v1"
+# A host-only startup fence for an externally provisioned Telegram webhook.
+# It is deliberately injected at process launch rather than stored in feature
+# config: a user config row must never be able to claim a host route is live.
+_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY = "telegram-hosted-ingress-owner-v1"
 # A non-cursor producer has no child-side durable cursor to retain a callback
 # while Core's gate is closed.  Keep one item in the queue while its serial
 # worker owns one other item; the SDK notification reader naturally applies
@@ -126,6 +133,13 @@ _ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY = "channel-inbound-acknowledgement-v1"
 _MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
 _event_source_client: ContextVar[Any | None] = ContextVar(
     "isolated_event_source_client", default=None
+)
+# This value is set only around a host-validated Telegram polling callback.
+# It is task-local rather than part of the child's JSON payload so an isolated
+# service cannot promote an arbitrary notification into the cursor-owning
+# protocol by adding a field to its message.
+_cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
+    "isolated_cursor_owned_inbound_protocol", default=False
 )
 
 # A staged config must survive a short process pause, but it must not turn an
@@ -2276,6 +2290,8 @@ class ProxyFeature(Feature):
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
+        self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_route_identity: Optional[str] = None
         # Process-local identity for the durable pending lease.  A new proxy
         # instance (including one after a crash/restart) never impersonates an
         # earlier writer; it may only reclaim that writer after its lease has
@@ -2305,6 +2321,72 @@ class ProxyFeature(Feature):
         if self.runtime.description:
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
+
+    def _require_telegram_runtime(self) -> None:
+        """Reject route attestation for any non-Telegram isolated runtime."""
+        runtime_distribution = re.sub(
+            r"[-_.]+", "-", self.runtime.distribution.strip().lower()
+        )
+        if runtime_distribution != "kestrel-channel-telegram":
+            raise RuntimeError(
+                "hosted Telegram startup attestation is valid only for the Telegram feature"
+            )
+
+    async def reconcile_hosted_telegram_route_claim(
+        self,
+        *,
+        ownership_store: ChannelRouteOwnershipStore,
+        canonical_bot_identity: str,
+    ) -> bool:
+        """Durably claim/reconcile the host-provisioned Telegram route.
+
+        This is a narrow host/provisioner API, not a feature config setting or
+        agent tool.  The host calls it before starting a webhook-owned child
+        and after replacing one.  A successful result is the *only* way Core
+        injects the no-poll startup capability; a config boolean cannot create
+        that attestation.  Core intentionally does not fabricate a Telegram
+        HTTP endpoint in this branch — the external Frinz provisioner owns
+        provider API calls and may invoke the same generic durable store.
+        """
+        self._require_telegram_runtime()
+        if not isinstance(ownership_store, ChannelRouteOwnershipStore):
+            raise TypeError(
+                "hosted Telegram route attestation requires ChannelRouteOwnershipStore"
+            )
+        claimed = await ownership_store.claim(
+            channel_type="telegram",
+            canonical_route_identity=canonical_bot_identity,
+            agent_id=self._config_agent_did(),
+        )
+        if not claimed:
+            self._hosted_telegram_startup_attested = False
+            self._hosted_telegram_route_identity = None
+            return False
+        self._hosted_telegram_startup_attested = True
+        self._hosted_telegram_route_identity = canonical_bot_identity
+        return True
+
+    async def release_hosted_telegram_route_claim(
+        self,
+        *,
+        ownership_store: ChannelRouteOwnershipStore,
+        canonical_bot_identity: str,
+    ) -> bool:
+        """Release this proxy's route claim and revoke its launch attestation."""
+        self._require_telegram_runtime()
+        if not isinstance(ownership_store, ChannelRouteOwnershipStore):
+            raise TypeError(
+                "hosted Telegram route release requires ChannelRouteOwnershipStore"
+            )
+        released = await ownership_store.release(
+            channel_type="telegram",
+            canonical_route_identity=canonical_bot_identity,
+            agent_id=self._config_agent_did(),
+        )
+        if self._hosted_telegram_route_identity == canonical_bot_identity:
+            self._hosted_telegram_startup_attested = False
+            self._hosted_telegram_route_identity = None
+        return released
 
     def _config_agent_did(self) -> str:
         """Return the stable DID that scopes this proxy's durable config.
@@ -6382,9 +6464,10 @@ class ProxyFeature(Feature):
             r"[-_.]+", "-", self.runtime.distribution.strip().lower()
         )
         if runtime_distribution == "kestrel-channel-telegram":
-            child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = [
-                _ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY
-            ]
+            capabilities = [_ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY]
+            if self._hosted_telegram_startup_attested:
+                capabilities.append(_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY)
+            child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
 
         kwargs = {
             "feature_name": self.name,
@@ -6904,6 +6987,25 @@ class ProxyFeature(Feature):
         data = self._inbound_event_data(detached_event)
         _inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
         retry = self._inbound_event_retry_completion(data)
+        # Telegram descriptors are an all-or-nothing, host-validated cursor
+        # protocol.  A malformed pair must not silently fall through to the
+        # legacy notification path (where it could bypass the paired
+        # ACK/NACK/fencing checks).  Other channels retain their established
+        # compatibility handling.
+        if (
+            self._authoritative_inbound_channel_type() == "telegram"
+            and type(data) is dict
+            and (
+                _EVENT_HOST_INGRESS_ACK_FIELD in data
+                or _EVENT_HOST_INGRESS_RETRY_FIELD in data
+            )
+            and (acknowledgement is None or retry is None)
+        ):
+            logger.warning(
+                "Dropping malformed Telegram polling ingress from isolated feature %s",
+                self.name,
+            )
+            return
         if acknowledgement is None and retry is None:
             await self._enqueue_non_cursor_inbound_event(detached_event, source_client)
             return
@@ -6964,7 +7066,15 @@ class ProxyFeature(Feature):
                                 )
                         if source_client is not self._client:
                             return
-                        admission = await self._route_inbound(inbound)
+                        admission = await self._route_validated_inbound(
+                            inbound,
+                            cursor_owned_protocol=(
+                                acknowledgement is not None
+                                and retry is not None
+                                and self._authoritative_inbound_channel_type()
+                                == "telegram"
+                            ),
+                        )
                 except _TrafficGateClosedError:
                     if source_client is self._client:
                         self._defer_current_acknowledged_event(detached_event, source_client)
@@ -7020,7 +7130,11 @@ class ProxyFeature(Feature):
         """Queue a legacy inbound notification with bounded reader backpressure."""
 
         while True:
-            if self._terminal_lifecycle_latched or source_client is not self._client:
+            if (
+                self._terminal_lifecycle_latched
+                or self._traffic_gate.closed
+                or source_client is not self._client
+            ):
                 return
             async with self._non_cursor_event_ingress_lock:
                 queue_entry = next(
@@ -7116,12 +7230,16 @@ class ProxyFeature(Feature):
                         self.name,
                     )
                 else:
-                    async with self._traffic_gate.admit(wait_for_open=True):
+                    # Legacy ingress is ordered and backpressured while the gate
+                    # is open.  Once a live transition closes it, however, this
+                    # old-child event is stale and must not replay under the next
+                    # configuration.
+                    async with self._traffic_gate.admit(wait_for_open=False):
                         if queue_entry.client is not self._client:
                             retire_worker = True
                         else:
                             await self._route_inbound(inbound)
-            except _TrafficGateTerminalError:
+            except (_TrafficGateClosedError, _TrafficGateTerminalError):
                 retire_worker = True
             except asyncio.CancelledError:
                 raise
@@ -7166,7 +7284,14 @@ class ProxyFeature(Feature):
         if event_name in {"channel.inbound", "inbound", "message.inbound"}:
             inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
             retry = self._inbound_event_retry_completion(data)
-            admission = await self._route_inbound(inbound)
+            admission = await self._route_validated_inbound(
+                inbound,
+                cursor_owned_protocol=(
+                    acknowledgement is not None
+                    and retry is not None
+                    and self._authoritative_inbound_channel_type() == "telegram"
+                ),
+            )
             source_client = _event_source_client.get()
             if (
                 self._inbound_admission_is_durable(admission)
@@ -7476,7 +7601,14 @@ class ProxyFeature(Feature):
                     # so the producer restarts from the same durable cursor.
                     if deferred.source_client is not self._client:
                         return
-                    admission = await self._route_inbound(deferred.message)
+                    admission = await self._route_validated_inbound(
+                        deferred.message,
+                        cursor_owned_protocol=(
+                            deferred.retry is not None
+                            and self._authoritative_inbound_channel_type()
+                            == "telegram"
+                        ),
+                    )
                     if self._inbound_admission_is_durable(admission):
                         self._schedule_event_ingress_acknowledgement(
                             deferred.source_client,
@@ -7820,6 +7952,24 @@ class ProxyFeature(Feature):
             logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
             return
 
+    async def _route_validated_inbound(
+        self, payload: Any, *, cursor_owned_protocol: bool
+    ) -> Any:
+        """Route with a host-only protocol classification.
+
+        The public/legacy ``_route_inbound`` shape remains a one-argument
+        method: integrations and test doubles use it as that narrow seam.
+        Context-local classification lets a detached callback carry the
+        negotiated protocol through that seam without trusting its JSON body
+        or widening every legacy ChannelFeature implementation.
+        """
+
+        token = _cursor_owned_inbound_protocol.set(cursor_owned_protocol)
+        try:
+            return await self._route_inbound(payload)
+        finally:
+            _cursor_owned_inbound_protocol.reset(token)
+
     async def _route_inbound(self, payload: Any) -> Any:
         channel = self._channel_feature()
         if channel is None or not hasattr(channel, "handle_inbound"):
@@ -7865,6 +8015,15 @@ class ProxyFeature(Feature):
         # Route and sender filtering must use the host-negotiated proxy
         # identity, never the isolated child's mutable wire field.
         message.channel_type = authoritative_channel_type
+        # This transient attribute is never serialized by ChannelMessage. It
+        # is written after child data is parsed and scoped by the ContextVar
+        # above, so only the host-validated Telegram polling path can request
+        # cursor-owned durable cognition.
+        setattr(
+            message,
+            "_kestrel_cursor_owned_protocol",
+            _cursor_owned_inbound_protocol.get(),
+        )
         return await channel.handle_inbound(message)
 
 

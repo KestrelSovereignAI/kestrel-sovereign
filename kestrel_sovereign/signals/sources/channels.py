@@ -117,22 +117,33 @@ def build_channel_message_registration() -> SourceRegistration:
 def build_signal_for_channel_message(
     message: ChannelMessage,
     target_agent: str,
+    *,
+    durable_cognition: bool = False,
 ) -> Signal:
+    """Build one normalized channel signal.
+
+    The durable-cognition marker is a negotiated cursor protocol capability,
+    not a property of the generic ``channel.message`` source.  Adding it to
+    Slack/WhatsApp/etc. would materialize a Telegram-owned delivery for an
+    event whose producer cannot retain or acknowledge a cursor.
+    """
     if message.direction != MessageDirection.INBOUND:
         raise ValueError("channel message signals require an inbound message")
+    payload = {
+        "message_id": message.id,
+        "channel_type": message.channel_type,
+        "sender": message.sender,
+        "recipient": message.recipient,
+        "content": message.content,
+        "metadata": message.metadata,
+    }
+    if durable_cognition:
+        payload[DURABLE_COGNITION_MARKER] = DURABLE_COGNITION_MARKER_VALUE
     return Signal(
         source=SOURCE_NAME,
         kind="inbound",
         mode=SignalMode.COGNITION,
-        payload={
-            DURABLE_COGNITION_MARKER: DURABLE_COGNITION_MARKER_VALUE,
-            "message_id": message.id,
-            "channel_type": message.channel_type,
-            "sender": message.sender,
-            "recipient": message.recipient,
-            "content": message.content,
-            "metadata": message.metadata,
-        },
+        payload=payload,
         target_agent=target_agent,
         visibility=Visibility.USER_VISIBLE,
         caller=message.sender,

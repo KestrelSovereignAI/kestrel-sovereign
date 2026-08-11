@@ -11,6 +11,7 @@ Hold/Release Lifecycle:
 4. On termination: unspent = N - spent credited back to parent
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -86,6 +87,11 @@ class DelegatedWallet:
         self._wallet = wallet
         self.allocation = allocation
         self.transactions: list[dict] = []
+        # Removal can quarantine cancellation-resistant cognition and refund
+        # this child's allocation before that cognition finishes.  The reaper
+        # must not be able to spend funds after they return to the parent.
+        self._revoked = False
+        self._spend_lock = asyncio.Lock()
 
     @property
     def ceiling(self) -> Decimal:
@@ -104,7 +110,22 @@ class DelegatedWallet:
 
     def can_spend(self, cost: Decimal) -> bool:
         """Check whether *cost* fits within the remaining budget."""
-        return self.allocation.spent + cost <= self.allocation.amount
+        return (
+            not self._revoked
+            and self.allocation.spent + cost <= self.allocation.amount
+        )
+
+    async def revoke_and_get_unspent(self) -> Decimal:
+        """Fence future spending and atomically snapshot refundable funds.
+
+        ``release_delegated_wallet`` shares this lock with ``spend``. A
+        quarantined turn therefore either completes its debit before the
+        refund is calculated or is refused after revocation; it cannot debit
+        after the parent has recovered the unspent allocation.
+        """
+        async with self._spend_lock:
+            self._revoked = True
+            return self.allocation.remaining
 
     # ------------------------------------------------------------------
     # WalletProtocol drop-in surface (#2113).
@@ -198,38 +219,39 @@ class DelegatedWallet:
         if cost <= 0:
             raise ValueError("Spend amount must be positive")
 
-        if not self.can_spend(cost):
+        async with self._spend_lock:
+            if not self.can_spend(cost):
+                currency_value = _currency_value(currency)
+                raise BudgetExceededError(
+                    f"Transaction of {cost} {currency_value} would exceed budget ceiling. "
+                    f"Ceiling: {self.allocation.amount}, "
+                    f"Spent: {self.allocation.spent}, "
+                    f"Remaining: {self.allocation.remaining}, "
+                    f"Requested: {cost}"
+                )
+
+            success = await self._wallet.transfer(cost, memo, currency)
+            if not success:
+                return False
+
+            self.allocation.spent += cost
             currency_value = _currency_value(currency)
-            raise BudgetExceededError(
-                f"Transaction of {cost} {currency_value} would exceed budget ceiling. "
-                f"Ceiling: {self.allocation.amount}, "
-                f"Spent: {self.allocation.spent}, "
-                f"Remaining: {self.allocation.remaining}, "
-                f"Requested: {cost}"
+            self.transactions.append({
+                "type": "delegated_spend",
+                "currency": currency_value,
+                "amount": str(cost),
+                "memo": memo,
+                "spent_total": str(self.allocation.spent),
+                "remaining": str(self.allocation.remaining),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+            logger.info(
+                "Delegated spend: %s %s for '%s'. Spent: %s/%s",
+                cost, currency_value, memo,
+                self.allocation.spent, self.allocation.amount,
             )
-
-        success = await self._wallet.transfer(cost, memo, currency)
-        if not success:
-            return False
-
-        self.allocation.spent += cost
-        currency_value = _currency_value(currency)
-        self.transactions.append({
-            "type": "delegated_spend",
-            "currency": currency_value,
-            "amount": str(cost),
-            "memo": memo,
-            "spent_total": str(self.allocation.spent),
-            "remaining": str(self.allocation.remaining),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-
-        logger.info(
-            "Delegated spend: %s %s for '%s'. Spent: %s/%s",
-            cost, currency_value, memo,
-            self.allocation.spent, self.allocation.amount,
-        )
-        return True
+            return True
 
     def get_status(self) -> dict:
         """Return a summary of the delegated budget status."""
@@ -373,7 +395,7 @@ async def release_delegated_wallet(
         The amount returned to the parent.
     """
     currency = currency or _default_currency_for(parent_wallet)
-    unspent = delegated_wallet.remaining
+    unspent = await delegated_wallet.revoke_and_get_unspent()
 
     if unspent > 0:
         await parent_wallet.deposit(
