@@ -4,27 +4,31 @@ import asyncio
 import gc
 import json
 import os
+import subprocess
+import sys
 import threading
 import types
 import weakref
 from datetime import datetime, timedelta, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.isolated_feature import (
+    MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionError,
     ConfigTransitionResult,
     HostIngressCapabilities,
     HostIngressError,
     HostIngressUnknownNameError,
     HostIngressUnsupportedError,
-    MAX_HOST_INGRESS_PAYLOAD_BYTES,
 )
 from kestrel_sdk.tools.result import ToolResultStatus
+
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
 from kestrel_sovereign.features.contribution_runtime import (
@@ -32,9 +36,15 @@ from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionRuntime,
 )
 from kestrel_sovereign.features.isolated_runtime import (
+    HostedTelegramRouteAttestation,
     ProxyFeature,
     SchedulerExecutionContextUnavailable,
     SchedulerTerminalAdmissionError,
+    canonical_telegram_bot_id,
+    set_hosted_telegram_route_attestation_resolver,
+)
+from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteOwnershipStore,
 )
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
@@ -51,9 +61,21 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.waits import WaitRegistry
 
-
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+_TELEGRAM_ATTEMPT_TOKEN = "t" * 43
+
+
+def _child_distribution_probe(version: str):
+    """Build the classified child-distribution result used by venv tests."""
+
+    if version == "missing":
+        return isolated_runtime._FeatureDistributionProbe.missing()
+    if version == "probe-failed":
+        return isolated_runtime._FeatureDistributionProbe.failed()
+    if version == "unknown":
+        return isolated_runtime._FeatureDistributionProbe.present_unversioned()
+    return isolated_runtime._FeatureDistributionProbe.versioned(version)
 
 
 def test_proxy_contribution_owners_are_stable_and_runtime_specific():
@@ -174,6 +196,19 @@ class FakeIsolatedClient:
 
     def on_event(self, handler):
         self.event_handler = handler
+
+
+class TelegramChannelClient(FakeIsolatedClient):
+    """An isolated client which explicitly negotiates the Telegram bridge."""
+
+    @property
+    def capabilities(self):
+        return {
+            "channel": {
+                "channel_type": "telegram",
+                "send_tool": "telegram_send",
+            }
+        }
 
 
 @pytest.mark.asyncio
@@ -523,6 +558,7 @@ class FakeChannelFeature:
 
     async def handle_inbound(self, message):
         self.inbound.append(message)
+        return SimpleNamespace(durably_admitted=True)
 
 
 def _isolated_runtime():
@@ -834,7 +870,7 @@ async def test_replacement_bridge_uses_effective_config_for_outbound_and_inbound
         did=_TEST_AGENT_DID,
         storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
         dispatcher=None,
-        signal_registry=None,
+        signal_registry=SourceRegistry(),
         features={},
     )
     channel_feature = ChannelFeature(channel_agent)
@@ -969,7 +1005,9 @@ async def test_proxy_send_maps_failure_receipt(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_proxy_send_maps_toolresult_envelopes(monkeypatch, tmp_path):
     """ToolResult wire shapes (status=error/partial) must not read as success."""
-    from kestrel_sovereign.features.isolated_runtime import _delivery_receipt_from_result
+    from kestrel_sovereign.features.isolated_runtime import (
+        _delivery_receipt_from_result,
+    )
 
     # status=error wrapped as a successful transport call must be a FAILURE
     err = _delivery_receipt_from_result(
@@ -1120,6 +1158,12 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     # Child venv python is a stub (empty file) — report a concrete SDK version
     # rather than shelling out to it.
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+    monkeypatch.setattr(
+        ir, "_feature_distribution_version", lambda _distribution, _target: "1.0.0"
+    )
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("1.0.0")
+    )
 
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
     feature.ensure_venv()  # fresh: uv venv + uv pip install (no --upgrade)
@@ -1129,6 +1173,9 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
     assert manifest["provisioned_against_host_sdk"] == "0.28.0"
     assert manifest["child_sdk_version"] == "0.28.0"
+    assert manifest["feature_distribution_version"] == "1.0.0"
+    assert manifest["child_feature_distribution_state"] == "versioned"
+    assert manifest["child_feature_distribution_version"] == "1.0.0"
 
     runs.clear()
     # Same host SDK → no reprovision.
@@ -1156,6 +1203,213 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert manifest["child_sdk_version"] == "0.28.0"
     runs.clear()
     feature.ensure_venv()  # not stale now (host unchanged) → no thrash
+    assert runs == []
+
+
+def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, monkeypatch):
+    """An unversioned Telegram service target still follows its distribution release."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    version = {"value": "0.1.1"}
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(
+        ir,
+        "_feature_distribution_version",
+        lambda distribution, target: version["value"],
+    )
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(version["value"]),
+    )
+
+    feature.ensure_venv()
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == [], "an unchanged Telegram release must remain fresh"
+
+    version["value"] = "0.1.2"
+    feature.ensure_venv()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == [], "the new Telegram release stamp must converge after one upgrade"
+
+
+@pytest.mark.parametrize("current_child_version", ("0.1.1", "missing"))
+def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifest(
+    tmp_path, monkeypatch, current_child_version
+):
+    """Freshness probes the child, not just the recorded successful install."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    python = feature._venv_path / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    feature._write_provision_manifest(
+        runtime.project,
+        "0.35.1",
+        "0.35.1",
+        "0.1.2",
+        _child_distribution_probe("0.1.2"),
+    )
+    child_version = {"value": current_child_version}
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        if "pip" in cmd and "install" in cmd:
+            child_version["value"] = "0.1.2"
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.1.2")
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(child_version["value"]),
+    )
+
+    feature.ensure_venv()
+
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+    assert child_version["value"] == "0.1.2"
+
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == []
+
+
+def test_feature_distribution_version_reads_local_editable_project_metadata(
+    tmp_path, monkeypatch
+):
+    """Editable source metadata wins over its stale installed dist-info stamp."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.2'\n"
+    )
+    monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
+
+    assert (
+        ir._feature_distribution_version(
+            "kestrel-channel-telegram", f"-e {project}[service]"
+        )
+        == "0.1.2"
+    )
+
+
+def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatch):
+    """A local editable source upgrade reprovisions once, then stays fresh."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.1'\n"
+    )
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project=f"-e {project}[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    import tomllib
+
+    child_version = {"value": "0.1.1"}
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+        if "pip" in cmd and "install" in cmd:
+            child_version["value"] = tomllib.loads(pyproject.read_text())["project"][
+                "version"
+            ]
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    # A real editable installation can retain this old dist-info version until
+    # it is reinstalled; the local source stamp must still see the upgrade.
+    monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(child_version["value"]),
+    )
+
+    feature.ensure_venv()
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == []
+
+    pyproject.write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.2'\n"
+    )
+    feature.ensure_venv()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+
+    runs.clear()
+    feature.ensure_venv()
     assert runs == []
 
 
@@ -1191,10 +1445,153 @@ def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatc
     # SDK mismatch present — must warn, but still NOT mutate.
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "1.2.0")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("1.2.0")
+    )
 
     feature.ensure_venv()
 
     assert runs == [], f"override venv must not be touched, ran: {runs}"
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("desired_version", "child_version"),
+    (
+        ("1.2.0", "1.1.9"),
+        ("1.2.0", "missing"),
+        ("unknown", "missing"),
+        ("unknown", "probe-failed"),
+    ),
+    ids=("stale", "missing", "unknown-desired-missing", "probe-failed"),
+)
+def test_prebuilt_override_refuses_stale_missing_or_unverifiable_distribution(
+    tmp_path, monkeypatch, desired_version, child_version
+):
+    """An immutable override must prove that its child distribution is usable."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project="override-pkg",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(
+        ir, "_feature_distribution_version", lambda _d, _t: desired_version
+    )
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe(child_version)
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to run an unverifiable override venv"):
+        feature.ensure_venv()
+
+    assert runs == []
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+def test_prebuilt_editable_override_probes_source_release_without_mutation(tmp_path, monkeypatch):
+    """A local editable desired release is checked against the child metadata."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'override-pkg'\nversion = '1.2.0'\n"
+    )
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project=f"-e {project}[service]",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("1.2.0")
+    )
+
+    feature.ensure_venv()
+
+    assert runs == []
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+def test_prebuilt_override_accepts_positively_present_versionless_child_for_unknown_desired(
+    tmp_path, monkeypatch
+):
+    """A genuine editable/versionless child is usable when desired is unknown."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project="override-pkg",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("unknown")
+    )
+
+    feature.ensure_venv()
+    feature.ensure_venv()
+
+    assert runs == []
     assert not (override_venv / ".kestrel_provision.json").exists()
 
 
@@ -1225,6 +1622,10 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("unknown")
+    )
 
     # First startup: override path missing → bootstrap (create + install + stamp).
     feature.ensure_venv()
@@ -1241,6 +1642,157 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     feature.ensure_venv()
     upgrades = [c for c in runs if "pip" in c and "install" in c]
     assert upgrades and "--upgrade" in upgrades[-1]
+
+
+def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
+    tmp_path, monkeypatch
+):
+    """A successful resolver run cannot mark an obsolete child package fresh."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.2.0")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("0.1.9")
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to stamp the venv fresh"):
+        feature.ensure_venv()
+
+    assert not (feature._venv_path / ".kestrel_provision.json").exists()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert len(installs) == 1 and "--upgrade" not in installs[0]
+
+
+def test_venv_feature_distribution_probe_executes_in_target_interpreter():
+    """The generated ``python -c`` probe contains executable newlines."""
+
+    assert isolated_runtime._venv_feature_distribution_probe(
+        Path(sys.executable), "pytest"
+    ) == isolated_runtime._FeatureDistributionProbe.versioned(
+        importlib_metadata.version("pytest")
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    (
+        ('{"state": "missing"}', isolated_runtime._FeatureDistributionProbe.missing()),
+        (
+            '{"state": "present-unversioned"}',
+            isolated_runtime._FeatureDistributionProbe.present_unversioned(),
+        ),
+        (
+            '{"state": "versioned", "version": "1.2.3"}',
+            isolated_runtime._FeatureDistributionProbe.versioned("1.2.3"),
+        ),
+    ),
+)
+def test_venv_feature_distribution_probe_preserves_distinct_positive_states(
+    monkeypatch, tmp_path, stdout, expected
+):
+    """The child probe never reduces missing and versionless to ``unknown``."""
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=stdout)
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", fake_run)
+    assert (
+        isolated_runtime._venv_feature_distribution_probe(
+            tmp_path / "venv" / "bin" / "python", "example-pkg"
+        )
+        == expected
+    )
+
+
+def test_venv_feature_distribution_probe_marks_execution_failure_unverifiable(
+    monkeypatch, tmp_path
+):
+    """A failed child interpreter probe is not evidence of an editable install."""
+
+    def fail_run(*_args, **_kwargs):
+        raise OSError("child unavailable")
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", fail_run)
+    assert (
+        isolated_runtime._venv_feature_distribution_probe(
+            tmp_path / "venv" / "bin" / "python", "example-pkg"
+        )
+        == isolated_runtime._FeatureDistributionProbe.failed()
+    )
+
+
+def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
+    tmp_path, monkeypatch
+):
+    """Unobservable host/child metadata is stable rather than permanently stale."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="UnknownFeature",
+        entry_point="unknown.feature:UnknownFeature",
+        distribution="unknown-package",
+        runtime="isolated-venv",
+        service="unknown-service",
+        project="unknown-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("unknown")
+    )
+
+    feature.ensure_venv()
+    manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
+    assert manifest["feature_distribution_version"] == "unknown"
+    assert manifest["child_feature_distribution_state"] == "present-unversioned"
+    assert manifest["child_feature_distribution_version"] is None
+    runs.clear()
+
+    feature.ensure_venv()
+    assert runs == []
 
 
 # --- F023: isolated service launch env must not inherit interpreter shadowing --
@@ -1342,6 +1894,317 @@ def test_build_client_preserves_explicit_empty_config(tmp_path):
     feature._build_client()
 
     assert captured["config"] == {}
+
+
+def test_build_client_injects_telegram_acknowledged_ingress_capability(tmp_path):
+    """The Telegram child receives Core's non-persisted protocol contract."""
+
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="Kestrel_Channel_Telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    feature = ProxyFeature(Mock(features={}), runtime, client_factory=client_factory)
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = tmp_path / "test-service"
+    feature._host_config = {
+        "enabled": True,
+        "_kestrel_host_runtime_capabilities": ["untrusted-user-value"],
+    }
+
+    feature._build_client()
+
+    assert captured["config"] == {
+        "enabled": True,
+        "_kestrel_host_runtime_capabilities": [
+            "channel-inbound-acknowledgement-v1"
+        ],
+    }
+    assert feature._host_config["_kestrel_host_runtime_capabilities"] == [
+        "untrusted-user-value"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_client_injects_durably_claimed_telegram_startup_fence(tmp_path):
+    """The launch-only fence requires a durable route claim, never config."""
+
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "route-ownership.db"))
+    await backend.connect()
+    feature = ProxyFeature(
+        Mock(did=_TEST_AGENT_DID, features={}), runtime, client_factory=client_factory
+    )
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = tmp_path / "test-service"
+    feature._host_config = {"enabled": True}
+
+    try:
+        assert await feature.reconcile_hosted_telegram_route_claim(
+            ownership_store=ChannelRouteOwnershipStore(backend),
+            bot_id="123456",
+        ) is True
+        feature._build_client()
+
+        assert captured["config"] == {
+            "enabled": True,
+            "_kestrel_host_runtime_capabilities": [
+                "channel-inbound-acknowledgement-v1",
+                "telegram-hosted-ingress-owner-v1",
+            ],
+        }
+        assert feature._host_config == {"enabled": True}
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_attestation_requires_exclusive_claim_and_reconciles(
+    tmp_path,
+):
+    """A loser never gets the child capability until the winner releases it."""
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "shared-routes.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    first_capture: dict = {}
+    second_capture: dict = {}
+
+    def first_factory(**kwargs):
+        first_capture.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    def second_factory(**kwargs):
+        second_capture.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    first = ProxyFeature(
+        Mock(did="did:test:telegram-first", features={}),
+        runtime,
+        client_factory=first_factory,
+    )
+    second = ProxyFeature(
+        Mock(did="did:test:telegram-second", features={}),
+        runtime,
+        client_factory=second_factory,
+    )
+    for feature in (first, second):
+        feature._venv_path = tmp_path / "svc-venv"
+        feature._bin_path = tmp_path / "test-service"
+        feature._host_config = {"enabled": True}
+
+    try:
+        assert await first.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            bot_id="123456",
+        ) is True
+        assert await second.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            bot_id="123456",
+        ) is False
+        first._build_client()
+        second._build_client()
+        assert "telegram-hosted-ingress-owner-v1" in first_capture["config"][
+            "_kestrel_host_runtime_capabilities"
+        ]
+        assert "telegram-hosted-ingress-owner-v1" not in second_capture["config"][
+            "_kestrel_host_runtime_capabilities"
+        ]
+
+        assert await first.release_hosted_telegram_route_claim(
+            ownership_store=store,
+            bot_id="123456",
+        ) is True
+        assert await second.reconcile_hosted_telegram_route_claim(
+            ownership_store=store,
+            bot_id="123456",
+        ) is True
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_reassertion_cannot_release_replacement_claim(tmp_path):
+    """An older proxy instance cannot ABA-delete its successor's same-DID claim."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "same-agent-route-aba.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    first = ProxyFeature(Mock(did="did:test:telegram", features={}), runtime)
+    replacement = ProxyFeature(Mock(did="did:test:telegram", features={}), runtime)
+    try:
+        assert await first.reconcile_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="000123"
+        )
+        with pytest.raises(RuntimeError, match="release it first"):
+            await first.reconcile_hosted_telegram_route_claim(
+                ownership_store=store, bot_id="456"
+            )
+        assert await replacement.reconcile_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        )
+        assert await first.release_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        ) is False
+        assert await store.is_claimed_by(
+            channel_type="telegram",
+            canonical_route_identity="telegram-bot:123",
+            agent_id="did:test:telegram",
+        )
+        assert await replacement.release_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_telegram_initialize_resolves_route_fence_before_child_start(
+    monkeypatch, tmp_path
+):
+    """The boot seam claims hosted ingress before the child can start polling."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "boot-route-fence.db"))
+    await backend.connect()
+    captured: dict = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    agent = SimpleNamespace(
+        did="did:test:telegram-boot",
+        features={},
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+    )
+    set_hosted_telegram_route_attestation_resolver(
+        agent,
+        lambda _proxy: HostedTelegramRouteAttestation(
+            ownership_store=ChannelRouteOwnershipStore(backend), bot_id="000123"
+        ),
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+
+    async def load_host_config():
+        return {"enabled": True}
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/test-service")
+    try:
+        await feature.initialize()
+        assert captured["config"]["_kestrel_host_runtime_capabilities"] == [
+            "channel-inbound-acknowledgement-v1",
+            "telegram-hosted-ingress-owner-v1",
+        ]
+        assert await ChannelRouteOwnershipStore(backend).is_claimed_by(
+            channel_type="telegram",
+            canonical_route_identity="telegram-bot:123",
+            agent_id=agent.did,
+        )
+    finally:
+        await feature.shutdown()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_telegram_initialize_refuses_existing_hosted_route_before_child_start(
+    monkeypatch, tmp_path
+):
+    """A resolver conflict fails before the child factory/start handshake runs."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "boot-route-conflict.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    assert await store.claim(
+        channel_type="telegram",
+        canonical_route_identity="telegram-bot:123",
+        agent_id="did:test:existing-host",
+    )
+    built: list[object] = []
+
+    def client_factory(**kwargs):
+        built.append(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    agent = SimpleNamespace(
+        did="did:test:blocked-host",
+        features={},
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        hosted_telegram_route_attestation_resolver=(
+            lambda _proxy: HostedTelegramRouteAttestation(store, "123")
+        ),
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+
+    async def load_host_config():
+        return {"enabled": True}
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/test-service")
+    try:
+        with pytest.raises(RuntimeError, match="already owned"):
+            await feature.initialize()
+        assert built == []
+    finally:
+        await feature.shutdown()
+        await backend.close()
+
+
+def test_telegram_route_identity_accepts_only_canonicalized_decimal_bot_ids():
+    """Provider prefixes cannot forge a second Telegram ownership key."""
+
+    assert canonical_telegram_bot_id("000123") == "123"
+    with pytest.raises(ValueError, match="positive decimal"):
+        canonical_telegram_bot_id("telegram-bot:123")
+    with pytest.raises(ValueError, match="positive"):
+        canonical_telegram_bot_id("000")
 
 
 class _FakeStorage:
@@ -1697,6 +2560,381 @@ async def test_supported_transition_failure_keeps_old_config_and_service(monkeyp
     assert feature._host_config == old_config
     assert (await feature.get_config()) == old_config
     assert agent.storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"] == old_config
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_quiesces_callback_while_admission_is_open_then_drains(
+    monkeypatch, tmp_path
+):
+    """A real pending producer callback cannot deadlock Core's transition."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+    delivered = []
+    clients = []
+    callback_started = asyncio.Event()
+    callback_finished = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    class QuiescingIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.pending_events = []
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=(
+                    "telegram-polling-ack",
+                    "external-ingress-quiesce",
+                    "external-ingress-resume",
+                )
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "telegram-polling-ack":
+                callback_started.set()
+                await release_callback.wait()
+                callback_finished.set()
+                return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+            if name == "external-ingress-quiesce":
+                # The provider quiesce waits for its actual callback to
+                # finish. Core must leave admission open for that wait.
+                assert feature._traffic_gate.closed is False
+                await callback_finished.wait()
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            # Resume is an owned finalizer: deferred work cannot replay until
+            # this exact source has resumed and Core reopens admission.
+            assert feature._traffic_gate.closed is True
+            self.quiesced = False
+            for event in self.pending_events:
+                await self.event_handler(event)
+            self.pending_events.clear()
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+        async def emit_external_update(self, event):
+            if self.quiesced:
+                self.pending_events.append(event)
+                return
+            await self.event_handler(event)
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            # Quiesce has now completed, so Core closes admission before the
+            # hook runs. New producer events are retained until resume.
+            assert feature._traffic_gate.closed is True
+            await self.emit_external_update(
+                {
+                    "type": "channel.inbound",
+                    "payload": {
+                        "message": {
+                            "id": "late-update",
+                            "metadata": {"dedupe_key": "late-update"},
+                        },
+                        "_host_ingress_ack": {
+                            "name": "telegram-polling-ack",
+                            "payload": {
+                                "dedupe_key": "late-update",
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
+                        },
+                    },
+                }
+            )
+            return ConfigTransitionResult.applied()
+
+    def client_factory(**kwargs):
+        client = QuiescingIngressClient(**kwargs)
+        clients.append(client)
+        return client
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+
+    async def record(event):
+        delivered.append(event)
+        return SimpleNamespace(durably_admitted=True)
+
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        feature._route_inbound = record  # type: ignore[method-assign]
+
+        await clients[0].event_handler(
+            _acknowledged_telegram_event("telegram:v2:bot:42:update:early")
+        )
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
+
+        transition_task = asyncio.create_task(feature.set_config(next_config))
+        await asyncio.sleep(0)
+        assert not transition_task.done()
+        release_callback.set()
+        await asyncio.wait_for(transition_task, timeout=1)
+
+        assert [
+            call[0]
+            for call in clients[0].ingress_calls
+            if call[0].startswith("external-ingress-")
+        ] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        for _ in range(20):
+            if delivered:
+                break
+            await asyncio.sleep(0)
+        assert delivered == [
+            {
+                "channel_type": "telegram",
+                "direction": "inbound",
+                "sender": "555",
+                "recipient": "42",
+                "content": "hello",
+                "id": "telegram:v2:bot:42:update:early",
+                "metadata": {"dedupe_key": "telegram:v2:bot:42:update:early"},
+            },
+            {"id": "late-update", "metadata": {"dedupe_key": "late-update"}}
+        ]
+        assert clients[0].pending_events == []
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == next_config
+    finally:
+        release_callback.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resumes_after_failed_transition_rollback(monkeypatch, tmp_path):
+    """A failed staged transition resumes polling before reopening Core admission."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    rejected_config = {"enabled": True, "revision": "rejected"}
+
+    class RollbackIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is True
+            self.quiesced = False
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+        async def prepare_config_transition(self, config):
+            assert self.quiesced is True
+            assert config == rejected_config
+            raise ConfigTransitionError("transition rejected")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RollbackIngressClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        old_client = feature._client
+
+        with pytest.raises(ConfigTransitionError, match="transition rejected"):
+            await feature.set_config(rejected_config)
+
+        assert feature._client is old_client
+        assert old_client.quiesced is False
+        assert [call[0] for call in old_client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == old_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resumes_after_cancelled_transition_rollback(monkeypatch, tmp_path):
+    """Cancellation after admission closes releases the exact producer."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    pending_config = {"enabled": True, "revision": "pending"}
+    quiesce_started = asyncio.Event()
+    release_quiesce = asyncio.Event()
+
+    class CancelledIngressClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                self.quiesced = True
+                quiesce_started.set()
+                await release_quiesce.wait()
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            assert feature._traffic_gate.closed is True
+            self.quiesced = False
+            return {"status": "ok", "http_status": 200, "state": "resumed"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CancelledIngressClient)
+    update = None
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+        client = feature._client
+
+        update = asyncio.create_task(feature.set_config(pending_config))
+        await asyncio.wait_for(quiesce_started.wait(), timeout=1)
+        update.cancel()
+        release_quiesce.set()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+
+        assert feature._client is client
+        assert client.quiesced is False
+        assert [call[0] for call in client.ingress_calls] == [
+            "external-ingress-quiesce",
+            "external-ingress-resume",
+        ]
+        assert feature._traffic_gate.closed is False
+        assert feature._host_config == old_config
+    finally:
+        if update is not None and not update.done():
+            update.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await update
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resume_error", "expected_error"),
+    [
+        (RuntimeError("resume failed"), HostIngressError),
+        (asyncio.CancelledError("resume cancelled"), asyncio.CancelledError),
+    ],
+    ids=["failure", "cancellation"],
+)
+async def test_external_ingress_resume_failure_never_reports_config_success(
+    monkeypatch, tmp_path, resume_error, expected_error
+):
+    """A failed resume quarantines and remains the successful body's outcome."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    next_config = {"enabled": True, "revision": "next"}
+
+    class ResumeFailingClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            if name == "external-ingress-quiesce":
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            raise resume_error
+
+        async def prepare_config_transition(self, config):
+            assert config == next_config
+            return ConfigTransitionResult.applied()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=ResumeFailingClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(expected_error):
+            await feature.set_config(next_config)
+
+        assert feature._client is None
+        assert feature.get_tools() == []
+        assert feature._stopping is True
+        assert feature._traffic_gate.sealed is True
+        assert feature._host_config == next_config
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_ingress_resume_failure_preserves_active_transition_error(
+    monkeypatch, tmp_path
+):
+    """Resume cleanup cannot hide the transition error already being unwound."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    rejected_config = {"enabled": True, "revision": "rejected"}
+
+    class BodyFailingClient(FakeIsolatedClient):
+        supports_config_transition = True
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            if name == "external-ingress-quiesce":
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            assert name == "external-ingress-resume"
+            raise RuntimeError("resume failed during unwind")
+
+        async def prepare_config_transition(self, config):
+            assert config == rejected_config
+            raise ConfigTransitionError("transition rejected")
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=BodyFailingClient)
+    try:
+        await feature.persist_config(old_config)
+        await feature.initialize()
+
+        with pytest.raises(ConfigTransitionError, match="transition rejected"):
+            await feature.set_config(rejected_config)
+
+        assert feature._client is None
+        assert feature._traffic_gate.sealed is True
+    finally:
+        await feature.shutdown()
 
 
 @pytest.mark.asyncio
@@ -3229,7 +4467,7 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until_promotion(
+async def test_live_apply_blocks_tools_and_drops_stale_legacy_inbound_until_promotion(
     monkeypatch, tmp_path
 ):
     """No host-visible effect may observe an applied candidate before its CAS.
@@ -3237,9 +4475,9 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
     The client intentionally mutates its local mode before reporting ``applied``.
     Promotion is then held at the durable write boundary while a direct tool,
     the generic channel adapter, and an SDK inbound callback all try to enter.
-    Tool/channel calls wait for the finite transition. An SDK callback is
-    instead dropped immediately: it originated from the old child, and replay
-    after promotion could apply stale inbound traffic under the new config.
+    Tool/channel calls wait for the finite transition. The legacy SDK callback
+    has no producer cursor or NACK, so a callback from the old child is stale
+    once the live gate closes and must not replay under the promoted config.
     """
 
     from kestrel_sdk.channels import ChannelMessage, MessageDirection
@@ -3329,6 +4567,7 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
         assert (await channel_send).status.value == "success"
         await inbound_callback
         assert client.effects == [("ping", "next"), ("whatsapp_send", "next")]
+        await asyncio.sleep(0)
         assert channel_feature.inbound == []
     finally:
         release_promotion.set()
@@ -3752,6 +4991,81 @@ async def test_replica_get_does_not_mask_stale_child_before_next_patch(
             storage.nodes[_TEST_CONFIG_NODE_ID].properties["config"]
             == next_config
         )
+    finally:
+        await stale.shutdown()
+        await winner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_equal_config_reconciles_only_after_external_ingress_fence(
+    monkeypatch, tmp_path
+):
+    """A stale ``B -> B`` update fences old polling before replacing child A."""
+
+    old_config = {"enabled": True, "revision": "old"}
+    winner_config = {"enabled": True, "revision": "winner"}
+    storage = _CASStorage()
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    winner_agent = Mock(did=_TEST_AGENT_DID, features={})
+    winner_agent.storage = storage
+    winner_agent.storage_path = str(tmp_path / "winner" / "kestrel_prime.db")
+    stale_agent = Mock(did=_TEST_AGENT_DID, features={})
+    stale_agent.storage = storage
+    stale_agent.storage_path = str(tmp_path / "stale" / "kestrel_prime.db")
+    stale_clients = []
+
+    class FencedStaleClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.quiesced = False
+            self.ingress_calls = []
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            self.ingress_calls.append((name, payload))
+            if name == "external-ingress-quiesce":
+                assert stale._traffic_gate.closed is False
+                self.quiesced = True
+                return {"status": "ok", "http_status": 200, "state": "quiesced"}
+            raise AssertionError("a retired child must not be resumed")
+
+        async def stop(self):
+            if self is stale_clients[0]:
+                assert self.quiesced is True
+                assert stale._traffic_gate.closed is True
+            await super().stop()
+
+    def stale_factory(**kwargs):
+        client = FencedStaleClient(**kwargs)
+        stale_clients.append(client)
+        return client
+
+    winner = ProxyFeature(
+        winner_agent, _cfg_runtime(), client_factory=FakeIsolatedClient
+    )
+    stale = ProxyFeature(stale_agent, _cfg_runtime(), client_factory=stale_factory)
+    try:
+        await winner.persist_config(old_config)
+        await winner.initialize()
+        await stale.initialize()
+        stale_child = stale_clients[0]
+
+        await winner.set_config(winner_config)
+        # Stale's local applied identity remains A even though its stage reads
+        # durable B, which is exactly the prior no-op fast-path hole.
+        assert stale._host_config == old_config
+        await stale.set_config(winner_config)
+
+        assert stale_child.stopped is True
+        assert [call[0] for call in stale_child.ingress_calls] == [
+            "external-ingress-quiesce"
+        ]
+        assert stale._client is stale_clients[1]
+        assert stale_clients[1].kwargs["config"] == winner_config
+        assert stale._host_config == winner_config
     finally:
         await stale.shutdown()
         await winner.shutdown()
@@ -5064,6 +6378,1356 @@ async def test_reload_cancellation_after_old_stop_quarantines_publication(
             reload_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await reload_task
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_acknowledges_exact_source_only_after_host_delivery(
+    monkeypatch, tmp_path
+):
+    """A notification's producer waits for post-handler private acknowledgement."""
+
+    dedupe_key = "telegram:v2:bot:42:update:101"
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    acknowledgement_started = asyncio.Event()
+    release_acknowledgement = asyncio.Event()
+    delivered = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            delivery_started.set()
+            await release_delivery.wait()
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AcknowledgingClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            acknowledgement_started.set()
+            await release_acknowledgement.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AcknowledgingClient)
+    event_task = None
+    try:
+        await feature.initialize()
+        client = feature._client
+        event_task = asyncio.create_task(
+            client.event_handler(
+                {
+                    "type": "channel.inbound",
+                    "payload": {
+                        "message": {
+                            "channel_type": "telegram",
+                            "direction": "inbound",
+                            "sender": "555",
+                            "recipient": "42",
+                            "content": "hello",
+                            "id": dedupe_key,
+                            "metadata": {"dedupe_key": dedupe_key},
+                        },
+                        "_host_ingress_ack": {
+                            "name": "telegram-polling-ack",
+                            "payload": {
+                                "dedupe_key": dedupe_key,
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
+                        },
+                        "_host_ingress_retry": {
+                            "name": "telegram-polling-nack",
+                            "payload": {
+                                "dedupe_key": dedupe_key,
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
+                        },
+                    },
+                }
+            )
+        )
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+        assert not acknowledgement_started.is_set()
+
+        release_delivery.set()
+        await asyncio.wait_for(event_task, timeout=1)
+        await asyncio.wait_for(acknowledgement_started.wait(), timeout=1)
+        assert delivered == [dedupe_key]
+        assert client.acknowledgements == [
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
+        # The acknowledgement remains independently in-flight so an SDK event
+        # reader can return to consume its JSON-RPC response instead of waiting
+        # on that same response inline.
+        assert feature._event_ack_tasks
+        release_acknowledgement.set()
+        for _ in range(20):
+            if not feature._event_ack_tasks:
+                break
+            await asyncio.sleep(0)
+        assert not feature._event_ack_tasks
+    finally:
+        release_delivery.set()
+        release_acknowledgement.set()
+        if event_task is not None and not event_task.done():
+            await event_task
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
+    monkeypatch, tmp_path
+):
+    """A replacement poller cannot lose its first update to Core's closed gate."""
+
+    dedupe_key = "telegram:v2:bot:42:update:102"
+    delivered = []
+    acknowledged = asyncio.Event()
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            assert (name, payload) == (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+            acknowledged.set()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        await feature._close_traffic_gate()
+        await feature._client.event_handler(
+            {
+                "type": "channel.inbound",
+                "payload": {
+                    "message": {
+                        "channel_type": "telegram",
+                        "direction": "inbound",
+                        "sender": "555",
+                        "recipient": "42",
+                        "content": "first after replacement",
+                        "id": dedupe_key,
+                        "metadata": {"dedupe_key": dedupe_key},
+                    },
+                    "_host_ingress_ack": {
+                        "name": "telegram-polling-ack",
+                        "payload": {
+                            "dedupe_key": dedupe_key,
+                            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                        },
+                    },
+                    "_host_ingress_retry": {
+                        "name": "telegram-polling-nack",
+                        "payload": {
+                            "dedupe_key": dedupe_key,
+                            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                        },
+                    },
+                },
+            }
+        )
+        assert delivered == []
+        assert not acknowledged.is_set()
+
+        await feature._reopen_traffic_gate()
+        await asyncio.wait_for(acknowledged.wait(), timeout=1)
+        assert delivered == [dedupe_key]
+    finally:
+        await feature.shutdown()
+
+
+def _acknowledged_telegram_event(dedupe_key: str) -> dict:
+    """Build the exact private ingress envelope shared by polling and hosted dedupe."""
+
+    return {
+        "type": "channel.inbound",
+        "payload": {
+            "message": {
+                "channel_type": "telegram",
+                "direction": "inbound",
+                "sender": "555",
+                "recipient": "42",
+                "content": "hello",
+                "id": dedupe_key,
+                "metadata": {"dedupe_key": dedupe_key},
+            },
+            "_host_ingress_ack": {
+                "name": "telegram-polling-ack",
+                "payload": {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            },
+            "_host_ingress_retry": {
+                "name": "telegram-polling-nack",
+                "payload": {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            },
+        },
+    }
+
+
+def _retryable_telegram_event(dedupe_key: str) -> dict:
+    """Build a polling envelope whose provider callback can be NACKed."""
+
+    return _acknowledged_telegram_event(dedupe_key)
+
+
+def test_telegram_polling_completion_descriptors_require_an_authoritative_pair():
+    """Telegram completion semantics come from the registered proxy identity."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._authoritative_inbound_channel_type = lambda: "telegram"
+    valid = _retryable_telegram_event("telegram:v2:bot:42:update:attempt-fenced")
+    assert feature._inbound_event_retry_completion(valid["payload"]) is not None
+
+    tokenless = _retryable_telegram_event("telegram:v2:bot:42:update:tokenless")
+    del tokenless["payload"]["_host_ingress_ack"]["payload"]["attempt_token"]
+    del tokenless["payload"]["_host_ingress_retry"]["payload"]["attempt_token"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        tokenless["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(tokenless["payload"]) is None
+
+    mismatched = _retryable_telegram_event("telegram:v2:bot:42:update:mismatched")
+    mismatched["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = (
+        "n" * 43
+    )
+    assert feature._inbound_event_retry_completion(mismatched["payload"]) is None
+
+    missing_pair = _acknowledged_telegram_event("telegram:v2:bot:42:update:missing")
+    del missing_pair["payload"]["_host_ingress_retry"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        missing_pair["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(missing_pair["payload"]) is None
+
+    renamed = _retryable_telegram_event("telegram:v2:bot:42:update:renamed")
+    renamed["payload"]["_host_ingress_ack"]["name"] = "other-provider-ack"
+    renamed["payload"]["_host_ingress_retry"]["name"] = "other-provider-nack"
+    del renamed["payload"]["_host_ingress_ack"]["payload"]["attempt_token"]
+    del renamed["payload"]["_host_ingress_retry"]["payload"]["attempt_token"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        renamed["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(renamed["payload"]) is None
+
+    # A different host-negotiated channel retains its established generic
+    # completion contract; the child message field does not choose it.
+    feature._authoritative_inbound_channel_type = lambda: "whatsapp"
+    non_telegram = _acknowledged_telegram_event("whatsapp:v1:message:1")
+    non_telegram["payload"]["message"]["channel_type"] = "whatsapp"
+    non_telegram["payload"]["_host_ingress_ack"] = {
+        "name": "whatsapp-webhook-ack",
+        "payload": {"dedupe_key": "whatsapp:v1:message:1"},
+    }
+    del non_telegram["payload"]["_host_ingress_retry"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        non_telegram["payload"]
+    )
+    assert acknowledgement is not None
+    assert acknowledgement.name == "whatsapp-webhook-ack"
+
+
+def test_telegram_terminal_envelope_preserves_the_attempt_fenced_ack_nack_pair():
+    """Terminal dispositions are bounded metadata, not a reason to drop ACK/NACK."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._authoritative_inbound_channel_type = lambda: "telegram"
+    event = _acknowledged_telegram_event("telegram:v2:bot:42:update:terminal")
+    event["payload"]["_telegram_terminal_disposition"] = {
+        "kind": "unauthorized_sender"
+    }
+    message, acknowledgement = feature._split_inbound_event_acknowledgement(
+        event["payload"]
+    )
+    assert message["id"] == "telegram:v2:bot:42:update:terminal"
+    assert acknowledgement is not None
+    assert feature._inbound_event_retry_completion(event["payload"]) is not None
+    assert feature._telegram_terminal_disposition(
+        event["payload"], cursor_owned_protocol=True
+    ) == "unauthorized_sender"
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_ingress_is_admitted_only_through_the_durable_route():
+    """A host cannot treat the child's normalized event as an HTTP-only success."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock(return_value={"durably_admitted": True})
+
+    payload = {"id": "telegram:v2:bot:42:update:12", "content": "hello"}
+    assert await feature.admit_hosted_telegram_ingress(
+        payload, terminal_disposition="unsupported_update"
+    ) == {"durably_admitted": True}
+    feature._route_validated_inbound.assert_awaited_once_with(
+        payload,
+        cursor_owned_protocol=True,
+        telegram_terminal_disposition="unsupported_update",
+    )
+
+
+def test_explicit_isolated_feature_data_directory_wins_over_storage_path(tmp_path):
+    """Postgres-backed hosts can isolate venvs without a SQLite storage file."""
+
+    agent = SimpleNamespace(
+        storage_path=str(tmp_path / "legacy" / "agent.db"),
+        isolated_feature_data_dir=tmp_path / "host-owned" / "agent-a",
+    )
+
+    assert isolated_runtime._agent_data_dir(agent) == (
+        tmp_path / "host-owned" / "agent-a"
+    ).resolve()
+
+@pytest.mark.parametrize(
+    ("allowed_senders", "expected"),
+    (
+        (["@jason"], []),
+        (["@jason", "555", "00555", "0"], ["555"]),
+    ),
+    ids=("legacy-only", "mixed-migration-list"),
+)
+def test_telegram_proxy_authorization_keeps_only_canonical_numeric_ids(
+    allowed_senders, expected
+):
+    """Migration-only usernames never reach the host authorization adapter."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._host_config = {"enabled": True, "allowed_senders": allowed_senders}
+
+    config = feature._channel_config("telegram")
+
+    assert config.allowed_senders == expected
+
+
+@pytest.mark.asyncio
+async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_telegram_pair(
+    monkeypatch, tmp_path
+):
+    """A Telegram child cannot select another adapter/filter with wire data."""
+
+    routed = []
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+
+    async def route_inbound(message):
+        routed.append((message.channel_type, message.sender))
+
+    class TelegramClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=SourceRegistry(),
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    channel_feature.registry.set_inbound_router(route_inbound)
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TelegramClient)
+    host_config = {
+        "agent_id": _TEST_AGENT_DID,
+        "enabled": True,
+        "allowed_senders": ["555"],
+    }
+
+    async def load_host_config():
+        return host_config
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    try:
+        await feature.initialize()
+        event = _acknowledged_telegram_event("telegram:v2:bot:42:update:spoofed")
+        event["payload"]["message"]["channel_type"] = "whatsapp"
+        event["payload"]["_host_ingress_ack"]["name"] = "renamed-ack"
+        event["payload"]["_host_ingress_retry"]["name"] = "renamed-nack"
+
+        await feature._client.event_handler(event)
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
+
+        # The authoritative Telegram identity rejects the renamed pair; it
+        # cannot fall through to WhatsApp's absent adapter/filter *or* the
+        # generic legacy router. Telegram requires its paired durable path.
+        assert routed == []
+        assert feature._client.completions == []
+
+        denied = _acknowledged_telegram_event("telegram:v2:bot:42:update:denied")
+        denied["payload"]["message"]["channel_type"] = "whatsapp"
+        denied["payload"]["message"]["sender"] = "not-allowed"
+        await feature._client.event_handler(denied)
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
+        assert routed == []
+
+        channel_feature.registry.unregister("telegram")
+        await feature._client.event_handler(_acknowledged_telegram_event(
+            "telegram:v2:bot:42:update:missing-adapter"
+        ))
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
+        assert routed == []
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_config",
+    (
+        {"enabled": False, "allowed_senders": ["555"]},
+        {"enabled": True, "allowed_senders": []},
+    ),
+    ids=("disabled-adapter", "telegram-default-deny"),
+)
+async def test_host_telegram_authorization_nacks_faulty_child_notifications(
+    monkeypatch, tmp_path, host_config
+):
+    """The host adapter policy controls ACKs even if an isolated child is faulty."""
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+
+    routed = []
+    nacked = asyncio.Event()
+
+    async def route_inbound(message):
+        routed.append(message)
+
+    class CompletionClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=SourceRegistry(),
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    channel_feature.registry.set_inbound_router(route_inbound)
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CompletionClient)
+    configured_host = {"agent_id": _TEST_AGENT_DID, **host_config}
+
+    async def load_host_config():
+        return configured_host
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    dedupe_key = "telegram:v2:bot:42:update:host-policy"
+    try:
+        await feature.initialize()
+        await feature._client.event_handler(_retryable_telegram_event(dedupe_key))
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+
+        assert routed == []
+        assert feature._client.completions == [
+            (
+                "telegram-polling-nack",
+                {"dedupe_key": dedupe_key, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN},
+            )
+        ]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_inbound_reader_returns_before_cognition_and_nacks_retryable_result(
+    monkeypatch, tmp_path
+):
+    """Cognition can make an outbound channel call without pinning the SDK reader."""
+
+    dedupe_key = "telegram:v2:bot:42:update:reader-free"
+    cognition_started = asyncio.Event()
+    release_cognition = asyncio.Event()
+    retry_completed = asyncio.Event()
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, _message):
+            cognition_started.set()
+            # This is the same data-plane route cognition uses for
+            # ``channels_send``. It must be able to await the child RPC after
+            # the notification reader has already returned to its stream.
+            await feature._channel_adapter.send_message("555", "reply during cognition")
+            await release_cognition.wait()
+            return SimpleNamespace(durably_admitted=False)
+
+    class RetryClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return {"status": "ok", "data": {"message_id": "reply-1"}}
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            retry_completed.set()
+            return {"status": "ok", "http_status": 200, "state": "retrying"}
+
+    channel_feature = ChannelFeature()
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RetryClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        # The notification invocation returns before even a deliberately
+        # blocked cognition turn, freeing its serial reader for outbound RPC
+        # responses and the later provider completion.
+        await asyncio.wait_for(
+            client.event_handler(_retryable_telegram_event(dedupe_key)), timeout=0.1
+        )
+        await asyncio.wait_for(cognition_started.wait(), timeout=1)
+        assert client.calls == [
+            ("telegram_send", {"to": "555", "message": "reply during cognition"})
+        ]
+        assert client.completions == []
+
+        release_cognition.set()
+        await asyncio.wait_for(retry_completed.wait(), timeout=1)
+        assert client.completions == [
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
+    finally:
+        release_cognition.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ack_bearing_ingress_never_acknowledges_legacy_router_fallback(monkeypatch, tmp_path):
+    """A legacy/non-durable ChannelFeature result leaves the provider cursor intact."""
+
+    dedupe_key = "telegram:v2:bot:42:update:201"
+
+    class LegacyChannelFeature:
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=False)
+
+    class AckClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": LegacyChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        await asyncio.sleep(0)
+        assert client.acknowledgements == []
+        assert feature._event_ack_tasks == set()
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ("MISMATCH", "INVALID"))
+async def test_ack_bearing_ingress_nacks_when_channel_source_contract_is_unusable(
+    monkeypatch, tmp_path, state_name
+):
+    """A rejected channel source contract reaches Telegram as a retry, never an ACK."""
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+    from kestrel_sovereign.signals.registry import (
+        RegistrationOutcome,
+        RegistrationState,
+    )
+
+    dedupe_key = f"telegram:v2:bot:42:update:source-{state_name.lower()}"
+    nacked = asyncio.Event()
+    state = getattr(RegistrationState, state_name)
+
+    class SourceRegistry:
+        def register_with_policy(self, _registration, _policy):
+            return RegistrationOutcome(
+                "channel.message", state, "test source contract failure"
+            )
+
+    class RetryClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=SourceRegistry(),
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RetryClient)
+    feature._host_config = {
+        "agent_id": _TEST_AGENT_DID,
+        "enabled": True,
+        "allowed_senders": ["555"],
+    }
+    feature._host_config_loaded = True
+    try:
+        await feature.initialize()
+        assert channel_feature._durable_cognition_registration_failed is True
+        await feature._client.event_handler(_retryable_telegram_event(dedupe_key))
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+        assert feature._client.completions == [
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_retired_source_event_is_rejected_under_traffic_admission(monkeypatch, tmp_path):
+    """A late callback from a retired child cannot route or ACK after replacement."""
+
+    dedupe_key = "telegram:v2:bot:42:update:202"
+    delivered = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    old_client = None
+    try:
+        await feature.initialize()
+        old_client = feature._client
+        # The callback closure still carries old_client, while publication has
+        # moved to the replacement. Identity is checked *inside* admission.
+        replacement = AckClient()
+        feature._client = replacement
+        await old_client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        await asyncio.sleep(0)
+        assert delivered == []
+        assert old_client.acknowledgements == []
+        assert replacement.acknowledgements == []
+    finally:
+        if old_client is not None:
+            await old_client.stop()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypatch, tmp_path):
+    """Sol regression: mutating a queued k1 envelope to k2 cannot redirect delivery/ACK."""
+
+    k1 = "telegram:v2:bot:42:update:203"
+    k2 = "telegram:v2:bot:42:update:204"
+    delivered = []
+    acknowledged = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class AckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            acknowledged.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=AckClient)
+    try:
+        await feature.initialize()
+        event = _acknowledged_telegram_event(k1)
+        await feature._close_traffic_gate()
+        await feature._client.event_handler(event)
+        # This is the caller-owned graph Sol mutated after Core deferred it.
+        event["payload"]["message"]["id"] = k2
+        event["payload"]["message"]["metadata"]["dedupe_key"] = k2
+        event["payload"]["_host_ingress_ack"]["payload"]["dedupe_key"] = k2
+
+        await feature._reopen_traffic_gate()
+        for _ in range(20):
+            if acknowledged:
+                break
+            await asyncio.sleep(0)
+        assert delivered == [k1]
+        assert acknowledged == [
+            (
+                "telegram-polling-ack",
+                {"dedupe_key": k1, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN},
+            )
+        ]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_acknowledged_ingress_exception_nacks_exact_live_callback(
+    monkeypatch, tmp_path
+):
+    """A reopened deferred route failure releases Telegram for redelivery."""
+
+    dedupe_key = "telegram:v2:bot:42:update:deferred-route-failure"
+    nacked = asyncio.Event()
+
+    class FailingChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, _message):
+            raise RuntimeError("cognition route failed")
+
+    class CompletionClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        features={"ChannelFeature": FailingChannelFeature()},
+    )
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CompletionClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await feature._close_traffic_gate()
+        await client.event_handler(_retryable_telegram_event(dedupe_key))
+        await feature._reopen_traffic_gate()
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+        assert client.completions == [
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(monkeypatch, tmp_path):
+    """Sol regression: 1,000 callbacks cannot create a host-memory route queue."""
+
+    release_ack = asyncio.Event()
+    ack_started = asyncio.Event()
+    delivered = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            delivered.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class SlowAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            ack_started.set()
+            await release_ack.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        for update_id in range(1_000):
+            await client.event_handler(
+                _acknowledged_telegram_event(f"telegram:v2:bot:42:update:{1_000 + update_id}")
+            )
+        await asyncio.wait_for(ack_started.wait(), timeout=1)
+        # The serial provider must retain every later update while the first
+        # detached route/ACK owns the source. Core intentionally does not turn
+        # those notifications into 999 unbounded cognition tasks.
+        assert len(delivered) == 1
+        assert len(feature._event_ingress_tasks) == 0
+        assert len(feature._event_ack_tasks) == 1
+        assert feature._non_cursor_event_ingress_queues == []
+        assert len(client.acknowledgements) == 1
+        release_ack.set()
+    finally:
+        release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_inbound_events_drop_across_a_closed_live_transition(
+    monkeypatch, tmp_path
+):
+    """Old non-cursor callbacks never replay after a live gate closes."""
+
+    delivered = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    async def record(message):
+        delivered.append(message["id"])
+        return SimpleNamespace(durably_admitted=True)
+
+    def legacy_event(message_id):
+        return {
+            "type": "channel.inbound",
+            "payload": {"id": message_id, "content": message_id},
+        }
+
+    try:
+        await feature.initialize()
+        client = feature._client
+        feature._route_inbound = record  # type: ignore[method-assign]
+        await feature._close_traffic_gate()
+
+        # Both callbacks originate from the old child while a live transition
+        # owns the closed gate. They must be retired rather than replayed.
+        await client.event_handler(legacy_event("first"))
+        await asyncio.sleep(0)
+        await client.event_handler(legacy_event("second"))
+        assert delivered == []
+
+        await feature._reopen_traffic_gate()
+        await asyncio.sleep(0)
+        assert delivered == []
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_inbound_events_are_serial_and_backpressured_while_gate_open(
+    monkeypatch, tmp_path
+):
+    """Open-gate legacy callbacks retain arrival order without task fan-out."""
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    delivered = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    async def record(message):
+        delivered.append(message["id"])
+        if message["id"] == "first":
+            first_started.set()
+            await release_first.wait()
+        return SimpleNamespace(durably_admitted=True)
+
+    def legacy_event(message_id):
+        return {
+            "type": "channel.inbound",
+            "payload": {"id": message_id, "content": message_id},
+        }
+
+    try:
+        await feature.initialize()
+        feature._route_inbound = record  # type: ignore[method-assign]
+        await feature._client.event_handler(legacy_event("first"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await feature._client.event_handler(legacy_event("second"))
+        assert delivered == ["first"]
+        assert len(feature._event_ingress_tasks) == 1
+        release_first.set()
+        for _ in range(20):
+            if delivered == ["first", "second"]:
+                break
+            await asyncio.sleep(0)
+        assert delivered == ["first", "second"]
+    finally:
+        release_first.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_callbacks_chain_attempt_scoped_completions_per_source(
+    monkeypatch, tmp_path
+):
+    """A second child callback waits for, rather than losing to, a delayed ACK RPC."""
+
+    first_ack_started = asyncio.Event()
+    release_first_ack = asyncio.Event()
+    second_ack_started = asyncio.Event()
+    routed = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            routed.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class DelayedAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            if len(self.acknowledgements) == 1:
+                first_ack_started.set()
+                await release_first_ack.wait()
+            else:
+                second_ack_started.set()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=DelayedAckClient)
+    first_key = "telegram:v2:bot:42:update:completion-one"
+    second_key = "telegram:v2:bot:42:update:completion-two"
+    try:
+        await feature.initialize()
+        client = feature._client
+        first = _acknowledged_telegram_event(first_key)
+        second = _acknowledged_telegram_event(second_key)
+        first["payload"]["_host_ingress_ack"]["payload"]["attempt_token"] = "a" * 43
+        second["payload"]["_host_ingress_ack"]["payload"]["attempt_token"] = "b" * 43
+        # The retry half is still required to authenticate the Telegram pair.
+        first["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = "a" * 43
+        second["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = "b" * 43
+
+        await client.event_handler(first)
+        await asyncio.wait_for(first_ack_started.wait(), timeout=1)
+        # Callback one has completed host routing, but its source RPC remains
+        # in flight. This mirrors the child process receiving the next callback
+        # before its first private RPC response is delivered.
+        await client.event_handler(second)
+        await asyncio.sleep(0)
+        assert routed == [first_key]
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": first_key, "attempt_token": "a" * 43})
+        ]
+
+        release_first_ack.set()
+        await asyncio.wait_for(second_ack_started.wait(), timeout=1)
+        assert routed == [first_key, second_key]
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": first_key, "attempt_token": "a" * 43}),
+            ("telegram-polling-ack", {"dedupe_key": second_key, "attempt_token": "b" * 43}),
+        ]
+        await asyncio.gather(*tuple(feature._event_ack_tasks))
+        assert feature._event_ack_tasks == set()
+    finally:
+        release_first_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_rejected_ack_retries_then_terminally_retires_exact_source(monkeypatch, tmp_path):
+    """A rejected polling ACK retries idempotently, then leaves Telegram's cursor for restart."""
+
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
+    dedupe_key = "telegram:v2:bot:42:update:205"
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class RejectingAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            return {"status": "error", "http_status": 409, "error": "still pending"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RejectingAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        for _ in range(50):
+            if feature._terminal_lifecycle_latched and client.stopped:
+                break
+            await asyncio.sleep(0)
+        assert client.acknowledgements == [
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ] * 3
+        assert feature._terminal_lifecycle_latched is True
+        assert client.stopped is True
+        assert feature._client is None
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_hung_ack_times_out_with_bounded_retries_then_retires_source(
+    monkeypatch, tmp_path
+):
+    """A never-completing ACK is fenced; it cannot retain an unbounded task swarm."""
+
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_TIMEOUT", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_CANCELLATION_GRACE", 0.01)
+    monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
+    dedupe_key = "telegram:v2:bot:42:update:208"
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class HungAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            await asyncio.Event().wait()
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=HungAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await client.event_handler(_acknowledged_telegram_event(dedupe_key))
+        for _ in range(100):
+            if feature._terminal_lifecycle_latched and client.stopped:
+                break
+            await asyncio.sleep(0.01)
+        assert client.acknowledgements == [
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ] * 3
+        assert feature._terminal_lifecycle_latched is True
+        assert client.stopped is True
+        assert feature._event_ack_tasks == set()
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_owner_joins_ack_and_deferred_workers_and_blocks_new_ack(
+    monkeypatch, tmp_path
+):
+    """Terminal success is fenced until both detached ingress worker kinds settle."""
+
+    ack_started = asyncio.Event()
+    release_ack = asyncio.Event()
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            return SimpleNamespace(durably_admitted=True)
+
+    class SlowAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+
+        async def call_host_ingress(self, name, payload=None):
+            ack_started.set()
+            await release_ack.wait()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowAckClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        first = _acknowledged_telegram_event("telegram:v2:bot:42:update:206")
+        await client.event_handler(first)
+        await asyncio.wait_for(ack_started.wait(), timeout=1)
+        await feature._close_traffic_gate()
+        await client.event_handler(_acknowledged_telegram_event("telegram:v2:bot:42:update:207"))
+        for _ in range(20):
+            if feature._deferred_acknowledged_event_tasks:
+                break
+            await asyncio.sleep(0)
+        assert feature._event_ack_tasks
+        assert feature._deferred_acknowledged_event_tasks
+
+        feature._latch_terminal_lifecycle()
+        release_ack.set()
+        await feature._complete_terminal_cleanup()
+        assert feature._event_ack_tasks == set()
+        assert feature._deferred_acknowledged_event_tasks == set()
+        request = feature._event_ingress_acknowledgement(first)
+        assert request is not None
+        feature._schedule_event_ingress_acknowledgement(client, request)
+        assert feature._event_ack_tasks == set()
+        assert client.stopped is True
+    finally:
+        release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_exact_lifecycle_rpc_bypasses_closed_data_plane_and_waits_for_drain(
+    monkeypatch, tmp_path
+):
+    """A slow already-admitted send cannot consume Core's quiesce lifecycle budget."""
+
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+    lifecycle_calls = []
+
+    class SlowToolClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("external-ingress-quiesce", "external-ingress-resume")
+            )
+
+        async def call_tool(self, name, args):
+            tool_started.set()
+            await release_tool.wait()
+            return {"echo": args}
+
+        async def call_host_ingress(self, name, payload=None):
+            lifecycle_calls.append((name, payload))
+            state = "quiesced" if name == "external-ingress-quiesce" else "resumed"
+            return {"status": "ok", "http_status": 200, "state": state}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=SlowToolClient)
+    tool_task = None
+    try:
+        await feature.initialize()
+        tool_task = asyncio.create_task(feature.call_isolated_tool("ping", {}))
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        quiesce = feature._new_external_ingress_quiesce()
+        assert quiesce is not None
+        await feature._close_traffic_gate_admission()
+        assert await asyncio.wait_for(feature._quiesce_external_ingress(quiesce), timeout=1) is None
+        assert not tool_task.done()
+        assert lifecycle_calls == [
+            ("external-ingress-quiesce", {"transition_id": quiesce.transition_id})
+        ]
+        release_tool.set()
+        await tool_task
+        await feature._drain_traffic_gate()
+        await feature._resume_external_ingress(quiesce)
+        await feature._reopen_traffic_gate()
+    finally:
+        release_tool.set()
+        if tool_task is not None and not tool_task.done():
+            await tool_task
         await feature.shutdown()
 
 

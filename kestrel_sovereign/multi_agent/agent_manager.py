@@ -13,6 +13,9 @@ import asyncio
 import inspect
 import logging
 import os
+import sys
+import time
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -28,6 +31,7 @@ from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.spawn.delegated_wallet import (
     _default_currency_for,
     create_delegated_wallet,
+    has_durable_delegated_child_wallet_provisioning_contract,
     release_delegated_wallet,
 )
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
@@ -42,6 +46,20 @@ from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
 
+_QUARANTINED_SHUTDOWN_HISTORY_LIMIT = 128
+_UNSAFE_QUARANTINED_FAILURE_LIMIT = 128
+_UNSAFE_REMOVAL_BUDGET_RELEASE_FAILURE_LIMIT = 128
+_QUARANTINED_METADATA_TEXT_LIMIT = 256
+
+
+def _bounded_shutdown_metadata(value: object) -> str:
+    """Keep operator-visible quarantine metadata safe and bounded."""
+
+    text = str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")
+    if len(text) > _QUARANTINED_METADATA_TEXT_LIMIT:
+        return text[: _QUARANTINED_METADATA_TEXT_LIMIT - 1] + "…"
+    return text
+
 
 @dataclass(frozen=True)
 class A2AHostedPolicy:
@@ -54,6 +72,89 @@ class A2AHostedPolicy:
     authorizer: object
     router: object
     requester: object
+
+
+@dataclass
+class QuarantinedShutdownReaper:
+    """Observable ownership record for cleanup that outlived agent removal.
+
+    The control plane has already withdrawn this generation from routing and
+    fenced any delegated budget.  The reaper retains an exact shutdown or
+    refund task, so durable storage and a blocked spend/refund cannot be
+    reclaimed or garbage-collected underneath cancellation-resistant work.
+    """
+
+    reaper_id: str
+    agent_name: str
+    canonical_agent_name: str
+    agent_id: str
+    task: "asyncio.Future[object]"
+    started_monotonic: float
+    completed_monotonic: Optional[float] = None
+    failure: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class QuarantinedShutdownHistory:
+    """Bounded, metadata-only outcome retained after a cleanup task settles."""
+
+    reaper_id: str
+    agent_name: str
+    canonical_agent_name: str
+    agent_id: str
+    started_monotonic: float
+    completed_monotonic: float
+    failure: Optional[str]
+
+
+@dataclass
+class InflightRemovalBudgetRelease:
+    """One ordinary delegated-budget release admitted before a terminal drain."""
+
+    release_id: str
+    child_name: str
+    task: "asyncio.Future[object]"
+    started_monotonic: float
+
+
+@dataclass(frozen=True)
+class UnsafeRemovalBudgetReleaseFailure:
+    """Bounded, acknowledgeable evidence that an ordinary refund failed."""
+
+    release_id: str
+    child_name: str
+    started_monotonic: float
+    completed_monotonic: float
+    failure: str
+
+
+@dataclass
+class AgentOperationAdmission:
+    """One named create/load/spawn operation that owns publication or rollback.
+
+    A routing name is a single-writer resource.  The operation that reserves it
+    owns every initialized result until it either publishes that exact result or
+    shuts it down.  Spawn operations extend the same ownership through their
+    budget and mandate commit, which gives a terminal fleet shutdown one
+    joinable boundary instead of a best-effort ``_pending_spawns`` count.
+    """
+
+    name: str
+    canonical_name: str
+    kind: str
+    registration_epoch: int
+    owner_task: "asyncio.Task[object] | None"
+    spawn_task: "asyncio.Future[object] | None" = None
+    child: Optional[KestrelAgent] = None
+    # Publication and spawn-governance commits are deliberately separate.  A
+    # spawned child is routable after create/load, but its spawning operation
+    # still owns it until the parent relationship and budget commit below.
+    published: bool = False
+    committed: bool = False
+    # A ``remove_agent(False)`` rollback inspection found this operation's
+    # child or hold still live.  The public spawn tail must not let a later
+    # cancellation overwrite the rollback failure with a bare cancellation.
+    rollback_incomplete: bool = False
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -135,6 +236,18 @@ def _has_shutdown_completion_contract(agent: object) -> bool:
     )
 
 
+def _has_shutdown_reaper_handoff_contract(agent: object) -> bool:
+    """Whether an agent can safely retain its own timed-out shutdown task.
+
+    Only the concrete agent lifecycle supplies this contract.  Looking on the
+    class avoids accidentally treating a ``MagicMock``-fabricated attribute as
+    proof that an arbitrary test/legacy object can keep its durable storage
+    alive after the manager withdraws it from routing.
+    """
+
+    return callable(getattr(type(agent), "handoff_shutdown_to_reaper", None))
+
+
 def _loaded_agent_did(agent: object) -> Optional[str]:
     """Return a concrete agent DID without trusting a dynamic test proxy."""
 
@@ -153,7 +266,14 @@ class AgentManager:
     and its own storage (SQLite file or Postgres with agent_id isolation).
     """
 
-    def __init__(self, base_data_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        base_data_dir: Optional[Path] = None,
+        *,
+        hosted_telegram_route_attestation_resolver_factory: Optional[
+            Callable[[str, str, LocalAgentConfig], object]
+        ] = None,
+    ):
         self._agents: dict[str, KestrelAgent] = {}
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
@@ -162,6 +282,11 @@ class AgentManager:
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = base_data_dir or Path.cwd()
+        # Host-owned, agent-scoped Telegram route evidence is injected before
+        # feature initialization. No request payload can select this resolver.
+        self._hosted_telegram_route_attestation_resolver_factory = (
+            hosted_telegram_route_attestation_resolver_factory
+        )
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -172,6 +297,82 @@ class AgentManager:
         self._a2a_lifecycle_lock = AsyncReaderWriterLock()
         self._a2a_policy_generation = 0
         self._a2a_hosted_policies: dict[str, A2AHostedPolicy] = {}
+        # Registration captures the current epoch before initialization and
+        # verifies it again while publishing, so an initializer that races a
+        # fleet shutdown can never publish after the shutdown sweep observed
+        # an empty fleet.  This is intentionally separate from the temporary
+        # reaper-handoff seal below: it fences publication for one fleet sweep
+        # without changing the manager's established reuse semantics.
+        self._agent_registration_shutdown_epoch = 0
+        self._agent_registration_sealed = False
+        # Name admission is intentionally independent of published routing.
+        # ``_agents`` cannot represent a create/load that has entered inception
+        # or feature initialization, so using it as the duplicate guard lets
+        # two same-name operations initialize independently and the loser
+        # overwrite the winner's routing/reverse mapping.  The admission stays
+        # owned until publication or terminal rollback completes.
+        self._agent_operations: dict[str, AgentOperationAdmission] = {}
+        # A timed-out agent is no longer routable, but its exact shutdown task
+        # may still own an active durable cognition delivery and its storage.
+        # Retain those tasks independently of ``_agents`` so removal/restart
+        # has a finite control-plane bound without abandoning durable state.
+        self._quarantined_shutdown_reapers: dict[str, QuarantinedShutdownReaper] = {}
+        # Completed asyncio tasks retain their coroutine frames and exception
+        # tracebacks. Keep only bounded metadata after either safe completion
+        # or an unsafe failure; active cleanup alone owns a live task.
+        self._quarantined_shutdown_history: deque[QuarantinedShutdownHistory] = deque(
+            maxlen=_QUARANTINED_SHUTDOWN_HISTORY_LIMIT
+        )
+        # Unsafe outcomes remain operator-visible until explicit process/host
+        # remediation, but retain only strings/timestamps — never the finished
+        # task or its traceback-bearing coroutine frame.
+        self._unsafe_quarantined_shutdown_failures: dict[
+            str, QuarantinedShutdownHistory
+        ] = {}
+        self._unsafe_quarantined_shutdown_failure_evictions = 0
+        self._unsafe_quarantined_shutdown_failure_evictions_acknowledged_through = 0
+        # The bounded failure history can evict individual unsafe records.
+        # Once that happens, retaining every evicted routing name would itself
+        # be unbounded.  Reserve *all* reuse until aggregate eviction evidence
+        # is acknowledged instead: this is deliberately conservative, but it
+        # is fixed-size and cannot silently reuse a name whose exact unsafe
+        # cleanup evidence was discarded.
+        self._unsafe_quarantined_shutdown_failure_overflow_reserved = False
+        self._next_shutdown_reaper_id = 0
+        # Ordinary stop-then-release cleanup is normally joined by the DELETE
+        # that started it.  It still becomes removal-owned work immediately
+        # after routing withdrawal, however, so a concurrent terminal drain
+        # must be able to join it too.  Keep active tasks only until they
+        # settle, but retain bounded metadata for an unsafe result: a release
+        # can fail while a drain is blocked acquiring ``_lock`` and must not
+        # become an implicit terminal success before that drain linearizes.
+        self._inflight_removal_budget_releases: dict[
+            str, InflightRemovalBudgetRelease
+        ] = {}
+        # This is the admission index.  Every owner that reaches a release for
+        # one child while ``_lock`` is held must receive this *exact* task;
+        # starting a second refund while the first override is suspended can
+        # otherwise credit the same delegated allocation twice.
+        self._inflight_removal_budget_releases_by_child: dict[
+            str, InflightRemovalBudgetRelease
+        ] = {}
+        self._unsafe_removal_budget_release_failures: dict[
+            str, UnsafeRemovalBudgetReleaseFailure
+        ] = {}
+        self._unsafe_removal_budget_release_failure_evictions = 0
+        self._unsafe_removal_budget_release_failure_evictions_acknowledged_through = (
+            0
+        )
+        self._next_removal_budget_release_id = 0
+        # A quarantined reaper is normally an intentional escape hatch for a
+        # bounded single-agent DELETE. A terminal drain temporarily seals all
+        # removal-cleanup admissions so every reaper *and ordinary budget
+        # release* admitted before its linearization point is visible to that
+        # drain. The separate drain lock makes that temporary seal exclusive:
+        # one drain cannot reopen admissions beneath another drain that still
+        # owns the terminal boundary.
+        self._quarantined_shutdown_handoffs_sealed = False
+        self._quarantined_shutdown_drain_lock = asyncio.Lock()
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
         # port is taken by the HOST" without starving every port below it.
@@ -774,6 +975,13 @@ class AgentManager:
         # across every agent, so ``KESTREL_DB_PATH`` cannot name each agent's
         # directory and usage rows would all land in one agent's DB (#2769).
         llm_service = LLMService(agent_data_dir=resolved_dir)
+        hosted_telegram_resolver = None
+        if self._hosted_telegram_route_attestation_resolver_factory is not None:
+            hosted_telegram_resolver = (
+                self._hosted_telegram_route_attestation_resolver_factory(
+                    name, agent_did, config
+                )
+            )
 
         # Build allowed_features set from config (None = load all)
         allowed_features = set(config.features) if config.features is not None else None
@@ -850,6 +1058,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     allowed_features=allowed_features,
+                    hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
@@ -868,6 +1077,7 @@ class AgentManager:
                     storage_path=db_path,
                     llm_service=llm_service,
                     allowed_features=allowed_features,
+                    hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
@@ -995,15 +1205,132 @@ class AgentManager:
         # live. Lightweight test doubles do not expose this contract.
         if _has_shutdown_completion_contract(agent):
             cancelled = await await_agent_shutdown_completion(agent) or cancelled
-        if rollback_failure is not None:
-            raise rollback_failure
         if cancelled:
             raise asyncio.CancelledError()
+        if rollback_failure is not None:
+            raise rollback_failure
+
+    def _withdraw_initialized_agent(self, name: str, agent: KestrelAgent) -> None:
+        """Synchronously withdraw one initialized result from published state.
+
+        Callers that are withdrawing a result which was ever published must
+        hold ``_a2a_lifecycle_lock``.  The no-publication cleanup path owns the
+        result privately, so it can use the same one source of truth without a
+        lifecycle lease.  Shutdown intentionally remains outside this method:
+        it can run arbitrary slow cleanup only after topology is no longer
+        observable.
+        """
+
+        self._revoke_a2a_hosted_policy(agent)
+        if self._agents.get(name) is agent:
+            self._agents.pop(name, None)
+        agent_id = _loaded_agent_did(agent)
+        if agent_id is not None and self._agent_names.get(agent_id) == name:
+            self._agent_names.pop(agent_id, None)
+
+    async def _discard_unpublished_initialized_agent(
+        self, name: str, agent: KestrelAgent
+    ) -> None:
+        """Withdraw and clean up one initialized agent that never committed.
+
+        A dynamic scheduler registration deliberately remains private until
+        host onboarding commits.  This method is therefore the one cleanup
+        owner for every initialized result that cannot be published, whether
+        publication was rejected, onboarding failed, or cancellation arrived
+        while waiting for the A2A lifecycle writer.
+        """
+
+        self._withdraw_initialized_agent(name, agent)
+        await self._shutdown_unregistered_agent(name, agent)
+
+    async def _discard_unpublished_initialized_agents(
+        self,
+        agents: list[tuple[str, KestrelAgent]],
+        *,
+        already_withdrawn: bool = False,
+    ) -> bool:
+        """Finish cleanup for every unpublished initialization despite cancel.
+
+        A batch load can have several fully initialized agents waiting behind
+        the A2A lifecycle writer.  Run each cleanup in its own owned task and
+        join every one through the lifecycle helper, so cancelling the batch
+        cannot strand either an invisible agent or its pending scheduler
+        registration.  Returns whether the caller observed cancellation after
+        all cleanup reached a terminal result.
+        """
+
+        cleanup = (
+            self._shutdown_unregistered_agent
+            if already_withdrawn
+            else self._discard_unpublished_initialized_agent
+        )
+        cleanup_tasks = [
+            asyncio.create_task(
+                cleanup(name, agent),
+                name=f"agent_unpublished_cleanup:{name}",
+            )
+            for name, agent in agents
+        ]
+        cancelled = False
+        failures: list[Exception] = []
+        fatal: Optional[BaseException] = None
+        for cleanup_task in cleanup_tasks:
+            cleanup_cancelled, cleanup_failure = (
+                await await_lifecycle_task_completion(cleanup_task)
+            )
+            cancelled = cancelled or cleanup_cancelled
+            if cleanup_failure is None:
+                continue
+            if isinstance(cleanup_failure, asyncio.CancelledError):
+                cancelled = True
+            elif isinstance(cleanup_failure, Exception):
+                failures.append(cleanup_failure)
+            elif fatal is None:
+                fatal = cleanup_failure
+        # The cleanup tasks are now terminal, so preserve the caller's
+        # cancellation in preference to any cleanup error.  Otherwise a batch
+        # onboarding failure can turn a later cancellation into an apparently
+        # ordinary startup failure after it already completed all cleanup.
+        if cancelled:
+            raise asyncio.CancelledError()
+        if fatal is not None:
+            raise fatal
+        if failures:
+            raise ExceptionGroup(
+                "One or more unpublished initialized agents failed to clean up",
+                failures,
+            )
+        return False
 
     def _register_agent(self, name: str, agent: KestrelAgent) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
+        agent_id = _loaded_agent_did(agent)
+        if not isinstance(agent_id, str) or not agent_id:
+            raise RuntimeError(
+                f"Cannot publish agent {name!r} without a concrete agent DID"
+            )
+        # The operation admission normally proves these are absent.  Keep the
+        # publication seam defensive too: callers/tests may construct manager
+        # state directly, and routing must never overwrite a different live
+        # name or reverse DID binding.
+        existing_name = next(
+            (
+                routing_name
+                for routing_name in self._agents
+                if routing_name.casefold() == name.casefold()
+            ),
+            None,
+        )
+        if existing_name is not None and self._agents[existing_name] is not agent:
+            raise ValueError(f"Agent '{name}' already exists")
+        bound_name = self._agent_names.get(agent_id)
+        if bound_name is not None and bound_name != name:
+            raise RuntimeError(
+                "Cannot publish an agent DID already routed under a different "
+                f"name: {agent_id!r} -> {bound_name!r}"
+            )
         self._agents[name] = agent
-        self._agent_names[agent.agent_id] = name
+        self._agent_names[agent_id] = name
         # Publish the registered routing key as the human display name so the
         # observability emitter (and any other consumer) attributes events to
         # the real agent name instead of falling back to "unknown" (#2461).
@@ -1025,6 +1352,306 @@ class AgentManager:
         # each agent sees agents registered after it.
         agent._cohosted_agents_provider = lambda: list(self._agents.values())
         logger.info(f"Loaded agent '{name}' (DID: {agent.agent_id[:30]}...)")
+
+    @staticmethod
+    def _canonical_agent_name(name: str) -> str:
+        """Return the sole identity used for case-insensitive name admission."""
+
+        return name.casefold()
+
+    def _quarantined_cleanup_name_is_reserved(self, canonical_name: str) -> bool:
+        """Whether active or unsafe quarantined cleanup owns this name.
+
+        A completed *successful* reaper is only operational history.  A
+        failed/cancelled reaper is different: its storage and, for delegated
+        children, its hold can require a later explicit remediation.  Keep the
+        exact case-insensitive routing identity unavailable until that unsafe
+        outcome is acknowledged.  If bounded history has evicted any unsafe
+        record, the aggregate overflow reservation blocks every name until its
+        explicit acknowledgement rather than retaining an unbounded name set.
+        """
+
+        retained_name_key = _bounded_shutdown_metadata(canonical_name)
+        return (
+            any(
+                record.canonical_agent_name == retained_name_key
+                for record in self._quarantined_shutdown_reapers.values()
+            )
+            or any(
+                record.canonical_agent_name == retained_name_key
+                for record in self._unsafe_quarantined_shutdown_failures.values()
+            )
+            or self._unsafe_quarantined_shutdown_failure_overflow_reserved
+        )
+
+    def _retained_child_tracking_name_is_reserved(
+        self, canonical_name: str
+    ) -> bool:
+        """Whether an unpruned mandate or parent edge still owns this name."""
+
+        return any(
+            self._canonical_agent_name(child_name) == canonical_name
+            for child_name in self._child_mandates
+        ) or any(
+            self._canonical_agent_name(child_name) == canonical_name
+            for children in self._parent_children.values()
+            for child_name in children
+        )
+
+    async def _admit_agent_operation(
+        self, name: str, *, kind: str
+    ) -> tuple[AgentOperationAdmission, bool]:
+        """Reserve ``name`` through one operation's publish/rollback boundary.
+
+        The returned boolean says whether this caller created the reservation.
+        Nested create -> load calls made by the same task borrow their parent's
+        admission; a second task is rejected before it can initialize or write
+        inception data.  Lock order matches removal (A2A lifecycle then state)
+        so the admission and shutdown epoch form one linearizable boundary.
+        """
+
+        canonical_name = self._canonical_agent_name(name)
+        owner_task = asyncio.current_task()
+        async with self._a2a_lifecycle_lock:
+            if self._agent_registration_sealed:
+                raise RuntimeError(
+                    "Refusing agent registration because the manager is shutting down"
+                )
+            async with self._lock:
+                # Re-check after the state-lock await because shutdown seals
+                # without awaiting the A2A writer (to avoid drain deadlocks).
+                if self._agent_registration_sealed:
+                    raise RuntimeError(
+                        "Refusing agent registration because the manager is shutting down"
+                    )
+                admitted = self._agent_operations.get(canonical_name)
+                if admitted is not None:
+                    if admitted.owner_task is owner_task:
+                        if (
+                            admitted.registration_epoch
+                            != self._agent_registration_shutdown_epoch
+                        ):
+                            # Reopening the manager admits only work that
+                            # begins after the completed shutdown.  A nested
+                            # create -> load from an older operation must not
+                            # treat that reopen as permission to initialize a
+                            # new runtime around persisted identity data.
+                            raise RuntimeError(
+                                "Refusing agent registration because this operation "
+                                "began before manager shutdown"
+                            )
+                        return admitted, False
+                    raise ValueError(
+                        f"Agent '{name}' is already being initialized or created"
+                    )
+                existing_name = next(
+                    (
+                        routing_name
+                        for routing_name in self._agents
+                        if routing_name.casefold() == canonical_name
+                    ),
+                    None,
+                )
+                if existing_name is not None:
+                    raise ValueError(f"Agent '{name}' already exists")
+                # A failed quarantined refund restores this exact allocation so
+                # an operator can retry safely.  Reusing its name for a new
+                # identity before that cleanup resolves would make restoration
+                # ambiguous and could attach an old hold to a new child.
+                unresolved_hold_name = next(
+                    (
+                        child_name
+                        for child_name in self._child_budgets
+                        if self._canonical_agent_name(child_name) == canonical_name
+                    ),
+                    None,
+                )
+                if unresolved_hold_name is not None:
+                    raise RuntimeError(
+                        f"Agent '{name}' has an unresolved delegated budget cleanup"
+                    )
+                # A bounded DELETE may already have withdrawn this name while
+                # a quarantined reaper owns its storage or a fenced delegated
+                # refund.  The hold is temporarily absent while that reaper
+                # runs, so ``_child_budgets`` alone has a gap in which a new
+                # same-name create could race a failed refund restoration.
+                # Keep the routing name unavailable until the exact reaper
+                # settles; on failure the restored hold then continues the
+                # reservation until an explicit safe retry succeeds.
+                if self._quarantined_cleanup_name_is_reserved(canonical_name):
+                    raise RuntimeError(
+                        f"Agent '{name}' has unresolved quarantined cleanup"
+                    )
+                # Successful quarantine retires its task record before the
+                # terminal drain reconciles the deliberately retained parent
+                # edge and mandate.  Keep that tracking authoritative during
+                # the callback-to-reconciliation gap so a new same-name child
+                # cannot inherit the old relationship.
+                if self._retained_child_tracking_name_is_reserved(canonical_name):
+                    raise RuntimeError(
+                        f"Agent '{name}' has retained child lifecycle tracking"
+                    )
+                admission = AgentOperationAdmission(
+                    name=name,
+                    canonical_name=canonical_name,
+                    kind=kind,
+                    registration_epoch=self._agent_registration_shutdown_epoch,
+                    owner_task=owner_task,
+                )
+                self._agent_operations[canonical_name] = admission
+                return admission, True
+
+    async def _release_agent_operation(
+        self, admission: AgentOperationAdmission
+    ) -> None:
+        """Release an operation's name only after its owner reached a terminal state.
+
+        This is itself a terminal ownership handoff.  A cancelled caller can
+        otherwise be interrupted while waiting for the state lock and strand a
+        completed admission forever.  Keep an owned
+        release task and join it through the common lifecycle contract.
+        """
+
+        async def release() -> None:
+            # Operation admission is state-only after its owner reaches a
+            # terminal result.  Do not reacquire the A2A writer here: callers
+            # may already be waiting for an admission that is blocked behind a
+            # writer they deliberately hold (for example, cancellation while
+            # publication is queued).  Taking it again would turn that normal
+            # ownership handoff into a re-entrancy deadlock.
+            async with self._lock:
+                if (
+                    self._agent_operations.get(admission.canonical_name)
+                    is admission
+                ):
+                    self._agent_operations.pop(admission.canonical_name, None)
+
+        release_task = asyncio.create_task(
+            release(), name=f"agent_operation_release:{admission.canonical_name}"
+        )
+        cancelled, failure = await await_lifecycle_task_completion(release_task)
+        if failure is not None:
+            raise failure
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def _settle_owned_lifecycle_tasks(
+        self,
+        tasks: list["asyncio.Future[object]"],
+        *,
+        description: str,
+    ) -> bool:
+        """Join every owned task before reporting cancellation or failures.
+
+        A caller's cancellation must not make a later owner invisible merely
+        because an earlier join observed it first.  Each task is independently
+        cancellation-safe, and this collector preserves that same terminal
+        boundary for a group of related lifecycle owners.  Cancellation wins
+        only after all work has settled; otherwise every terminal failure is
+        retained in one group rather than dropping failures after the first.
+        """
+
+        cancelled = False
+        failures: list[BaseException] = []
+        for task in tasks:
+            task_cancelled, failure = await await_lifecycle_task_completion(task)
+            cancelled = cancelled or task_cancelled
+            if failure is None:
+                continue
+            if isinstance(failure, asyncio.CancelledError):
+                cancelled = True
+            else:
+                failures.append(failure)
+        if cancelled:
+            return True
+        if failures:
+            raise BaseExceptionGroup(description, failures)
+        return False
+
+    async def _release_agent_operations(
+        self, admissions: list[AgentOperationAdmission]
+    ) -> bool:
+        """Retire every admission before returning any observed cancellation."""
+
+        releases = [
+            asyncio.create_task(
+                self._release_agent_operation(admission),
+                name=f"agent_operation_final_release:{admission.canonical_name}",
+            )
+            for admission in admissions
+        ]
+        return await self._settle_owned_lifecycle_tasks(
+            releases,
+            description="One or more agent operation admissions failed to release",
+        )
+
+    async def _retire_spawn_slot_and_admission(
+        self,
+        admission: AgentOperationAdmission,
+        *,
+        spawn_slot_admitted: bool,
+    ) -> bool:
+        """Retire a spawn's cap slot and name admission as one terminal tail."""
+
+        async def retire_spawn_slot() -> None:
+            if not spawn_slot_admitted:
+                return
+            async with self._lock:
+                self._pending_spawns -= 1
+
+        tasks: list["asyncio.Future[object]"] = [
+            asyncio.create_task(
+                self._release_agent_operation(admission),
+                name=f"agent_operation_final_release:{admission.canonical_name}",
+            )
+        ]
+        if spawn_slot_admitted:
+            tasks.append(
+                asyncio.create_task(
+                    retire_spawn_slot(),
+                    name=f"spawn_slot_retirement:{admission.canonical_name}",
+                )
+            )
+        return await self._settle_owned_lifecycle_tasks(
+            tasks,
+            description="One or more spawn lifecycle owners failed to retire",
+        )
+
+    def _operation_is_admitted(self, admission: AgentOperationAdmission) -> bool:
+        """Whether a named operation may still publish or commit state.
+
+        The caller must hold ``_a2a_lifecycle_lock``.  Checking at publication
+        rather than only before initialization closes the interval in which a
+        slow load could otherwise publish just after ``shutdown_all`` finishes.
+        """
+
+        return (
+            self._agent_operations.get(admission.canonical_name) is admission
+            and not self._agent_registration_sealed
+            and admission.registration_epoch == self._agent_registration_shutdown_epoch
+        )
+
+    def _seal_agent_registration_for_shutdown_all(self) -> None:
+        """Fence publications that overlap the current fleet shutdown."""
+
+        # Publishing is serialized by ``_a2a_lifecycle_lock``, but a normal
+        # removal deliberately holds that writer while joining an ordinary
+        # refund.  Waiting for it here would deadlock the terminal drain that
+        # must join the same refund.  This state transition itself has no
+        # await point, so it is atomic on the manager's event loop; each
+        # publisher still verifies it while holding the A2A lifecycle writer.
+        if not self._agent_registration_sealed:
+            self._agent_registration_sealed = True
+            self._agent_registration_shutdown_epoch += 1
+
+    def _reopen_agent_registration_after_shutdown_all(self) -> None:
+        """Allow registrations that begin only after the fleet sweep returns."""
+
+        # This runs without an await point immediately before the caller
+        # releases the terminal-drain lock and returns.  A task that began
+        # before the sweep still has the previous epoch and remains fenced;
+        # one that begins afterward observes the new epoch normally.
+        self._agent_registration_sealed = False
 
     async def load_agent(
         self,
@@ -1078,36 +1705,72 @@ class AgentManager:
                         f"the claimed DID {expected_agent_id!r}"
                     )
                 return existing
-        agent = await self._initialize_agent(
-            name,
-            config,
-            scheduler_lifecycle_lock_held=scheduler_lifecycle_lock_held,
+        admission, owns_admission = await self._admit_agent_operation(
+            name, kind="load"
         )
-        actual_agent_id = _loaded_agent_did(agent)
-        if (
-            expected_agent_id is not None
-            and actual_agent_id != expected_agent_id
-        ):
-            await self._shutdown_unregistered_agent(name, agent)
-            raise RuntimeError(
-                "Refusing hosted scheduler cold wake: initialized agent DID "
-                f"{actual_agent_id!r} does not match claimed DID "
-                f"{expected_agent_id!r}"
+        try:
+            agent = await self._initialize_agent(
+                name,
+                config,
+                scheduler_lifecycle_lock_held=scheduler_lifecycle_lock_held,
             )
-        async with self._a2a_lifecycle_lock:
-            self._register_agent(name, agent)
-            try:
-                await self._on_agent_registered(name, agent)
-                self._commit_dynamic_scheduler_registration(agent)
-            except BaseException:
-                # An agent without app-owned A2A/route/asset onboarding must
-                # never remain routable after a cold wake failure.
-                self._revoke_a2a_hosted_policy(agent)
-                self._agents.pop(name, None)
-                self._agent_names.pop(actual_agent_id or agent.agent_id, None)
+            actual_agent_id = _loaded_agent_did(agent)
+            if (
+                expected_agent_id is not None
+                and actual_agent_id != expected_agent_id
+            ):
                 await self._shutdown_unregistered_agent(name, agent)
+                raise RuntimeError(
+                    "Refusing hosted scheduler cold wake: initialized agent DID "
+                    f"{actual_agent_id!r} does not match claimed DID "
+                    f"{expected_agent_id!r}"
+                )
+            committed = False
+            withdrawn_after_onboarding_failure = False
+            try:
+                async with self._a2a_lifecycle_lock:
+                    if not self._operation_is_admitted(admission):
+                        raise RuntimeError(
+                            "Refusing agent registration because the manager is shutting down"
+                        )
+                    try:
+                        self._register_agent(name, agent)
+                        await self._on_agent_registered(name, agent)
+                        self._commit_dynamic_scheduler_registration(agent)
+                    except BaseException:
+                        # The registration hook can install hosted A2A policy
+                        # and app routes before it reports failure.  Withdraw
+                        # that partial publication *while this same writer is
+                        # still held*, then perform the potentially slow agent
+                        # shutdown below.  Releasing the writer first lets an
+                        # inbound reader observe a rejected recipient or lets a
+                        # DELETE claim a second shutdown owner.
+                        self._withdraw_initialized_agent(name, agent)
+                        withdrawn_after_onboarding_failure = True
+                        raise
+                    committed = True
+                    admission.published = True
+                return agent
+            except BaseException:
+                if not committed:
+                    cleanup_cancelled = (
+                        await self._discard_unpublished_initialized_agents(
+                            [(name, agent)],
+                            already_withdrawn=withdrawn_after_onboarding_failure,
+                        )
+                    )
+                    if cleanup_cancelled:
+                        raise asyncio.CancelledError()
                 raise
-        return agent
+        finally:
+            if owns_admission:
+                release_cancelled = await self._release_agent_operations([admission])
+                # Once the agent is fully published, returning cancellation
+                # would report failure while leaving a live agent and a config
+                # handoff that the caller may never persist. The admission is
+                # now terminal, so retain the successful return instead.
+                if release_cancelled and not admission.published:
+                    raise asyncio.CancelledError()
 
     async def load_from_config(self, config: MultiAgentConfig) -> int:
         """Load all autostart agents from a MultiAgentConfig.
@@ -1144,106 +1807,219 @@ class AgentManager:
                 continue
             pending.append((name, agent_cfg))
 
-        # Agent storage, provider construction, and feature initialization are
-        # independent. Run them concurrently, then register successful results
-        # in config order so the UI/fleet order remains stable across boots.
-        init_slots = asyncio.Semaphore(self._init_concurrency)
-
-        async def _bounded_initialize(name, agent_cfg):
-            async with init_slots:
-                return await self._initialize_agent(name, agent_cfg)
-
-        init_tasks = [
-            asyncio.create_task(_bounded_initialize(name, agent_cfg))
-            for name, agent_cfg in pending
-        ]
+        # Admit every configured name before running concurrent initialization.
+        # Each admission is held by this batch task until the exact result has
+        # either published or completed its single cleanup attempt.  That makes
+        # a concurrent dynamic create/load fail before duplicate initialization.
+        admitted: list[tuple[str, LocalAgentConfig, AgentOperationAdmission]] = []
         try:
-            results = await asyncio.gather(*init_tasks, return_exceptions=True)
-        except BaseException:
-            # ``gather`` cancellation cancels pending initializers, whose own
-            # cleanup handles partially-built agents. Initializers that already
-            # returned successfully are not registered yet and need explicit
-            # teardown because shutdown_all() cannot see them.
-            settled = await asyncio.gather(*init_tasks, return_exceptions=True)
-            await asyncio.gather(
-                *(
-                    self._shutdown_unregistered_agent(name, result)
-                    for (name, _), result in zip(pending, settled)
-                    if not isinstance(result, BaseException)
-                ),
-                return_exceptions=True,
-            )
-            raise
-
-        fatal = next(
-            (
-                result
-                for result in results
-                if isinstance(result, BaseException)
-                and not isinstance(result, Exception)
-            ),
-            None,
-        )
-        if fatal is not None:
-            await asyncio.gather(
-                *(
-                    self._shutdown_unregistered_agent(name, result)
-                    for (name, _), result in zip(pending, results)
-                    if not isinstance(result, BaseException)
-                ),
-                return_exceptions=True,
-            )
-            raise fatal
-
-        for (name, _), result in zip(pending, results):
-            if isinstance(result, BaseException):
-                e = result
-                if isinstance(e, IdentityReadinessError):
-                    logger.error(
-                        "Failed to load agent '%s': %s "
-                        "(code=%s, cause_type=%s)",
-                        name,
-                        e,
-                        e.error_code,
-                        e.cause_type,
-                    )
-                else:
-                    logger.error(
-                        f"Failed to load agent '{name}': {e}",
-                        exc_info=(type(e), e, e.__traceback__),
-                    )
-                self._init_failures.append((name, e))
-                continue
-            async with self._a2a_lifecycle_lock:
-                self._register_agent(name, result)
+            for name, agent_cfg in pending:
                 try:
-                    await self._on_agent_registered(name, result)
-                    self._commit_dynamic_scheduler_registration(result)
-                except asyncio.CancelledError:
-                    self._revoke_a2a_hosted_policy(result)
-                    self._agents.pop(name, None)
-                    self._agent_names.pop(_loaded_agent_did(result), None)
-                    await self._shutdown_unregistered_agent(name, result)
-                    raise
-                except Exception as exc:
-                    # Host onboarding is part of successful registration.  A
-                    # feature-route/A2A failure must not leave an agent
-                    # published without the host capabilities every sibling
-                    # receives.
-                    self._revoke_a2a_hosted_policy(result)
-                    self._agents.pop(name, None)
-                    self._agent_names.pop(_loaded_agent_did(result), None)
-                    await self._shutdown_unregistered_agent(name, result)
-                    logger.error(
-                        "Failed to onboard agent %r after initialization: %s",
-                        name,
-                        exc,
-                        exc_info=True,
+                    admission, owns_admission = await self._admit_agent_operation(
+                        name, kind="batch-load"
                     )
+                    assert owns_admission
+                except Exception as exc:
+                    logger.error("Failed to admit configured agent %r: %s", name, exc)
                     self._init_failures.append((name, exc))
                     continue
-            loaded += 1
-        return loaded
+                admitted.append((name, agent_cfg, admission))
+
+            # Agent storage, provider construction, and feature initialization
+            # are independent. Run them concurrently, then register successful
+            # results in config order so UI/fleet order remains stable.
+            init_slots = asyncio.Semaphore(self._init_concurrency)
+
+            async def _bounded_initialize(name, agent_cfg):
+                async with init_slots:
+                    return await self._initialize_agent(name, agent_cfg)
+
+            init_tasks = [
+                asyncio.create_task(_bounded_initialize(name, agent_cfg))
+                for name, agent_cfg, _ in admitted
+            ]
+            try:
+                results = await asyncio.gather(*init_tasks, return_exceptions=True)
+            except BaseException as initial_failure:
+                # ``gather`` cancellation cancels pending initializers.  Results
+                # that already initialized are invisible to shutdown_all(), so
+                # this batch still owns their cleanup.  Cancellation wins only
+                # after all of those ownership transfers have settled.
+                settled = await asyncio.gather(*init_tasks, return_exceptions=True)
+                initialized = [
+                    (name, result)
+                    for (name, _, _), result in zip(admitted, settled)
+                    if not isinstance(result, BaseException)
+                ]
+                try:
+                    cleanup_cancelled = (
+                        await self._discard_unpublished_initialized_agents(initialized)
+                    )
+                except BaseException:
+                    if isinstance(initial_failure, asyncio.CancelledError):
+                        raise asyncio.CancelledError()
+                    raise
+                if isinstance(initial_failure, asyncio.CancelledError) or cleanup_cancelled:
+                    raise asyncio.CancelledError()
+                raise initial_failure
+
+            fatal = next(
+                (
+                    result
+                    for result in results
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, Exception)
+                ),
+                None,
+            )
+            if fatal is not None:
+                initialized = [
+                    (name, result)
+                    for (name, _, _), result in zip(admitted, results)
+                    if not isinstance(result, BaseException)
+                ]
+                try:
+                    cleanup_cancelled = (
+                        await self._discard_unpublished_initialized_agents(initialized)
+                    )
+                except BaseException:
+                    if isinstance(fatal, asyncio.CancelledError):
+                        raise asyncio.CancelledError()
+                    raise
+                if isinstance(fatal, asyncio.CancelledError) or cleanup_cancelled:
+                    raise asyncio.CancelledError()
+                raise fatal
+
+            unpublished = {
+                name: result
+                for (name, _, _), result in zip(admitted, results)
+                if not isinstance(result, BaseException)
+            }
+            try:
+                for (name, _, admission), result in zip(admitted, results):
+                    if isinstance(result, BaseException):
+                        e = result
+                        if isinstance(e, IdentityReadinessError):
+                            logger.error(
+                                "Failed to load agent '%s': %s "
+                                "(code=%s, cause_type=%s)",
+                                name,
+                                e,
+                                e.error_code,
+                                e.cause_type,
+                            )
+                        else:
+                            logger.error(
+                                f"Failed to load agent '{name}': {e}",
+                                exc_info=(type(e), e, e.__traceback__),
+                            )
+                        self._init_failures.append((name, e))
+                        continue
+                    try:
+                        withdrawn_after_onboarding_failure = False
+                        async with self._a2a_lifecycle_lock:
+                            if not self._operation_is_admitted(admission):
+                                raise RuntimeError(
+                                    "Agent initialization completed after manager shutdown began"
+                                )
+                            try:
+                                self._register_agent(name, result)
+                                await self._on_agent_registered(name, result)
+                                self._commit_dynamic_scheduler_registration(result)
+                            except BaseException:
+                                # Mirror the single-load path: an onboarding
+                                # rejection is withdrawn before releasing the
+                                # A2A writer, while cleanup remains outside the
+                                # writer so it cannot block inbound topology.
+                                self._withdraw_initialized_agent(name, result)
+                                withdrawn_after_onboarding_failure = True
+                                raise
+                            admission.published = True
+                        unpublished.pop(name, None)
+                        loaded += 1
+                    except BaseException as onboarding_failure:
+                        # Claim before the first cleanup await.  If that cleanup
+                        # fails, the outer batch handler must not discover and
+                        # shut down this same initialized agent a second time.
+                        claimed = unpublished.pop(name, None)
+                        cleanup_failure: Optional[BaseException] = None
+                        cleanup_cancelled = False
+                        if claimed is not None:
+                            try:
+                                cleanup_cancelled = (
+                                    await self._discard_unpublished_initialized_agents(
+                                        [(name, claimed)],
+                                        already_withdrawn=withdrawn_after_onboarding_failure,
+                                    )
+                                )
+                            except BaseException as error:
+                                cleanup_failure = error
+                        if (
+                            isinstance(onboarding_failure, asyncio.CancelledError)
+                            or cleanup_cancelled
+                            or isinstance(cleanup_failure, asyncio.CancelledError)
+                        ):
+                            raise asyncio.CancelledError()
+                        if cleanup_failure is not None:
+                            if isinstance(onboarding_failure, Exception) and isinstance(
+                                cleanup_failure, Exception
+                            ):
+                                raise ExceptionGroup(
+                                    "Agent onboarding and its claimed cleanup failed",
+                                    [onboarding_failure, cleanup_failure],
+                                )
+                            raise cleanup_failure
+                        if not isinstance(onboarding_failure, Exception):
+                            raise onboarding_failure
+                        logger.error(
+                            "Failed to onboard agent %r after initialization: %s",
+                            name,
+                            onboarding_failure,
+                            exc_info=True,
+                        )
+                        self._init_failures.append((name, onboarding_failure))
+                        continue
+            except BaseException as publication_failure:
+                # ``unpublished`` contains only agents this path still owns;
+                # failing onboarding claimed its result before cleanup above.
+                cleanup_failure: Optional[BaseException] = None
+                cleanup_cancelled = False
+                if unpublished:
+                    claimed_unpublished = list(unpublished.items())
+                    unpublished.clear()
+                    try:
+                        cleanup_cancelled = (
+                            await self._discard_unpublished_initialized_agents(
+                                claimed_unpublished
+                            )
+                        )
+                    except BaseException as error:
+                        cleanup_failure = error
+                if (
+                    isinstance(publication_failure, asyncio.CancelledError)
+                    or cleanup_cancelled
+                    or isinstance(cleanup_failure, asyncio.CancelledError)
+                ):
+                    raise asyncio.CancelledError()
+                if cleanup_failure is not None:
+                    if isinstance(publication_failure, Exception) and isinstance(
+                        cleanup_failure, Exception
+                    ):
+                        raise ExceptionGroup(
+                            "Batch publication and claimed cleanup failed",
+                            [publication_failure, cleanup_failure],
+                        )
+                    raise cleanup_failure
+                raise
+            return loaded
+        finally:
+            # No batch admission is reusable until all initialization,
+            # publication, or claimed cleanup paths above have settled.
+            release_cancelled = await self._release_agent_operations(
+                [admission for _, _, admission in admitted]
+            )
+            if release_cancelled:
+                raise asyncio.CancelledError()
 
     @property
     def init_failures(self) -> list[tuple[str, Exception]]:
@@ -1426,12 +2202,579 @@ class AgentManager:
                     self._restore_scheduler_authority(agent_id, revoked)
                 return removed
 
+    def _handoff_shutdown_to_quarantined_reaper(
+        self,
+        *,
+        name: str,
+        agent: KestrelAgent,
+        shutdown_task: "asyncio.Future[object]",
+    ) -> bool:
+        """Retain durable shutdown cleanup without extending a DELETE timeout.
+
+        The handoff is deliberately opt-in.  A legacy/test agent without the
+        concrete lifecycle contract continues through the conservative join
+        path below; only an agent that explicitly promises to preserve its
+        durable owner/storage may be withdrawn while its reaper is live.
+        """
+        if self._quarantined_shutdown_handoffs_sealed:
+            return False
+        if not _has_shutdown_reaper_handoff_contract(agent):
+            return False
+        handoff = getattr(type(agent), "handoff_shutdown_to_reaper")
+        reaper_task = handoff(agent, shutdown_task)
+        if not isinstance(reaper_task, asyncio.Future):
+            raise TypeError(
+                "agent shutdown reaper handoff must return an asyncio future"
+            )
+
+        self._retain_quarantined_cleanup(
+            name=name,
+            agent_id=_loaded_agent_did(agent) or "<unknown>",
+            task=reaper_task,
+        )
+        logger.warning(
+            "Handed agent %r to quarantined shutdown cleanup; routing is "
+            "withdrawn but durable owner/storage remain retained until it settles.",
+            name,
+        )
+        return True
+
+    def _retain_quarantined_cleanup(
+        self,
+        *,
+        name: str,
+        agent_id: str,
+        task: "asyncio.Future[object]",
+    ) -> str:
+        """Keep one live cleanup task, then collapse it to bounded metadata."""
+
+        if self._quarantined_shutdown_handoffs_sealed:
+            raise RuntimeError(
+                "cannot retain quarantined cleanup after the terminal manager "
+                "drain has been sealed"
+        )
+
+        self._next_shutdown_reaper_id += 1
+        # Reaper ids are operator-facing retained metadata too.  Put the
+        # monotonic discriminator first (so truncation cannot collide) and
+        # bound the whole value before it becomes a map key.
+        reaper_id = _bounded_shutdown_metadata(
+            f"{self._next_shutdown_reaper_id}:{name}"
+        )
+        record = QuarantinedShutdownReaper(
+            reaper_id=reaper_id,
+            agent_name=_bounded_shutdown_metadata(name),
+            # A full canonical user name is not retained in bounded failure
+            # metadata.  Prefix collisions only over-reserve admission, which
+            # is fail-closed until acknowledgement.
+            canonical_agent_name=_bounded_shutdown_metadata(
+                self._canonical_agent_name(name)
+            ),
+            agent_id=_bounded_shutdown_metadata(agent_id),
+            task=task,
+            started_monotonic=time.monotonic(),
+        )
+        self._quarantined_shutdown_reapers[reaper_id] = record
+
+        def observe_reaper_completion(task: "asyncio.Future[object]") -> None:
+            record.completed_monotonic = time.monotonic()
+            if task.cancelled():
+                record.failure = "shutdown reaper was cancelled"
+            else:
+                failure = task.exception()
+                if failure is not None:
+                    record.failure = _bounded_shutdown_metadata(
+                        f"{type(failure).__name__}: {failure}"
+                    )
+            # Do not keep a completed Task: it retains coroutine locals and,
+            # on failure, the full traceback. Operators still receive a
+            # bounded history entry with the safety outcome.
+            self._quarantined_shutdown_reapers.pop(record.reaper_id, None)
+            history = QuarantinedShutdownHistory(
+                reaper_id=record.reaper_id,
+                agent_name=record.agent_name,
+                canonical_agent_name=record.canonical_agent_name,
+                agent_id=record.agent_id,
+                started_monotonic=record.started_monotonic,
+                completed_monotonic=record.completed_monotonic or time.monotonic(),
+                failure=record.failure,
+            )
+            if history.failure is None:
+                self._quarantined_shutdown_history.append(history)
+            else:
+                self._unsafe_quarantined_shutdown_failures[history.reaper_id] = history
+                while (
+                    len(self._unsafe_quarantined_shutdown_failures)
+                    > _UNSAFE_QUARANTINED_FAILURE_LIMIT
+                ):
+                    self._unsafe_quarantined_shutdown_failures.pop(
+                        next(iter(self._unsafe_quarantined_shutdown_failures))
+                    )
+                    # The individual record is intentionally discarded to
+                    # preserve the hard metadata bound.  Keep one aggregate
+                    # reservation instead of an unbounded set of evicted
+                    # names; acknowledgement below is the explicit boundary
+                    # for reopening admission.
+                    self._unsafe_quarantined_shutdown_failure_overflow_reserved = (
+                        True
+                    )
+                    self._unsafe_quarantined_shutdown_failure_evictions += 1
+            if record.failure is None:
+                logger.info(
+                    "Quarantined shutdown reaper %s completed for agent %r",
+                    record.reaper_id,
+                    record.agent_name,
+                )
+            else:
+                logger.error(
+                    "Quarantined shutdown reaper %s remains unsafe for agent %r: %s",
+                    record.reaper_id,
+                    record.agent_name,
+                    record.failure,
+                )
+
+        task.add_done_callback(observe_reaper_completion)
+        return reaper_id
+
+    def quarantined_shutdowns(self) -> dict[str, dict[str, object]]:
+        """Return operational status for cleanup retained after removal.
+
+        This is intentionally metadata-only: it exposes neither the agent's
+        storage handle nor a foreign tenant's signal payload, while allowing a
+        host operator to distinguish a still-draining reaper from a completed
+        or failed one.
+        """
+        active = {
+            reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": not record.task.done(),
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for reaper_id, record in self._quarantined_shutdown_reapers.items()
+        }
+        history = {
+            record.reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": False,
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for record in self._quarantined_shutdown_history
+        }
+        unsafe_failures = {
+            record.reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": False,
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for record in self._unsafe_quarantined_shutdown_failures.values()
+        }
+        return {**history, **unsafe_failures, **active}
+
+    @property
+    def unsafe_quarantined_shutdown_failure_eviction_count(self) -> int:
+        """Return unsafe quarantine evictions not yet operator-acknowledged."""
+
+        return (
+            self._unsafe_quarantined_shutdown_failure_evictions
+            - self._unsafe_quarantined_shutdown_failure_evictions_acknowledged_through
+        )
+
+    def acknowledge_unsafe_quarantined_shutdown_failure_evictions(self) -> int:
+        """Acknowledge the aggregate evidence for evicted unsafe reapers.
+
+        Individual records remain bounded and require their own acknowledgement.
+        An eviction cannot retain its exact record, so this acknowledgement
+        clears the single fail-closed overflow reservation for every eviction
+        observed through this checkpoint.  Later evictions reserve admission
+        again until this method is called again.
+        """
+
+        unacknowledged = self.unsafe_quarantined_shutdown_failure_eviction_count
+        self._unsafe_quarantined_shutdown_failure_evictions_acknowledged_through = (
+            self._unsafe_quarantined_shutdown_failure_evictions
+        )
+        # Individual evicted records are intentionally not retained.  This
+        # explicit aggregate acknowledgement is therefore the remediation
+        # boundary for the conservative overflow reservation.
+        self._unsafe_quarantined_shutdown_failure_overflow_reserved = False
+        return unacknowledged
+
+    def acknowledge_unsafe_quarantined_shutdown_failure(self, reaper_id: str) -> bool:
+        """Remove an operator-acknowledged unsafe outcome from bounded history."""
+
+        return self._unsafe_quarantined_shutdown_failures.pop(reaper_id, None) is not None
+
+    def unsafe_removal_budget_release_failures(self) -> dict[str, dict[str, object]]:
+        """Return bounded evidence for ordinary refunds that failed after removal.
+
+        A successful ordinary release has no post-removal state to expose. A
+        failed one is different: routing may already be withdrawn, so dropping
+        the completed task would let a terminal drain falsely certify the
+        manager. Keep metadata only until the host operator explicitly
+        acknowledges it; the finished task and its traceback remain unretained.
+        """
+
+        return {
+            record.release_id: {
+                "child_name": record.child_name,
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for record in self._unsafe_removal_budget_release_failures.values()
+        }
+
+    @property
+    def unsafe_removal_budget_release_failure_eviction_count(self) -> int:
+        """Return unsafe ordinary-release evictions not yet acknowledged."""
+
+        return (
+            self._unsafe_removal_budget_release_failure_evictions
+            - self._unsafe_removal_budget_release_failure_evictions_acknowledged_through
+        )
+
+    def acknowledge_unsafe_removal_budget_release_failure_evictions(self) -> int:
+        """Acknowledge aggregate evidence for evicted ordinary-release failures."""
+
+        unacknowledged = self.unsafe_removal_budget_release_failure_eviction_count
+        self._unsafe_removal_budget_release_failure_evictions_acknowledged_through = (
+            self._unsafe_removal_budget_release_failure_evictions
+        )
+        return unacknowledged
+
+    def acknowledge_unsafe_removal_budget_release_failure(self, release_id: str) -> bool:
+        """Remove an operator-acknowledged ordinary-release failure record."""
+
+        return (
+            self._unsafe_removal_budget_release_failures.pop(release_id, None)
+            is not None
+        )
+
+    def _removal_budget_release_ids_for_child(self, child_name: str) -> set[str]:
+        """Snapshot live or retained ordinary-release evidence for one child.
+
+        This is used only within one ``shutdown_all`` sweep to avoid reporting
+        a newly admitted release first through ``attempt_removal`` and then
+        again through its retained unsafe metadata.  It intentionally does not
+        acknowledge anything: a later drain must still surface the failure.
+        """
+
+        release_ids = {
+            release_id
+            for release_id, record in self._unsafe_removal_budget_release_failures.items()
+            if record.child_name == _bounded_shutdown_metadata(child_name)
+        }
+        active = self._inflight_removal_budget_releases_by_child.get(child_name)
+        if active is not None:
+            release_ids.add(active.release_id)
+        return release_ids
+
+    async def _set_quarantined_shutdown_handoffs_sealed(self, sealed: bool) -> bool:
+        """Set the temporary reaper-handoff seal at a drain boundary.
+
+        Quarantined handoffs and ordinary budget-release tasks are both
+        admitted while they hold ``_lock``. Waiting for that lock therefore
+        makes setting the seal the exact linearization point: cleanup either
+        completed admission before the seal and is drained below, or starts
+        while sealed and takes the conservative no-removal path. Keep the
+        acquisition cancellation-safe so a terminal owner cannot be cancelled
+        in the small gap before it owns the state transition.
+        """
+
+        acquire = asyncio.create_task(
+            self._lock.acquire(),
+            name="agent_manager:set_quarantined_shutdown_handoff_seal",
+        )
+        cancelled, failure = await await_lifecycle_task_completion(acquire)
+        if failure is not None:
+            raise RuntimeError(
+                "Unable to update quarantined shutdown handoff seal"
+            ) from failure
+        try:
+            self._quarantined_shutdown_handoffs_sealed = sealed
+        finally:
+            self._lock.release()
+        return cancelled
+
+    async def _acquire_quarantined_shutdown_drain(self) -> bool:
+        """Serialize terminal drains despite caller cancellation."""
+
+        acquire = asyncio.create_task(
+            self._quarantined_shutdown_drain_lock.acquire(),
+            name="agent_manager:drain_quarantined_shutdowns",
+        )
+        cancelled, failure = await await_lifecycle_task_completion(acquire)
+        if failure is not None:
+            raise RuntimeError(
+                "Unable to acquire quarantined shutdown drain"
+            ) from failure
+        return cancelled
+
+    async def drain_quarantined_shutdowns(
+        self,
+        *,
+        reported_budget_release_failures: Optional[set[str]] = None,
+    ) -> bool:
+        """Join every active quarantined shutdown before retiring this manager.
+
+        ``remove_agent`` deliberately remains a bounded control-plane operation:
+        it can unpublish an agent after handing its exact durable cleanup task to
+        quarantine.  A caller that is itself about to retire the *manager* has a
+        different responsibility.  It must join those retained tasks before the
+        surrounding server can close the event loop or any shared resource they
+        still use.  Otherwise a late owner-release transaction can run against
+        storage that the next teardown phase has already closed.
+
+        Returns whether this join observed caller cancellation.  Like the other
+        lifecycle joins, it still drains every retained reaper first so
+        cancellation cannot orphan a SQLite worker or durable runtime owner.
+        """
+
+        # This public operation is a terminal lifecycle boundary, not a
+        # best-effort status poll.  Serialize the drain and seal it first so a
+        # concurrent bounded ``remove_agent`` cannot hand work to a registry
+        # this drain has already declared empty.  The seal is released after
+        # every attempt: a failure that leaves an agent or a delegated hold
+        # retained must remain retryable by a later startup/server shutdown.
+        cancelled = await self._acquire_quarantined_shutdown_drain()
+        try:
+            return await self._drain_quarantined_shutdowns_while_locked(
+                cancelled=cancelled,
+                reported_budget_release_failures=reported_budget_release_failures,
+            )
+        finally:
+            self._quarantined_shutdown_drain_lock.release()
+
+    async def _drain_quarantined_shutdowns_while_locked(
+        self,
+        *,
+        cancelled: bool,
+        reported_budget_release_failures: Optional[set[str]],
+    ) -> bool:
+        """Drain terminal cleanup while the caller owns the drain lock."""
+
+        failures: list[Exception] = []
+        observed_reapers: set[str] = set()
+        observed_budget_releases: set[str] = set()
+        # ``shutdown_all`` may have already joined and reported a release
+        # before this terminal drain gets to its retained unsafe metadata.
+        # That evidence must remain for a later drain, but one fleet-shutdown
+        # ExceptionGroup must name the release only once.
+        reported_budget_release_failures = (
+            set()
+            if reported_budget_release_failures is None
+            else reported_budget_release_failures
+        )
+
+        def record_reaper_failure(reaper_id: str, detail: str) -> None:
+            failures.append(
+                RuntimeError(
+                    f"Quarantined shutdown reaper {reaper_id!r} {detail}"
+                )
+            )
+
+        def record_budget_release_failure(release_id: str, detail: str) -> None:
+            failures.append(
+                RuntimeError(
+                    f"Ordinary child budget release {release_id!r} {detail}"
+                )
+            )
+
+        sealed = False
+        try:
+            cancelled = (
+                await self._set_quarantined_shutdown_handoffs_sealed(True)
+            ) or cancelled
+            sealed = True
+
+            while (
+                self._quarantined_shutdown_reapers
+                or self._inflight_removal_budget_releases
+            ):
+                records = tuple(self._quarantined_shutdown_reapers.values())
+                for record in records:
+                    # Completion callbacks remove their record after collapsing it
+                    # to bounded history.  A snapshot can therefore include a task
+                    # another callback has already retired; it is still the exact
+                    # task this manager must observe once.
+                    if record.reaper_id in observed_reapers:
+                        continue
+                    observed_reapers.add(record.reaper_id)
+                    join_cancelled, failure = await await_lifecycle_task_completion(
+                        record.task
+                    )
+                    cancelled = cancelled or join_cancelled
+                    if failure is not None:
+                        detail = (
+                            "was cancelled"
+                            if isinstance(failure, asyncio.CancelledError)
+                            else f"failed: {failure}"
+                        )
+                        record_reaper_failure(record.reaper_id, detail)
+
+                # A normal DELETE waits for this exact task itself.  It is
+                # nevertheless removal-owned as soon as it is admitted, so a
+                # concurrent terminal owner must join it after unpublishing
+                # has made both the routing and delegated-hold maps empty.
+                # These tasks are deliberately separate from quarantine
+                # metadata: a successful ordinary release is not a deferred
+                # cleanup state that operators need to inspect.
+                budget_releases = tuple(
+                    self._inflight_removal_budget_releases.values()
+                )
+                for budget_release in budget_releases:
+                    if budget_release.release_id in observed_budget_releases:
+                        continue
+                    observed_budget_releases.add(budget_release.release_id)
+                    join_cancelled, release_failure = (
+                        await await_lifecycle_task_completion(budget_release.task)
+                    )
+                    cancelled = cancelled or join_cancelled
+                    if (
+                        release_failure is not None
+                        and budget_release.release_id
+                        not in reported_budget_release_failures
+                    ):
+                        detail = (
+                            "was cancelled"
+                            if isinstance(release_failure, asyncio.CancelledError)
+                            else f"failed: {release_failure}"
+                        )
+                        record_budget_release_failure(
+                            budget_release.release_id,
+                            detail,
+                        )
+
+                # A terminal task's done callback is responsible for dropping its
+                # live task reference.  Yield once so a task which completed before
+                # this join started cannot keep the loop spinning on stale active
+                # metadata.  Use the same cancellation-safe join contract here:
+                # a second cancellation must not interrupt this manager between
+                # observing a reaper and its callback retiring the live task.
+                callback_yield = asyncio.create_task(asyncio.sleep(0))
+                yield_cancelled, yield_failure = await await_lifecycle_task_completion(
+                    callback_yield
+                )
+                cancelled = cancelled or yield_cancelled
+                if yield_failure is not None:
+                    raise RuntimeError(
+                        "Unable to retire completed quarantined shutdown metadata"
+                    ) from yield_failure
+
+            # A task can finish (and its callback can collapse it to unsafe
+            # metadata) before this drain gets its first registry snapshot.  That
+            # outcome is still unresolved terminal cleanup, so surface every
+            # unacknowledged failure exactly once alongside failures observed live.
+            for reaper_id, record in self._unsafe_quarantined_shutdown_failures.items():
+                if reaper_id not in observed_reapers:
+                    record_reaper_failure(reaper_id, f"failed: {record.failure}")
+
+            # An ordinary release may fail before this drain acquires the
+            # manager lock. Its completion callback then drops the live task,
+            # so retained bounded evidence is the only way to prevent the
+            # terminal boundary from falsely succeeding.
+            for (
+                release_id,
+                record,
+            ) in self._unsafe_removal_budget_release_failures.items():
+                if (
+                    release_id not in observed_budget_releases
+                    and release_id not in reported_budget_release_failures
+                ):
+                    record_budget_release_failure(
+                        release_id, f"failed: {record.failure}"
+                    )
+
+            # A direct ``terminate_child`` retains its parent edge while a
+            # bounded DELETE has handed cleanup to quarantine.  The terminal
+            # drain has sealed new handoffs and joined every retained task, so
+            # reconcile only now: a failed refund has restored its hold and an
+            # unsafe reaper still reserves the name, while a successful refund
+            # can finally release the mandate and spawn-cap edge.
+            reconciliation = asyncio.create_task(
+                self._prune_all_fully_removed_child_tracking(),
+                name="agent_manager:reconcile_completed_child_terminations",
+            )
+            reconciliation_cancelled, reconciliation_failure = (
+                await await_lifecycle_task_completion(reconciliation)
+            )
+            cancelled = cancelled or reconciliation_cancelled
+            if reconciliation_failure is not None:
+                raise RuntimeError(
+                    "Unable to reconcile completed child terminations"
+                ) from reconciliation_failure
+
+            # Eviction never acknowledges an unsafe result.  The retained
+            # metadata is intentionally bounded, so preserve the loss as an
+            # aggregate terminal failure rather than letting 129+ failures be
+            # hidden after every surviving record is acknowledged.
+            evictions = self.unsafe_quarantined_shutdown_failure_eviction_count
+            if evictions:
+                failures.append(
+                    RuntimeError(
+                        f"{evictions} unsafe quarantined shutdown failure "
+                        "record(s) were evicted before acknowledgement"
+                    )
+                )
+
+            budget_release_evictions = (
+                self.unsafe_removal_budget_release_failure_eviction_count
+            )
+            if budget_release_evictions:
+                failures.append(
+                    RuntimeError(
+                        f"{budget_release_evictions} unsafe ordinary budget "
+                        "release failure record(s) were evicted before acknowledgement"
+                    )
+                )
+        finally:
+            if sealed:
+                cancelled = (
+                    await self._set_quarantined_shutdown_handoffs_sealed(False)
+                ) or cancelled
+
+        # Lifecycle cancellation always has precedence over a terminal cleanup
+        # failure after owned work has settled.  A successful join retains the
+        # established ``True`` return value so callers can choose when to
+        # re-raise cancellation themselves.
+        if cancelled and failures:
+            raise asyncio.CancelledError()
+        if failures:
+            raise ExceptionGroup(
+                "One or more quarantined shutdown reapers or ordinary budget "
+                "releases failed",
+                failures,
+            )
+        return cancelled
+
     async def _remove_agent_without_scheduler_lifecycle(self, name: str) -> bool:
         """Shutdown and remove an agent.
 
         Returns:
             True if agent was found and removed.
         """
+        # A manager that is inside its terminal drain cannot safely accept a
+        # new bounded handoff. Refuse promptly rather than extending a
+        # single-agent DELETE into an unbounded join or letting the current
+        # drain return without observing the new reaper.
+        async with self._lock:
+            if self._quarantined_shutdown_handoffs_sealed:
+                logger.warning(
+                    "Refusing removal of agent %r after terminal manager shutdown "
+                    "handoffs were sealed",
+                    name,
+                )
+                return False
+
         # Refuse to remove an agent that still has budgeted descendants (#2113):
         # remove_agent is a single-agent primitive, so releasing this agent's hold
         # while a budgeted grandchild still holds from its (about-to-be-removed)
@@ -1450,19 +2793,37 @@ class AgentManager:
         # There is no process to stop in that state, but a DELETE/shutdown must
         # still refund the hold.  Treat it as a completed removal rather than
         # silently retaining money because there is no routing entry.
+        ordinary_budget_release: Optional[InflightRemovalBudgetRelease] = None
         async with self._lock:
+            if self._quarantined_shutdown_handoffs_sealed:
+                logger.warning(
+                    "Refusing removal of agent %r after terminal manager shutdown "
+                    "handoffs were sealed",
+                    name,
+                )
+                return False
             unpublished_hold = (
                 name not in self._agents and name in self._child_budgets
             )
+            if unpublished_hold:
+                ordinary_budget_release = self._start_child_budget_release(name)
         if unpublished_hold:
-            release_cancelled = await self._release_child_budget_cancellation_safe(
-                name
+            assert ordinary_budget_release is not None
+            release_cancelled = await self._await_child_budget_release_cancellation_safe(
+                ordinary_budget_release.task
             )
             if release_cancelled:
                 raise asyncio.CancelledError()
             return True
 
         async with self._lock:
+            if self._quarantined_shutdown_handoffs_sealed:
+                logger.warning(
+                    "Refusing removal of agent %r after terminal manager shutdown "
+                    "handoffs were sealed",
+                    name,
+                )
+                return False
             agent = self._agents.get(name)
             if agent is None:
                 return False
@@ -1477,6 +2838,9 @@ class AgentManager:
             )
             caller_cancelled = False
             shutdown_timed_out = False
+            shutdown_handed_off = False
+            budget_handed_off = False
+            ordinary_budget_release = None
             try:
                 await asyncio.wait_for(
                     asyncio.shield(shutdown_task), timeout=SHUTDOWN_TIMEOUT
@@ -1485,19 +2849,39 @@ class AgentManager:
                 caller_cancelled = asyncio.current_task().cancelling() > 0
                 if not shutdown_task.done():
                     shutdown_task.cancel()
-                logger.warning(
-                    "Agent '%s' shutdown was cancelled; joining its actual "
-                    "shutdown task and durable cleanup before unpublishing.",
-                    name,
+                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                    name=name, agent=agent, shutdown_task=shutdown_task
                 )
+                if shutdown_handed_off:
+                    logger.warning(
+                        "Agent '%s' shutdown was cancelled; durable cleanup is "
+                        "quarantined while control-plane removal continues.",
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "Agent '%s' shutdown was cancelled; joining its actual "
+                        "shutdown task and durable cleanup before unpublishing.",
+                        name,
+                    )
             except asyncio.TimeoutError:
                 shutdown_timed_out = True
                 shutdown_task.cancel()
-                logger.warning(
-                    "Agent '%s' shutdown timed out; joining its actual "
-                    "shutdown task before deciding removal.",
-                    name,
+                shutdown_handed_off = self._handoff_shutdown_to_quarantined_reaper(
+                    name=name, agent=agent, shutdown_task=shutdown_task
                 )
+                if shutdown_handed_off:
+                    logger.warning(
+                        "Agent '%s' exceeded its shutdown bound; durable cleanup "
+                        "is quarantined while control-plane removal continues.",
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "Agent '%s' shutdown timed out; joining its actual "
+                        "shutdown task before deciding removal.",
+                        name,
+                    )
             except Exception as exc:
                 # A normal shutdown error has no general proof that the agent
                 # reached its cancellation tail.  Keep the historical safe
@@ -1512,48 +2896,65 @@ class AgentManager:
                 )
                 return False
 
-            join_cancelled, shutdown_failure = await await_lifecycle_task_completion(
-                shutdown_task
-            )
-            caller_cancelled = caller_cancelled or join_cancelled
-            if shutdown_failure is not None and not isinstance(
-                shutdown_failure, asyncio.CancelledError
-            ):
-                logger.warning(
-                    "Agent '%s' shutdown task failed; retaining it until "
-                    "cleanup can be confirmed: %s",
-                    name,
-                    shutdown_failure,
-                    exc_info=(
-                        type(shutdown_failure),
+            if not shutdown_handed_off:
+                join_cancelled, shutdown_failure = await await_lifecycle_task_completion(
+                    shutdown_task
+                )
+                caller_cancelled = caller_cancelled or join_cancelled
+                if shutdown_failure is not None and not isinstance(
+                    shutdown_failure, asyncio.CancelledError
+                ):
+                    logger.warning(
+                        "Agent '%s' shutdown task failed; retaining it until "
+                        "cleanup can be confirmed: %s",
+                        name,
                         shutdown_failure,
-                        shutdown_failure.__traceback__,
-                    ),
-                )
-                return False
-            if shutdown_timed_out and shutdown_failure is None:
-                logger.warning(
-                    "Agent '%s' exceeded its shutdown budget but completed "
-                    "while being joined; continuing durable cleanup.",
-                    name,
-                )
+                        exc_info=(
+                            type(shutdown_failure),
+                            shutdown_failure,
+                            shutdown_failure.__traceback__,
+                        ),
+                    )
+                    return False
+                if shutdown_timed_out and shutdown_failure is None:
+                    logger.warning(
+                        "Agent '%s' exceeded its shutdown budget but completed "
+                        "while being joined; continuing durable cleanup.",
+                        name,
+                    )
 
-            # A tail that spent its dispatcher guard continues in the
-            # agent-owned completion task.  Do not unpublish the agent or
-            # release its delegated budget until that task has released the
-            # owner and closed storage. This also handles a bounded outer
-            # timeout: the one removal call remains the lifecycle owner.
-            if _has_shutdown_completion_contract(agent):
-                caller_cancelled = (
-                    await await_agent_shutdown_completion(agent)
-                ) or caller_cancelled
+                # A tail that spent its dispatcher guard continues in the
+                # agent-owned completion task.  Do not unpublish the agent or
+                # release its delegated budget until that task has released the
+                # owner and closed storage. Legacy lifecycle implementations
+                # remain on this conservative path; KestrelAgent's explicit
+                # handoff contract above is what permits bounded removal.
+                if _has_shutdown_completion_contract(agent):
+                    caller_cancelled = (
+                        await await_agent_shutdown_completion(agent)
+                    ) or caller_cancelled
 
-            # Only publish removal after all agent-owned durable cleanup has
-            # completed.  In particular, this keeps the manager as the
-            # lifecycle owner while a SQLite worker is still draining.
+            # Publish removal only after cleanup completed, or after the
+            # explicit reaper handoff above retained that exact cleanup task.
+            # In the latter case the quarantined record, not a routable agent,
+            # remains the lifecycle owner while durable cognition/storage drain.
             self._agents.pop(name, None)
             self._agent_names.pop(agent.agent_id, None)
             self._revoke_a2a_hosted_policy(agent)
+            if shutdown_handed_off:
+                # Keep both quarantine handoffs under the same lock that
+                # linearizes terminal sealing.  This synchronous fence is
+                # still immediately after routing withdrawal, as before.
+                budget_handed_off = self._handoff_child_budget_release_to_quarantined_reaper(
+                    name, agent_id=_loaded_agent_did(agent) or "<unknown>"
+                )
+            if not budget_handed_off:
+                # Admission is deliberately before we release ``_lock``. A
+                # terminal drain that follows routing withdrawal can then
+                # either observe this exact ordinary release or seal before a
+                # removal begins; it can never see both routing and the hold
+                # gone while this task is still unowned.
+                ordinary_budget_release = self._start_child_budget_release(name)
             logger.info(f"Agent '{name}' shut down")
 
         # Release THIS agent's own budget hold AFTER it is stopped (#2113):
@@ -1568,7 +2969,19 @@ class AgentManager:
         # required for removal.  Retain its task through repeated cancellation
         # before propagating cancellation to the caller; otherwise a closed
         # child can strand its delegated hold.
-        release_cancelled = await self._release_child_budget_cancellation_safe(name)
+        # The shutdown reaper proves the agent's durable owner/storage are
+        # retained, but a still-running cognition can also be blocked inside
+        # DelegatedWallet.spend(). In that case the budget handoff above keeps
+        # DELETE bounded. Otherwise this is the same ordinary stop-then-
+        # release task DELETE has always joined, now admitted early enough for
+        # a terminal manager drain to join it too.
+        release_cancelled = (
+            False
+            if ordinary_budget_release is None
+            else await self._await_child_budget_release_cancellation_safe(
+                ordinary_budget_release.task
+            )
+        )
         if caller_cancelled or release_cancelled:
             raise asyncio.CancelledError()
         return True
@@ -1662,55 +3075,68 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
-        if self.get_agent(name) is not None:
-            raise ValueError(f"Agent '{name}' already exists")
-
-        # Custody guard (#2468): runtime inception (POST /api/agents, spawned
-        # children) reaches ``create_kestrel_identity_async`` without the setup
-        # resolver, so verify — through the *same* resolver setup uses — that the
-        # KESTREL_DATA_KEY this process would encrypt with matches the one
-        # persisted in the resolved home ``.env``. Refuse a split brain (exported
-        # key A ⇄ persisted key B) before any identity is written, rather than
-        # mint an agent the next boot cannot decrypt.
-        custody_conflict = self._data_key_custody_conflict()
-        if custody_conflict:
-            raise ValueError(custody_conflict)
-
-        # Allocate the port BEFORE inception (codex round 6): failing the
-        # allocation after inception leaves an orphaned identity directory.
-        port = self._allocate_port()
-
-        from kestrel_sovereign.inception_service import create_kestrel_identity_async
-
-        agent_dir = self._base_data_dir / "agent_data" / name
-        agent_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            await create_kestrel_identity_async(
-                output_dir=str(agent_dir),
-                agent_name=name,
-                parent_did=parent_did,
-                spawn_mandate=mandate,
-            )
-        except Exception as e:
-            # No agent came into being — release the reservation so repeated
-            # failures can't drain the allocator (codex P3 round 12). Ports of
-            # agents that EXISTED keep their never-reuse guarantee (#1729).
-            self._reserved_ports.discard(port)
-            raise ValueError(f"Inception failed for '{name}': {e}")
-
-        config = LocalAgentConfig(
-            data_dir=Path("agent_data") / name,
-            port=port,  # reserved — never reused, never colliding (see _allocate_port)
-            autostart=True,
-            features=features,
+        admission, owns_admission = await self._admit_agent_operation(
+            name, kind="create"
         )
-        # Retain the created config so callers (the create-agent endpoint) can
-        # PERSIST the registration into multi_agent.toml — without that, a
-        # config-file-driven deployment silently loses UI-created agents on
-        # the next restart (codex P1 on #2358).
-        self._created_configs[name] = config
-        return await self.load_agent(name, config)
+        try:
+            # Custody guard (#2468): runtime inception (POST /api/agents,
+            # spawned children) reaches ``create_kestrel_identity_async``
+            # without the setup resolver, so verify — through the *same*
+            # resolver setup uses — that the KESTREL_DATA_KEY this process
+            # would encrypt with matches the one persisted in the resolved home
+            # ``.env``. Refuse a split brain before any identity is written.
+            custody_conflict = self._data_key_custody_conflict()
+            if custody_conflict:
+                raise ValueError(custody_conflict)
+
+            # Allocate the port BEFORE inception: failing allocation afterward
+            # would leave an orphaned identity directory.
+            port = self._allocate_port()
+
+            from kestrel_sovereign.inception_service import (
+                create_kestrel_identity_async,
+            )
+
+            agent_dir = self._base_data_dir / "agent_data" / name
+            agent_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                await create_kestrel_identity_async(
+                    output_dir=str(agent_dir),
+                    agent_name=name,
+                    parent_did=parent_did,
+                    spawn_mandate=mandate,
+                )
+            except Exception as error:
+                # A normal inception failure reports that no identity came into
+                # being, so free the port.  Cancellation/ambiguity deliberately
+                # keeps it reserved and never attempts filesystem deletion:
+                # inception may have persisted identity data before its await
+                # was interrupted.
+                self._reserved_ports.discard(port)
+                raise ValueError(f"Inception failed for '{name}': {error}")
+
+            config = LocalAgentConfig(
+                data_dir=Path("agent_data") / name,
+                port=port,
+                autostart=True,
+                features=features,
+            )
+            agent = await self.load_agent(name, config)
+            # Retain only an actually published configuration for the endpoint
+            # persistence handoff.  A stale pre-shutdown operation must not
+            # leave an in-memory config which a later request could persist.
+            self._created_configs[name] = config
+            return agent
+        finally:
+            if owns_admission:
+                release_cancelled = await self._release_agent_operations([admission])
+                # ``load_agent`` records publication on this outer admission,
+                # even when create owns it through the nested call. Do not
+                # turn that committed create into a false cancellation while
+                # merely retiring its now-terminal admission.
+                if release_cancelled and not admission.published:
+                    raise asyncio.CancelledError()
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:
         """Feature class names available to the parent — the ceiling a child's
@@ -1791,6 +3217,14 @@ class AgentManager:
                 "funded wallet (enable the wallet feature). Spawn without a budget "
                 "or fund the parent's wallet."
             )
+        if has_durable_delegated_child_wallet_provisioning_contract(parent_wallet):
+            # A persistent provider's in-memory balance is explicitly only a
+            # local snapshot. Its atomic reserve-and-provision transaction is
+            # the affordability authority and also recognizes exact retries,
+            # so a synchronous preflight here would reject an already-held
+            # budget or a concurrent-process deposit before the provider can
+            # decide safely.
+            return
         currency = _default_currency_for(parent_wallet)
         if not parent_wallet.can_afford(budget, currency):
             raise ValueError(
@@ -1804,6 +3238,8 @@ class AgentManager:
         parent_agent: KestrelAgent,
         child: KestrelAgent,
         mandate: SpawnMandate,
+        *,
+        admission: Optional[AgentOperationAdmission] = None,
     ) -> None:
         """Hold the budget from the parent and point the child's wallet at a
         ceiling'd DelegatedWallet (#2113). No-op for budget<=0."""
@@ -1820,17 +3256,32 @@ class AgentManager:
                 child_did=child.agent_id,
                 budget=budget,
             )
-        except Exception:
+        except BaseException:
             # The hold failed AFTER the child was created (e.g. a concurrent
             # spend drained the parent). Don't leave an uncapped child running.
             await self.remove_agent(name)
             raise
+
+        # Provider I/O may have yielded to terminal shutdown or a direct DELETE.
+        # Claim the exact hold *before* any post-provider await. A positive
+        # allocation is durable provider state already, so cancellation while
+        # waiting for lifecycle locks must leave rollback an entry it can
+        # release. The subsequent fenced check still controls whether this
+        # spawn may commit governance state; it never makes an allocation
+        # disappear from the cleanup owner's view.
+        self._child_budgets[name] = (delegated, parent_wallet)
+        if admission is not None:
+            async with self._a2a_lifecycle_lock:
+                async with self._lock:
+                    if not self._spawn_operation_is_admitted(admission, child):
+                        raise RuntimeError(
+                            "Spawn was fenced while its delegated budget was being created"
+                        )
         child.wallet = delegated
         child.wallet_agent = delegated
         # Also expose it as ``_delegated_wallet`` so the spawn-status endpoint
         # reports live budget_spent / budget_remaining (#2113).
         child._delegated_wallet = delegated
-        self._child_budgets[name] = (delegated, parent_wallet)
         logger.info(
             "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
             budget, name,
@@ -1865,37 +3316,243 @@ class AgentManager:
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).
 
-        Best-effort: a wallet error must not block termination/cleanup. The
-        cascade case (a budgeted child with budgeted descendants) is handled by
-        ``terminate_child`` recursing — each descendant releases its own hold.
+        The admitted release task is the terminal owner of this refund: a
+        provider failure must reach it so removal and a later terminal drain
+        retain unsafe evidence instead of certifying an unknown refund state.
+        Keep the hold entry until the provider confirms the refund: a durable
+        provider can safely retry the same allocation idempotently, while a
+        legacy provider's uncertain outcome remains visibly held and refuses a
+        duplicate credit rather than disappearing from lifecycle ownership.
+        The cascade case (a budgeted child with budgeted descendants) is
+        handled by ``terminate_child`` recursing — each descendant releases
+        its own hold.
         """
-        entry = self._child_budgets.pop(child_name, None)
+        entry = self._child_budgets.get(child_name)
         if entry is None:
             return
         delegated, parent_wallet = entry
-        try:
-            returned = await release_delegated_wallet(delegated, parent_wallet)
+        await self._release_child_budget_entry(
+            child_name, delegated=delegated, parent_wallet=parent_wallet
+        )
+        # A concurrent terminal owner can only join this exact release task;
+        # it must not make the hold look released before this provider call
+        # returns. Remove the original entry only after confirmed success.
+        if self._child_budgets.get(child_name) is entry:
+            self._child_budgets.pop(child_name, None)
+
+    async def _release_child_budget_entry(
+        self, child_name: str, *, delegated, parent_wallet
+    ) -> None:
+        """Release an already-reserved hold through its terminal owner."""
+
+        returned = await release_delegated_wallet(delegated, parent_wallet)
+        logger.info(
+            "Released delegated budget for '%s': returned %s to parent (#2113).",
+            child_name,
+            returned,
+        )
+
+    def _handoff_child_budget_release_to_quarantined_reaper(
+        self, child_name: str, *, agent_id: str
+    ) -> bool:
+        """Fence a budget now and retain its blocked refund outside DELETE.
+
+        A cancellation-resistant cognition turn can hold the delegated wallet's
+        spend lock while arbitrary provider I/O is blocked.  Fencing is
+        synchronous, so no later spend can begin; the retained reaper then
+        waits for the in-flight transfer and performs exactly one refund.
+        """
+
+        if self._quarantined_shutdown_handoffs_sealed:
+            return False
+
+        entry = self._child_budgets.pop(child_name, None)
+        if entry is None:
+            return False
+        delegated, parent_wallet = entry
+        delegated.fence_spending()
+
+        async def release() -> None:
+            try:
+                returned = await release_delegated_wallet(delegated, parent_wallet)
+            except BaseException:
+                # Quarantine fenced the wallet before withdrawing routing, but
+                # its refund is still an ordinary ownership obligation.  Keep
+                # the *exact* allocation entry retryable after a provider
+                # failure/cancellation, just as the non-quarantined path does.
+                # A new same-name create is refused while this entry remains,
+                # so restoration cannot attach old money to a new identity.
+                if child_name not in self._child_budgets:
+                    self._child_budgets[child_name] = entry
+                raise
             logger.info(
-                "Released delegated budget for '%s': returned %s to parent (#2113).",
-                child_name, returned,
+                "Released quarantined delegated budget for '%s': returned %s to parent (#2113).",
+                child_name,
+                returned,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Failed to release delegated budget for '%s': %s", child_name, e
+
+        task = asyncio.create_task(
+            release(), name=f"agent_budget_release_quarantine:{child_name}"
+        )
+        self._retain_quarantined_cleanup(
+            name=child_name,
+            agent_id=agent_id,
+            task=task,
+        )
+        logger.warning(
+            "Handed delegated budget for %r to quarantined cleanup after immediate spend fence.",
+            child_name,
+        )
+        return True
+
+    def _record_unsafe_removal_budget_release_failure(
+        self,
+        record: InflightRemovalBudgetRelease,
+        failure: BaseException,
+    ) -> None:
+        """Retain bounded evidence for one terminal ordinary-release failure."""
+
+        unsafe = UnsafeRemovalBudgetReleaseFailure(
+            release_id=record.release_id,
+            child_name=_bounded_shutdown_metadata(record.child_name),
+            started_monotonic=record.started_monotonic,
+            completed_monotonic=time.monotonic(),
+            failure=_bounded_shutdown_metadata(
+                "budget release was cancelled"
+                if isinstance(failure, asyncio.CancelledError)
+                else f"{type(failure).__name__}: {failure}"
+            ),
+        )
+        self._unsafe_removal_budget_release_failures[unsafe.release_id] = unsafe
+        while (
+            len(self._unsafe_removal_budget_release_failures)
+            > _UNSAFE_REMOVAL_BUDGET_RELEASE_FAILURE_LIMIT
+        ):
+            self._unsafe_removal_budget_release_failures.pop(
+                next(iter(self._unsafe_removal_budget_release_failures))
             )
+            self._unsafe_removal_budget_release_failure_evictions += 1
+        logger.error(
+            "Ordinary child budget release %s remains unsafe for child %r: %s",
+            unsafe.release_id,
+            unsafe.child_name,
+            unsafe.failure,
+        )
+
+    def _start_child_budget_release(
+        self, child_name: str
+    ) -> InflightRemovalBudgetRelease:
+        """Admit or join one ordinary child-budget release under ``_lock``."""
+
+        admitted = self._inflight_removal_budget_releases_by_child.get(child_name)
+        if admitted is not None:
+            return admitted
+
+        if self._quarantined_shutdown_handoffs_sealed:
+            raise RuntimeError(
+                "cannot start ordinary budget release after the terminal manager "
+                "drain has been sealed"
+            )
+        # Reserve a release id *before* calling the legacy override seam. A
+        # synchronous override can mutate its hold and raise before it returns
+        # an awaitable; that is still an unsafe terminal outcome which must be
+        # visible to a later drain and require explicit acknowledgement.
+        self._next_removal_budget_release_id += 1
+        release_id = f"ordinary-budget-release:{self._next_removal_budget_release_id}"
+        started_monotonic = time.monotonic()
+        try:
+            release_awaitable = self._release_child_budget_cancellation_safe(
+                child_name
+            )
+            # ``ensure_future`` preserves the existing override seam: legacy
+            # managers may return an already-created Future instead of a bare
+            # coroutine from ``_release_child_budget_cancellation_safe``.
+            budget_release = asyncio.ensure_future(release_awaitable)
+        except BaseException as failure:
+            # A failed Future gives the caller the same await/cancellation
+            # contract as an asynchronously failed release, while ensuring the
+            # just-reserved record can retain its evidence synchronously.
+            budget_release = asyncio.get_running_loop().create_future()
+            if isinstance(failure, asyncio.CancelledError):
+                budget_release.cancel()
+            else:
+                budget_release.set_exception(failure)
+        if isinstance(budget_release, asyncio.Task):
+            budget_release.set_name(f"agent_budget_release:{child_name}")
+        record = InflightRemovalBudgetRelease(
+            release_id=release_id,
+            child_name=child_name,
+            task=budget_release,
+            started_monotonic=started_monotonic,
+        )
+        self._inflight_removal_budget_releases[release_id] = record
+        self._inflight_removal_budget_releases_by_child[child_name] = record
+
+        def observe_budget_release_completion(
+            task: "asyncio.Future[object]",
+        ) -> None:
+            # A completed task retains its traceback-bearing frame. Remove it
+            # immediately, but never discard an unsafe terminal outcome: this
+            # callback can run while a terminal drain is still waiting to
+            # acquire ``_lock`` and therefore has not yet observed the task.
+            self._inflight_removal_budget_releases.pop(record.release_id, None)
+            if (
+                self._inflight_removal_budget_releases_by_child.get(child_name)
+                is record
+            ):
+                self._inflight_removal_budget_releases_by_child.pop(child_name, None)
+            if task.cancelled():
+                self._record_unsafe_removal_budget_release_failure(
+                    record, asyncio.CancelledError()
+                )
+                return
+            failure = task.exception()
+            if failure is not None:
+                self._record_unsafe_removal_budget_release_failure(record, failure)
+
+        # ``Future.add_done_callback`` schedules callbacks for a later loop
+        # turn when the override returned an already-completed Future. Retire
+        # that result now instead: an immediate DELETE/shutdown retry must
+        # admit a fresh release rather than coalescing to an old failed Future.
+        if budget_release.done():
+            observe_budget_release_completion(budget_release)
+        else:
+            budget_release.add_done_callback(observe_budget_release_completion)
+        return record
+
+    async def _await_child_budget_release_cancellation_safe(
+        self, budget_release: "asyncio.Future[object]"
+    ) -> bool:
+        """Join one admitted budget release before reporting cancellation."""
+
+        release_cancelled, release_failure = await await_lifecycle_task_completion(
+            budget_release
+        )
+        # The task's done callback retains unsafe refund evidence before this
+        # join returns.  Once that owned task has settled, the caller's
+        # cancellation must still win over its provider error; DELETE otherwise
+        # reports an ordinary failure even though its cancellation contract was
+        # observed and cleanup fully completed.
+        if release_cancelled:
+            raise asyncio.CancelledError()
+        if release_failure is not None:
+            raise release_failure
+        # ``_release_child_budget_cancellation_safe`` predates the task
+        # admission wrapper and promises a boolean: ``True`` means its own
+        # cancellation-safe cleanup observed caller cancellation after the
+        # refund completed. The wrapper's join cancellation is only one half
+        # of that contract; preserve an override's completed ``True`` result
+        # too. Legacy overrides returning ``None`` remain a normal success.
+        return release_cancelled or budget_release.result() is True
 
     async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
         """Release one removed child's hold before reporting caller cancellation."""
+
         budget_release = asyncio.create_task(
             self._release_child_budget(child_name),
             name=f"agent_budget_release:{child_name}",
         )
-        release_cancelled, release_failure = await await_lifecycle_task_completion(
-            budget_release
-        )
-        if release_failure is not None:
-            raise release_failure
-        return release_cancelled
+        return await self._await_child_budget_release_cancellation_safe(budget_release)
 
     async def spawn_agent(
         self,
@@ -1932,29 +3589,40 @@ class AgentManager:
         # producing an uncapped child.
         self._validate_budget_precondition(parent_agent, mandate)
 
+        admission, owns_admission = await self._admit_agent_operation(
+            name, kind="spawn"
+        )
+        assert owns_admission
+        admission.spawn_task = asyncio.current_task()
+        spawn_slot_admitted = False
+
         # Spawn caps (#1729): bound runaway spawning. The check + reservation run
         # under the manager lock so concurrent spawn_agent calls can't all read
         # the same count and blow past the cap (codex r2). ``_pending_spawns``
         # counts in-flight spawns whose mandate isn't registered yet.
-        async with self._lock:
-            in_use = len(self._child_mandates) + self._pending_spawns
-            if in_use >= self._max_spawned_agents:
-                raise ValueError(
-                    f"Spawn refused: at the spawned-agent cap "
-                    f"({self._max_spawned_agents}). Set KESTREL_MAX_SPAWNED_AGENTS to raise."
-                )
-            # Depth cap — if the PARENT was itself spawned and its mandate marks
-            # it a leaf (max_child_depth <= 0), it may not spawn further.
-            parent_name = self._agent_names.get(parent_agent.agent_id)
-            parent_mandate = self._child_mandates.get(parent_name) if parent_name else None
-            if parent_mandate is not None and getattr(parent_mandate, "max_child_depth", 0) <= 0:
-                raise ValueError(
-                    f"Spawn refused: parent '{parent_name}' is at its max child depth "
-                    f"(mandate max_child_depth={getattr(parent_mandate, 'max_child_depth', 0)})."
-                )
-            self._pending_spawns += 1
-
         try:
+            async with self._lock:
+                in_use = len(self._child_mandates) + self._pending_spawns
+                if in_use >= self._max_spawned_agents:
+                    raise ValueError(
+                        f"Spawn refused: at the spawned-agent cap "
+                        f"({self._max_spawned_agents}). Set KESTREL_MAX_SPAWNED_AGENTS to raise."
+                    )
+                # Depth cap — if the PARENT was itself spawned and its mandate marks
+                # it a leaf (max_child_depth <= 0), it may not spawn further.
+                parent_name = self._agent_names.get(parent_agent.agent_id)
+                parent_mandate = (
+                    self._child_mandates.get(parent_name) if parent_name else None
+                )
+                if parent_mandate is not None and getattr(
+                    parent_mandate, "max_child_depth", 0
+                ) <= 0:
+                    raise ValueError(
+                        f"Spawn refused: parent '{parent_name}' is at its max child depth "
+                        f"(mandate max_child_depth={getattr(parent_mandate, 'max_child_depth', 0)})."
+                )
+                self._pending_spawns += 1
+                spawn_slot_admitted = True
             # DECREMENT remaining depth on delegation (codex r2): a non-leaf
             # spawned parent's child must have strictly less depth, regardless of
             # what the caller put in the mandate — otherwise depth never shrinks.
@@ -1962,18 +3630,53 @@ class AgentManager:
                 allowed = getattr(parent_mandate, "max_child_depth", 0) - 1
                 if getattr(mandate, "max_child_depth", 0) > allowed:
                     mandate.max_child_depth = max(allowed, 0)
-            return await self._do_spawn(name, parent_agent, mandate)
+            return await self._do_spawn(name, parent_agent, mandate, admission)
         finally:
-            async with self._lock:
-                self._pending_spawns -= 1
+            release_cancelled = await self._retire_spawn_slot_and_admission(
+                admission,
+                spawn_slot_admitted=spawn_slot_admitted,
+            )
+            # The spawn body can be propagating a BaseExceptionGroup which
+            # preserves both cancellation and a rollback failure.  Retirement
+            # observes the same pending cancellation, but must not replace
+            # that already-terminal evidence with a bare CancelledError.
+            if (
+                release_cancelled
+                and sys.exception() is None
+                and not admission.committed
+                and not admission.rollback_incomplete
+            ):
+                raise asyncio.CancelledError()
 
     async def _do_spawn(
         self,
         name: str,
         parent_agent: KestrelAgent,
         mandate: SpawnMandate,
+        admission: Optional[AgentOperationAdmission] = None,
     ) -> KestrelAgent:
-        """Sign the mandate, create the child, and register it (#1729)."""
+        """Sign, create, then atomically commit or roll back one child spawn."""
+        # A couple of focused feature tests exercise this private seam directly.
+        # Give those calls the same named ownership contract as public spawn,
+        # rather than preserving a second untracked creation path.
+        if admission is None:
+            admission, owns_admission = await self._admit_agent_operation(
+                name, kind="direct-spawn-test"
+            )
+            assert owns_admission
+            admission.spawn_task = asyncio.current_task()
+            try:
+                return await self._do_spawn(name, parent_agent, mandate, admission)
+            finally:
+                release_cancelled = await self._release_agent_operations([admission])
+                if (
+                    release_cancelled
+                    and sys.exception() is None
+                    and not admission.committed
+                ):
+                    raise asyncio.CancelledError()
+
+        assert admission is not None
         # Sign the mandate with the parent's keys if available.
         # Hybrid parents (post-rotation ceremony) get an additional
         # ``parent_identity`` arg so the mandate is signed with both
@@ -2014,40 +3717,314 @@ class AgentManager:
                 mandate, parent_private_key,
                 parent_identity=parent_identity,
             )
-        child = await self.create_agent(
-            name,
-            parent_did=parent_agent.agent_id,
-            features=child_features,
-            mandate=mandate,
+        child: Optional[KestrelAgent] = None
+        try:
+            child = await self.create_agent(
+                name,
+                parent_did=parent_agent.agent_id,
+                features=child_features,
+                mandate=mandate,
+            )
+            admission.child = child
+            await self._ensure_spawn_operation_admitted(admission, child)
+
+            # Fill in child DID on the mandate before the final commit.  The
+            # rollback below owns the live child if shutdown/delete fences this
+            # operation before it can publish the parent relationship.
+            mandate.child_did = child.agent_id
+
+            # Per-child budget (#2113): hold from the parent and route the
+            # child's spend through a ceiling'd DelegatedWallet.  The operation
+            # is rechecked after provider I/O before the hold is made visible.
+            await self._apply_delegated_budget(
+                name, parent_agent, child, mandate, admission=admission
+            )
+
+            # Runtime enforcement (spawn_mandate attach + restricted_tools hook)
+            # is applied uniformly in load_agent from the persisted delegation
+            # edge (#2137), which already ran for this child inside create_agent.
+            parent_did = parent_agent.agent_id
+            async with self._a2a_lifecycle_lock:
+                async with self._lock:
+                    if not self._spawn_operation_is_admitted(admission, child):
+                        raise RuntimeError(
+                            "Spawn was fenced before its budget and mandate could commit"
+                        )
+                    children = self._parent_children.setdefault(parent_did, [])
+                    if name not in children:
+                        children.append(name)
+                    self._child_mandates[name] = mandate
+                    admission.committed = True
+
+            logger.info(
+                f"Spawned child '{name}' (DID: {child.agent_id[:30]}...) "
+                f"for parent '{parent_did[:30]}...' — purpose: {mandate.purpose}"
+            )
+            return child
+        except BaseException as spawn_failure:
+            if child is not None and not admission.committed:
+                cleanup_failure: Optional[BaseException] = None
+                cleanup_cancelled = False
+                try:
+                    cleanup_cancelled = await self._rollback_uncommitted_spawn(
+                        admission, child
+                    )
+                except BaseException as error:
+                    cleanup_failure = error
+                # A rollback that proves its uncommitted child or exact hold
+                # is still live is not safely subsumed by the caller's
+                # cancellation.  Preserve both facts so a cancellation cannot
+                # make a routable, mandate-less child look like a completed
+                # rollback to its lifecycle owner.
+                if cleanup_failure is not None and (
+                    isinstance(spawn_failure, asyncio.CancelledError)
+                    or cleanup_cancelled
+                ):
+                    cancellation = (
+                        spawn_failure
+                        if isinstance(spawn_failure, asyncio.CancelledError)
+                        else asyncio.CancelledError()
+                    )
+                    raise BaseExceptionGroup(
+                        "Spawn cancellation and its owned rollback failed",
+                        [cancellation, cleanup_failure],
+                    )
+                if (
+                    isinstance(spawn_failure, asyncio.CancelledError)
+                    or cleanup_cancelled
+                    or isinstance(cleanup_failure, asyncio.CancelledError)
+                ):
+                    raise asyncio.CancelledError()
+                if cleanup_failure is not None:
+                    if isinstance(spawn_failure, Exception) and isinstance(
+                        cleanup_failure, Exception
+                    ):
+                        raise ExceptionGroup(
+                            "Spawn and its owned rollback failed",
+                            [spawn_failure, cleanup_failure],
+                        )
+                    raise cleanup_failure
+            raise
+
+    def _spawn_operation_is_admitted(
+        self, admission: AgentOperationAdmission, child: KestrelAgent
+    ) -> bool:
+        """Whether this exact child may still commit its spawn bookkeeping.
+
+        Callers hold the A2A lifecycle writer.  Checking the published object
+        identity prevents a concurrent DELETE from turning an old child into a
+        successful spawn result after it has been withdrawn.
+        """
+
+        child_id = _loaded_agent_did(child)
+        # ``_do_spawn`` is a long-standing private feature-test seam whose
+        # lightweight fake ``create_agent`` deliberately does not publish a
+        # runtime child.  Public ``spawn_agent`` is the production path and
+        # requires the exact routing/reverse binding before it can commit.
+        if admission.kind == "direct-spawn-test" and self._agents.get(
+            admission.name
+        ) is None:
+            return self._operation_is_admitted(admission)
+        return (
+            self._operation_is_admitted(admission)
+            and self._agents.get(admission.name) is child
+            and isinstance(child_id, str)
+            and self._agent_names.get(child_id) == admission.name
         )
 
-        # Fill in child DID on the mandate
-        mandate.child_did = child.agent_id
+    async def _ensure_spawn_operation_admitted(
+        self, admission: AgentOperationAdmission, child: KestrelAgent
+    ) -> None:
+        """Fail a stale spawn before it makes another irreversible mutation."""
 
-        # Per-child budget (#2113): hold from the parent and route the child's
-        # spend through a ceiling'd DelegatedWallet. On hold failure this removes
-        # the just-created child and re-raises (no uncapped orphan).
-        await self._apply_delegated_budget(name, parent_agent, child, mandate)
+        async with self._a2a_lifecycle_lock:
+            if not self._spawn_operation_is_admitted(admission, child):
+                raise RuntimeError(
+                    "Spawn was fenced before its child could commit"
+                )
 
-        # Runtime enforcement (spawn_mandate attach + restricted_tools hook) is
-        # applied uniformly in load_agent from the persisted delegation edge
-        # (#2137), which already ran for this child inside create_agent — so it
-        # covers reload/restart, not just this in-process spawn.
+    async def _rollback_uncommitted_spawn(
+        self, admission: AgentOperationAdmission, child: KestrelAgent
+    ) -> bool:
+        """Own rollback of a child whose spawn never committed its mandate.
 
-        # Track parent-child relationship
-        parent_did = parent_agent.agent_id
-        if parent_did not in self._parent_children:
-            self._parent_children[parent_did] = []
-        self._parent_children[parent_did].append(name)
+        ``remove_agent`` remains the sole runtime/budget cleanup primitive.  A
+        concurrent DELETE may have already claimed that child, in which case
+        its ``False`` is a completed handoff rather than permission to issue a
+        second shutdown.  A ``False`` is not itself proof of that handoff,
+        though: inspect the authoritative routing/hold state before accepting
+        it, so a failed spawn cannot leave a routable uncommitted child behind.
+        Return cancellation only after that chosen owner and the inspection
+        have both reached terminal state.
+        """
 
-        # Store the mandate
-        self._child_mandates[name] = mandate
-
-        logger.info(
-            f"Spawned child '{name}' (DID: {child.agent_id[:30]}...) "
-            f"for parent '{parent_did[:30]}...' — purpose: {mandate.purpose}"
+        cleanup = asyncio.create_task(
+            self.remove_agent(admission.name),
+            name=f"rollback_uncommitted_spawn:{admission.name}",
         )
-        return child
+        cancelled, failure = await await_lifecycle_task_completion(cleanup)
+        if failure is not None:
+            raise failure
+        if cleanup.result() is True:
+            return cancelled
+
+        inspection = asyncio.create_task(
+            self._child_runtime_or_delegated_hold_is_live(admission.name),
+            name=f"rollback_uncommitted_spawn_inspect:{admission.name}",
+        )
+        inspection_cancelled, inspection_failure = (
+            await await_lifecycle_task_completion(inspection)
+        )
+        if inspection_failure is not None:
+            raise inspection_failure
+        child_live, hold_live = inspection.result()
+        if child_live or hold_live:
+            admission.rollback_incomplete = True
+            live_resources = ", ".join(
+                resource
+                for resource, is_live in (
+                    ("routable child", child_live),
+                    ("delegated budget hold", hold_live),
+                )
+                if is_live
+            )
+            raise RuntimeError(
+                "Rollback of uncommitted spawn "
+                f"{admission.name!r} did not remove its live {live_resources}"
+            )
+        return cancelled or inspection_cancelled
+
+    async def _child_runtime_or_delegated_hold_is_live(
+        self, child_name: str
+    ) -> tuple[bool, bool]:
+        """Read the authoritative child routing and delegated-hold state."""
+
+        async with self._lock:
+            return (
+                self._agents.get(child_name) is not None,
+                child_name in self._child_budgets,
+            )
+
+    def _prune_child_relationship_and_mandate(
+        self, parent_did: str, child_name: str
+    ) -> None:
+        """Forget one fully removed child from parent spawn-cap bookkeeping."""
+
+        children = self._parent_children.get(parent_did)
+        if children is not None:
+            try:
+                children.remove(child_name)
+            except ValueError:
+                pass
+            if not children:
+                self._parent_children.pop(parent_did, None)
+        self._child_mandates.pop(child_name, None)
+
+    async def _prune_child_tracking_if_fully_removed(
+        self, parent_did: str, child_name: str
+    ) -> bool:
+        """Prune a parent edge only after every child cleanup owner is gone."""
+
+        async with self._lock:
+            child_live = self._agents.get(child_name) is not None
+            hold_live = child_name in self._child_budgets
+            quarantined_cleanup_live = self._quarantined_cleanup_name_is_reserved(
+                self._canonical_agent_name(child_name)
+            )
+            if child_live or hold_live or quarantined_cleanup_live:
+                return False
+            self._prune_child_relationship_and_mandate(parent_did, child_name)
+            return True
+
+    async def _prune_all_fully_removed_child_tracking(self) -> None:
+        """Reconcile completed child removals while the terminal drain is sealed.
+
+        A bounded ``remove_agent`` may return after handing shutdown and/or a
+        delegated refund to quarantine.  Its parent edge is deliberately kept
+        while that reaper owns the name, so the terminal drain is the only
+        point that may prune the edge after a successful handoff completion.
+        The drain seal excludes a new handoff between this check and pruning.
+        """
+
+        async with self._lock:
+            for parent_did, children in tuple(self._parent_children.items()):
+                for child_name in tuple(children):
+                    child_live = self._agents.get(child_name) is not None
+                    hold_live = child_name in self._child_budgets
+                    quarantined_cleanup_live = (
+                        self._quarantined_cleanup_name_is_reserved(
+                            self._canonical_agent_name(child_name)
+                        )
+                    )
+                    if not (
+                        child_live or hold_live or quarantined_cleanup_live
+                    ):
+                        self._prune_child_relationship_and_mandate(
+                            parent_did, child_name
+                        )
+
+    async def _join_admitted_spawn_operations(
+        self,
+    ) -> tuple[bool, list[BaseException]]:
+        """Join every spawn admitted before the shutdown registration fence.
+
+        A plain create/load has no child hold or mandate to commit after the
+        fleet sweep; its captured epoch prevents publication once shutdown
+        reopens for later operations.  A spawn is different: it can resume from
+        an already-published child into budget/mandate commit, so shutdown joins
+        that full operation before it snapshots live routing.  The spawn's own
+        failure is not independently a fleet failure: surviving runtime state
+        is what the subsequent sweep authoritatively reports.
+        """
+
+        cancelled = False
+        failures: list[BaseException] = []
+        observed: set[str] = set()
+        current_task = asyncio.current_task()
+        while True:
+            async with self._lock:
+                operations = tuple(
+                    operation
+                    for operation in self._agent_operations.values()
+                    if operation.kind in {"spawn", "direct-spawn-test"}
+                    and operation.spawn_task is not None
+                    and operation.spawn_task is not current_task
+                )
+            pending = [
+                operation
+                for operation in operations
+                if operation.canonical_name not in observed
+            ]
+            if not pending:
+                return cancelled, failures
+            for operation in pending:
+                observed.add(operation.canonical_name)
+                task = operation.spawn_task
+                assert task is not None
+                join_cancelled, failure = await await_lifecycle_task_completion(
+                    task
+                )
+                cancelled = cancelled or join_cancelled
+                # A spawn owns its rollback until this join.  Ordinary spawn
+                # failures are represented by the authoritative state swept
+                # below, but a BaseExceptionGroup preserves cancellation plus
+                # a rollback failure and cannot be allowed to abort that
+                # sweep.  Defer it so the terminal report retains both facts
+                # after every live agent has received cleanup.
+                if isinstance(failure, BaseExceptionGroup) and not isinstance(
+                    failure, Exception
+                ):
+                    expected, unexpected = failure.split(
+                        (asyncio.CancelledError, Exception)
+                    )
+                    if unexpected is not None:
+                        raise unexpected
+                    assert expected is not None
+                    failures.append(expected)
+                elif failure is not None and not isinstance(
+                    failure, (Exception, asyncio.CancelledError)
+                ):
+                    raise failure
 
     def get_children(self, parent_did: str) -> list[str]:
         """Get list of child agent names for a parent DID."""
@@ -2083,19 +4060,67 @@ class AgentManager:
         # (stop-then-release), after the cascade above has already stopped and
         # released every descendant — so refunds flow up leaf-first (#2113).
 
-        # Remove from parent tracking
-        children.remove(child_name)
-        if not children:
-            self._parent_children.pop(parent_did, None)
+        # Shutdown the child before mutating retry bookkeeping.  A false
+        # removal result or a failed/cancelled refund leaves either routing or
+        # its exact delegated hold live; keeping the relationship and mandate
+        # lets the ordinary terminate_child path retry safely.  ``remove_agent``
+        # can also re-raise cancellation only after its owned shutdown/refund
+        # tail settled.  In that terminal case reconcile the authoritative
+        # state before propagating cancellation, or the removed child keeps a
+        # stale mandate that consumes a spawn-cap slot forever.
+        try:
+            removed = await self.remove_agent(child_name)
+        except asyncio.CancelledError:
+            reconciliation = asyncio.create_task(
+                self._prune_child_tracking_if_fully_removed(parent_did, child_name),
+                name=f"terminate_child_cancel_reconcile:{child_name}",
+            )
+            _, reconciliation_failure = await await_lifecycle_task_completion(
+                reconciliation
+            )
+            if reconciliation_failure is not None:
+                logger.error(
+                    "Unable to reconcile cancelled termination of child %r",
+                    child_name,
+                    exc_info=(
+                        type(reconciliation_failure),
+                        reconciliation_failure,
+                        reconciliation_failure.__traceback__,
+                    ),
+                )
+            raise
+        if not removed:
+            return False
 
-        # Clean up mandate
-        self._child_mandates.pop(child_name, None)
-
-        # Shutdown the child agent
-        removed = await self.remove_agent(child_name)
-        if removed:
-            logger.info(f"Terminated child '{child_name}' of parent '{parent_did[:30]}...'")
-        return removed
+        # ``True`` means routing has been withdrawn, not necessarily that a
+        # timeout/cancellation-resistant shutdown or fenced refund is done:
+        # remove_agent may have handed either to quarantine.  Keep the parent
+        # edge and mandate until the authoritative maps *and* the per-name
+        # reaper reservation prove the complete removal.  A terminal drain
+        # performs the same reconciliation after it joins the reaper, so a
+        # late failed refund that restores its hold cannot race this pruning.
+        reconciliation = asyncio.create_task(
+            self._prune_child_tracking_if_fully_removed(parent_did, child_name),
+            name=f"terminate_child_reconcile:{child_name}",
+        )
+        reconciliation_cancelled, reconciliation_failure = (
+            await await_lifecycle_task_completion(reconciliation)
+        )
+        if reconciliation_failure is not None:
+            raise reconciliation_failure
+        if reconciliation_cancelled:
+            raise asyncio.CancelledError()
+        if reconciliation.result():
+            logger.info(
+                f"Terminated child '{child_name}' of parent '{parent_did[:30]}...'"
+            )
+        else:
+            logger.info(
+                "Child %r routing was withdrawn, but its retry tracking remains "
+                "owned by delegated cleanup.",
+                child_name,
+            )
+        return True
 
     async def terminate_children(self, parent_did: str) -> int:
         """Terminate all children of a parent agent (cascading).
@@ -2122,22 +4147,48 @@ class AgentManager:
         failed agents as published, and surface all ordinary failures only once
         every candidate has received its shutdown attempt.
         """
+        # A fleet shutdown and a direct terminal drain have the same ownership
+        # boundary.  Own that boundary *before* attempting removal: otherwise a
+        # drain can seal between this sweep's snapshot and its first DELETE,
+        # making a live agent look like a false ``remove_agent(False)`` failure.
+        # This also serializes concurrent fleet shutdowns, so the second owner
+        # takes a fresh snapshot after the first has finished every live agent.
+        cancelled = await self._acquire_quarantined_shutdown_drain()
+        try:
+            self._seal_agent_registration_for_shutdown_all()
+            await self._shutdown_all_while_drain_locked(cancelled=cancelled)
+        finally:
+            self._reopen_agent_registration_after_shutdown_all()
+            self._quarantined_shutdown_drain_lock.release()
+
+    async def _shutdown_all_while_drain_locked(self, *, cancelled: bool) -> None:
+        """Perform one fleet sweep while owning the terminal drain boundary."""
+
         # Stop + release budgeted children leaf-first (#2113): reverse insertion
         # order is leaf-first (a descendant is always spawned after its ancestor),
         # so each is quiesced and its unspent hold refunded UP into its (budgeted)
         # parent before that parent is released to the root. remove_agent does the
         # stop-then-release. (A follow-up covers durable reconciliation across an
         # *ungraceful* crash.)
-        cancelled = False
-        failures: list[Exception] = []
+        # Fence first, then join each pre-fence spawn through its full create ->
+        # budget -> mandate commit/rollback boundary.  Plain create/load work is
+        # publication-fenced by its captured epoch and remains intentionally
+        # bounded by its own initializer; waiting for arbitrary provider or
+        # inception I/O here would turn a normal fleet shutdown into a hang.
+        spawn_join_cancelled, spawn_failures = (
+            await self._join_admitted_spawn_operations()
+        )
+        cancelled = spawn_join_cancelled or cancelled
+        failures: list[BaseException] = list(spawn_failures)
         removed_names: set[str] = set()
         attempted_names: set[str] = set()
+        reported_budget_release_failures: set[str] = set()
 
         def fully_removed(name: str) -> bool:
             """Whether neither a routable agent nor a delegated hold remains."""
             return name not in self._agents and name not in self._child_budgets
 
-        def record_failure(name: str, failure: Exception) -> None:
+        def record_failure(name: str, failure: BaseException) -> None:
             failures.append(failure)
             logger.warning("Could not completely shut down agent %r: %s", name, failure)
 
@@ -2146,10 +4197,16 @@ class AgentManager:
             nonlocal cancelled
             attempted_names.add(name)
             failure_recorded = False
+            admitted_budget_release: Optional[InflightRemovalBudgetRelease] = None
+            release_ids_before_attempt = self._removal_budget_release_ids_for_child(
+                name
+            )
             try:
                 if unpublished_hold:
-                    release_cancelled = (
-                        await self._release_child_budget_cancellation_safe(name)
+                    async with self._lock:
+                        admitted_budget_release = self._start_child_budget_release(name)
+                    release_cancelled = await self._await_child_budget_release_cancellation_safe(
+                        admitted_budget_release.task
                     )
                     cancelled = cancelled or release_cancelled
                     removed = fully_removed(name)
@@ -2167,10 +4224,58 @@ class AgentManager:
                         RuntimeError("removal was interrupted before completion"),
                     )
                     failure_recorded = True
+            except BaseExceptionGroup as exc:
+                # A lifecycle owner can retain cancellation and an ordinary
+                # cleanup failure in one group.  As with admitted spawns,
+                # report that terminal evidence only after every later fleet
+                # member has received its own removal attempt.
+                expected, unexpected = exc.split(
+                    (asyncio.CancelledError, Exception)
+                )
+                if unexpected is not None:
+                    raise unexpected
+                assert expected is not None
+                removed = fully_removed(name)
+                record_failure(name, expected)
+                failure_recorded = True
+                if admitted_budget_release is not None:
+                    reported_budget_release_failures.add(
+                        admitted_budget_release.release_id
+                    )
+                else:
+                    reported_budget_release_failures.update(
+                        self._removal_budget_release_ids_for_child(name)
+                        - release_ids_before_attempt
+                    )
             except Exception as exc:
                 removed = fully_removed(name)
                 record_failure(name, exc)
                 failure_recorded = True
+                if admitted_budget_release is not None:
+                    # Keep its retained unsafe metadata for a later terminal
+                    # drain, but this fleet shutdown already names the exact
+                    # release failure above.
+                    reported_budget_release_failures.add(
+                        admitted_budget_release.release_id
+                    )
+                else:
+                    # A published agent admits its release inside
+                    # ``remove_agent``. Attribute only evidence created by
+                    # this attempt, leaving pre-existing unsafe records for
+                    # the terminal drain to report.
+                    reported_budget_release_failures.update(
+                        self._removal_budget_release_ids_for_child(name)
+                        - release_ids_before_attempt
+                    )
+
+            # A concurrent DELETE can complete the snapshotted target while
+            # this sweep is waiting on its per-DID lifecycle writer. Its later
+            # ``False`` means there was nothing left for *this* caller to do,
+            # not that fleet teardown failed. Only accept that result when the
+            # authoritative maps prove both routing and the delegated hold are
+            # gone; a live agent or retained hold remains a real failure.
+            if not removed:
+                removed = fully_removed(name)
 
             if removed:
                 removed_names.add(name)
@@ -2195,6 +4300,37 @@ class AgentManager:
         names = [name for name in self._agents if name not in attempted_names]
         for name in names:
             await attempt_removal(name)
+
+        # ``remove_agent`` is intentionally allowed to return once it has
+        # quarantined cancellation-resistant cleanup.  Fleet/server shutdown
+        # is the terminal lifecycle owner, however: do not let a following
+        # server teardown close the event loop or shared storage while one of
+        # those retained reapers is still releasing an owner or closing SQLite.
+        try:
+            cancelled = (
+                await self._drain_quarantined_shutdowns_while_locked(
+                    cancelled=False,
+                    reported_budget_release_failures=reported_budget_release_failures
+                )
+            ) or cancelled
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:
+            failures.append(exc)
+            logger.warning(
+                "Quarantined agent shutdown cleanup did not complete safely: %s",
+                exc,
+                exc_info=True,
+            )
+
+        # A bounded DELETE may initially look fully removed after handing a
+        # fenced refund to quarantine.  The terminal drain above can then
+        # observe that refund fail and restore its exact hold.  Re-evaluate the
+        # authoritative routing/hold state before pruning relationships: a
+        # restored hold needs its mandate and parent edge for normal retry.
+        removed_names = {
+            name for name in removed_names if fully_removed(name)
+        }
 
         # Only successful removals may disappear from relationship state. A
         # failed child stays visible to its parent and retains its mandate for a
@@ -2225,4 +4361,6 @@ class AgentManager:
         if cancelled:
             raise asyncio.CancelledError()
         if failures:
-            raise ExceptionGroup("One or more fleet agents failed to shut down", failures)
+            raise BaseExceptionGroup(
+                "One or more fleet agents failed to shut down", failures
+            )

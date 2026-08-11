@@ -163,6 +163,38 @@ over time, Talon/MCP) uses one substrate:
 - **State/secret ownership**: the service owns its own data dir / session DB
   (e.g. WhatsApp linked-device credentials) under the agent data dir.
 
+#### External-ingress transition fence
+
+Some isolated services acknowledge input at an external producer before their
+stdio notification reaches Core (for example, a long-poll cursor).  Such a
+producer opts into a pre-gate lifecycle by advertising both private
+host-ingress names `external-ingress-quiesce` and `external-ingress-resume`.
+These are ordinary versioned SDK host-ingress capability names, not channel
+operations and never agent tools.
+
+For each config transition, Core generates a fresh opaque 256-bit
+`transition_id`, calls `external-ingress-quiesce` **while its traffic gate is
+still open**, and closes/drains that gate only after a strict `quiesced`
+acknowledgment. The service must stop its producer, cancel/reap a pending
+external receive, and wait for an already-started event callback to settle
+before returning that acknowledgment. On the shared stdio wire that callback's
+notification precedes the quiesce response; the SDK client serially delivers
+the notification before resolving the response, so the gate drain also covers
+it. This is an ordering handshake, not a sleep or a dropped-event workaround.
+
+If staging/promotion fails or the old child live-applies the change, Core
+invokes `external-ingress-resume` with the same id **while its traffic gate is
+still closed**. The service must return the strict `resumed` response before it
+starts polling or produces another callback; only after Core receives that
+response does it reopen the gate. A first callback produced immediately after
+the response is held by the closed-gate deferred-ingress path, so it cannot be
+lost in the response/reopen handoff. A replacement owns a new child and does
+not resume the retired producer. A mismatched id, malformed acknowledgment,
+timeout, cross-loop operation, or cancellation-ambiguous lifecycle result
+fails closed and leaves the exact child under the established terminal/reaping
+ownership rules. Services which do not advertise both names, including legacy
+SDK/services, keep the existing safe replacement path unchanged.
+
 ### 3.4 Layout (same repo, two venvs)
 
 Isolation is a **venv** boundary, not a **repo** boundary. Default layout keeps

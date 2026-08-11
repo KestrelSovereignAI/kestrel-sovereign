@@ -56,7 +56,7 @@ def _durable_backend_double() -> MagicMock:
     backend.fetch_all = AsyncMock(return_value=[])
 
     @contextlib.asynccontextmanager
-    async def transaction():
+    async def transaction(*, immediate: bool = False):
         yield
 
     backend.transaction = transaction
@@ -244,6 +244,24 @@ class TestKestrelAgentInit:
         assert agent.storage_path == db_path
         assert agent._privacy_mode == PrivacyMode.ISOLATED
         assert agent.agent_id == did
+
+    def test_init_exposes_hosted_telegram_route_resolver_before_feature_boot(self, tmp_path):
+        """A host can inject the resolver before isolated feature discovery."""
+
+        resolver = lambda _proxy: None
+        agent = KestrelAgent(
+            did="did:pkh:eip155:1:0xTelegramRoute",
+            storage_path=str(tmp_path / "test.db"),
+            hosted_telegram_route_attestation_resolver=resolver,
+        )
+
+        assert agent.hosted_telegram_route_attestation_resolver is resolver
+        with pytest.raises(TypeError, match="must be callable"):
+            KestrelAgent(
+                did="did:pkh:eip155:1:0xTelegramRouteInvalid",
+                storage_path=str(tmp_path / "invalid.db"),
+                hosted_telegram_route_attestation_resolver=object(),
+            )
 
     def test_init_retains_injected_scoped_peer_dependencies(self, tmp_path):
         """Hosted embedding supplies a router plus trusted opaque scope once."""

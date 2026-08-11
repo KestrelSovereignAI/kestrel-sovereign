@@ -255,6 +255,16 @@ KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
 )
 
 
+def _raise_unexpected_lifecycle_exception_group(
+    error: BaseExceptionGroup,
+) -> None:
+    """Propagate process-control leaves from an owned lifecycle outcome."""
+
+    _expected, unexpected = error.split((asyncio.CancelledError, Exception))
+    if unexpected is not None:
+        raise unexpected
+
+
 async def await_lifecycle_task_completion(
     task: "asyncio.Future[object]",
 ) -> tuple[bool, BaseException | None]:
@@ -280,6 +290,15 @@ async def await_lifecycle_task_completion(
         except asyncio.CancelledError:
             if joiner is not None and joiner.cancelling():
                 cancelled = True
+        except BaseExceptionGroup as error:
+            # A lifecycle owner can deliberately retain cancellation and an
+            # ordinary cleanup failure in one group.  Like an Exception, that
+            # is the owned task's terminal outcome, not a reason to abandon
+            # later cleanup owners that the caller must still join.
+            # Process-control exceptions are not lifecycle failure data.
+            # Preserve their grouping and propagate them immediately.
+            _raise_unexpected_lifecycle_exception_group(error)
+            assert task.done()
         except Exception:
             # ``shield`` re-raises the owned task's terminal exception into
             # this joiner.  The lifecycle contract returns that outcome as
@@ -290,7 +309,12 @@ async def await_lifecycle_task_completion(
 
     if task.cancelled():
         return cancelled, asyncio.CancelledError()
-    return cancelled, task.exception()
+    failure = task.exception()
+    if isinstance(failure, BaseExceptionGroup):
+        # A task can already be terminal when this helper is entered, in which
+        # case the loop above never observes its raised group.
+        _raise_unexpected_lifecycle_exception_group(failure)
+    return cancelled, failure
 
 
 async def await_agent_shutdown_completion(agent: object) -> bool:
@@ -533,8 +557,10 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
+        isolated_feature_data_dir: Optional[Path] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -579,6 +605,12 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            hosted_telegram_route_attestation_resolver: Optional host-owned
+                       pre-initialize resolver for a Telegram route already
+                       provisioned outside Core. It supplies typed ledger
+                       evidence before isolated feature discovery can start
+                       the child handshake; Core never provisions provider
+                       HTTP/webhooks through this seam.
             peer_directory_router: Optional hosted peer-directory/router.  When
                        supplied it replaces the local multi-agent HTTP adapter
                        used by ``PeersFeature``.
@@ -586,6 +618,11 @@ class KestrelAgent(
                        opaque authorization scope for ``peer_directory_router``.
                        This is injected by the embedding runtime, never derived
                        from a tool caller or user-id field.
+            isolated_feature_data_dir: Optional host-owned per-agent directory
+                       for isolated feature venvs and provisioning manifests.
+                       This lets a PostgreSQL-backed multi-tenant embedding
+                       isolate feature runtimes without pretending it owns a
+                       SQLite storage path.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -636,12 +673,25 @@ class KestrelAgent(
         # on-disk host.db lookups during credential resolution at init.
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
+        if hosted_telegram_route_attestation_resolver is not None:
+            from kestrel_sovereign.features.isolated_runtime import (
+                set_hosted_telegram_route_attestation_resolver,
+            )
+
+            set_hosted_telegram_route_attestation_resolver(
+                self, hosted_telegram_route_attestation_resolver
+            )
         # Scoped peer routing is an explicit dependency-injection seam for
         # hosted multi-tenant runtimes.  PeersFeature validates the pair at
         # initialization; keeping the opaque scope here avoids serializing it
         # into agent state or accepting any caller-controlled substitute.
         self.peer_directory_router = peer_directory_router
         self.peer_requester = peer_requester
+        self.isolated_feature_data_dir = (
+            Path(isolated_feature_data_dir).expanduser().resolve()
+            if isolated_feature_data_dir is not None
+            else None
+        )
         self._sovereign_trust_root_path = sovereign_trust_root_path
         self.identity_export_dir = identity_export_dir
 
@@ -6293,6 +6343,11 @@ Expected Duration: {expected_duration}
         the agent or releasing its budget.
         """
         await dispatcher.shutdown_durable_delivery()
+        wait_for_owner_release = getattr(
+            dispatcher, "wait_for_durable_shutdown_release", None
+        )
+        if callable(wait_for_owner_release):
+            await wait_for_owner_release()
         if storage_preclose is not None:
             await storage_preclose()
         if storage is not None and hasattr(storage, "close"):
@@ -6379,6 +6434,40 @@ Expected Duration: {expected_duration}
                 exc_info=(type(failure), failure, failure.__traceback__),
             )
             await self._ensure_durable_shutdown_continuation(dispatcher)
+
+    def handoff_shutdown_to_reaper(
+        self, shutdown_task: "asyncio.Future[object]"
+    ) -> "asyncio.Future[None]":
+        """Transfer a timed-out lifecycle join to a retained control-plane reaper.
+
+        A durable cognition turn can legally outlive the user-facing shutdown
+        deadline: its delivery lease and the storage connection it uses must
+        remain with that original execution until it either commits or is
+        safely retried.  Lifecycle callers nevertheless need a finite control
+        plane operation so they can withdraw routing and revoke a delegated
+        budget.  This method gives them one explicit handoff boundary.
+
+        The returned coroutine *never* closes storage early.  It first joins
+        the exact ``shutdown_task`` the caller already owns, then joins this
+        agent's continuation (if the bounded tail created one).  An
+        :class:`~kestrel_sovereign.multi_agent.agent_manager.AgentManager`
+        retains that coroutine in its observable quarantine registry rather
+        than awaiting it on the DELETE/restart path.
+        """
+        if not isinstance(shutdown_task, asyncio.Future):
+            raise TypeError("shutdown reaper handoff requires an asyncio future")
+
+        async def reap() -> None:
+            _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                raise failure
+            await self.wait_for_shutdown_completion()
+
+        return asyncio.create_task(
+            reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
+        )
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
@@ -6888,11 +6977,19 @@ Expected Duration: {expected_duration}
         # lifecycle timeout already cancelled us, leave the continuation
         # shielded and let that lifecycle owner join it before removing the
         # agent; re-raising below preserves the cancellation contract.
-        if not shutdown_cancelled:
+        dispatcher_owner_fenced = bool(
+            getattr(dispatcher, "durable_shutdown_owner_fenced", False)
+        )
+        if not shutdown_cancelled and not dispatcher_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion()
             except asyncio.CancelledError:
                 shutdown_cancelled = True
+        elif dispatcher_owner_fenced:
+            # The continuation owns storage close after the hostile cognition
+            # task settles. Returning degraded keeps shutdown bounded without
+            # making that live task peer-reclaimable in this process.
+            tail_degraded = True
         elif (
             self._durable_shutdown_continuation is not None
             and not self._durable_shutdown_continuation.done()
@@ -7234,6 +7331,18 @@ Expected Duration: {expected_duration}
                 "durable-signal-dispatcher",
             )
             dispatcher_shutdown_complete = dispatcher_shutdown_status == "ok"
+            if getattr(dispatcher, "durable_shutdown_owner_fenced", False):
+                await self._ensure_durable_shutdown_continuation(dispatcher)
+                logging.warning(
+                    "Durable cognition is still running after shutdown cancellation; "
+                    "keeping owner liveness and storage fenced until it settles."
+                )
+                # Other bounded shutdown work remains safe and useful (memory
+                # bookkeeping and sync workers do not own the retained
+                # delivery lease). The continuation observed below is the
+                # sole fence around shared storage close.
+                state["degraded"] = True
+                dispatcher_shutdown_complete = False
             # The dispatcher owns an independent, shielded teardown task, so
             # caller cancellation cannot strand committed work.  If its task
             # outlives this guard, it may still be using the same backend;

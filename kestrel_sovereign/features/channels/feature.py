@@ -11,10 +11,18 @@ DB tables (created on initialize):
   channel_config    -- per-agent per-channel configuration
 """
 
+import inspect
 import json
 import logging
+import re
 import uuid
-from typing import Dict, Optional
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from enum import Enum
+from typing import AsyncIterator, Dict, Optional
+
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
@@ -29,8 +37,16 @@ from kestrel_sovereign.security.encryption import (
     get_agent_fernet,
     get_fernet,
 )
-from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
+    DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
+    build_channel_message_registration,
+    build_signal_for_channel_message,
+)
 
 from .models import (
     ChannelMessage,
@@ -39,12 +55,20 @@ from .models import (
     MessageDirection,
 )
 from .registry import ChannelRegistry
-from kestrel_sovereign.signals.sources.channels import (
-    build_channel_message_registration,
-    build_signal_for_channel_message,
-)
 
 logger = logging.getLogger(__name__)
+
+_CANONICAL_TELEGRAM_UPDATE_ID = re.compile(
+    r"telegram:v2:bot:[1-9][0-9]*:update:[0-9]+\Z"
+)
+_TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
+    {
+        "malformed_update",
+        "unsupported_update",
+        "senderless_update",
+        "unauthorized_sender",
+    }
+)
 
 # Key version stamped into channel_messages metadata when a row is
 # encrypted at rest. Mirrors
@@ -53,10 +77,67 @@ logger = logging.getLogger(__name__)
 # guarantee (#2096 / F112).
 CHANNEL_KEY_VERSION = 1
 
-# SQL for the two tables managed by this feature.
-CHANNEL_TABLES_SQL = """
+
+def canonical_telegram_user_id(value: object) -> str | None:
+    """Return one immutable Telegram user ID, rejecting display identities.
+
+    Telegram usernames are mutable presentation data.  The host must apply the
+    same numeric-only authorization boundary as the isolated Telegram service,
+    because a child notification is not trusted to preserve that distinction.
+    """
+
+    if (
+        type(value) is not str
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+    ):
+        return None
+    try:
+        return value if int(value) > 0 else None
+    except ValueError:
+        return None
+
+
+def canonical_telegram_allowed_senders(value: object) -> list[str]:
+    """Normalize host-side Telegram authorization to canonical numeric IDs."""
+
+    if type(value) is not list:
+        return []
+    return [sender for item in value if (sender := canonical_telegram_user_id(item))]
+
+
+class InboundAdmissionDisposition(str, Enum):
+    """What the channel feature proved about one inbound message."""
+
+    DURABLY_ADMITTED = "durably_admitted"
+    RETRYABLE = "retryable"
+    LEGACY_ROUTED = "legacy_routed"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class InboundAdmission:
+    """Explicit ingress result consumed by ACK-bearing isolated channels.
+
+    Legacy routing intentionally has a different disposition: it may preserve
+    compatibility for a non-dispatcher host, but it is not a durable receipt
+    and therefore can never advance an external provider cursor.
+    """
+
+    disposition: InboundAdmissionDisposition
+
+    @property
+    def durably_admitted(self) -> bool:
+        return self.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+# SQL for the two tables managed by this feature.  Keep the message-table DDL
+# as one source of truth: the identity migration creates this exact shape in
+# its transaction, while normal initialization adds the same table idempotently
+# alongside the indexes/config table below.
+CHANNEL_MESSAGES_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS channel_messages (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     channel_type TEXT NOT NULL,
     direction TEXT NOT NULL,
@@ -65,8 +146,12 @@ CREATE TABLE IF NOT EXISTS channel_messages (
     content TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'success',
     metadata TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agent_id, id)
+)
+"""
+
+CHANNEL_TABLES_SQL = CHANNEL_MESSAGES_TABLE_SQL + """;
 
 CREATE INDEX IF NOT EXISTS idx_channel_messages_agent
     ON channel_messages(agent_id);
@@ -119,6 +204,12 @@ class ChannelFeature(Feature):
             getattr(storage, "agent_id", "")
             or getattr(getattr(storage, "_storage", None), "agent_id", "")
         )
+        agent_did = getattr(self.agent, "did", None)
+        self._authoritative_agent_id = (
+            agent_did
+            if isinstance(agent_did, str) and agent_did.strip()
+            else self._agent_id
+        )
 
         # Encryption-at-rest keys for channel_messages content. Same key
         # hierarchy the conversation store uses (per-agent HKDF key with a
@@ -132,10 +223,23 @@ class ChannelFeature(Feature):
 
         # Create the channel registry
         self.registry = ChannelRegistry()
+        self._durable_cognition_ready = False
+        self._durable_terminal_ready = False
+        self._durable_cognition_registration_failed = False
         self._register_channel_signal_source()
+        await self._register_durable_cognition_consumer()
 
         # Create tables if DB is available
         if self._db:
+            try:
+                await self._migrate_channel_message_identity()
+            except Exception as exc:
+                # History identity is a data-safety boundary. Continuing after
+                # an ambiguous migration can turn a duplicate provider ID
+                # into a dropped row, so leave the source table intact and
+                # fail initialization loudly for an operator to reconcile.
+                logger.error("Could not safely migrate channel history identity: %s", exc)
+                raise
             try:
                 for statement in CHANNEL_TABLES_SQL.strip().split(";"):
                     statement = statement.strip()
@@ -149,24 +253,357 @@ class ChannelFeature(Feature):
             (self._agent_id[:30] + "...") if len(self._agent_id) > 30 else self._agent_id,
         )
 
+    async def _migrate_channel_message_identity(self) -> None:
+        """Safely replace the historical database-global message key.
+
+        New tables use ``(agent_id, id)``.  Existing SQLite data is copied
+        row-for-row through a retained legacy table and verified before that
+        table is removed; PostgreSQL changes only the old primary-key
+        constraint.  Both migrations run in one backend transaction, so a
+        process death, copy failure, or competing initializer cannot expose a
+        renamed/copying half-state.
+        """
+        backend_type = getattr(self._db, "backend_type", None)
+        if not isinstance(backend_type, str):
+            return
+        if backend_type == "sqlite":
+            await self._migrate_sqlite_channel_message_identity()
+        elif backend_type == "postgres":
+            await self._migrate_postgres_channel_message_identity()
+
+    @asynccontextmanager
+    async def _channel_identity_migration_transaction(self) -> AsyncIterator[None]:
+        """Enter the transaction that owns this whole schema transition.
+
+        ``resolve_feature_database`` normally gives an ``AsyncDatabase``
+        facade.  SQLite's ``BEGIN IMMEDIATE`` lives on its backend, so use that
+        same backend for the transaction while keeping feature queries on the
+        facade.  PostgreSQL gets a normal transaction plus an explicit table
+        lock below.  Both choices serialize independent process initializers,
+        not merely coroutines sharing one feature instance.
+        """
+        backend = getattr(self._db, "backend", self._db)
+        transaction = getattr(backend, "transaction", None)
+        if not callable(transaction):
+            raise RuntimeError(
+                "channel history database has no transaction API for migration"
+            )
+        if getattr(backend, "backend_type", None) == "sqlite":
+            async with transaction(immediate=True):
+                yield
+            return
+        async with transaction():
+            yield
+
+    @staticmethod
+    def _quote_postgres_identifier(identifier: object) -> str:
+        """Validate and quote one catalog-provided PostgreSQL identifier.
+
+        Constraint names are data returned from the database catalog, not a
+        trusted source-code constant.  PostgreSQL permits quoted names, so a
+        restrictive ASCII regex would reject valid legacy databases; reject
+        values that cannot be a PostgreSQL identifier and quote every embedded
+        double quote before putting the value in DDL.
+        """
+        if (
+            type(identifier) is not str
+            or not identifier
+            or "\x00" in identifier
+            or len(identifier.encode("utf-8")) > 63
+            or any(ord(character) < 32 for character in identifier)
+        ):
+            raise RuntimeError("channel_messages has an invalid primary-key name")
+        return '"' + identifier.replace('"', '""') + '"'
+
+    async def _migrate_sqlite_channel_message_identity(self) -> None:
+        legacy_table = "channel_messages_legacy_global_id"
+        async with self._channel_identity_migration_transaction():
+            tables = await self._channel_db_fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+                ("channel_messages", legacy_table),
+            )
+            names = {row[0] for row in tables}
+            if "channel_messages" not in names and legacy_table not in names:
+                # Fresh concurrent initializers serialize at BEGIN IMMEDIATE;
+                # the second one observes this exact canonical table.
+                await self._db.execute(CHANNEL_MESSAGES_TABLE_SQL)
+                return
+            if "channel_messages" in names:
+                columns = await self._channel_db_fetch_all(
+                    "PRAGMA table_info(channel_messages)"
+                )
+                key_columns = [
+                    row[1]
+                    for row in sorted(columns, key=lambda row: int(row[5]))
+                    if row[5]
+                ]
+                if key_columns == ["id"]:
+                    if legacy_table in names:
+                        raise RuntimeError(
+                            "channel message identity migration found both legacy and live tables"
+                        )
+                    await self._db.execute(
+                        f"ALTER TABLE channel_messages RENAME TO {legacy_table}"
+                    )
+                    names.remove("channel_messages")
+                    names.add(legacy_table)
+                elif key_columns != ["agent_id", "id"]:
+                    raise RuntimeError(
+                        "channel_messages has an unsupported primary key; refusing unsafe migration"
+                    )
+            if legacy_table not in names:
+                return
+
+            # A pre-transactional version may have left the retained source
+            # table behind.  Recover it inside this same writer transaction;
+            # a second process cannot see or drop a half-copied source.
+            await self._db.execute(CHANNEL_MESSAGES_TABLE_SQL)
+            await self._db.execute(
+                f"""INSERT OR IGNORE INTO channel_messages
+                     (id, agent_id, channel_type, direction, sender, recipient,
+                      content, status, metadata, created_at)
+                     SELECT id, agent_id, channel_type, direction, sender, recipient,
+                            content, status, metadata, created_at
+                     FROM {legacy_table}"""
+            )
+            mismatch = await self._channel_db_fetch_one(
+                f"""SELECT COUNT(*) FROM {legacy_table} legacy
+                     LEFT JOIN channel_messages migrated
+                       ON migrated.agent_id = legacy.agent_id AND migrated.id = legacy.id
+                     WHERE migrated.id IS NULL
+                        OR migrated.channel_type IS NOT legacy.channel_type
+                        OR migrated.direction IS NOT legacy.direction
+                        OR migrated.sender IS NOT legacy.sender
+                        OR migrated.recipient IS NOT legacy.recipient
+                        OR migrated.content IS NOT legacy.content
+                        OR migrated.status IS NOT legacy.status
+                        OR migrated.metadata IS NOT legacy.metadata
+                        OR migrated.created_at IS NOT legacy.created_at"""
+            )
+            if mismatch is None or int(mismatch[0]) != 0:
+                raise RuntimeError(
+                    "channel message identity migration could not verify every historical row"
+                )
+            await self._db.execute(f"DROP TABLE {legacy_table}")
+
+    async def _migrate_postgres_channel_message_identity(self) -> None:
+        async with self._channel_identity_migration_transaction():
+            # ``LOCK TABLE`` cannot protect the absent-table branch. Serialize
+            # that branch with a transaction-scoped advisory lock, then use the
+            # relation lock below once a table exists. This lets a rolling old
+            # creator race only against one canonical migration transaction;
+            # the re-read after CREATE observes and repairs whichever schema
+            # became real rather than returning into an outside CREATE path.
+            await self._db.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))"
+            )
+            table_exists = await self._channel_db_fetch_one(
+                "SELECT to_regclass('channel_messages')"
+            )
+            if table_exists is None or table_exists[0] is None:
+                # Fresh PostgreSQL creation belongs to this migration
+                # transaction, not the later best-effort table bootstrap.
+                # Otherwise two rolling initializers can both observe absence,
+                # then let an old creator publish ``PRIMARY KEY (id)`` outside
+                # the lock window. Re-read and lock the relation we created so
+                # this path has exactly the same postcondition as migration.
+                await self._db.execute(CHANNEL_MESSAGES_TABLE_SQL)
+                table_exists = await self._channel_db_fetch_one(
+                    "SELECT to_regclass('channel_messages')"
+                )
+                if table_exists is None or table_exists[0] is None:
+                    raise RuntimeError(
+                        "channel_messages creation did not become visible in migration transaction"
+                    )
+            # Re-read every catalog value after the exclusive relation lock.
+            # Without it, two initializers can both observe the old key; one
+            # then drops a constraint the first transaction has already
+            # replaced. The lock and both ALTERs share one transaction.
+            await self._db.execute(
+                "LOCK TABLE channel_messages IN ACCESS EXCLUSIVE MODE"
+            )
+            primary_key = await self._channel_db_fetch_one(
+                """SELECT con.conname FROM pg_constraint con
+                     WHERE con.conrelid = to_regclass('channel_messages')
+                       AND con.contype = 'p'"""
+            )
+            if primary_key is None:
+                raise RuntimeError("channel_messages is missing its primary key")
+            columns = await self._channel_db_fetch_all(
+                """SELECT attribute.attname
+                     FROM pg_constraint con
+                     JOIN unnest(con.conkey) WITH ORDINALITY AS key_column(attnum, ordinal)
+                       ON TRUE
+                     JOIN pg_attribute attribute
+                       ON attribute.attrelid = con.conrelid
+                      AND attribute.attnum = key_column.attnum
+                     WHERE con.conrelid = to_regclass('channel_messages')
+                       AND con.contype = 'p'
+                     ORDER BY key_column.ordinal"""
+            )
+            key_columns = [row[0] for row in columns]
+            if key_columns == ["agent_id", "id"]:
+                return
+            if key_columns != ["id"]:
+                raise RuntimeError(
+                    "channel_messages has an unsupported primary key; refusing unsafe migration"
+                )
+            constraint_name = self._quote_postgres_identifier(primary_key[0])
+            # A global id key already proves the new pair is unique, so this
+            # DDL broadens identity without transforming or discarding rows.
+            await self._db.execute(
+                f"ALTER TABLE channel_messages DROP CONSTRAINT {constraint_name}"
+            )
+            await self._db.execute(
+                "ALTER TABLE channel_messages ADD PRIMARY KEY (agent_id, id)"
+            )
+
+    async def _channel_db_fetch_all(self, query: str, params: tuple = ()):
+        """Use the established async-storage spelling on either DB facade."""
+
+        fetch = getattr(self._db, "fetchall", None)
+        if not callable(fetch):
+            fetch = getattr(self._db, "fetch_all", None)
+        if not callable(fetch):
+            raise RuntimeError("channel history database has no fetch-all operation")
+        return await fetch(query, params)
+
+    async def _channel_db_fetch_one(self, query: str, params: tuple = ()):
+        """Use the established async-storage spelling on either DB facade."""
+
+        fetch = getattr(self._db, "fetchone", None)
+        if not callable(fetch):
+            fetch = getattr(self._db, "fetch_one", None)
+        if not callable(fetch):
+            raise RuntimeError("channel history database has no fetch-one operation")
+        return await fetch(query, params)
+
     def _register_channel_signal_source(self) -> None:
         signal_registry = getattr(self.agent, "signal_registry", None)
-        if signal_registry is None or not hasattr(
-            signal_registry, "register_with_policy"
-        ):
+        register = getattr(signal_registry, "register_with_policy", None)
+        get_registration = getattr(signal_registry, "get", None)
+        if not callable(register) or not callable(get_registration):
+            self._durable_cognition_registration_failed = True
+            logger.error(
+                "Channel signal registry cannot verify the required channel.message "
+                "contract; ACK-bearing ingress will remain retryable"
+            )
             return
-        from kestrel_sovereign.signals import RegistrationPolicy
+        from kestrel_sovereign.signals import (
+            RegistrationOutcome,
+            RegistrationPolicy,
+            SourceRegistry,
+        )
 
         # OPTIONAL policy (#2522): idempotent on re-init, but an existing
         # channel.message source with a DIFFERENT contract is reported rather
         # than silently accepted by a precheck-by-name skip. Never raises.
-        outcome = signal_registry.register_with_policy(
-            build_channel_message_registration(),
-            RegistrationPolicy.OPTIONAL,
-        )
+        required = build_channel_message_registration()
+        try:
+            outcome = register(required, RegistrationPolicy.OPTIONAL)
+            # A host which merely claims registration succeeded is insufficient
+            # for cursor-owned ingress. Verify the installed source itself so
+            # an older/embedder registry cannot ACK an unknown contract.
+            actual = get_registration(required.name)
+            verified = (
+                isinstance(outcome, RegistrationOutcome)
+                and outcome.ok
+                and SourceRegistry.contract_equivalent(actual, required)
+            )
+        except Exception:
+            self._durable_cognition_registration_failed = True
+            logger.exception(
+                "Could not register and verify the channel.message signal source; "
+                "ACK-bearing ingress will remain retryable"
+            )
+            return
+        if not verified:
+            # ``OPTIONAL`` keeps a pre-existing source alive on a mismatch or
+            # validation failure.  That is tolerable for an ordinary optional
+            # feature, but not for cursor-owning channel ingress: its durable
+            # consumer would otherwise bind to a different (or absent)
+            # ``channel.message`` contract and let a provider ACK work that
+            # Core cannot safely process.  Preserve the provider cursor until
+            # this feature can start against its intended contract.
+            self._durable_cognition_registration_failed = True
+            logger.error(
+                "Channel signal source registration is not verifiably usable for "
+                "durable cognition (state=%s): %s; ACK-bearing ingress will "
+                "remain retryable",
+                getattr(getattr(outcome, "state", None), "value", "unknown"),
+                getattr(outcome, "detail", "required contract missing or mismatched"),
+            )
+            return
         # Own the source we newly registered so shutdown / boot rollback
-        # unregisters it (#2522 P2).
+        # unregisters it (#2522 P2). This is deliberately after verifying the
+        # actual registration rather than trusting an embedder's return value.
         self._own_signal_sources(outcome)
+
+    async def _register_durable_cognition_consumer(self) -> None:
+        """Register the restart-safe delivery behind ACK-bearing channels.
+
+        This registration is intentionally nonfatal for older/embedder
+        dispatchers.  In that compatibility case ingress retains its cursor
+        rather than claiming delivery was made durable.
+        """
+        if self._durable_cognition_registration_failed:
+            return
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        register = getattr(dispatcher, "register_durable_consumer", None)
+        start_owner = getattr(dispatcher, "start_durable_cognition_consumer", None)
+        agent_did = getattr(self.agent, "did", None)
+        if not callable(register) or not isinstance(agent_did, str) or not agent_did:
+            return
+        try:
+            from kestrel_sovereign.signals.durable import DurableConsumerRegistration
+
+            await register(
+                DurableConsumerRegistration(
+                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                    source="channel.message",
+                    agent_id=agent_did,
+                    correlation_selector=(
+                        f"payload.{DURABLE_COGNITION_MARKER}="
+                        f"{DURABLE_COGNITION_MARKER_VALUE}"
+                    ),
+                    # Provider cursors are retryable until cognition is
+                    # acknowledged; bounded retries would turn outages into
+                    # irreversible loss.
+                    max_attempts=0,
+                )
+            )
+            await register(
+                DurableConsumerRegistration(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    source="channel.message",
+                    agent_id=agent_did,
+                    correlation_selector=(
+                        f"payload.{DURABLE_TERMINAL_MARKER}="
+                        f"{DURABLE_TERMINAL_MARKER_VALUE}"
+                    ),
+                    max_attempts=0,
+                )
+            )
+            # A provider cursor is permitted to advance once the selected
+            # delivery is owned durably.  Therefore this owner must be live
+            # at boot and independently recover that delivery after a process
+            # loss; a future provider callback is not a restart mechanism.
+            if callable(start_owner):
+                started = start_owner(DURABLE_COGNITION_CONSUMER_ID)
+                # Older embedding seams and test doubles may expose a plain
+                # registration mock. Production's dispatcher method is
+                # awaitable; only that concrete owner satisfies restart drain.
+                if inspect.isawaitable(started):
+                    await started
+        except Exception:
+            self._durable_cognition_registration_failed = True
+            logger.exception(
+                "Could not register durable channel cognition consumer; "
+                "ACK-bearing ingress will remain retryable"
+            )
+            return
+        self._durable_cognition_ready = True
+        self._durable_terminal_ready = True
 
     async def shutdown(self):
         """Disconnect all registered adapters."""
@@ -532,7 +969,52 @@ class ChannelFeature(Feature):
     # Inbound message handling (called by adapters)
     # ------------------------------------------------------------------
 
-    async def handle_inbound(self, message: ChannelMessage) -> None:
+    async def handle_terminal_inbound(
+        self, message: ChannelMessage, *, disposition: str
+    ) -> InboundAdmission:
+        """Durably own a bounded Telegram terminal update without cognition."""
+
+        if (
+            disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
+            or message.channel_type != "telegram"
+            or getattr(message, "_kestrel_cursor_owned_protocol", False) is not True
+            or _CANONICAL_TELEGRAM_UPDATE_ID.fullmatch(message.id or "") is None
+        ):
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        if metadata.get("dedupe_key") != message.id:
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if (
+            self._durable_cognition_registration_failed
+            or not self._durable_terminal_ready
+        ):
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        enqueue_terminal = getattr(dispatcher, "enqueue_durable_terminal", None)
+        if not callable(enqueue_terminal):
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        try:
+            signal = build_signal_for_channel_message(
+                message,
+                target_agent=getattr(self.agent, "did", self._agent_id),
+            )
+            signal.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+            handle = await enqueue_terminal(
+                signal,
+                source_event_id=message.id,
+                consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+            )
+            receipt = await handle.wait_for_durable_admission()
+        except Exception:
+            logger.exception(
+                "Failed to durably record terminal Telegram update id=%s", message.id
+            )
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        if getattr(receipt, "acknowledged", False) is True:
+            return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+        return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+
+    async def handle_inbound(self, message: ChannelMessage) -> InboundAdmission:
         """
         Process an inbound message from a channel adapter.
 
@@ -542,44 +1024,179 @@ class ChannelFeature(Feature):
         Args:
             message: The inbound ChannelMessage.
         """
-        # Check sender filtering
+        # The child transport is not an authorization boundary. Enforce the
+        # host adapter's enabled state and sender policy before logging,
+        # dispatching, or issuing a cursor-advancing receipt.
+        is_telegram = message.channel_type == "telegram"
+        # The channel name alone is not a cursor protocol.  The isolated
+        # proxy supplies this flag only after it has validated Telegram's
+        # paired acknowledgement/retry contract on its registered bridge.
+        # The proxy stamps this in-memory attribute only after it validates
+        # Telegram's paired ACK/NACK contract.  It is intentionally absent
+        # from ChannelMessage serialization and ordinary callers cannot turn
+        # on durable cursor semantics through persisted/user config.
+        cursor_owning = (
+            is_telegram
+            and getattr(message, "_kestrel_cursor_owned_protocol", False) is True
+        )
+        canonical_sender = (
+            canonical_telegram_user_id(message.sender) if is_telegram else None
+        )
+        if is_telegram and canonical_sender is None:
+            logger.info("Blocked noncanonical Telegram sender identity %r", message.sender)
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         adapter = self.registry.get(message.channel_type)
         if adapter and adapter.config:
-            if not adapter.config.is_sender_allowed(message.sender):
+            config = adapter.config
+            telegram_default_deny = (
+                is_telegram
+                and not getattr(config, "allowed_senders", None)
+            )
+            if (
+                not config.enabled
+                or telegram_default_deny
+                or not config.is_sender_allowed(message.sender)
+            ):
                 logger.info(
-                    "Blocked message from disallowed sender '%s' on channel '%s'",
+                    "Blocked inbound message from sender '%s' on channel '%s'",
                     message.sender,
                     message.channel_type,
                 )
-                return
+                return InboundAdmission(InboundAdmissionDisposition.REJECTED)
 
-        # Set agent_id if not already set
-        if not message.agent_id:
-            message.agent_id = self._agent_id
+        # A child transport is never an authority for the message tenant. Bind
+        # every inbound row and signal to this host feature's resolved agent,
+        # including a non-empty child-supplied value.
+        message.agent_id = self._authoritative_agent_id
 
         # Log inbound message
         await self._log_message(message, status="received")
 
-        dispatched_signal = False
+        durable_admission = False
+        durable_cognition_attempted = False
         dispatcher = getattr(self.agent, "dispatcher", None)
+        if self._durable_cognition_registration_failed and cursor_owning:
+            # A dispatcher that rejected the durable consumer contract is not
+            # an older compatibility host. Falling back to ordinary enqueue
+            # here would let a provider cursor advance on event persistence
+            # alone, before cursor-owning cognition has a durable consumer.
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
         if dispatcher is not None:
             try:
                 signal = build_signal_for_channel_message(
                     message,
                     target_agent=getattr(self.agent, "did", self._agent_id),
+                    durable_cognition=cursor_owning,
                 )
-                # Provider retries reuse the channel message ID.  Pass it as
-                # the durable source-event key so a retry cannot wake a
-                # workflow consumer twice after process restart.
-                await dispatcher.enqueue_signal(signal, source_event_id=message.id)
-                dispatched_signal = True
+                # Provider retries reuse the channel message ID. Only the
+                # negotiated cursor-owning Telegram path gets a dedicated
+                # durable cognition delivery; ordinary channels retain their
+                # historical signal/router behavior.
+                enqueue_durable_cognition = getattr(
+                    dispatcher, "enqueue_durable_cognition", None
+                )
+                if (
+                    cursor_owning
+                    and self._durable_cognition_ready
+                    and callable(enqueue_durable_cognition)
+                ):
+                    durable_cognition_attempted = True
+                    handle = await enqueue_durable_cognition(
+                        signal,
+                        source_event_id=message.id,
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                    )
+                elif cursor_owning:
+                    # Telegram polling owns a provider cursor. It has an
+                    # explicit negotiated durable path and must never fall
+                    # through to ordinary queue persistence or legacy routing.
+                    logger.error(
+                        "Telegram inbound lacks a verified durable cognition path; "
+                        "retaining provider cursor for message id=%s",
+                        message.id,
+                    )
+                    return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+                else:
+                    # Legacy channels may still enqueue their ordinary signal
+                    # for the dispatcher, but they neither create nor wait on
+                    # the Telegram cursor delivery receipt. Their router path
+                    # remains the compatibility contract.
+                    await dispatcher.enqueue_signal(
+                        signal, source_event_id=message.id
+                    )
+                if cursor_owning:
+                    wait_for_durable_admission = getattr(
+                        handle, "wait_for_durable_admission", None
+                    )
+                    if not callable(wait_for_durable_admission):
+                        logger.error(
+                            "Channel dispatcher returned no durable-admission receipt "
+                            "for message id=%s",
+                            message.id,
+                        )
+                    elif self._persistent_content_hidden():
+                        # Privacy-elided durable rows intentionally retain
+                        # only a marker plus a process-local handoff.  An
+                        # admission ACK at that point would let Telegram
+                        # advance its cursor even though a restart could no
+                        # longer recover caller/content.  Keep the provider
+                        # cursor until cognition reaches a terminal durable
+                        # outcome; raw content still never enters storage.
+                        wait_for_terminal = getattr(handle, "wait", None)
+                        delivery_for_event = getattr(
+                            dispatcher, "get_durable_delivery_for_event", None
+                        )
+                        if not callable(wait_for_terminal) or not callable(
+                            delivery_for_event
+                        ):
+                            logger.error(
+                                "Volatile Telegram cognition has no terminal durable "
+                                "receipt for message id=%s",
+                                message.id,
+                            )
+                        else:
+                            await wait_for_terminal()
+                            event_id = getattr(handle, "signal_id", None)
+                            if not isinstance(event_id, str) or not event_id:
+                                logger.error(
+                                    "Volatile Telegram cognition has no durable event ID "
+                                    "for message id=%s",
+                                    message.id,
+                                )
+                                return InboundAdmission(
+                                    InboundAdmissionDisposition.RETRYABLE
+                                )
+                            delivery = await delivery_for_event(
+                                consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                                event_id=event_id,
+                            )
+                            durable_admission = getattr(delivery, "status", None) in {
+                                "acknowledged",
+                                "terminal_ackable",
+                            }
+                    else:
+                        receipt = await wait_for_durable_admission()
+                        durable_admission = (
+                            getattr(receipt, "acknowledged", False) is True
+                        )
             except Exception:
                 logger.exception(
-                    "Failed to enqueue channel.message signal for message id=%s",
+                    "Failed to durably admit channel.message signal for message id=%s",
                     message.id,
                 )
 
-        if not dispatched_signal:
-            # Legacy adapter/router path remains as fallback when the
-            # dispatcher is unavailable or rejected the signal.
+        if durable_admission:
+            return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+
+        if durable_cognition_attempted or cursor_owning:
+            # Do not send this message through the legacy in-memory router
+            # after its durable cognition path was rate-limited or failed.
+            # The external producer must retain its cursor and redeliver.
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+
+        # A legacy adapter/router path remains available for hosts without the
+        # dispatcher contract, but is deliberately not reported as a durable
+        # admission. ACK-bearing providers must retain their cursor and retry.
+        if not durable_admission:
             await self.registry.route_message(message)
+            return InboundAdmission(InboundAdmissionDisposition.LEGACY_ROUTED)

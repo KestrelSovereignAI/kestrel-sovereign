@@ -1,5 +1,7 @@
 """Tests for DelegatedWallet budget delegation and ceiling enforcement."""
 
+import asyncio
+
 import pytest
 from decimal import Decimal
 from enum import Enum
@@ -7,6 +9,7 @@ from enum import Enum
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
+    DelegatedSpendOutcomeUnknown,
     DelegatedWallet,
     create_delegated_wallet,
     release_delegated_wallet,
@@ -31,6 +34,7 @@ class WalletAgent:
         self.initial_currency = initial_currency
         self._balances = {Currency.FIL: {"main": Decimal("0"), "audit": Decimal("0")}}
         self.transaction_history = []
+        self._debit_intents = {}
 
     async def initialize(self):
         self._balances[self.initial_currency]["main"] = (
@@ -57,6 +61,24 @@ class WalletAgent:
         self._balances[currency]["main"] -= amount
         self.transaction_history.append({"type": "transfer", "memo": memo})
         return True
+
+    async def prepare_debit_intent(self, *, idempotency_key, amount, memo, currency):
+        self._debit_intents.setdefault(
+            idempotency_key,
+            {"amount": amount, "memo": memo, "currency": currency, "outcome": False},
+        )
+        return idempotency_key
+
+    async def execute_debit_intent(self, intent_id):
+        intent = self._debit_intents[intent_id]
+        if intent["outcome"] is True:
+            return True
+        applied = await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+        intent["outcome"] = applied
+        return applied
+
+    async def resolve_debit_intent(self, intent_id):
+        return self._debit_intents[intent_id]["outcome"]
 
     async def deposit(
         self,
@@ -88,6 +110,55 @@ class TestBudgetAllocation:
         assert not alloc.is_exhausted
         alloc.spent = Decimal("10")
         assert alloc.is_exhausted
+
+
+@pytest.mark.asyncio
+async def test_applied_then_cancelled_child_debit_reconciles_before_refund():
+    """Cancellation after provider I/O cannot refund a debit that applied."""
+
+    class AppliedThenCancelledWallet(WalletAgent):
+        async def execute_debit_intent(self, intent_id):
+            intent = self._debit_intents[intent_id]
+            assert await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+            intent["outcome"] = True
+            raise asyncio.CancelledError()
+
+    child = AppliedThenCancelledWallet("did:child", Decimal("10"))
+    await child.initialize()
+    parent = WalletAgent("did:parent")
+    await parent.initialize()
+    wallet = DelegatedWallet(child, BudgetAllocation(child_did="did:child", amount=Decimal("10")))
+
+    with pytest.raises(asyncio.CancelledError):
+        await wallet.spend(Decimal("3"), "provider applied")
+
+    assert await release_delegated_wallet(wallet, parent) == Decimal("7")
+    assert wallet.spent == Decimal("3")
+    assert parent.get_balance(Currency.FIL) == Decimal("7")
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_child_debit_refuses_refund_after_transport_error():
+    """An unknown provider outcome is unsafe; a full refund is forbidden."""
+
+    class AppliedThenTransportErrorWallet(WalletAgent):
+        async def execute_debit_intent(self, intent_id):
+            intent = self._debit_intents[intent_id]
+            assert await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+            intent["outcome"] = None
+            raise ConnectionError("response lost after provider debit")
+
+    child = AppliedThenTransportErrorWallet("did:child", Decimal("10"))
+    await child.initialize()
+    parent = WalletAgent("did:parent")
+    await parent.initialize()
+    wallet = DelegatedWallet(child, BudgetAllocation(child_did="did:child", amount=Decimal("10")))
+
+    with pytest.raises(ConnectionError):
+        await wallet.spend(Decimal("3"), "response lost")
+    with pytest.raises(DelegatedSpendOutcomeUnknown):
+        await release_delegated_wallet(wallet, parent)
+    assert parent.get_balance(Currency.FIL) == Decimal("0")
 
     def test_created_at_populated(self):
         alloc = BudgetAllocation(child_did="did:child:1", amount=Decimal("1"))
@@ -239,6 +310,58 @@ async def test_hold_release_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_durable_parent_allocation_retries_hold_and_release_by_allocation_id():
+    """Core uses a provider-owned allocation ledger when one is available."""
+
+    class DurableAllocationWallet(WalletAgent):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.allocations = {}
+
+        async def reserve_delegated_allocation(
+            self, *, allocation_id, child_did, amount, memo, currency
+        ):
+            existing = self.allocations.get(allocation_id)
+            if existing is not None:
+                assert existing[:4] == (child_did, amount, memo, currency)
+                return existing[4] == "held"
+            if not await self.transfer(amount, memo, currency):
+                return False
+            self.allocations[allocation_id] = (child_did, amount, memo, currency, "held")
+            return True
+
+        async def release_delegated_allocation(self, *, allocation_id, amount, currency):
+            child_did, held, _memo, held_currency, state = self.allocations[allocation_id]
+            assert held_currency == currency and amount <= held
+            if state == "released":
+                return True
+            assert await self.deposit(amount, currency, memo=f"release {child_did}")
+            self.allocations[allocation_id] = (
+                child_did, held, _memo, held_currency, "released"
+            )
+            return True
+
+    parent = DurableAllocationWallet("did:parent", Decimal("100"))
+    await parent.initialize()
+    delegated = await create_delegated_wallet(
+        parent, "did:parent", "did:child", Decimal("30")
+    )
+    assert delegated.allocation.parent_hold_durable is True
+    assert parent.get_balance(Currency.FIL) == Decimal("60")
+    # A retry after a crash before child publication reuses the deterministic
+    # parent/child allocation key instead of taking another parent hold.
+    retried = await create_delegated_wallet(
+        parent, "did:parent", "did:child", Decimal("30")
+    )
+    assert retried.allocation.allocation_id == delegated.allocation.allocation_id
+    assert parent.get_balance(Currency.FIL) == Decimal("60")
+    assert await delegated.spend(Decimal("10"), "work")
+    assert await release_delegated_wallet(delegated, parent) == Decimal("20")
+    assert await release_delegated_wallet(delegated, parent) == Decimal("0")
+    assert parent.get_balance(Currency.FIL) == Decimal("80")
+
+
+@pytest.mark.asyncio
 async def test_hold_release_full_spend():
     """When child spends entire budget, nothing is returned to parent."""
     parent_wallet = WalletAgent(
@@ -285,6 +408,24 @@ async def test_hold_release_no_spend():
 
     parent_main = parent_wallet.get_balance(Currency.FIL, "main")
     assert parent_main == Decimal("90")  # 90 - 25 + 25 = original
+
+
+@pytest.mark.asyncio
+async def test_release_revokes_late_quarantined_spending():
+    """A removed child cannot spend after its unspent hold returns to parent."""
+    parent_wallet = WalletAgent(agent_id="parent-reaper", initial_balance=Decimal("100"))
+    await parent_wallet.initialize()
+    delegated = await create_delegated_wallet(
+        parent_wallet=parent_wallet,
+        parent_did="did:parent:reaper",
+        child_did="did:child:reaper",
+        budget=Decimal("25"),
+    )
+
+    assert await release_delegated_wallet(delegated, parent_wallet) == Decimal("25")
+    assert delegated.can_afford(Decimal("1")) is False
+    with pytest.raises(BudgetExceededError):
+        await delegated.spend(Decimal("1"), "late quarantined cognition")
 
 
 # ---------------------------------------------------------------------------

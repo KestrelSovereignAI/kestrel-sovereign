@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import weakref
@@ -37,13 +38,13 @@ from uuid import uuid4
 from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.isolated_feature import (
     CONFIG_TRANSITION_APPLIED,
+    MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionResult,
     HostIngressCapabilities,
     HostIngressError,
     HostIngressPayload,
     HostIngressUnknownNameError,
     HostIngressUnsupportedError,
-    MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ProtocolError,
     validate_host_ingress_name,
     validate_host_ingress_payload,
@@ -52,8 +53,61 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
+from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteClaim,
+    ChannelRouteOwnershipStore,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_telegram_bot_id(value: object) -> str:
+    """Normalize one Telegram bot ID for Core's route-ownership boundary.
+
+    Telegram accepts decimal IDs, while route ownership must not let a host
+    accidentally split one bot across textual aliases.  In particular,
+    ``000123`` normalizes to ``123`` and provider-prefixed strings such as
+    ``telegram-bot:123`` are rejected rather than treated as already
+    canonical.
+    """
+
+    if type(value) is not str or not value.isascii() or not value.isdecimal():
+        raise ValueError("Telegram bot ID must be a positive decimal string")
+    normalized = value.lstrip("0")
+    if not normalized:
+        raise ValueError("Telegram bot ID must be positive")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class HostedTelegramRouteAttestation:
+    """Host-supplied route evidence consumed before a Telegram child starts.
+
+    The host (for example Frinz) remains responsible for concrete provider and
+    HTTP provisioning.  Core only receives this typed, provider-neutral
+    ownership input and establishes its own durable ledger fence before the
+    child handshake can start polling or receive the hosted-ingress capability.
+    """
+
+    ownership_store: ChannelRouteOwnershipStore
+    bot_id: str
+
+
+def set_hosted_telegram_route_attestation_resolver(
+    agent: Any, resolver: Callable[["ProxyFeature"], Any]
+) -> None:
+    """Inject a host's pre-initialize Telegram route resolver.
+
+    This is Core's generic boot seam: a host installs it while constructing an
+    agent, before feature discovery invokes :meth:`ProxyFeature.initialize`.
+    The resolver supplies only typed route evidence; Core performs the durable
+    ownership claim itself. Concrete webhook and provider provisioning remain
+    outside Core.
+    """
+
+    if not callable(resolver):
+        raise TypeError("hosted Telegram route attestation resolver must be callable")
+    setattr(agent, "hosted_telegram_route_attestation_resolver", resolver)
 
 # Upper bound on a single supervision health probe. A wedged child that never
 # answers health() must not silently kill supervision forever (F013) — treat a
@@ -78,6 +132,77 @@ _CONFIG_GENERATION_KEY = "_isolated_config_generation"
 _PENDING_GENERATION_KEY = "_isolated_pending_generation"
 _PENDING_OWNER_KEY = "_isolated_pending_owner"
 _PENDING_LEASE_EXPIRES_AT_KEY = "_isolated_pending_lease_expires_at"
+
+# Optional, capability-negotiated lifecycle callbacks for isolated services
+# that acknowledge external input independently of Core's stdio event path.
+# A service only advertises these names when it can stop its producer and reap
+# any in-flight callback before acknowledging quiescence. The opaque transition
+# id lets a later resume prove it belongs to this exact config attempt.
+_EXTERNAL_INGRESS_QUIESCE = "external-ingress-quiesce"
+_EXTERNAL_INGRESS_RESUME = "external-ingress-resume"
+_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
+
+# A service-to-host event is a JSON-RPC notification and therefore has no
+# response channel. An opted-in producer may wrap a channel inbound payload in
+# this private descriptor; after the host has completed the inbound handler it
+# calls the advertised host-ingress name with the exact detached payload. The
+# callback must run outside the SDK event reader because that same reader owns
+# the response stream for host-ingress RPCs.
+_EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
+_EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
+_EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
+_EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD = "_telegram_terminal_disposition"
+_TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
+    {
+        "malformed_update",
+        "unsupported_update",
+        "senderless_update",
+        "unauthorized_sender",
+    }
+)
+_EVENT_INGRESS_ATTEMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+_TELEGRAM_POLLING_ACK = "telegram-polling-ack"
+_TELEGRAM_POLLING_NACK = "telegram-polling-nack"
+# Polling is sequential: an acknowledged source cannot emit its next update
+# until Core acknowledges the current one. Retaining one current-child event
+# during a finite gate close therefore preserves no-loss startup without
+# turning a malicious notification flood into unbounded host memory.
+_MAX_DEFERRED_ACKNOWLEDGED_EVENTS = 1
+# An ACK is an idempotent private RPC, but it must not become an unbounded task
+# flood or retain a Telegram poller forever after one lost response.
+_EVENT_INGRESS_ACK_ATTEMPTS = 3
+_EVENT_INGRESS_ACK_TIMEOUT = 3.0
+_EVENT_INGRESS_ACK_CANCELLATION_GRACE = 1.0
+_EVENT_INGRESS_ACK_BACKOFF = 0.1
+# This is an initialize-handshake capability, not persisted feature config.
+# SDK 0.35.1 forwards the host-controlled config object but has no reverse
+# capability field on its subprocess wrapper yet.  Keeping this identifier in
+# one Core-owned place gives services an explicit opt-in contract without
+# guessing Core versions from an arbitrary client name.
+_HOST_RUNTIME_CAPABILITIES_FIELD = "_kestrel_host_runtime_capabilities"
+_ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY = "channel-inbound-acknowledgement-v1"
+# A host-only startup fence for an externally provisioned Telegram webhook.
+# It is deliberately injected at process launch rather than stored in feature
+# config: a user config row must never be able to claim a host route is live.
+_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY = "telegram-hosted-ingress-owner-v1"
+# A non-cursor producer has no child-side durable cursor to retain a callback
+# while Core's gate is closed.  Keep one item in the queue while its serial
+# worker owns one other item; the SDK notification reader naturally applies
+# backpressure to the producer before a third item can allocate host memory.
+_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
+_event_source_client: ContextVar[Any | None] = ContextVar(
+    "isolated_event_source_client", default=None
+)
+# This value is set only around a host-validated Telegram polling callback.
+# It is task-local rather than part of the child's JSON payload so an isolated
+# service cannot promote an arbitrary notification into the cursor-owning
+# protocol by adding a field to its message.
+_cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
+    "isolated_cursor_owned_inbound_protocol", default=False
+)
+_telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
+    "isolated_telegram_terminal_inbound_disposition", default=None
+)
 
 # A staged config must survive a short process pause, but it must not turn an
 # interrupted deploy or process death into a permanent write lock.  Readers
@@ -1210,6 +1335,17 @@ class _HostIngressOutcomeSlot:
 
 
 @dataclass
+class _NonCursorIngressQueue:
+    """One bounded, serial legacy ingress queue owned by an exact child."""
+
+    client: Any
+    events: asyncio.Queue[Any]
+    worker: asyncio.Task[None] | None = None
+    accepting: bool = True
+    retired: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class _TrackedFacadeLifecycleTask:
     """Non-detached ownership for a cancellation-hostile facade operation."""
 
@@ -1599,6 +1735,25 @@ class _ConfigTransition:
     owner: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _ExternalIngressQuiesce:
+    """One acknowledged external-producer pause owned by a config transition."""
+
+    client: Any = field(repr=False)
+    transition_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _DeferredAcknowledgedIngress:
+    """One detached, bounded polling event held behind a finite gate."""
+
+    message: dict[str, Any]
+    acknowledgement: _HostIngressRequest
+    source_client: Any = field(repr=False)
+    retry: _HostIngressRequest | None = None
+    telegram_terminal_disposition: str | None = None
+
+
 @dataclass
 class _ConfigWriteResult:
     """The direct result of one graph write, before ambiguity is reconciled."""
@@ -1751,6 +1906,55 @@ def _host_sdk_version() -> str:
     return "unknown"
 
 
+def _feature_distribution_version(distribution: str, install_target: str) -> str:
+    """Return the host-visible feature release used to provision a child.
+
+    The install target is often deliberately unversioned (for example
+    ``kestrel-channel-telegram[service]``), so it cannot tell a provisioned
+    venv that the host's feature distribution has changed. Explicit local
+    project metadata wins for editable targets; installed distribution
+    metadata covers normal package targets.
+
+    ``unknown`` is an honest non-version rather than a moving value: callers
+    stamp it once and do not reprovision forever when a target has no readable
+    version metadata.
+    """
+    # Editable installs retain their original ``.dist-info`` version until
+    # they are reinstalled. For an explicit local project, its source metadata
+    # therefore has to win over that stale installed record or a source version
+    # bump could not trigger the very reprovision it requires.
+    if isinstance(install_target, str) and install_target:
+        local_target = install_target.removeprefix("-e ").strip()
+        is_local_target = local_target.startswith((".", "/", "~", "file://"))
+        if is_local_target:
+            if local_target.startswith("file://"):
+                local_target = local_target.removeprefix("file://")
+            # pip permits extras on a local directory target; they are not
+            # part of the filesystem path containing project metadata.
+            local_target = re.sub(r"\[[^]]*\]$", "", local_target)
+            pyproject = Path(local_target).expanduser() / "pyproject.toml"
+            if pyproject.is_file():
+                try:
+                    try:
+                        import tomllib
+                    except ImportError:  # pragma: no cover - Python < 3.11 support
+                        import tomli as tomllib  # type: ignore[no-redef]
+
+                    data = tomllib.loads(pyproject.read_text())
+                    version = data.get("project", {}).get("version")
+                    if isinstance(version, str) and version:
+                        return version
+                except Exception:  # noqa: BLE001 - use installed metadata below
+                    pass
+
+    if isinstance(distribution, str) and distribution:
+        try:
+            return importlib_metadata.version(distribution)
+        except Exception:  # noqa: BLE001 - a non-installed target is stable below
+            pass
+    return "unknown"
+
+
 # Probe run *inside* a feature venv to report the kestrel-sdk version actually
 # installed there — mirrors _host_sdk_version's distribution resolution.
 _CHILD_SDK_PROBE = (
@@ -1764,6 +1968,99 @@ _CHILD_SDK_PROBE = (
     "    return 'unknown'\n"
     "print(v())\n"
 )
+
+
+@dataclass(frozen=True)
+class _FeatureDistributionProbe:
+    """One classified distribution probe from an isolated interpreter.
+
+    ``importlib.metadata.version`` alone conflates a missing distribution, a
+    broken probe, and a positively identified editable/versionless
+    distribution.  Prebuilt venvs are immutable, so those states must remain
+    distinguishable when deciding whether they are safe to run.
+    """
+
+    state: str
+    version: str | None = None
+
+    @classmethod
+    def versioned(cls, version: str) -> "_FeatureDistributionProbe":
+        return cls("versioned", version)
+
+    @classmethod
+    def present_unversioned(cls) -> "_FeatureDistributionProbe":
+        return cls("present-unversioned")
+
+    @classmethod
+    def missing(cls) -> "_FeatureDistributionProbe":
+        return cls("missing")
+
+    @classmethod
+    def failed(cls) -> "_FeatureDistributionProbe":
+        return cls("probe-failed")
+
+    @property
+    def is_present(self) -> bool:
+        return self.state in {"versioned", "present-unversioned"}
+
+
+def _venv_feature_distribution_probe(
+    python_path: Path, distribution: str
+) -> _FeatureDistributionProbe:
+    """Classify this runtime distribution inside the isolated child.
+
+    A host-visible release is only an installation intent.  The resolver can
+    still select an older index package (notably when the host runs an editable
+    or pre-release build), so provisioning must verify the distribution that
+    actually landed before declaring the venv fresh.
+    """
+    if type(distribution) is not str or not distribution:
+        return _FeatureDistributionProbe.failed()
+    bin_dir = python_path.parent
+    venv_path = bin_dir.parent if bin_dir.name in {"bin", "Scripts"} else None
+    probe = (
+        "from importlib import metadata as m\n"
+        f"distribution = {json.dumps(distribution)}\n"
+        "try:\n"
+        "    installed = m.distribution(distribution)\n"
+        "except m.PackageNotFoundError:\n"
+        "    print('{\"state\": \"missing\"}')\n"
+        "except Exception:\n"
+        "    print('{\"state\": \"probe-failed\"}')\n"
+        "else:\n"
+        "    try:\n"
+        "        version = installed.version\n"
+        "    except Exception:\n"
+        "        version = None\n"
+        "    if isinstance(version, str) and version:\n"
+        "        import json\n"
+        "        print(json.dumps({\"state\": \"versioned\", \"version\": version}))\n"
+        "    else:\n"
+        "        print('{\"state\": \"present-unversioned\"}')\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_isolated_child_env(venv_path),
+        )
+        decoded = json.loads(result.stdout)
+        if type(decoded) is not dict:
+            return _FeatureDistributionProbe.failed()
+        state = decoded.get("state")
+        if state == "versioned" and type(decoded.get("version")) is str and decoded["version"]:
+            return _FeatureDistributionProbe.versioned(decoded["version"])
+        if state == "present-unversioned":
+            return _FeatureDistributionProbe.present_unversioned()
+        if state == "missing":
+            return _FeatureDistributionProbe.missing()
+        if state == "probe-failed":
+            return _FeatureDistributionProbe.failed()
+        return _FeatureDistributionProbe.failed()
+    except Exception:  # noqa: BLE001 - the caller applies the safe stale policy
+        return _FeatureDistributionProbe.failed()
 
 
 def _venv_sdk_version(python_path: Path) -> str:
@@ -1797,6 +2094,13 @@ def _env_key(feature_name: str, suffix: str) -> str:
 
 
 def _agent_data_dir(agent: Any) -> Path:
+    # A PostgreSQL-backed multi-tenant host has no SQLite ``storage_path`` to
+    # derive from, yet each agent still needs a private isolated-feature venv.
+    # The embedding host supplies this path before feature discovery; it never
+    # comes from feature configuration or a tool request.
+    isolated_feature_data_dir = getattr(agent, "isolated_feature_data_dir", None)
+    if isinstance(isolated_feature_data_dir, (str, os.PathLike)):
+        return Path(isolated_feature_data_dir).expanduser().resolve()
     storage_path = getattr(agent, "storage_path", None)
     if storage_path:
         return Path(storage_path).expanduser().resolve().parent
@@ -2034,10 +2338,33 @@ class ProxyFeature(Feature):
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
+        # Event acknowledgement requests are intentionally detached from the
+        # SDK read loop (which cannot await a response it must itself read).
+        # Keep exact task ownership so terminal cleanup can cancel them rather
+        # than leaving a raw client RPC alive after the proxy is retired.
+        self._event_ack_tasks: set[asyncio.Task[None]] = set()
+        self._event_ack_clients: list[tuple[Any, asyncio.Task[None]]] = []
+        # Full inbound routing can run cognition. Keep it outside the SDK's
+        # serial notification reader. Cursor-owning providers retain their own
+        # next callback; legacy providers use the separate bounded serial queue
+        # below because they have no cursor/NACK contract to prevent loss.
+        self._event_ingress_tasks: set[asyncio.Task[None]] = set()
+        self._event_ingress_clients: list[tuple[Any, asyncio.Task[None]]] = []
+        self._non_cursor_event_ingress_queues: list[_NonCursorIngressQueue] = []
+        # Serial SDK readers normally invoke event handlers one at a time, but
+        # the queue handoff must stay correct for a concurrent/custom facade as
+        # well.  It closes the only race between a worker deciding it is idle
+        # and the next notification reserving that worker's bounded queue.
+        self._non_cursor_event_ingress_lock = asyncio.Lock()
+        self._deferred_acknowledged_event_tasks: set[asyncio.Task[None]] = set()
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
+        self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_route_identity: Optional[str] = None
+        self._hosted_telegram_route_claim: Optional[ChannelRouteClaim] = None
+        self._hosted_telegram_ownership_store: Optional[ChannelRouteOwnershipStore] = None
         # Process-local identity for the durable pending lease.  A new proxy
         # instance (including one after a crash/restart) never impersonates an
         # earlier writer; it may only reclaim that writer after its lease has
@@ -2092,6 +2419,184 @@ class ProxyFeature(Feature):
         if self.runtime.description:
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
+
+    def _is_telegram_runtime(self) -> bool:
+        return (
+            re.sub(r"[-_.]+", "-", self.runtime.distribution.strip().lower())
+            == "kestrel-channel-telegram"
+        )
+
+    def _require_telegram_runtime(self) -> None:
+        """Reject route attestation for any non-Telegram isolated runtime."""
+        if not self._is_telegram_runtime():
+            raise RuntimeError(
+                "hosted Telegram startup attestation is valid only for the Telegram feature"
+            )
+
+    @staticmethod
+    def _telegram_route_identity(bot_id: object) -> str:
+        """Build the only Telegram route spelling Core places in the ledger."""
+
+        return f"telegram-bot:{canonical_telegram_bot_id(bot_id)}"
+
+    def _clear_hosted_telegram_startup_attestation(self) -> None:
+        self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_route_identity = None
+        self._hosted_telegram_route_claim = None
+        self._hosted_telegram_ownership_store = None
+
+    async def _resolve_hosted_telegram_startup_attestation(self) -> None:
+        """Resolve host route evidence before a Telegram child handshake.
+
+        A normal Core boot discovers isolated features before the caller can
+        obtain the new proxy instance.  Hosts therefore inject the resolver on
+        the agent *before* initialization under the explicit
+        ``hosted_telegram_route_attestation_resolver`` seam.  Returning
+        ``None`` means this is an ordinary polling route.  Returning typed
+        hosted-route evidence requires a successful durable claim; any
+        conflict aborts startup before the child can touch provider ingress.
+        """
+
+        self._require_telegram_runtime()
+        # Do not use bare ``getattr`` here: dynamic integration proxies (and
+        # unittest mocks) manufacture callable-looking attributes that were
+        # never a host injection. Only an explicitly stored instance value or
+        # a concrete class-level resolver opens this hosted-route path.
+        resolver_name = "hosted_telegram_route_attestation_resolver"
+        instance_attributes = getattr(self.agent, "__dict__", None)
+        resolver = (
+            instance_attributes.get(resolver_name)
+            if isinstance(instance_attributes, dict)
+            else None
+        )
+        if resolver is None:
+            class_resolver = getattr(type(self.agent), resolver_name, None)
+            if class_resolver is not None:
+                resolver = getattr(self.agent, resolver_name)
+        if resolver is None:
+            # Preserve the narrow pre-initialize injection API for hosts that
+            # already hold the proxy, but reassert its generation before a new
+            # handshake. A stale in-memory boolean is never sufficient.
+            if (
+                self._hosted_telegram_ownership_store is not None
+                and self._hosted_telegram_route_identity is not None
+            ):
+                bot_id = self._hosted_telegram_route_identity.removeprefix(
+                    "telegram-bot:"
+                )
+                claimed = await self.reconcile_hosted_telegram_route_claim(
+                    ownership_store=self._hosted_telegram_ownership_store,
+                    bot_id=bot_id,
+                )
+                if not claimed:
+                    raise RuntimeError(
+                        "Hosted Telegram route is already owned; refusing to start child"
+                    )
+            else:
+                self._clear_hosted_telegram_startup_attestation()
+            return
+        if not callable(resolver):
+            raise TypeError(
+                "hosted_telegram_route_attestation_resolver must be callable"
+            )
+        resolved = await _maybe_await(resolver(self))
+        if resolved is None:
+            if self._hosted_telegram_route_claim is not None:
+                raise RuntimeError(
+                    "cannot remove hosted Telegram route evidence while its "
+                    "generation remains claimed; release it first"
+                )
+            self._clear_hosted_telegram_startup_attestation()
+            return
+        if not isinstance(resolved, HostedTelegramRouteAttestation):
+            raise TypeError(
+                "hosted Telegram route resolver must return "
+                "HostedTelegramRouteAttestation or None"
+            )
+        claimed = await self.reconcile_hosted_telegram_route_claim(
+            ownership_store=resolved.ownership_store,
+            bot_id=resolved.bot_id,
+        )
+        if not claimed:
+            raise RuntimeError(
+                "Hosted Telegram route is already owned; refusing to start child"
+            )
+
+    async def reconcile_hosted_telegram_route_claim(
+        self,
+        *,
+        ownership_store: ChannelRouteOwnershipStore,
+        bot_id: str,
+    ) -> bool:
+        """Durably claim/reconcile the host-provisioned Telegram route.
+
+        This is a narrow host/provisioner API, not a feature config setting or
+        agent tool.  The host calls it before starting a webhook-owned child
+        and after replacing one.  A successful result is the *only* way Core
+        injects the no-poll startup capability; a config boolean cannot create
+        that attestation.  Core intentionally does not fabricate a Telegram
+        HTTP endpoint in this branch — the external Frinz provisioner owns
+        provider API calls and may invoke the same generic durable store.
+        """
+        self._require_telegram_runtime()
+        if not isinstance(ownership_store, ChannelRouteOwnershipStore):
+            raise TypeError(
+                "hosted Telegram route attestation requires ChannelRouteOwnershipStore"
+            )
+        route_identity = self._telegram_route_identity(bot_id)
+        if (
+            self._hosted_telegram_route_claim is not None
+            and (
+                self._hosted_telegram_route_identity != route_identity
+                or self._hosted_telegram_ownership_store is not ownership_store
+            )
+        ):
+            raise RuntimeError(
+                "cannot reconcile a different hosted Telegram route ledger or "
+                "identity while the current generation remains claimed; release it first"
+            )
+        claim = await ownership_store.claim(
+            channel_type="telegram",
+            canonical_route_identity=route_identity,
+            agent_id=self._config_agent_did(),
+        )
+        if claim is None:
+            self._clear_hosted_telegram_startup_attestation()
+            return False
+        self._hosted_telegram_startup_attested = True
+        self._hosted_telegram_route_identity = route_identity
+        self._hosted_telegram_route_claim = claim
+        self._hosted_telegram_ownership_store = ownership_store
+        return True
+
+    async def release_hosted_telegram_route_claim(
+        self,
+        *,
+        ownership_store: ChannelRouteOwnershipStore,
+        bot_id: str,
+    ) -> bool:
+        """Release this proxy's route claim and revoke its launch attestation."""
+        self._require_telegram_runtime()
+        if not isinstance(ownership_store, ChannelRouteOwnershipStore):
+            raise TypeError(
+                "hosted Telegram route release requires ChannelRouteOwnershipStore"
+            )
+        route_identity = self._telegram_route_identity(bot_id)
+        claim = self._hosted_telegram_route_claim
+        if (
+            claim is None
+            or self._hosted_telegram_ownership_store is not ownership_store
+            or self._hosted_telegram_route_identity != route_identity
+        ):
+            return False
+        released = await ownership_store.release(
+            channel_type="telegram",
+            canonical_route_identity=route_identity,
+            agent_id=self._config_agent_did(),
+            claim=claim,
+        )
+        self._clear_hosted_telegram_startup_attestation()
+        return released
 
     def _config_agent_did(self) -> str:
         """Return the stable DID that scopes this proxy's durable config.
@@ -2433,6 +2938,8 @@ class ProxyFeature(Feature):
             # forwarded to the isolated service through the initialize handshake (the
             # service is otherwise launched bare, with only env vars).
             await self._ensure_host_config_loaded()
+            if self._is_telegram_runtime():
+                await self._resolve_hosted_telegram_startup_attestation()
             self._assert_child_start_allowed()
             await self._connect_client()
             self._assert_child_start_allowed()
@@ -2455,6 +2962,12 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_generation += 1
         self._terminal_lifecycle_latched = True
         self._stopping = True
+        for task in tuple(self._event_ack_tasks):
+            task.cancel()
+        for task in tuple(self._event_ingress_tasks):
+            task.cancel()
+        for task in tuple(self._deferred_acknowledged_event_tasks):
+            task.cancel()
         return self._terminal_lifecycle_generation
 
     async def _run_traffic_gate_operation(
@@ -2954,6 +3467,40 @@ class ProxyFeature(Feature):
         self._has_running_terminal_health_probe_task()
         return True
 
+    async def _cancel_terminal_event_ingress_tasks(self) -> bool:
+        """Fence inbound, ACK, and deferred-ingress workers before retirement.
+
+        A terminal latch may cancel either kind of worker, but cancellation is
+        only a request.  Retiring the exact facade before those tasks settle
+        could let one resume on a foreign loop and issue a late acknowledgement
+        or route a deferred body after terminal ownership was reported.  Keep
+        cleanup incomplete when the bounded join cannot prove settlement.
+        """
+
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in (
+                *self._event_ack_tasks,
+                *self._event_ingress_tasks,
+                *self._deferred_acknowledged_event_tasks,
+            )
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return True
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_EVENT_INGRESS_ACK_CANCELLATION_GRACE,
+            )
+        except asyncio.TimeoutError:
+            self._terminal_cleanup_uncertain = True
+            return False
+        return True
+
     def _has_running_terminal_lifecycle_task(self, client: Any) -> bool:
         """Whether a prior exact stop still owns this facade's process handle."""
 
@@ -3283,6 +3830,9 @@ class ProxyFeature(Feature):
             self._terminal_cleanup_uncertain
             or self._terminal_retirement_clients
             or self._has_running_terminal_health_probe_task()
+            or any(not task.done() for task in self._event_ack_tasks)
+            or any(not task.done() for task in self._event_ingress_tasks)
+            or any(not task.done() for task in self._deferred_acknowledged_event_tasks)
             or self._traffic_gate._active
             or self._terminal_traffic_drain_task is not None
         ):
@@ -3360,7 +3910,12 @@ class ProxyFeature(Feature):
         health_probe_running = self._has_running_terminal_health_probe_task()
         if health_probe_running and not self._terminal_cleanup_uncertain:
             health_probe_running = not await self._cancel_terminal_health_probe()
-        if self._terminal_cleanup_uncertain or health_probe_running:
+        ingress_tasks_settled = await self._cancel_terminal_event_ingress_tasks()
+        if (
+            self._terminal_cleanup_uncertain
+            or health_probe_running
+            or not ingress_tasks_settled
+        ):
             # A bounded facade stop did not establish whether its child retired,
             # or a cancellation-resistant health call still owns the facade.
             # Keep the exact private handle and leave admitted RPCs undrained:
@@ -3546,10 +4101,12 @@ class ProxyFeature(Feature):
                 )
                 return
             self._begin_reload()
-            # This intent marker deliberately precedes the await below. A
-            # cancelled close/drain has already made the gate finite-closed,
-            # so its finally must perform a cancellation-safe reopen or seal.
-            gate_closed = True
+            # The gate closes only after an opt-in external producer has
+            # acknowledged that it cannot emit another callback. A cancelled
+            # close/drain still needs the final reopen/seal below, but staging
+            # and producer quiescence deliberately happen while old traffic is
+            # still admissible.
+            gate_closed = False
             self._fenced_recovery_failed = False
             transition_attempted = False
             transition_succeeded = False
@@ -3558,13 +4115,9 @@ class ProxyFeature(Feature):
             transition_settled = False
             lifecycle_result: Optional[ConfigTransitionResult] = None
             local_authoritative = False
+            external_ingress_quiesce: _ExternalIngressQuiesce | None = None
+            body_error: BaseException | None = None
             try:
-                # Admission must close before the candidate is staged, not just
-                # before a replacement.  A successful in-process hook may have
-                # adopted its candidate by the time it returns, so tools,
-                # channel sends, and inbound callbacks must all be drained
-                # before the hook begins.
-                await self._close_traffic_gate()
                 # A caller may invoke set_config after a failed startup or
                 # before normal initialization. Reload the authoritative
                 # durable value first; otherwise a partial PATCH could stage
@@ -3585,11 +4138,59 @@ class ProxyFeature(Feature):
                 # the post-reconciliation lease renewal below remains the
                 # final fence immediately before a live SDK hook.
                 await self._assert_staged_transition_authority(transition)
+                # A no-op may commit immediately only when the published child
+                # is already known to be on the active durable generation. A
+                # replica can have a child on A while its fresh stage reads B;
+                # treating ``B -> B`` as a no-op there would cache B and leave
+                # that child reachable on A indefinitely.
+                reconcile_can_retire_client = (
+                    self._client is not None
+                    and self._host_config != transition.active_config
+                )
+                if (
+                    transition.next_config == transition.active_config
+                    and not reconcile_can_retire_client
+                ):
+                    promotion = await self._promote_config(transition)
+                    if not promotion.committed:
+                        await self._run_owned_transition_cleanup(
+                            transition,
+                            force=False,
+                            preserve_cancellation=False,
+                        )
+                        transition_settled = True
+                        self._raise_promotion_failure(promotion)
+                    transition_settled = True
+                    self._host_config = dict(transition.next_config)
+                    self._host_config_loaded = True
+                    local_authoritative = True
+                    if promotion.error is not None:
+                        self._raise_promotion_failure(promotion)
+                    return
+
+                # Quiesce the exact external producer while Core admission is
+                # still open. A callback already written into the bridge may
+                # be waiting for Core's durable ACK; closing first deadlocks
+                # that callback with the producer quiesce wait. The exact
+                # lifecycle RPC remains identity-fenced and bypasses the
+                # normal data-plane gate, so it cannot admit new work.
+                external_ingress_quiesce = self._new_external_ingress_quiesce()
+                if external_ingress_quiesce is not None:
+                    await self._quiesce_external_ingress(external_ingress_quiesce)
+                # Once the producer has confirmed its pause, close admission
+                # and drain every callback that crossed the prior boundary.
+                gate_closed = True
+                await self._close_traffic_gate_admission()
+                await self._drain_traffic_gate()
+
                 await self._reconcile_client_to_authoritative_config(
                     transition.active_config,
                     force=False,
                 )
-                if self._client is None:
+                if (
+                    self._client is None
+                    or transition.next_config == transition.active_config
+                ):
                     promotion = await self._promote_config(transition)
                     if not promotion.committed:
                         await self._run_owned_transition_cleanup(
@@ -3665,6 +4266,7 @@ class ProxyFeature(Feature):
                 if promotion.error is not None:
                     self._raise_promotion_failure(promotion)
             except _ConfigAuthorityChanged as authority_error:
+                body_error = authority_error
                 staged_transition = transition or getattr(
                     authority_error, "transition", None
                 )
@@ -3673,7 +4275,8 @@ class ProxyFeature(Feature):
                     f"Cannot apply config for isolated feature {self.name}: "
                     "legacy config authority became visible during rolling upgrade"
                 ) from authority_error
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation_error:
+                body_error = cancellation_error
                 if transition is not None:
                     # Every await after staging enters this path. The cleanup
                     # task is shielded so a second cancellation cannot strand
@@ -3703,6 +4306,7 @@ class ProxyFeature(Feature):
                         )
                 raise
             except BaseException as transition_error:
+                body_error = transition_error
                 if transition is not None and not transition_settled:
                     if transition_attempted and not transition_succeeded:
                         if (
@@ -3742,21 +4346,34 @@ class ProxyFeature(Feature):
                     )
                 raise
             finally:
+                # This finalizer owns the complete resume/reopen boundary.
+                # In particular, a cancelled caller cannot reopen the gate and
+                # replay a deferred polling update before the exact paused
+                # source has either resumed or been terminally quarantined.
+                finalizer_error: BaseException | None = None
                 try:
                     if self._fenced_recovery_failed:
                         await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+                    # Cancellation can arrive while the exact producer is
+                    # quiescing, before the normal body reaches its Core gate
+                    # close. Once that lifecycle operation has started, this
+                    # finalizer owns the same close/drain -> resume/quarantine
+                    # boundary; otherwise a cancelled quiesce can strand the
+                    # external producer paused forever.
+                    if external_ingress_quiesce is not None and not gate_closed:
+                        gate_closed = True
+                        await self._close_traffic_gate_admission()
+                        await self._drain_traffic_gate()
+                    if gate_closed:
+                        await self._finalize_external_ingress_transition(
+                            external_ingress_quiesce
+                        )
+                except BaseException as exc:  # noqa: BLE001 - body outcome wins below
+                    finalizer_error = exc
                 finally:
                     self._end_reload()
-                    # A quarantined proxy remains fail-closed. Every other path
-                    # reaches this point only after promotion or owned cleanup
-                    # has reconciled the active child with durable state. These
-                    # operations are themselves shielded to a final condition
-                    # state before this reload releases its lock.
-                    if gate_closed:
-                        if self._stopping:
-                            await self._seal_traffic_gate()
-                        else:
-                            await self._reopen_traffic_gate()
+                if finalizer_error is not None and body_error is None:
+                    raise finalizer_error
 
     async def _persist_terminal_config(
         self,
@@ -5079,6 +5696,172 @@ class ProxyFeature(Feature):
             and getattr(self._client, "supports_config_transition", False) is True
         )
 
+    def _new_external_ingress_quiesce(self) -> _ExternalIngressQuiesce | None:
+        """Return a capability-negotiated producer pause for this exact child.
+
+        The SDK 0.35.1 private host-ingress capability already supplies the
+        versioned, typed negotiation and bounded JSON transport this lifecycle
+        protocol needs. Legacy SDK/services simply do not advertise both names
+        and retain their established replacement behavior.
+        """
+
+        client = self._client
+        if client is None:
+            return None
+        capabilities = self._host_ingress_capabilities()
+        if capabilities is None or not {
+            _EXTERNAL_INGRESS_QUIESCE,
+            _EXTERNAL_INGRESS_RESUME,
+        }.issubset(capabilities.names):
+            return None
+        return _ExternalIngressQuiesce(
+            client=client,
+            transition_id=secrets.token_urlsafe(_EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES),
+        )
+
+    @staticmethod
+    def _is_external_ingress_lifecycle_ack(value: Any, *, state: str) -> bool:
+        """Accept only the small, deterministic lifecycle acknowledgment."""
+
+        if type(value) is not dict:
+            return False
+        allowed = {
+            "status",
+            "http_status",
+            "state",
+            "already_quiesced",
+            "already_resumed",
+        }
+        if not set(value).issubset(allowed):
+            return False
+        if (
+            value.get("status") != "ok"
+            or type(value.get("http_status")) is not int
+            or value.get("http_status") != 200
+            or value.get("state") != state
+        ):
+            return False
+        return all(
+            type(value[key]) is bool
+            for key in ("already_quiesced", "already_resumed")
+            if key in value
+        )
+
+    def _fence_external_ingress_lifecycle_timeout(self) -> None:
+        """Fail closed if a quiesce/resume RPC cannot settle within its budget."""
+
+        self._fenced_recovery_failed = True
+        self._latch_terminal_lifecycle()
+
+    async def _call_exact_external_ingress_lifecycle(
+        self,
+        quiesce: _ExternalIngressQuiesce,
+        name: str,
+    ) -> Any:
+        """Call only the paused client's lifecycle RPC outside data admission.
+
+        This private path is deliberately narrower than ``call_host_ingress``:
+        it accepts only the negotiated transition names, only the exact client
+        captured before the gate closed, and only a freshly validated detached
+        token payload. It is not an agent tool or a general ingress bypass.
+        """
+
+        if self._stopping or self._client is not quiesce.client:
+            raise RuntimeError("isolated feature changed during external ingress lifecycle")
+        if name not in {_EXTERNAL_INGRESS_QUIESCE, _EXTERNAL_INGRESS_RESUME}:
+            raise RuntimeError("invalid external ingress lifecycle operation")
+        capabilities = self._host_ingress_capabilities(quiesce.client)
+        if capabilities is None or name not in capabilities.names:
+            raise RuntimeError("isolated feature lacks external ingress lifecycle capability")
+        request = _prepare_host_ingress_request(
+            name, {"transition_id": quiesce.transition_id}
+        )
+        if request is None:
+            raise RuntimeError("invalid external ingress lifecycle request")
+        call = getattr(quiesce.client, "call_host_ingress", None)
+        if not callable(call):
+            raise RuntimeError("isolated feature lacks external ingress lifecycle RPC")
+        outcome_slot = _HostIngressOutcomeSlot()
+        await self._call_host_ingress_rpc(call, request, outcome_slot)
+        outcome = outcome_slot.outcome
+        if outcome is None:
+            raise HostIngressError("external ingress lifecycle RPC failed")
+        if outcome.status == _HOST_INGRESS_CANCELLED:
+            raise asyncio.CancelledError()
+        if outcome.status != _HOST_INGRESS_SUCCESS:
+            raise HostIngressError("external ingress lifecycle RPC failed")
+        return outcome.payload
+
+    async def _quiesce_external_ingress(
+        self, quiesce: _ExternalIngressQuiesce
+    ) -> None:
+        """Stop/reap an opt-in external producer before closing Core admission."""
+
+        if self._client is not quiesce.client:
+            raise RuntimeError("isolated feature changed before external ingress quiesce")
+        result = await _await_owned_facade_lifecycle_operation(
+            self._call_exact_external_ingress_lifecycle(
+                quiesce, _EXTERNAL_INGRESS_QUIESCE
+            ),
+            name=f"isolated-external-ingress-quiesce:{self.name}",
+            on_timeout=self._fence_external_ingress_lifecycle_timeout,
+            on_late_task=lambda task, client=quiesce.client: self._retain_terminal_lifecycle_task(
+                task, client
+            ),
+        )
+        if not self._is_external_ingress_lifecycle_ack(result, state="quiesced"):
+            raise RuntimeError("isolated feature did not acknowledge external ingress quiesce")
+
+    async def _resume_external_ingress(
+        self, quiesce: _ExternalIngressQuiesce
+    ) -> None:
+        """Resume a failed/live-applied transition only after Core reopens its gate."""
+
+        if self._client is not quiesce.client:
+            return
+        result = await _await_owned_facade_lifecycle_operation(
+            self._call_exact_external_ingress_lifecycle(
+                quiesce, _EXTERNAL_INGRESS_RESUME
+            ),
+            name=f"isolated-external-ingress-resume:{self.name}",
+            on_timeout=self._fence_external_ingress_lifecycle_timeout,
+            on_late_task=lambda task, client=quiesce.client: self._retain_terminal_lifecycle_task(
+                task, client
+            ),
+        )
+        if not self._is_external_ingress_lifecycle_ack(result, state="resumed"):
+            raise RuntimeError("isolated feature did not acknowledge external ingress resume")
+
+    async def _finalize_external_ingress_transition(
+        self, quiesce: _ExternalIngressQuiesce | None
+    ) -> None:
+        """Resume the exact paused producer, then reopen traffic atomically.
+
+        Resuming while the gate remains closed is intentional: its first
+        acknowledged callback is stored as the single detached deferred
+        snapshot. A resume failure seals and quarantines before that snapshot
+        can replay.
+        """
+
+        if self._stopping:
+            await self._seal_traffic_gate()
+            return
+        if quiesce is not None and self._client is quiesce.client:
+            try:
+                await self._resume_external_ingress(quiesce)
+            except BaseException:
+                logger.error(
+                    "Isolated feature %s could not resume external ingress; quarantining the proxy",
+                    self.name,
+                )
+                self._latch_terminal_lifecycle()
+                await self._quarantine_unreconciled_client(lifecycle_lock_held=True)
+                raise
+        if self._stopping:
+            await self._seal_traffic_gate()
+            return
+        await self._reopen_traffic_gate()
+
     def _client_requires_replacement(self) -> bool:
         """Whether the SDK fenced the current child after an unknown outcome."""
 
@@ -5125,7 +5908,9 @@ class ProxyFeature(Feature):
                 caps = inner_caps
         return caps if isinstance(caps, dict) else {}
 
-    def _host_ingress_capabilities(self) -> HostIngressCapabilities | None:
+    def _host_ingress_capabilities(
+        self, client: Any | None = None
+    ) -> HostIngressCapabilities | None:
         """Return an immutable snapshot of this client's ingress contract.
 
         Host ingress deliberately relies on the SDK's typed capability rather
@@ -5142,7 +5927,8 @@ class ProxyFeature(Feature):
         rather than invoke behavior on the facade object.
         """
 
-        capabilities = getattr(self._client, "host_ingress_capabilities", None)
+        target = self._client if client is None else client
+        capabilities = getattr(target, "host_ingress_capabilities", None)
         if type(capabilities) is not HostIngressCapabilities:
             return None
 
@@ -5365,6 +6151,8 @@ class ProxyFeature(Feature):
             if not callable(getter) or getter(self._channel_adapter.channel_type) is self._channel_adapter:
                 registry.unregister(self._channel_adapter.channel_type)
         self._channel_adapter = None
+        self._channel_type = None
+        self._link_tool = None
 
     def _channel_feature(self) -> Any:
         features = getattr(self.agent, "features", None)
@@ -5383,14 +6171,23 @@ class ProxyFeature(Feature):
         onto the forwarding adapter.
         """
         from kestrel_sdk.channels import ChannelConfig
+        from kestrel_sovereign.features.channels.feature import (
+            canonical_telegram_allowed_senders,
+        )
 
         cfg = self._host_config if config is None else config
         cfg = cfg if isinstance(cfg, dict) else {}
+        allowed_senders = cfg.get("allowed_senders") or []
+        if channel_type == "telegram":
+            # The child retains legacy @usernames only to explain migration.
+            # They are not host authorization data: notifications are
+            # untrusted until this proxy has applied immutable numeric IDs.
+            allowed_senders = canonical_telegram_allowed_senders(allowed_senders)
         return ChannelConfig(
             channel_type=channel_type,
             agent_id=str(cfg.get("agent_id", "") or ""),
             enabled=bool(cfg.get("enabled", True)),
-            allowed_senders=list(cfg.get("allowed_senders") or []),
+            allowed_senders=list(allowed_senders),
         )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -5613,7 +6410,12 @@ class ProxyFeature(Feature):
             return {}
 
     def _write_provision_manifest(
-        self, install_target: str, host_sdk: str, child_sdk: str
+        self,
+        install_target: str,
+        host_sdk: str,
+        child_sdk: str,
+        feature_distribution_version: str,
+        child_feature_distribution: _FeatureDistributionProbe,
     ) -> None:
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -5628,22 +6430,114 @@ class ProxyFeature(Feature):
                     # The SDK version that actually landed in the venv (may lag
                     # host_sdk if the feature pins it); recorded for diagnosis.
                     "child_sdk_version": child_sdk,
+                    # ``project`` is commonly an unversioned pip target. Keep
+                    # the host-visible distribution release separately so an
+                    # upgraded isolated feature cannot keep running an older
+                    # child merely because its target string did not change.
+                    "feature_distribution_version": feature_distribution_version,
+                    # The feature release actually resolved inside the child
+                    # venv.  It must equal the host-visible desired release
+                    # whenever that release is known; retaining it makes the
+                    # successful verification auditable and invalidates old
+                    # manifests that predate this check once.
+                    "child_feature_distribution_state": (
+                        child_feature_distribution.state
+                    ),
+                    "child_feature_distribution_version": (
+                        child_feature_distribution.version
+                    ),
                 },
                 indent=2,
             )
         )
 
     def _provision_is_stale(self, install_target: str) -> bool:
-        """A provisioned venv is stale if the install target changed or the host
-        has upgraded kestrel-sdk since we last provisioned against it (F019: a
-        stale wire contract — e.g. pre-0.28 serial dispatch — must not silently
-        survive a host update)."""
+        """Return whether this host-owned venv must be reprovisioned.
+
+        The stamp covers the exact project target, the host SDK wire contract,
+        and the feature distribution release.  An unavailable distribution
+        version does not become a moving stale marker: it is stamped as
+        ``unknown`` and remains fresh until a concrete version is observable.
+        """
         manifest = self._read_provision_manifest()
         if manifest.get("install_target") != install_target:
             return True
         if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
             return True
+        installed_version = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        stamped_version = manifest.get("feature_distribution_version")
+        # Old manifests predate this stamp. Reprovision once even when the
+        # version cannot be observed, then treat an ``unknown`` stamp as stable
+        # so local/dynamic targets do not reinstall on every startup.
+        if not isinstance(stamped_version, str):
+            return True
+        if installed_version != "unknown" and stamped_version != installed_version:
+            return True
+        stamped_child_state = manifest.get("child_feature_distribution_state")
+        stamped_child_version = manifest.get("child_feature_distribution_version")
+        if stamped_child_state not in {"versioned", "present-unversioned"}:
+            return True
+        # A fresh manifest proves only what was installed previously. Every
+        # unchanged-environment check must probe the child interpreter again:
+        # an index repair, manual downgrade, or stale editable metadata can
+        # otherwise leave the host running an older service indefinitely.
+        child = _venv_feature_distribution_probe(
+            _venv_python(self._venv_path), self.runtime.distribution
+        )
+        if not child.is_present:
+            return True
+        if installed_version != "unknown" and (
+            child.state != "versioned" or child.version != installed_version
+        ):
+            return True
+        if (
+            stamped_child_state == "versioned"
+            and child.version != stamped_child_version
+        ):
+            return True
         return False
+
+    def _verify_prebuilt_feature_distribution(
+        self, python_path: Path, install_target: str
+    ) -> None:
+        """Fail closed when an immutable override cannot run the desired feature.
+
+        An operator-owned venv must never be installed into or stamped by the
+        host, but SDK compatibility alone does not prove that its feature
+        distribution is present or current. A positively identified but
+        versionless/editable child is accepted only when the desired release is
+        genuinely unknown; missing and failed probes are never treated as that
+        evidence.
+        """
+
+        desired = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        child = _venv_feature_distribution_probe(
+            python_path, self.runtime.distribution
+        )
+        if not child.is_present:
+            observed = "missing" if child.state == "missing" else "unverifiable"
+            raise RuntimeError(
+                f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
+                f"version {observed}, but host requires {desired!r}; refusing to run "
+                "an unverifiable override venv"
+            )
+        if desired != "unknown" and (
+            child.state != "versioned" or child.version != desired
+        ):
+            observed = (
+                "versionless/editable"
+                if child.state == "present-unversioned"
+                else repr(child.version)
+            )
+            raise RuntimeError(
+                f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
+                f"version {observed}, but host requires {desired!r}; refusing to run "
+                "an unverifiable override venv"
+            )
 
     def ensure_venv(self) -> None:
         assert self._venv_path is not None
@@ -5674,6 +6568,7 @@ class ProxyFeature(Feature):
             and self._venv_is_overridden()
             and not self._provision_manifest_path().exists()
         ):
+            self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
             return
 
@@ -5707,8 +6602,40 @@ class ProxyFeature(Feature):
         # don't thrash reinstalling a genuinely pinned feature every startup.
         host_sdk = _host_sdk_version()
         child_sdk = _venv_sdk_version(python_path)
+        desired_feature_version = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        child_feature_distribution = _venv_feature_distribution_probe(
+            python_path, self.runtime.distribution
+        )
+        if (
+            desired_feature_version != "unknown"
+            and (
+                child_feature_distribution.state != "versioned"
+                or child_feature_distribution.version != desired_feature_version
+            )
+        ):
+            raise RuntimeError(
+                f"Isolated feature {self.name} installed "
+                f"{self.runtime.distribution!r} version "
+                f"{child_feature_distribution.version!r}, "
+                f"but host requires {desired_feature_version!r}; refusing to "
+                "stamp the venv fresh"
+            )
+        if not child_feature_distribution.is_present:
+            raise RuntimeError(
+                f"Isolated feature {self.name} installed "
+                f"{self.runtime.distribution!r} but its child distribution probe "
+                "was not positively present; refusing to stamp the venv fresh"
+            )
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
-        self._write_provision_manifest(install_target, host_sdk, child_sdk)
+        self._write_provision_manifest(
+            install_target,
+            host_sdk,
+            child_sdk,
+            desired_feature_version,
+            child_feature_distribution,
+        )
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
@@ -5737,6 +6664,22 @@ class ProxyFeature(Feature):
             factory = SubprocessIsolatedFeatureClient
 
         child_config = self._host_config if config is None else config
+        # SDK 0.35.1's subprocess wrapper does not yet expose a reverse
+        # host-capability field in ``clientInfo``.  Its initialize ``config``
+        # envelope is nevertheless host-authenticated stdio input. Telegram
+        # 0.1.3 needs the acknowledged ingress protocol, so inject its reserved
+        # non-persisted marker here and let that service strip it before normal
+        # configuration. The copy also means stored user config can never forge
+        # or suppress Core's contract.
+        child_config = dict(child_config) if isinstance(child_config, dict) else {}
+        runtime_distribution = re.sub(
+            r"[-_.]+", "-", self.runtime.distribution.strip().lower()
+        )
+        if runtime_distribution == "kestrel-channel-telegram":
+            capabilities = [_ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY]
+            if self._hosted_telegram_startup_attested:
+                capabilities.append(_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY)
+            child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
 
         kwargs = {
             "feature_name": self.name,
@@ -5823,13 +6766,17 @@ class ProxyFeature(Feature):
         """
 
         target = self._client if client is None else client
+
+        async def handle_source_event(event: Any, *, source_client: Any = target) -> None:
+            await self._handle_event(event, source_client=source_client)
+
         register = (
             getattr(target, "set_event_handler", None)
             or getattr(target, "add_event_handler", None)
             or getattr(target, "subscribe", None)
         )
         if register is not None:
-            await _maybe_await(register(self._handle_event))
+            await _maybe_await(register(handle_source_event))
             return
 
         on_event = getattr(target, "on_event", None)
@@ -5844,7 +6791,7 @@ class ProxyFeature(Feature):
             return
         first_name = params[0].name
         if first_name in {"handler", "callback", "event_handler"}:
-            await _maybe_await(on_event(self._handle_event))
+            await _maybe_await(on_event(handle_source_event))
 
     def _start_supervision(self) -> asyncio.Task:
         """Start the supervision loop, registered with the agent's background-task
@@ -6161,20 +7108,390 @@ class ProxyFeature(Feature):
             return status.lower() in {"ready", "ok", "healthy", "running"}
         return False
 
-    async def _handle_event(self, event: Any) -> None:
+    async def _handle_event(self, event: Any, *, source_client: Any = None) -> None:
         # SDK event callbacks are externally visible traffic too: an inbound
         # channel message can wake the agent and trigger effects.  Keep it on
         # the same gate as tools so a candidate hook cannot route an event
-        # before its config becomes durable. Events are deliberately *dropped*
+        # before its config becomes durable. Events are normally *dropped*
         # rather than queued during a finite close: they originated from the
         # old child and replaying them after promotion could apply stale input
-        # under a new configuration. Terminal drops are also silent because an
-        # SDK callback has no caller to handle a deliberate shutdown result.
+        # under a new configuration. The exceptions below are an acknowledged
+        # event from the already-published replacement child, whose producer
+        # has retained the source cursor, and a legacy/non-cursor event, which
+        # Core holds in a bounded serial queue because dropping it is permanent
+        # loss. Terminal drops remain silent
+        # because an SDK callback has no caller to handle a deliberate shutdown
+        # result.
+        source_client = self._client if source_client is None else source_client
+        # Channel ingress can run an unbounded cognition turn. The SDK invokes
+        # this callback from its one serial notification reader, which is also
+        # responsible for receiving private host-ingress RPC responses. Detach
+        # the *entire* admission/routing/completion lifecycle before any await
+        # that could reach cognition; otherwise cognition calling channels_send
+        # can deadlock the reader against its own response stream.
+        if self._is_inbound_event(event):
+            await self._schedule_event_ingress_routing(event, source_client)
+            return
         try:
             async with self._traffic_gate.admit(wait_for_open=False):
-                await self._handle_event_admitted(event)
-        except (_TrafficGateClosedError, _TrafficGateTerminalError):
+                # The callback retains the client that registered it. Recheck
+                # that exact identity *under admission*, before routing or ACK,
+                # so a retired child cannot deliver a late message after a
+                # replacement has been published.
+                if source_client is not self._client:
+                    return
+                await self._handle_event_admitted_from_source(event, source_client)
+        except _TrafficGateClosedError:
+            # A newly published replacement can begin polling while its parent
+            # transition's gate is still closed. Its canonical acknowledged
+            # event is already on the durable next config, unlike an old
+            # quiesced child event. Hold exactly that one producer update until
+            # the gate reopens; never acknowledge an old or unproven source.
+            if source_client is self._client:
+                self._defer_current_acknowledged_event(event, source_client)
             return
+        except _TrafficGateTerminalError:
+            return
+
+    @staticmethod
+    def _is_inbound_event(event: Any) -> bool:
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        if kind == "feature/event":
+            event_name = _meta_get(payload, "name") or _meta_get(payload, "event")
+        else:
+            event_name = kind
+        return event_name in {"channel.inbound", "inbound", "message.inbound"}
+
+    @staticmethod
+    def _inbound_event_data(event: Any) -> Any:
+        """Extract an inbound event payload from either supported wire shape."""
+
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        return _meta_get(payload, "data", payload) if kind == "feature/event" else payload
+
+    async def _schedule_event_ingress_routing(
+        self, event: Any, source_client: Any
+    ) -> None:
+        """Route one inbound callback with its negotiated retention protocol.
+
+        This method deliberately classifies the acknowledgement protocol before
+        applying the cursor-source guard. A legacy notification has no cursor
+        or NACK to retain it at the child, so dropping a concurrent one is
+        permanent loss; it must enter the bounded serial queue instead.
+        """
+
+        if self._terminal_lifecycle_latched or source_client is not self._client:
+            return
+        # The SDK reader owns an untrusted JSON graph. Copy the complete
+        # bounded envelope before returning so a child (or a test double) cannot
+        # mutate the event between notification receipt and the detached host
+        # task's first turn.
+        try:
+            detached_event = _snapshot_host_ingress_payload(event)
+        except (ProtocolError, TypeError, ValueError):
+            logger.warning(
+                "Ignoring malformed inbound ingress from isolated feature %s",
+                self.name,
+            )
+            return
+        data = self._inbound_event_data(detached_event)
+        _inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
+        retry = self._inbound_event_retry_completion(data)
+        # Telegram descriptors are an all-or-nothing, host-validated cursor
+        # protocol.  A malformed pair must not silently fall through to the
+        # legacy notification path (where it could bypass the paired
+        # ACK/NACK/fencing checks).  Other channels retain their established
+        # compatibility handling.
+        if (
+            self._authoritative_inbound_channel_type() == "telegram"
+            and type(data) is dict
+            and (
+                _EVENT_HOST_INGRESS_ACK_FIELD in data
+                or _EVENT_HOST_INGRESS_RETRY_FIELD in data
+            )
+            and (acknowledgement is None or retry is None)
+        ):
+            logger.warning(
+                "Dropping malformed Telegram polling ingress from isolated feature %s",
+                self.name,
+            )
+            return
+        if acknowledgement is None and retry is None:
+            await self._enqueue_non_cursor_inbound_event(detached_event, source_client)
+            return
+        if any(
+            client is source_client and not task.done()
+            for client, task in self._event_ingress_clients
+        ):
+            # A cursor-owning source must retain the second update itself. Do
+            # not turn a malformed/flooding notification stream into unbounded
+            # host tasks or host-memory queueing.
+            logger.warning(
+                "Ignoring concurrent inbound ingress from isolated feature %s",
+                self.name,
+            )
+            return
+
+        # A legitimate serial provider can emit callback two after callback
+        # one's child-side Future is resolved but before Core receives that
+        # completion RPC response. Retain exactly that next callback as the
+        # single active route task, but do not execute its cognition until the
+        # preceding provider completion settles. This keeps an untrusted child
+        # from building an unbounded completion queue while preserving the
+        # already-emitted callback instead of dropping it.
+        completion_predecessors = tuple(
+            task
+            for client, task in self._event_ack_clients
+            if client is source_client and not task.done()
+        )
+
+        async def route() -> None:
+            retry: _HostIngressRequest | None = None
+            try:
+                kind = _meta_get(detached_event, "type") or _meta_get(detached_event, "event") or _meta_get(detached_event, "kind")
+                payload = _meta_get(detached_event, "payload", detached_event)
+                if kind == "feature/event":
+                    data = _meta_get(payload, "data", payload)
+                else:
+                    data = payload
+                inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
+                retry = self._inbound_event_retry_completion(data)
+                try:
+                    async with self._traffic_gate.admit(wait_for_open=False):
+                        for predecessor in completion_predecessors:
+                            try:
+                                await asyncio.shield(predecessor)
+                            except asyncio.CancelledError:
+                                if (
+                                    asyncio.current_task() is not None
+                                    and asyncio.current_task().cancelling()
+                                ):
+                                    raise
+                            except BaseException:  # noqa: BLE001 - predecessor audited
+                                logger.warning(
+                                    "Prior inbound completion from isolated feature %s "
+                                    "failed; rechecking the queued callback against "
+                                    "source ownership",
+                                    self.name,
+                                )
+                        if source_client is not self._client:
+                            return
+                        terminal_disposition = self._telegram_terminal_disposition(
+                            data,
+                            cursor_owned_protocol=(
+                                acknowledgement is not None
+                                and retry is not None
+                                and self._authoritative_inbound_channel_type()
+                                == "telegram"
+                            ),
+                        )
+                        admission = await self._route_validated_inbound(
+                            inbound,
+                            cursor_owned_protocol=(
+                                acknowledgement is not None
+                                and retry is not None
+                                and self._authoritative_inbound_channel_type()
+                                == "telegram"
+                            ),
+                            telegram_terminal_disposition=terminal_disposition,
+                        )
+                except _TrafficGateClosedError:
+                    if source_client is self._client:
+                        self._defer_current_acknowledged_event(detached_event, source_client)
+                    return
+                except _TrafficGateTerminalError:
+                    return
+                if self._inbound_admission_is_durable(admission):
+                    if acknowledgement is not None:
+                        self._schedule_event_ingress_acknowledgement(
+                            source_client, acknowledgement
+                        )
+                elif retry is not None:
+                    self._schedule_event_ingress_retry(source_client, retry)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - producer retains its cursor
+                logger.warning(
+                    "Detached inbound ingress from isolated feature %s failed",
+                    self.name,
+                )
+                # A retryable cognitive failure must release the child-side
+                # polling callback.  Without this terminal provider response,
+                # the update is retained correctly but its serial poll loop is
+                # stuck awaiting a completion Core will never send.
+                if retry is not None:
+                    self._schedule_event_ingress_retry(source_client, retry)
+
+        task = asyncio.create_task(
+            route(), name=f"isolated-event-ingress-route:{self.name}"
+        )
+        self._event_ingress_tasks.add(task)
+        self._event_ingress_clients.append((source_client, task))
+
+        def consume_route(completed: asyncio.Task[None]) -> None:
+            self._event_ingress_tasks.discard(completed)
+            self._event_ingress_clients = [
+                (client, owned_task)
+                for client, owned_task in self._event_ingress_clients
+                if owned_task is not completed
+            ]
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - already logged by route
+                return
+
+        task.add_done_callback(consume_route)
+
+    async def _enqueue_non_cursor_inbound_event(
+        self, detached_event: Any, source_client: Any
+    ) -> None:
+        """Queue a legacy inbound notification with bounded reader backpressure."""
+
+        while True:
+            if (
+                self._terminal_lifecycle_latched
+                or self._traffic_gate.closed
+                or source_client is not self._client
+            ):
+                return
+            async with self._non_cursor_event_ingress_lock:
+                queue_entry = next(
+                    (
+                        entry
+                        for entry in self._non_cursor_event_ingress_queues
+                        if entry.client is source_client
+                        and entry.accepting
+                        and entry.worker is not None
+                        and not entry.worker.done()
+                    ),
+                    None,
+                )
+                if queue_entry is None:
+                    queue_entry = _NonCursorIngressQueue(
+                        client=source_client,
+                        events=asyncio.Queue(
+                            maxsize=_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS
+                        ),
+                    )
+                    task = asyncio.create_task(
+                        self._route_non_cursor_inbound_events(queue_entry),
+                        name=f"isolated-non-cursor-ingress-route:{self.name}",
+                    )
+                    queue_entry.worker = task
+                    self._non_cursor_event_ingress_queues.append(queue_entry)
+                    self._event_ingress_tasks.add(task)
+
+                    def consume(
+                        completed: asyncio.Task[None],
+                        *,
+                        entry: _NonCursorIngressQueue = queue_entry,
+                    ) -> None:
+                        self._event_ingress_tasks.discard(completed)
+                        self._non_cursor_event_ingress_queues = [
+                            candidate
+                            for candidate in self._non_cursor_event_ingress_queues
+                            if candidate.worker is not completed
+                        ]
+                        entry.retired.set()
+                        if completed.cancelled():
+                            return
+                        try:
+                            completed.result()
+                        except BaseException:  # noqa: BLE001 - worker logs its route errors
+                            return
+
+                    task.add_done_callback(consume)
+
+                try:
+                    queue_entry.events.put_nowait(detached_event)
+                    return
+                except asyncio.QueueFull:
+                    # A worker owns one current callback and this queue holds
+                    # one later callback. Wait outside the lock so the worker
+                    # can drain it; no third item allocates host memory.
+                    pass
+
+            join = asyncio.create_task(queue_entry.events.join())
+            retired = asyncio.create_task(queue_entry.retired.wait())
+            done, pending = await asyncio.wait(
+                (join, retired), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+
+    async def _route_non_cursor_inbound_events(
+        self, queue_entry: _NonCursorIngressQueue
+    ) -> None:
+        """Deliver legacy notifications in source order across finite gate closes."""
+
+        while True:
+            detached_event = await queue_entry.events.get()
+            retire_worker = False
+            try:
+                inbound, acknowledgement = self._split_inbound_event_acknowledgement(
+                    self._inbound_event_data(detached_event)
+                )
+                retry = self._inbound_event_retry_completion(
+                    self._inbound_event_data(detached_event)
+                )
+                # The envelope was classified before enqueue. If a bridge
+                # changed while it waited, do not accidentally turn this old
+                # source into a cursor protocol; source ownership below still
+                # prevents it from reaching a replacement child.
+                if acknowledgement is not None or retry is not None:
+                    logger.warning(
+                        "Dropping ingress whose completion protocol changed while queued "
+                        "for isolated feature %s",
+                        self.name,
+                    )
+                else:
+                    # Legacy ingress is ordered and backpressured while the gate
+                    # is open.  Once a live transition closes it, however, this
+                    # old-child event is stale and must not replay under the next
+                    # configuration.
+                    async with self._traffic_gate.admit(wait_for_open=False):
+                        if queue_entry.client is not self._client:
+                            retire_worker = True
+                        else:
+                            await self._route_inbound(inbound)
+            except (_TrafficGateClosedError, _TrafficGateTerminalError):
+                retire_worker = True
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - legacy provider has no retry path
+                logger.warning(
+                    "Detached legacy inbound ingress from isolated feature %s failed",
+                    self.name,
+                )
+            finally:
+                queue_entry.events.task_done()
+            async with self._non_cursor_event_ingress_lock:
+                if retire_worker or queue_entry.events.empty():
+                    # Enqueue checks this flag under the same lock. It either
+                    # publishes the next item before this point, or starts a
+                    # new worker after this one retires; no notification can
+                    # be placed onto an about-to-exit worker and disappear.
+                    queue_entry.accepting = False
+                    queue_entry.retired.set()
+                    return
+
+    async def _handle_event_admitted_from_source(
+        self, event: Any, source_client: Any
+    ) -> None:
+        """Run one admitted event with its exact client available to the ack path."""
+
+        token = _event_source_client.set(source_client)
+        try:
+            await self._handle_event_admitted(event)
+        finally:
+            _event_source_client.reset(token)
 
     async def _handle_event_admitted(self, event: Any) -> None:
         kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
@@ -6187,11 +7504,662 @@ class ProxyFeature(Feature):
             data = payload
 
         if event_name in {"channel.inbound", "inbound", "message.inbound"}:
-            await self._route_inbound(data)
+            inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
+            retry = self._inbound_event_retry_completion(data)
+            cursor_owned_protocol = (
+                acknowledgement is not None
+                and retry is not None
+                and self._authoritative_inbound_channel_type() == "telegram"
+            )
+            admission = await self._route_validated_inbound(
+                inbound,
+                cursor_owned_protocol=cursor_owned_protocol,
+                telegram_terminal_disposition=self._telegram_terminal_disposition(
+                    data, cursor_owned_protocol=cursor_owned_protocol
+                ),
+            )
+            source_client = _event_source_client.get()
+            if (
+                self._inbound_admission_is_durable(admission)
+                and acknowledgement is not None
+                and source_client is not None
+            ):
+                self._schedule_event_ingress_acknowledgement(
+                    source_client,
+                    acknowledgement,
+                )
+            elif retry is not None and source_client is not None:
+                self._schedule_event_ingress_retry(source_client, retry)
         elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
             await self._route_link_qr(data)
         elif event_name in {"channel.link_cleared", "link_cleared"}:
             await self._route_link_cleared(data)
+
+    def _split_inbound_event_acknowledgement(
+        self, payload: Any
+    ) -> tuple[Any, _HostIngressRequest | None]:
+        """Extract a bounded post-delivery ingress acknowledgement, if valid.
+
+        A malformed descriptor never causes Core to acknowledge an external
+        update. The inbound message can still take the normal ChannelFeature
+        path, but its producer will retry from its unchanged durable cursor.
+        The acknowledgement payload must name the same stable dedupe key as
+        the message itself, preventing a child from acknowledging a different
+        bot/update after a successful delivery.
+        """
+
+        allowed_payload_keys = {
+            frozenset(
+                {_EVENT_HOST_INGRESS_MESSAGE_FIELD, _EVENT_HOST_INGRESS_ACK_FIELD}
+            ),
+            frozenset(
+                {
+                    _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                    _EVENT_HOST_INGRESS_ACK_FIELD,
+                    _EVENT_HOST_INGRESS_RETRY_FIELD,
+                }
+            ),
+        }
+        # Telegram's polling protocol adds a bounded, host-validated terminal
+        # disposition.  It is intentionally not accepted for generic channel
+        # events, where it would otherwise become an unreviewed extension of
+        # the acknowledgement envelope.
+        if self._authoritative_inbound_channel_type() == "telegram":
+            allowed_payload_keys.add(
+                frozenset(
+                    {
+                        _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                        _EVENT_HOST_INGRESS_ACK_FIELD,
+                        _EVENT_HOST_INGRESS_RETRY_FIELD,
+                        _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+                    }
+                )
+            )
+        if type(payload) is not dict or frozenset(payload) not in allowed_payload_keys:
+            return payload, None
+        message = payload.get(_EVENT_HOST_INGRESS_MESSAGE_FIELD)
+        descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
+        if type(message) is not dict or type(descriptor) is not dict:
+            return message, None
+        # Telegram polling is a cursor-owning protocol, not a convention
+        # inferred from an arbitrary child descriptor name *or* a child-owned
+        # field in an inbound message.  The registered proxy bridge is the
+        # only host-negotiated identity that can classify this callback, and
+        # therefore the only identity allowed to select its ACK/NACK contract.
+        if self._authoritative_inbound_channel_type() == "telegram":
+            pair = self._telegram_polling_completion_pair(payload, message)
+            return message, pair[0] if pair is not None else None
+        if set(descriptor) != {"name", "payload"}:
+            return message, None
+        request = _prepare_host_ingress_request(
+            descriptor.get("name"), descriptor.get("payload")
+        )
+        if request is None or type(request.payload) is not dict:
+            return message, None
+        # A polling NACK is meaningful only as the paired retry descriptor;
+        # accepting it in the ACK slot could invert a successful delivery.
+        if request.name == _TELEGRAM_POLLING_NACK:
+            return message, None
+        payload_keys = set(request.payload)
+        telegram_polling_ack = request.name == _TELEGRAM_POLLING_ACK
+        if payload_keys not in ({"dedupe_key"}, {"dedupe_key", "attempt_token"}):
+            return message, None
+        if telegram_polling_ack and payload_keys != {"dedupe_key", "attempt_token"}:
+            return message, None
+        message_metadata = message.get("metadata")
+        dedupe_key = (
+            message_metadata.get("dedupe_key")
+            if type(message_metadata) is dict
+            else None
+        )
+        if (
+            type(dedupe_key) is not str
+            or message.get("id") != dedupe_key
+            or request.payload.get("dedupe_key") != dedupe_key
+        ):
+            return message, None
+        attempt_token = request.payload.get("attempt_token")
+        if (telegram_polling_ack and type(attempt_token) is not str) or (
+            attempt_token is not None
+            and (
+                type(attempt_token) is not str
+                or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
+            )
+        ):
+            return message, None
+        return message, request
+
+    def _authoritative_inbound_channel_type(self) -> str | None:
+        """Return this proxy's currently registered inbound channel identity.
+
+        The isolated child owns every event field, including ``channel_type``.
+        It may not select an allowlist, routing adapter, or cursor-completion
+        protocol by changing that field.  A channel is authoritative only
+        while this exact proxy adapter remains registered in the host's
+        ChannelFeature; a missing/replaced bridge fails closed instead of
+        bypassing the sender filter through a generic route.
+        """
+        channel_type = self._channel_type
+        adapter = self._channel_adapter
+        if (
+            not isinstance(channel_type, str)
+            or not channel_type
+            or adapter is None
+            or getattr(adapter, "channel_type", None) != channel_type
+        ):
+            return None
+        channel_feature = self._channel_feature()
+        registry = getattr(channel_feature, "registry", None) if channel_feature else None
+        getter = getattr(registry, "get", None)
+        if not callable(getter) or getter(channel_type) is not adapter:
+            return None
+        return channel_type
+
+    @staticmethod
+    def _telegram_polling_completion_pair(
+        payload: dict[str, Any], message: dict[str, Any]
+    ) -> tuple[_HostIngressRequest, _HostIngressRequest] | None:
+        """Validate Telegram's exact, attempt-fenced ACK/NACK descriptor pair."""
+
+        if set(payload) not in (
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+            },
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+                _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+            },
+        ):
+            return None
+        acknowledgement_descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
+        retry_descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
+        if (
+            type(acknowledgement_descriptor) is not dict
+            or type(retry_descriptor) is not dict
+            or set(acknowledgement_descriptor) != {"name", "payload"}
+            or set(retry_descriptor) != {"name", "payload"}
+        ):
+            return None
+        acknowledgement = _prepare_host_ingress_request(
+            acknowledgement_descriptor.get("name"),
+            acknowledgement_descriptor.get("payload"),
+        )
+        retry = _prepare_host_ingress_request(
+            retry_descriptor.get("name"), retry_descriptor.get("payload")
+        )
+        if (
+            acknowledgement is None
+            or retry is None
+            or acknowledgement.name != _TELEGRAM_POLLING_ACK
+            or retry.name != _TELEGRAM_POLLING_NACK
+            or type(acknowledgement.payload) is not dict
+            or type(retry.payload) is not dict
+            or set(acknowledgement.payload) != {"dedupe_key", "attempt_token"}
+            or set(retry.payload) != {"dedupe_key", "attempt_token"}
+        ):
+            return None
+        metadata = message.get("metadata")
+        dedupe_key = metadata.get("dedupe_key") if type(metadata) is dict else None
+        acknowledgement_token = acknowledgement.payload.get("attempt_token")
+        retry_token = retry.payload.get("attempt_token")
+        if (
+            type(dedupe_key) is not str
+            or message.get("id") != dedupe_key
+            or acknowledgement.payload.get("dedupe_key") != dedupe_key
+            or retry.payload.get("dedupe_key") != dedupe_key
+            or type(acknowledgement_token) is not str
+            or type(retry_token) is not str
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(acknowledgement_token)
+            is None
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(retry_token) is None
+            or not secrets.compare_digest(acknowledgement_token, retry_token)
+        ):
+            return None
+        return acknowledgement, retry
+
+    def _inbound_event_retry_completion(
+        self, payload: Any
+    ) -> _HostIngressRequest | None:
+        """Return a validated retry completion paired to one inbound ACK key."""
+
+        if type(payload) is not dict or set(payload) not in (
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+            },
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+                _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+            },
+        ):
+            return None
+        message, acknowledgement = self._split_inbound_event_acknowledgement(payload)
+        descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
+        if (
+            acknowledgement is None
+            or type(message) is not dict
+            or type(descriptor) is not dict
+            or set(descriptor) != {"name", "payload"}
+        ):
+            return None
+        request = _prepare_host_ingress_request(
+            descriptor.get("name"), descriptor.get("payload")
+        )
+        if request is None or type(request.payload) is not dict:
+            return None
+        message_metadata = message.get("metadata")
+        dedupe_key = (
+            message_metadata.get("dedupe_key")
+            if type(message_metadata) is dict
+            else None
+        )
+        telegram_polling_pair = (
+            acknowledgement.name == _TELEGRAM_POLLING_ACK
+            or request.name == _TELEGRAM_POLLING_NACK
+        )
+        if (
+            type(dedupe_key) is not str
+            or set(request.payload) not in (
+                {"dedupe_key"}, {"dedupe_key", "attempt_token"}
+            )
+            or request.payload.get("dedupe_key") != dedupe_key
+        ):
+            return None
+        if telegram_polling_pair and (
+            acknowledgement.name != _TELEGRAM_POLLING_ACK
+            or request.name != _TELEGRAM_POLLING_NACK
+            or set(request.payload) != {"dedupe_key", "attempt_token"}
+        ):
+            return None
+        attempt_token = request.payload.get("attempt_token")
+        if (telegram_polling_pair and type(attempt_token) is not str) or (
+            attempt_token is not None
+            and (
+            type(attempt_token) is not str
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
+            )
+        ):
+            return None
+        acknowledgement_token = acknowledgement.payload.get("attempt_token")
+        if telegram_polling_pair and not secrets.compare_digest(
+            acknowledgement_token, attempt_token
+        ):
+            return None
+        return request
+
+    @staticmethod
+    def _inbound_admission_is_durable(admission: Any) -> bool:
+        return getattr(admission, "durably_admitted", False) is True
+
+    def _event_ingress_acknowledgement(
+        self, event: Any
+    ) -> _HostIngressRequest | None:
+        """Return a valid acknowledgement descriptor only for inbound events."""
+
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        if kind == "feature/event":
+            event_name = _meta_get(payload, "name") or _meta_get(payload, "event")
+            data = _meta_get(payload, "data", payload)
+        else:
+            event_name = kind
+            data = payload
+        if event_name not in {"channel.inbound", "inbound", "message.inbound"}:
+            return None
+        _, acknowledgement = self._split_inbound_event_acknowledgement(data)
+        return acknowledgement
+
+    def _defer_current_acknowledged_event(self, event: Any, source_client: Any) -> None:
+        """Hold one new-child polling event until a finite gate reopens."""
+
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        if kind == "feature/event":
+            event_name = _meta_get(payload, "name") or _meta_get(payload, "event")
+            payload = _meta_get(payload, "data", payload)
+        else:
+            event_name = kind
+        if event_name not in {"channel.inbound", "inbound", "message.inbound"}:
+            return
+        message, acknowledgement = self._split_inbound_event_acknowledgement(payload)
+        retry = self._inbound_event_retry_completion(payload)
+        if acknowledgement is None or type(message) is not dict:
+            return
+        try:
+            detached_message = _snapshot_host_ingress_payload(message)
+        except BaseException:  # noqa: BLE001 - producer keeps its cursor
+            logger.warning(
+                "Dropping malformed deferred acknowledged ingress from isolated feature %s",
+                self.name,
+            )
+            return
+        if type(detached_message) is not dict:
+            return
+        deferred = _DeferredAcknowledgedIngress(
+            message=detached_message,
+            acknowledgement=acknowledgement,
+            source_client=source_client,
+            retry=retry,
+            telegram_terminal_disposition=self._telegram_terminal_disposition(
+                payload,
+                cursor_owned_protocol=(
+                    acknowledgement is not None
+                    and retry is not None
+                    and self._authoritative_inbound_channel_type() == "telegram"
+                ),
+            ),
+        )
+        if len(self._deferred_acknowledged_event_tasks) >= _MAX_DEFERRED_ACKNOWLEDGED_EVENTS:
+            logger.warning(
+                "Dropping excess deferred acknowledged ingress from isolated feature %s",
+                self.name,
+            )
+            return
+
+        async def deliver_after_reopen() -> None:
+            try:
+                async with self._traffic_gate.admit():
+                    # A second transition can replace this child before the
+                    # first gate reopens. Its event must remain unacknowledged
+                    # so the producer restarts from the same durable cursor.
+                    if deferred.source_client is not self._client:
+                        return
+                    admission = await self._route_validated_inbound(
+                        deferred.message,
+                        cursor_owned_protocol=(
+                            deferred.retry is not None
+                            and self._authoritative_inbound_channel_type()
+                            == "telegram"
+                        ),
+                        telegram_terminal_disposition=(
+                            deferred.telegram_terminal_disposition
+                        ),
+                    )
+                    if self._inbound_admission_is_durable(admission):
+                        self._schedule_event_ingress_acknowledgement(
+                            deferred.source_client,
+                            deferred.acknowledgement,
+                        )
+                    elif deferred.retry is not None:
+                        self._schedule_event_ingress_retry(
+                            deferred.source_client, deferred.retry
+                        )
+            except (_TrafficGateClosedError, _TrafficGateTerminalError):
+                return
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - producer retains its cursor
+                logger.warning(
+                    "Deferred acknowledged ingress from isolated feature %s failed",
+                    self.name,
+                )
+                # Match detached ingress: a validated NACK reaches the exact
+                # still-live facade after a routing exception, while any
+                # replacement/terminal lifecycle state retains the provider
+                # callback for its normal retry instead.
+                if deferred.retry is not None:
+                    self._schedule_event_ingress_retry(
+                        deferred.source_client, deferred.retry
+                    )
+
+        task = asyncio.create_task(
+            deliver_after_reopen(),
+            name=f"isolated-deferred-ingress:{self.name}",
+        )
+        self._deferred_acknowledged_event_tasks.add(task)
+
+        def consume_deferred_event(completed: asyncio.Task[None]) -> None:
+            self._deferred_acknowledged_event_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - failure already logged
+                return
+
+        task.add_done_callback(consume_deferred_event)
+
+    def _schedule_event_ingress_acknowledgement(
+        self,
+        source_client: Any,
+        request: _HostIngressRequest,
+    ) -> None:
+        """Acknowledge durably admitted ingress without blocking the SDK reader."""
+
+        self._schedule_event_ingress_completion(
+            source_client, request, expected_state="acknowledged", kind="ack"
+        )
+
+    def _schedule_event_ingress_retry(
+        self,
+        source_client: Any,
+        request: _HostIngressRequest,
+    ) -> None:
+        """Release a retryable provider callback without advancing its cursor."""
+
+        self._schedule_event_ingress_completion(
+            source_client, request, expected_state="retrying", kind="retry"
+        )
+
+    def _schedule_event_ingress_completion(
+        self,
+        source_client: Any,
+        request: _HostIngressRequest,
+        *,
+        expected_state: str,
+        kind: str,
+    ) -> None:
+        """Complete a provider callback after detached routing has settled.
+
+        ``IsolatedFeatureClient`` reads notifications and JSON-RPC responses on
+        one task. Awaiting ``call_host_ingress`` in that notification handler
+        would deadlock waiting for a response the same reader cannot consume.
+        Schedule the callback only after :meth:`_route_inbound` completes; the
+        task is queued before the gate releases, so a following quiesce sees
+        the acknowledgement request before it waits for the producer callback.
+        It deliberately calls the exact source client rather than the current
+        proxy slot, allowing a pre-gate acknowledgement to finish while a
+        lifecycle transition owns ordinary admission.
+        """
+
+        if self._terminal_lifecycle_latched or source_client is not self._client:
+            return
+        # Routing finishes before the provider RPC response comes back. A
+        # cross-process child can therefore deliver callback two while callback
+        # one is still awaiting its ACK response. Keep the source serialized,
+        # but do not discard that already-routed completion: queue it behind
+        # the exact active completions in arrival order.
+        predecessors = tuple(
+            task
+            for client, task in self._event_ack_clients
+            if client is source_client and not task.done()
+        )
+
+        try:
+            capabilities = getattr(source_client, "host_ingress_capabilities", None)
+            names = getattr(capabilities, "names", ())
+            if request.name not in names:
+                logger.warning(
+                    "Inbound event from isolated feature %s requested an unavailable completion",
+                    self.name,
+                )
+                return
+            call = getattr(source_client, "call_host_ingress", None)
+        except BaseException:  # noqa: BLE001 - untrusted facade stays unacknowledged
+            logger.warning(
+                "Inbound event from isolated feature %s could not start completion",
+                self.name,
+            )
+            return
+        if not callable(call):
+            logger.warning(
+                "Inbound event from isolated feature %s requested an unsupported completion",
+                self.name,
+            )
+            return
+
+        async def complete() -> None:
+            for predecessor in predecessors:
+                try:
+                    # Shield the predecessor so shutdown/cancellation of this
+                    # queued completion cannot create a second completion RPC
+                    # for the same provider callback.
+                    await asyncio.shield(predecessor)
+                except asyncio.CancelledError:
+                    if (
+                        asyncio.current_task() is not None
+                        and asyncio.current_task().cancelling()
+                    ):
+                        raise
+                    # A predecessor may have been cancelled by an older
+                    # lifecycle transition. Recheck the current source below;
+                    # if it remains current, this exact callback still needs
+                    # its own completion attempt.
+                except BaseException:  # noqa: BLE001 - predecessor already audited
+                    logger.warning(
+                        "Prior inbound completion from isolated feature %s failed; "
+                        "continuing the queued provider callback",
+                        self.name,
+                    )
+            for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
+                if self._terminal_lifecycle_latched or source_client is not self._client:
+                    return
+                settled, result = await self._await_event_ingress_ack_attempt(
+                    call, request, source_client
+                )
+                if settled and self._is_event_ingress_completion(result, expected_state):
+                    return
+                if not settled:
+                    # The exact RPC rejected cancellation or belongs to a
+                    # stopped loop. It remains lifecycle-owned and the source
+                    # is sealed rather than risking a second concurrent ACK.
+                    self._fence_event_ingress_ack_source(source_client)
+                    return
+                if attempt + 1 < _EVENT_INGRESS_ACK_ATTEMPTS:
+                    await asyncio.sleep(_EVENT_INGRESS_ACK_BACKOFF * (attempt + 1))
+            logger.warning(
+                "Inbound event %s completion for isolated feature %s exhausted retries",
+                kind,
+                self.name,
+            )
+            # Telegram's pending completion keeps its getUpdates offset
+            # unchanged; retiring this exact source makes it redeliver on a
+            # fresh process instead of silently losing the update.
+            self._fence_event_ingress_ack_source(source_client)
+
+        task = asyncio.create_task(
+            complete(),
+            name=f"isolated-event-ingress-{kind}:{self.name}",
+        )
+        self._event_ack_tasks.add(task)
+        self._event_ack_clients.append((source_client, task))
+
+        def consume_acknowledgement(completed: asyncio.Task[None]) -> None:
+            self._event_ack_tasks.discard(completed)
+            self._event_ack_clients = [
+                (client, owned_task)
+                for client, owned_task in self._event_ack_clients
+                if owned_task is not completed
+            ]
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - completion already logged
+                return
+
+        task.add_done_callback(consume_acknowledgement)
+
+    async def _await_event_ingress_ack_attempt(
+        self,
+        call: Callable[[str, HostIngressPayload], Any],
+        request: _HostIngressRequest,
+        source_client: Any,
+    ) -> tuple[bool, Any]:
+        """Run one ACK with a bounded owned timeout."""
+
+        operation = _create_host_owned_facade_task(
+            _maybe_await(call(request.name, request.payload)),
+            name=f"isolated-event-ingress-ack-rpc:{self.name}",
+        )
+        try:
+            result = await asyncio.wait_for(
+                operation.shield(), timeout=_EVENT_INGRESS_ACK_TIMEOUT
+            )
+            return True, result
+        except asyncio.TimeoutError:
+            operation.cancel()
+            try:
+                await asyncio.wait_for(
+                    operation.shield(), timeout=_EVENT_INGRESS_ACK_CANCELLATION_GRACE
+                )
+            except asyncio.TimeoutError:
+                self._retain_terminal_lifecycle_task(operation, source_client)
+                return False, None
+            except BaseException:  # noqa: BLE001 - failed ACK remains retryable
+                _consume_late_lifecycle_task_outcome(operation)
+                return True, None
+            _consume_late_lifecycle_task_outcome(operation)
+            return True, None
+        except asyncio.CancelledError:
+            operation.cancel()
+            if not operation.done():
+                self._retain_terminal_lifecycle_task(operation, source_client)
+            raise
+        except BaseException:  # noqa: BLE001 - producer retries unchanged cursor
+            _consume_late_lifecycle_task_outcome(operation)
+            return True, None
+
+    def _fence_event_ingress_ack_source(self, source_client: Any) -> None:
+        """Terminally remove an ACK source after bounded retries fail."""
+
+        if source_client is not self._client:
+            return
+        self._latch_terminal_lifecycle()
+        # Establish the shared terminal owner synchronously. It unpublishes and
+        # retires this exact facade; no successful cleanup can race a later ACK
+        # because scheduling is blocked by the latch above.
+        self.prepare_shutdown_with_agent_deadline()
+
+    @staticmethod
+    def _is_event_ingress_acknowledged(value: Any) -> bool:
+        """Accept the narrow, private completion envelope only."""
+
+        return ProxyFeature._is_event_ingress_completion(value, "acknowledged")
+
+    @staticmethod
+    def _is_event_ingress_completion(value: Any, expected_state: str) -> bool:
+        """Accept the narrow private ACK or retry-completion envelope."""
+
+        if type(value) is not dict:
+            return False
+        allowed = {
+            "status",
+            "http_status",
+            "state",
+            "already_acknowledged",
+            "already_retrying",
+        }
+        if not set(value).issubset(allowed):
+            return False
+        if (
+            value.get("status") != "ok"
+            or value.get("http_status") != 200
+            or value.get("state") != expected_state
+        ):
+            return False
+        return all(
+            type(value[key]) is bool
+            for key in ("already_acknowledged", "already_retrying")
+            if key in value
+        )
 
     async def _route_link_cleared(self, payload: Any) -> None:
         """Retract a channel pairing QR once the channel is linked.
@@ -6257,14 +8225,107 @@ class ProxyFeature(Feature):
             logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
             return
 
-    async def _route_inbound(self, payload: Any) -> None:
+    def _telegram_terminal_disposition(
+        self, data: Any, *, cursor_owned_protocol: bool
+    ) -> str | None:
+        """Validate one bounded, non-cognitive Telegram terminal descriptor."""
+
+        if not isinstance(data, dict):
+            return None
+        descriptor = data.get(_EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD)
+        if descriptor is None:
+            return None
+        if (
+            self._authoritative_inbound_channel_type() != "telegram"
+            or not cursor_owned_protocol
+            or type(descriptor) is not dict
+            or set(descriptor) != {"kind"}
+            or descriptor.get("kind") not in _TELEGRAM_TERMINAL_DISPOSITIONS
+        ):
+            raise ProtocolError("invalid Telegram terminal inbound disposition")
+        return descriptor["kind"]
+
+    async def _route_validated_inbound(
+        self,
+        payload: Any,
+        *,
+        cursor_owned_protocol: bool,
+        telegram_terminal_disposition: str | None = None,
+    ) -> Any:
+        """Route with a host-only protocol classification.
+
+        The public/legacy ``_route_inbound`` shape remains a one-argument
+        method: integrations and test doubles use it as that narrow seam.
+        Context-local classification lets a detached callback carry the
+        negotiated protocol through that seam without trusting its JSON body
+        or widening every legacy ChannelFeature implementation.
+        """
+
+        token = _cursor_owned_inbound_protocol.set(cursor_owned_protocol)
+        terminal_token = _telegram_terminal_inbound_disposition.set(
+            telegram_terminal_disposition
+        )
+        try:
+            return await self._route_inbound(payload)
+        finally:
+            _cursor_owned_inbound_protocol.reset(token)
+            _telegram_terminal_inbound_disposition.reset(terminal_token)
+
+    async def admit_hosted_telegram_ingress(
+        self,
+        payload: dict[str, Any],
+        *,
+        terminal_disposition: str | None = None,
+    ) -> Any:
+        """Durably admit one host-authenticated Telegram webhook result.
+
+        Frinz first gives the authenticated provider update to the isolated
+        child, which validates its active binding and normalizes it without
+        retaining a bot token.  A hosted delivery has no child-side polling
+        cursor/RPC pair, so the host must explicitly drive its resulting event
+        through the same Core durable channel boundary before returning HTTP
+        success to Telegram.  This narrow host API preserves the proxy-owned
+        agent/channel binding and refuses ordinary polling or un-attested
+        children from manufacturing hosted admission.
+        """
+
+        if (
+            not self._is_telegram_runtime()
+            or not self._hosted_telegram_startup_attested
+            or type(payload) is not dict
+        ):
+            return None
+        if (
+            terminal_disposition is not None
+            and terminal_disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
+        ):
+            raise ProtocolError("invalid hosted Telegram terminal disposition")
+        return await self._route_validated_inbound(
+            payload,
+            cursor_owned_protocol=True,
+            telegram_terminal_disposition=terminal_disposition,
+        )
+
+    async def _route_inbound(self, payload: Any) -> Any:
         channel = self._channel_feature()
-        if channel is None or not hasattr(channel, "handle_inbound"):
+        terminal_disposition = _telegram_terminal_inbound_disposition.get()
+        expected_method = (
+            "handle_terminal_inbound" if terminal_disposition is not None else "handle_inbound"
+        )
+        if channel is None or not hasattr(channel, expected_method):
             logger.warning(
                 "Inbound notification from %s dropped: ChannelFeature unavailable",
                 self.name,
             )
-            return
+            return None
+
+        authoritative_channel_type = self._authoritative_inbound_channel_type()
+        if authoritative_channel_type is None:
+            logger.warning(
+                "Inbound notification from %s dropped: no registered host channel bridge",
+                self.name,
+            )
+            return None
 
         from kestrel_sovereign.features.channels.models import ChannelMessage
 
@@ -6273,7 +8334,41 @@ class ProxyFeature(Feature):
             # from_dict coerces the wire shape (string direction/timestamp) back
             # into typed fields and ignores unknown keys.
             message = ChannelMessage.from_dict(payload)
-        await channel.handle_inbound(message)
+        authoritative_agent_id = getattr(self.agent, "did", None)
+        if not isinstance(authoritative_agent_id, str) or not authoritative_agent_id:
+            logger.warning(
+                "Inbound notification from %s dropped: host agent identity unavailable",
+                self.name,
+            )
+            return None
+        supplied_agent_id = getattr(message, "agent_id", "")
+        if supplied_agent_id not in {"", authoritative_agent_id}:
+            logger.warning(
+                "Inbound notification from %s dropped: child supplied another agent scope",
+                self.name,
+            )
+            return None
+        # The host, not the isolated child, owns the tenant/agent boundary.
+        # ChannelFeature repeats this binding before its own persistence so a
+        # direct caller cannot bypass the proxy's authoritative scope either.
+        message.agent_id = authoritative_agent_id
+        # Route and sender filtering must use the host-negotiated proxy
+        # identity, never the isolated child's mutable wire field.
+        message.channel_type = authoritative_channel_type
+        # This transient attribute is never serialized by ChannelMessage. It
+        # is written after child data is parsed and scoped by the ContextVar
+        # above, so only the host-validated Telegram polling path can request
+        # cursor-owned durable cognition.
+        setattr(
+            message,
+            "_kestrel_cursor_owned_protocol",
+            _cursor_owned_inbound_protocol.get(),
+        )
+        if terminal_disposition is not None:
+            return await channel.handle_terminal_inbound(
+                message, disposition=terminal_disposition
+            )
+        return await channel.handle_inbound(message)
 
 
 def _send_outcome(envelope: Dict[str, Any], transport_ok: bool):

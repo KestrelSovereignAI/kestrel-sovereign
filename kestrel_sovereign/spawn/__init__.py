@@ -16,6 +16,7 @@ from .mandate import (
 from .delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
+    DelegatedSpendOutcomeUnknown,
     DelegatedWallet,
     create_delegated_wallet,
     release_delegated_wallet,
@@ -35,6 +36,7 @@ __all__ = [
     "create_child_did_document",
     "BudgetAllocation",
     "BudgetExceededError",
+    "DelegatedSpendOutcomeUnknown",
     "DelegatedWallet",
     "create_delegated_wallet",
     "release_delegated_wallet",

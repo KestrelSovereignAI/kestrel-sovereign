@@ -319,6 +319,377 @@ class TestAgentManagerBasics:
         agent.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_onboarding", [False, True])
+    async def test_rejected_onboarding_withdraws_before_a2a_reader_or_cleanup(
+        self, cancel_onboarding: bool
+    ) -> None:
+        """A failed/cancelled hook cannot expose its partial publication."""
+
+        manager = AgentManager()
+        agent = _make_mock_agent("did:test:rejected-onboarding")
+        config = LocalAgentConfig(data_dir="rejected", port=8801)
+        hook_entered = asyncio.Event()
+        allow_failure = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def reject_onboarding(_name, registered_agent) -> None:
+            manager.install_a2a_hosted_policy(
+                registered_agent,
+                resolver=object(),
+                authorizer=object(),
+                router=object(),
+                requester=object(),
+            )
+            hook_entered.set()
+            await allow_failure.wait()
+            raise RuntimeError("host onboarding rejected")
+
+        original_cleanup = manager._discard_unpublished_initialized_agents
+
+        async def pause_cleanup(*args, **kwargs) -> bool:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            return await original_cleanup(*args, **kwargs)
+
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        manager.set_agent_registration_hook(reject_onboarding)
+        manager._discard_unpublished_initialized_agents = pause_cleanup
+        load = asyncio.create_task(manager.load_agent("Rejected", config))
+        await asyncio.wait_for(hook_entered.wait(), timeout=1.0)
+
+        async def observe_reader():
+            async with manager.a2a_execution_lease():
+                return (
+                    manager.get_agent("Rejected"),
+                    manager.a2a_hosted_policy_for(agent),
+                )
+
+        # Queue the reader while onboarding owns the writer.  It can proceed
+        # only after that writer releases, exactly where the old failure path
+        # exposed routing while it had merely started slow cleanup.
+        reader = asyncio.create_task(observe_reader())
+        await asyncio.sleep(0)
+        if cancel_onboarding:
+            load.cancel()
+        else:
+            allow_failure.set()
+
+        try:
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+            observed_agent, observed_policy = await asyncio.wait_for(reader, timeout=1.0)
+            assert observed_agent is None
+            assert observed_policy is None
+        finally:
+            allow_cleanup.set()
+
+        if cancel_onboarding:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(load, timeout=1.0)
+        else:
+            with pytest.raises(RuntimeError, match="host onboarding rejected"):
+                await asyncio.wait_for(load, timeout=1.0)
+        agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_batch_rejected_onboarding_withdraws_before_a2a_reader_or_cleanup(
+        self,
+    ) -> None:
+        """The ordered batch registrar has the same no-reader failure boundary."""
+
+        manager = AgentManager()
+        agent = _make_mock_agent("did:test:batch-rejected-onboarding")
+        config = LocalAgentConfig(data_dir="batch-rejected", port=8801)
+        hook_entered = asyncio.Event()
+        allow_failure = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def reject_onboarding(_name, registered_agent) -> None:
+            manager.install_a2a_hosted_policy(
+                registered_agent,
+                resolver=object(),
+                authorizer=object(),
+                router=object(),
+                requester=object(),
+            )
+            hook_entered.set()
+            await allow_failure.wait()
+            raise RuntimeError("batch host onboarding rejected")
+
+        original_cleanup = manager._discard_unpublished_initialized_agents
+
+        async def pause_cleanup(*args, **kwargs) -> bool:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            return await original_cleanup(*args, **kwargs)
+
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        manager.set_agent_registration_hook(reject_onboarding)
+        manager._discard_unpublished_initialized_agents = pause_cleanup
+        batch = asyncio.create_task(
+            manager.load_from_config(MultiAgentConfig(agents={"Rejected": config}))
+        )
+        await asyncio.wait_for(hook_entered.wait(), timeout=1.0)
+
+        async def observe_reader():
+            async with manager.a2a_execution_lease():
+                return (
+                    manager.get_agent("Rejected"),
+                    manager.a2a_hosted_policy_for(agent),
+                )
+
+        reader = asyncio.create_task(observe_reader())
+        await asyncio.sleep(0)
+        allow_failure.set()
+        try:
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+            assert await asyncio.wait_for(reader, timeout=1.0) == (None, None)
+        finally:
+            allow_cleanup.set()
+
+        assert await asyncio.wait_for(batch, timeout=1.0) == 0
+        assert manager.init_failures[0][0] == "Rejected"
+        agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_load_agent_cancellation_waiting_for_a2a_publication_cleans_unpublished_dynamic_registration(
+        self,
+    ):
+        """A cancelled cold publication releases its invisible scheduler tenant."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        agent_id = "did:scheduler:cancelled-single-publication"
+        config = LocalAgentConfig(data_dir="dynamic", port=8801)
+        protocol_rolled_back = asyncio.Event()
+
+        async def register(_name, _agent_id, _config):
+            async def rollback() -> None:
+                protocol_rolled_back.set()
+
+            return rollback
+
+        manager.set_scheduler_tenant_registration_hook(register)
+        pending = await manager._begin_dynamic_scheduler_tenant_registration(
+            "Dynamic", agent_id, config
+        )
+        assert pending is not None
+        agent = _make_mock_agent(agent_id)
+        agent._dynamic_scheduler_tenant_registration = pending
+        initialize_entered = asyncio.Event()
+        allow_initialize_return = asyncio.Event()
+
+        async def initialize(*_args, **_kwargs):
+            initialize_entered.set()
+            await allow_initialize_return.wait()
+            return agent
+
+        manager._initialize_agent = initialize
+        load = asyncio.create_task(manager.load_agent("Dynamic", config))
+        await asyncio.wait_for(initialize_entered.wait(), timeout=1.0)
+        await manager._a2a_lifecycle_lock.acquire()
+        try:
+            allow_initialize_return.set()
+            await asyncio.sleep(0)
+            assert not load.done()
+
+            load.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(load, timeout=1.0)
+        finally:
+            manager._a2a_lifecycle_lock.release()
+
+        assert manager.list_agents() == {}
+        assert manager.scheduler_authority_for(agent_id) is None
+        assert agent_id not in manager.scheduler_authorized_agent_ids()
+        assert not manager.scheduler_lifecycle_lock(agent_id).locked()
+        assert protocol_rolled_back.is_set()
+        agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_load_from_config_cancellation_waiting_for_a2a_publication_cleans_every_unpublished_result(
+        self,
+    ):
+        """One blocked batch publication cannot strand any initialized sibling."""
+
+        manager = AgentManager()
+        manager.set_scheduler_polling_managed_by_host(True)
+        configs = {
+            "Alpha": LocalAgentConfig(data_dir="alpha", port=8801),
+            "Beta": LocalAgentConfig(data_dir="beta", port=8802),
+        }
+        agent_ids = {
+            "Alpha": "did:scheduler:cancelled-batch-alpha",
+            "Beta": "did:scheduler:cancelled-batch-beta",
+        }
+        rolled_back: set[str] = set()
+
+        async def register(name, _agent_id, _config):
+            async def rollback() -> None:
+                rolled_back.add(name)
+
+            return rollback
+
+        manager.set_scheduler_tenant_registration_hook(register)
+        agents = {}
+        for name, config in configs.items():
+            pending = await manager._begin_dynamic_scheduler_tenant_registration(
+                name, agent_ids[name], config
+            )
+            assert pending is not None
+            agent = _make_mock_agent(agent_ids[name])
+            agent._dynamic_scheduler_tenant_registration = pending
+            agents[name] = agent
+
+        initialized = set()
+        all_initialized = asyncio.Event()
+        allow_initialize_return = asyncio.Event()
+
+        async def initialize(name, *_args, **_kwargs):
+            initialized.add(name)
+            if len(initialized) == len(agents):
+                all_initialized.set()
+            await allow_initialize_return.wait()
+            return agents[name]
+
+        manager._initialize_agent = initialize
+        batch = asyncio.create_task(
+            manager.load_from_config(MultiAgentConfig(agents=configs))
+        )
+        await asyncio.wait_for(all_initialized.wait(), timeout=1.0)
+        await manager._a2a_lifecycle_lock.acquire()
+        try:
+            allow_initialize_return.set()
+            await asyncio.sleep(0)
+            assert not batch.done()
+
+            batch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(batch, timeout=1.0)
+        finally:
+            manager._a2a_lifecycle_lock.release()
+
+        assert manager.list_agents() == {}
+        assert rolled_back == {"Alpha", "Beta"}
+        for name, agent in agents.items():
+            assert manager.scheduler_authority_for(agent_ids[name]) is None
+            assert agent_ids[name] not in manager.scheduler_authorized_agent_ids()
+            assert not manager.scheduler_lifecycle_lock(agent_ids[name]).locked()
+            agent.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_load_from_config_cancellation_releases_every_batch_admission(
+        self,
+    ) -> None:
+        """Cancellation during the first final release cannot strand its peers."""
+
+        manager = AgentManager()
+        configs = {
+            "Alpha": LocalAgentConfig(data_dir="alpha", port=8801),
+            "Beta": LocalAgentConfig(data_dir="beta", port=8802),
+        }
+        agents = {
+            "Alpha": _make_mock_agent("did:test:batch-release-alpha"),
+            "Beta": _make_mock_agent("did:test:batch-release-beta"),
+        }
+        final_publication_holds_state_lock = asyncio.Event()
+
+        async def initialize(name, *_args, **_kwargs):
+            return agents[name]
+
+        async def hold_state_lock_after_final_publication(name, _agent) -> None:
+            if name == "Beta":
+                await manager._lock.acquire()
+                final_publication_holds_state_lock.set()
+
+        manager._initialize_agent = initialize
+        manager.set_agent_registration_hook(hold_state_lock_after_final_publication)
+        batch = asyncio.create_task(
+            manager.load_from_config(MultiAgentConfig(agents=configs))
+        )
+        await asyncio.wait_for(final_publication_holds_state_lock.wait(), timeout=1.0)
+        try:
+            # The batch has committed both agents and is blocked retiring its
+            # first admission. Its cancellation must join both release tasks.
+            batch.cancel()
+            await asyncio.sleep(0)
+        finally:
+            manager._lock.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(batch, timeout=1.0)
+
+        assert manager.list_agents() == agents
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_committed_load_returns_success_after_cancellation_during_admission_release(
+        self,
+    ) -> None:
+        """A completed load is success even when its final release sees cancel."""
+
+        manager = AgentManager()
+        agent = _make_mock_agent("did:test:committed-load")
+        release_is_blocked = asyncio.Event()
+
+        async def hold_state_lock_after_registration(_name, _agent) -> None:
+            await manager._lock.acquire()
+            release_is_blocked.set()
+
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        manager.set_agent_registration_hook(hold_state_lock_after_registration)
+        load = asyncio.create_task(
+            manager.load_agent(
+                "CommittedLoad", LocalAgentConfig(data_dir="load", port=8801)
+            )
+        )
+        await asyncio.wait_for(release_is_blocked.wait(), timeout=1.0)
+        try:
+            load.cancel()
+            await asyncio.sleep(0)
+        finally:
+            manager._lock.release()
+
+        assert await asyncio.wait_for(load, timeout=1.0) is agent
+        assert manager.get_agent("CommittedLoad") is agent
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_committed_create_returns_success_after_cancellation_during_admission_release(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A committed create preserves its persistence handoff after cancel."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        agent = _make_mock_agent("did:test:committed-create")
+        release_is_blocked = asyncio.Event()
+
+        async def hold_state_lock_after_registration(_name, _agent) -> None:
+            await manager._lock.acquire()
+            release_is_blocked.set()
+
+        manager._data_key_custody_conflict = lambda: None
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        manager.set_agent_registration_hook(hold_state_lock_after_registration)
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            AsyncMock(),
+        )
+        create = asyncio.create_task(manager.create_agent("CommittedCreate"))
+        await asyncio.wait_for(release_is_blocked.wait(), timeout=1.0)
+        try:
+            create.cancel()
+            await asyncio.sleep(0)
+        finally:
+            manager._lock.release()
+
+        assert await asyncio.wait_for(create, timeout=1.0) is agent
+        assert manager.get_agent("CommittedCreate") is agent
+        assert "CommittedCreate" in manager._created_configs
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
     async def test_pending_dynamic_registration_cannot_claim_before_onboarding_commit(
         self, tmp_path
     ):
@@ -1158,7 +1529,7 @@ class TestAgentManagerBasics:
         agent2.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_remove_agent_joins_deferred_durable_close_before_unpublishing(
+    async def test_remove_agent_quarantines_deferred_durable_close_before_unpublishing(
         self, tmp_path
     ):
         """One production removal call drains the real SQLite worker (#2713)."""
@@ -1216,24 +1587,32 @@ class TestAgentManagerBasics:
 
         try:
             # The manager's normal outer timeout cancels the bounded agent
-            # shutdown. It must then join the agent-owned continuation rather
-            # than removing this routing entry or releasing its resources.
+            # shutdown. It withdraws the routing entry within that advertised
+            # bound, while a retained quarantine reaper remains the sole owner
+            # of the dispatcher release and SQLite close.
             with patch(
                 "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
                 0.05,
             ):
                 remove_task = asyncio.create_task(manager.remove_agent("Managed"))
                 await asyncio.wait_for(release_entered.wait(), timeout=1.0)
-                await asyncio.sleep(0.1)
-
-                assert manager.get_agent("Managed") is agent
-                assert not remove_task.done()
-                assert storage_closed == []
-
-                allow_release.set()
                 assert await asyncio.wait_for(remove_task, timeout=1.0) is True
 
-            assert manager.get_agent("Managed") is None
+                assert manager.get_agent("Managed") is None
+                assert storage_closed == []
+                quarantined = manager.quarantined_shutdowns()
+                assert len(quarantined) == 1
+                assert next(iter(quarantined.values()))["pending"] is True
+
+                allow_release.set()
+                # A reaper owns a real SQLite worker, whose completion is not
+                # ordered by a count of event-loop turns. Join the manager's
+                # explicit terminal lifecycle boundary instead of letting test
+                # teardown close that worker's backend underneath its release.
+                assert await asyncio.wait_for(
+                    manager.drain_quarantined_shutdowns(), timeout=1.0
+                ) is False
+
             assert storage_closed == [True]
             assert backend._connection is None
             for _ in range(100):
@@ -1244,6 +1623,13 @@ class TestAgentManagerBasics:
         finally:
             allow_release.set()
             dispatcher._durable_store.release_initial_reservations = original_release
+            # Keep the production-shaped owner alive even when an assertion
+            # above fails.  Closing the backend first would manufacture the
+            # very post-close owner-release race this regression covers.
+            if manager._quarantined_shutdown_reapers:
+                await asyncio.wait_for(
+                    manager.drain_quarantined_shutdowns(), timeout=1.0
+                )
             if backend._connection is not None:
                 await backend.close()
 
@@ -1394,6 +1780,46 @@ class TestLoadFromConfig:
         assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == (
             tmp_path / "agent_data" / "claw" / "continuity"
         ).resolve()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_hosted_telegram_resolver_is_bound_before_agent_initialize(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """A host resolver is selected by local agent scope, never by input."""
+
+        mock_get_did.return_value = "did:telegram:one"
+        mock_agent_cls.return_value = _make_mock_agent("did:telegram:one")
+        resolver = object()
+        resolver_factory = MagicMock(return_value=resolver)
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            hosted_telegram_route_attestation_resolver_factory=resolver_factory,
+        )
+        config = LocalAgentConfig(data_dir=Path("agent_data/telegram"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("telegram", config)
+
+        resolver_factory.assert_called_once_with(
+            "telegram", "did:telegram:one", config
+        )
+        assert (
+            mock_agent_cls.call_args.kwargs[
+                "hosted_telegram_route_attestation_resolver"
+            ]
+            is resolver
+        )
+        mock_agent_cls.return_value.initialize.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch(
@@ -1866,6 +2292,167 @@ class TestCreateAgent:
         call_kwargs = mock_inception.call_args[1]
         assert call_kwargs["parent_did"] == "did:parent-abc"
         assert call_kwargs["agent_name"] == "ChildBot"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_name_create_is_admitted_once_before_inception(
+        self, monkeypatch, tmp_path
+    ):
+        """One name owner reaches inception; the concurrent loser does not."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        inception_started = asyncio.Event()
+        allow_inception = asyncio.Event()
+        inception_calls = 0
+        child = _make_mock_agent("did:test:single-create-owner")
+
+        async def inception(**_kwargs):
+            nonlocal inception_calls
+            inception_calls += 1
+            inception_started.set()
+            await allow_inception.wait()
+
+        async def initialize(*_args, **_kwargs):
+            return child
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            inception,
+        )
+        manager._initialize_agent = initialize
+
+        first = asyncio.create_task(manager.create_agent("SameName"))
+        await asyncio.wait_for(inception_started.wait(), timeout=1.0)
+        with pytest.raises(ValueError, match="already being initialized or created"):
+            await manager.create_agent("samename")
+        with pytest.raises(ValueError, match="already being initialized or created"):
+            await manager.load_agent(
+                "SAMENAME", LocalAgentConfig(data_dir="other", port=8802)
+            )
+
+        allow_inception.set()
+        assert await asyncio.wait_for(first, timeout=1.0) is child
+        assert inception_calls == 1
+        assert manager.list_agents() == {"SameName": child}
+        assert manager.get_agent_name(child.agent_id) == "SameName"
+        child.shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_fences_pre_inception_create_without_deleting_identity(
+        self, monkeypatch, tmp_path
+    ):
+        """An old create cannot publish after shutdown or block later reuse."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        inception_started = asyncio.Event()
+        allow_inception = asyncio.Event()
+        child = _make_mock_agent("did:test:stale-create")
+
+        async def inception(**_kwargs):
+            inception_started.set()
+            await allow_inception.wait()
+
+        async def initialize(*_args, **_kwargs):
+            return child
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            inception,
+        )
+        manager._initialize_agent = initialize
+
+        create = asyncio.create_task(manager.create_agent("BeforeShutdown"))
+        await asyncio.wait_for(inception_started.wait(), timeout=1.0)
+        shutdown = asyncio.create_task(manager.shutdown_all())
+        while not manager._agent_registration_sealed:
+            await asyncio.sleep(0)
+        # Inception itself is unbounded external work.  Shutdown fences its
+        # later publication but does not hang waiting for that ordinary create.
+        assert await asyncio.wait_for(shutdown, timeout=1.0) is None
+
+        allow_inception.set()
+        with pytest.raises(RuntimeError, match="began before manager shutdown"):
+            await asyncio.wait_for(create, timeout=1.0)
+
+        assert manager.list_agents() == {}
+        assert manager._created_configs == {}
+        child.shutdown.assert_not_awaited()
+        # Inception data remains deliberately intact; a canceled/stale create
+        # never guesses whether it is safe to delete an identity directory.
+        assert (tmp_path / "agent_data" / "BeforeShutdown").is_dir()
+        # The stale admission is rejected before it can initialize a runtime
+        # around identity data written before shutdown.
+        assert manager._agent_operations == {}
+
+        replacement = _make_mock_agent("did:test:post-shutdown-create")
+
+        async def initialize_replacement(*_args, **_kwargs):
+            return replacement
+
+        manager._initialize_agent = initialize_replacement
+        assert await manager.load_agent(
+            "BeforeShutdown", LocalAgentConfig(data_dir="replacement", port=8802)
+        ) is replacement
+        assert manager.get_agent("BeforeShutdown") is replacement
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_name_load_rejects_before_second_initialization(self):
+        """Direct cold loads share the same admission, not just create_agent."""
+
+        manager = AgentManager()
+        initialized = asyncio.Event()
+        allow_first = asyncio.Event()
+        child = _make_mock_agent("did:test:single-load-owner")
+        initialize_calls = 0
+
+        async def initialize(*_args, **_kwargs):
+            nonlocal initialize_calls
+            initialize_calls += 1
+            initialized.set()
+            await allow_first.wait()
+            return child
+
+        manager._initialize_agent = initialize
+        config = LocalAgentConfig(data_dir="same", port=8801)
+        first = asyncio.create_task(manager.load_agent("SameLoad", config))
+        await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        with pytest.raises(ValueError, match="already being initialized or created"):
+            await manager.load_agent("sameload", config)
+
+        allow_first.set()
+        assert await asyncio.wait_for(first, timeout=1.0) is child
+        assert initialize_calls == 1
+        assert manager.list_agents() == {"SameLoad": child}
+        assert manager._agent_names == {child.agent_id: "SameLoad"}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_operation_release_waits_for_state_lock(
+        self,
+    ) -> None:
+        """A completed admission cannot be stranded by cancellation in finally."""
+
+        manager = AgentManager()
+        admission, owns_admission = await manager._admit_agent_operation(
+            "Completed", kind="test"
+        )
+        assert owns_admission
+
+        await manager._lock.acquire()
+        release = asyncio.create_task(manager._release_agent_operation(admission))
+        try:
+            await asyncio.sleep(0)
+            release.cancel()
+
+            # The owned release is blocked on the state lock. Releasing that
+            # lock must finish its mutation before the caller's cancellation
+            # can propagate.
+            manager._lock.release()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(release, timeout=1.0)
+        finally:
+            if manager._lock.locked():
+                manager._lock.release()
+
+        assert manager._agent_operations == {}
 
 
 class TestSpawnAgent:

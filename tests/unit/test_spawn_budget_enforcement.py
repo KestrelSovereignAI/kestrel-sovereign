@@ -9,6 +9,7 @@ paths, so a `budget` was a no-op (later an interim rejection). These tests cover
     terminate, and refusal of a budget with no funded parent wallet.
 """
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -34,6 +35,7 @@ class FakeWallet:
         self._currency = initial_currency
         self._balances = {initial_currency: {"main": Decimal(initial_balance)}}
         self.deposits = []
+        self._debit_intents = {}
 
     async def initialize(self):
         return None
@@ -54,12 +56,102 @@ class FakeWallet:
         self._balances[currency]["main"] = self._bal(currency) - amount
         return True
 
+    async def prepare_debit_intent(self, *, idempotency_key, amount, memo, currency):
+        self._debit_intents.setdefault(
+            idempotency_key,
+            {"amount": amount, "memo": memo, "currency": currency, "outcome": False},
+        )
+        return idempotency_key
+
+    async def execute_debit_intent(self, intent_id):
+        intent = self._debit_intents[intent_id]
+        if intent["outcome"] is True:
+            return True
+        outcome = await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+        intent["outcome"] = outcome
+        return outcome
+
+    async def resolve_debit_intent(self, intent_id):
+        return self._debit_intents[intent_id]["outcome"]
+
     async def deposit(self, amount, currency=None, to_audit=False, memo=""):
         currency = currency or self._currency
         self._balances.setdefault(currency, {}).setdefault("main", Decimal("0"))
         self._balances[currency]["main"] += amount
         self.deposits.append((amount, memo))
         return True
+
+
+class DurableHoldOnlyWallet(FakeWallet):
+    """An older durable allocation provider without child provisioning."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reserve_calls = []
+
+    def can_afford(self, amount, currency=None):
+        raise AssertionError("durable allocation retries must not use stale can_afford")
+
+    async def reserve_delegated_allocation(
+        self, *, allocation_id, child_did, amount, memo, currency
+    ):
+        self.reserve_calls.append(allocation_id)
+        record = getattr(self, "_allocations", {}).get(allocation_id)
+        if record is not None:
+            return True
+        self._allocations = getattr(self, "_allocations", {})
+        self._allocations[allocation_id] = amount
+        self._balances[currency]["main"] -= amount
+        return True
+
+    async def release_delegated_allocation(self, *, allocation_id, amount, currency):
+        self._balances[currency]["main"] += amount
+        return True
+
+
+class DurableProvisioningWallet(DurableHoldOnlyWallet):
+    """Modern provider seam: Core never constructs or funds this child itself."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.provision_calls = []
+        self.release_calls = []
+        self.children = {}
+
+    async def reserve_and_provision_delegated_child_wallet(
+        self, *, allocation_id, child_did, amount, memo, currency
+    ):
+        self.provision_calls.append(allocation_id)
+        child = self.children.get(allocation_id)
+        if child is not None:
+            return child
+        await self.reserve_delegated_allocation(
+            allocation_id=allocation_id,
+            child_did=child_did,
+            amount=amount,
+            memo=memo,
+            currency=currency,
+        )
+        child = FakeWallet(
+            agent_id=child_did,
+            initial_balance=Decimal("0"),
+            initial_currency=currency,
+        )
+        child.db_path = "provider-owned-durable-child-storage"
+        await child.initialize()
+        child._balances[currency]["main"] = amount
+        self.children[allocation_id] = child
+        return child
+
+    async def release_and_fence_delegated_child_wallet(
+        self, *, allocation_id, currency
+    ):
+        self.release_calls.append(allocation_id)
+        child = self.children[allocation_id]
+        unspent = child.get_balance(currency, "main")
+        child._balances[currency]["main"] = Decimal("0")
+        self._balances[currency]["main"] += unspent
+        return unspent
 
 
 # --------------------------- DelegatedWallet drop-in ---------------------------
@@ -105,6 +197,65 @@ async def test_delegates_unoverridden_attrs():
 # ----------------------------- hold / release ---------------------------------
 
 @pytest.mark.asyncio
+async def test_durable_allocation_retry_precedes_stale_affordability_for_legacy_provider():
+    """Old durable providers still own idempotent hold retries before preflight."""
+
+    parent = DurableHoldOnlyWallet(initial_balance=Decimal("100"))
+    child = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+
+    assert child.remaining == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    # A re-run after the original hold must ask the allocation authority, not
+    # the now-stale/insufficient cache, and must not debit twice.
+    retried = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert retried.remaining == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    assert len(parent.reserve_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_provider_provisions_and_persists_child_without_core_wallet_internals():
+    """Core uses the provider seam for storage and initial allocation atomically."""
+
+    parent = DurableProvisioningWallet(initial_balance=Decimal("100"))
+    delegated = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+
+    assert delegated._wallet.db_path == "provider-owned-durable-child-storage"
+    assert delegated.get_balance() == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    retried = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert retried._wallet is delegated._wallet
+    assert parent.get_balance() == Decimal("70")
+    assert len(parent.provision_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_child_release_uses_provider_balance_not_volatile_allocation_spend():
+    """A reconstructed Core wrapper must not refund its stale local counter."""
+
+    parent = DurableProvisioningWallet(initial_balance=Decimal("100"))
+    delegated = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert await delegated.transfer(Decimal("7"), "durable child work") is True
+
+    # Simulate process restart: this allocation presentation has no confirmed
+    # spend history, but the provider-owned child wallet has only 23 left.
+    restarted = DelegatedWallet(
+        delegated._wallet,
+        BudgetAllocation(
+            child_did="did:c",
+            parent_did="did:p",
+            amount=Decimal("30"),
+            allocation_id=delegated.allocation.allocation_id,
+            parent_hold_durable=True,
+        ),
+    )
+    assert await release_delegated_wallet(restarted, parent) == Decimal("23")
+    assert parent.get_balance() == Decimal("93")
+    assert parent.release_calls == [delegated.allocation.allocation_id]
+    assert await release_delegated_wallet(restarted, parent) == Decimal("0")
+    assert parent.get_balance() == Decimal("93")
+
+@pytest.mark.asyncio
 async def test_nested_budgeted_spawn_unwraps_delegated_parent():
     """A budgeted child (its wallet already a DelegatedWallet) spawning a
     budgeted grandchild: the hold goes through the child's ceiling, and the
@@ -120,6 +271,33 @@ async def test_nested_budgeted_spawn_unwraps_delegated_parent():
     assert real.get_balance() == Decimal("80")
     assert gc.remaining == Decimal("20")
     assert isinstance(gc._wallet, FakeWallet)      # not a nested DelegatedWallet
+
+
+@pytest.mark.asyncio
+async def test_nested_legacy_release_does_not_proxy_root_child_release_contract():
+    """A grandchild's legacy hold returns through its immediate delegated parent."""
+
+    class RootWithLegacyNestedAffordability(DurableProvisioningWallet):
+        # The outer provider is durable, while its manually wrapped delegated
+        # child follows the legacy nested-transfer path.
+        can_afford = FakeWallet.can_afford
+
+    root = RootWithLegacyNestedAffordability(initial_balance=Decimal("100"))
+    child = DelegatedWallet(
+        root, BudgetAllocation(child_did="did:child", amount=Decimal("50"))
+    )
+    grandchild = await create_delegated_wallet(
+        child, "did:child", "did:grandchild", Decimal("20")
+    )
+    assert await grandchild.transfer(Decimal("5"), "grandchild work") is True
+
+    # ``child`` proxies normal deposits to ``root``, but its legacy grandchild
+    # allocation has no root-owned child-release ledger entry. Looking through
+    # __getattr__ would invoke the root protocol and strand the refund.
+    assert await release_delegated_wallet(grandchild, child) == Decimal("15")
+    assert root.get_balance() == Decimal("95")
+    assert child.spent == Decimal("5")
+    assert root.release_calls == []
 
 
 class _InitFailWallet(FakeWallet):
@@ -269,6 +447,73 @@ async def test_spawn_holds_budget_and_terminate_releases():
 
 
 @pytest.mark.asyncio
+async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold() -> None:
+    """A cancellation blocked on lifecycle admission cannot leak a new hold."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    provider_returned_with_lifecycle_lock = asyncio.Event()
+
+    class LockHoldingProvisioner(DurableProvisioningWallet):
+        async def reserve_and_provision_delegated_child_wallet(self, **kwargs):
+            child_wallet = await super().reserve_and_provision_delegated_child_wallet(
+                **kwargs
+            )
+            await manager._a2a_lifecycle_lock.acquire()
+            provider_returned_with_lifecycle_lock.set()
+            return child_wallet
+
+    parent = SimpleNamespace(
+        _private_key=None,
+        identity=None,
+        agent_id="did:test:provider-parent",
+        features={},
+        wallet=LockHoldingProvisioner(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(
+        agent_id="did:test:provider-child", wallet=None, wallet_agent=None,
+        shutdown=AsyncMock(),
+    )
+
+    async def fake_create_agent(name, **_kwargs):
+        manager._agents[name] = child
+        manager._agent_names[child.agent_id] = name
+        return child
+
+    manager.create_agent = fake_create_agent
+    mandate = SpawnMandate(
+        parent_did=parent.agent_id,
+        purpose="allocation cancellation regression",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+    spawn = asyncio.create_task(manager.spawn_agent("Kid", parent, mandate))
+    await asyncio.wait_for(provider_returned_with_lifecycle_lock.wait(), timeout=1.0)
+    try:
+        # The provider has returned a durable positive allocation, and the
+        # spawn is now waiting to re-enter the lifecycle writer. Tracking must
+        # already be visible to rollback before this cancellation is delivered.
+        await asyncio.sleep(0)
+        assert "Kid" in manager._child_budgets
+        spawn.cancel()
+        await asyncio.sleep(0)
+    finally:
+        manager._a2a_lifecycle_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(spawn, timeout=1.0)
+
+    assert parent.wallet.get_balance() == Decimal("100")
+    assert manager._child_budgets == {}
+    assert manager.get_agent("Kid") is None
+    assert manager.get_children(parent.agent_id) == []
+    assert manager.get_mandate("Kid") is None
+    child.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_releases_nested_budgets_leaf_first():
     """Graceful shutdown releases a budgeted grandchild before its budgeted
     parent, so ALL unspent funds flow back to the root (not stranded in an
@@ -301,10 +546,16 @@ async def test_direct_remove_agent_releases_budget():
         _private_key=None, identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
-    child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
+    child = SimpleNamespace(
+        agent_id="did:c", wallet=None, wallet_agent=None, shutdown=AsyncMock()
+    )
     mgr = AgentManager()
 
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
+        # Match the public create/load contract: a spawn may only commit after
+        # its exact child is published to both routing maps.
+        mgr._agents[name] = child
+        mgr._agent_names[child.agent_id] = name
         return child
 
     mgr.create_agent = fake_create_agent  # real remove_agent (the path under test)
@@ -315,6 +566,105 @@ async def test_direct_remove_agent_releases_budget():
 
     await mgr.remove_agent("Kid")
     assert parent.wallet.get_balance() == Decimal("100")   # hold released on delete
+
+
+@pytest.mark.asyncio
+async def test_casefolded_delegated_hold_blocks_new_child_admission() -> None:
+    """A restored Foo hold must reserve foo before any new child initializes."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+    manager = AgentManager()
+    manager._child_budgets["Foo"] = (object(), object())
+    initialize = AsyncMock()
+    manager._initialize_agent = initialize
+
+    with pytest.raises(RuntimeError, match="unresolved delegated budget cleanup"):
+        await manager.load_agent("foo", LocalAgentConfig(data_dir="foo", port=8801))
+
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_keeps_retry_tracking_after_refund_failure() -> None:
+    """A failed stop-then-refund retains the parent edge and mandate for retry."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    child = SimpleNamespace(agent_id="did:test:retry-child", shutdown=AsyncMock())
+    entry = (object(), object())
+    mandate = SpawnMandate(parent_did="did:test:retry-parent", purpose="retry")
+    manager._agents["retry-child"] = child
+    manager._agent_names[child.agent_id] = "retry-child"
+    manager._child_budgets["retry-child"] = entry
+    manager._parent_children["did:test:retry-parent"] = ["retry-child"]
+    manager._child_mandates["retry-child"] = mandate
+
+    async def fail_refund(name: str) -> bool:
+        assert name == "retry-child"
+        raise RuntimeError("refund provider failed")
+
+    manager._release_child_budget_cancellation_safe = fail_refund
+    with pytest.raises(RuntimeError, match="refund provider failed"):
+        await manager.terminate_child("did:test:retry-parent", "retry-child")
+
+    # remove_agent has withdrawn the stopped child, but it retained the exact
+    # hold.  terminate_child must preserve the relation that permits the
+    # normal retry to find that hold and its governance mandate.
+    assert manager.get_children("did:test:retry-parent") == ["retry-child"]
+    assert manager.get_mandate("retry-child") is mandate
+    assert manager._child_budgets["retry-child"] is entry
+
+    async def release_refund(name: str) -> bool:
+        assert name == "retry-child"
+        assert manager._child_budgets.pop(name) is entry
+        return False
+
+    manager._release_child_budget_cancellation_safe = release_refund
+    assert await manager.terminate_child("did:test:retry-parent", "retry-child")
+    assert manager.get_children("did:test:retry-parent") == []
+    assert manager.get_mandate("retry-child") is None
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_prunes_tracking_after_completed_removal_cancellation() -> None:
+    """A terminal DELETE cancellation must not consume a spawn-cap slot forever."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    child = SimpleNamespace(
+        agent_id="did:test:cancelled-child", shutdown=AsyncMock()
+    )
+    entry = (object(), object())
+    mandate = SpawnMandate(parent_did="did:test:cancelled-parent", purpose="retry")
+    manager._agents["cancelled-child"] = child
+    manager._agent_names[child.agent_id] = "cancelled-child"
+    manager._child_budgets["cancelled-child"] = entry
+    manager._parent_children["did:test:cancelled-parent"] = ["cancelled-child"]
+    manager._child_mandates["cancelled-child"] = mandate
+
+    async def refund_then_report_cancellation(name: str) -> bool:
+        assert name == "cancelled-child"
+        assert manager._child_budgets.pop(name) is entry
+        # This is the remove_agent contract after shutdown and refund have
+        # completed while the caller's cancellation is still pending.
+        return True
+
+    manager._release_child_budget_cancellation_safe = refund_then_report_cancellation
+    with pytest.raises(asyncio.CancelledError):
+        await manager.terminate_child("did:test:cancelled-parent", "cancelled-child")
+
+    child.shutdown.assert_awaited_once()
+    assert manager.get_agent("cancelled-child") is None
+    assert "cancelled-child" not in manager._child_budgets
+    assert manager.get_children("did:test:cancelled-parent") == []
+    assert manager.get_mandate("cancelled-child") is None
+    assert manager._pending_spawns == 0
 
 
 @pytest.mark.asyncio
@@ -432,6 +782,30 @@ async def test_budget_refused_when_parent_cannot_afford():
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("50"))
     with pytest.raises(ValueError, match="cannot afford"):
         await mgr.spawn_agent("Kid", parent, mandate)
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_bypasses_stale_preflight_for_durable_provisioner():
+    """Only the provider's atomic reserve may decide a durable spawn budget."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    # ``DurableProvisioningWallet.can_afford`` deliberately raises: it models
+    # a cross-process stale snapshot, while its reserve/provision seam is the
+    # authoritative transaction exercised by the wallet package regression.
+    parent = SimpleNamespace(
+        agent_id="did:p",
+        wallet=DurableProvisioningWallet(initial_balance=Decimal("30")),
+    )
+    mandate = SpawnMandate(
+        parent_did="did:p",
+        purpose="x",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+
+    AgentManager()._validate_budget_precondition(parent, mandate)
 
 
 @pytest.mark.asyncio

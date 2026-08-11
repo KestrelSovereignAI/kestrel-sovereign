@@ -25,6 +25,7 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.features.channels.route_ownership import ChannelRouteOwnershipStore
 
 
 def _signal(agent_id: str) -> Signal:
@@ -35,6 +36,12 @@ def _signal(agent_id: str) -> Signal:
         payload={"workflow": "wf-1", "message": "normalized"},
         target_agent=agent_id,
     )
+
+
+def _dispatcher_owner_id() -> str:
+    """Return the same managed-owner shape a production dispatcher emits."""
+
+    return f"dispatcher:{uuid4().hex}"
 
 
 class _DispatcherAgent:
@@ -137,6 +144,183 @@ async def _assert_one_pending_delivery(
 ) -> None:
     deliveries = await store.list_deliveries(agent_id=agent_id)
     assert [delivery.event_id for delivery in deliveries] == [event_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_schema_bootstrap_is_safe_under_independent_backend_contention(db_backend):
+    """Fresh/additive durable and route bootstrap serializes across processes."""
+
+    peer_backend = await _independent_backend(db_backend)
+    try:
+        first = DurableSignalStore(db_backend)
+        second = DurableSignalStore(peer_backend)
+        first_routes = ChannelRouteOwnershipStore(db_backend)
+        second_routes = ChannelRouteOwnershipStore(peer_backend)
+        await asyncio.wait_for(
+            asyncio.gather(
+                first.initialize(), second.initialize(),
+                first_routes.initialize(), second_routes.initialize(),
+            ),
+            timeout=10,
+        )
+        assert await db_backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_event_integrity"
+        ) == 0
+        claim = await first_routes.claim(
+            channel_type="telegram",
+            canonical_route_identity=f"telegram-bot:bootstrap-{uuid4().hex}",
+            agent_id="did:test:bootstrap",
+        )
+        assert claim is not None
+    finally:
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("exact_event_claim", (False, True), ids=("ordinary", "exact"))
+async def test_implicit_claim_clock_follows_contended_scope_handoff_on_both_backends(
+    db_backend, monkeypatch, exact_event_claim
+):
+    """A delayed claim takes its implicit lease clock after the real DB lock."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:durable-claim-clock:{uuid4()}"
+    consumer = DurableConsumerRegistration(
+        consumer_id="clock-worker",
+        source="provider.message",
+        agent_id=agent_id,
+        lease_seconds=1,
+    )
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    monkeypatch.setattr(store, "now_utc", lambda: clock["now"])
+    await store.register_consumer(consumer)
+    persisted = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"claim-clock:{uuid4()}",
+        retention_days=7,
+    )
+    lock_acquired = asyncio.Event()
+    entered_handoff = asyncio.Event()
+    release_lock = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+
+    async def hold_peer_scope() -> None:
+        async with peer_backend.transaction():
+            await peer_store._lock_scope_handoff(
+                agent_id=agent_id, source=consumer.source
+            )
+            lock_acquired.set()
+            await release_lock.wait()
+
+    blocker = asyncio.create_task(hold_peer_scope())
+    try:
+        await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+        if exact_event_claim:
+            claim = asyncio.create_task(
+                store.claim_delivery_for_event(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    event_id=persisted.event_id,
+                    executor_id="worker",
+                )
+            )
+        else:
+            claim = asyncio.create_task(
+                store.claim_delivery(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    executor_id="worker",
+                )
+            )
+        await asyncio.wait_for(entered_handoff.wait(), timeout=5)
+        clock["now"] = base + timedelta(seconds=2)
+        release_lock.set()
+        claimed = await asyncio.wait_for(claim, timeout=5)
+        assert claimed is not None
+        assert claimed.lease_expires_at == base + timedelta(seconds=3)
+    finally:
+        release_lock.set()
+        await _cancel_and_drain(blocker)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_registration_backfill_clock_follows_contended_scope_handoff_on_both_backends(
+    db_backend, monkeypatch
+):
+    """Backfill evaluates retention after the real database serialization point."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:durable-registration-clock:{uuid4()}"
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    monkeypatch.setattr(store, "now_utc", lambda: clock["now"])
+    persisted = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"registration-clock:{uuid4()}",
+        retention_days=7,
+    )
+    await db_backend.execute(
+        "UPDATE durable_signal_events SET retention_until = ? WHERE event_id = ?",
+        (base + timedelta(seconds=1), persisted.event_id),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="late-clock-worker",
+        source="provider.message",
+        agent_id=agent_id,
+    )
+    lock_acquired = asyncio.Event()
+    entered_handoff = asyncio.Event()
+    release_lock = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+
+    async def hold_peer_scope() -> None:
+        async with peer_backend.transaction():
+            await peer_store._lock_scope_handoff(
+                agent_id=agent_id, source=consumer.source
+            )
+            lock_acquired.set()
+            await release_lock.wait()
+
+    blocker = asyncio.create_task(hold_peer_scope())
+    try:
+        await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+        registration = asyncio.create_task(store.register_consumer(consumer))
+        await asyncio.wait_for(entered_handoff.wait(), timeout=5)
+        clock["now"] = base + timedelta(seconds=2)
+        release_lock.set()
+        await asyncio.wait_for(registration, timeout=5)
+        assert await store.list_deliveries(agent_id=agent_id) == []
+    finally:
+        release_lock.set()
+        await _cancel_and_drain(blocker)
+        await peer_backend.close()
 
 
 @pytest.mark.asyncio
@@ -346,7 +530,7 @@ async def test_unactivated_reservation_survives_a_long_paused_commit_and_owner_a
         await peer_store.initialize()
         agent_id = f"did:test:durable-paused-commit:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
+        owner_id = _dispatcher_owner_id()
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
                 consumer_id=consumer_id,
@@ -442,7 +626,9 @@ async def test_startup_recovers_only_a_stale_unactivated_owner_as_marker_work(
         await emitting_store.initialize()
         agent_id = f"did:test:durable-stale-owner:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "crashed-dispatcher"
+        # Recovery deliberately considers only managed dispatcher owners;
+        # arbitrary executor namespaces must never be stolen as crashed hosts.
+        owner_id = _dispatcher_owner_id()
         now = datetime.now(timezone.utc)
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
@@ -509,8 +695,8 @@ async def test_live_runtime_owner_cannot_be_recovered_by_a_concurrent_dispatcher
         await peer_store.initialize()
         agent_id = f"did:test:durable-live-owner:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "live-dispatcher"
-        peer_owner_id = "other-live-dispatcher"
+        owner_id = _dispatcher_owner_id()
+        peer_owner_id = _dispatcher_owner_id()
         now = datetime.now(timezone.utc)
         await emitting_store.register_consumer(
             DurableConsumerRegistration(
@@ -578,8 +764,8 @@ async def test_delayed_runtime_heartbeat_cannot_regress_owner_liveness_or_releas
         await peer_store.initialize()
         agent_id = f"did:test:durable-monotonic-heartbeat:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
-        recovering_owner_id = "concurrent-dispatcher"
+        owner_id = _dispatcher_owner_id()
+        recovering_owner_id = _dispatcher_owner_id()
         base = datetime(2040, 1, 1, tzinfo=timezone.utc)
         older = base + timedelta(seconds=1)
         newer = base + timedelta(seconds=10)
@@ -636,6 +822,111 @@ async def test_delayed_runtime_heartbeat_cannot_regress_owner_liveness_or_releas
             executor_id="peer-worker",
         ) is None
     finally:
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_recovery_waits_for_overlapping_live_runtime_heartbeat(
+    db_backend,
+):
+    """A PostgreSQL recovery cannot classify a heartbeat mid-transaction stale."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL advisory-lock overlap regression")
+
+    peer_backend = await _independent_backend(db_backend)
+    heartbeat_task = None
+    recovery_task = None
+    try:
+        emitting_store = DurableSignalStore(db_backend)
+        recovering_store = DurableSignalStore(peer_backend)
+        await emitting_store.initialize()
+        await recovering_store.initialize()
+        agent_id = f"did:test:durable-heartbeat-overlap:{uuid4()}"
+        consumer_id = "workflow-wait"
+        owner_id = _dispatcher_owner_id()
+        recovering_owner_id = _dispatcher_owner_id()
+        base = datetime.now(timezone.utc)
+        stale = base - timedelta(minutes=5)
+        now = base + timedelta(seconds=1)
+        await emitting_store.register_consumer(
+            DurableConsumerRegistration(
+                consumer_id=consumer_id,
+                source="provider.message",
+                agent_id=agent_id,
+            )
+        )
+        await emitting_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, now=stale
+        )
+        await recovering_store.register_runtime_owner(
+            agent_id=agent_id, owner_id=recovering_owner_id, now=now
+        )
+        marker = _signal(agent_id)
+        persisted = await emitting_store.persist_signal(
+            marker,
+            agent_id=agent_id,
+            source_event_id=f"heartbeat-overlap:{uuid4()}",
+            retention_days=7,
+            initial_lease_owner=owner_id,
+        )
+        reservation = persisted.initial_reservations[0]
+        activated = await emitting_store.activate_initial_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+            initial_lease_owner=owner_id,
+            initial_lease_token=reservation.reservation_token,
+            now=stale,
+        )
+        assert activated is not None and activated.status == "leased"
+
+        heartbeat_updated = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+        original_touch = emitting_store._touch_runtime_owner_locked
+
+        async def pause_after_owner_touch(**kwargs):
+            await original_touch(**kwargs)
+            heartbeat_updated.set()
+            await release_heartbeat.wait()
+
+        emitting_store._touch_runtime_owner_locked = pause_after_owner_touch
+        heartbeat_task = asyncio.create_task(
+            emitting_store.heartbeat_runtime_owner(
+                agent_id=agent_id, owner_id=owner_id, now=now
+            )
+        )
+        await asyncio.wait_for(heartbeat_updated.wait(), timeout=2)
+        recovery_task = asyncio.create_task(
+            recovering_store.recover_abandoned_leases(
+                agent_id=agent_id,
+                recovering_owner_id=recovering_owner_id,
+                stale_before=base,
+                now=now,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert recovery_task.done() is False
+
+        release_heartbeat.set()
+        await heartbeat_task
+        assert await recovery_task == 0
+        delivery = await recovering_store.get_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            delivery_id=reservation.delivery_id,
+        )
+        assert delivery is not None and delivery.status == "leased"
+    finally:
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+        await asyncio.gather(
+            *(task for task in (heartbeat_task, recovery_task) if task is not None),
+            return_exceptions=True,
+        )
         await peer_backend.close()
 
 
@@ -865,7 +1156,7 @@ async def test_initial_worker_transfer_does_not_publish_an_expired_lease_after_c
         await peer_store.initialize()
         agent_id = f"did:test:durable-initial-transfer:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "emitting-dispatcher"
+        owner_id = _dispatcher_owner_id()
         base = datetime(2040, 1, 1, tzinfo=timezone.utc)
         current_time = {"value": base}
         store.now_utc = lambda: current_time["value"]
