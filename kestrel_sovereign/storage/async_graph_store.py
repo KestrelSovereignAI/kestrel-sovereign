@@ -153,6 +153,24 @@ def _is_shareable_amendment_artifact_properties(
     return _is_tz_aware_iso(created_at)
 
 
+#: The ``(node_type, label)`` shapes a PostgreSQL fleet may co-own, and the
+#: predicate that decides whether a given row really is content-derived.
+#:
+#: Two node types qualify: the governing constitution document, and a
+#: Sovereign-signed reanchor artifact (#2893). Both are the same argument — the
+#: node id IS the hash of the bytes, so every tenant computes identical
+#: properties — and both are gated the same way: the writer must independently
+#: own the underlying blob, so co-ownership follows possession of the content
+#: rather than knowledge of a hash.
+_SHARED_CONTENT_SHAPES = {
+    ("document", "KESTREL_CONSTITUTION"): _is_shareable_constitution_properties,
+    (
+        "constitution_amendment_artifact",
+        "Signed Constitution Reanchor Artifact",
+    ): _is_shareable_amendment_artifact_properties,
+}
+
+
 def _insert_owner_sql(db: AsyncDatabase, table: str, columns: str) -> str:
     """Return a backend-neutral insert-if-absent statement for an owner row."""
     placeholders = ", ".join("?" for _ in columns.split(","))
@@ -479,24 +497,9 @@ class AsyncGraphStore:
             existing_properties = (
                 json.loads(existing[2]) if existing and existing[2] else {}
             )
-            # Two content-addressed node types may be co-owned: the governing
-            # constitution document, and a Sovereign-signed reanchor artifact
-            # (#2893). Both are the same argument — the node id IS the hash of
-            # the bytes, so every tenant computes identical properties — and
-            # both are gated the same way: the writer must independently own
-            # the underlying blob, so co-ownership follows possession of the
-            # content rather than knowledge of a hash.
-            shared_shapes = {
-                ("document", "KESTREL_CONSTITUTION"): (
-                    _is_shareable_constitution_properties
-                ),
-                (
-                    "constitution_amendment_artifact",
-                    "Signed Constitution Reanchor Artifact",
-                ): _is_shareable_amendment_artifact_properties,
-            }
-            shape_key = (node.node_type, node.label)
-            is_shareable = shared_shapes.get(shape_key)
+            # ``None`` for every node type that is not content-addressed, which
+            # is the overwhelming majority — see _SHARED_CONTENT_SHAPES.
+            is_shareable = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
 
             owns_content_reference = False
             if (
