@@ -213,6 +213,7 @@ def test_doctor_accepts_private_identity_export_metadata(tmp_path):
 
 import hashlib  # noqa: E402
 import json  # noqa: E402
+import os  # noqa: E402
 import sqlite3  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
@@ -950,7 +951,7 @@ def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     assert not any("OPENROUTER_API_KEY" in m for m in report.fail)
 
 
-def test_the_backend_rule_is_the_runtimes_rule(monkeypatch):
+def test_the_backend_rule_is_the_runtimes_rule():
     """Copied from ``agent_manager._initialize_agent``, and copied *exactly*.
 
     `KESTREL_DB_BACKEND=postgres` with no DSN is a host whose agents really do
@@ -959,15 +960,74 @@ def test_the_backend_rule_is_the_runtimes_rule(monkeypatch):
     """
     from kestrel_sovereign.doctor import _anchor_is_the_runtime_database
 
+    assert _anchor_is_the_runtime_database({}) is True
+    assert (
+        _anchor_is_the_runtime_database({"KESTREL_DB_BACKEND": "postgres"}) is True
+    ), "no DSN -> the runtime is SQLite"
+    assert _anchor_is_the_runtime_database(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://h/db",
+        }
+    ) is False
+
+
+def test_the_database_settings_are_read_from_the_project_env(tmp_path, monkeypatch):
+    """The standard install keeps them in the project ``.env``, nowhere else.
+
+    ``kestrel doctor`` and ``setup --check`` call ``diagnose(project_dir)``
+    without loading that file, so a doctor that consulted only ``os.environ``
+    saw an unset backend, concluded SQLite, and went on reporting the birth
+    record as current governance — on precisely the hosts #2892 is about. The
+    fix would have been invisible in production while every test that exported
+    the variables stayed green.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+
     monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
-    assert _anchor_is_the_runtime_database() is True
+    (tmp_path / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://durable.example/kestrel\n"
+    )
 
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    assert _anchor_is_the_runtime_database() is True, "no DSN -> the runtime is SQLite"
+    resolved = runtime_env(tmp_path)
 
-    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/db")
-    assert _anchor_is_the_runtime_database() is False
+    assert resolved["KESTREL_DB_BACKEND"] == "postgres"
+    assert resolved["KESTREL_DATABASE_URL"] == "postgresql://durable.example/kestrel"
+
+
+def test_an_exported_setting_still_outranks_the_project_env(tmp_path, monkeypatch):
+    """``paths.load_project_env`` uses ``setdefault``; this must match it.
+
+    Reading the file *instead of* the environment would be the same mistake
+    pointing the other way — an operator who exports a DSN to aim a tool at one
+    database would be diagnosed against another.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+
+    (tmp_path / ".env").write_text("KESTREL_DATABASE_URL=postgresql://from-file/db\n")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://exported/db")
+
+    assert runtime_env(tmp_path)["KESTREL_DATABASE_URL"] == "postgresql://exported/db"
+
+
+def test_diagnose_does_not_export_the_project_env(tmp_path, monkeypatch):
+    """A diagnostic reports on the process; it does not become it.
+
+    Loading ``.env`` into ``os.environ`` would leave every later command in the
+    same process — ``setup``'s remaining steps, a test, an embedding CLI —
+    running under settings the operator never exported.
+    """
+    _seed_ready(tmp_path)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    (tmp_path / ".env").write_text(
+        (tmp_path / ".env").read_text() + "\nKESTREL_DB_BACKEND=postgres\n"
+    )
+
+    diagnose(tmp_path)
+
+    assert "KESTREL_DB_BACKEND" not in os.environ
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1040,20 @@ def test_the_backend_rule_is_the_runtimes_rule(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _real_psycopg2_extensions():
+    """Import the genuine ``psycopg2.extensions`` and keep it in ``sys.modules``.
+
+    ``from psycopg2.extensions import make_dsn`` resolves out of
+    ``sys.modules["psycopg2.extensions"]`` when that key is present, and only
+    falls back to walking the parent package's ``__path__`` when it is not.
+    Importing it before the parent is swapped for the double is what lets
+    doctor's DSN handling run for real against a faked connection.
+    """
+    import psycopg2.extensions
+
+    return psycopg2.extensions
+
+
 class _FakePostgres:
     """Just enough psycopg2 to answer doctor's three queries.
 
@@ -987,16 +1061,30 @@ class _FakePostgres:
     database returns is the thing that can go wrong: one PostgreSQL holds every
     local agent, so an unscoped read answers about whichever tenant came back
     first.
+
+    ``extensions`` is the **real** submodule. A double that omitted it made
+    ``from psycopg2.extensions import ...`` raise ``ModuleNotFoundError``
+    ("'psycopg2' is not a package"), which the readers map to "database
+    unreadable" — so every assertion below would have been satisfied by doctor
+    quietly giving up, and the DSN it dials would never be exercised. Real
+    psycopg2 is a package; the double has to be one too.
     """
 
     def __init__(self, rows_by_prefix: dict):
         self._rows_by_prefix = rows_by_prefix
         self.executed: list[tuple[str, tuple]] = []
         self.closed = False
+        self.extensions = _real_psycopg2_extensions()
 
     # -- module surface ----------------------------------------------------
-    def connect(self, dsn):
-        self.dsn = dsn
+    def connect(self, dsn, **kwargs):
+        # Real ``psycopg2.connect`` merges keywords into the DSN through
+        # ``make_dsn``, where **the keyword wins**. The double has to merge the
+        # same way: a ``connect(self, dsn)`` that simply rejected keywords
+        # would kill a "passes connect_timeout as a keyword" regression with an
+        # ``AttributeError`` about its own signature, proving nothing about
+        # whose timeout survives.
+        self.dsn = self.extensions.make_dsn(dsn, **kwargs) if kwargs else dsn
         return self
 
     # -- connection surface ------------------------------------------------
@@ -1093,6 +1181,47 @@ def test_the_runtime_read_is_scoped_to_this_agent(tmp_path, monkeypatch):
         assert "node_id = %s" in sql, sql
         assert "LIMIT 1" not in sql, sql
         assert params and params[0].startswith("did:"), params
+
+
+def test_the_diagnostic_connection_is_bounded(tmp_path, monkeypatch):
+    """Doctor is what an operator runs *when the database is unavailable*.
+
+    A black-holed or firewalled endpoint does not refuse the connection — it
+    drops the packets, and libpq then waits out the OS TCP timeout. Unbounded,
+    the recovery diagnostic hangs for minutes on exactly the failure it exists
+    to describe.
+    """
+    from psycopg2.extensions import parse_dsn
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({"SELECT node_id, properties FROM graph_nodes": []})
+    _postgres_host(monkeypatch, fake)
+
+    diagnose(tmp_path)
+
+    assert parse_dsn(fake.dsn)["connect_timeout"] == "5"
+
+
+def test_a_dsn_that_sets_its_own_timeout_keeps_it(tmp_path, monkeypatch):
+    """``psycopg2.connect(dsn, connect_timeout=...)`` merges through
+    ``make_dsn``, where the **keyword wins over the DSN**. Passing the default
+    that way would overrule an operator who tuned a slow or distant link, and
+    doctor would report a reachable database as unreadable — the cry-wolf
+    failure this whole change is about, reintroduced by its own fix.
+    """
+    from psycopg2.extensions import parse_dsn
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({"SELECT node_id, properties FROM graph_nodes": []})
+    _postgres_host(monkeypatch, fake)
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://durable.example/kestrel?connect_timeout=30",
+    )
+
+    diagnose(tmp_path)
+
+    assert parse_dsn(fake.dsn)["connect_timeout"] == "30"
 
 
 def test_a_postgres_host_whose_anchor_names_no_agent_is_skipped_not_guessed(

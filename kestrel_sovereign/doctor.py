@@ -77,11 +77,18 @@ def diagnose(project_dir: Path) -> DoctorReport:
     env = read_env(env_path)
     config = read_toml(toml_path)
 
+    # Two different questions, two different readings, deliberately.
+    # ``env`` is the *file's* contents: "is KESTREL_DATA_KEY written down where
+    # setup would find it" is answered by the file, not by this shell.
+    # ``resolved`` is what the agents would actually boot with, and it is the
+    # only thing that can say which database holds their governance.
+    resolved = runtime_env(project_dir)
+
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
     _check_multi_agent(multi_agent_path, project_dir, report)
-    _check_constitution_drift(multi_agent_path, project_dir, report)
-    _check_anchor_consistency(multi_agent_path, project_dir, report)
+    _check_constitution_drift(multi_agent_path, project_dir, resolved, report)
+    _check_anchor_consistency(multi_agent_path, project_dir, resolved, report)
     _check_legacy_identity_exports(project_dir, report)
 
     return report
@@ -182,7 +189,39 @@ def _check_multi_agent(
             )
 
 
-def _anchor_is_the_runtime_database() -> bool:
+def runtime_env(project_dir: Path) -> dict:
+    """The environment the agents would boot with — without becoming it.
+
+    A diagnostic must not mutate the process it runs in, so this returns what
+    ``paths.load_project_env`` *would* have produced rather than calling it.
+    The precedence is that function's: an exported value stays authoritative
+    (it uses ``setdefault``), and the project ``.env`` fills the rest.
+
+    Reading ``os.environ`` alone was the bug this replaces. On a standard
+    install the PostgreSQL settings live only in the project ``.env`` — that is
+    what ``.env.example`` documents and what ``kestrel setup`` writes — and
+    neither ``cmd_doctor`` nor ``setup --check`` loads it. Doctor therefore saw
+    ``KESTREL_DB_BACKEND`` unset, concluded SQLite, and went on reporting the
+    birth record as current governance on exactly the hosts #2892 is about.
+
+    Parsed with ``dotenv_values`` — python-dotenv's own parser, the one
+    ``load_project_env`` uses — rather than ``setup.env_file.read_env``, so the
+    DSN doctor connects to is the identical byte string boot would resolve.
+    Which database a governance tool reads is not a place to accept a second
+    parser's opinion.
+    """
+    from dotenv import dotenv_values
+
+    resolved = {
+        key: value
+        for key, value in dotenv_values(str(project_dir / ".env")).items()
+        if value is not None
+    }
+    resolved.update(os.environ)
+    return resolved
+
+
+def _anchor_is_the_runtime_database(env: dict) -> bool:
     """Whether the local ``kestrel_prime.db`` is what the agents actually read.
 
     Same rule as ``agent_manager._initialize_agent`` and
@@ -191,9 +230,11 @@ def _anchor_is_the_runtime_database() -> bool:
     dependency profile — and copied *exactly*, with no ``.strip()`` and no
     refusal on an unknown backend, because being stricter than the runtime is
     the same bug with the databases exchanged.
+
+    ``env`` is :func:`runtime_env`'s resolution, not ``os.environ``.
     """
-    backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
-    return not (backend == "postgres" and os.environ.get("KESTREL_DATABASE_URL"))
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    return not (backend == "postgres" and env.get("KESTREL_DATABASE_URL"))
 
 
 @dataclass(frozen=True)
@@ -236,7 +277,7 @@ class _GovernanceSource:
         return str(self.anchor_path) if self.reads_the_anchor else "PostgreSQL"
 
 
-def _resolve_governance_source(anchor_path: Path):
+def _resolve_governance_source(anchor_path: Path, env: dict):
     """Resolve where to read this agent's governance from.
 
     Returns a :class:`_GovernanceSource`, or an ``_UnreadableDB`` sentinel when
@@ -244,7 +285,7 @@ def _resolve_governance_source(anchor_path: Path):
     the read to. Refusing there is right: an unscoped read of a shared database
     would answer about whichever agent came back first.
     """
-    if _anchor_is_the_runtime_database():
+    if _anchor_is_the_runtime_database(env):
         return _GovernanceSource(anchor_path=anchor_path)
 
     node = _read_agent_node(_GovernanceSource(anchor_path=anchor_path))
@@ -260,9 +301,43 @@ def _resolve_governance_source(anchor_path: Path):
     node_id, _ = node
     return _GovernanceSource(
         anchor_path=anchor_path,
-        dsn=os.environ["KESTREL_DATABASE_URL"],
+        dsn=env["KESTREL_DATABASE_URL"],
         agent_did=node_id,
     )
+
+
+#: Seconds doctor will wait for a PostgreSQL connection before calling the
+#: database unreadable. Doctor is the tool an operator reaches for *when the
+#: database is unavailable*, and a black-holed or firewalled endpoint does not
+#: refuse the connection — it drops the packets, and libpq's default is to wait
+#: out the OS TCP timeout, minutes of an apparently hung diagnostic. Failing
+#: fast turns that into the ``_UnreadableDB`` finding callers already report.
+_CONNECT_TIMEOUT_SECONDS = 5
+
+
+def _bounded_dsn(dsn: str) -> str:
+    """``dsn`` with a connection timeout, unless it already states one.
+
+    ``psycopg2.connect(dsn, connect_timeout=...)`` merges through
+    ``make_dsn``, where the **keyword wins** over the DSN. Passing the default
+    that way would silently overrule an operator who tuned a slow or distant
+    link, and doctor would then report a reachable database as unreadable —
+    the cry-wolf failure this whole change is about. So the default is applied
+    only where the DSN is silent.
+    """
+    try:
+        from psycopg2.extensions import make_dsn, parse_dsn
+
+        if "connect_timeout" in parse_dsn(dsn):
+            return dsn
+        return make_dsn(dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 — psycopg2.ProgrammingError on a bad DSN
+        # The import is inside the ``try`` on purpose. An unparseable DSN is
+        # the connection's own problem to report, with its own message, and a
+        # psycopg2 that cannot offer these helpers is not a reason for doctor
+        # to stop reading — either way the unbounded DSN is exactly the
+        # behaviour that preceded this bound, and ``connect`` still speaks.
+        return dsn
 
 
 def _fetch_rows(
@@ -293,7 +368,7 @@ def _fetch_rows(
     # A fresh connection per query: doctor makes a handful of reads per agent,
     # is not a hot path, and a connection that closes with its query cannot
     # outlive a diagnostic that fails halfway.
-    connection = psycopg2.connect(source.dsn)
+    connection = psycopg2.connect(_bounded_dsn(source.dsn))
     try:
         with connection.cursor() as cursor:
             cursor.execute(postgres_sql, postgres_params)
@@ -303,7 +378,7 @@ def _fetch_rows(
 
 
 def _check_constitution_drift(
-    multi_agent_path: Path, project_dir: Path, report: DoctorReport
+    multi_agent_path: Path, project_dir: Path, env: dict, report: DoctorReport
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
@@ -357,7 +432,7 @@ def _check_constitution_drift(
             # Already reported by _check_multi_agent; don't duplicate.
             continue
 
-        source = _resolve_governance_source(db_path)
+        source = _resolve_governance_source(db_path, env)
         if isinstance(source, _UnreadableDB):
             report.warn.append(
                 f"{name}: constitution drift check skipped — {source.reason}"
@@ -444,7 +519,7 @@ _OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
 
 
 def _check_anchor_consistency(
-    multi_agent_path: Path, project_dir: Path, report: DoctorReport
+    multi_agent_path: Path, project_dir: Path, env: dict, report: DoctorReport
 ) -> None:
     """Pre-upgrade anchor-drift checks beyond base-hash drift (#2616).
 
@@ -477,7 +552,7 @@ def _check_anchor_consistency(
             # Already a fail in _check_multi_agent; don't duplicate.
             continue
 
-        source = _resolve_governance_source(db_path)
+        source = _resolve_governance_source(db_path, env)
         if isinstance(source, _UnreadableDB):
             # Already warned by _check_constitution_drift.
             continue

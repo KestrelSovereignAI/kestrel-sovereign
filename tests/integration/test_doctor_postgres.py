@@ -277,3 +277,43 @@ def test_doctor_does_not_answer_about_a_neighbouring_agent(
         "doctor answered about a neighbouring agent"
     )
     assert any("constitution anchored to current file" in m for m in report.ok)
+
+
+def test_the_project_env_alone_is_enough_to_reach_postgres(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """The configuration an operator actually has, against a real database.
+
+    Every other test here *exports* the two settings, which is not how a
+    Kestrel host is set up: ``.env.example`` documents them in the project
+    ``.env`` and ``kestrel setup`` writes them there. Neither ``cmd_doctor``
+    nor ``setup --check`` loads that file, so a doctor reading ``os.environ``
+    alone silently fell back to the anchor on every real PostgreSQL host —
+    passing this file's entire suite while fixing nothing.
+
+    So this one deletes the exports and puts the settings only where they
+    really live.
+    """
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID, {"name": "Test", "constitution_hash": stale}, governed_by=stale
+    )
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    write_env(
+        tmp_path / ".env",
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": runtime_db.dsn,
+        },
+    )
+
+    report = diagnose(tmp_path)
+
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert "KESTREL_DB_BACKEND" not in os.environ, (
+        "a diagnostic must not export the project's environment"
+    )
