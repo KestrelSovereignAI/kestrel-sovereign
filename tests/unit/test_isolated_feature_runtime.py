@@ -4,6 +4,7 @@ import asyncio
 import gc
 import json
 import os
+import subprocess
 import sys
 import threading
 import types
@@ -49,6 +50,18 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
 _TELEGRAM_ATTEMPT_TOKEN = "t" * 43
+
+
+def _child_distribution_probe(version: str):
+    """Build the classified child-distribution result used by venv tests."""
+
+    if version == "missing":
+        return isolated_runtime._FeatureDistributionProbe.missing()
+    if version == "probe-failed":
+        return isolated_runtime._FeatureDistributionProbe.failed()
+    if version == "unknown":
+        return isolated_runtime._FeatureDistributionProbe.present_unversioned()
+    return isolated_runtime._FeatureDistributionProbe.versioned(version)
 
 
 class FakeIsolatedClient:
@@ -1063,7 +1076,7 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
         ir, "_feature_distribution_version", lambda _distribution, _target: "1.0.0"
     )
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "1.0.0"
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("1.0.0")
     )
 
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
@@ -1075,6 +1088,7 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert manifest["provisioned_against_host_sdk"] == "0.28.0"
     assert manifest["child_sdk_version"] == "0.28.0"
     assert manifest["feature_distribution_version"] == "1.0.0"
+    assert manifest["child_feature_distribution_state"] == "versioned"
     assert manifest["child_feature_distribution_version"] == "1.0.0"
 
     runs.clear()
@@ -1143,8 +1157,8 @@ def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, 
     )
     monkeypatch.setattr(
         ir,
-        "_venv_feature_distribution_version",
-        lambda _path, _distribution: version["value"],
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(version["value"]),
     )
 
     feature.ensure_venv()
@@ -1162,7 +1176,7 @@ def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, 
     assert runs == [], "the new Telegram release stamp must converge after one upgrade"
 
 
-@pytest.mark.parametrize("current_child_version", ("0.1.1", "unknown"))
+@pytest.mark.parametrize("current_child_version", ("0.1.1", "missing"))
 def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifest(
     tmp_path, monkeypatch, current_child_version
 ):
@@ -1192,7 +1206,7 @@ def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifes
         "0.35.1",
         "0.35.1",
         "0.1.2",
-        "0.1.2",
+        _child_distribution_probe("0.1.2"),
     )
     child_version = {"value": current_child_version}
     runs = []
@@ -1208,8 +1222,8 @@ def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifes
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.1.2")
     monkeypatch.setattr(
         ir,
-        "_venv_feature_distribution_version",
-        lambda _path, _distribution: child_version["value"],
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(child_version["value"]),
     )
 
     feature.ensure_venv()
@@ -1292,8 +1306,8 @@ def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatc
     monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
     monkeypatch.setattr(
         ir,
-        "_venv_feature_distribution_version",
-        lambda _path, _distribution: child_version["value"],
+        "_venv_feature_distribution_probe",
+        lambda _path, _distribution: _child_distribution_probe(child_version["value"]),
     )
 
     feature.ensure_venv()
@@ -1347,7 +1361,7 @@ def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatc
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "1.2.0")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _p, _d: "1.2.0"
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("1.2.0")
     )
 
     feature.ensure_venv()
@@ -1356,11 +1370,20 @@ def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatc
     assert not (override_venv / ".kestrel_provision.json").exists()
 
 
-@pytest.mark.parametrize("child_version", ("1.1.9", "unknown"), ids=("stale", "missing"))
-def test_prebuilt_override_refuses_stale_or_missing_feature_distribution(
-    tmp_path, monkeypatch, child_version
+@pytest.mark.parametrize(
+    ("desired_version", "child_version"),
+    (
+        ("1.2.0", "1.1.9"),
+        ("1.2.0", "missing"),
+        ("unknown", "missing"),
+        ("unknown", "probe-failed"),
+    ),
+    ids=("stale", "missing", "unknown-desired-missing", "probe-failed"),
+)
+def test_prebuilt_override_refuses_stale_missing_or_unverifiable_distribution(
+    tmp_path, monkeypatch, desired_version, child_version
 ):
-    """An immutable override still proves it can run the desired feature."""
+    """An immutable override must prove that its child distribution is usable."""
 
     import kestrel_sovereign.features.isolated_runtime as ir
 
@@ -1387,9 +1410,11 @@ def test_prebuilt_override_refuses_stale_or_missing_feature_distribution(
     monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
-    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "1.2.0")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _p, _d: child_version
+        ir, "_feature_distribution_version", lambda _d, _t: desired_version
+    )
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe(child_version)
     )
 
     with pytest.raises(RuntimeError, match="refusing to run an unverifiable override venv"):
@@ -1433,7 +1458,7 @@ def test_prebuilt_editable_override_probes_source_release_without_mutation(tmp_p
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _p, _d: "1.2.0"
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("1.2.0")
     )
 
     feature.ensure_venv()
@@ -1442,8 +1467,10 @@ def test_prebuilt_editable_override_probes_source_release_without_mutation(tmp_p
     assert not (override_venv / ".kestrel_provision.json").exists()
 
 
-def test_prebuilt_override_both_unknown_versions_are_stably_accepted(tmp_path, monkeypatch):
-    """Unobservable source metadata is supported without ownership mutation."""
+def test_prebuilt_override_accepts_positively_present_versionless_child_for_unknown_desired(
+    tmp_path, monkeypatch
+):
+    """A genuine editable/versionless child is usable when desired is unknown."""
 
     import kestrel_sovereign.features.isolated_runtime as ir
 
@@ -1472,7 +1499,7 @@ def test_prebuilt_override_both_unknown_versions_are_stably_accepted(tmp_path, m
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _p, _d: "unknown"
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("unknown")
     )
 
     feature.ensure_venv()
@@ -1511,7 +1538,7 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _p, _d: "unknown"
+        ir, "_venv_feature_distribution_probe", lambda _p, _d: _child_distribution_probe("unknown")
     )
 
     # First startup: override path missing → bootstrap (create + install + stamp).
@@ -1565,7 +1592,7 @@ def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.2.0")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "0.1.9"
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("0.1.9")
     )
 
     with pytest.raises(RuntimeError, match="refusing to stamp the venv fresh"):
@@ -1579,9 +1606,59 @@ def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
 def test_venv_feature_distribution_probe_executes_in_target_interpreter():
     """The generated ``python -c`` probe contains executable newlines."""
 
-    assert isolated_runtime._venv_feature_distribution_version(
+    assert isolated_runtime._venv_feature_distribution_probe(
         Path(sys.executable), "pytest"
-    ) == importlib_metadata.version("pytest")
+    ) == isolated_runtime._FeatureDistributionProbe.versioned(
+        importlib_metadata.version("pytest")
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    (
+        ('{"state": "missing"}', isolated_runtime._FeatureDistributionProbe.missing()),
+        (
+            '{"state": "present-unversioned"}',
+            isolated_runtime._FeatureDistributionProbe.present_unversioned(),
+        ),
+        (
+            '{"state": "versioned", "version": "1.2.3"}',
+            isolated_runtime._FeatureDistributionProbe.versioned("1.2.3"),
+        ),
+    ),
+)
+def test_venv_feature_distribution_probe_preserves_distinct_positive_states(
+    monkeypatch, tmp_path, stdout, expected
+):
+    """The child probe never reduces missing and versionless to ``unknown``."""
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=stdout)
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", fake_run)
+    assert (
+        isolated_runtime._venv_feature_distribution_probe(
+            tmp_path / "venv" / "bin" / "python", "example-pkg"
+        )
+        == expected
+    )
+
+
+def test_venv_feature_distribution_probe_marks_execution_failure_unverifiable(
+    monkeypatch, tmp_path
+):
+    """A failed child interpreter probe is not evidence of an editable install."""
+
+    def fail_run(*_args, **_kwargs):
+        raise OSError("child unavailable")
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", fail_run)
+    assert (
+        isolated_runtime._venv_feature_distribution_probe(
+            tmp_path / "venv" / "bin" / "python", "example-pkg"
+        )
+        == isolated_runtime._FeatureDistributionProbe.failed()
+    )
 
 
 def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
@@ -1618,13 +1695,14 @@ def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
     monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
     monkeypatch.setattr(
-        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "unknown"
+        ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("unknown")
     )
 
     feature.ensure_venv()
     manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
     assert manifest["feature_distribution_version"] == "unknown"
-    assert manifest["child_feature_distribution_version"] == "unknown"
+    assert manifest["child_feature_distribution_state"] == "present-unversioned"
+    assert manifest["child_feature_distribution_version"] is None
     runs.clear()
 
     feature.ensure_venv()
@@ -1730,6 +1808,43 @@ def test_build_client_preserves_explicit_empty_config(tmp_path):
     feature._build_client()
 
     assert captured["config"] == {}
+
+
+def test_build_client_injects_telegram_acknowledged_ingress_capability(tmp_path):
+    """The Telegram child receives Core's non-persisted protocol contract."""
+
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="Kestrel_Channel_Telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    feature = ProxyFeature(Mock(features={}), runtime, client_factory=client_factory)
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = tmp_path / "test-service"
+    feature._host_config = {
+        "enabled": True,
+        "_kestrel_host_runtime_capabilities": ["untrusted-user-value"],
+    }
+
+    feature._build_client()
+
+    assert captured["config"] == {
+        "enabled": True,
+        "_kestrel_host_runtime_capabilities": [
+            "channel-inbound-acknowledgement-v1"
+        ],
+    }
+    assert feature._host_config["_kestrel_host_runtime_capabilities"] == [
+        "untrusted-user-value"
+    ]
 
 
 class _FakeStorage:
@@ -3992,7 +4107,7 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until_promotion(
+async def test_live_apply_blocks_tools_and_channel_but_retains_legacy_inbound_until_promotion(
     monkeypatch, tmp_path
 ):
     """No host-visible effect may observe an applied candidate before its CAS.
@@ -4000,9 +4115,9 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
     The client intentionally mutates its local mode before reporting ``applied``.
     Promotion is then held at the durable write boundary while a direct tool,
     the generic channel adapter, and an SDK inbound callback all try to enter.
-    Tool/channel calls wait for the finite transition. An SDK callback is
-    instead dropped immediately: it originated from the old child, and replay
-    after promotion could apply stale inbound traffic under the new config.
+    Tool/channel calls wait for the finite transition. The legacy SDK callback
+    has no producer cursor or NACK, so it remains in Core's bounded serial
+    queue and is delivered only after the promoted configuration is durable.
     """
 
     from kestrel_sdk.channels import ChannelMessage, MessageDirection
@@ -4092,7 +4207,12 @@ async def test_live_apply_blocks_tools_and_channel_but_drops_stale_inbound_until
         assert (await channel_send).status.value == "success"
         await inbound_callback
         assert client.effects == [("ping", "next"), ("whatsapp_send", "next")]
-        assert channel_feature.inbound == []
+        for _ in range(20):
+            if channel_feature.inbound:
+                break
+            await asyncio.sleep(0)
+        assert len(channel_feature.inbound) == 1
+        assert channel_feature.inbound[0].content == "hello"
     finally:
         release_promotion.set()
         if update is not None and not update.done():
@@ -6803,10 +6923,60 @@ async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(m
         assert len(delivered) == 1
         assert len(feature._event_ingress_tasks) == 0
         assert len(feature._event_ack_tasks) == 1
+        assert feature._non_cursor_event_ingress_queues == []
         assert len(client.acknowledgements) == 1
         release_ack.set()
     finally:
         release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_inbound_events_queue_in_order_across_a_closed_gate(
+    monkeypatch, tmp_path
+):
+    """A non-cursor source retains its first and second blocked callbacks."""
+
+    delivered = []
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+
+    async def record(message):
+        delivered.append(message["id"])
+        return SimpleNamespace(durably_admitted=True)
+
+    def legacy_event(message_id):
+        return {
+            "type": "channel.inbound",
+            "payload": {"id": message_id, "content": message_id},
+        }
+
+    try:
+        await feature.initialize()
+        client = feature._client
+        feature._route_inbound = record  # type: ignore[method-assign]
+        await feature._close_traffic_gate()
+
+        # Let the first queue worker enter the closed gate before the second
+        # callback arrives. Both handlers must return without turning either
+        # notification into an unbounded detached route task.
+        await client.event_handler(legacy_event("first"))
+        await asyncio.sleep(0)
+        await client.event_handler(legacy_event("second"))
+        assert delivered == []
+        assert len(feature._event_ingress_tasks) == 1
+        assert len(feature._non_cursor_event_ingress_queues) == 1
+
+        await feature._reopen_traffic_gate()
+        for _ in range(20):
+            if delivered == ["first", "second"]:
+                break
+            await asyncio.sleep(0)
+        assert delivered == ["first", "second"]
+    finally:
         await feature.shutdown()
 
 

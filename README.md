@@ -300,6 +300,15 @@ declarations and lockfile resolve the same SDK line. It cannot validate another
 repository's working tree, so the downstream release verification remains an
 explicit release gate owned by those repositories.
 
+#### Telegram acknowledged-ingress release order
+
+Core 0.51.1 adds the host-authenticated initialize capability
+`channel-inbound-acknowledgement-v1` for the Telegram polling bridge. Telegram
+0.1.3 requires that capability before it will start polling, preventing an old
+Core from mis-parsing its durable ACK envelope and leaving a child poller
+blocked. Publish Core 0.51.1 first, then publish Telegram 0.1.3; do not relax
+the Telegram requirement to make the reverse order installable.
+
 Windows base installs also include `tzdata`, so default `UTC` and named-IANA
 scheduler time zones work without optional Pandas or Phoenix extras.
 

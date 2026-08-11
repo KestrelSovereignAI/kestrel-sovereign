@@ -112,6 +112,18 @@ _EVENT_INGRESS_ACK_ATTEMPTS = 3
 _EVENT_INGRESS_ACK_TIMEOUT = 3.0
 _EVENT_INGRESS_ACK_CANCELLATION_GRACE = 1.0
 _EVENT_INGRESS_ACK_BACKOFF = 0.1
+# This is an initialize-handshake capability, not persisted feature config.
+# SDK 0.35.1 forwards the host-controlled config object but has no reverse
+# capability field on its subprocess wrapper yet.  Keeping this identifier in
+# one Core-owned place gives services an explicit opt-in contract without
+# guessing Core versions from an arbitrary client name.
+_HOST_RUNTIME_CAPABILITIES_FIELD = "_kestrel_host_runtime_capabilities"
+_ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY = "channel-inbound-acknowledgement-v1"
+# A non-cursor producer has no child-side durable cursor to retain a callback
+# while Core's gate is closed.  Keep one item in the queue while its serial
+# worker owns one other item; the SDK notification reader naturally applies
+# backpressure to the producer before a third item can allocate host memory.
+_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
 _event_source_client: ContextVar[Any | None] = ContextVar(
     "isolated_event_source_client", default=None
 )
@@ -1247,6 +1259,17 @@ class _HostIngressOutcomeSlot:
 
 
 @dataclass
+class _NonCursorIngressQueue:
+    """One bounded, serial legacy ingress queue owned by an exact child."""
+
+    client: Any
+    events: asyncio.Queue[Any]
+    worker: asyncio.Task[None] | None = None
+    accepting: bool = True
+    retired: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class _TrackedFacadeLifecycleTask:
     """Non-detached ownership for a cancellation-hostile facade operation."""
 
@@ -1870,8 +1893,44 @@ _CHILD_SDK_PROBE = (
 )
 
 
-def _venv_feature_distribution_version(python_path: Path, distribution: str) -> str:
-    """Return this runtime distribution's version from the isolated child.
+@dataclass(frozen=True)
+class _FeatureDistributionProbe:
+    """One classified distribution probe from an isolated interpreter.
+
+    ``importlib.metadata.version`` alone conflates a missing distribution, a
+    broken probe, and a positively identified editable/versionless
+    distribution.  Prebuilt venvs are immutable, so those states must remain
+    distinguishable when deciding whether they are safe to run.
+    """
+
+    state: str
+    version: str | None = None
+
+    @classmethod
+    def versioned(cls, version: str) -> "_FeatureDistributionProbe":
+        return cls("versioned", version)
+
+    @classmethod
+    def present_unversioned(cls) -> "_FeatureDistributionProbe":
+        return cls("present-unversioned")
+
+    @classmethod
+    def missing(cls) -> "_FeatureDistributionProbe":
+        return cls("missing")
+
+    @classmethod
+    def failed(cls) -> "_FeatureDistributionProbe":
+        return cls("probe-failed")
+
+    @property
+    def is_present(self) -> bool:
+        return self.state in {"versioned", "present-unversioned"}
+
+
+def _venv_feature_distribution_probe(
+    python_path: Path, distribution: str
+) -> _FeatureDistributionProbe:
+    """Classify this runtime distribution inside the isolated child.
 
     A host-visible release is only an installation intent.  The resolver can
     still select an older index package (notably when the host runs an editable
@@ -1879,16 +1938,28 @@ def _venv_feature_distribution_version(python_path: Path, distribution: str) -> 
     actually landed before declaring the venv fresh.
     """
     if type(distribution) is not str or not distribution:
-        return "unknown"
+        return _FeatureDistributionProbe.failed()
     bin_dir = python_path.parent
     venv_path = bin_dir.parent if bin_dir.name in {"bin", "Scripts"} else None
     probe = (
         "from importlib import metadata as m\n"
         f"distribution = {json.dumps(distribution)}\n"
         "try:\n"
-        "    print(m.version(distribution))\n"
+        "    installed = m.distribution(distribution)\n"
         "except m.PackageNotFoundError:\n"
-        "    print('unknown')\n"
+        "    print('{\"state\": \"missing\"}')\n"
+        "except Exception:\n"
+        "    print('{\"state\": \"probe-failed\"}')\n"
+        "else:\n"
+        "    try:\n"
+        "        version = installed.version\n"
+        "    except Exception:\n"
+        "        version = None\n"
+        "    if isinstance(version, str) and version:\n"
+        "        import json\n"
+        "        print(json.dumps({\"state\": \"versioned\", \"version\": version}))\n"
+        "    else:\n"
+        "        print('{\"state\": \"present-unversioned\"}')\n"
     )
     try:
         result = subprocess.run(
@@ -1898,9 +1969,21 @@ def _venv_feature_distribution_version(python_path: Path, distribution: str) -> 
             text=True,
             env=_isolated_child_env(venv_path),
         )
-        return result.stdout.strip() or "unknown"
+        decoded = json.loads(result.stdout)
+        if type(decoded) is not dict:
+            return _FeatureDistributionProbe.failed()
+        state = decoded.get("state")
+        if state == "versioned" and type(decoded.get("version")) is str and decoded["version"]:
+            return _FeatureDistributionProbe.versioned(decoded["version"])
+        if state == "present-unversioned":
+            return _FeatureDistributionProbe.present_unversioned()
+        if state == "missing":
+            return _FeatureDistributionProbe.missing()
+        if state == "probe-failed":
+            return _FeatureDistributionProbe.failed()
+        return _FeatureDistributionProbe.failed()
     except Exception:  # noqa: BLE001 - the caller applies the safe stale policy
-        return "unknown"
+        return _FeatureDistributionProbe.failed()
 
 
 def _venv_sdk_version(python_path: Path) -> str:
@@ -2177,10 +2260,17 @@ class ProxyFeature(Feature):
         self._event_ack_tasks: set[asyncio.Task[None]] = set()
         self._event_ack_clients: list[tuple[Any, asyncio.Task[None]]] = []
         # Full inbound routing can run cognition. Keep it outside the SDK's
-        # serial notification reader and own at most one current callback per
-        # isolated client, matching cursor-owning polling semantics.
+        # serial notification reader. Cursor-owning providers retain their own
+        # next callback; legacy providers use the separate bounded serial queue
+        # below because they have no cursor/NACK contract to prevent loss.
         self._event_ingress_tasks: set[asyncio.Task[None]] = set()
         self._event_ingress_clients: list[tuple[Any, asyncio.Task[None]]] = []
+        self._non_cursor_event_ingress_queues: list[_NonCursorIngressQueue] = []
+        # Serial SDK readers normally invoke event handlers one at a time, but
+        # the queue handoff must stay correct for a concurrent/custom facade as
+        # well.  It closes the only race between a worker deciding it is idle
+        # and the next notification reserving that worker's bounded queue.
+        self._non_cursor_event_ingress_lock = asyncio.Lock()
         self._deferred_acknowledged_event_tasks: set[asyncio.Task[None]] = set()
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
@@ -6031,7 +6121,7 @@ class ProxyFeature(Feature):
         host_sdk: str,
         child_sdk: str,
         feature_distribution_version: str,
-        child_feature_distribution_version: str,
+        child_feature_distribution: _FeatureDistributionProbe,
     ) -> None:
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6056,8 +6146,11 @@ class ProxyFeature(Feature):
                     # whenever that release is known; retaining it makes the
                     # successful verification auditable and invalidates old
                     # manifests that predate this check once.
+                    "child_feature_distribution_state": (
+                        child_feature_distribution.state
+                    ),
                     "child_feature_distribution_version": (
-                        child_feature_distribution_version
+                        child_feature_distribution.version
                     ),
                 },
                 indent=2,
@@ -6088,25 +6181,27 @@ class ProxyFeature(Feature):
             return True
         if installed_version != "unknown" and stamped_version != installed_version:
             return True
+        stamped_child_state = manifest.get("child_feature_distribution_state")
         stamped_child_version = manifest.get("child_feature_distribution_version")
-        if not isinstance(stamped_child_version, str):
+        if stamped_child_state not in {"versioned", "present-unversioned"}:
             return True
         # A fresh manifest proves only what was installed previously. Every
         # unchanged-environment check must probe the child interpreter again:
         # an index repair, manual downgrade, or stale editable metadata can
         # otherwise leave the host running an older service indefinitely.
-        child_version = _venv_feature_distribution_version(
+        child = _venv_feature_distribution_probe(
             _venv_python(self._venv_path), self.runtime.distribution
         )
-        # Known desired or recorded versions require a verifiable installed
-        # child. Fully source/unknown targets remain supported: they stamp and
-        # probe as ``unknown`` without a permanent reinstall loop.
-        if installed_version != "unknown" or stamped_child_version != "unknown":
-            if child_version == "unknown":
-                return True
-        if installed_version != "unknown" and child_version != installed_version:
+        if not child.is_present:
             return True
-        if stamped_child_version != "unknown" and child_version != stamped_child_version:
+        if installed_version != "unknown" and (
+            child.state != "versioned" or child.version != installed_version
+        ):
+            return True
+        if (
+            stamped_child_state == "versioned"
+            and child.version != stamped_child_version
+        ):
             return True
         return False
 
@@ -6117,20 +6212,33 @@ class ProxyFeature(Feature):
 
         An operator-owned venv must never be installed into or stamped by the
         host, but SDK compatibility alone does not prove that its feature
-        distribution is present or current.  A fully unobservable source
-        target remains intentionally stable: desired and child ``unknown`` is
-        accepted without a mutation, matching the host-owned unknown-version
-        contract while avoiding a permanent reinstall loop.
+        distribution is present or current. A positively identified but
+        versionless/editable child is accepted only when the desired release is
+        genuinely unknown; missing and failed probes are never treated as that
+        evidence.
         """
 
         desired = _feature_distribution_version(
             self.runtime.distribution, install_target
         )
-        child = _venv_feature_distribution_version(
+        child = _venv_feature_distribution_probe(
             python_path, self.runtime.distribution
         )
-        if desired != "unknown" and child != desired:
-            observed = "missing" if child == "unknown" else repr(child)
+        if not child.is_present:
+            observed = "missing" if child.state == "missing" else "unverifiable"
+            raise RuntimeError(
+                f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
+                f"version {observed}, but host requires {desired!r}; refusing to run "
+                "an unverifiable override venv"
+            )
+        if desired != "unknown" and (
+            child.state != "versioned" or child.version != desired
+        ):
+            observed = (
+                "versionless/editable"
+                if child.state == "present-unversioned"
+                else repr(child.version)
+            )
             raise RuntimeError(
                 f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
                 f"version {observed}, but host requires {desired!r}; refusing to run "
@@ -6203,18 +6311,28 @@ class ProxyFeature(Feature):
         desired_feature_version = _feature_distribution_version(
             self.runtime.distribution, install_target
         )
-        child_feature_version = _venv_feature_distribution_version(
+        child_feature_distribution = _venv_feature_distribution_probe(
             python_path, self.runtime.distribution
         )
         if (
             desired_feature_version != "unknown"
-            and child_feature_version != desired_feature_version
+            and (
+                child_feature_distribution.state != "versioned"
+                or child_feature_distribution.version != desired_feature_version
+            )
         ):
             raise RuntimeError(
                 f"Isolated feature {self.name} installed "
-                f"{self.runtime.distribution!r} version {child_feature_version!r}, "
+                f"{self.runtime.distribution!r} version "
+                f"{child_feature_distribution.version!r}, "
                 f"but host requires {desired_feature_version!r}; refusing to "
                 "stamp the venv fresh"
+            )
+        if not child_feature_distribution.is_present:
+            raise RuntimeError(
+                f"Isolated feature {self.name} installed "
+                f"{self.runtime.distribution!r} but its child distribution probe "
+                "was not positively present; refusing to stamp the venv fresh"
             )
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
         self._write_provision_manifest(
@@ -6222,7 +6340,7 @@ class ProxyFeature(Feature):
             host_sdk,
             child_sdk,
             desired_feature_version,
-            child_feature_version,
+            child_feature_distribution,
         )
 
     def _warn_on_sdk_mismatch(
@@ -6252,6 +6370,21 @@ class ProxyFeature(Feature):
             factory = SubprocessIsolatedFeatureClient
 
         child_config = self._host_config if config is None else config
+        # SDK 0.35.1's subprocess wrapper does not yet expose a reverse
+        # host-capability field in ``clientInfo``.  Its initialize ``config``
+        # envelope is nevertheless host-authenticated stdio input. Telegram
+        # 0.1.3 needs the acknowledged ingress protocol, so inject its reserved
+        # non-persisted marker here and let that service strip it before normal
+        # configuration. The copy also means stored user config can never forge
+        # or suppress Core's contract.
+        child_config = dict(child_config) if isinstance(child_config, dict) else {}
+        runtime_distribution = re.sub(
+            r"[-_.]+", "-", self.runtime.distribution.strip().lower()
+        )
+        if runtime_distribution == "kestrel-channel-telegram":
+            child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = [
+                _ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY
+            ]
 
         kwargs = {
             "feature_name": self.name,
@@ -6687,10 +6820,11 @@ class ProxyFeature(Feature):
         # before its config becomes durable. Events are normally *dropped*
         # rather than queued during a finite close: they originated from the
         # old child and replaying them after promotion could apply stale input
-        # under a new configuration. The one exception below is an
-        # acknowledged event from the already-published replacement child;
-        # its producer has retained the source cursor and Core can safely hold
-        # that exact event until reopening. Terminal drops remain silent
+        # under a new configuration. The exceptions below are an acknowledged
+        # event from the already-published replacement child, whose producer
+        # has retained the source cursor, and a legacy/non-cursor event, which
+        # Core holds in a bounded serial queue because dropping it is permanent
+        # loss. Terminal drops remain silent
         # because an SDK callback has no caller to handle a deliberate shutdown
         # result.
         source_client = self._client if source_client is None else source_client
@@ -6701,7 +6835,7 @@ class ProxyFeature(Feature):
         # that could reach cognition; otherwise cognition calling channels_send
         # can deadlock the reader against its own response stream.
         if self._is_inbound_event(event):
-            self._schedule_event_ingress_routing(event, source_client)
+            await self._schedule_event_ingress_routing(event, source_client)
             return
         try:
             async with self._traffic_gate.admit(wait_for_open=False):
@@ -6734,8 +6868,24 @@ class ProxyFeature(Feature):
             event_name = kind
         return event_name in {"channel.inbound", "inbound", "message.inbound"}
 
-    def _schedule_event_ingress_routing(self, event: Any, source_client: Any) -> None:
-        """Detach one bounded inbound route from the SDK notification reader."""
+    @staticmethod
+    def _inbound_event_data(event: Any) -> Any:
+        """Extract an inbound event payload from either supported wire shape."""
+
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        return _meta_get(payload, "data", payload) if kind == "feature/event" else payload
+
+    async def _schedule_event_ingress_routing(
+        self, event: Any, source_client: Any
+    ) -> None:
+        """Route one inbound callback with its negotiated retention protocol.
+
+        This method deliberately classifies the acknowledgement protocol before
+        applying the cursor-source guard. A legacy notification has no cursor
+        or NACK to retain it at the child, so dropping a concurrent one is
+        permanent loss; it must enter the bounded serial queue instead.
+        """
 
         if self._terminal_lifecycle_latched or source_client is not self._client:
             return
@@ -6750,6 +6900,12 @@ class ProxyFeature(Feature):
                 "Ignoring malformed inbound ingress from isolated feature %s",
                 self.name,
             )
+            return
+        data = self._inbound_event_data(detached_event)
+        _inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
+        retry = self._inbound_event_retry_completion(data)
+        if acknowledgement is None and retry is None:
+            await self._enqueue_non_cursor_inbound_event(detached_event, source_client)
             return
         if any(
             client is source_client and not task.done()
@@ -6857,6 +7013,134 @@ class ProxyFeature(Feature):
                 return
 
         task.add_done_callback(consume_route)
+
+    async def _enqueue_non_cursor_inbound_event(
+        self, detached_event: Any, source_client: Any
+    ) -> None:
+        """Queue a legacy inbound notification with bounded reader backpressure."""
+
+        while True:
+            if self._terminal_lifecycle_latched or source_client is not self._client:
+                return
+            async with self._non_cursor_event_ingress_lock:
+                queue_entry = next(
+                    (
+                        entry
+                        for entry in self._non_cursor_event_ingress_queues
+                        if entry.client is source_client
+                        and entry.accepting
+                        and entry.worker is not None
+                        and not entry.worker.done()
+                    ),
+                    None,
+                )
+                if queue_entry is None:
+                    queue_entry = _NonCursorIngressQueue(
+                        client=source_client,
+                        events=asyncio.Queue(
+                            maxsize=_MAX_PENDING_NON_CURSOR_INGRESS_EVENTS
+                        ),
+                    )
+                    task = asyncio.create_task(
+                        self._route_non_cursor_inbound_events(queue_entry),
+                        name=f"isolated-non-cursor-ingress-route:{self.name}",
+                    )
+                    queue_entry.worker = task
+                    self._non_cursor_event_ingress_queues.append(queue_entry)
+                    self._event_ingress_tasks.add(task)
+
+                    def consume(
+                        completed: asyncio.Task[None],
+                        *,
+                        entry: _NonCursorIngressQueue = queue_entry,
+                    ) -> None:
+                        self._event_ingress_tasks.discard(completed)
+                        self._non_cursor_event_ingress_queues = [
+                            candidate
+                            for candidate in self._non_cursor_event_ingress_queues
+                            if candidate.worker is not completed
+                        ]
+                        entry.retired.set()
+                        if completed.cancelled():
+                            return
+                        try:
+                            completed.result()
+                        except BaseException:  # noqa: BLE001 - worker logs its route errors
+                            return
+
+                    task.add_done_callback(consume)
+
+                try:
+                    queue_entry.events.put_nowait(detached_event)
+                    return
+                except asyncio.QueueFull:
+                    # A worker owns one current callback and this queue holds
+                    # one later callback. Wait outside the lock so the worker
+                    # can drain it; no third item allocates host memory.
+                    pass
+
+            join = asyncio.create_task(queue_entry.events.join())
+            retired = asyncio.create_task(queue_entry.retired.wait())
+            done, pending = await asyncio.wait(
+                (join, retired), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+
+    async def _route_non_cursor_inbound_events(
+        self, queue_entry: _NonCursorIngressQueue
+    ) -> None:
+        """Deliver legacy notifications in source order across finite gate closes."""
+
+        while True:
+            detached_event = await queue_entry.events.get()
+            retire_worker = False
+            try:
+                inbound, acknowledgement = self._split_inbound_event_acknowledgement(
+                    self._inbound_event_data(detached_event)
+                )
+                retry = self._inbound_event_retry_completion(
+                    self._inbound_event_data(detached_event)
+                )
+                # The envelope was classified before enqueue. If a bridge
+                # changed while it waited, do not accidentally turn this old
+                # source into a cursor protocol; source ownership below still
+                # prevents it from reaching a replacement child.
+                if acknowledgement is not None or retry is not None:
+                    logger.warning(
+                        "Dropping ingress whose completion protocol changed while queued "
+                        "for isolated feature %s",
+                        self.name,
+                    )
+                else:
+                    async with self._traffic_gate.admit(wait_for_open=True):
+                        if queue_entry.client is not self._client:
+                            retire_worker = True
+                        else:
+                            await self._route_inbound(inbound)
+            except _TrafficGateTerminalError:
+                retire_worker = True
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - legacy provider has no retry path
+                logger.warning(
+                    "Detached legacy inbound ingress from isolated feature %s failed",
+                    self.name,
+                )
+            finally:
+                queue_entry.events.task_done()
+            async with self._non_cursor_event_ingress_lock:
+                if retire_worker or queue_entry.events.empty():
+                    # Enqueue checks this flag under the same lock. It either
+                    # publishes the next item before this point, or starts a
+                    # new worker after this one retires; no notification can
+                    # be placed onto an about-to-exit worker and disappear.
+                    queue_entry.accepting = False
+                    queue_entry.retired.set()
+                    return
 
     async def _handle_event_admitted_from_source(
         self, event: Any, source_client: Any
