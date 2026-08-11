@@ -333,13 +333,23 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     agent = get_agent(request)
     loaded = _get_loaded_features_or_404(agent, name)
 
+    to_activate = tuple(
+        feature
+        for _class_name, feature in loaded
+        if not bool(getattr(feature, "enabled", True))
+    )
+    prepared = agent._prepare_feature_contribution_transition(to_activate)
+    prepared_by_feature = {id(item.feature): item for item in prepared}
     activated: List[tuple[str, Any]] = []
     try:
         for class_name, feature in loaded:
             if bool(getattr(feature, "enabled", True)):
                 # Already enabled — nothing to re-activate.
                 continue
-            await agent._activate_feature_runtime(feature)
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared_by_feature[id(feature)],
+            )
             activated.append((class_name, feature))
     except Exception:
         # Group transaction: roll the already-activated members back to the

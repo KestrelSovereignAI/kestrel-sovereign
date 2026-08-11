@@ -19,6 +19,14 @@ from fastapi.staticfiles import StaticFiles
 
 from kestrel_sdk.features.host_base import HostFeature
 
+from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionRuntime,
+    FeatureContributionRuntimeError,
+)
+from kestrel_sovereign.operator import OperatorRuntimeRegistry
+from kestrel_sovereign.signals import SourceRegistry
+from kestrel_sovereign.waits import WaitRegistry
+
 from .ui import compute_host_ui_manifest, host_feature_static_mounts
 
 logger = logging.getLogger(__name__)
@@ -139,22 +147,131 @@ def unmount_host_features(app: FastAPI) -> None:
     app.state.host_ui_manifest = []
 
 
-async def start_host_features(features: List[HostFeature], ctx: Any) -> None:
-    """Run ``on_host_start`` for every host feature (isolating failures)."""
+def _host_contribution_runtime(ctx: Any) -> FeatureContributionRuntime:
+    runtime = getattr(ctx, "feature_contribution_runtime", None)
+    if runtime is not None:
+        return runtime
+    runtime = FeatureContributionRuntime(
+        operator_registry=OperatorRuntimeRegistry(),
+        wait_registry=WaitRegistry(),
+        source_registry=SourceRegistry(),
+    )
+    # Retain the exact registries on Sovereign's extensible HostContext so the
+    # stop boundary receives the same lifecycle capabilities.
+    ctx.feature_contribution_runtime = runtime
+    ctx.operator_registry = runtime.operator_registry
+    ctx.wait_registry = runtime.wait_registry
+    ctx.signal_registry = runtime.source_registry
+    ctx.permission_defaults_registry = runtime.permission_defaults_registry
+    ctx.setup_step_registry = runtime.setup_step_registry
+    return runtime
+
+
+async def start_host_features(
+    features: List[HostFeature], ctx: Any
+) -> List[HostFeature]:
+    """Start features after validating the complete contribution transition.
+
+    An ordinary feature start failure remains isolated, but its declarative
+    registrations are exactly reversed before a later feature is started.
+    Contribution contract and owner conflicts raise before any mutation.
+    """
+    runtime = _host_contribution_runtime(ctx)
+    prepared = runtime.prepare_transition(features)
+    by_feature = {id(item.feature): item for item in prepared}
+    previously_started = tuple(getattr(ctx, "started_host_features", ()))
+    started: List[HostFeature] = []
     for feature in features:
         try:
+            runtime.activate(by_feature[id(feature)])
+        except Exception as exc:
+            # A declarative commit failure is not an optional imperative
+            # lifecycle failure. Reverse the already-started prefix and reject
+            # the transition so callers cannot serve a partially-active set.
+            await _rollback_started_host_features(started, ctx, runtime)
+            ctx.started_host_features = previously_started
+            raise FeatureContributionRuntimeError(
+                f"host feature {feature!r} contribution activation failed"
+            ) from exc
+        try:
             await feature.on_host_start(ctx)
-        except Exception as exc:  # noqa: BLE001 - one feature's start must not abort the host
+        except Exception as exc:  # noqa: BLE001 - isolate a reversible failure
             logger.warning("Host feature %s on_host_start failed: %s", feature, exc)
+            try:
+                runtime.deactivate(feature)
+            except Exception:  # noqa: BLE001 - unsafe rollback cannot be hidden
+                logger.exception(
+                    "Host feature %s contribution rollback failed", feature
+                )
+                raise
+            try:
+                await feature.on_host_stop(ctx)
+            except Exception:  # noqa: BLE001 - partial imperative cleanup
+                logger.exception(
+                    "Host feature %s partial-start cleanup failed", feature
+                )
+            continue
+        started.append(feature)
+    try:
+        runtime.setup_step_registry.ordered()
+    except Exception:
+        # A failed member may have been the target of another member's hard
+        # setup ordering constraint. That leaves no valid partial host set, so
+        # reverse every successfully started member before reporting failure.
+        await _rollback_started_host_features(started, ctx, runtime)
+        ctx.started_host_features = previously_started
+        raise
+    ctx.started_host_features = (*previously_started, *started)
+    return started
+
+
+async def _rollback_started_host_features(
+    features: List[HostFeature],
+    ctx: Any,
+    runtime: FeatureContributionRuntime,
+) -> None:
+    """Best-effort cleanup of a rejected prospective host transition."""
+
+    for feature in reversed(features):
+        try:
+            await feature.on_host_stop(ctx)
+        except Exception:  # noqa: BLE001 - continue exact declarative cleanup
+            logger.exception("Host feature %s rollback stop failed", feature)
+        try:
+            runtime.deactivate(feature)
+        except Exception:  # noqa: BLE001 - continue cleaning remaining owners
+            logger.exception(
+                "Host feature %s declarative rollback failed", feature
+            )
 
 
 async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
-    """Run ``on_host_stop`` for every host feature (isolating failures)."""
-    for feature in features:
+    """Stop active host features and remove their exact contribution objects."""
+    runtime = getattr(ctx, "feature_contribution_runtime", None)
+    requested = tuple(features)
+    for feature in reversed(requested):
+        if runtime is not None and not runtime.is_active(feature):
+            continue
         try:
             await feature.on_host_stop(ctx)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Host feature %s on_host_stop failed: %s", feature, exc)
+        finally:
+            if runtime is not None:
+                try:
+                    runtime.deactivate(feature)
+                except Exception as exc:  # noqa: BLE001 - continue stopping peers
+                    logger.warning(
+                        "Host feature %s contribution teardown failed: %s",
+                        feature,
+                        exc,
+                    )
+    removed_ids = {id(feature) for feature in requested}
+    ctx.started_host_features = tuple(
+        feature
+        for feature in getattr(ctx, "started_host_features", ())
+        if id(feature) not in removed_ids
+    )
 
 
 __all__ = [

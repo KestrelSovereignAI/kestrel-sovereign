@@ -13,7 +13,12 @@ from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
-from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+from kestrel_sovereign.features.security.permissions import (
+    PermissionLevel,
+    PermissionStore,
+    assert_sdk_permission_level_parity,
+    compose_restrictive_permission,
+)
 
 
 # Per-feature default permission levels for fresh agents (#406).
@@ -34,9 +39,12 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 # into a 20+ minute timeout cascade on first run (Meridian, #406).
 #
 # This map opts the core "must work to function" features into ALLOW.
-# Genuinely destructive or externally-visible features stay on ASK. Anything
-# not listed falls through to ASK — adding a new feature to the agent does
-# NOT silently grant it; the maintainer must add it here explicitly.
+# Genuinely destructive or externally-visible features stay on ASK. An SDK
+# feature declaration composes with an explicit entry here: ordinary modes
+# cannot weaken the Sovereign baseline, while ALWAYS_ASK or DENY may tighten
+# it. Anything not listed falls through to ASK only when it has no SDK
+# declaration — adding a legacy feature to the agent does NOT silently grant
+# it, while an unmapped SDK feature retains its declared contract.
 _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     # --- Core boot / identity / memory: ALLOW (agent cannot function without) ---
     "BootstrapFeature": PermissionLevel.ALLOW,
@@ -89,9 +97,11 @@ def default_permission_for_feature(
 ) -> PermissionLevel:
     """Return the default permission level for a freshly-loaded feature.
 
-    Unmapped features get the conservative ASK fallback — adding a new feature
-    does not silently grant it permission. To opt a feature into ALLOW or to
-    explicitly ASK, update ``_DEFAULT_PERMISSION_BY_FEATURE`` above.
+    Unmapped callers get the conservative ASK fallback. SDK declarations are
+    composed by ``SecurityFeature._register_all_tools`` only when this map has
+    an explicit entry; otherwise the declaration remains the feature baseline.
+    To opt a legacy feature into ALLOW or to explicitly ASK, update
+    ``_DEFAULT_PERMISSION_BY_FEATURE`` above.
     """
     return _DEFAULT_PERMISSION_BY_FEATURE.get(feature_name, fallback)
 
@@ -149,11 +159,9 @@ def default_permission_for_tool(
 ) -> Optional[PermissionLevel]:
     """Return a per-tool default-permission override, or ``None``.
 
-    ``None`` means "no override" — the caller should fall back to the
-    per-feature default (including the demo-server ALLOW override). A non-None
-    result is authoritative and MUST win over both the per-feature default and
-    the demo-server override (that is the whole point: destructive tools stay
-    gated even on a demo agent). See ``_DEFAULT_PERMISSION_BY_TOOL``.
+    ``None`` means "no static rail". A non-None result is a Sovereign-owned
+    migration/security floor: an SDK declaration may tighten it but cannot
+    weaken it.
     """
     return _DEFAULT_PERMISSION_BY_TOOL.get(feature_name, {}).get(tool_name)
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
@@ -399,21 +407,29 @@ class SecurityFeature(Feature):
     async def _register_all_tools(self):
         """Register all agent tools with sensible per-feature default permissions.
 
-        Demo servers (KESTREL_DEMO_SERVER=1, set by ``kestrel demo run``) get
-        ALLOW for every tool — Playwright demos can't click through an
-        interactive approval modal, and the demo agent runs in an isolated DB
-        so the broader-grants are scoped correctly (#897).
+        Demo servers (KESTREL_DEMO_SERVER=1, set by ``kestrel demo run``) use
+        ALLOW as the feature-wide baseline — Playwright demos can't click
+        through an interactive approval modal, and the demo agent runs in an
+        isolated DB so the broader grants are scoped correctly (#897). An SDK
+        feature-wide ALWAYS_ASK or DENY declaration may tighten that baseline,
+        and explicit per-tool declarations retain their normal precedence.
 
-        Production agents use per-feature defaults from
-        ``default_permission_for_feature``: core boot features get ALLOW so a
-        fresh agent isn't paralyzed in an approval-modal loop on first turn
-        (#406, Meridian incident); features that take externally-visible or
-        irreversible action stay on ASK; unmapped features default to ASK so
-        adding a new feature never silently grants it.
+        Outside demo mode, an active SDK ``FeaturePermissionDefaults``
+        descriptor composes with an explicit Sovereign per-feature baseline:
+        ordinary declarations cannot weaken that baseline, while ALWAYS_ASK
+        or DENY may tighten it. An unmapped feature retains its SDK declaration
+        instead of composing against the conservative legacy ASK fallback.
+        Features not yet declaring a default use
+        ``default_permission_for_feature`` as the migration baseline: core boot
+        features get ALLOW so a fresh agent isn't paralyzed in an approval-
+        modal loop on first turn (#406, Meridian incident), while risky or
+        unmapped legacy features remain ASK. Static per-tool rails compose
+        independently below.
         """
         if not hasattr(self.agent, "features"):
             return
 
+        assert_sdk_permission_level_parity()
         is_demo_server = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
             "1", "true", "yes",
         )
@@ -421,53 +437,11 @@ class SecurityFeature(Feature):
         for feature_name, feature in self.agent.features.items():
             if feature_name == "SecurityFeature":
                 continue
-
-            if is_demo_server:
-                feature_default = PermissionLevel.ALLOW
-            else:
-                feature_default = default_permission_for_feature(feature_name)
-
-            # Register the inner @tool methods. A per-tool override (#2093)
-            # wins over BOTH the per-feature default AND the demo-server ALLOW
-            # override — that is how the destructive memory tools stay
-            # approval-gated even on a demo/governed agent, closing F203.
-            for tool_obj in feature.get_tools():
-                tool_override = default_permission_for_tool(
-                    feature_name, tool_obj.name
-                )
-                # A per-tool override is a non-downgradeable hard rail: pass
-                # ``hardened=True`` so register_tool force-upgrades any stale
-                # permissive row an already-running agent persisted under the
-                # old feature-level default (INSERT-OR-IGNORE would leave that
-                # ALLOW row in place and the destructive tool would keep
-                # bypassing approval — the F203 upgrade gap, #2093).
-                await self.permission_store.register_tool(
-                    feature_name=feature_name,
-                    tool_name=tool_obj.name,
-                    default_level=tool_override or feature_default,
-                    hardened=tool_override is not None,
-                )
-
-            # Also register the feature-as-subagent dispatch entry. The
-            # orchestrator may call the whole feature as a subagent (e.g.
-            # `BootstrapFeature.bootstrap_feature`) and SecurityHook checks
-            # permission for that feature-level tool name too. Without this
-            # the per-feature ALLOW defaults wouldn't cover subagent calls,
-            # leaving the Meridian first-boot approval loop in place (#406
-            # codex review P1).
-            subagent_tool_name = getattr(feature, "tool_name", None)
-            if subagent_tool_name and not isinstance(subagent_tool_name, property):
-                try:
-                    await self.permission_store.register_tool(
-                        feature_name=feature_name,
-                        tool_name=subagent_tool_name,
-                        default_level=feature_default,
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
-                        "Could not register subagent permission for "
-                        f"{feature_name}.{subagent_tool_name}: {exc}"
-                    )
+            await self.register_feature_tools(
+                feature_name,
+                feature,
+                is_demo_server=is_demo_server,
+            )
 
         for tool_name in ("commandExecution", "fileChange"):
             await self.permission_store.register_tool(
@@ -478,11 +452,147 @@ class SecurityFeature(Feature):
 
         if is_demo_server:
             logger.info(
-                "Registered all tools with ALLOW (KESTREL_DEMO_SERVER=1)"
+                "Registered demo permission baseline ALLOW; SDK declarations "
+                "and static per-tool rails may tighten it "
+                "(KESTREL_DEMO_SERVER=1)"
             )
         else:
             logger.info(
                 "Registered all tools with per-feature default permissions"
+            )
+
+    async def register_feature_tools(
+        self,
+        feature_name: str,
+        feature: Feature,
+        *,
+        is_demo_server: Optional[bool] = None,
+    ) -> None:
+        """Register one feature's tool and dispatch permission rows.
+
+        This is the shared owner-bound seam for boot's all-feature pass and a
+        successful runtime enable. Runtime activation calls it after the SDK
+        contribution is active but before hooks, A2A dispatch, or promoted
+        direct tools become callable, so contributed hard defaults take effect
+        immediately without rescanning unrelated features.
+        """
+        # SDK features declare permission defaults with a separate enum. Do
+        # not consume even a currently familiar value unless the *complete*
+        # declaration and enforcement vocabularies still agree.
+        assert_sdk_permission_level_parity()
+        if is_demo_server is None:
+            is_demo_server = os.environ.get(
+                "KESTREL_DEMO_SERVER", ""
+            ).lower() in ("1", "true", "yes")
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            PermissionDefaultsRegistry,
+        )
+
+        declared_defaults = None
+        registry = getattr(self.agent, "permission_defaults_registry", None)
+        # ``agent`` is MagicMock-backed in some legacy embedders/tests;
+        # require the lifecycle registry rather than treating an arbitrary
+        # dynamically-created ``.get`` result as a security declaration.
+        if isinstance(registry, PermissionDefaultsRegistry):
+            declared_defaults = registry.get(feature_name)
+
+        mapped_feature = feature_name in _DEFAULT_PERMISSION_BY_FEATURE
+        if is_demo_server:
+            feature_default = PermissionLevel.ALLOW
+            if declared_defaults is not None:
+                feature_default = compose_restrictive_permission(
+                    feature_default,
+                    PermissionLevel(declared_defaults.feature_default.value),
+                )
+        elif declared_defaults is not None:
+            declared_feature_default = PermissionLevel(
+                declared_defaults.feature_default.value
+            )
+            if mapped_feature:
+                feature_default = compose_restrictive_permission(
+                    default_permission_for_feature(feature_name),
+                    declared_feature_default,
+                )
+            else:
+                feature_default = declared_feature_default
+        else:
+            feature_default = default_permission_for_feature(feature_name)
+
+        # Register the inner @tool methods. SDK declarations compose with,
+        # rather than replace, Sovereign's static rails. The static map
+        # includes destructive approval floors and established ALLOW
+        # migrations needed by unattended reconciliation.
+        for tool_obj in feature.get_tools():
+            static_override = default_permission_for_tool(
+                feature_name, tool_obj.name
+            )
+            if declared_defaults is not None:
+                declared_override = declared_defaults.tool_overrides.get(
+                    tool_obj.name
+                )
+                tool_override = (
+                    None
+                    if declared_override is None
+                    else PermissionLevel(declared_override.value)
+                )
+            else:
+                tool_override = None
+
+            if tool_override is None:
+                declared_default = feature_default
+            elif not is_demo_server and mapped_feature:
+                # A mapped feature's already-composed Sovereign baseline also
+                # clamps per-tool declarations. In particular, ALLOW cannot
+                # bypass an explicit risky-feature ASK rail merely because no
+                # exact static per-tool entry exists. Hard declarations may
+                # still tighten through the same composition policy.
+                declared_default = compose_restrictive_permission(
+                    feature_default,
+                    tool_override,
+                )
+            else:
+                # Preserve the reviewed demo behavior and the SDK contract for
+                # unmapped extracted features: their exact tool declaration is
+                # authoritative unless an exact static per-tool rail follows.
+                declared_default = tool_override
+
+            if static_override is None:
+                effective_default = declared_default
+            else:
+                effective_default = compose_restrictive_permission(
+                    static_override,
+                    declared_default,
+                )
+            await self.permission_store.register_tool(
+                feature_name=feature_name,
+                tool_name=tool_obj.name,
+                default_level=effective_default,
+                # Every static override retains its persisted-row upgrade
+                # semantics, including ALLOW rails for unattended status
+                # and release work. Ordinary contributed defaults remain
+                # insert-only unless they are DENY/ALWAYS_ASK.
+                hardened=(
+                    static_override is not None
+                    or effective_default
+                    in {PermissionLevel.DENY, PermissionLevel.ALWAYS_ASK}
+                ),
+            )
+
+        # Also register the feature-as-subagent dispatch entry. It carries the
+        # feature baseline and therefore must use the same hardening predicate
+        # as inner tools: a stale ALLOW row cannot outlive a newly-declared
+        # feature-wide DENY or ALWAYS_ASK rail.
+        subagent_tool_name = getattr(feature, "tool_name", None)
+        if subagent_tool_name and not isinstance(subagent_tool_name, property):
+            await self.permission_store.register_tool(
+                feature_name=feature_name,
+                tool_name=subagent_tool_name,
+                default_level=feature_default,
+                hardened=feature_default in {
+                    PermissionLevel.DENY,
+                    PermissionLevel.ALWAYS_ASK,
+                },
             )
 
     async def _emit_approval_request(self, request: ApprovalRequest):

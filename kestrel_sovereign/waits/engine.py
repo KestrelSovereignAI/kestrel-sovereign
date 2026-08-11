@@ -291,6 +291,14 @@ class WaitRegistry:
         stack = self._stacks.get(kind)
         return stack[-1] if stack else None
 
+    def contains(self, kind: str, provider: Waitable) -> bool:
+        """Whether this exact provider is registered anywhere in ``kind``.
+
+        Lifecycle teardown uses this identity-aware query before removing a
+        provider that may sit beneath a newer, explicitly replacing owner.
+        """
+        return any(item is provider for item in self._stacks.get(kind, ()))
+
     def kinds(self) -> List[str]:
         return sorted(kind for kind, stack in self._stacks.items() if stack)
 

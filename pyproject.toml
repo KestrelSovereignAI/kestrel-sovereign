@@ -87,19 +87,21 @@ dependencies = [
     # 0.35.0 floor: owner-scoped idle renewal plus the absolute lease-lifetime
     # ceiling used to reject provider acquisition/touch results that outlive
     # the request's readiness deadline and expected session.
+    # 0.36.0 floor: public lifecycle-owned operator service, workflow,
+    # execution-target, authorization-context, and contribution contracts.
     # The ceiling tracks the MINOR, not the major, and 0.35.0 is itself the
     # evidence for that: it added a required member to a runtime-checkable
     # protocol and tightened validate_for, so leases that validated under
     # 0.34.0 are now rejected. An SDK minor can therefore break inference-lease
-    # providers. Under <0.36 that lands as an unresolvable install; under <1 it
-    # would resolve silently, and InferenceLeaseFeature.initialize catches
-    # discovery errors and keeps the agent up with providers={} - so every
+    # providers. Under a minor ceiling that lands as an unresolvable install;
+    # under <1 it would resolve silently. InferenceLeaseFeature.initialize
+    # catches discovery errors and keeps the agent up with providers={} - so every
     # installed provider would become "not installed" on an unchanged Core.
     # Widen this only with a Core release that has tested the newer minor.
     # Release cascade: Frinz and the observability fleet must publish/test
     # constraints that admit this line before Core is released. Do not weaken
     # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[tracing]>=0.35.1,<0.36",
+    "kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -277,7 +279,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.35.1,<0.36",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.36.0,<0.37",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the
