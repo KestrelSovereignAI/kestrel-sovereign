@@ -101,6 +101,28 @@ class DurableDelegatedAllocationProviderProtocol(Protocol):
     ) -> bool: ...
 
 
+class DurableDelegatedChildWalletProviderProtocol(Protocol):
+    """Provider-owned atomic hold plus durable child-wallet provisioning.
+
+    Core cannot infer a feature's storage layout or safely seed private wallet
+    state.  Providers that support durable allocations therefore expose this
+    optional seam: it commits the parent hold, child initial allocation, and
+    replay record together, then returns an initialized child wallet bound to
+    durable storage.  ``None`` means the atomic hold was refused for insufficient
+    funds; parameter drift and storage failures raise.
+    """
+
+    async def reserve_and_provision_delegated_child_wallet(
+        self,
+        *,
+        allocation_id: str,
+        child_did: str,
+        amount: Decimal,
+        memo: str,
+        currency: Any,
+    ) -> WalletProtocol | None: ...
+
+
 class BudgetExceededError(Exception):
     """Raised when a transaction would exceed the delegated budget ceiling."""
 
@@ -200,6 +222,15 @@ class DelegatedWallet:
             "release_delegated_allocation",
         )
         if all(callable(getattr(wallet, name, None)) for name in required):
+            return wallet  # type: ignore[return-value]
+        return None
+
+    @staticmethod
+    def _durable_child_wallet_provider(
+        wallet: WalletProtocol,
+    ) -> DurableDelegatedChildWalletProviderProtocol | None:
+        provision = getattr(wallet, "reserve_and_provision_delegated_child_wallet", None)
+        if callable(provision):
             return wallet  # type: ignore[return-value]
         return None
 
@@ -508,11 +539,10 @@ async def create_delegated_wallet(
 ) -> DelegatedWallet:
     """Create a delegated wallet by holding budget from the parent.
 
-    This implements the "hold" phase of the hold/release lifecycle:
-    1. Validates the parent can afford the budget.
-    2. Debits the parent wallet.
-    3. Creates a child WalletAgent funded with the budget.
-    4. Returns a DelegatedWallet wrapping the child wallet.
+    This implements the "hold" phase of the hold/release lifecycle.  A modern
+    durable provider atomically holds and provisions the child through its own
+    storage contract. Legacy providers retain the historical affordability /
+    transfer / in-memory-child path.
 
     Args:
         parent_wallet: The parent's WalletAgent (will be debited).
@@ -531,14 +561,6 @@ async def create_delegated_wallet(
         raise ValueError("Budget must be positive")
 
     currency = currency or _default_currency_for(parent_wallet)
-
-    if not parent_wallet.can_afford(budget, currency):
-        parent_balance = parent_wallet.get_balance(currency, "main")
-        currency_value = _currency_value(currency)
-        raise ValueError(
-            f"Parent has insufficient funds. "
-            f"Need {budget} {currency_value}, have {parent_balance} {currency_value}"
-        )
 
     # The child DID is minted before this call and is the durable identity of a
     # single spawn.  Derive the hold key from it rather than creating a fresh
@@ -563,7 +585,33 @@ async def create_delegated_wallet(
         if isinstance(parent_wallet, DelegatedWallet)
         else DelegatedWallet._durable_allocation_provider(parent_wallet)
     )
-    if allocation_provider is not None:
+    child_wallet_provider = (
+        None
+        if isinstance(parent_wallet, DelegatedWallet)
+        else DelegatedWallet._durable_child_wallet_provider(parent_wallet)
+    )
+    child_wallet: WalletProtocol | None = None
+    success: bool | None = None
+    if child_wallet_provider is not None:
+        # This is deliberately before any synchronous can_afford preflight.
+        # A retry can arrive after the original durable hold made the cache look
+        # insufficient; the provider's allocation key is the authority and
+        # returns the existing child without taking another hold.
+        child_wallet = await child_wallet_provider.reserve_and_provision_delegated_child_wallet(
+            allocation_id=allocation.allocation_id,
+            child_did=child_did,
+            amount=budget,
+            memo=f"budget hold for child {child_did}",
+            currency=currency,
+        )
+        if child_wallet is None:
+            raise ValueError("Failed to debit parent wallet for budget hold")
+        allocation.parent_hold_durable = True
+    elif allocation_provider is not None:
+        # The durable idempotency path must precede stale in-memory affordability
+        # checks. Older durable providers may not yet provision children, but
+        # their reserve operation still atomically decides whether a hold exists
+        # or can be afforded.
         success = await allocation_provider.reserve_delegated_allocation(
             allocation_id=allocation.allocation_id,
             child_did=child_did,
@@ -573,18 +621,29 @@ async def create_delegated_wallet(
         )
         allocation.parent_hold_durable = True
     else:
+        # Preserve the legacy provider path, which has no durable allocation
+        # record to reconcile and therefore needs the historical local preflight.
+        if not parent_wallet.can_afford(budget, currency):
+            parent_balance = parent_wallet.get_balance(currency, "main")
+            currency_value = _currency_value(currency)
+            raise ValueError(
+                f"Parent has insufficient funds. "
+                f"Need {budget} {currency_value}, have {parent_balance} {currency_value}"
+            )
         success = await parent_wallet.transfer(
             budget,
             f"budget hold for child {child_did}",
             currency,
         )
-    if success is not True:
+    if child_wallet is None and success is not True:
         raise ValueError("Failed to debit parent wallet for budget hold")
 
     # Transactional after the debit: if child-wallet construction/init fails, the
     # parent has already been debited, so refund the hold before propagating —
     # otherwise the funds are stranded (#2113, codex).
     try:
+        if child_wallet is not None:
+            return DelegatedWallet(wallet=child_wallet, allocation=allocation)
         # Construct from the CONCRETE wallet class: when the parent's wallet is
         # itself a DelegatedWallet (a budgeted child spawning a budgeted
         # grandchild), unwrap to the underlying funded wallet — DelegatedWallet's

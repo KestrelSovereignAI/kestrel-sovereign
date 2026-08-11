@@ -81,6 +81,67 @@ class FakeWallet:
         return True
 
 
+class DurableHoldOnlyWallet(FakeWallet):
+    """An older durable allocation provider without child provisioning."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reserve_calls = []
+
+    def can_afford(self, amount, currency=None):
+        raise AssertionError("durable allocation retries must not use stale can_afford")
+
+    async def reserve_delegated_allocation(
+        self, *, allocation_id, child_did, amount, memo, currency
+    ):
+        self.reserve_calls.append(allocation_id)
+        record = getattr(self, "_allocations", {}).get(allocation_id)
+        if record is not None:
+            return True
+        self._allocations = getattr(self, "_allocations", {})
+        self._allocations[allocation_id] = amount
+        self._balances[currency]["main"] -= amount
+        return True
+
+    async def release_delegated_allocation(self, *, allocation_id, amount, currency):
+        self._balances[currency]["main"] += amount
+        return True
+
+
+class DurableProvisioningWallet(DurableHoldOnlyWallet):
+    """Modern provider seam: Core never constructs or funds this child itself."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.provision_calls = []
+        self.children = {}
+
+    async def reserve_and_provision_delegated_child_wallet(
+        self, *, allocation_id, child_did, amount, memo, currency
+    ):
+        self.provision_calls.append(allocation_id)
+        child = self.children.get(allocation_id)
+        if child is not None:
+            return child
+        await self.reserve_delegated_allocation(
+            allocation_id=allocation_id,
+            child_did=child_did,
+            amount=amount,
+            memo=memo,
+            currency=currency,
+        )
+        child = FakeWallet(
+            agent_id=child_did,
+            initial_balance=Decimal("0"),
+            initial_currency=currency,
+        )
+        child.db_path = "provider-owned-durable-child-storage"
+        await child.initialize()
+        child._balances[currency]["main"] = amount
+        self.children[allocation_id] = child
+        return child
+
+
 # --------------------------- DelegatedWallet drop-in ---------------------------
 
 @pytest.mark.asyncio
@@ -122,6 +183,38 @@ async def test_delegates_unoverridden_attrs():
 
 
 # ----------------------------- hold / release ---------------------------------
+
+@pytest.mark.asyncio
+async def test_durable_allocation_retry_precedes_stale_affordability_for_legacy_provider():
+    """Old durable providers still own idempotent hold retries before preflight."""
+
+    parent = DurableHoldOnlyWallet(initial_balance=Decimal("100"))
+    child = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+
+    assert child.remaining == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    # A re-run after the original hold must ask the allocation authority, not
+    # the now-stale/insufficient cache, and must not debit twice.
+    retried = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert retried.remaining == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    assert len(parent.reserve_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_provider_provisions_and_persists_child_without_core_wallet_internals():
+    """Core uses the provider seam for storage and initial allocation atomically."""
+
+    parent = DurableProvisioningWallet(initial_balance=Decimal("100"))
+    delegated = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+
+    assert delegated._wallet.db_path == "provider-owned-durable-child-storage"
+    assert delegated.get_balance() == Decimal("30")
+    assert parent.get_balance() == Decimal("70")
+    retried = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert retried._wallet is delegated._wallet
+    assert parent.get_balance() == Decimal("70")
+    assert len(parent.provision_calls) == 2
 
 @pytest.mark.asyncio
 async def test_nested_budgeted_spawn_unwraps_delegated_parent():
