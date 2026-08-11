@@ -20,7 +20,7 @@ privacy: public
 
 **Status:** Contract scaffold
 **Parent issues:** #413, #416, #419
-**Last updated:** 2026-05-14
+**Last updated:** 2026-08-11
 
 This document names the runtime boundary Kestrel is moving toward. It is a
 vocabulary and contract scaffold, not a runtime rewrite. Later issues can add
@@ -51,6 +51,25 @@ The kernel can call declared feature lifecycle methods. It should not know that
 MCP, wallet, GitHub, voice, observability, reflection, council, or cloud-provider
 packages exist by import path. Optional packages depend on the framework or SDK;
 the framework does not depend on optional packages.
+
+### Discovery collision and extraction migrations
+
+Feature class names are the current runtime registration keys, so discovery
+must resolve their ownership before constructing per-agent instances. An
+installed entry point and a bundled module that export the same class name are
+an ambiguity, not an ordering rule: the kernel raises
+`FeatureDiscoveryAmbiguityError` with both implementation modules and the
+external distribution. Two external distributions that claim one class remain
+a separate `DuplicateFeatureEntryPointError`.
+
+An extraction can temporarily replace a bundled predecessor only when that
+bundled registry row declares both the exact external distribution and its
+Python module prefix. Both checks must match. This narrow migration record does
+not change the row's package boundary; ownership moves only in the later
+catalog-cutover change. `discover_feature_selections()` exposes the selected
+class, implementation module, source, and distribution for diagnostics without
+constructing the feature. This is a generic kernel policy: feature packages do
+not receive custom import branches in the host.
 
 ## Module
 
@@ -204,7 +223,7 @@ through entry points.
 This document does not:
 
 - add a descriptor class
-- change feature discovery
+- define stable module descriptors beyond the current discovery selection
 - move routes
 - move runtime state
 - change startup behavior

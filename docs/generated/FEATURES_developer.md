@@ -191,7 +191,7 @@ Read or set the active preset at `GET /agent/privacy-mode` / `POST /agent/privac
 Features are discovered from two sources:
 
 1. **Bundled Feature modules** — modules under `kestrel_sovereign/features/` that export a `Feature` subclass (single-file modules, package `__init__.py`, or package `feature.py`). Only modules with a discoverable `Feature` subclass are retained.
-2. **Extracted Feature packages** — installed via pip and registered as `kestrel_sovereign.features` entry points. Discovered at runtime via `discover_entrypoint_feature_classes()`. On duplicate class names, bundled modules win.
+2. **Extracted Feature packages** — installed via pip and registered as `kestrel_sovereign.features` entry points. Discovered at runtime via `discover_entrypoint_feature_classes()`. A bundled/external class-name collision fails closed unless the bundled registry row authorizes the exact extracted distribution and implementation-module prefix; two external owners always fail.
 
 > **Note:** Some support packages reside under `kestrel_sovereign/features/` but are not discoverable features because they do not export a `Feature` subclass.
 

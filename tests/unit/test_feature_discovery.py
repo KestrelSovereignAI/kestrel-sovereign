@@ -4,16 +4,19 @@ Tests for the Feature Discovery module.
 
 import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
+    FeatureDiscoveryAmbiguityError,
     MandatoryFeatureReadinessError,
     discover_features,
     discover_feature_class_by_name,
     resolve_feature_canonical_name,
     discover_feature_modules,
     discover_entrypoint_feature_classes,
+    discover_feature_selections,
     get_disabled_features,
     get_feature_by_name,
     find_feature_class,
@@ -21,6 +24,7 @@ from kestrel_sovereign.features import (
     FEATURE_ENTRY_POINT_GROUP,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sdk.features.base import Feature as _SDKFeature
 
 
@@ -537,8 +541,8 @@ class TestEntryPointDiscovery:
 
         assert classes == {"ExternalFeature": ExternalFeature}
 
-    def test_local_features_win_on_duplicate(self):
-        """Test that local features take priority over entry_point features on name collision."""
+    def test_unrecognized_local_external_ambiguity_fails_actionably(self):
+        """A bundled/external collision must never resolve by enumeration order."""
         class DuplicateFeature(Feature):
             @property
             def tool_description(self):
@@ -549,6 +553,7 @@ class TestEntryPointDiscovery:
         ep = self._make_entry_point("HealthFeature", DuplicateFeature)
         # Rename the class to match a real local feature
         DuplicateFeature.__name__ = "HealthFeature"
+        ep.dist.name = "surprise-health-package"
         mock_eps = MagicMock()
         mock_eps.select.return_value = [ep]
 
@@ -556,14 +561,112 @@ class TestEntryPointDiscovery:
         agent.storage = Mock()
         agent.llm_service = Mock()
 
-        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
-            features = discover_features(agent)
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), pytest.raises(FeatureDiscoveryAmbiguityError) as exc:
+            discover_features(agent)
 
-        # HealthFeature should be the LOCAL version, not the entry_point one
-        heartbeats = [f for f in features if f.__class__.__name__ == "HealthFeature"]
-        assert len(heartbeats) == 1
-        # The local HealthFeature won't be our DuplicateFeature class
-        assert heartbeats[0].__class__ is not DuplicateFeature
+        message = str(exc.value)
+        assert "HealthFeature" in message
+        assert "surprise-health-package" in message
+        assert "no extracted-over-bundled migration" in message
+        assert "feature_registry.toml" in message
+
+    def test_registry_declared_talon_external_replaces_bundled(self):
+        """The sole migration pair selects the extracted Talon module."""
+
+        class ExtractedTalonCoordinatorFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Extracted Talon"
+
+            async def initialize(self):
+                pass
+
+        ExtractedTalonCoordinatorFeature.__name__ = "TalonCoordinatorFeature"
+        ExtractedTalonCoordinatorFeature.__module__ = (
+            "kestrel_feature_talon.coordinator"
+        )
+        ep = self._make_entry_point(
+            "TalonCoordinatorFeature",
+            ExtractedTalonCoordinatorFeature,
+        )
+        ep.dist.name = "kestrel-feature-talon"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            selections = discover_feature_selections()
+
+        selected = selections["TalonCoordinatorFeature"]
+        assert selected.feature_class is ExtractedTalonCoordinatorFeature
+        assert selected.source == "entry-point"
+        assert selected.distribution == "kestrel-feature-talon"
+        assert selected.implementation_module.startswith("kestrel_feature_talon")
+
+    def test_talon_named_package_with_wrong_module_is_ambiguous(self):
+        """Distribution ownership alone cannot authorize an unrelated module."""
+
+        class ImpostorTalonFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Impostor"
+
+            async def initialize(self):
+                pass
+
+        ImpostorTalonFeature.__name__ = "TalonCoordinatorFeature"
+        ImpostorTalonFeature.__module__ = "unrelated_package.coordinator"
+        ep = self._make_entry_point("TalonCoordinatorFeature", ImpostorTalonFeature)
+        ep.dist.name = "kestrel-feature-talon"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), pytest.raises(FeatureDiscoveryAmbiguityError) as exc:
+            discover_feature_selections()
+
+        assert "outside the registered prefix 'kestrel_feature_talon'" in str(
+            exc.value
+        )
+
+    def test_no_external_talon_keeps_bundled_implementation(self):
+        """The migration allowlist does not alter a core-only installation."""
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = []
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            selected = discover_feature_selections()["TalonCoordinatorFeature"]
+
+        assert selected.source == "bundled"
+        assert selected.distribution == "kestrel-sovereign"
+        assert selected.implementation_module == (
+            "kestrel_sovereign.features.talon.coordinator"
+        )
+
+    def test_bundled_reexport_keeps_public_alias_without_implementation_alias(self):
+        """Bundled shorthands come from discovery modules, not inner modules."""
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = []
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            assert (
+                resolve_feature_canonical_name("talon")
+                == "TalonCoordinatorFeature"
+            )
+            assert resolve_feature_canonical_name("coordinator") is None
 
     def test_entrypoint_features_loaded_when_no_local_duplicate(self):
         """Test that entry_point features are loaded when there's no local duplicate."""
@@ -662,6 +765,164 @@ class TestEntryPointDiscovery:
     def test_entrypoint_group_constant(self):
         """Test that the entry_point group constant is correct."""
         assert FEATURE_ENTRY_POINT_GROUP == "kestrel_sovereign.features"
+
+    def test_authorized_isolated_talon_suppresses_bundled_and_loads_proxy(self):
+        runtime = InstalledFeatureRuntime(
+            class_name="TalonCoordinatorFeature",
+            entry_point=(
+                "kestrel_feature_talon.coordinator:TalonCoordinatorFeature"
+            ),
+            distribution="kestrel-feature-talon",
+            runtime="isolated-venv",
+            service="kestrel-feature-talon-service",
+        )
+        ep = _IsolatedEntryPoint(
+            runtime.class_name,
+            runtime.entry_point,
+            SimpleNamespace(name=runtime.distribution),
+        )
+        mock_eps = _IsolatedEntryPoints([ep])
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ):
+            selections = discover_feature_selections()
+            features = discover_features(Mock())
+
+        assert runtime.class_name not in selections
+        selected = next(feature for feature in features if feature.name == runtime.class_name)
+        assert selected.__class__.__name__ == "ProxyFeature"
+        assert ep.loaded is False
+
+    def test_discovery_gives_two_isolated_runtimes_distinct_stable_owners(self):
+        runtimes = {
+            class_name: InstalledFeatureRuntime(
+                class_name=class_name,
+                entry_point=f"isolated_package.feature:{class_name}",
+                distribution="shared-isolated-package",
+                runtime="isolated-venv",
+                service=f"{class_name.lower()}-service",
+            )
+            for class_name in ("FirstIsolatedFeature", "SecondIsolatedFeature")
+        }
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+                for runtime in runtimes.values()
+            ]
+        )
+        agent = Mock(did="did:test:isolated-discovery")
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=entry_points,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value=runtimes,
+        ):
+            features = discover_features(
+                agent,
+                allowed_features=set(runtimes),
+            )
+
+        proxies = [feature for feature in features if feature.name in runtimes]
+        assert {feature.name for feature in proxies} == set(runtimes)
+        assert len({feature.contribution_owner for feature in proxies}) == 2
+        assert all(entry_point.loaded is False for entry_point in entry_points)
+
+    @pytest.mark.parametrize(
+        ("distribution", "module"),
+        [
+            ("unapproved-talon", "kestrel_feature_talon.coordinator"),
+            ("kestrel-feature-talon", "kestrel_feature_talon_evil.coordinator"),
+        ],
+    )
+    def test_unauthorized_isolated_talon_claim_fails_without_bundled_fallback(
+        self, distribution, module
+    ):
+        runtime = InstalledFeatureRuntime(
+            class_name="TalonCoordinatorFeature",
+            entry_point=f"{module}:TalonCoordinatorFeature",
+            distribution=distribution,
+            runtime="isolated-venv",
+            service="talon-service",
+        )
+        ep = _IsolatedEntryPoint(
+            runtime.class_name,
+            runtime.entry_point,
+            SimpleNamespace(name=distribution),
+        )
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=_IsolatedEntryPoints([ep]),
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ), pytest.raises(FeatureDiscoveryAmbiguityError):
+            discover_feature_selections()
+
+        assert ep.loaded is False
+
+    def test_authorized_but_unimportable_in_process_talon_fails_without_fallback(
+        self,
+    ):
+        runtime = InstalledFeatureRuntime(
+            class_name="TalonCoordinatorFeature",
+            entry_point=(
+                "kestrel_feature_talon.coordinator:TalonCoordinatorFeature"
+            ),
+            distribution="kestrel-feature-talon",
+            runtime="in-process",
+        )
+        ep = MagicMock()
+        ep.name = runtime.class_name
+        ep.value = runtime.entry_point
+        ep.dist.name = runtime.distribution
+        ep.load.side_effect = ImportError("broken extracted install")
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ), pytest.raises(
+            FeatureDiscoveryAmbiguityError,
+            match="did not provide a valid importable in-process replacement",
+        ):
+            discover_feature_selections()
+
+    def test_external_lookup_aliases_use_implementation_module(self):
+        class ForecastFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Forecast"
+
+            async def initialize(self):
+                pass
+
+        ForecastFeature.__module__ = "vendor_weather.feature"
+        ep = self._make_entry_point("forecast-entry-alias", ForecastFeature)
+        ep.dist.name = "vendor-weather"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            assert discover_feature_class_by_name("vendor_weather") is ForecastFeature
+            assert discover_feature_class_by_name("forecast-entry-alias") is None
 
 
 class TestEntrypointClassName:

@@ -214,7 +214,7 @@ _PENDING_CONFIG_CLOCK_SKEW = timedelta(seconds=30)
 _PENDING_CLEANUP_WRITE_ATTEMPTS = 2
 _TERMINAL_TRAFFIC_ERROR = "isolated feature traffic is unavailable"
 
-# The locked SDK 0.35.1 has no public stop-budget export.  Its private
+# The locked SDK 0.36.0 has no public stop-budget export.  Its private
 # ``SupervisedIsolatedFeatureClient.stop()`` path observes a single facade's
 # lifecycle serially: two startup-settlement observations, eight child
 # retirement observations (spawn/startup, graceful shutdown, natural exit,
@@ -754,7 +754,7 @@ async def _await_owned_facade_lifecycle_operation(
     awaits graceful termination.  Cancelling that exact coroutine therefore
     cannot be repaired by a later ``stop()`` call: the later call sees no
     process to kill.  Own the operation in a task and observe caller
-    cancellation outside facade code. A real SDK 0.35.1 stop receives its full
+    cancellation outside facade code. A real SDK 0.36.0 stop receives its full
     documented graceful/terminate/kill budget; a hostile legacy facade which
     does not settle by then is cancelled, drained for a short acknowledgement
     window, and reported as an *uncertain* outcome through ``on_timeout``.
@@ -2327,6 +2327,7 @@ class ProxyFeature(Feature):
         # must keep its newer seal rather than being overwritten by stale
         # initialization state.
         self._terminal_lifecycle_generation = 0
+
         # Coordinate ``set_config``'s reload with the health supervisor so they
         # never stop/start the client concurrently. ``_reloading`` skips probes
         # during a reload; ``_reload_lock`` serializes the actual stop/start of
@@ -2387,6 +2388,31 @@ class ProxyFeature(Feature):
         # orphaning as a live SSE bubble.
         self._channel_type: Optional[str] = None
         self._link_tool: Optional[str] = None
+
+    @property
+    def contribution_owner(self) -> str:
+        """Return the durable contribution identity of this isolated runtime.
+
+        Every isolated feature is represented in-process by ``ProxyFeature``,
+        so the SDK's implementation-class default would give every proxy the
+        same owner.  Hash only installed runtime metadata: unlike process or
+        object identity, this remains stable across agent restarts while
+        distinguishing independently installed feature implementations.  The
+        fixed-format digest also remains within the SDK stable-token contract
+        regardless of distribution or entry-point length and character set.
+        """
+
+        identity = json.dumps(
+            (
+                self.runtime.distribution,
+                self.runtime.class_name,
+                self.runtime.entry_point,
+            ),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return f"isolated-runtime:{digest}"
 
     @property
     def tool_description(self) -> str:

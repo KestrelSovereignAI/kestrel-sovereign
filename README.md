@@ -93,6 +93,13 @@ uv run kestrel start Kestrel    # if you only ran --quickstart
 uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autostart)
 ```
 
+Installed features may contribute setup steps through the SDK. Their complete
+ordering is validated before any step runs, and contributed default steps may
+not precede the built-in `keys` custody boundary. Use `kestrel setup --core-only`
+to recover built-in configuration without importing provider code. `setup
+--check` is always core-only because Python plugins are not sandboxed and
+therefore cannot be trusted to honor a read-only check contract.
+
 > **Refreshing later — use the `kestrel` CLI, not raw `uv sync`.** The `uv sync` above is only for this first install. To pull in upstream changes afterward, run **`kestrel update`** (pull → install → reconcile → feature sync → restart). Plain `uv sync` makes the venv match `pyproject.toml` exactly and therefore **prunes out-of-tree feature packages** (`kestrel-feature-*`, voice/provider packages); `kestrel update` restores them in the same pass. See [Pulling in upstream changes](#pulling-in-upstream-changes-kestrel-update).
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
@@ -277,19 +284,20 @@ DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
 is always treated as a legacy migration; do not seed or unfence scheduler rows
 manually.
 
-#### SDK 0.35 release cascade
+#### SDK 0.36 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.35.1,<0.36`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
 runtime contract for durable isolated execution, provider-neutral private
 inference leases (including bounded owner-scoped idle renewal), and private
-host ingress. It is not a preference that a downstream package may relax. The
-Core-owned release-cascade contract is:
+host ingress, plus feature-owned operator contribution contracts. It is not a
+preference that a downstream package may relax. The Core-owned release-cascade
+contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.35.1,<0.36` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.35.1,<0.36` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim observability has changed. |
 
 Verify the published Frinz and observability constraints and tests before the
 Core publish. Do not weaken Core's requirement to make an older sibling
@@ -302,11 +310,11 @@ explicit release gate owned by those repositories.
 
 #### Telegram acknowledged-ingress release order
 
-Core 0.51.1 adds the host-authenticated initialize capability
+Core 0.52.1 adds the host-authenticated initialize capability
 `channel-inbound-acknowledgement-v1` for the Telegram polling bridge. Telegram
 0.1.3 requires that capability before it will start polling, preventing an old
 Core from mis-parsing its durable ACK envelope and leaving a child poller
-blocked. Publish Core 0.51.1 first, then publish Telegram 0.1.3; do not relax
+blocked. Publish Core 0.52.1 first, then publish Telegram 0.1.3; do not relax
 the Telegram requirement to make the reverse order installable.
 
 Windows base installs also include `tzdata`, so default `UTC` and named-IANA

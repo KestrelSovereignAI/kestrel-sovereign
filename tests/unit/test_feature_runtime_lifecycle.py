@@ -26,11 +26,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from kestrel_sdk.features import (
+    FeaturePermissionDefaults,
+    PermissionLevel as SDKPermissionLevel,
+)
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.security.feature import SecurityFeature
+from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
@@ -156,6 +162,25 @@ class _FullFeature(Feature):
     @tool("full_do", "does a full-feature thing", ToolCategory.SYSTEM)
     async def full_do(self):  # pragma: no cover - never executed here
         return "done"
+
+
+class _RuntimeDeniedFeature(Feature):
+    """Contributes a hard default only when its runtime lifecycle is active."""
+
+    tool_name = "runtime_denied_feature"
+    tool_description = "feature exercising runtime permission registration"
+
+    async def initialize(self):
+        return None
+
+    def get_feature_permission_defaults(self):
+        return FeaturePermissionDefaults(
+            feature_default=SDKPermissionLevel.DENY,
+        )
+
+    @tool("runtime_guarded", "guarded at runtime", ToolCategory.SYSTEM)
+    async def runtime_guarded(self):  # pragma: no cover - never executed here
+        return "blocked"
 
 
 class _FullFeatureWaitable:
@@ -700,6 +725,69 @@ async def test_reenable_on_agent_ready_failure_is_non_fatal(tmp_path):
     assert feature.ready_calls == 1
     live = _live_registrations(agent, feature)
     assert all(live.values()), f"ready-hook failure wrongly rolled back: {live}"
+
+
+@pytest.mark.asyncio
+async def test_runtime_enable_registers_contributed_hard_permission_immediately(
+    tmp_path,
+):
+    """Runtime activation consumes the newly-live declaration before exposure."""
+    agent = _agent(tmp_path)
+    security = SecurityFeature(agent)
+    await security.initialize()
+    agent.features[security.name] = security
+
+    feature = _RuntimeDeniedFeature(agent)
+    feature.enabled = False
+    agent.features[feature.name] = feature
+    await security.permission_store.register_tool(
+        feature.name,
+        "runtime_guarded",
+        PermissionLevel.ALLOW,
+    )
+
+    await agent._activate_feature_runtime(feature)
+
+    assert feature.enabled is True
+    assert (
+        await security.permission_store.get_permission(
+            feature.name,
+            "runtime_guarded",
+        )
+        is PermissionLevel.DENY
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_permission_registration_failure_rolls_back_activation(
+    tmp_path,
+    monkeypatch,
+):
+    """Permission registration is an atomic activation gate, not an afterthought."""
+    agent = _agent(tmp_path)
+    security = SecurityFeature(agent)
+    await security.initialize()
+    agent.features[security.name] = security
+
+    feature = _RuntimeDeniedFeature(agent)
+    feature.enabled = False
+    agent.features[feature.name] = feature
+
+    async def fail_registration(*args, **kwargs):
+        raise RuntimeError("permission registration failed")
+
+    monkeypatch.setattr(
+        security,
+        "register_feature_tools",
+        fail_registration,
+    )
+
+    with pytest.raises(RuntimeError, match="permission registration failed"):
+        await agent._activate_feature_runtime(feature)
+
+    assert feature.enabled is False
+    assert not agent.feature_contribution_runtime.is_active(feature)
+    assert feature.tool_name not in agent.task_manager.agents
 
 
 # ---------------------------------------------------------------------------

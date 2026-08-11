@@ -51,6 +51,37 @@ class PermissionLevel(Enum):
     SESSION = "session"
 
 
+def assert_sdk_permission_level_parity() -> None:
+    """Fail closed unless SDK declarations match Sovereign enforcement.
+
+    Feature packages declare defaults with the SDK enum while this module owns
+    persistence and enforcement.  Comparing both names *and* values prevents a
+    newly-added or renamed SDK value from being accepted by only part of the
+    security stack.
+    """
+    from kestrel_sdk.features import PermissionLevel as SDKPermissionLevel
+
+    sovereign = {level.name: level.value for level in PermissionLevel}
+    sdk = {level.name: level.value for level in SDKPermissionLevel}
+    enforcement = set(_LEVEL_RANK)
+    composition = set(_CONTRIBUTED_TIGHTENING)
+    hardening = set(_HARDENED_PRESERVED_LEVELS)
+    if (
+        sdk != sovereign
+        or enforcement != set(PermissionLevel)
+        or composition != set(PermissionLevel)
+        or hardening != set(PermissionLevel)
+    ):
+        raise RuntimeError(
+            "SDK/Sovereign permission vocabulary mismatch; refusing feature "
+            "permission defaults "
+            f"(sdk={sdk!r}, sovereign={sovereign!r}, "
+            f"enforced={sorted(level.value for level in enforcement)!r}, "
+            f"composed={sorted(level.value for level in composition)!r}, "
+            f"hardened={sorted(level.value for level in hardening)!r})"
+        )
+
+
 @dataclass
 class ToolPermission:
     """Permission configuration for a single tool."""
@@ -145,6 +176,86 @@ _LEVEL_RANK = {
     PermissionLevel.AUTO: 3,
     PermissionLevel.SESSION: 2,
     PermissionLevel.ASK: 1,
+}
+
+# Static-rail composition is a separate concern from the legacy-row winner
+# policy above. ALLOW/AUTO/SESSION/ASK are operational modes, not a general
+# restrictiveness order: global auto mode can promote three of them, while
+# static ALLOW entries intentionally migrate selected unattended tools. Only
+# ALWAYS_ASK and DENY are hard rails with a strict ordering. Listing every
+# declaration keeps the vocabulary closed when the SDK enum grows.
+_CONTRIBUTED_TIGHTENING = {
+    PermissionLevel.ALLOW: None,
+    PermissionLevel.AUTO: None,
+    PermissionLevel.SESSION: None,
+    PermissionLevel.ASK: None,
+    PermissionLevel.ALWAYS_ASK: PermissionLevel.ALWAYS_ASK,
+    PermissionLevel.DENY: PermissionLevel.DENY,
+}
+
+
+def compose_restrictive_permission(
+    sovereign_level: PermissionLevel,
+    declared_level: PermissionLevel,
+) -> PermissionLevel:
+    """Compose a Sovereign baseline or rail with a declaration, fail closed.
+
+    Ordinary declaration modes cannot replace a Sovereign-owned feature
+    baseline or per-tool override. A contributed ALWAYS_ASK or DENY may tighten
+    it, and DENY remains the strongest rail. This policy is intentionally not a
+    numeric ordering: the operational modes have different migration and
+    auto-mode semantics.
+    """
+
+    if set(_CONTRIBUTED_TIGHTENING) != set(PermissionLevel):
+        raise RuntimeError(
+            "Permission restrictiveness vocabulary is incomplete; refusing "
+            "to compose static and contributed defaults"
+        )
+    tightening = _CONTRIBUTED_TIGHTENING[declared_level]
+    if sovereign_level is PermissionLevel.DENY or tightening is None:
+        return sovereign_level
+    if tightening is PermissionLevel.DENY:
+        return PermissionLevel.DENY
+    if sovereign_level is PermissionLevel.ALWAYS_ASK:
+        return PermissionLevel.ALWAYS_ASK
+    return tightening
+
+
+# Hardened registration normally preserves levels at least as restrictive as
+# its target.  Static ALLOW entries are deliberate migrations for unattended
+# reconciliation, so they retain their historic behavior: stale ASK/AUTO/
+# SESSION defaults are upgraded while explicit ALWAYS_ASK and DENY operator
+# rails survive.  Listing every target fails closed if the enum grows.
+_HARDENED_PRESERVED_LEVELS = {
+    PermissionLevel.ALLOW: frozenset({
+        PermissionLevel.ALLOW,
+        PermissionLevel.ALWAYS_ASK,
+        PermissionLevel.DENY,
+    }),
+    PermissionLevel.AUTO: frozenset({
+        PermissionLevel.AUTO,
+        PermissionLevel.SESSION,
+        PermissionLevel.ASK,
+        PermissionLevel.ALWAYS_ASK,
+        PermissionLevel.DENY,
+    }),
+    PermissionLevel.SESSION: frozenset({
+        PermissionLevel.SESSION,
+        PermissionLevel.ASK,
+        PermissionLevel.ALWAYS_ASK,
+        PermissionLevel.DENY,
+    }),
+    PermissionLevel.ASK: frozenset({
+        PermissionLevel.ASK,
+        PermissionLevel.ALWAYS_ASK,
+        PermissionLevel.DENY,
+    }),
+    PermissionLevel.ALWAYS_ASK: frozenset({
+        PermissionLevel.ALWAYS_ASK,
+        PermissionLevel.DENY,
+    }),
+    PermissionLevel.DENY: frozenset({PermissionLevel.DENY}),
 }
 
 _AUTO_MODE_EXEMPT_LEVELS = {
@@ -715,13 +826,13 @@ class PermissionStore:
             feature_name: Name of the feature
             tool_name: Name of the tool
             default_level: Default permission level (default: ASK)
-            hardened: When True, ``default_level`` is a non-downgradeable hard
-                rail rather than a first-registration default. In addition to
-                the usual insert-if-missing, any *existing* row for this tool
-                (across every casing/alias variant) whose level ranks below
-                ``default_level`` is force-upgraded to it. A stricter operator
-                choice — a level ranking at or above ``default_level`` (e.g.
-                DENY over ALWAYS_ASK) — is preserved. This is what closes the
+            hardened: When True, ``default_level`` is an enforced static or
+                contributed rail rather than a first-registration default. In
+                addition to the usual insert-if-missing, incompatible existing
+                rows for this tool (across every casing/alias variant) are
+                migrated to it. Explicit harder operator rails are preserved;
+                static ALLOW migrations retain their reviewed upgrade policy.
+                This is what closes the
                 F203 upgrade gap (#2093): an agent that already persisted a
                 permissive ``ALLOW`` row for a destructive memory tool under
                 the old feature-level default would otherwise keep bypassing
@@ -730,17 +841,20 @@ class PermissionStore:
         """
         async with aiosqlite.connect(self.db_path) as db:
             if hardened:
-                # Force-upgrade any pre-existing permissive rows (any casing /
-                # alias variant) to the hard rail. Rows that already rank at or
-                # above the hard rail (a stricter DENY, or an identical
-                # ALWAYS_ASK) are left untouched, so we never downgrade the
-                # operator's last word and never churn updated_at needlessly.
-                target_rank = _LEVEL_RANK.get(default_level, 0)
-                preserved = [
-                    level.value
-                    for level in PermissionLevel
-                    if _LEVEL_RANK.get(level, 0) >= target_rank
-                ]
+                # Force-upgrade incompatible pre-existing rows (any casing /
+                # alias variant) while preserving the reviewed harder choices
+                # for this target. The explicit table avoids reusing the
+                # unrelated legacy-alias winner ranking.
+                try:
+                    preserved = [
+                        level.value
+                        for level in _HARDENED_PRESERVED_LEVELS[default_level]
+                    ]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "Permission hardening vocabulary is incomplete; "
+                        f"cannot register {default_level!r}"
+                    ) from exc
                 names = sorted(self.feature_name_variants(feature_name))
                 name_placeholders = ",".join(["?"] * len(names))
                 preserved_placeholders = ",".join(["?"] * len(preserved))

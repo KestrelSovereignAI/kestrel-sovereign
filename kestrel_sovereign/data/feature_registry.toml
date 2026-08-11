@@ -561,6 +561,11 @@ boundary = "bundled"
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["TalonCoordinatorFeature"]
+# Temporary discovery migration: an installed extracted coordinator replaces
+# this bundled predecessor, while this row intentionally remains bundled until
+# the later ownership-cutover story.
+extracted_replacement_package = "kestrel-feature-talon"
+extracted_replacement_module_prefix = "kestrel_feature_talon"
 companion = "talon_cli"
 description = "Bundled in-agent coordinator for the standalone kestrel-talon GitHub issue processor"
 tags = ["automation", "github", "devtools"]

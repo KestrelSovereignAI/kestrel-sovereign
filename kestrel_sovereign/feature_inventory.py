@@ -446,6 +446,8 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         "1. **Bundled Feature modules** — discovered from `kestrel_sovereign/features/` via `discover_feature_modules()`.",
         "2. **Extracted Feature packages** — installed packages registered with the `kestrel_sovereign.features` entry point group at runtime.",
         "",
+        "A bundled/external class-name collision fails closed unless the bundled registry row explicitly authorizes that exact extracted distribution and implementation-module prefix as a temporary migration replacement. Two external owners always fail.",
+        "",
         "The generated inventory below lists bundled Feature lifecycle modules only: the in-tree surface discoverable from this checkout.",
         "Installed entry point feature classes are included in JSON output when present in the active environment.",
         "Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.",

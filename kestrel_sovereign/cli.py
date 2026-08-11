@@ -1337,7 +1337,11 @@ def cmd_setup(args) -> int:
 
         load_project_env(project_dir, exclude=(DATA_KEY_ENV,))
 
-    return run_wizard(ctx, only_step=args.step)
+    return run_wizard(
+        ctx,
+        only_step=args.step,
+        core_only=getattr(args, "core_only", False),
+    )
 
 
 def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
@@ -1781,9 +1785,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_p.add_argument(
         "step", nargs="?",
-        choices=["keys", "llm", "integrations", "agent", "verify", "talon"],
         help="Run only this step (default: run all in order). "
-             "Optional steps (talon) only run when named explicitly.",
+             "Installed feature steps and optional steps only run when named "
+             "explicitly.",
     )
     setup_p.add_argument(
         "--quickstart", action="store_true",
@@ -1792,6 +1796,10 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument(
         "--check", action="store_true",
         help="Report readiness only, never write or prompt",
+    )
+    setup_p.add_argument(
+        "--core-only", action="store_true",
+        help="Run only built-in setup/recovery steps without loading providers",
     )
     setup_p.add_argument(
         "--reset", action="store_true",

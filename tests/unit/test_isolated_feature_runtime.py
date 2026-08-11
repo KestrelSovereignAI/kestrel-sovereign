@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.isolated_feature import (
     MAX_HOST_INGRESS_PAYLOAD_BYTES,
     ConfigTransitionError,
@@ -29,6 +31,10 @@ from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
+from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
+    FeatureContributionRuntime,
+)
 from kestrel_sovereign.features.isolated_runtime import (
     HostedTelegramRouteAttestation,
     ProxyFeature,
@@ -49,9 +55,11 @@ from kestrel_sovereign.features.scheduler.runner import (
     _SchedulerExecutionScope,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.operator import OperatorRuntimeRegistry
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from kestrel_sovereign.waits import WaitRegistry
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
@@ -68,6 +76,78 @@ def _child_distribution_probe(version: str):
     if version == "unknown":
         return isolated_runtime._FeatureDistributionProbe.present_unversioned()
     return isolated_runtime._FeatureDistributionProbe.versioned(version)
+
+
+def test_proxy_contribution_owners_are_stable_and_runtime_specific():
+    agent = Mock(did=_TEST_AGENT_DID, agent_id=_TEST_AGENT_DID)
+    first_runtime = InstalledFeatureRuntime(
+        class_name="FirstIsolatedFeature",
+        entry_point="shared.feature:FirstIsolatedFeature",
+        distribution="shared-isolated-package",
+        runtime="isolated-venv",
+        service="first-service",
+    )
+    second_runtime = InstalledFeatureRuntime(
+        class_name="SecondIsolatedFeature",
+        entry_point="shared.feature:SecondIsolatedFeature",
+        distribution="shared-isolated-package",
+        runtime="isolated-venv",
+        service="second-service",
+    )
+    first = ProxyFeature(agent, first_runtime)
+    restarted_first = ProxyFeature(agent, first_runtime)
+    second = ProxyFeature(agent, second_runtime)
+
+    assert first.contribution_owner == restarted_first.contribution_owner
+    assert first.contribution_owner != second.contribution_owner
+    assert first.contribution_owner.startswith("isolated-runtime:")
+    assert len(first.contribution_owner) <= 256
+
+    runtime = FeatureContributionRuntime(
+        operator_registry=OperatorRuntimeRegistry(),
+        wait_registry=WaitRegistry(),
+        source_registry=SourceRegistry(),
+    )
+    prepared = runtime.prepare_transition((first, second))
+    assert tuple(item.owner for item in prepared) == (
+        first.contribution_owner,
+        second.contribution_owner,
+    )
+
+
+def test_proxy_duplicate_runtime_owner_is_rejected_before_transition_mutation():
+    agent = Mock(did=_TEST_AGENT_DID, agent_id=_TEST_AGENT_DID)
+    runtime_metadata = InstalledFeatureRuntime(
+        class_name="ConflictingIsolatedFeature",
+        entry_point="conflict.feature:ConflictingIsolatedFeature",
+        distribution="conflicting-isolated-package",
+        runtime="isolated-venv",
+        service="conflict-service",
+    )
+    first = ProxyFeature(agent, runtime_metadata)
+    duplicate = ProxyFeature(agent, runtime_metadata)
+    runtime = FeatureContributionRuntime(
+        operator_registry=OperatorRuntimeRegistry(),
+        wait_registry=WaitRegistry(),
+        source_registry=SourceRegistry(),
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((first, duplicate))
+
+    error = exc_info.value
+    assert error.feature is duplicate
+    assert error.stage == "contribution validation"
+    assert error.getter == "validate_contribution_owner_uniqueness"
+    assert str(error) == (
+        "feature contribution failure during contribution validation "
+        "(validate_contribution_owner_uniqueness)"
+    )
+    assert duplicate.contribution_owner not in str(error)
+    assert "duplicate active feature contribution_owner" not in str(error)
+    assert type(error.__cause__) is ContributionContractError
+    assert "duplicate active feature contribution_owner" in str(error.__cause__)
+    assert runtime.active_owners() == ()
 
 
 class FakeIsolatedClient:
@@ -12264,7 +12344,7 @@ async def test_owned_facade_timeout_acknowledges_child_cancellation_as_timeout(
 
 
 def test_facade_lifecycle_timeout_covers_locked_sdk_stop_sequence():
-    """The host deadline tracks every sequential SDK 0.35.1 stop observation."""
+    """The host deadline tracks every sequential SDK 0.36.0 stop observation."""
 
     assert isolated_runtime._SDK_SUBPROCESS_STOP_BUDGET == 33.0
     assert isolated_runtime._FACADE_LIFECYCLE_OPERATION_TIMEOUT == 36.0
