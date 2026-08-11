@@ -35,6 +35,36 @@ _DELETE_ID_BATCH = 500
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
+def _has_only(properties: Dict[str, Any], allowed: frozenset) -> bool:
+    """Whether ``properties`` carries no key outside ``allowed``.
+
+    Spelled as a subset test on purpose. The obvious-looking
+    ``set(properties) > allowed`` asks whether the keys are a *proper superset*
+    of the allowed set, which is a different — and much weaker — question: swap
+    an optional key for an unlisted one (drop ``created_at``, add
+    ``source_path``) and the key set is no longer a superset at all, so the
+    guard never fires and the unlisted key rides onto a row other tenants
+    co-own. That is the exact leak these predicates exist to prevent.
+    """
+    return set(properties) <= allowed
+
+
+#: The bounded public metadata a shared constitution anchor may carry.
+_SHAREABLE_CONSTITUTION_KEYS = frozenset({"hash", "type", "created_at"})
+
+#: The bounded, content-derived metadata a shared reanchor artifact may carry.
+_SHAREABLE_ARTIFACT_KEYS = frozenset(
+    {
+        "hash",
+        "type",
+        "artifact_type",
+        "constitution_hash",
+        "signer",
+        "created_at",
+    }
+)
+
+
 def _is_tz_aware_iso(value: Any) -> bool:
     """A timezone-qualified ISO timestamp, bounded in length."""
     if not isinstance(value, str) or len(value) > 64:
@@ -50,7 +80,7 @@ def _is_shareable_constitution_properties(
     properties: Dict[str, Any], node_id: str
 ) -> bool:
     """Validate the bounded public metadata allowed on a shared anchor."""
-    if set(properties) > {"hash", "type", "created_at"}:
+    if not _has_only(properties, _SHAREABLE_CONSTITUTION_KEYS):
         return False
     if (
         properties.get("hash") != node_id
@@ -98,14 +128,7 @@ def _is_shareable_amendment_artifact_properties(
     tenant's paths reachable from another's row, which is why
     ``privacy_wrapper`` refused to treat this node type as content-free.
     """
-    if set(properties) > {
-        "hash",
-        "type",
-        "artifact_type",
-        "constitution_hash",
-        "signer",
-        "created_at",
-    }:
+    if not _has_only(properties, _SHAREABLE_ARTIFACT_KEYS):
         return False
     if (
         properties.get("hash") != node_id
