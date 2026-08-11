@@ -17,7 +17,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,35 @@ class DurableDelegatedChildWalletProviderProtocol(Protocol):
         memo: str,
         currency: Any,
     ) -> WalletProtocol | None: ...
+
+
+class DurableDelegatedChildWalletReleaseProviderProtocol(Protocol):
+    """Provider-owned terminal release for a durably provisioned child.
+
+    The provider reads its authoritative child balance, fences that child
+    against all future debits, credits the parent, and records the terminal
+    allocation state in one atomic transaction.  The returned amount is the
+    durable release result and is stable across retries; Core must not derive
+    it from ``BudgetAllocation.spent``.
+    """
+
+    async def release_and_fence_delegated_child_wallet(
+        self, *, allocation_id: str, currency: Any
+    ) -> Decimal: ...
+
+
+def has_durable_delegated_child_wallet_provisioning_contract(wallet: object) -> bool:
+    """Whether *wallet* atomically reserves and provisions a durable child.
+
+    This capability is the authority for a production spawn's affordability
+    decision.  It is intentionally shared with ``AgentManager`` so a stale
+    synchronous cache check cannot be reintroduced before the provider's
+    idempotent reserve.
+    """
+
+    return callable(
+        getattr(wallet, "reserve_and_provision_delegated_child_wallet", None)
+    )
 
 
 class BudgetExceededError(Exception):
@@ -229,8 +258,16 @@ class DelegatedWallet:
     def _durable_child_wallet_provider(
         wallet: WalletProtocol,
     ) -> DurableDelegatedChildWalletProviderProtocol | None:
-        provision = getattr(wallet, "reserve_and_provision_delegated_child_wallet", None)
-        if callable(provision):
+        if has_durable_delegated_child_wallet_provisioning_contract(wallet):
+            return wallet  # type: ignore[return-value]
+        return None
+
+    @staticmethod
+    def _durable_child_wallet_release_provider(
+        wallet: WalletProtocol,
+    ) -> DurableDelegatedChildWalletReleaseProviderProtocol | None:
+        release = getattr(wallet, "release_and_fence_delegated_child_wallet", None)
+        if callable(release):
             return wallet  # type: ignore[return-value]
         return None
 
@@ -327,10 +364,40 @@ class DelegatedWallet:
                 )
             self._refund_attempted = True
             unspent = self.allocation.remaining
-            if unspent <= 0:
+            child_release_provider = self._durable_child_wallet_release_provider(
+                parent_wallet
+            )
+            if child_release_provider is not None:
+                released_amount = await child_release_provider.release_and_fence_delegated_child_wallet(
+                    allocation_id=self.allocation.allocation_id,
+                    currency=currency,
+                )
+                try:
+                    unspent = Decimal(released_amount)
+                except (TypeError, ValueError, InvalidOperation) as exc:
+                    raise RuntimeError(
+                        "durable child release provider returned an invalid amount"
+                    ) from exc
+                if not unspent.is_finite() or unspent < 0:
+                    raise RuntimeError(
+                        "durable child release provider returned an invalid amount"
+                    )
+                # The allocation record is a local presentation cache only.
+                # Synchronize it from the provider's authoritative child
+                # balance after release so status/logging cannot claim the
+                # old process's volatile spend total.
+                self.allocation.spent = max(
+                    Decimal("0"), self.allocation.amount - unspent
+                )
+            elif self._durable_child_wallet_provider(parent_wallet) is not None:
+                raise RuntimeError(
+                    "durably provisioned delegated child requires a provider-owned "
+                    "child-fencing release contract"
+                )
+            elif unspent <= 0:
                 self._refund_completed = True
                 return unspent
-            if durable_hold:
+            elif durable_hold:
                 released = await provider.release_delegated_allocation(  # type: ignore[union-attr]
                     allocation_id=self.allocation.allocation_id,
                     amount=unspent,

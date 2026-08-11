@@ -30,6 +30,7 @@ from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.spawn.delegated_wallet import (
     _default_currency_for,
     create_delegated_wallet,
+    has_durable_delegated_child_wallet_provisioning_contract,
     release_delegated_wallet,
 )
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
@@ -2091,6 +2092,14 @@ class AgentManager:
                 "funded wallet (enable the wallet feature). Spawn without a budget "
                 "or fund the parent's wallet."
             )
+        if has_durable_delegated_child_wallet_provisioning_contract(parent_wallet):
+            # A persistent provider's in-memory balance is explicitly only a
+            # local snapshot. Its atomic reserve-and-provision transaction is
+            # the affordability authority and also recognizes exact retries,
+            # so a synchronous preflight here would reject an already-held
+            # budget or a concurrent-process deposit before the provider can
+            # decide safely.
+            return
         currency = _default_currency_for(parent_wallet)
         if not parent_wallet.can_afford(budget, currency):
             raise ValueError(

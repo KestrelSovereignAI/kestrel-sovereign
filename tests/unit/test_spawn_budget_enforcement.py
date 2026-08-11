@@ -114,6 +114,7 @@ class DurableProvisioningWallet(DurableHoldOnlyWallet):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.provision_calls = []
+        self.release_calls = []
         self.children = {}
 
     async def reserve_and_provision_delegated_child_wallet(
@@ -140,6 +141,16 @@ class DurableProvisioningWallet(DurableHoldOnlyWallet):
         child._balances[currency]["main"] = amount
         self.children[allocation_id] = child
         return child
+
+    async def release_and_fence_delegated_child_wallet(
+        self, *, allocation_id, currency
+    ):
+        self.release_calls.append(allocation_id)
+        child = self.children[allocation_id]
+        unspent = child.get_balance(currency, "main")
+        child._balances[currency]["main"] = Decimal("0")
+        self._balances[currency]["main"] += unspent
+        return unspent
 
 
 # --------------------------- DelegatedWallet drop-in ---------------------------
@@ -215,6 +226,33 @@ async def test_durable_provider_provisions_and_persists_child_without_core_walle
     assert retried._wallet is delegated._wallet
     assert parent.get_balance() == Decimal("70")
     assert len(parent.provision_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_child_release_uses_provider_balance_not_volatile_allocation_spend():
+    """A reconstructed Core wrapper must not refund its stale local counter."""
+
+    parent = DurableProvisioningWallet(initial_balance=Decimal("100"))
+    delegated = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert await delegated.transfer(Decimal("7"), "durable child work") is True
+
+    # Simulate process restart: this allocation presentation has no confirmed
+    # spend history, but the provider-owned child wallet has only 23 left.
+    restarted = DelegatedWallet(
+        delegated._wallet,
+        BudgetAllocation(
+            child_did="did:c",
+            parent_did="did:p",
+            amount=Decimal("30"),
+            allocation_id=delegated.allocation.allocation_id,
+            parent_hold_durable=True,
+        ),
+    )
+    assert await release_delegated_wallet(restarted, parent) == Decimal("23")
+    assert parent.get_balance() == Decimal("93")
+    assert parent.release_calls == [delegated.allocation.allocation_id]
+    assert await release_delegated_wallet(restarted, parent) == Decimal("0")
+    assert parent.get_balance() == Decimal("93")
 
 @pytest.mark.asyncio
 async def test_nested_budgeted_spawn_unwraps_delegated_parent():
@@ -544,6 +582,30 @@ async def test_budget_refused_when_parent_cannot_afford():
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("50"))
     with pytest.raises(ValueError, match="cannot afford"):
         await mgr.spawn_agent("Kid", parent, mandate)
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_bypasses_stale_preflight_for_durable_provisioner():
+    """Only the provider's atomic reserve may decide a durable spawn budget."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    # ``DurableProvisioningWallet.can_afford`` deliberately raises: it models
+    # a cross-process stale snapshot, while its reserve/provision seam is the
+    # authoritative transaction exercised by the wallet package regression.
+    parent = SimpleNamespace(
+        agent_id="did:p",
+        wallet=DurableProvisioningWallet(initial_balance=Decimal("30")),
+    )
+    mandate = SpawnMandate(
+        parent_did="did:p",
+        purpose="x",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+
+    AgentManager()._validate_budget_precondition(parent, mandate)
 
 
 @pytest.mark.asyncio
