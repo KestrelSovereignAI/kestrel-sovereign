@@ -205,6 +205,21 @@ class ChannelFeature(Feature):
         # Own the source we newly registered so shutdown / boot rollback
         # unregisters it (#2522 P2).
         self._own_signal_sources(outcome)
+        if not outcome.ok:
+            # ``OPTIONAL`` keeps a pre-existing source alive on a mismatch or
+            # validation failure.  That is tolerable for an ordinary optional
+            # feature, but not for cursor-owning channel ingress: its durable
+            # consumer would otherwise bind to a different (or absent)
+            # ``channel.message`` contract and let a provider ACK work that
+            # Core cannot safely process.  Preserve the provider cursor until
+            # this feature can start against its intended contract.
+            self._durable_cognition_registration_failed = True
+            logger.error(
+                "Channel signal source registration is not usable for durable "
+                "cognition (state=%s): %s; ACK-bearing ingress will remain retryable",
+                outcome.state.value,
+                outcome.detail,
+            )
 
     async def _register_durable_cognition_consumer(self) -> None:
         """Register the restart-safe delivery behind ACK-bearing channels.
@@ -213,6 +228,8 @@ class ChannelFeature(Feature):
         dispatchers.  In that compatibility case ingress retains its cursor
         rather than claiming delivery was made durable.
         """
+        if self._durable_cognition_registration_failed:
+            return
         dispatcher = getattr(self.agent, "dispatcher", None)
         register = getattr(dispatcher, "register_durable_consumer", None)
         agent_did = getattr(self.agent, "did", None)

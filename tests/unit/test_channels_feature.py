@@ -38,6 +38,10 @@ from kestrel_sovereign.signals.dispatcher import (
     DurableAdmissionDisposition,
     DurableAdmissionResult,
 )
+from kestrel_sovereign.signals.registry import (
+    RegistrationOutcome,
+    RegistrationState,
+)
 
 # ============================================================================
 # Helpers
@@ -688,6 +692,51 @@ class TestChannelFeature:
         )
 
         assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state",
+        (RegistrationState.MISMATCH, RegistrationState.INVALID),
+    )
+    async def test_handle_inbound_fails_closed_when_channel_source_is_not_registered(
+        self, state
+    ):
+        """A non-OK optional source outcome keeps ACK-bearing ingress retryable."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.signal_registry = MagicMock()
+        agent.signal_registry.register_with_policy.return_value = RegistrationOutcome(
+            "channel.message", state, "test source contract failure"
+        )
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="retain my provider cursor",
+            )
+        )
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.register_durable_consumer.assert_not_awaited()
         agent.dispatcher.enqueue_signal.assert_not_awaited()
         agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
         router.assert_not_awaited()

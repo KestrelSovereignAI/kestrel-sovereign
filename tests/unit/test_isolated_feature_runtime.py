@@ -4,10 +4,12 @@ import asyncio
 import gc
 import json
 import os
+import sys
 import threading
 import types
 import weakref
 from datetime import datetime, timedelta, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1059,6 +1061,9 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ir, "_feature_distribution_version", lambda _distribution, _target: "1.0.0"
     )
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "1.0.0"
+    )
 
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
     feature.ensure_venv()  # fresh: uv venv + uv pip install (no --upgrade)
@@ -1069,6 +1074,7 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert manifest["provisioned_against_host_sdk"] == "0.28.0"
     assert manifest["child_sdk_version"] == "0.28.0"
     assert manifest["feature_distribution_version"] == "1.0.0"
+    assert manifest["child_feature_distribution_version"] == "1.0.0"
 
     runs.clear()
     # Same host SDK → no reprovision.
@@ -1134,6 +1140,11 @@ def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, 
         "_feature_distribution_version",
         lambda distribution, target: version["value"],
     )
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_version",
+        lambda _path, _distribution: version["value"],
+    )
 
     feature.ensure_venv()
     runs.clear()
@@ -1197,11 +1208,19 @@ def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatc
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
     runs = []
 
+    import tomllib
+
+    child_version = {"value": "0.1.1"}
+
     def fake_run(cmd):
         runs.append(cmd)
         python = feature._venv_path / "bin" / "python"
         python.parent.mkdir(parents=True, exist_ok=True)
         python.touch()
+        if "pip" in cmd and "install" in cmd:
+            child_version["value"] = tomllib.loads(pyproject.read_text())["project"][
+                "version"
+            ]
 
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
@@ -1209,6 +1228,11 @@ def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatc
     # A real editable installation can retain this old dist-info version until
     # it is reinstalled; the local source stamp must still see the upgrade.
     monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_version",
+        lambda _path, _distribution: child_version["value"],
+    )
 
     feature.ensure_venv()
     runs.clear()
@@ -1293,6 +1317,10 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _p, _d: "unknown"
+    )
 
     # First startup: override path missing → bootstrap (create + install + stamp).
     feature.ensure_venv()
@@ -1309,6 +1337,106 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
     feature.ensure_venv()
     upgrades = [c for c in runs if "pip" in c and "install" in c]
     assert upgrades and "--upgrade" in upgrades[-1]
+
+
+def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
+    tmp_path, monkeypatch
+):
+    """A successful resolver run cannot mark an obsolete child package fresh."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.2.0")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "0.1.9"
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to stamp the venv fresh"):
+        feature.ensure_venv()
+
+    assert not (feature._venv_path / ".kestrel_provision.json").exists()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert len(installs) == 1 and "--upgrade" not in installs[0]
+
+
+def test_venv_feature_distribution_probe_executes_in_target_interpreter():
+    """The generated ``python -c`` probe contains executable newlines."""
+
+    assert isolated_runtime._venv_feature_distribution_version(
+        Path(sys.executable), "pytest"
+    ) == importlib_metadata.version("pytest")
+
+
+def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
+    tmp_path, monkeypatch
+):
+    """Unobservable host/child metadata is stable rather than permanently stale."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="UnknownFeature",
+        entry_point="unknown.feature:UnknownFeature",
+        distribution="unknown-package",
+        runtime="isolated-venv",
+        service="unknown-service",
+        project="unknown-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _path, _distribution: "unknown"
+    )
+
+    feature.ensure_venv()
+    manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
+    assert manifest["feature_distribution_version"] == "unknown"
+    assert manifest["child_feature_distribution_version"] == "unknown"
+    runs.clear()
+
+    feature.ensure_venv()
+    assert runs == []
 
 
 # --- F023: isolated service launch env must not inherit interpreter shadowing --
@@ -6091,6 +6219,83 @@ async def test_ack_bearing_ingress_never_acknowledges_legacy_router_fallback(mon
         assert feature._event_ack_tasks == set()
     finally:
         await feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ("MISMATCH", "INVALID"))
+async def test_ack_bearing_ingress_nacks_when_channel_source_contract_is_unusable(
+    monkeypatch, tmp_path, state_name
+):
+    """A rejected channel source contract reaches Telegram as a retry, never an ACK."""
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+    from kestrel_sovereign.signals.registry import (
+        RegistrationOutcome,
+        RegistrationState,
+    )
+
+    dedupe_key = f"telegram:v2:bot:42:update:source-{state_name.lower()}"
+    nacked = asyncio.Event()
+    state = getattr(RegistrationState, state_name)
+
+    class SourceRegistry:
+        def register_with_policy(self, _registration, _policy):
+            return RegistrationOutcome(
+                "channel.message", state, "test source contract failure"
+            )
+
+    class RetryClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=SourceRegistry(),
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RetryClient)
+    feature._host_config = {
+        "agent_id": _TEST_AGENT_DID,
+        "enabled": True,
+        "allowed_senders": ["555"],
+    }
+    feature._host_config_loaded = True
+    try:
+        await feature.initialize()
+        assert channel_feature._durable_cognition_registration_failed is True
+        await feature._client.event_handler(_retryable_telegram_event(dedupe_key))
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+        assert feature._client.completions == [
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
 
 
 @pytest.mark.asyncio

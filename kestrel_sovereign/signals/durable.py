@@ -82,10 +82,11 @@ class DurableSignalEvent:
     payload: Any
     session_id: Optional[str]
     # ``caller_identity`` is an opaque, dispatcher-produced ciphertext for a
-    # persistence-allowed caller (or the ``v1:none`` sentinel).  It is never a
-    # raw caller identifier in storage.  Payload-elided rows deliberately
-    # leave it NULL and bind the caller only through their keyed integrity
-    # proof plus the verified live retry envelope.
+    # persistence-allowed caller, a keyless ``v2:opaque:...`` event label, or
+    # the ``v1:none`` sentinel.  It is never a raw caller identifier in
+    # storage. Payload-elided rows deliberately leave it NULL and bind the
+    # caller only through their keyed integrity proof plus the verified live
+    # retry envelope.
     caller_identity: Optional[str]
     visibility: str
     urgency: str

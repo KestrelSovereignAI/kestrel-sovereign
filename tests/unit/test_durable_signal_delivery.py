@@ -812,6 +812,60 @@ async def test_durable_caller_identity_is_tenant_bound_encrypted_and_reconstruct
 
 
 @pytest.mark.asyncio
+async def test_keyless_channel_ingress_uses_nonsecret_versioned_caller_label(
+    monkeypatch, tmp_path
+):
+    """Keyless NORMAL storage admits Telegram without retaining its raw caller twice."""
+
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "keyless-channel-ingress.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = "telegram:update:keyless-initial-ingress"
+    original = _channel_signal(agent.did, "keyless-initial-ingress")
+    original.caller = "telegram-user-555"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            original,
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await handle.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        assert (await handle.wait()).status is Status.OK
+
+        row = await backend.fetch_one(
+            "SELECT caller_identity FROM durable_signal_events WHERE event_id = ?",
+            (handle.signal_id,),
+        )
+        assert row is not None
+        assert row[0].startswith("v2:opaque:")
+        assert "telegram-user-555" not in row[0]
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        recovered = dispatcher._signal_from_durable_event(
+            delivery.event, dispatch_signal=original
+        )
+        assert recovered.caller == row[0]
+        assert recovered.caller != original.caller
+        assert delivery.status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("recovery_failure", ("missing-key", "rotated-key", "corrupt-cipher"))
 async def test_caller_recovery_failure_after_claim_releases_retry_and_logs_outcome(
     monkeypatch, tmp_path, recovery_failure

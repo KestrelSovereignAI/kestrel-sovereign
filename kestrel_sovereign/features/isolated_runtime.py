@@ -1870,6 +1870,39 @@ _CHILD_SDK_PROBE = (
 )
 
 
+def _venv_feature_distribution_version(python_path: Path, distribution: str) -> str:
+    """Return this runtime distribution's version from the isolated child.
+
+    A host-visible release is only an installation intent.  The resolver can
+    still select an older index package (notably when the host runs an editable
+    or pre-release build), so provisioning must verify the distribution that
+    actually landed before declaring the venv fresh.
+    """
+    if type(distribution) is not str or not distribution:
+        return "unknown"
+    bin_dir = python_path.parent
+    venv_path = bin_dir.parent if bin_dir.name in {"bin", "Scripts"} else None
+    probe = (
+        "from importlib import metadata as m\n"
+        f"distribution = {json.dumps(distribution)}\n"
+        "try:\n"
+        "    print(m.version(distribution))\n"
+        "except m.PackageNotFoundError:\n"
+        "    print('unknown')\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_isolated_child_env(venv_path),
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 - the caller applies the safe stale policy
+        return "unknown"
+
+
 def _venv_sdk_version(python_path: Path) -> str:
     """The kestrel-sdk version resolved *inside* the feature venv (may differ
     from the host when the feature pins the dependency)."""
@@ -5989,6 +6022,7 @@ class ProxyFeature(Feature):
         host_sdk: str,
         child_sdk: str,
         feature_distribution_version: str,
+        child_feature_distribution_version: str,
     ) -> None:
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6008,6 +6042,14 @@ class ProxyFeature(Feature):
                     # upgraded isolated feature cannot keep running an older
                     # child merely because its target string did not change.
                     "feature_distribution_version": feature_distribution_version,
+                    # The feature release actually resolved inside the child
+                    # venv.  It must equal the host-visible desired release
+                    # whenever that release is known; retaining it makes the
+                    # successful verification auditable and invalidates old
+                    # manifests that predate this check once.
+                    "child_feature_distribution_version": (
+                        child_feature_distribution_version
+                    ),
                 },
                 indent=2,
             )
@@ -6036,6 +6078,14 @@ class ProxyFeature(Feature):
         if not isinstance(stamped_version, str):
             return True
         if installed_version != "unknown" and stamped_version != installed_version:
+            return True
+        stamped_child_version = manifest.get("child_feature_distribution_version")
+        if not isinstance(stamped_child_version, str):
+            return True
+        if (
+            installed_version != "unknown"
+            and stamped_child_version != installed_version
+        ):
             return True
         return False
 
@@ -6101,12 +6151,29 @@ class ProxyFeature(Feature):
         # don't thrash reinstalling a genuinely pinned feature every startup.
         host_sdk = _host_sdk_version()
         child_sdk = _venv_sdk_version(python_path)
+        desired_feature_version = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        child_feature_version = _venv_feature_distribution_version(
+            python_path, self.runtime.distribution
+        )
+        if (
+            desired_feature_version != "unknown"
+            and child_feature_version != desired_feature_version
+        ):
+            raise RuntimeError(
+                f"Isolated feature {self.name} installed "
+                f"{self.runtime.distribution!r} version {child_feature_version!r}, "
+                f"but host requires {desired_feature_version!r}; refusing to "
+                "stamp the venv fresh"
+            )
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
         self._write_provision_manifest(
             install_target,
             host_sdk,
             child_sdk,
-            _feature_distribution_version(self.runtime.distribution, install_target),
+            desired_feature_version,
+            child_feature_version,
         )
 
     def _warn_on_sdk_mismatch(

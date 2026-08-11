@@ -84,6 +84,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections import deque
@@ -169,6 +170,13 @@ _DURABLE_PRIVACY_GATED_MARKER = "_privacy_gated"
 _DURABLE_CALLER_IDENTITY_NONE = "v1:none"
 _DURABLE_CALLER_IDENTITY_PREFIX = "v1:"
 _DURABLE_CALLER_IDENTITY_AAD_PREFIX = b"kestrel:durable-signal-caller:v1:"
+# Keyless installations retain NORMAL durable payloads in plaintext by the
+# documented storage policy.  A caller identity still must not add a second,
+# raw identifier column merely because no at-rest key is configured.  This
+# process-generated, non-secret opaque label is stable for the retained event
+# (including provider redelivery) without encoding or exposing the caller.
+_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX = "v2:opaque:"
+_DURABLE_CALLER_IDENTITY_KEYLESS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _DURABLE_INTEGRITY_CONTEXT = b"kestrel:durable-signal-integrity:v1"
 # A cancellation-resistant cognition turn must never pin the ingress dispatch
 # forever.  The surviving task remains dispatcher-owned after this bounded
@@ -1977,27 +1985,44 @@ class SignalDispatcher:
     def _protect_durable_caller_identity_for_event(
         self, caller: Any, *, event_id: str
     ) -> str:
-        """Seal one canonical caller against the event that retains it."""
+        """Seal one canonical caller, or retain a keyless opaque label.
+
+        The keyless representation is intentionally not reversible.  Sources
+        that support keyless durable persistence already retain their own
+        replayable payload identity (for Telegram, ``payload.sender``), while
+        the dispatcher preserves only an event-local opaque caller label for
+        routing/audit surfaces.  This avoids putting a raw caller in a second
+        durable column when no encryption hierarchy is configured.
+        """
 
         caller = self._canonical_caller_identity(caller)
         if caller is None:
             return _DURABLE_CALLER_IDENTITY_NONE
         cipher = get_agent_fernet(self._durable_agent_id())
         if cipher is None:
-            raise RuntimeError(
-                "Durable caller identity persistence requires the configured "
-                "per-agent key hierarchy"
-            )
+            return _DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX + secrets.token_urlsafe(32)
         return _DURABLE_CALLER_IDENTITY_PREFIX + cipher.encrypt(
             caller.encode("utf-8"), aad=self._durable_caller_identity_aad(event_id)
         ).decode("ascii")
 
     def _recover_durable_caller_identity(self, event) -> Optional[str]:
-        """Decrypt the canonical caller, refusing legacy/unbound raw state."""
+        """Recover a protected caller, refusing legacy/unbound raw state."""
 
         stored = event.caller_identity
         if stored == _DURABLE_CALLER_IDENTITY_NONE:
             return None
+        if isinstance(stored, str) and stored.startswith(
+            _DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX
+        ):
+            token = stored.removeprefix(_DURABLE_CALLER_IDENTITY_KEYLESS_PREFIX)
+            if _DURABLE_CALLER_IDENTITY_KEYLESS_TOKEN_RE.fullmatch(token) is None:
+                raise RuntimeError(
+                    "Durable source event has an invalid keyless caller identity"
+                )
+            # This is a non-secret opaque caller label, never the source's
+            # raw caller identifier.  Returning the complete versioned value
+            # keeps callers distinguishable within the durable event contract.
+            return stored
         if type(stored) is not str or not stored.startswith(
             _DURABLE_CALLER_IDENTITY_PREFIX
         ):
