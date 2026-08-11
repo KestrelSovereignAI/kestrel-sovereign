@@ -12,6 +12,7 @@ Hold/Release Lifecycle:
 """
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -71,6 +72,35 @@ class DurableDebitProviderProtocol(Protocol):
     async def resolve_debit_intent(self, intent_id: str) -> bool | None: ...
 
 
+class DurableDelegatedAllocationProviderProtocol(Protocol):
+    """Durable parent-side hold/release contract for a delegated budget.
+
+    Child spend intents protect individual work charges.  This separate
+    provider contract protects the allocation itself, whose hold and later
+    refund can otherwise be ambiguous across a process crash.  Both calls are
+    idempotent by ``allocation_id`` and commit their balance mutation with the
+    provider's allocation ledger.
+    """
+
+    async def reserve_delegated_allocation(
+        self,
+        *,
+        allocation_id: str,
+        child_did: str,
+        amount: Decimal,
+        memo: str,
+        currency: Any,
+    ) -> bool: ...
+
+    async def release_delegated_allocation(
+        self,
+        *,
+        allocation_id: str,
+        amount: Decimal,
+        currency: Any,
+    ) -> bool: ...
+
+
 class BudgetExceededError(Exception):
     """Raised when a transaction would exceed the delegated budget ceiling."""
 
@@ -103,6 +133,9 @@ class BudgetAllocation:
     # This is a reconciliation reference, not the source of durability.  The
     # provider contract above owns the durable debit intent and outcome.
     pending_spend_intent: DelegatedSpendIntent | None = None
+    # ``True`` means the parent hold is provider-owned and its refund must use
+    # the same durable allocation record rather than an ordinary deposit.
+    parent_hold_durable: bool = False
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -157,6 +190,18 @@ class DelegatedWallet:
                 "idempotent debit intent contract"
             )
         return provider  # type: ignore[return-value]
+
+    @staticmethod
+    def _durable_allocation_provider(
+        wallet: WalletProtocol,
+    ) -> DurableDelegatedAllocationProviderProtocol | None:
+        required = (
+            "reserve_delegated_allocation",
+            "release_delegated_allocation",
+        )
+        if all(callable(getattr(wallet, name, None)) for name in required):
+            return wallet  # type: ignore[return-value]
+        return None
 
     async def _reconcile_pending_spend(self) -> None:
         """Resolve any provider debit before another debit or a refund."""
@@ -239,7 +284,13 @@ class DelegatedWallet:
             await self._reconcile_pending_spend()
             if self._refund_completed:
                 return Decimal("0")
-            if self._refund_attempted:
+            provider = self._durable_allocation_provider(parent_wallet)
+            durable_hold = self.allocation.parent_hold_durable
+            if durable_hold and provider is None:
+                raise RuntimeError(
+                    "delegated allocation requires its durable parent provider for release"
+                )
+            if self._refund_attempted and not durable_hold:
                 raise RuntimeError(
                     "delegated wallet refund outcome is uncertain; refusing duplicate credit"
                 )
@@ -248,14 +299,23 @@ class DelegatedWallet:
             if unspent <= 0:
                 self._refund_completed = True
                 return unspent
-            deposited = await parent_wallet.deposit(
-                unspent,
-                currency,
-                to_audit=False,
-                memo=f"budget release from child {self.allocation.child_did}",
-            )
-            if deposited is not True:
-                raise RuntimeError("parent wallet refused delegated budget refund")
+            if durable_hold:
+                released = await provider.release_delegated_allocation(  # type: ignore[union-attr]
+                    allocation_id=self.allocation.allocation_id,
+                    amount=unspent,
+                    currency=currency,
+                )
+                if released is not True:
+                    raise RuntimeError("parent wallet refused durable delegated budget refund")
+            else:
+                deposited = await parent_wallet.deposit(
+                    unspent,
+                    currency,
+                    to_audit=False,
+                    memo=f"budget release from child {self.allocation.child_did}",
+                )
+                if deposited is not True:
+                    raise RuntimeError("parent wallet refused delegated budget refund")
             # If the parent is itself budgeted (a grandchild being released
             # back into its budgeted parent), restore headroom only after the
             # single confirmed credit.
@@ -480,13 +540,45 @@ async def create_delegated_wallet(
             f"Need {budget} {currency_value}, have {parent_balance} {currency_value}"
         )
 
-    # Hold: debit the parent
-    success = await parent_wallet.transfer(
-        budget,
-        f"budget hold for child {child_did}",
-        currency,
+    # The child DID is minted before this call and is the durable identity of a
+    # single spawn.  Derive the hold key from it rather than creating a fresh
+    # random key here: after a crash between parent debit and child setup, the
+    # manager can repeat the same child creation without taking a second hold.
+    allocation_key = hashlib.sha256(
+        f"delegated-allocation:v1\x00{parent_did}\x00{child_did}".encode("utf-8")
+    ).hexdigest()
+    allocation = BudgetAllocation(
+        child_did=child_did,
+        amount=budget,
+        parent_did=parent_did,
+        allocation_id=allocation_key,
     )
-    if not success:
+    # A direct durable parent can atomically persist the hold and the
+    # allocation identity before any child construction.  Keep nested
+    # DelegatedWallet parents on their ceiling-enforced transfer path: bypassing
+    # that wrapper would debit the root wallet without consuming the parent's
+    # delegated headroom.
+    allocation_provider = (
+        None
+        if isinstance(parent_wallet, DelegatedWallet)
+        else DelegatedWallet._durable_allocation_provider(parent_wallet)
+    )
+    if allocation_provider is not None:
+        success = await allocation_provider.reserve_delegated_allocation(
+            allocation_id=allocation.allocation_id,
+            child_did=child_did,
+            amount=budget,
+            memo=f"budget hold for child {child_did}",
+            currency=currency,
+        )
+        allocation.parent_hold_durable = True
+    else:
+        success = await parent_wallet.transfer(
+            budget,
+            f"budget hold for child {child_did}",
+            currency,
+        )
+    if success is not True:
         raise ValueError("Failed to debit parent wallet for budget hold")
 
     # Transactional after the debit: if child-wallet construction/init fails, the
@@ -515,12 +607,20 @@ async def create_delegated_wallet(
         child_wallet._balances[currency]["main"] = budget
     except Exception:
         try:
-            await parent_wallet.deposit(
-                budget,
-                currency,
-                to_audit=False,
-                memo=f"budget hold refund (child wallet setup failed) for {child_did}",
-            )
+            if allocation.parent_hold_durable:
+                if allocation_provider is None or not await allocation_provider.release_delegated_allocation(
+                    allocation_id=allocation.allocation_id,
+                    amount=budget,
+                    currency=currency,
+                ):
+                    raise RuntimeError("durable budget hold release was not acknowledged")
+            else:
+                await parent_wallet.deposit(
+                    budget,
+                    currency,
+                    to_audit=False,
+                    memo=f"budget hold refund (child wallet setup failed) for {child_did}",
+                )
             # If the parent is itself budgeted, the failed hold incremented its
             # allocation.spent — restore that headroom too, mirroring the normal
             # release path (otherwise a failed nested spawn permanently shrinks
@@ -533,12 +633,6 @@ async def create_delegated_wallet(
                 "setup failure — parent funds may be stranded.", child_did,
             )
         raise
-
-    allocation = BudgetAllocation(
-        child_did=child_did,
-        amount=budget,
-        parent_did=parent_did,
-    )
 
     logger.info(
         "Created delegated wallet: child=%s, budget=%s %s, parent=%s",

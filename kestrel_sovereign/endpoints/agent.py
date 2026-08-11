@@ -2547,6 +2547,9 @@ async def send_task(request: Request):
         TextPart,
         TaskSendParams,
     )
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
     try:
         # Parse body into TaskSendParams. Sender-side already validated
         # the shape, but we re-validate here because this is the only
@@ -2566,11 +2569,24 @@ async def send_task(request: Request):
             role=str(message_data.get("role", "user")),
             parts=parts,
         )
+        raw_metadata = body.get("metadata") or {}
+        if (
+            isinstance(raw_metadata, dict)
+            and HOST_ATTESTED_LOCAL_SUBMISSION_METADATA in raw_metadata
+        ):
+            # This marker is Core-internal provenance for the explicit local
+            # host-attested path.  A wire client can claim arbitrary metadata,
+            # so accepting it here would let an external sender forge the task
+            # ownership relationship used by local retrieval/subscription.
+            raise HTTPException(
+                status_code=400,
+                detail="host-attested local A2A provenance is not accepted over the wire",
+            )
         params = TaskSendParams(
             id=str(body.get("id") or ""),
             sessionId=str(body.get("sessionId") or ""),
             message=message,
-            metadata=body.get("metadata") or {},
+            metadata=raw_metadata,
         )
         # Send-side artifacts/references: a sender may attach durable
         # handoff payload (planning docs, evidence bundles, saved-memory

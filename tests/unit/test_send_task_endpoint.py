@@ -171,6 +171,28 @@ def test_send_task_rejects_malformed_artifact(app_with_send):
     agent.task_manager.create_task.assert_not_awaited()
 
 
+def test_send_task_rejects_forged_host_attested_local_task_owner(app_with_send):
+    """Only Core's in-process contract may stamp local task provenance."""
+
+    agent = _stub_agent()
+    _attach(app_with_send, agent)
+    with TestClient(app_with_send) as client:
+        resp = client.post(
+            "/api/agent/tasks/send",
+            json=_body(
+                metadata={
+                    "sender": "emma",
+                    "_kestrel_host_attested_local_submission": {
+                        "requester_id": "emma",
+                        "recipient_id": "did:test:recipient",
+                    },
+                }
+            ),
+        )
+    assert resp.status_code == 400
+    agent.task_manager.create_task.assert_not_awaited()
+
+
 # --------------------------------------------------------------------------
 # Cryptographic sender verification (#1673)
 # --------------------------------------------------------------------------

@@ -310,6 +310,58 @@ async def test_hold_release_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_durable_parent_allocation_retries_hold_and_release_by_allocation_id():
+    """Core uses a provider-owned allocation ledger when one is available."""
+
+    class DurableAllocationWallet(WalletAgent):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.allocations = {}
+
+        async def reserve_delegated_allocation(
+            self, *, allocation_id, child_did, amount, memo, currency
+        ):
+            existing = self.allocations.get(allocation_id)
+            if existing is not None:
+                assert existing[:4] == (child_did, amount, memo, currency)
+                return existing[4] == "held"
+            if not await self.transfer(amount, memo, currency):
+                return False
+            self.allocations[allocation_id] = (child_did, amount, memo, currency, "held")
+            return True
+
+        async def release_delegated_allocation(self, *, allocation_id, amount, currency):
+            child_did, held, _memo, held_currency, state = self.allocations[allocation_id]
+            assert held_currency == currency and amount <= held
+            if state == "released":
+                return True
+            assert await self.deposit(amount, currency, memo=f"release {child_did}")
+            self.allocations[allocation_id] = (
+                child_did, held, _memo, held_currency, "released"
+            )
+            return True
+
+    parent = DurableAllocationWallet("did:parent", Decimal("100"))
+    await parent.initialize()
+    delegated = await create_delegated_wallet(
+        parent, "did:parent", "did:child", Decimal("30")
+    )
+    assert delegated.allocation.parent_hold_durable is True
+    assert parent.get_balance(Currency.FIL) == Decimal("60")
+    # A retry after a crash before child publication reuses the deterministic
+    # parent/child allocation key instead of taking another parent hold.
+    retried = await create_delegated_wallet(
+        parent, "did:parent", "did:child", Decimal("30")
+    )
+    assert retried.allocation.allocation_id == delegated.allocation.allocation_id
+    assert parent.get_balance(Currency.FIL) == Decimal("60")
+    assert await delegated.spend(Decimal("10"), "work")
+    assert await release_delegated_wallet(delegated, parent) == Decimal("20")
+    assert await release_delegated_wallet(delegated, parent) == Decimal("0")
+    assert parent.get_balance(Currency.FIL) == Decimal("80")
+
+
+@pytest.mark.asyncio
 async def test_hold_release_full_spend():
     """When child spends entire budget, nothing is returned to parent."""
     parent_wallet = WalletAgent(
