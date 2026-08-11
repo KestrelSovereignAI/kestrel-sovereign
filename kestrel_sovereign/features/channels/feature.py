@@ -11,8 +11,10 @@ DB tables (created on initialize):
   channel_config    -- per-agent per-channel configuration
 """
 
+import inspect
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -39,6 +41,9 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
+    DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
     build_signal_for_channel_message,
 )
@@ -52,6 +57,10 @@ from .models import (
 from .registry import ChannelRegistry
 
 logger = logging.getLogger(__name__)
+
+_CANONICAL_TELEGRAM_UPDATE_ID = re.compile(
+    r"telegram:v2:bot:[1-9][0-9]*:update:[0-9]+\Z"
+)
 
 # Key version stamped into channel_messages metadata when a row is
 # encrypted at rest. Mirrors
@@ -207,6 +216,7 @@ class ChannelFeature(Feature):
         # Create the channel registry
         self.registry = ChannelRegistry()
         self._durable_cognition_ready = False
+        self._durable_terminal_ready = False
         self._durable_cognition_registration_failed = False
         self._register_channel_signal_source()
         await self._register_durable_cognition_consumer()
@@ -532,6 +542,7 @@ class ChannelFeature(Feature):
             return
         dispatcher = getattr(self.agent, "dispatcher", None)
         register = getattr(dispatcher, "register_durable_consumer", None)
+        start_owner = getattr(dispatcher, "start_durable_cognition_consumer", None)
         agent_did = getattr(self.agent, "did", None)
         if not callable(register) or not isinstance(agent_did, str) or not agent_did:
             return
@@ -553,6 +564,29 @@ class ChannelFeature(Feature):
                     max_attempts=0,
                 )
             )
+            await register(
+                DurableConsumerRegistration(
+                    consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                    source="channel.message",
+                    agent_id=agent_did,
+                    correlation_selector=(
+                        f"payload.{DURABLE_TERMINAL_MARKER}="
+                        f"{DURABLE_TERMINAL_MARKER_VALUE}"
+                    ),
+                    max_attempts=0,
+                )
+            )
+            # A provider cursor is permitted to advance once the selected
+            # delivery is owned durably.  Therefore this owner must be live
+            # at boot and independently recover that delivery after a process
+            # loss; a future provider callback is not a restart mechanism.
+            if callable(start_owner):
+                started = start_owner(DURABLE_COGNITION_CONSUMER_ID)
+                # Older embedding seams and test doubles may expose a plain
+                # registration mock. Production's dispatcher method is
+                # awaitable; only that concrete owner satisfies restart drain.
+                if inspect.isawaitable(started):
+                    await started
         except Exception:
             self._durable_cognition_registration_failed = True
             logger.exception(
@@ -561,6 +595,7 @@ class ChannelFeature(Feature):
             )
             return
         self._durable_cognition_ready = True
+        self._durable_terminal_ready = True
 
     async def shutdown(self):
         """Disconnect all registered adapters."""
@@ -925,6 +960,51 @@ class ChannelFeature(Feature):
     # ------------------------------------------------------------------
     # Inbound message handling (called by adapters)
     # ------------------------------------------------------------------
+
+    async def handle_terminal_inbound(
+        self, message: ChannelMessage, *, disposition: str
+    ) -> InboundAdmission:
+        """Durably own a malformed Telegram update without routing cognition."""
+
+        if (
+            disposition != "malformed_update"
+            or message.channel_type != "telegram"
+            or getattr(message, "_kestrel_cursor_owned_protocol", False) is not True
+            or _CANONICAL_TELEGRAM_UPDATE_ID.fullmatch(message.id or "") is None
+        ):
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        if metadata.get("dedupe_key") != message.id:
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if (
+            self._durable_cognition_registration_failed
+            or not self._durable_terminal_ready
+        ):
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        enqueue_terminal = getattr(dispatcher, "enqueue_durable_terminal", None)
+        if not callable(enqueue_terminal):
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        try:
+            signal = build_signal_for_channel_message(
+                message,
+                target_agent=getattr(self.agent, "did", self._agent_id),
+            )
+            signal.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+            handle = await enqueue_terminal(
+                signal,
+                source_event_id=message.id,
+                consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+            )
+            receipt = await handle.wait_for_durable_admission()
+        except Exception:
+            logger.exception(
+                "Failed to durably record malformed Telegram update id=%s", message.id
+            )
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
+        if getattr(receipt, "acknowledged", False) is True:
+            return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
+        return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
 
     async def handle_inbound(self, message: ChannelMessage) -> InboundAdmission:
         """

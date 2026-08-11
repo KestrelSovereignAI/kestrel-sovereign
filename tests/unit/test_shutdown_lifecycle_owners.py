@@ -1102,6 +1102,7 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
         def __init__(self) -> None:
             self.transfer_entered = asyncio.Event()
             self.allow_transfer = asyncio.Event()
+            self._debit_intents = {}
 
         def can_afford(self, amount, currency):
             return True
@@ -1114,6 +1115,24 @@ async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_o
             await self.allow_transfer.wait()
             self._balances[currency]["main"] -= amount
             return True
+
+        async def prepare_debit_intent(self, *, idempotency_key, amount, memo, currency):
+            self._debit_intents.setdefault(
+                idempotency_key,
+                {"amount": amount, "memo": memo, "currency": currency, "outcome": False},
+            )
+            return idempotency_key
+
+        async def execute_debit_intent(self, intent_id):
+            intent = self._debit_intents[intent_id]
+            if intent["outcome"] is True:
+                return True
+            outcome = await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+            intent["outcome"] = outcome
+            return outcome
+
+        async def resolve_debit_intent(self, intent_id):
+            return self._debit_intents[intent_id]["outcome"]
 
     class ParentWallet:
         _balances = {"FIL": {"main": Decimal("0")}}
@@ -1209,6 +1228,35 @@ async def test_completed_quarantine_reaper_keeps_only_bounded_metadata() -> None
     assert manager.quarantined_shutdowns()[failed_reaper_id]["failure"] == (
         "RuntimeError: wallet refund remained unsafe"
     )
+
+
+@pytest.mark.asyncio
+async def test_unsafe_quarantine_metadata_is_bounded_and_acknowledgeable() -> None:
+    manager = AgentManager()
+
+    async def fail() -> None:
+        raise RuntimeError("x" * 10_000)
+
+    reaper_ids = []
+    for index in range(130):
+        task = asyncio.create_task(fail())
+        reaper_ids.append(
+            manager._retain_quarantined_cleanup(
+                name=f"agent-{index}", agent_id=f"did:test:{index}", task=task
+            )
+        )
+        with pytest.raises(RuntimeError):
+            await task
+    await asyncio.sleep(0)
+
+    unsafe = manager._unsafe_quarantined_shutdown_failures
+    assert len(unsafe) == 128
+    assert manager.unsafe_quarantined_shutdown_failure_eviction_count == 2
+    assert all(len(record.failure or "") <= 256 for record in unsafe.values())
+    latest = reaper_ids[-1]
+    assert manager.acknowledge_unsafe_quarantined_shutdown_failure(latest) is True
+    assert latest not in manager.quarantined_shutdowns()
+    assert manager.acknowledge_unsafe_quarantined_shutdown_failure(latest) is False
 
 
 @pytest.mark.asyncio

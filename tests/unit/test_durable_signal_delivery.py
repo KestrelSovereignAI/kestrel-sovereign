@@ -41,6 +41,9 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
+    DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
@@ -449,7 +452,8 @@ async def test_cursor_owned_admission_resolves_before_a_hung_cognition_turn(tmp_
 
         release_cognition.set()
         assert (await handle.wait()).status is Status.OK
-        assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert delivery.status == ACKNOWLEDGED
     finally:
         release_cognition.set()
         await dispatcher.shutdown_durable_delivery()
@@ -1841,7 +1845,7 @@ async def test_simultaneous_route_success_and_lease_loss_finalizes_once(
 
 @pytest.mark.asyncio
 async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ack(tmp_path):
-    """A persisted but interrupted callback is redeliverable after restart."""
+    """A persisted ACKed callback is drained after restart without redelivery."""
     path = tmp_path / "cursor-restart.db"
     backend_a, agent_a, dispatcher_a = await _channel_dispatcher(path, "did:agent:one")
     consumer = DurableConsumerRegistration(
@@ -1855,11 +1859,10 @@ async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ac
         max_attempts=0,
     )
     started = asyncio.Event()
-    never_finish = asyncio.Event()
 
     async def interrupted_cognition(_prompt: str):
         started.set()
-        await never_finish.wait()
+        raise RuntimeError("process died after provider ACK")
 
     agent_a.process_input = interrupted_cognition
     try:
@@ -1870,54 +1873,144 @@ async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ac
             consumer_id=consumer.consumer_id,
         )
         await asyncio.wait_for(started.wait(), timeout=1)
-        leased = (await dispatcher_a.list_durable_deliveries())[0]
-        assert leased.status == LEASED
-
-        # Simulate a hard process loss after persistence and lease acquisition
-        # but before cognition returns. No graceful owner release or provider
-        # cursor receipt occurs; make the abandoned owner's durable heartbeat
-        # stale without a wall-clock sleep so restart recovery can prove the
-        # exact lease is safe to redeliver.
-        interrupted.task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await interrupted.task
+        # The provider receives this receipt before the route returns. Once
+        # cognition NACKs, no provider redelivery is manufactured below: the
+        # restarted owner must find the persisted retry itself.
         assert (
             await interrupted.wait_for_durable_admission()
         ).disposition is DurableAdmissionDisposition.COMMITTED
-        stale_at = datetime.now(timezone.utc) - timedelta(minutes=3)
-        await backend_a.execute(
-            "UPDATE durable_signal_runtime_owners SET heartbeat_at = ? "
-            "WHERE agent_id = ? AND owner_id = ?",
-            (
-                dispatcher_a._durable_store.to_timestamp_param(stale_at),
-                agent_a.did,
-                dispatcher_a._durable_delivery_owner,
-            ),
-        )
-        if dispatcher_a._runtime_owner_heartbeat_timer is not None:
-            dispatcher_a._runtime_owner_heartbeat_timer.cancel()
+        assert (await interrupted.wait()).status is Status.FAILED
+        assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
     finally:
+        await dispatcher_a.shutdown_durable_delivery()
         await _close(backend_a, agent_a)
 
     backend_b, agent_b, dispatcher_b = await _channel_dispatcher(path, "did:agent:one")
     try:
         assert (await dispatcher_b.list_durable_deliveries())[0].status == RETRY
+        recovered = asyncio.Event()
+
+        async def recovered_cognition(_prompt: str):
+            recovered.set()
+
+        agent_b.process_input = recovered_cognition
         await dispatcher_b.register_durable_consumer(consumer)
-        recovered = await dispatcher_b.enqueue_durable_cognition(
-            _channel_signal(agent_b.did, "restart"),
-            source_event_id="telegram:update:restart",
-            consumer_id=consumer.consumer_id,
+        await dispatcher_b.start_durable_cognition_consumer(consumer.consumer_id)
+        for _ in range(100):
+            if recovered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert recovered.is_set(), (
+            (await dispatcher_b.list_durable_deliveries())[0],
+            dispatcher_b._durable_cognition_drainers,
+            dispatcher_b._durable_cognition_drain_timers,
         )
-        assert (
-            await recovered.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.DUPLICATE
-        assert (await recovered.wait()).status is Status.OK
+        for _ in range(100):
+            delivery = (await dispatcher_b.list_durable_deliveries())[0]
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
         delivery = (await dispatcher_b.list_durable_deliveries())[0]
         assert delivery.status == ACKNOWLEDGED
         assert delivery.attempts == 2
     finally:
         await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_malformed_telegram_terminal_is_durable_without_cognition(tmp_path):
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "terminal-ingress.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_TERMINAL_MARKER}={DURABLE_TERMINAL_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    signal = _channel_signal(agent.did, "malformed")
+    signal.payload.pop(DURABLE_COGNITION_MARKER)
+    signal.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_terminal(
+            signal,
+            source_event_id="telegram:update:malformed",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await handle.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+        assert (await handle.wait()).status is Status.OK
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert delivery.status == TERMINAL_ACKABLE
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_live_cognition_nack_is_drained_without_provider_redelivery(tmp_path):
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "live-nack-drain.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    attempts = 0
+    recovered = asyncio.Event()
+
+    async def fail_once_then_recover(_prompt: str):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("first cognition attempt failed")
+        recovered.set()
+
+    agent.process_input = fail_once_then_recover
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        initial = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "live-nack"),
+            source_event_id="telegram:update:live-nack",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await initial.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        assert (await initial.wait()).status is Status.FAILED
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=1)
+        except TimeoutError:
+            delivery = (await dispatcher.list_durable_deliveries())[0]
+            raise AssertionError(
+                "durable cognition retry was not drained: "
+                f"status={delivery.status} attempts={delivery.attempts} "
+                f"next_attempt_at={delivery.next_attempt_at} "
+                f"error={delivery.last_error!r}"
+            )
+        deadline = time.monotonic() + 1
+        while True:
+            delivery = (await dispatcher.list_durable_deliveries())[0]
+            if delivery.status == ACKNOWLEDGED or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        assert delivery.attempts == 2
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
 
 
 @pytest.mark.asyncio

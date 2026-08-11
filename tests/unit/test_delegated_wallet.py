@@ -1,5 +1,7 @@
 """Tests for DelegatedWallet budget delegation and ceiling enforcement."""
 
+import asyncio
+
 import pytest
 from decimal import Decimal
 from enum import Enum
@@ -7,6 +9,7 @@ from enum import Enum
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
+    DelegatedSpendOutcomeUnknown,
     DelegatedWallet,
     create_delegated_wallet,
     release_delegated_wallet,
@@ -31,6 +34,7 @@ class WalletAgent:
         self.initial_currency = initial_currency
         self._balances = {Currency.FIL: {"main": Decimal("0"), "audit": Decimal("0")}}
         self.transaction_history = []
+        self._debit_intents = {}
 
     async def initialize(self):
         self._balances[self.initial_currency]["main"] = (
@@ -57,6 +61,24 @@ class WalletAgent:
         self._balances[currency]["main"] -= amount
         self.transaction_history.append({"type": "transfer", "memo": memo})
         return True
+
+    async def prepare_debit_intent(self, *, idempotency_key, amount, memo, currency):
+        self._debit_intents.setdefault(
+            idempotency_key,
+            {"amount": amount, "memo": memo, "currency": currency, "outcome": False},
+        )
+        return idempotency_key
+
+    async def execute_debit_intent(self, intent_id):
+        intent = self._debit_intents[intent_id]
+        if intent["outcome"] is True:
+            return True
+        applied = await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+        intent["outcome"] = applied
+        return applied
+
+    async def resolve_debit_intent(self, intent_id):
+        return self._debit_intents[intent_id]["outcome"]
 
     async def deposit(
         self,
@@ -88,6 +110,55 @@ class TestBudgetAllocation:
         assert not alloc.is_exhausted
         alloc.spent = Decimal("10")
         assert alloc.is_exhausted
+
+
+@pytest.mark.asyncio
+async def test_applied_then_cancelled_child_debit_reconciles_before_refund():
+    """Cancellation after provider I/O cannot refund a debit that applied."""
+
+    class AppliedThenCancelledWallet(WalletAgent):
+        async def execute_debit_intent(self, intent_id):
+            intent = self._debit_intents[intent_id]
+            assert await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+            intent["outcome"] = True
+            raise asyncio.CancelledError()
+
+    child = AppliedThenCancelledWallet("did:child", Decimal("10"))
+    await child.initialize()
+    parent = WalletAgent("did:parent")
+    await parent.initialize()
+    wallet = DelegatedWallet(child, BudgetAllocation(child_did="did:child", amount=Decimal("10")))
+
+    with pytest.raises(asyncio.CancelledError):
+        await wallet.spend(Decimal("3"), "provider applied")
+
+    assert await release_delegated_wallet(wallet, parent) == Decimal("7")
+    assert wallet.spent == Decimal("3")
+    assert parent.get_balance(Currency.FIL) == Decimal("7")
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_child_debit_refuses_refund_after_transport_error():
+    """An unknown provider outcome is unsafe; a full refund is forbidden."""
+
+    class AppliedThenTransportErrorWallet(WalletAgent):
+        async def execute_debit_intent(self, intent_id):
+            intent = self._debit_intents[intent_id]
+            assert await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+            intent["outcome"] = None
+            raise ConnectionError("response lost after provider debit")
+
+    child = AppliedThenTransportErrorWallet("did:child", Decimal("10"))
+    await child.initialize()
+    parent = WalletAgent("did:parent")
+    await parent.initialize()
+    wallet = DelegatedWallet(child, BudgetAllocation(child_did="did:child", amount=Decimal("10")))
+
+    with pytest.raises(ConnectionError):
+        await wallet.spend(Decimal("3"), "response lost")
+    with pytest.raises(DelegatedSpendOutcomeUnknown):
+        await release_delegated_wallet(wallet, parent)
+    assert parent.get_balance(Currency.FIL) == Decimal("0")
 
     def test_created_at_populated(self):
         alloc = BudgetAllocation(child_did="did:child:1", amount=Decimal("1"))

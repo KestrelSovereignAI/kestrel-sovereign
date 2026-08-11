@@ -29,6 +29,12 @@ DURABLE_COGNITION_MARKER_VALUE = "channel-v1"
 # feature-instance detail: durable redelivery recovery must be able to name
 # this exact consumer without broadening delivery to other subscriptions.
 DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
+# A malformed Telegram record has a canonical bot/update identity but no safe
+# content to route to cognition. Its selected delivery is completed as a
+# durable terminal receipt before the provider cursor can advance.
+DURABLE_TERMINAL_MARKER = "_durable_terminal"
+DURABLE_TERMINAL_MARKER_VALUE = "channel-terminal-v1"
+DURABLE_TERMINAL_CONSUMER_ID = "core.channel-terminal-v1"
 PROMPT_TEMPLATE = (
     Path(__file__).resolve().parents[2]
     / "prompts"
@@ -156,6 +162,9 @@ __all__ = [
     "DURABLE_COGNITION_CONSUMER_ID",
     "DURABLE_COGNITION_MARKER",
     "DURABLE_COGNITION_MARKER_VALUE",
+    "DURABLE_TERMINAL_CONSUMER_ID",
+    "DURABLE_TERMINAL_MARKER",
+    "DURABLE_TERMINAL_MARKER_VALUE",
     "PROMPT_TEMPLATE",
     "SOURCE_NAME",
     "build_channel_message_registration",

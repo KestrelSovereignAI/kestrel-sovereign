@@ -44,6 +44,19 @@ from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
 
+_QUARANTINED_SHUTDOWN_HISTORY_LIMIT = 128
+_UNSAFE_QUARANTINED_FAILURE_LIMIT = 128
+_QUARANTINED_METADATA_TEXT_LIMIT = 256
+
+
+def _bounded_shutdown_metadata(value: object) -> str:
+    """Keep operator-visible quarantine metadata safe and bounded."""
+
+    text = str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")
+    if len(text) > _QUARANTINED_METADATA_TEXT_LIMIT:
+        return text[: _QUARANTINED_METADATA_TEXT_LIMIT - 1] + "…"
+    return text
+
 
 @dataclass(frozen=True)
 class A2AHostedPolicy:
@@ -198,7 +211,14 @@ class AgentManager:
     and its own storage (SQLite file or Postgres with agent_id isolation).
     """
 
-    def __init__(self, base_data_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        base_data_dir: Optional[Path] = None,
+        *,
+        hosted_telegram_route_attestation_resolver_factory: Optional[
+            Callable[[str, str, LocalAgentConfig], object]
+        ] = None,
+    ):
         self._agents: dict[str, KestrelAgent] = {}
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
@@ -207,6 +227,11 @@ class AgentManager:
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = base_data_dir or Path.cwd()
+        # Host-owned, agent-scoped Telegram route evidence is injected before
+        # feature initialization. No request payload can select this resolver.
+        self._hosted_telegram_route_attestation_resolver_factory = (
+            hosted_telegram_route_attestation_resolver_factory
+        )
         self._lock = asyncio.Lock()
         # Inbound hosted A2A verification/authorization/task persistence holds
         # a shared reader lease from DID resolution through create_task.
@@ -226,7 +251,7 @@ class AgentManager:
         # tracebacks. Keep only bounded metadata after either safe completion
         # or an unsafe failure; active cleanup alone owns a live task.
         self._quarantined_shutdown_history: deque[QuarantinedShutdownHistory] = deque(
-            maxlen=128
+            maxlen=_QUARANTINED_SHUTDOWN_HISTORY_LIMIT
         )
         # Unsafe outcomes remain operator-visible until explicit process/host
         # remediation, but retain only strings/timestamps — never the finished
@@ -234,6 +259,7 @@ class AgentManager:
         self._unsafe_quarantined_shutdown_failures: dict[
             str, QuarantinedShutdownHistory
         ] = {}
+        self._unsafe_quarantined_shutdown_failure_evictions = 0
         self._next_shutdown_reaper_id = 0
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
@@ -837,6 +863,13 @@ class AgentManager:
         # across every agent, so ``KESTREL_DB_PATH`` cannot name each agent's
         # directory and usage rows would all land in one agent's DB (#2769).
         llm_service = LLMService(agent_data_dir=resolved_dir)
+        hosted_telegram_resolver = None
+        if self._hosted_telegram_route_attestation_resolver_factory is not None:
+            hosted_telegram_resolver = (
+                self._hosted_telegram_route_attestation_resolver_factory(
+                    name, agent_did, config
+                )
+            )
 
         # Build allowed_features set from config (None = load all)
         allowed_features = set(config.features) if config.features is not None else None
@@ -913,6 +946,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     allowed_features=allowed_features,
+                    hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
@@ -931,6 +965,7 @@ class AgentManager:
                     storage_path=db_path,
                     llm_service=llm_service,
                     allowed_features=allowed_features,
+                    hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
@@ -1537,8 +1572,8 @@ class AgentManager:
         reaper_id = f"{name}:{self._next_shutdown_reaper_id}"
         record = QuarantinedShutdownReaper(
             reaper_id=reaper_id,
-            agent_name=name,
-            agent_id=agent_id,
+            agent_name=_bounded_shutdown_metadata(name),
+            agent_id=_bounded_shutdown_metadata(agent_id),
             task=task,
             started_monotonic=time.monotonic(),
         )
@@ -1551,7 +1586,9 @@ class AgentManager:
             else:
                 failure = task.exception()
                 if failure is not None:
-                    record.failure = f"{type(failure).__name__}: {failure}"
+                    record.failure = _bounded_shutdown_metadata(
+                        f"{type(failure).__name__}: {failure}"
+                    )
             # Do not keep a completed Task: it retains coroutine locals and,
             # on failure, the full traceback. Operators still receive a
             # bounded history entry with the safety outcome.
@@ -1568,6 +1605,14 @@ class AgentManager:
                 self._quarantined_shutdown_history.append(history)
             else:
                 self._unsafe_quarantined_shutdown_failures[history.reaper_id] = history
+                while (
+                    len(self._unsafe_quarantined_shutdown_failures)
+                    > _UNSAFE_QUARANTINED_FAILURE_LIMIT
+                ):
+                    self._unsafe_quarantined_shutdown_failures.pop(
+                        next(iter(self._unsafe_quarantined_shutdown_failures))
+                    )
+                    self._unsafe_quarantined_shutdown_failure_evictions += 1
             if record.failure is None:
                 logger.info(
                     "Quarantined shutdown reaper %s completed for agent %r",
@@ -1627,6 +1672,17 @@ class AgentManager:
             for record in self._unsafe_quarantined_shutdown_failures.values()
         }
         return {**history, **unsafe_failures, **active}
+
+    @property
+    def unsafe_quarantined_shutdown_failure_eviction_count(self) -> int:
+        """Count unsafe records evicted after bounded metadata retention."""
+
+        return self._unsafe_quarantined_shutdown_failure_evictions
+
+    def acknowledge_unsafe_quarantined_shutdown_failure(self, reaper_id: str) -> bool:
+        """Remove an operator-acknowledged unsafe outcome from bounded history."""
+
+        return self._unsafe_quarantined_shutdown_failures.pop(reaper_id, None) is not None
 
     async def _remove_agent_without_scheduler_lifecycle(self, name: str) -> bool:
         """Shutdown and remove an agent.

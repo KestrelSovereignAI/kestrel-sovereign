@@ -13,6 +13,7 @@ Hold/Release Lifecycle:
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -45,8 +46,48 @@ class WalletProtocol(Protocol):
     ) -> bool: ...
 
 
+class DurableDebitProviderProtocol(Protocol):
+    """Provider-owned, durable idempotent debit contract.
+
+    ``prepare_debit_intent`` MUST durably record ``idempotency_key`` before
+    any provider debit can occur. ``execute_debit_intent`` may be retried and
+    ``resolve_debit_intent`` returns ``True`` (applied), ``False`` (known not
+    applied), or ``None`` (still ambiguous).  The allocation keeps only a
+    reference to this provider-owned record; an in-memory flag is never used
+    as proof that an external debit did or did not happen.
+    """
+
+    async def prepare_debit_intent(
+        self,
+        *,
+        idempotency_key: str,
+        amount: Decimal,
+        memo: str,
+        currency: Any,
+    ) -> str: ...
+
+    async def execute_debit_intent(self, intent_id: str) -> bool: ...
+
+    async def resolve_debit_intent(self, intent_id: str) -> bool | None: ...
+
+
 class BudgetExceededError(Exception):
     """Raised when a transaction would exceed the delegated budget ceiling."""
+
+
+class DelegatedSpendOutcomeUnknown(RuntimeError):
+    """A provider debit may have applied and must be reconciled before refund."""
+
+
+@dataclass(frozen=True)
+class DelegatedSpendIntent:
+    """Serializable reference to a provider-owned durable debit intent."""
+
+    intent_id: str
+    idempotency_key: str
+    amount: Decimal
+    currency: str
+    created_at: str
 
 
 @dataclass
@@ -57,6 +98,11 @@ class BudgetAllocation:
     amount: Decimal
     spent: Decimal = Decimal("0")
     parent_did: str = ""
+    allocation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    next_spend_sequence: int = 0
+    # This is a reconciliation reference, not the source of durability.  The
+    # provider contract above owns the durable debit intent and outcome.
+    pending_spend_intent: DelegatedSpendIntent | None = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -97,6 +143,37 @@ class DelegatedWallet:
         # replayed and credited twice.
         self._refund_attempted = False
         self._refund_completed = False
+
+    def _durable_debit_provider(self) -> DurableDebitProviderProtocol:
+        provider = self._wallet
+        required = (
+            "prepare_debit_intent",
+            "execute_debit_intent",
+            "resolve_debit_intent",
+        )
+        if not all(callable(getattr(provider, name, None)) for name in required):
+            raise RuntimeError(
+                "delegated child spending requires a provider-owned durable "
+                "idempotent debit intent contract"
+            )
+        return provider  # type: ignore[return-value]
+
+    async def _reconcile_pending_spend(self) -> None:
+        """Resolve any provider debit before another debit or a refund."""
+
+        intent = self.allocation.pending_spend_intent
+        if intent is None:
+            return
+        provider = self._durable_debit_provider()
+        outcome = await provider.resolve_debit_intent(intent.intent_id)
+        if outcome is None:
+            raise DelegatedSpendOutcomeUnknown(
+                "delegated child debit outcome is ambiguous; refusing refund or new spend"
+            )
+        if outcome is True:
+            self.allocation.spent += intent.amount
+            self._record_spend(intent.amount, intent.currency, "reconciled durable debit")
+        self.allocation.pending_spend_intent = None
 
     def fence_spending(self) -> None:
         """Immediately refuse new spends without waiting for wallet I/O.
@@ -159,6 +236,7 @@ class DelegatedWallet:
 
         self.fence_spending()
         async with self._spend_lock:
+            await self._reconcile_pending_spend()
             if self._refund_completed:
                 return Decimal("0")
             if self._refund_attempted:
@@ -279,6 +357,7 @@ class DelegatedWallet:
             raise ValueError("Spend amount must be positive")
 
         async with self._spend_lock:
+            await self._reconcile_pending_spend()
             if not self.can_spend(cost):
                 currency_value = _currency_value(currency)
                 raise BudgetExceededError(
@@ -289,13 +368,50 @@ class DelegatedWallet:
                     f"Requested: {cost}"
                 )
 
-            success = await self._wallet.transfer(cost, memo, currency)
+            provider = self._durable_debit_provider()
+            self.allocation.next_spend_sequence += 1
+            idempotency_key = (
+                f"delegated-spend:{self.allocation.allocation_id}:"
+                f"{self.allocation.next_spend_sequence}"
+            )
+            intent_id = await provider.prepare_debit_intent(
+                idempotency_key=idempotency_key,
+                amount=cost,
+                memo=memo,
+                currency=currency,
+            )
+            if not isinstance(intent_id, str) or not intent_id:
+                raise RuntimeError("provider returned no durable delegated debit intent ID")
+            intent = DelegatedSpendIntent(
+                intent_id=intent_id,
+                idempotency_key=idempotency_key,
+                amount=cost,
+                currency=_currency_value(currency),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            # The durable provider intent is prepared before any debit I/O.
+            # Keep its reference until the provider proves the debit outcome.
+            self.allocation.pending_spend_intent = intent
+            success = await provider.execute_debit_intent(intent_id)
             if not success:
+                self.allocation.pending_spend_intent = None
                 return False
 
             self.allocation.spent += cost
-            currency_value = _currency_value(currency)
-            self.transactions.append({
+            self.allocation.pending_spend_intent = None
+            self._record_spend(cost, _currency_value(currency), memo)
+
+            logger.info(
+                "Delegated spend: %s %s for '%s'. Spent: %s/%s",
+                cost, _currency_value(currency), memo,
+                self.allocation.spent, self.allocation.amount,
+            )
+            return True
+
+    def _record_spend(self, cost: Decimal, currency_value: str, memo: str) -> None:
+        """Record only a confirmed/reconciled debit; never an ambiguous one."""
+
+        self.transactions.append({
                 "type": "delegated_spend",
                 "currency": currency_value,
                 "amount": str(cost),
@@ -304,13 +420,6 @@ class DelegatedWallet:
                 "remaining": str(self.allocation.remaining),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-
-            logger.info(
-                "Delegated spend: %s %s for '%s'. Spent: %s/%s",
-                cost, currency_value, memo,
-                self.allocation.spent, self.allocation.amount,
-            )
-            return True
 
     def get_status(self) -> dict:
         """Return a summary of the delegated budget status."""
@@ -322,6 +431,11 @@ class DelegatedWallet:
             "remaining": str(self.allocation.remaining),
             "is_exhausted": self.allocation.is_exhausted,
             "transaction_count": len(self.transactions),
+            "pending_spend_intent": (
+                self.allocation.pending_spend_intent.intent_id
+                if self.allocation.pending_spend_intent is not None
+                else None
+            ),
         }
 
 

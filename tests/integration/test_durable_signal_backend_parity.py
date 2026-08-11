@@ -25,6 +25,7 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.features.channels.route_ownership import ChannelRouteOwnershipStore
 
 
 def _signal(agent_id: str) -> Signal:
@@ -143,6 +144,37 @@ async def _assert_one_pending_delivery(
 ) -> None:
     deliveries = await store.list_deliveries(agent_id=agent_id)
     assert [delivery.event_id for delivery in deliveries] == [event_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_schema_bootstrap_is_safe_under_independent_backend_contention(db_backend):
+    """Fresh/additive durable and route bootstrap serializes across processes."""
+
+    peer_backend = await _independent_backend(db_backend)
+    try:
+        first = DurableSignalStore(db_backend)
+        second = DurableSignalStore(peer_backend)
+        first_routes = ChannelRouteOwnershipStore(db_backend)
+        second_routes = ChannelRouteOwnershipStore(peer_backend)
+        await asyncio.wait_for(
+            asyncio.gather(
+                first.initialize(), second.initialize(),
+                first_routes.initialize(), second_routes.initialize(),
+            ),
+            timeout=10,
+        )
+        assert await db_backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_event_integrity"
+        ) == 0
+        claim = await first_routes.claim(
+            channel_type="telegram",
+            canonical_route_identity=f"telegram-bot:bootstrap-{uuid4().hex}",
+            agent_id="did:test:bootstrap",
+        )
+        assert claim is not None
+    finally:
+        await peer_backend.close()
 
 
 @pytest.mark.asyncio

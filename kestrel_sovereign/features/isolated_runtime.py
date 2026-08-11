@@ -151,6 +151,7 @@ _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
 _EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
 _EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
 _EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
+_EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD = "_telegram_terminal_disposition"
 _EVENT_INGRESS_ATTEMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _TELEGRAM_POLLING_ACK = "telegram-polling-ack"
 _TELEGRAM_POLLING_NACK = "telegram-polling-nack"
@@ -190,6 +191,9 @@ _event_source_client: ContextVar[Any | None] = ContextVar(
 # protocol by adding a field to its message.
 _cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
     "isolated_cursor_owned_inbound_protocol", default=False
+)
+_telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
+    "isolated_telegram_terminal_inbound_disposition", default=None
 )
 
 # A staged config must survive a short process pause, but it must not turn an
@@ -1739,6 +1743,7 @@ class _DeferredAcknowledgedIngress:
     acknowledgement: _HostIngressRequest
     source_client: Any = field(repr=False)
     retry: _HostIngressRequest | None = None
+    telegram_terminal_disposition: str | None = None
 
 
 @dataclass
@@ -7232,6 +7237,15 @@ class ProxyFeature(Feature):
                                 )
                         if source_client is not self._client:
                             return
+                        terminal_disposition = self._telegram_terminal_disposition(
+                            data,
+                            cursor_owned_protocol=(
+                                acknowledgement is not None
+                                and retry is not None
+                                and self._authoritative_inbound_channel_type()
+                                == "telegram"
+                            ),
+                        )
                         admission = await self._route_validated_inbound(
                             inbound,
                             cursor_owned_protocol=(
@@ -7240,6 +7254,7 @@ class ProxyFeature(Feature):
                                 and self._authoritative_inbound_channel_type()
                                 == "telegram"
                             ),
+                            telegram_terminal_disposition=terminal_disposition,
                         )
                 except _TrafficGateClosedError:
                     if source_client is self._client:
@@ -7450,12 +7465,16 @@ class ProxyFeature(Feature):
         if event_name in {"channel.inbound", "inbound", "message.inbound"}:
             inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
             retry = self._inbound_event_retry_completion(data)
+            cursor_owned_protocol = (
+                acknowledgement is not None
+                and retry is not None
+                and self._authoritative_inbound_channel_type() == "telegram"
+            )
             admission = await self._route_validated_inbound(
                 inbound,
-                cursor_owned_protocol=(
-                    acknowledgement is not None
-                    and retry is not None
-                    and self._authoritative_inbound_channel_type() == "telegram"
+                cursor_owned_protocol=cursor_owned_protocol,
+                telegram_terminal_disposition=self._telegram_terminal_disposition(
+                    data, cursor_owned_protocol=cursor_owned_protocol
                 ),
             )
             source_client = _event_source_client.get()
@@ -7751,6 +7770,14 @@ class ProxyFeature(Feature):
             acknowledgement=acknowledgement,
             source_client=source_client,
             retry=retry,
+            telegram_terminal_disposition=self._telegram_terminal_disposition(
+                payload,
+                cursor_owned_protocol=(
+                    acknowledgement is not None
+                    and retry is not None
+                    and self._authoritative_inbound_channel_type() == "telegram"
+                ),
+            ),
         )
         if len(self._deferred_acknowledged_event_tasks) >= _MAX_DEFERRED_ACKNOWLEDGED_EVENTS:
             logger.warning(
@@ -7773,6 +7800,9 @@ class ProxyFeature(Feature):
                             deferred.retry is not None
                             and self._authoritative_inbound_channel_type()
                             == "telegram"
+                        ),
+                        telegram_terminal_disposition=(
+                            deferred.telegram_terminal_disposition
                         ),
                     )
                     if self._inbound_admission_is_durable(admission):
@@ -8118,8 +8148,31 @@ class ProxyFeature(Feature):
             logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
             return
 
+    def _telegram_terminal_disposition(
+        self, data: Any, *, cursor_owned_protocol: bool
+    ) -> str | None:
+        """Validate the private malformed-update terminal descriptor."""
+
+        if not isinstance(data, dict):
+            return None
+        descriptor = data.get(_EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD)
+        if descriptor is None:
+            return None
+        if (
+            self._authoritative_inbound_channel_type() != "telegram"
+            or not cursor_owned_protocol
+            or type(descriptor) is not dict
+            or descriptor != {"kind": "malformed_update"}
+        ):
+            raise ProtocolError("invalid Telegram terminal inbound disposition")
+        return "malformed_update"
+
     async def _route_validated_inbound(
-        self, payload: Any, *, cursor_owned_protocol: bool
+        self,
+        payload: Any,
+        *,
+        cursor_owned_protocol: bool,
+        telegram_terminal_disposition: str | None = None,
     ) -> Any:
         """Route with a host-only protocol classification.
 
@@ -8131,14 +8184,22 @@ class ProxyFeature(Feature):
         """
 
         token = _cursor_owned_inbound_protocol.set(cursor_owned_protocol)
+        terminal_token = _telegram_terminal_inbound_disposition.set(
+            telegram_terminal_disposition
+        )
         try:
             return await self._route_inbound(payload)
         finally:
             _cursor_owned_inbound_protocol.reset(token)
+            _telegram_terminal_inbound_disposition.reset(terminal_token)
 
     async def _route_inbound(self, payload: Any) -> Any:
         channel = self._channel_feature()
-        if channel is None or not hasattr(channel, "handle_inbound"):
+        terminal_disposition = _telegram_terminal_inbound_disposition.get()
+        expected_method = (
+            "handle_terminal_inbound" if terminal_disposition is not None else "handle_inbound"
+        )
+        if channel is None or not hasattr(channel, expected_method):
             logger.warning(
                 "Inbound notification from %s dropped: ChannelFeature unavailable",
                 self.name,
@@ -8190,6 +8251,10 @@ class ProxyFeature(Feature):
             "_kestrel_cursor_owned_protocol",
             _cursor_owned_inbound_protocol.get(),
         )
+        if terminal_disposition is not None:
+            return await channel.handle_terminal_inbound(
+                message, disposition=terminal_disposition
+            )
         return await channel.handle_inbound(message)
 
 

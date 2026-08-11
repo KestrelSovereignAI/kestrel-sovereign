@@ -19,7 +19,8 @@ import re
 import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterable, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable, Iterable, Optional
 
 from kestrel_sdk.signals import Signal
 
@@ -212,11 +213,20 @@ class DurableSignalStore(UnifiedStoreBase):
         super().__init__(native_backend)
 
     async def initialize(self) -> None:
+        """Bootstrap/evolve the ledger under one cross-process schema lock.
+
+        The delivery tables are shared by independently restarted dispatchers.
+        In particular, the integrity side table was added after the original
+        ledger, so a plain sequence of ``CREATE IF NOT EXISTS`` calls is not a
+        migration protocol: another process can observe a partial schema and
+        begin routing before the additive migration finishes.
+        """
+
         ts_type = self.timestamp_type()
         ts_default = self.now_default()
         json_type = self.json_type()
         bool_type = self.boolean_type()
-        await self._backend.execute_script(
+        statements = (
             f"""
             CREATE TABLE IF NOT EXISTS {self.EVENTS} (
                 event_id TEXT PRIMARY KEY,
@@ -237,8 +247,9 @@ class DurableSignalStore(UnifiedStoreBase):
                 committed_at {ts_type} {ts_default},
                 retention_until {ts_type} NOT NULL,
                 UNIQUE (agent_id, source, source_event_id)
-            );
-
+            )
+            """,
+            f"""
             CREATE TABLE IF NOT EXISTS {self.CONSUMERS} (
                 agent_id TEXT NOT NULL,
                 consumer_id TEXT NOT NULL,
@@ -250,8 +261,9 @@ class DurableSignalStore(UnifiedStoreBase):
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
                 PRIMARY KEY (agent_id, consumer_id)
-            );
-
+            )
+            """,
+            f"""
             CREATE TABLE IF NOT EXISTS {self.DELIVERIES} (
                 delivery_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -275,8 +287,9 @@ class DurableSignalStore(UnifiedStoreBase):
                 FOREIGN KEY (agent_id, consumer_id)
                     REFERENCES {self.CONSUMERS}(agent_id, consumer_id)
                     ON DELETE RESTRICT
-            );
-
+            )
+            """,
+            f"""
             CREATE TABLE IF NOT EXISTS {self.RUNTIME_OWNERS} (
                 agent_id TEXT NOT NULL,
                 owner_id TEXT NOT NULL,
@@ -285,37 +298,78 @@ class DurableSignalStore(UnifiedStoreBase):
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
                 PRIMARY KEY (agent_id, owner_id)
-            );
-
+            )
+            """,
+            f"""
             CREATE TABLE IF NOT EXISTS {self.EVENT_INTEGRITY} (
                 event_id TEXT PRIMARY KEY,
                 integrity_binding TEXT NOT NULL,
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE
-            );
-            """
+            )
+            """,
         )
-        # ``CREATE TABLE IF NOT EXISTS`` cannot evolve an existing durable
-        # ledger.  Keep the caller representation additive: legacy rows lack
-        # it and are rejected for caller-bearing replay rather than silently
-        # accepting an unbound live caller.
-        await self.add_column_if_missing(self.EVENTS, "caller_identity", "TEXT")
-        await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.EVENTS}_scope_retention "
-            f"ON {self.EVENTS}(agent_id, source, retention_until)"
-        )
-        await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_claim "
-            f"ON {self.DELIVERIES}(agent_id, consumer_id, status, next_attempt_at)"
-        )
-        await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_lease "
-            f"ON {self.DELIVERIES}(agent_id, consumer_id, lease_expires_at)"
-        )
-        await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
-            f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
-        )
+        async with self._schema_bootstrap_transaction():
+            for statement in statements:
+                await self._backend.execute(statement)
+            # ``CREATE TABLE IF NOT EXISTS`` cannot evolve an existing durable
+            # ledger. Keep the caller representation additive: legacy rows
+            # lack it and are rejected for caller-bearing replay rather than
+            # silently accepting an unbound live caller.
+            await self._ensure_caller_identity_column()
+            await self._backend.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self.EVENTS}_scope_retention "
+                f"ON {self.EVENTS}(agent_id, source, retention_until)"
+            )
+            await self._backend.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_claim "
+                f"ON {self.DELIVERIES}(agent_id, consumer_id, status, next_attempt_at)"
+            )
+            await self._backend.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_lease "
+                f"ON {self.DELIVERIES}(agent_id, consumer_id, lease_expires_at)"
+            )
+            await self._backend.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
+                f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
+            )
+
+    @asynccontextmanager
+    async def _schema_bootstrap_transaction(self) -> AsyncIterator[None]:
+        """Serialize every fresh and additive ledger migration.
+
+        PostgreSQL uses a fixed transaction advisory key; SQLite reserves its
+        writer before schema inspection.  Both keep the catalog recheck, DDL,
+        and indexes in one transaction rather than relying on an instance-local
+        ``initialized`` flag.
+        """
+
+        if self.is_postgres:
+            async with self._backend.transaction():
+                await self._backend.fetch_val(
+                    "SELECT pg_advisory_xact_lock(hashtext('kestrel.durable_signal.bootstrap'))"
+                )
+                yield
+            return
+        if self._backend.backend_type == "sqlite":
+            async with self._backend.transaction(immediate=True):
+                yield
+            return
+        raise RuntimeError("Durable signal delivery supports only sqlite or postgres databases")
+
+    async def _ensure_caller_identity_column(self) -> None:
+        """Apply the sole additive event-table migration under the schema lock."""
+
+        if self.is_postgres:
+            await self._backend.execute(
+                f"ALTER TABLE {self.EVENTS} ADD COLUMN IF NOT EXISTS caller_identity TEXT"
+            )
+            return
+        columns = await self._backend.fetch_all(f"PRAGMA table_info({self.EVENTS})")
+        if not any(row[1] == "caller_identity" for row in columns):
+            await self._backend.execute(
+                f"ALTER TABLE {self.EVENTS} ADD COLUMN caller_identity TEXT"
+            )
 
     # ------------------------------------------------------------------
     # Subscription registration and event persistence

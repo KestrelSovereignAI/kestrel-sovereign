@@ -1407,6 +1407,46 @@ class TestLoadFromConfig:
     )
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_hosted_telegram_resolver_is_bound_before_agent_initialize(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """A host resolver is selected by local agent scope, never by input."""
+
+        mock_get_did.return_value = "did:telegram:one"
+        mock_agent_cls.return_value = _make_mock_agent("did:telegram:one")
+        resolver = object()
+        resolver_factory = MagicMock(return_value=resolver)
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            hosted_telegram_route_attestation_resolver_factory=resolver_factory,
+        )
+        config = LocalAgentConfig(data_dir=Path("agent_data/telegram"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("telegram", config)
+
+        resolver_factory.assert_called_once_with(
+            "telegram", "did:telegram:one", config
+        )
+        assert (
+            mock_agent_cls.call_args.kwargs[
+                "hosted_telegram_route_attestation_resolver"
+            ]
+            is resolver
+        )
+        mock_agent_cls.return_value.initialize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_each_agent_llm_service_is_bound_to_its_own_data_dir(
         self,
         mock_llm_cls,

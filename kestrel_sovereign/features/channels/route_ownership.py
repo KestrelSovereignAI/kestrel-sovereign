@@ -147,6 +147,16 @@ class ChannelRouteOwnershipStore:
         if self._initialized:
             return
         async with self._transaction():
+            # PostgreSQL's relation locks cannot protect the absent-table
+            # branch.  Hold one transaction-scoped lock across the *entire*
+            # bootstrap/check/migrate sequence, then re-check catalog state
+            # while it is held.  SQLite reaches the same point through the
+            # BEGIN IMMEDIATE transaction selected by ``_transaction``.
+            if self.backend_type == "postgres":
+                await self._execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtext('kestrel.channel_route_ownership.bootstrap'))"
+                )
             await self._execute(
                 f"""CREATE TABLE IF NOT EXISTS {self.TABLE} (
                     channel_type TEXT NOT NULL,
@@ -182,6 +192,14 @@ class ChannelRouteOwnershipStore:
             )
             if column is not None:
                 return
+            # The advisory lock above is the primary serialization boundary.
+            # Keep PostgreSQL's native idempotent form as secondary protection
+            # for a manually repaired/rolling deployment that races an older
+            # initializer outside this class.
+            await self._execute(
+                f"ALTER TABLE {self.TABLE} ADD COLUMN IF NOT EXISTS generation TEXT"
+            )
+            return
         else:
             raise RuntimeError(
                 "channel route ownership supports only sqlite or postgres databases"

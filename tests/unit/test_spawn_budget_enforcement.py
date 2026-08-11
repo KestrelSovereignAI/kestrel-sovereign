@@ -34,6 +34,7 @@ class FakeWallet:
         self._currency = initial_currency
         self._balances = {initial_currency: {"main": Decimal(initial_balance)}}
         self.deposits = []
+        self._debit_intents = {}
 
     async def initialize(self):
         return None
@@ -53,6 +54,24 @@ class FakeWallet:
             return False
         self._balances[currency]["main"] = self._bal(currency) - amount
         return True
+
+    async def prepare_debit_intent(self, *, idempotency_key, amount, memo, currency):
+        self._debit_intents.setdefault(
+            idempotency_key,
+            {"amount": amount, "memo": memo, "currency": currency, "outcome": False},
+        )
+        return idempotency_key
+
+    async def execute_debit_intent(self, intent_id):
+        intent = self._debit_intents[intent_id]
+        if intent["outcome"] is True:
+            return True
+        outcome = await self.transfer(intent["amount"], intent["memo"], intent["currency"])
+        intent["outcome"] = outcome
+        return outcome
+
+    async def resolve_debit_intent(self, intent_id):
+        return self._debit_intents[intent_id]["outcome"]
 
     async def deposit(self, amount, currency=None, to_audit=False, memo=""):
         currency = currency or self._currency
