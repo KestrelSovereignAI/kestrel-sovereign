@@ -1182,6 +1182,8 @@ class SignalDispatcher:
         delivery_id: str,
         lease_token: str,
         error: str,
+        terminal: bool = False,
+        terminal_ackable: bool = False,
     ) -> Optional[DurableDelivery]:
         """Release this dispatcher's exact lease after retained work settles."""
 
@@ -1194,8 +1196,10 @@ class SignalDispatcher:
                 lease_token=lease_token,
                 owner_id=self._durable_delivery_owner,
                 error=error,
+                terminal=terminal,
+                terminal_ackable=terminal_ackable,
             )
-            if delivery is not None and delivery.status == FAILED:
+            if delivery is not None and delivery.status in {FAILED, TERMINAL_ACKABLE}:
                 self._discard_transient_durable_handoff(delivery_id)
             return delivery
 
@@ -2922,13 +2926,32 @@ class SignalDispatcher:
             terminal_ackable=terminal,
         )
         if released is None:
-            await self.release_durable_delivery_after_task(
+            # An ordinary NACK correctly refuses an expired lease.  This
+            # dispatcher still owns a live managed token, however, so it can
+            # make one narrow owner/token-conditional transition after the
+            # route task has settled. Preserve a proven terminal no-op in that
+            # same atomic update; never turn it into an ordinary retry/failed
+            # row and then tell the provider it may advance its cursor.
+            released = await self.release_durable_delivery_after_task(
                 consumer_id=consumer_id,
                 delivery_id=delivery.delivery_id,
                 lease_token=delivery.lease_token or "",
                 error=result.error or f"Cognition delivery returned {result.status.value}",
+                terminal=terminal,
+                terminal_ackable=terminal,
             )
-        if terminal and durable_admission is not None and not durable_admission.done():
+        # TERMINAL is an external receipt, not a route-level interpretation.
+        # Publish it only after this exact delivery row confirms the durable
+        # terminal-ackable state. A lost lease/ownership transfer remains
+        # non-ACKable and the provider must redeliver.
+        terminal_persisted = (
+            terminal and released is not None and released.status == TERMINAL_ACKABLE
+        )
+        if (
+            terminal_persisted
+            and durable_admission is not None
+            and not durable_admission.done()
+        ):
             durable_admission.set_result(
                 DurableAdmissionResult(DurableAdmissionDisposition.TERMINAL, signal.id)
             )

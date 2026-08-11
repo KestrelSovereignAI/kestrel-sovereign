@@ -638,6 +638,106 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_attempts", (0, 1), ids=("unlimited", "exhausted"))
+async def test_expired_terminal_nack_uses_managed_token_before_provider_receipt(
+    tmp_path, monkeypatch, max_attempts
+):
+    """A late terminal NACK is ACKable only when its fallback row proves it."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / f"expired-terminal-nack-{max_attempts}.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=max_attempts,
+    )
+
+    async def terminal_noop(signal, _registration, start):
+        return dispatcher._failure_result(
+            signal,
+            start,
+            error="terminal validation refusal after lease expiry",
+            status=Status.DROPPED_VALIDATION,
+        )
+
+    async def expired_nack(**kwargs):
+        # ``nack_delivery`` returns None for an expired exact lease. The
+        # managed-owner fallback below is the only permitted late transition.
+        return await dispatcher._durable_store.nack_delivery(
+            agent_id=agent.did,
+            now=datetime.now(timezone.utc) + timedelta(days=1),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(dispatcher, "_route_after_durable_persistence", terminal_noop)
+    monkeypatch.setattr(dispatcher, "nack_durable_delivery", expired_nack)
+    source_event_id = f"telegram:update:expired-terminal:{max_attempts}"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "terminal"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await first.wait()).status is Status.DROPPED_VALIDATION
+        assert (
+            await first.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+        stored = await dispatcher.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=first.signal_id,
+        )
+        assert stored is not None and stored.status == TERMINAL_ACKABLE
+
+        # A provider that lost the receipt sees the durable terminal row, not
+        # a fresh cognition execution.
+        redelivery = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "terminal"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await redelivery.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+
+        async def ordinary_failure(signal, _registration, start):
+            return dispatcher._failure_result(
+                signal,
+                start,
+                error="ordinary cognition failure after lease expiry",
+                status=Status.FAILED,
+            )
+
+        monkeypatch.setattr(
+            dispatcher, "_route_after_durable_persistence", ordinary_failure
+        )
+        ordinary = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "ordinary"),
+            source_event_id=f"{source_event_id}:ordinary",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await ordinary.wait()).status is Status.FAILED
+        assert (
+            await ordinary.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        ordinary_delivery = await dispatcher.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=ordinary.signal_id,
+        )
+        assert ordinary_delivery is not None
+        assert ordinary_delivery.status == (RETRY if max_attempts == 0 else FAILED)
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_legacy_channel_redelivery_upgrades_only_matching_normal_event(tmp_path):
     """One matching retry repairs an origin/main row without bulk backfill."""
 
@@ -2924,6 +3024,107 @@ async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
         release_writer.set()
         await asyncio.gather(blocker, return_exceptions=True)
         await peer.close()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event_claim", (False, True), ids=("ordinary", "exact"))
+async def test_implicit_claim_clock_waits_for_selected_delivery_serialization(
+    tmp_path, exact_event_claim
+):
+    """A row lock longer than the lease cannot publish an expired implicit claim."""
+
+    backend = SQLiteBackend(str(tmp_path / f"row-claim-{exact_event_claim}.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:row-contention"
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    store.now_utc = lambda: clock["now"]  # type: ignore[method-assign]
+    consumer = DurableConsumerRegistration(
+        consumer_id="row-contention-worker",
+        source="provider.message",
+        agent_id=agent_id,
+        lease_seconds=1,
+    )
+    await store.register_consumer(consumer)
+    persisted = await store.persist_signal(
+        _signal(agent_id=agent_id),
+        agent_id=agent_id,
+        source_event_id="provider:row-contention",
+        retention_days=7,
+    )
+    selected = asyncio.Event()
+    release_selected = asyncio.Event()
+    original_lock = store._lock_claimable_delivery
+
+    async def hold_selected_delivery(**kwargs):
+        delivery_id = await original_lock(**kwargs)
+        assert delivery_id is not None
+        selected.set()
+        await release_selected.wait()
+        return delivery_id
+
+    store._lock_claimable_delivery = hold_selected_delivery  # type: ignore[method-assign]
+    try:
+        if exact_event_claim:
+            claim_task = asyncio.create_task(
+                store.claim_delivery_for_event(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    event_id=persisted.event_id,
+                    executor_id="worker",
+                )
+            )
+        else:
+            claim_task = asyncio.create_task(
+                store.claim_delivery(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    executor_id="worker",
+                )
+            )
+        await asyncio.wait_for(selected.wait(), timeout=1)
+        # This models a PostgreSQL SELECT .. FOR UPDATE blocked beyond the
+        # entire nominal lease. The later clock must determine the lease.
+        clock["now"] = base + timedelta(seconds=2)
+        release_selected.set()
+        claimed = await asyncio.wait_for(claim_task, timeout=1)
+        assert claimed is not None
+        assert claimed.lease_expires_at == base + timedelta(seconds=3)
+
+        # Explicit caller time remains an exact deterministic contract even
+        # when row serialization waits.
+        explicit = base + timedelta(seconds=10)
+        assert await store.nack_delivery(
+            agent_id=agent_id,
+            consumer_id=consumer.consumer_id,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token or "",
+            error="make explicit retry due",
+            now=clock["now"],
+        ) is not None
+        explicit_claim = (
+            await store.claim_delivery_for_event(
+                agent_id=agent_id,
+                consumer_id=consumer.consumer_id,
+                event_id=persisted.event_id,
+                executor_id="worker-explicit",
+                now=explicit,
+            )
+            if exact_event_claim
+            else await store.claim_delivery(
+                agent_id=agent_id,
+                consumer_id=consumer.consumer_id,
+                executor_id="worker-explicit",
+                now=explicit,
+            )
+        )
+        assert explicit_claim is not None
+        assert explicit_claim.lease_expires_at == explicit + timedelta(seconds=1)
+    finally:
+        release_selected.set()
         await backend.close()
 
 

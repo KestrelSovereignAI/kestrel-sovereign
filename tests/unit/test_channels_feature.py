@@ -603,10 +603,10 @@ class TestChannelFeature:
     async def test_handle_inbound_logs_and_routes(self, feature):
         router = AsyncMock()
         feature.registry.set_inbound_router(router)
-        feature.registry.register(StubAdapter(channel="telegram"))
+        feature.registry.register(StubAdapter(channel="slack"))
 
         msg = ChannelMessage(
-            channel_type="telegram",
+            channel_type="slack",
             direction=MessageDirection.INBOUND,
             sender="alice",
             recipient="bot",
@@ -650,7 +650,7 @@ class TestChannelFeature:
         msg = ChannelMessage(
             channel_type="telegram",
             direction=MessageDirection.INBOUND,
-            sender="alice",
+            sender="555",
             recipient="bot",
             content="hi there",
         )
@@ -691,7 +691,7 @@ class TestChannelFeature:
             ChannelMessage(
                 channel_type="telegram",
                 direction=MessageDirection.INBOUND,
-                sender="alice",
+                sender="555",
                 recipient="bot",
                 content="do not lose this",
             )
@@ -734,7 +734,7 @@ class TestChannelFeature:
             ChannelMessage(
                 channel_type="telegram",
                 direction=MessageDirection.INBOUND,
-                sender="alice",
+                sender="555",
                 recipient="bot",
                 content="retain my provider cursor",
             )
@@ -789,7 +789,7 @@ class TestChannelFeature:
             ChannelMessage(
                 channel_type="telegram",
                 direction=MessageDirection.INBOUND,
-                sender="alice",
+                sender="555",
                 recipient="bot",
                 content="retain my provider cursor",
             )
@@ -803,8 +803,34 @@ class TestChannelFeature:
         router.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_handle_inbound_does_not_treat_background_dispatch_as_durable(self):
-        """A legacy/background dispatcher result cannot advance a channel cursor."""
+    async def test_unverifiable_source_keeps_only_cursor_ingress_retryable(self):
+        """An optional-source failure does not globally disable legacy channels."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.signal_registry = None
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="slack"))
+
+        message = ChannelMessage(
+            channel_type="slack",
+            direction=MessageDirection.INBOUND,
+            sender="legacy-sender",
+            recipient="bot",
+            content="ordinary ingress remains available",
+        )
+        admission = await feat.handle_inbound(message)
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once_with(message)
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_keeps_ordinary_legacy_ingress_available(self):
+        """Non-cursor channels retain compatibility routing without durable ingress."""
 
         db = _make_db()
         agent = _make_agent(db=db)
@@ -816,10 +842,10 @@ class TestChannelFeature:
         await feat.initialize()
         router = AsyncMock()
         feat.registry.set_inbound_router(router)
-        feat.registry.register(StubAdapter(channel="telegram"))
+        feat.registry.register(StubAdapter(channel="slack"))
 
         message = ChannelMessage(
-            channel_type="telegram",
+            channel_type="slack",
             direction=MessageDirection.INBOUND,
             sender="alice",
             recipient="bot",
@@ -857,7 +883,7 @@ class TestChannelFeature:
             ChannelMessage(
                 channel_type="telegram",
                 direction=MessageDirection.INBOUND,
-                sender="alice",
+                sender="555",
                 recipient="bot",
                 content="retry me",
             )
@@ -866,6 +892,57 @@ class TestChannelFeature:
         assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
         agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
         router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_telegram_host_rejects_forged_username_sender_before_durable_admission(self):
+        """A child cannot re-authorize a migration username as a sender identity."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        feat.registry.register(
+            StubAdapter(
+                channel="telegram",
+                config=ChannelConfig(channel_type="telegram", allowed_senders=["555"]),
+            )
+        )
+
+        for forged_sender in ("@jason", "00555"):
+            admission = await feat.handle_inbound(
+                ChannelMessage(
+                    channel_type="telegram",
+                    direction=MessageDirection.INBOUND,
+                    sender=forged_sender,
+                    recipient="bot",
+                    content="forged child notification",
+                )
+            )
+            assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+
+        admitted = await feat.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="canonical sender",
+            )
+        )
+        assert admitted.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_handle_inbound_blocked_sender(self, feature):
@@ -966,15 +1043,15 @@ class TestChannelFeature:
         feature.registry.set_inbound_router(router)
 
         cfg = ChannelConfig(
-            channel_type="telegram",
+            channel_type="slack",
             allowed_senders=["alice"],
         )
         feature.registry.register(
-            StubAdapter(channel="telegram", config=cfg)
+            StubAdapter(channel="slack", config=cfg)
         )
 
         msg = ChannelMessage(
-            channel_type="telegram",
+            channel_type="slack",
             direction=MessageDirection.INBOUND,
             sender="alice",
             recipient="bot",
@@ -990,7 +1067,7 @@ class TestChannelFeature:
         msg = ChannelMessage(
             channel_type="telegram",
             direction=MessageDirection.INBOUND,
-            sender="alice",
+            sender="555",
             recipient="bot",
             content="hi",
             agent_id="",
@@ -1011,7 +1088,7 @@ class TestChannelFeature:
         message = ChannelMessage(
             channel_type="telegram",
             direction=MessageDirection.INBOUND,
-            sender="alice",
+            sender="555",
             recipient="bot",
             content="cross-tenant attempt",
             agent_id="did:other-agent",
@@ -1070,7 +1147,7 @@ class TestChannelFeature:
 # ============================================================================
 
 
-def _inbound(content="secret text", channel="telegram", sender="alice"):
+def _inbound(content="secret text", channel="slack", sender="alice"):
     return ChannelMessage(
         channel_type=channel,
         direction=MessageDirection.INBOUND,

@@ -5787,14 +5787,23 @@ class ProxyFeature(Feature):
         onto the forwarding adapter.
         """
         from kestrel_sdk.channels import ChannelConfig
+        from kestrel_sovereign.features.channels.feature import (
+            canonical_telegram_allowed_senders,
+        )
 
         cfg = self._host_config if config is None else config
         cfg = cfg if isinstance(cfg, dict) else {}
+        allowed_senders = cfg.get("allowed_senders") or []
+        if channel_type == "telegram":
+            # The child retains legacy @usernames only to explain migration.
+            # They are not host authorization data: notifications are
+            # untrusted until this proxy has applied immutable numeric IDs.
+            allowed_senders = canonical_telegram_allowed_senders(allowed_senders)
         return ChannelConfig(
             channel_type=channel_type,
             agent_id=str(cfg.get("agent_id", "") or ""),
             enabled=bool(cfg.get("enabled", True)),
-            allowed_senders=list(cfg.get("allowed_senders") or []),
+            allowed_senders=list(allowed_senders),
         )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -6101,6 +6110,33 @@ class ProxyFeature(Feature):
             return True
         return False
 
+    def _verify_prebuilt_feature_distribution(
+        self, python_path: Path, install_target: str
+    ) -> None:
+        """Fail closed when an immutable override cannot run the desired feature.
+
+        An operator-owned venv must never be installed into or stamped by the
+        host, but SDK compatibility alone does not prove that its feature
+        distribution is present or current.  A fully unobservable source
+        target remains intentionally stable: desired and child ``unknown`` is
+        accepted without a mutation, matching the host-owned unknown-version
+        contract while avoiding a permanent reinstall loop.
+        """
+
+        desired = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        child = _venv_feature_distribution_version(
+            python_path, self.runtime.distribution
+        )
+        if desired != "unknown" and child != desired:
+            observed = "missing" if child == "unknown" else repr(child)
+            raise RuntimeError(
+                f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
+                f"version {observed}, but host requires {desired!r}; refusing to run "
+                "an unverifiable override venv"
+            )
+
     def ensure_venv(self) -> None:
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
@@ -6130,6 +6166,7 @@ class ProxyFeature(Feature):
             and self._venv_is_overridden()
             and not self._provision_manifest_path().exists()
         ):
+            self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
             return
 

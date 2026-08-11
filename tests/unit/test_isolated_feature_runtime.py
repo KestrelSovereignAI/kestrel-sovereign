@@ -1345,10 +1345,140 @@ def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatc
     # SDK mismatch present — must warn, but still NOT mutate.
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "1.2.0")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _p, _d: "1.2.0"
+    )
 
     feature.ensure_venv()
 
     assert runs == [], f"override venv must not be touched, ran: {runs}"
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+@pytest.mark.parametrize("child_version", ("1.1.9", "unknown"), ids=("stale", "missing"))
+def test_prebuilt_override_refuses_stale_or_missing_feature_distribution(
+    tmp_path, monkeypatch, child_version
+):
+    """An immutable override still proves it can run the desired feature."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project="override-pkg",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "1.2.0")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _p, _d: child_version
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to run an unverifiable override venv"):
+        feature.ensure_venv()
+
+    assert runs == []
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+def test_prebuilt_editable_override_probes_source_release_without_mutation(tmp_path, monkeypatch):
+    """A local editable desired release is checked against the child metadata."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'override-pkg'\nversion = '1.2.0'\n"
+    )
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project=f"-e {project}[service]",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _p, _d: "1.2.0"
+    )
+
+    feature.ensure_venv()
+
+    assert runs == []
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+def test_prebuilt_override_both_unknown_versions_are_stably_accepted(tmp_path, monkeypatch):
+    """Unobservable source metadata is supported without ownership mutation."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    python = override_venv / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project="override-pkg",
+        venv=str(override_venv),
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "a" / "db.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "unknown")
+    monkeypatch.setattr(
+        ir, "_venv_feature_distribution_version", lambda _p, _d: "unknown"
+    )
+
+    feature.ensure_venv()
+    feature.ensure_venv()
+
+    assert runs == []
     assert not (override_venv / ".kestrel_provision.json").exists()
 
 
@@ -6072,6 +6202,27 @@ def test_telegram_polling_completion_descriptors_require_an_authoritative_pair()
     assert acknowledgement.name == "whatsapp-webhook-ack"
 
 
+@pytest.mark.parametrize(
+    ("allowed_senders", "expected"),
+    (
+        (["@jason"], []),
+        (["@jason", "555", "00555", "0"], ["555"]),
+    ),
+    ids=("legacy-only", "mixed-migration-list"),
+)
+def test_telegram_proxy_authorization_keeps_only_canonical_numeric_ids(
+    allowed_senders, expected
+):
+    """Migration-only usernames never reach the host authorization adapter."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._host_config = {"enabled": True, "allowed_senders": allowed_senders}
+
+    config = feature._channel_config("telegram")
+
+    assert config.allowed_senders == expected
+
+
 @pytest.mark.asyncio
 async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_telegram_pair(
     monkeypatch, tmp_path
@@ -6144,9 +6295,9 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         )
 
         # The authoritative Telegram identity rejects the renamed pair; it
-        # cannot fall through to WhatsApp's absent adapter/filter. Real
-        # ChannelFeature authorization sees the Telegram bridge's allowlist.
-        assert routed == [("telegram", "555")]
+        # cannot fall through to WhatsApp's absent adapter/filter *or* the
+        # generic legacy router. Telegram requires its paired durable path.
+        assert routed == []
         assert feature._client.completions == []
 
         denied = _acknowledged_telegram_event("telegram:v2:bot:42:update:denied")
@@ -6156,7 +6307,7 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         await asyncio.gather(
             *tuple(feature._event_ingress_tasks), return_exceptions=True
         )
-        assert routed == [("telegram", "555")]
+        assert routed == []
 
         channel_feature.registry.unregister("telegram")
         await feature._client.event_handler(_acknowledged_telegram_event(
@@ -6165,7 +6316,7 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         await asyncio.gather(
             *tuple(feature._event_ingress_tasks), return_exceptions=True
         )
-        assert routed == [("telegram", "555")]
+        assert routed == []
     finally:
         await feature.shutdown()
         await channel_feature.shutdown()

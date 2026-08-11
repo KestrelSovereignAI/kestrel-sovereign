@@ -753,23 +753,36 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         # Claim, recovery, and restart backfill all serialize with event
         # persistence for this source.  Besides avoiding a registration/event
-        # visibility gap, sampling an implicit clock *after* this point gives a
-        # newly issued lease its full duration under writer contention.
+        # visibility gap, this makes SQLite's single writer serialization
+        # explicit. PostgreSQL still needs to serialize the actual delivery
+        # row below before it observes an implicit lease clock.
         async with self._backend.transaction():
             await self._lock_scope_handoff(agent_id=agent_id, source=registration.source)
-            effective_now = explicit_now or self.now_utc()
+            recovery_now = explicit_now or self.now_utc()
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
-                now=effective_now,
+                now=recovery_now,
                 runtime_owner_stale_before=(
                     _as_utc(runtime_owner_stale_before)
                     if runtime_owner_stale_before is not None
-                    else effective_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
                 ),
             )
             # Backfill is idempotent because delivery identity is unique.
-            await self._backfill_consumer(registration, now=effective_now)
+            await self._backfill_consumer(registration, now=recovery_now)
+            delivery_id = await self._lock_claimable_delivery(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                now=recovery_now,
+            )
+            if delivery_id is None:
+                return None
+            # A PostgreSQL row lock can wait behind a worker that is slower
+            # than this consumer's entire lease.  Preserve an explicitly
+            # supplied timestamp exactly, but otherwise sample only after the
+            # selected delivery is serialized so the new lease is full-lived.
+            effective_now = explicit_now or self.now_utc()
             lease_token = secrets.token_urlsafe(24)
             lease_expires_at = effective_now + timedelta(
                 seconds=registration.lease_seconds
@@ -780,16 +793,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 SET status = ?, attempts = attempts + 1, lease_owner = ?,
                     lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
                     updated_at = ?
-                WHERE delivery_id = (
-                    SELECT delivery_id FROM {self.DELIVERIES}
-                    WHERE agent_id = ? AND consumer_id = ?
-                      AND status IN ('{PENDING}', '{RETRY}')
-                      AND (max_attempts = 0 OR attempts < max_attempts)
-                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                    ORDER BY created_at, delivery_id
-                    LIMIT 1
-                )
-                  AND agent_id = ? AND consumer_id = ?
+                WHERE delivery_id = ? AND agent_id = ? AND consumer_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -800,9 +804,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     lease_token,
                     self.to_timestamp_param(lease_expires_at),
                     self.to_timestamp_param(effective_now),
-                    agent_id,
-                    consumer_id,
-                    self.to_timestamp_param(effective_now),
+                    delivery_id,
                     agent_id,
                     consumer_id,
                     self.to_timestamp_param(effective_now),
@@ -842,17 +844,28 @@ class DurableSignalStore(UnifiedStoreBase):
             return None
         async with self._backend.transaction():
             await self._lock_scope_handoff(agent_id=agent_id, source=consumer[0])
-            effective_now = explicit_now or self.now_utc()
+            recovery_now = explicit_now or self.now_utc()
             await self._recover_expired_leases(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
-                now=effective_now,
+                now=recovery_now,
                 runtime_owner_stale_before=(
                     _as_utc(runtime_owner_stale_before)
                     if runtime_owner_stale_before is not None
-                    else effective_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+                    else recovery_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
                 ),
             )
+            delivery_id = await self._lock_claimable_delivery(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                event_id=event_id,
+                now=recovery_now,
+            )
+            if delivery_id is None:
+                return None
+            # See claim_delivery: do not publish an already-expired implicit
+            # lease after waiting for this exact delivery row.
+            effective_now = explicit_now or self.now_utc()
             lease_token = secrets.token_urlsafe(24)
             lease_expires_at = effective_now + timedelta(seconds=int(consumer[3]))
             updated = await self._backend.execute(
@@ -861,7 +874,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 SET status = ?, attempts = attempts + 1, lease_owner = ?,
                     lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
                     updated_at = ?
-                WHERE agent_id = ? AND consumer_id = ? AND event_id = ?
+                WHERE delivery_id = ? AND agent_id = ? AND consumer_id = ? AND event_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -872,6 +885,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     lease_token,
                     self.to_timestamp_param(lease_expires_at),
                     self.to_timestamp_param(effective_now),
+                    delivery_id,
                     agent_id,
                     consumer_id,
                     event_id,
@@ -885,6 +899,47 @@ class DurableSignalStore(UnifiedStoreBase):
             consumer_id=consumer_id,
             lease_token=lease_token,
         )
+
+    async def _lock_claimable_delivery(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        now: datetime,
+        event_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Serialize one due delivery before assigning an implicit lease clock.
+
+        ``_lock_scope_handoff`` protects event/consumer registration handoff,
+        but a PostgreSQL transaction may still block on the selected delivery
+        row itself (for example, an operator repair holding that row).  Select
+        and lock that exact row before the caller samples its implicit clock.
+        SQLite has already acquired its single writer in ``_lock_scope_handoff``;
+        the same select keeps both backends on one claim contract.
+        """
+
+        where = [
+            "agent_id = ?",
+            "consumer_id = ?",
+            f"status IN ('{PENDING}', '{RETRY}')",
+            "(max_attempts = 0 OR attempts < max_attempts)",
+            "(next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        ]
+        params: list[Any] = [agent_id, consumer_id, self.to_timestamp_param(now)]
+        if event_id is not None:
+            where.insert(2, "event_id = ?")
+            params.insert(2, event_id)
+        lock_clause = " FOR UPDATE" if self.is_postgres else ""
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT delivery_id FROM {self.DELIVERIES}
+            WHERE {' AND '.join(where)}
+            ORDER BY created_at, delivery_id
+            LIMIT 1{lock_clause}
+            """,
+            tuple(params),
+        )
+        return str(row[0]) if row is not None else None
 
     async def renew_delivery_lease(
         self,
@@ -1478,6 +1533,8 @@ class DurableSignalStore(UnifiedStoreBase):
         lease_token: str,
         owner_id: str,
         error: str,
+        terminal: bool = False,
+        terminal_ackable: bool = False,
         now: Optional[datetime] = None,
     ) -> Optional[DurableDelivery]:
         """Release a completed local task's exact managed lease.
@@ -1498,6 +1555,8 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("lease_token", lease_token)
         self._require_nonempty("owner_id", owner_id)
         self._require_nonempty("error", error)
+        if terminal_ackable and not terminal:
+            raise ValueError("terminal_ackable deliveries must be terminal")
         if not owner_id.startswith("dispatcher:"):
             raise ValueError("owner_id must identify a managed dispatcher")
         now = _as_utc(now or self.now_utc())
@@ -1505,22 +1564,37 @@ class DurableSignalStore(UnifiedStoreBase):
         updated = await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
-            SET status = CASE WHEN max_attempts > 0 AND attempts >= max_attempts THEN ? ELSE ? END,
+            SET status = CASE
+                    WHEN ? THEN ?
+                    WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
+                    ELSE ?
+                END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                next_attempt_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
-                    THEN NULL ELSE {timestamp} END,
+                next_attempt_at = CASE
+                    WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
+                        THEN NULL ELSE {timestamp}
+                END,
                 last_error = ?,
-                terminal_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
-                    THEN {timestamp} ELSE NULL END,
+                terminal_at = CASE
+                    WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
+                        THEN {timestamp} ELSE NULL
+                END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
               AND status = ? AND lease_owner = ? AND lease_token = ?
             """,
             (
+                self.to_bool_param(terminal_ackable),
+                TERMINAL_ACKABLE,
+                self.to_bool_param(terminal),
                 FAILED,
                 RETRY,
+                self.to_bool_param(terminal_ackable),
+                self.to_bool_param(terminal),
                 self.to_timestamp_param(now),
                 error,
+                self.to_bool_param(terminal_ackable),
+                self.to_bool_param(terminal),
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
                 agent_id,

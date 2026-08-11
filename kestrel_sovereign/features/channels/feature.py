@@ -58,6 +58,37 @@ logger = logging.getLogger(__name__)
 # so channel content matches the conversation_history encryption
 # guarantee (#2096 / F112).
 CHANNEL_KEY_VERSION = 1
+
+
+def canonical_telegram_user_id(value: object) -> str | None:
+    """Return one immutable Telegram user ID, rejecting display identities.
+
+    Telegram usernames are mutable presentation data.  The host must apply the
+    same numeric-only authorization boundary as the isolated Telegram service,
+    because a child notification is not trusted to preserve that distinction.
+    """
+
+    if (
+        type(value) is not str
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+    ):
+        return None
+    try:
+        return value if int(value) > 0 else None
+    except ValueError:
+        return None
+
+
+def canonical_telegram_allowed_senders(value: object) -> list[str]:
+    """Normalize host-side Telegram authorization to canonical numeric IDs."""
+
+    if type(value) is not list:
+        return []
+    return [sender for item in value if (sender := canonical_telegram_user_id(item))]
+
+
 class InboundAdmissionDisposition(str, Enum):
     """What the channel feature proved about one inbound message."""
 
@@ -666,11 +697,18 @@ class ChannelFeature(Feature):
         # The child transport is not an authorization boundary. Enforce the
         # host adapter's enabled state and sender policy before logging,
         # dispatching, or issuing a cursor-advancing receipt.
+        cursor_owning = message.channel_type == "telegram"
+        canonical_sender = (
+            canonical_telegram_user_id(message.sender) if cursor_owning else None
+        )
+        if cursor_owning and canonical_sender is None:
+            logger.info("Blocked noncanonical Telegram sender identity %r", message.sender)
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         adapter = self.registry.get(message.channel_type)
         if adapter and adapter.config:
             config = adapter.config
             telegram_default_deny = (
-                message.channel_type == "telegram"
+                cursor_owning
                 and not getattr(config, "allowed_senders", None)
             )
             if (
@@ -696,7 +734,7 @@ class ChannelFeature(Feature):
         durable_admission = False
         durable_cognition_attempted = False
         dispatcher = getattr(self.agent, "dispatcher", None)
-        if self._durable_cognition_registration_failed:
+        if self._durable_cognition_registration_failed and cursor_owning:
             # A dispatcher that rejected the durable consumer contract is not
             # an older compatibility host. Falling back to ordinary enqueue
             # here would let a provider cursor advance on event persistence
@@ -722,6 +760,16 @@ class ChannelFeature(Feature):
                         source_event_id=message.id,
                         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
                     )
+                elif cursor_owning:
+                    # Telegram polling owns a provider cursor. It has an
+                    # explicit negotiated durable path and must never fall
+                    # through to ordinary queue persistence or legacy routing.
+                    logger.error(
+                        "Telegram inbound lacks a verified durable cognition path; "
+                        "retaining provider cursor for message id=%s",
+                        message.id,
+                    )
+                    return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
                 else:
                     handle = await dispatcher.enqueue_signal(
                         signal, source_event_id=message.id
@@ -749,7 +797,7 @@ class ChannelFeature(Feature):
         if durable_admission:
             return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
 
-        if durable_cognition_attempted:
+        if durable_cognition_attempted or cursor_owning:
             # Do not send this message through the legacy in-memory router
             # after its durable cognition path was rate-limited or failed.
             # The external producer must retain its cursor and redeliver.
