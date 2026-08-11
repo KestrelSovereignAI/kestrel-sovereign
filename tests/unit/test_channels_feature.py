@@ -616,11 +616,12 @@ class TestChannelFeature:
         router.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_handle_inbound_enqueues_signal_when_dispatcher_available(self):
+    async def test_handle_inbound_enqueues_durable_cognition_when_dispatcher_available(self):
         db = _make_db()
         agent = _make_agent(db=db)
         agent.did = "did:test:channels"
         agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
         handle = MagicMock()
         handle.wait_for_durable_admission = AsyncMock(
             return_value=DurableAdmissionResult(
@@ -628,7 +629,7 @@ class TestChannelFeature:
                 signal_id="signal-1",
             )
         )
-        agent.dispatcher.enqueue_signal = AsyncMock(return_value=handle)
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
 
         feat = ChannelFeature(agent)
         await feat.initialize()
@@ -645,13 +646,51 @@ class TestChannelFeature:
         )
         admission = await feat.handle_inbound(msg)
 
-        agent.dispatcher.enqueue_signal.assert_awaited_once()
-        signal = agent.dispatcher.enqueue_signal.await_args.args[0]
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+        signal = agent.dispatcher.enqueue_durable_cognition.await_args.args[0]
         assert signal.source == "channel.message"
         assert signal.payload["content"] == "hi there"
-        assert agent.dispatcher.enqueue_signal.await_args.kwargs["source_event_id"] == msg.id
+        assert (
+            agent.dispatcher.enqueue_durable_cognition.await_args.kwargs["source_event_id"]
+            == msg.id
+        )
         router.assert_not_awaited()
         assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_fails_closed_when_durable_consumer_registration_fails(self):
+        """Registration failure cannot fall back to ordinary queued routing."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock(
+            side_effect=RuntimeError("durable store unavailable")
+        )
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="do not lose this",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handle_inbound_does_not_treat_background_dispatch_as_durable(self):

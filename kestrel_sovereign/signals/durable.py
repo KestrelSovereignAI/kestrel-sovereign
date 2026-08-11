@@ -175,6 +175,9 @@ class DurableSignalStore(UnifiedStoreBase):
     CONSUMERS = "durable_signal_consumers"
     DELIVERIES = "durable_signal_deliveries"
     RUNTIME_OWNERS = "durable_signal_runtime_owners"
+    # Payload-eliding privacy modes cannot retain their canonical input in the
+    # event row. This side table stores only a fixed-width integrity binding.
+    EVENT_INTEGRITY = "durable_signal_event_integrity"
 
     def __init__(self, backend: DatabaseBackend):
         # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
@@ -264,6 +267,13 @@ class DurableSignalStore(UnifiedStoreBase):
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
                 PRIMARY KEY (agent_id, owner_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS {self.EVENT_INTEGRITY} (
+                event_id TEXT PRIMARY KEY,
+                integrity_binding TEXT NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
+                    ON DELETE CASCADE
             );
             """
         )
@@ -369,6 +379,7 @@ class DurableSignalStore(UnifiedStoreBase):
         retention_days: int,
         transient_selector_payload: Any = _PERSISTED_PAYLOAD,
         initial_lease_owner: Optional[str] = None,
+        integrity_binding: Optional[str] = None,
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
     ) -> DurableEventPersistence:
@@ -409,6 +420,11 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("source", signal.source)
         if initial_lease_owner is not None:
             self._require_nonempty("initial_lease_owner", initial_lease_owner)
+        if integrity_binding is not None and (
+            type(integrity_binding) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", integrity_binding) is None
+        ):
+            raise ValueError("integrity_binding must be a SHA-256 hex digest")
         source_event_id = self._normalize_source_event_id(source_event_id)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
@@ -453,6 +469,15 @@ class DurableSignalStore(UnifiedStoreBase):
                         agent_id, signal, source_event_id
                     )
                     return DurableEventPersistence(event_id=existing, created=False)
+
+                if integrity_binding is not None:
+                    await self._backend.execute(
+                        f"""
+                        INSERT INTO {self.EVENT_INTEGRITY} (event_id, integrity_binding)
+                        VALUES (?, ?)
+                        """,
+                        (signal.id, integrity_binding),
+                    )
 
                 consumer_rows = await self._backend.fetch_all(
                     f"""
@@ -656,6 +681,57 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id,
                 consumer_id,
                 event_id,
+                self.to_timestamp_param(now),
+            ),
+        )
+        if updated == 0:
+            return None
+        return await self._delivery_for_lease_locked(
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            lease_token=lease_token,
+        )
+
+    async def renew_delivery_lease(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DurableDelivery]:
+        """Extend one still-owned lease using the consumer's persisted policy.
+
+        A long cognition turn keeps its original token. This conditional update
+        refuses an expired or foreign lease, so a late worker can never revive
+        work another executor may already have claimed.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("lease_token", lease_token)
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        if consumer is None or not consumer[4]:
+            return None
+        now = _as_utc(now or self.now_utc())
+        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+              AND status = ? AND lease_token = ? AND lease_expires_at > ?
+            """,
+            (
+                self.to_timestamp_param(lease_expires_at),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+                LEASED,
+                lease_token,
                 self.to_timestamp_param(now),
             ),
         )
@@ -972,12 +1048,13 @@ class DurableSignalStore(UnifiedStoreBase):
         stale_before: datetime,
         now: Optional[datetime] = None,
     ) -> int:
-        """Requeue only reservations whose distinct runtime owner is gone.
+        """Requeue reservations only from stale managed dispatcher owners.
 
         Generic claim/retry recovery intentionally never touches
         ``INITIAL_RESERVED``.  Startup uses this owner-aware path instead;
         another live dispatcher remains protected by its heartbeat even when
-        it shares the same tenant and consumer IDs.
+        it shares the same tenant and consumer IDs. Public executor owners and
+        unknown owner namespaces are never recovery candidates.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("recovering_owner_id", recovering_owner_id)
@@ -992,21 +1069,15 @@ class DurableSignalStore(UnifiedStoreBase):
                     last_error = 'initial reservation owner unavailable before activation',
                     updated_at = ?
                 WHERE agent_id = ? AND status = ? AND lease_owner <> ?
-                  AND (
-                      NOT EXISTS (
-                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
-                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
-                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
-                      )
-                      OR EXISTS (
-                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
-                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
-                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
-                            AND (
-                                owner.stopped_at IS NOT NULL
-                                OR owner.heartbeat_at < ?
-                            )
-                      )
+                  AND lease_owner LIKE 'dispatcher:%'
+                  AND EXISTS (
+                      SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                      WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                        AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                        AND (
+                            owner.stopped_at IS NOT NULL
+                            OR owner.heartbeat_at < ?
+                        )
                   )
                 """,
                 (
@@ -1029,13 +1100,14 @@ class DurableSignalStore(UnifiedStoreBase):
         stale_before: datetime,
         now: Optional[datetime] = None,
     ) -> int:
-        """Requeue foreign leases whose runtime owner is stopped or stale.
+        """Requeue only managed dispatcher leases whose owner is stale/stopped.
 
         A normal lease can be committed before cognition begins.  On restart,
         retaining that lease until its deadline would make a provider callback
         look like a duplicate even though its cognition was never made safe.
         Owner-aware recovery restores that delivery without disturbing a live
-        sibling dispatcher sharing the same tenant.
+        sibling dispatcher sharing the same tenant. It deliberately preserves
+        public executor leases and unknown ownership domains.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("recovering_owner_id", recovering_owner_id)
@@ -1062,21 +1134,15 @@ class DurableSignalStore(UnifiedStoreBase):
                     END,
                     updated_at = ?
                 WHERE agent_id = ? AND status = ? AND lease_owner <> ?
-                  AND (
-                      NOT EXISTS (
-                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
-                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
-                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
-                      )
-                      OR EXISTS (
-                          SELECT 1 FROM {self.RUNTIME_OWNERS} owner
-                          WHERE owner.agent_id = {self.DELIVERIES}.agent_id
-                            AND owner.owner_id = {self.DELIVERIES}.lease_owner
-                            AND (
-                                owner.stopped_at IS NOT NULL
-                                OR owner.heartbeat_at < ?
-                            )
-                      )
+                  AND lease_owner LIKE 'dispatcher:%'
+                  AND EXISTS (
+                      SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                      WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                        AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                        AND (
+                            owner.stopped_at IS NOT NULL
+                            OR owner.heartbeat_at < ?
+                        )
                   )
                 """,
                 (
@@ -1212,6 +1278,24 @@ class DurableSignalStore(UnifiedStoreBase):
             (agent_id, consumer_id, event_id),
         )
         return self._row_to_delivery(row) if row is not None else None
+
+    async def get_event_integrity(
+        self, *, agent_id: str, event_id: str
+    ) -> Optional[str]:
+        """Return one agent-scoped privacy-safe durable event binding."""
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("event_id", event_id)
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT integrity.integrity_binding
+            FROM {self.EVENT_INTEGRITY} integrity
+            JOIN {self.EVENTS} event ON event.event_id = integrity.event_id
+            WHERE integrity.event_id = ? AND event.agent_id = ?
+            """,
+            (event_id, agent_id),
+        )
+        return str(row[0]) if row is not None else None
 
     async def list_deliveries(
         self,

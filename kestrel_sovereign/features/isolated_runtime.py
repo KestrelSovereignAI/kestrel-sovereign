@@ -96,6 +96,7 @@ _EXTERNAL_INGRESS_TRANSITION_TOKEN_BYTES = 32
 # callback must run outside the SDK event reader because that same reader owns
 # the response stream for host-ingress RPCs.
 _EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
+_EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
 _EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
 # Polling is sequential: an acknowledged source cannot emit its next update
 # until Core acknowledges the current one. Retaining one current-child event
@@ -1647,6 +1648,7 @@ class _DeferredAcknowledgedIngress:
     message: dict[str, Any]
     acknowledgement: _HostIngressRequest
     source_client: Any = field(repr=False)
+    retry: _HostIngressRequest | None = None
 
 
 @dataclass
@@ -2089,6 +2091,11 @@ class ProxyFeature(Feature):
         # than leaving a raw client RPC alive after the proxy is retired.
         self._event_ack_tasks: set[asyncio.Task[None]] = set()
         self._event_ack_clients: list[tuple[Any, asyncio.Task[None]]] = []
+        # Full inbound routing can run cognition. Keep it outside the SDK's
+        # serial notification reader and own at most one current callback per
+        # isolated client, matching cursor-owning polling semantics.
+        self._event_ingress_tasks: set[asyncio.Task[None]] = set()
+        self._event_ingress_clients: list[tuple[Any, asyncio.Task[None]]] = []
         self._deferred_acknowledged_event_tasks: set[asyncio.Task[None]] = set()
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
@@ -2487,6 +2494,8 @@ class ProxyFeature(Feature):
         self._terminal_lifecycle_latched = True
         self._stopping = True
         for task in tuple(self._event_ack_tasks):
+            task.cancel()
+        for task in tuple(self._event_ingress_tasks):
             task.cancel()
         for task in tuple(self._deferred_acknowledged_event_tasks):
             task.cancel()
@@ -2990,7 +2999,7 @@ class ProxyFeature(Feature):
         return True
 
     async def _cancel_terminal_event_ingress_tasks(self) -> bool:
-        """Fence ACK and deferred-ingress workers before client retirement.
+        """Fence inbound, ACK, and deferred-ingress workers before retirement.
 
         A terminal latch may cancel either kind of worker, but cancellation is
         only a request.  Retiring the exact facade before those tasks settle
@@ -3004,6 +3013,7 @@ class ProxyFeature(Feature):
             task
             for task in (
                 *self._event_ack_tasks,
+                *self._event_ingress_tasks,
                 *self._deferred_acknowledged_event_tasks,
             )
             if task is not current and not task.done()
@@ -3352,6 +3362,7 @@ class ProxyFeature(Feature):
             or self._terminal_retirement_clients
             or self._has_running_terminal_health_probe_task()
             or any(not task.done() for task in self._event_ack_tasks)
+            or any(not task.done() for task in self._event_ingress_tasks)
             or any(not task.done() for task in self._deferred_acknowledged_event_tasks)
             or self._traffic_gate._active
             or self._terminal_traffic_drain_task is not None
@@ -6485,6 +6496,15 @@ class ProxyFeature(Feature):
         # because an SDK callback has no caller to handle a deliberate shutdown
         # result.
         source_client = self._client if source_client is None else source_client
+        # Channel ingress can run an unbounded cognition turn. The SDK invokes
+        # this callback from its one serial notification reader, which is also
+        # responsible for receiving private host-ingress RPC responses. Detach
+        # the *entire* admission/routing/completion lifecycle before any await
+        # that could reach cognition; otherwise cognition calling channels_send
+        # can deadlock the reader against its own response stream.
+        if self._is_inbound_event(event):
+            self._schedule_event_ingress_routing(event, source_client)
+            return
         try:
             async with self._traffic_gate.admit(wait_for_open=False):
                 # The callback retains the client that registered it. Recheck
@@ -6505,6 +6525,111 @@ class ProxyFeature(Feature):
             return
         except _TrafficGateTerminalError:
             return
+
+    @staticmethod
+    def _is_inbound_event(event: Any) -> bool:
+        kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")
+        payload = _meta_get(event, "payload", event)
+        if kind == "feature/event":
+            event_name = _meta_get(payload, "name") or _meta_get(payload, "event")
+        else:
+            event_name = kind
+        return event_name in {"channel.inbound", "inbound", "message.inbound"}
+
+    def _schedule_event_ingress_routing(self, event: Any, source_client: Any) -> None:
+        """Detach one bounded inbound route from the SDK notification reader."""
+
+        if self._terminal_lifecycle_latched or source_client is not self._client:
+            return
+        # The SDK reader owns an untrusted JSON graph. Copy the complete
+        # bounded envelope before returning so a child (or a test double) cannot
+        # mutate the event between notification receipt and the detached host
+        # task's first turn.
+        try:
+            detached_event = _snapshot_host_ingress_payload(event)
+        except (ProtocolError, TypeError, ValueError):
+            logger.warning(
+                "Ignoring malformed inbound ingress from isolated feature %s",
+                self.name,
+            )
+            return
+        if any(
+            client is source_client and not task.done()
+            for client, task in self._event_ingress_clients
+        ):
+            # A cursor-owning source must retain the second update itself. Do
+            # not turn a malformed/flooding notification stream into unbounded
+            # host tasks or host-memory queueing.
+            logger.warning(
+                "Ignoring concurrent inbound ingress from isolated feature %s",
+                self.name,
+            )
+            return
+
+        async def route() -> None:
+            retry: _HostIngressRequest | None = None
+            try:
+                kind = _meta_get(detached_event, "type") or _meta_get(detached_event, "event") or _meta_get(detached_event, "kind")
+                payload = _meta_get(detached_event, "payload", detached_event)
+                if kind == "feature/event":
+                    data = _meta_get(payload, "data", payload)
+                else:
+                    data = payload
+                inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
+                retry = self._inbound_event_retry_completion(data)
+                try:
+                    async with self._traffic_gate.admit(wait_for_open=False):
+                        if source_client is not self._client:
+                            return
+                        admission = await self._route_inbound(inbound)
+                except _TrafficGateClosedError:
+                    if source_client is self._client:
+                        self._defer_current_acknowledged_event(detached_event, source_client)
+                    return
+                except _TrafficGateTerminalError:
+                    return
+                if self._inbound_admission_is_durable(admission):
+                    if acknowledgement is not None:
+                        self._schedule_event_ingress_acknowledgement(
+                            source_client, acknowledgement
+                        )
+                elif retry is not None:
+                    self._schedule_event_ingress_retry(source_client, retry)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001 - producer retains its cursor
+                logger.warning(
+                    "Detached inbound ingress from isolated feature %s failed",
+                    self.name,
+                )
+                # A retryable cognitive failure must release the child-side
+                # polling callback.  Without this terminal provider response,
+                # the update is retained correctly but its serial poll loop is
+                # stuck awaiting a completion Core will never send.
+                if retry is not None:
+                    self._schedule_event_ingress_retry(source_client, retry)
+
+        task = asyncio.create_task(
+            route(), name=f"isolated-event-ingress-route:{self.name}"
+        )
+        self._event_ingress_tasks.add(task)
+        self._event_ingress_clients.append((source_client, task))
+
+        def consume_route(completed: asyncio.Task[None]) -> None:
+            self._event_ingress_tasks.discard(completed)
+            self._event_ingress_clients = [
+                (client, owned_task)
+                for client, owned_task in self._event_ingress_clients
+                if owned_task is not completed
+            ]
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except BaseException:  # noqa: BLE001 - already logged by route
+                return
+
+        task.add_done_callback(consume_route)
 
     async def _handle_event_admitted_from_source(
         self, event: Any, source_client: Any
@@ -6529,13 +6654,20 @@ class ProxyFeature(Feature):
 
         if event_name in {"channel.inbound", "inbound", "message.inbound"}:
             inbound, acknowledgement = self._split_inbound_event_acknowledgement(data)
-            accepted = await self._route_inbound(inbound)
+            retry = self._inbound_event_retry_completion(data)
+            admission = await self._route_inbound(inbound)
             source_client = _event_source_client.get()
-            if accepted and acknowledgement is not None and source_client is not None:
+            if (
+                self._inbound_admission_is_durable(admission)
+                and acknowledgement is not None
+                and source_client is not None
+            ):
                 self._schedule_event_ingress_acknowledgement(
                     source_client,
                     acknowledgement,
                 )
+            elif retry is not None and source_client is not None:
+                self._schedule_event_ingress_retry(source_client, retry)
         elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
             await self._route_link_qr(data)
         elif event_name in {"channel.link_cleared", "link_cleared"}:
@@ -6554,12 +6686,13 @@ class ProxyFeature(Feature):
         bot/update after a successful delivery.
         """
 
-        if (
-            type(payload) is not dict
-            or set(payload) != {
+        if type(payload) is not dict or set(payload) not in (
+            {_EVENT_HOST_INGRESS_MESSAGE_FIELD, _EVENT_HOST_INGRESS_ACK_FIELD},
+            {
                 _EVENT_HOST_INGRESS_MESSAGE_FIELD,
                 _EVENT_HOST_INGRESS_ACK_FIELD,
-            }
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+            },
         ):
             return payload, None
         message = payload.get(_EVENT_HOST_INGRESS_MESSAGE_FIELD)
@@ -6588,6 +6721,49 @@ class ProxyFeature(Feature):
         ):
             return message, None
         return message, request
+
+    def _inbound_event_retry_completion(
+        self, payload: Any
+    ) -> _HostIngressRequest | None:
+        """Return a validated retry completion paired to one inbound ACK key."""
+
+        if type(payload) is not dict or set(payload) != {
+            _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+            _EVENT_HOST_INGRESS_ACK_FIELD,
+            _EVENT_HOST_INGRESS_RETRY_FIELD,
+        }:
+            return None
+        message, acknowledgement = self._split_inbound_event_acknowledgement(payload)
+        descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
+        if (
+            acknowledgement is None
+            or type(message) is not dict
+            or type(descriptor) is not dict
+            or set(descriptor) != {"name", "payload"}
+        ):
+            return None
+        request = _prepare_host_ingress_request(
+            descriptor.get("name"), descriptor.get("payload")
+        )
+        if request is None or type(request.payload) is not dict:
+            return None
+        message_metadata = message.get("metadata")
+        dedupe_key = (
+            message_metadata.get("dedupe_key")
+            if type(message_metadata) is dict
+            else None
+        )
+        if (
+            type(dedupe_key) is not str
+            or set(request.payload) != {"dedupe_key"}
+            or request.payload.get("dedupe_key") != dedupe_key
+        ):
+            return None
+        return request
+
+    @staticmethod
+    def _inbound_admission_is_durable(admission: Any) -> bool:
+        return getattr(admission, "durably_admitted", False) is True
 
     def _event_ingress_acknowledgement(
         self, event: Any
@@ -6620,6 +6796,7 @@ class ProxyFeature(Feature):
         if event_name not in {"channel.inbound", "inbound", "message.inbound"}:
             return
         message, acknowledgement = self._split_inbound_event_acknowledgement(payload)
+        retry = self._inbound_event_retry_completion(payload)
         if acknowledgement is None or type(message) is not dict:
             return
         try:
@@ -6636,6 +6813,7 @@ class ProxyFeature(Feature):
             message=detached_message,
             acknowledgement=acknowledgement,
             source_client=source_client,
+            retry=retry,
         )
         if len(self._deferred_acknowledged_event_tasks) >= _MAX_DEFERRED_ACKNOWLEDGED_EVENTS:
             logger.warning(
@@ -6652,11 +6830,15 @@ class ProxyFeature(Feature):
                     # so the producer restarts from the same durable cursor.
                     if deferred.source_client is not self._client:
                         return
-                    accepted = await self._route_inbound(deferred.message)
-                    if accepted:
+                    admission = await self._route_inbound(deferred.message)
+                    if self._inbound_admission_is_durable(admission):
                         self._schedule_event_ingress_acknowledgement(
                             deferred.source_client,
                             deferred.acknowledgement,
+                        )
+                    elif deferred.retry is not None:
+                        self._schedule_event_ingress_retry(
+                            deferred.source_client, deferred.retry
                         )
             except (_TrafficGateClosedError, _TrafficGateTerminalError):
                 return
@@ -6690,7 +6872,32 @@ class ProxyFeature(Feature):
         source_client: Any,
         request: _HostIngressRequest,
     ) -> None:
-        """Acknowledge delivered ingress without blocking the SDK event reader.
+        """Acknowledge durably admitted ingress without blocking the SDK reader."""
+
+        self._schedule_event_ingress_completion(
+            source_client, request, expected_state="acknowledged", kind="ack"
+        )
+
+    def _schedule_event_ingress_retry(
+        self,
+        source_client: Any,
+        request: _HostIngressRequest,
+    ) -> None:
+        """Release a retryable provider callback without advancing its cursor."""
+
+        self._schedule_event_ingress_completion(
+            source_client, request, expected_state="retrying", kind="retry"
+        )
+
+    def _schedule_event_ingress_completion(
+        self,
+        source_client: Any,
+        request: _HostIngressRequest,
+        *,
+        expected_state: str,
+        kind: str,
+    ) -> None:
+        """Complete a provider callback after detached routing has settled.
 
         ``IsolatedFeatureClient`` reads notifications and JSON-RPC responses on
         one task. Awaiting ``call_host_ingress`` in that notification handler
@@ -6713,7 +6920,7 @@ class ProxyFeature(Feature):
             # the same facade is not queued in host memory; its source retains
             # the cursor and retries after this one settles.
             logger.warning(
-                "Ignoring concurrent ingress acknowledgement from isolated feature %s",
+                "Ignoring concurrent ingress completion from isolated feature %s",
                 self.name,
             )
             return
@@ -6723,32 +6930,32 @@ class ProxyFeature(Feature):
             names = getattr(capabilities, "names", ())
             if request.name not in names:
                 logger.warning(
-                    "Inbound event from isolated feature %s requested an unavailable acknowledgement",
+                    "Inbound event from isolated feature %s requested an unavailable completion",
                     self.name,
                 )
                 return
             call = getattr(source_client, "call_host_ingress", None)
         except BaseException:  # noqa: BLE001 - untrusted facade stays unacknowledged
             logger.warning(
-                "Inbound event from isolated feature %s could not start acknowledgement",
+                "Inbound event from isolated feature %s could not start completion",
                 self.name,
             )
             return
         if not callable(call):
             logger.warning(
-                "Inbound event from isolated feature %s requested an unsupported acknowledgement",
+                "Inbound event from isolated feature %s requested an unsupported completion",
                 self.name,
             )
             return
 
-        async def acknowledge() -> None:
+        async def complete() -> None:
             for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
                 if self._terminal_lifecycle_latched or source_client is not self._client:
                     return
                 settled, result = await self._await_event_ingress_ack_attempt(
                     call, request, source_client
                 )
-                if settled and self._is_event_ingress_acknowledged(result):
+                if settled and self._is_event_ingress_completion(result, expected_state):
                     return
                 if not settled:
                     # The exact RPC rejected cancellation or belongs to a
@@ -6759,7 +6966,8 @@ class ProxyFeature(Feature):
                 if attempt + 1 < _EVENT_INGRESS_ACK_ATTEMPTS:
                     await asyncio.sleep(_EVENT_INGRESS_ACK_BACKOFF * (attempt + 1))
             logger.warning(
-                "Inbound event acknowledgement for isolated feature %s exhausted retries",
+                "Inbound event %s completion for isolated feature %s exhausted retries",
+                kind,
                 self.name,
             )
             # Telegram's pending completion keeps its getUpdates offset
@@ -6768,8 +6976,8 @@ class ProxyFeature(Feature):
             self._fence_event_ingress_ack_source(source_client)
 
         task = asyncio.create_task(
-            acknowledge(),
-            name=f"isolated-event-ingress-ack:{self.name}",
+            complete(),
+            name=f"isolated-event-ingress-{kind}:{self.name}",
         )
         self._event_ack_tasks.add(task)
         self._event_ack_clients.append((source_client, task))
@@ -6785,7 +6993,7 @@ class ProxyFeature(Feature):
                 return
             try:
                 completed.result()
-            except BaseException:  # noqa: BLE001 - acknowledgement already logged
+            except BaseException:  # noqa: BLE001 - completion already logged
                 return
 
         task.add_done_callback(consume_acknowledgement)
@@ -6845,20 +7053,33 @@ class ProxyFeature(Feature):
     def _is_event_ingress_acknowledged(value: Any) -> bool:
         """Accept the narrow, private completion envelope only."""
 
+        return ProxyFeature._is_event_ingress_completion(value, "acknowledged")
+
+    @staticmethod
+    def _is_event_ingress_completion(value: Any, expected_state: str) -> bool:
+        """Accept the narrow private ACK or retry-completion envelope."""
+
         if type(value) is not dict:
             return False
-        allowed = {"status", "http_status", "state", "already_acknowledged"}
+        allowed = {
+            "status",
+            "http_status",
+            "state",
+            "already_acknowledged",
+            "already_retrying",
+        }
         if not set(value).issubset(allowed):
             return False
         if (
             value.get("status") != "ok"
             or value.get("http_status") != 200
-            or value.get("state") != "acknowledged"
+            or value.get("state") != expected_state
         ):
             return False
-        return (
-            "already_acknowledged" not in value
-            or type(value["already_acknowledged"]) is bool
+        return all(
+            type(value[key]) is bool
+            for key in ("already_acknowledged", "already_retrying")
+            if key in value
         )
 
     async def _route_link_cleared(self, payload: Any) -> None:
@@ -6925,14 +7146,14 @@ class ProxyFeature(Feature):
             logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
             return
 
-    async def _route_inbound(self, payload: Any) -> bool:
+    async def _route_inbound(self, payload: Any) -> Any:
         channel = self._channel_feature()
         if channel is None or not hasattr(channel, "handle_inbound"):
             logger.warning(
                 "Inbound notification from %s dropped: ChannelFeature unavailable",
                 self.name,
             )
-            return False
+            return None
 
         from kestrel_sovereign.features.channels.models import ChannelMessage
 
@@ -6947,20 +7168,19 @@ class ProxyFeature(Feature):
                 "Inbound notification from %s dropped: host agent identity unavailable",
                 self.name,
             )
-            return False
+            return None
         supplied_agent_id = getattr(message, "agent_id", "")
         if supplied_agent_id not in {"", authoritative_agent_id}:
             logger.warning(
                 "Inbound notification from %s dropped: child supplied another agent scope",
                 self.name,
             )
-            return False
+            return None
         # The host, not the isolated child, owns the tenant/agent boundary.
         # ChannelFeature repeats this binding before its own persistence so a
         # direct caller cannot bypass the proxy's authoritative scope either.
         message.agent_id = authoritative_agent_id
-        admission = await channel.handle_inbound(message)
-        return getattr(admission, "durably_admitted", False) is True
+        return await channel.handle_inbound(message)
 
 
 def _send_outcome(envelope: Dict[str, Any], transport_ok: bool):

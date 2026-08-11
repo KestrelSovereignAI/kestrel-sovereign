@@ -80,6 +80,7 @@ import contextvars
 import copy
 import hashlib
 import inspect
+import json
 import logging
 import os
 import secrets
@@ -104,6 +105,8 @@ from kestrel_sdk.signals import (
     SignalResult,
     SourceRegistration,
     Status,
+    Trust,
+    Urgency,
     Visibility,
 )
 
@@ -965,7 +968,14 @@ class SignalDispatcher:
     async def claim_durable_delivery_for_event(
         self, *, consumer_id: str, event_id: str, executor_id: str
     ) -> Optional[DurableDelivery]:
-        """Claim this consumer's delivery for exactly one persisted event."""
+        """Claim this consumer's delivery for exactly one persisted event.
+
+        Payload-eliding privacy modes initially reserve their delivery to this
+        dispatcher, rather than publishing a claimable marker row. The exact
+        event path used by cursor-owning channel ingress must perform that same
+        reservation transfer as the general polling path; otherwise a first
+        EPHEMERAL/ISOLATED/DEIDENTIFIED delivery is durable but unclaimable.
+        """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             self._discard_expired_transient_durable_handoffs()
@@ -975,11 +985,35 @@ class SignalDispatcher:
                 event_id=event_id,
                 executor_id=executor_id,
             )
-            return (
-                self._delivery_with_transient_handoff(delivery)
-                if delivery is not None
-                else None
-            )
+            if delivery is not None:
+                return self._delivery_with_transient_handoff(delivery)
+
+            async with self._transient_durable_initial_claim_lock:
+                reserved = await self._durable_store.get_delivery_for_event(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    event_id=event_id,
+                )
+                if reserved is None:
+                    return None
+                handoff = self._transient_durable_handoffs.get(reserved.delivery_id)
+                if handoff is None or handoff.initial_lease_token is None:
+                    return None
+                delivery = await self._durable_store.claim_initial_delivery(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    delivery_id=reserved.delivery_id,
+                    initial_lease_owner=self._durable_delivery_owner,
+                    initial_lease_token=handoff.initial_lease_token,
+                    executor_id=executor_id,
+                )
+                if delivery is None:
+                    # If the transfer can no longer happen, raw data must not
+                    # outlive the reservation capability that protected it.
+                    self._discard_transient_durable_handoff(reserved.delivery_id)
+                    return None
+                handoff.initial_lease_token = None
+                return self._delivery_with_transient_handoff(delivery)
 
     async def get_durable_delivery_for_event(
         self, *, consumer_id: str, event_id: str
@@ -1058,6 +1092,20 @@ class SignalDispatcher:
             if delivery is not None and delivery.status == FAILED:
                 self._discard_transient_durable_handoff(delivery_id)
             return delivery
+
+    async def renew_durable_delivery_lease(
+        self, *, consumer_id: str, delivery_id: str, lease_token: str
+    ) -> Optional[DurableDelivery]:
+        """Renew a still-owned cursor delivery while its cognition turn runs."""
+
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.renew_delivery_lease(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+            )
 
     async def list_durable_deliveries(
         self,
@@ -1586,6 +1634,130 @@ class SignalDispatcher:
             return anonymize(value)
         return value
 
+    @staticmethod
+    def _volatile_source_integrity_binding(
+        signal: Signal, source_event_id: Optional[str]
+    ) -> str:
+        """Bind a live privacy-mode retry to its normalized original input.
+
+        The durable event intentionally elides user content in volatile privacy
+        modes. A fixed SHA-256 digest gives a restart-safe equality proof for a
+        provider redelivery without persisting sender/content or another raw
+        payload projection. The event UUID is deliberately excluded because a
+        provider retry creates a fresh signal object for the same source event.
+        """
+
+        envelope = {
+            "source_event_id": source_event_id,
+            "source": signal.source,
+            "kind": signal.kind,
+            "mode": signal.mode.value,
+            "target_agent": signal.target_agent,
+            "caller": getattr(signal, "caller", None),
+            "session_id": signal.session_id,
+            "visibility": signal.visibility.value,
+            "urgency": signal.urgency.value,
+            "origin_trust": getattr(signal.origin_trust, "value", None),
+            "dedupe_key": signal.dedupe_key,
+            "payload": signal.payload,
+        }
+        canonical = json.dumps(
+            envelope,
+            default=lambda value: (
+                value.isoformat()
+                if isinstance(value, datetime)
+                else getattr(value, "value", str(value))
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _signal_from_durable_event(event) -> Signal:
+        """Reconstruct the canonical persisted envelope for a retry turn."""
+
+        chain = [
+            CausationFrame(
+                agent_id=str(frame["agent_id"]),
+                source=str(frame["source"]),
+                signal_id=str(frame["signal_id"]),
+                turn_id=(str(frame["turn_id"]) if frame.get("turn_id") is not None else None),
+                depth=int(frame["depth"]),
+                emitted_at=datetime.fromisoformat(str(frame["emitted_at"])),
+            )
+            for frame in event.causation_chain
+        ]
+        return Signal(
+            source=event.source,
+            kind=event.kind,
+            mode=SignalMode(event.mode),
+            payload=copy.deepcopy(event.payload),
+            target_agent=event.target_agent,
+            visibility=Visibility(event.visibility),
+            session_id=event.session_id,
+            urgency=Urgency(event.urgency),
+            dedupe_key=event.dedupe_key,
+            # Source registration reasserts its trust ceiling before routing.
+            origin_trust=Trust.UNTRUSTED,
+            causation_chain=chain,
+            id=event.event_id,
+            arrived_at=event.arrived_at,
+        )
+
+    @asynccontextmanager
+    async def _renew_durable_cognition_lease(self, delivery: DurableDelivery):
+        """Keep a cursor-owned cognition lease alive until its turn settles."""
+
+        if delivery.lease_expires_at is None or delivery.lease_token is None:
+            yield
+            return
+        stop = asyncio.Event()
+
+        async def renew() -> None:
+            expires_at = delivery.lease_expires_at
+            while not stop.is_set():
+                remaining = max(
+                    0.01, (expires_at - datetime.now(timezone.utc)).total_seconds()
+                )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=max(0.01, remaining / 3))
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    renewed = await self.renew_durable_delivery_lease(
+                        consumer_id=delivery.consumer_id,
+                        delivery_id=delivery.delivery_id,
+                        lease_token=delivery.lease_token,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not renew durable cognition lease: delivery=%s",
+                        delivery.delivery_id,
+                    )
+                    return
+                if renewed is None or renewed.lease_expires_at is None:
+                    logger.error(
+                        "Lost durable cognition lease while turn was running: delivery=%s",
+                        delivery.delivery_id,
+                    )
+                    return
+                expires_at = renewed.lease_expires_at
+
+        task = asyncio.create_task(
+            renew(), name=f"durable_cognition_lease_renewal:{delivery.delivery_id}"
+        )
+        try:
+            yield
+        finally:
+            stop.set()
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(task)
+
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
@@ -1709,6 +1881,11 @@ class SignalDispatcher:
                     if durable_projection.payload_elided
                     else {}
                 )
+                volatile_integrity_binding = (
+                    self._volatile_source_integrity_binding(signal, source_event_id)
+                    if durable_projection.payload_elided
+                    else None
+                )
                 committed_reservations = None
 
                 def install_transient_handoffs(persisted) -> None:
@@ -1771,6 +1948,7 @@ class SignalDispatcher:
                         if durable_projection.payload_elided
                         else None
                     ),
+                    "integrity_binding": volatile_integrity_binding,
                     "before_commit": (
                         install_transient_handoffs
                         if durable_projection.payload_elided
@@ -1897,6 +2075,26 @@ class SignalDispatcher:
                 )
             )
 
+        if durable_projection.payload_elided and not persisted.created:
+            recorded_binding = await self._durable_store.get_event_integrity(
+                agent_id=self._agent.did, event_id=persisted.event_id
+            )
+            if (
+                recorded_binding is None
+                or volatile_integrity_binding is None
+                or not secrets.compare_digest(recorded_binding, volatile_integrity_binding)
+            ):
+                return self._fail(
+                    signal,
+                    start,
+                    Status.FAILED,
+                    error=(
+                        "Privacy-elided durable source event did not match its "
+                        "original normalized integrity binding"
+                    ),
+                    registration=registration,
+                )
+
         if durable_delivery_consumer_id is not None:
             return await self._route_durable_cognition_delivery(
                 signal,
@@ -1905,6 +2103,7 @@ class SignalDispatcher:
                 persisted_event_id=persisted.event_id,
                 consumer_id=durable_delivery_consumer_id,
                 durable_admission=durable_admission,
+                use_live_signal=durable_projection.payload_elided,
             )
 
         if not persisted.created:
@@ -1932,6 +2131,7 @@ class SignalDispatcher:
         persisted_event_id: str,
         consumer_id: str,
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
+        use_live_signal: bool,
     ) -> SignalResult:
         """Route cursor-owned work and ACK only its durable cognition lease."""
         delivery = await self.claim_durable_delivery_for_event(
@@ -1972,9 +2172,15 @@ class SignalDispatcher:
                 registration=registration,
             )
 
-        result = await self._route_after_durable_persistence(
-            signal, registration, start
-        )
+        # A retried persistence-allowed event must execute the canonical
+        # durable envelope, not whatever a duplicate provider callback happens
+        # to carry. Volatile privacy modes retain no content in the ledger, so
+        # their live callback is usable only after the integrity check above.
+        routing_signal = signal if use_live_signal else self._signal_from_durable_event(delivery.event)
+        async with self._renew_durable_cognition_lease(delivery):
+            result = await self._route_after_durable_persistence(
+                routing_signal, registration, start
+            )
         if result.status is Status.OK:
             acknowledged = await self.ack_durable_delivery(
                 consumer_id=consumer_id,

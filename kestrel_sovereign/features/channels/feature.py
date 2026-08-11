@@ -170,6 +170,7 @@ class ChannelFeature(Feature):
         # Create the channel registry
         self.registry = ChannelRegistry()
         self._durable_cognition_ready = False
+        self._durable_cognition_registration_failed = False
         self._register_channel_signal_source()
         await self._register_durable_cognition_consumer()
 
@@ -238,6 +239,7 @@ class ChannelFeature(Feature):
                 )
             )
         except Exception:
+            self._durable_cognition_registration_failed = True
             logger.exception(
                 "Could not register durable channel cognition consumer; "
                 "ACK-bearing ingress will remain retryable"
@@ -641,6 +643,12 @@ class ChannelFeature(Feature):
         durable_admission = False
         durable_cognition_attempted = False
         dispatcher = getattr(self.agent, "dispatcher", None)
+        if self._durable_cognition_registration_failed:
+            # A dispatcher that rejected the durable consumer contract is not
+            # an older compatibility host. Falling back to ordinary enqueue
+            # here would let a provider cursor advance on event persistence
+            # alone, before cursor-owning cognition has a durable consumer.
+            return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
         if dispatcher is not None:
             try:
                 signal = build_signal_for_channel_message(

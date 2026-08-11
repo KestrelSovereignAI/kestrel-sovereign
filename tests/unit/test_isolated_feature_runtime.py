@@ -1716,7 +1716,7 @@ async def test_external_ingress_quiesces_callback_while_admission_is_open_then_d
 
     async def record(event):
         delivered.append(event)
-        return True
+        return SimpleNamespace(durably_admitted=True)
 
     try:
         await feature.persist_config(old_config)
@@ -5620,6 +5620,95 @@ def _acknowledged_telegram_event(dedupe_key: str) -> dict:
     }
 
 
+def _retryable_telegram_event(dedupe_key: str) -> dict:
+    """Build a polling envelope whose provider callback can be NACKed."""
+
+    event = _acknowledged_telegram_event(dedupe_key)
+    event["payload"]["_host_ingress_retry"] = {
+        "name": "telegram-polling-nack",
+        "payload": {"dedupe_key": dedupe_key},
+    }
+    return event
+
+
+@pytest.mark.asyncio
+async def test_inbound_reader_returns_before_cognition_and_nacks_retryable_result(
+    monkeypatch, tmp_path
+):
+    """Cognition can make an outbound channel call without pinning the SDK reader."""
+
+    dedupe_key = "telegram:v2:bot:42:update:reader-free"
+    cognition_started = asyncio.Event()
+    release_cognition = asyncio.Event()
+    retry_completed = asyncio.Event()
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, _message):
+            cognition_started.set()
+            # This is the same data-plane route cognition uses for
+            # ``channels_send``. It must be able to await the child RPC after
+            # the notification reader has already returned to its stream.
+            await feature._channel_adapter.send_message("555", "reply during cognition")
+            await release_cognition.wait()
+            return SimpleNamespace(durably_admitted=False)
+
+    class RetryClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return {"status": "ok", "data": {"message_id": "reply-1"}}
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            retry_completed.set()
+            return {"status": "ok", "http_status": 200, "state": "retrying"}
+
+    channel_feature = ChannelFeature()
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=RetryClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        # The notification invocation returns before even a deliberately
+        # blocked cognition turn, freeing its serial reader for outbound RPC
+        # responses and the later provider completion.
+        await asyncio.wait_for(
+            client.event_handler(_retryable_telegram_event(dedupe_key)), timeout=0.1
+        )
+        await asyncio.wait_for(cognition_started.wait(), timeout=1)
+        assert client.calls == [
+            ("telegram_send", {"to": "555", "message": "reply during cognition"})
+        ]
+        assert client.completions == []
+
+        release_cognition.set()
+        await asyncio.wait_for(retry_completed.wait(), timeout=1)
+        assert client.completions == [
+            ("telegram-polling-nack", {"dedupe_key": dedupe_key})
+        ]
+    finally:
+        release_cognition.set()
+        await feature.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_ack_bearing_ingress_never_acknowledges_legacy_router_fallback(monkeypatch, tmp_path):
     """A legacy/non-durable ChannelFeature result leaves the provider cursor intact."""
@@ -5758,8 +5847,8 @@ async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_ack_workers_are_bounded_to_one_per_source_under_1000_events(monkeypatch, tmp_path):
-    """Sol regression: 1,000 post-delivery events cannot create 1,000 ACK tasks."""
+async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(monkeypatch, tmp_path):
+    """Sol regression: 1,000 callbacks cannot create a host-memory route queue."""
 
     release_ack = asyncio.Event()
     ack_started = asyncio.Event()
@@ -5797,7 +5886,11 @@ async def test_ack_workers_are_bounded_to_one_per_source_under_1000_events(monke
                 _acknowledged_telegram_event(f"telegram:v2:bot:42:update:{1_000 + update_id}")
             )
         await asyncio.wait_for(ack_started.wait(), timeout=1)
-        assert len(delivered) == 1_000
+        # The serial provider must retain every later update while the first
+        # detached route/ACK owns the source. Core intentionally does not turn
+        # those notifications into 999 unbounded cognition tasks.
+        assert len(delivered) == 1
+        assert len(feature._event_ingress_tasks) == 0
         assert len(feature._event_ack_tasks) == 1
         assert len(client.acknowledgements) == 1
         release_ack.set()
@@ -5940,6 +6033,10 @@ async def test_terminal_owner_joins_ack_and_deferred_workers_and_blocks_new_ack(
         await asyncio.wait_for(ack_started.wait(), timeout=1)
         await feature._close_traffic_gate()
         await client.event_handler(_acknowledged_telegram_event("telegram:v2:bot:42:update:207"))
+        for _ in range(20):
+            if feature._deferred_acknowledged_event_tasks:
+                break
+            await asyncio.sleep(0)
         assert feature._event_ack_tasks
         assert feature._deferred_acknowledged_event_tasks
 
