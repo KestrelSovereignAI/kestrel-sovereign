@@ -36,8 +36,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
@@ -87,8 +88,17 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
     _check_multi_agent(multi_agent_path, project_dir, report)
-    _check_constitution_drift(multi_agent_path, project_dir, resolved, report)
-    _check_anchor_consistency(multi_agent_path, project_dir, resolved, report)
+
+    # Read each agent's governance ONCE and give the same reading to both
+    # checks. They used to resolve and read independently, which on an
+    # unreachable PostgreSQL meant paying the connection timeout twice per
+    # agent — a ten-agent fleet waiting 100s to be told the database is down,
+    # from a tool whose bound is five seconds and whose whole purpose is to
+    # answer quickly when the database is down.
+    readings = _read_agent_governance(multi_agent_path, project_dir, resolved)
+
+    _check_constitution_drift(readings, report)
+    _check_anchor_consistency(readings, report)
     _check_legacy_identity_exports(project_dir, report)
 
     return report
@@ -264,6 +274,10 @@ class _GovernanceSource:
     anchor_path: Path
     agent_did: str
     dsn: str | None = None
+    #: Whether ``graph_node_owners`` / ``graph_edge_owners`` exist here.
+    #: False on a database predating the ownership migration (#2649), where
+    #: the scoped reads below cannot run at all — see ``_has_ownership_ledger``.
+    ownership_ledger: bool = True
 
     @property
     def reads_the_anchor(self) -> bool:
@@ -296,6 +310,46 @@ def _discover_agent_did(anchor_path: Path):
     return row[0]
 
 
+def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
+    """Whether this database has the ownership tables at all.
+
+    A database written before the ownership migration (#2649) has neither
+    ``graph_node_owners`` nor ``graph_edge_owners``; ``AsyncStorage`` creates
+    and backfills them at boot. Doctor exists to be run *before* that boot
+    (#2616), so it meets un-migrated databases routinely, and the tenant-scoped
+    reads simply cannot execute against one.
+
+    Absent is not the same as unwitnessed, and conflating them was a real
+    regression: the scoped query raised ``no such table``, which became a
+    warning, which skipped the hash and edge checks entirely — and warnings
+    leave ``ready`` true, so doctor would certify governance it never examined.
+    When the ledger is absent, the legacy unscoped reads are the faithful ones:
+    every row in a per-agent file belongs to that agent, and the backfill is
+    what will shortly say so.
+    """
+    if source.reads_the_anchor:
+        try:
+            with sqlite3.connect(str(source.anchor_path)) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='graph_node_owners'"
+                ).fetchone()
+        except sqlite3.Error:
+            # Let the real read report the real problem.
+            return True
+        return row is not None
+
+    try:
+        rows = _fetch_rows(
+            source,
+            "SELECT 1",
+            "SELECT to_regclass('graph_node_owners') IS NOT NULL",
+        )
+    except Exception:  # noqa: BLE001 — the real read reports the real problem
+        return True
+    return bool(rows and rows[0][0])
+
+
 def _resolve_governance_source(anchor_path: Path, env: dict):
     """Resolve where to read this agent's governance from, and as whom.
 
@@ -314,12 +368,14 @@ def _resolve_governance_source(anchor_path: Path, env: dict):
         )
 
     if _anchor_is_the_runtime_database(env):
-        return _GovernanceSource(anchor_path=anchor_path, agent_did=agent_did)
-    return _GovernanceSource(
-        anchor_path=anchor_path,
-        agent_did=agent_did,
-        dsn=env["KESTREL_DATABASE_URL"],
-    )
+        source = _GovernanceSource(anchor_path=anchor_path, agent_did=agent_did)
+    else:
+        source = _GovernanceSource(
+            anchor_path=anchor_path,
+            agent_did=agent_did,
+            dsn=env["KESTREL_DATABASE_URL"],
+        )
+    return replace(source, ownership_ledger=_has_ownership_ledger(source))
 
 
 #: Seconds doctor will wait for a PostgreSQL connection before calling the
@@ -329,6 +385,62 @@ def _resolve_governance_source(anchor_path: Path, env: dict):
 #: out the OS TCP timeout, minutes of an apparently hung diagnostic. Failing
 #: fast turns that into the ``_UnreadableDB`` finding callers already report.
 _CONNECT_TIMEOUT_SECONDS = 5
+
+
+def _safe(exc: object, source: "_GovernanceSource") -> str:
+    """A driver error with the connection string taken out of it.
+
+    libpq echoes the DSN it could not parse. An unmatched ``[`` in a URI is
+    enough:
+
+        invalid dsn: end of string reached when looking for matching "]"
+        in IPv6 host address in URI: "postgresql://user:hunter2@[bad/kestrel"
+
+    Doctor puts these straight into ``report.warn``, which an operator reads on
+    a terminal and CI archives, so the unredacted form prints the database
+    password. The whole DSN goes, not just the password: it also names a host
+    and database an operator may not want in a build log, and a message that
+    keeps everything except the secret is one parser bug away from keeping the
+    secret too.
+    """
+    text = str(exc)
+    if not source.dsn:
+        return text
+
+    text = text.replace(source.dsn, "<dsn>")
+
+    # And the password on its own, because the whole-string replace above only
+    # catches an echo that is byte-identical to what we passed. libpq is free
+    # to truncate or normalise the URI it quotes back, and a redaction that
+    # depends on the driver quoting us exactly is not a redaction.
+    for secret in _dsn_secrets(source.dsn):
+        text = text.replace(secret, "<redacted>")
+    return text
+
+
+def _dsn_secrets(dsn: str) -> tuple:
+    """Every secret-bearing token in ``dsn``, longest first.
+
+    Longest first so that redacting one token cannot leave a shorter one
+    embedded in the replacement text.
+    """
+    secrets = set()
+    try:
+        from psycopg2.extensions import parse_dsn
+
+        password = parse_dsn(dsn).get("password")
+        if password:
+            secrets.add(password)
+    except Exception:  # noqa: BLE001 — an unparseable DSN is why we are here
+        pass
+
+    # ``parse_dsn`` raises on exactly the malformed URIs that leak, so fall
+    # back to the URI's own shape: everything between "://user:" and the "@".
+    match = re.search(r"://[^:/?#]*:([^@/?#]+)@", dsn)
+    if match:
+        secrets.add(match.group(1))
+
+    return tuple(sorted(secrets, key=len, reverse=True))
 
 
 def _bounded_dsn(dsn: str) -> str:
@@ -393,8 +505,56 @@ def _fetch_rows(
         connection.close()
 
 
+@dataclass(frozen=True)
+class _AgentGovernance:
+    """One agent's governance, read once and shared by every check.
+
+    ``source`` is a :class:`_GovernanceSource` or an ``_UnreadableDB``;
+    ``node`` is ``(node_id, properties)`` or one of the read sentinels. Both
+    checks below interpret the same values rather than fetching their own, so
+    an agent costs one resolve and one row read per ``diagnose`` — not one per
+    check, which on an unreachable PostgreSQL doubled every connection timeout.
+    """
+
+    name: str
+    agent_dir: Path
+    source: object
+    node: object
+
+
+def _read_agent_governance(
+    multi_agent_path: Path, project_dir: Path, env: dict
+) -> "list[_AgentGovernance]":
+    """Resolve and read every registered local agent's governance, once each.
+
+    Agents whose anchor file is missing are skipped silently: that is already
+    a fail from ``_check_multi_agent``, and re-reporting it would say the same
+    thing twice in one report.
+    """
+    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    readings: list[_AgentGovernance] = []
+    for name, cfg in multi_agent.get_local_agents().items():
+        agent_dir = (project_dir / cfg.data_dir).resolve()
+        db_path = agent_dir / "kestrel_prime.db"
+        if not db_path.exists():
+            continue
+
+        source = _resolve_governance_source(db_path, env)
+        node = (
+            source
+            if isinstance(source, _UnreadableDB)
+            else _read_agent_node(source)
+        )
+        readings.append(
+            _AgentGovernance(
+                name=name, agent_dir=agent_dir, source=source, node=node
+            )
+        )
+    return readings
+
+
 def _check_constitution_drift(
-    multi_agent_path: Path, project_dir: Path, env: dict, report: DoctorReport
+    readings: "list[_AgentGovernance]", report: DoctorReport
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
@@ -420,9 +580,7 @@ def _check_constitution_drift(
     anchored since #1722, and the edge is integrity proof 2. Both are
     checked by ``_check_anchor_consistency`` (#2616).
     """
-    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
-    agents = multi_agent.get_local_agents()
-    if not agents:
+    if not readings:
         return
 
     canonical = _canonical_constitution_path()
@@ -442,25 +600,16 @@ def _check_constitution_drift(
         )
         return
 
-    for name, cfg in agents.items():
-        db_path = (project_dir / cfg.data_dir / "kestrel_prime.db").resolve()
-        if not db_path.exists():
-            # Already reported by _check_multi_agent; don't duplicate.
-            continue
-
-        source = _resolve_governance_source(db_path, env)
+    for reading in readings:
+        name = reading.name
+        source = reading.source
         if isinstance(source, _UnreadableDB):
             report.warn.append(
                 f"{name}: constitution drift check skipped — {source.reason}"
             )
             continue
 
-        # One read of the agent node, as the runtime sees it. Both properties
-        # this check needs come out of that single row: asking twice over two
-        # connections let a transient failure on the second answer "no
-        # emancipation contract" for an agent that has one, which renders the
-        # wrong constitution and reports drift that is not there.
-        node = _read_agent_node(source)
+        node = reading.node
         if isinstance(node, _UnreadableDB):
             report.warn.append(
                 f"{name}: constitution drift check skipped — {node.reason}"
@@ -544,7 +693,7 @@ _OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
 
 
 def _check_anchor_consistency(
-    multi_agent_path: Path, project_dir: Path, env: dict, report: DoctorReport
+    readings: "list[_AgentGovernance]", report: DoctorReport
 ) -> None:
     """Pre-upgrade anchor-drift checks beyond base-hash drift (#2616).
 
@@ -568,21 +717,13 @@ def _check_anchor_consistency(
     anchor are already surfaced by ``_check_constitution_drift``; this
     check stays silent for those instead of duplicating the warning.
     """
-    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
-    agents = multi_agent.get_local_agents()
-    for name, cfg in agents.items():
-        agent_dir = (project_dir / cfg.data_dir).resolve()
-        db_path = agent_dir / "kestrel_prime.db"
-        if not db_path.exists():
-            # Already a fail in _check_multi_agent; don't duplicate.
-            continue
-
-        source = _resolve_governance_source(db_path, env)
+    for reading in readings:
+        source = reading.source
         if isinstance(source, _UnreadableDB):
             # Already warned by _check_constitution_drift.
             continue
 
-        node = _read_agent_node(source)
+        node = reading.node
         if isinstance(node, (_UnreadableDB, _NoAgentNode)):
             # Already warned by _check_constitution_drift.
             continue
@@ -592,8 +733,8 @@ def _check_anchor_consistency(
             # warns (missing constitution_hash); nothing verifiable here.
             continue
 
-        _check_governance_edge(name, source, node_id, properties, report)
-        _check_overlay_anchor(name, agent_dir, properties, report)
+        _check_governance_edge(reading.name, source, node_id, properties, report)
+        _check_overlay_anchor(reading.name, reading.agent_dir, properties, report)
 
 
 def _check_governance_edge(
@@ -817,6 +958,27 @@ _GOVERNED_BY_PG = (
     "  AND owner.label = graph_edges.label AND owner.agent_id = %s)"
 )
 
+#: The same reads against a database predating the ownership migration
+#: (#2649), where those ledgers do not exist yet. The second placeholder is
+#: still bound — and still the DID — so the two forms stay parameter-compatible
+#: and a caller cannot pick the wrong argument list with the wrong query.
+_AGENT_NODE_SQLITE_LEGACY = (
+    "SELECT node_id, properties FROM graph_nodes "
+    "WHERE node_id = ? AND node_type = 'agent' AND ? IS NOT NULL"
+)
+_AGENT_NODE_PG_LEGACY = (
+    "SELECT node_id, properties FROM graph_nodes "
+    "WHERE node_id = %s AND node_type = 'agent' AND %s IS NOT NULL"
+)
+_GOVERNED_BY_SQLITE_LEGACY = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id = ? AND label = 'governed_by' AND ? IS NOT NULL"
+)
+_GOVERNED_BY_PG_LEGACY = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id = %s AND label = 'governed_by' AND %s IS NOT NULL"
+)
+
 
 @dataclass(frozen=True)
 class _UnreadableDB:
@@ -892,7 +1054,11 @@ def _read_agent_node(source: "_GovernanceSource"):
     """
     try:
         rows = _fetch_rows(
-            source, _AGENT_NODE_SQLITE, _AGENT_NODE_PG,
+            source,
+            _AGENT_NODE_SQLITE if source.ownership_ledger
+            else _AGENT_NODE_SQLITE_LEGACY,
+            _AGENT_NODE_PG if source.ownership_ledger
+            else _AGENT_NODE_PG_LEGACY,
             sqlite_params=(source.agent_did, source.agent_did),
             postgres_params=(source.agent_did, source.agent_did),
         )
@@ -901,7 +1067,9 @@ def _read_agent_node(source: "_GovernanceSource"):
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
     except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
-        return _UnreadableDB(reason=f"cannot read {source.describe()} ({exc})")
+        return _UnreadableDB(
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+        )
 
     if not rows:
         return _NoAgentNode()
@@ -935,7 +1103,11 @@ def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
     """
     try:
         rows = _fetch_rows(
-            source, _GOVERNED_BY_SQLITE, _GOVERNED_BY_PG,
+            source,
+            _GOVERNED_BY_SQLITE if source.ownership_ledger
+            else _GOVERNED_BY_SQLITE_LEGACY,
+            _GOVERNED_BY_PG if source.ownership_ledger
+            else _GOVERNED_BY_PG_LEGACY,
             sqlite_params=(source_id, source.agent_did),
             postgres_params=(source_id, source.agent_did),
         )
@@ -945,7 +1117,10 @@ def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
         return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
     except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
         return _UnreadableDB(
-            reason=f"cannot read graph_edges in {source.describe()} ({exc})"
+            reason=(
+                f"cannot read graph_edges in {source.describe()} "
+                f"({_safe(exc, source)})"
+            )
         )
 
     return tuple(row[0] for row in rows if row[0])

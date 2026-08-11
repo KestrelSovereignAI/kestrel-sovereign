@@ -172,6 +172,55 @@ def _stubbed_helper(result: ReanchorResult):
     return _stub
 
 
+def test_reanchor_targets_the_database_doctor_reads(reanchor_env, monkeypatch):
+    """The repair and the finding must mean the same database (#2892).
+
+    ``kestrel doctor`` resolves the target through ``spawned_agent_env`` — the
+    launcher's precedence, where the project ``.env`` outranks an export,
+    because that is what a spawned agent actually gets. This command loads its
+    environment through ``load_project_env``, whose ``setdefault`` is the
+    opposite. Left to the ambient environment, a stale exported DSN would have
+    doctor report drift in database A while the repair it prescribes rewrote
+    database B: the finding survives, and a database nobody reads is modified.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://from-file/db\n"
+    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://stale-export/db")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    seen: dict = {}
+
+    async def _capture(**kwargs):
+        seen.update(kwargs)
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64,
+            new_hash="a" * 64,
+            backup_path=None,
+            unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    doctors_view = runtime_env(reanchor_env)
+    assert seen["runtime_dsn"] == doctors_view["KESTREL_DATABASE_URL"]
+    assert seen["runtime_backend"] == doctors_view["KESTREL_DB_BACKEND"]
+    assert seen["runtime_dsn"] == "postgresql://from-file/db"
+
+
 def test_reanchor_unchanged_returns_zero(reanchor_env, capsys):
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     result = ReanchorResult(

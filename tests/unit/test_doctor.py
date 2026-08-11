@@ -1023,6 +1023,107 @@ def test_read_governed_by_targets_unreadable_without_table(tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# A database from before the ownership migration (#2649) has no ledgers at all.
+# Doctor is *meant* to run before boot (#2616), which is exactly when it meets
+# one — and boot is what creates and backfills them.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_graph_db(path, *, nodes=(), edges=()):
+    """A pre-#2649 database: graph tables, no ownership ledgers."""
+    with sqlite3.connect(str(path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE graph_nodes (
+                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
+            );
+            CREATE TABLE graph_edges (
+                source_id TEXT, target_id TEXT, label TEXT, properties TEXT
+            );
+            """
+        )
+        conn.executemany("INSERT INTO graph_nodes VALUES (?, ?, ?, ?)", nodes)
+        conn.executemany("INSERT INTO graph_edges VALUES (?, ?, ?, NULL)", edges)
+        conn.commit()
+    return path
+
+
+def test_a_pre_migration_database_is_still_read(tmp_path, monkeypatch):
+    """Absent ledger ≠ unwitnessed row.
+
+    Scoping unconditionally made the query raise ``no such table``, which
+    became a warning, which skipped the hash and edge checks — and warnings
+    leave ``ready`` true, so doctor certified governance it had not looked at.
+    Every row in a per-agent file belongs to that agent; the backfill at boot
+    is what will shortly say so.
+    """
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _legacy_graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+        edges=[("did:x", "abc", "governed_by")],
+    )
+    source = _resolve_governance_source(db, {})
+
+    assert source.ownership_ledger is False
+    node_id, properties = _read_agent_node(source)
+    assert node_id == "did:x"
+    assert properties == {"constitution_hash": "abc"}
+    assert _read_governed_by_targets(source, "did:x") == ("abc",)
+
+
+def test_a_migrated_database_is_detected_as_such(tmp_path):
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", "{}")],
+        node_owners=[("did:x", "did:x")],
+    )
+    assert _resolve_governance_source(db, {}).ownership_ledger is True
+
+
+# ---------------------------------------------------------------------------
+# Driver errors reach report.warn, which operators read on a terminal and CI
+# archives. libpq echoes the DSN it could not parse.
+# ---------------------------------------------------------------------------
+
+
+def test_a_driver_error_never_carries_the_dsn(tmp_path):
+    """An unmatched ``[`` in the URI is enough to make libpq quote the whole
+    connection string back, password included."""
+    from kestrel_sovereign.doctor import _GovernanceSource, _read_agent_node
+
+    dsn = "postgresql://kestrel:hunter2@[bad/kestrel"
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=dsn
+    )
+
+    result = _read_agent_node(source)
+
+    assert isinstance(result, _UnreadableDB)
+    assert "hunter2" not in result.reason
+    assert dsn not in result.reason
+
+
+def test_the_password_is_redacted_even_if_the_dsn_is_not_quoted_whole(tmp_path):
+    """The whole-string replace only catches a byte-identical echo, and libpq
+    is free to truncate or normalise what it quotes. The password is redacted
+    on its own for that reason."""
+    from kestrel_sovereign.doctor import _GovernanceSource, _safe
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:x",
+        dsn="postgresql://kestrel:hunter2@db.internal:5432/kestrel",
+    )
+
+    truncated = 'invalid dsn: ... in URI: "postgresql://kestrel:hunter2@db.int'
+    assert "hunter2" not in _safe(truncated, source)
+
+
 def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     """#2245: a management-key-only OpenRouter route (api_key_env unset in .env,
     but management_api_key_env present) must NOT be flagged — doctor must agree
@@ -1319,6 +1420,35 @@ def test_the_diagnostic_connection_is_bounded(tmp_path, monkeypatch):
     diagnose(tmp_path)
 
     assert parse_dsn(fake.dsn)["connect_timeout"] == "5"
+
+
+def test_an_agent_costs_one_postgres_connection(tmp_path, monkeypatch):
+    """Both checks read one shared result, so the timeout is paid once.
+
+    Resolving and reading per check meant an unreachable database cost two
+    connection timeouts *per agent*: a ten-agent fleet waiting 100 seconds to
+    be told the database is down, from the tool whose bound is five seconds and
+    whose purpose is to answer quickly when the database is down.
+    """
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    properties = json.dumps({"name": "Test", "constitution_hash": "a" * 64})
+    fake = _FakePostgres(
+        {
+            "SELECT node_id, properties FROM graph_nodes": [
+                ("did:test:Test", properties)
+            ],
+            "FROM graph_edges": [("a" * 64,)],
+        }
+    )
+    connects = []
+    original_connect = fake.connect
+    fake.connect = lambda dsn, **kw: (connects.append(dsn), original_connect(dsn, **kw))[1]
+    _postgres_host(monkeypatch, fake)
+
+    diagnose(tmp_path)
+
+    node_reads = [sql for sql, _ in fake.executed if "graph_nodes" in sql]
+    assert len(node_reads) == 1, f"agent node read {len(node_reads)}× : {node_reads}"
 
 
 def test_a_dsn_that_sets_its_own_timeout_keeps_it(tmp_path, monkeypatch):

@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign import __version__
-from kestrel_sovereign.paths import load_project_env
+from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
     LocalAgentConfig,
@@ -922,6 +922,22 @@ def cmd_constitution_reanchor(args) -> int:
     # the key now gets loaded at all.
     load_project_env(project_dir)
 
+    # ...but the *database target* is resolved separately, with the launcher's
+    # precedence, where the project ``.env`` outranks a conflicting export.
+    # ``load_project_env``'s ``setdefault`` is the opposite, and the two
+    # disagreeing is not academic: ``kestrel doctor`` reads the database the
+    # agents will actually open (``paths.spawned_agent_env``, the body of
+    # ``ProcessManager._load_env``). With a stale DSN exported in the shell,
+    # doctor would report drift in database A while the repair it prescribes
+    # rewrote database B — leaving the finding standing and modifying a copy
+    # nobody reads. A finding and its remedy have to mean the same database.
+    #
+    # Targeting somewhere else deliberately is still possible; it just has to
+    # be deliberate, which is what these explicit arguments are.
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -963,6 +979,8 @@ def cmd_constitution_reanchor(args) -> int:
             sovereign_trust_root_path=(
                 Path(args.trust_root) if args.trust_root else None
             ),
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
         )
     )
 
