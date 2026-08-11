@@ -5504,6 +5504,13 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
                                 "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
                             },
                         },
+                        "_host_ingress_retry": {
+                            "name": "telegram-polling-nack",
+                            "payload": {
+                                "dedupe_key": dedupe_key,
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
+                        },
                     },
                 }
             )
@@ -5603,6 +5610,13 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
                             "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
                         },
                     },
+                    "_host_ingress_retry": {
+                        "name": "telegram-polling-nack",
+                        "payload": {
+                            "dedupe_key": dedupe_key,
+                            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                        },
+                    },
                 },
             }
         )
@@ -5638,6 +5652,13 @@ def _acknowledged_telegram_event(dedupe_key: str) -> dict:
                     "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
                 },
             },
+            "_host_ingress_retry": {
+                "name": "telegram-polling-nack",
+                "payload": {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            },
         },
     }
 
@@ -5645,19 +5666,11 @@ def _acknowledged_telegram_event(dedupe_key: str) -> dict:
 def _retryable_telegram_event(dedupe_key: str) -> dict:
     """Build a polling envelope whose provider callback can be NACKed."""
 
-    event = _acknowledged_telegram_event(dedupe_key)
-    event["payload"]["_host_ingress_retry"] = {
-        "name": "telegram-polling-nack",
-        "payload": {
-            "dedupe_key": dedupe_key,
-            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
-        },
-    }
-    return event
+    return _acknowledged_telegram_event(dedupe_key)
 
 
-def test_telegram_polling_completion_descriptors_require_one_attempt_token():
-    """Core refuses tokenless or cross-attempt Telegram completions."""
+def test_telegram_polling_completion_descriptors_require_an_authoritative_pair():
+    """Telegram classification comes from the message, never descriptor names."""
 
     feature = object.__new__(ProxyFeature)
     valid = _retryable_telegram_event("telegram:v2:bot:42:update:attempt-fenced")
@@ -5677,6 +5690,39 @@ def test_telegram_polling_completion_descriptors_require_one_attempt_token():
         "n" * 43
     )
     assert feature._inbound_event_retry_completion(mismatched["payload"]) is None
+
+    missing_pair = _acknowledged_telegram_event("telegram:v2:bot:42:update:missing")
+    del missing_pair["payload"]["_host_ingress_retry"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        missing_pair["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(missing_pair["payload"]) is None
+
+    renamed = _retryable_telegram_event("telegram:v2:bot:42:update:renamed")
+    renamed["payload"]["_host_ingress_ack"]["name"] = "other-provider-ack"
+    renamed["payload"]["_host_ingress_retry"]["name"] = "other-provider-nack"
+    del renamed["payload"]["_host_ingress_ack"]["payload"]["attempt_token"]
+    del renamed["payload"]["_host_ingress_retry"]["payload"]["attempt_token"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        renamed["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(renamed["payload"]) is None
+
+    # Non-Telegram descriptors retain their established generic contract.
+    non_telegram = _acknowledged_telegram_event("whatsapp:v1:message:1")
+    non_telegram["payload"]["message"]["channel_type"] = "whatsapp"
+    non_telegram["payload"]["_host_ingress_ack"] = {
+        "name": "whatsapp-webhook-ack",
+        "payload": {"dedupe_key": "whatsapp:v1:message:1"},
+    }
+    del non_telegram["payload"]["_host_ingress_retry"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        non_telegram["payload"]
+    )
+    assert acknowledgement is not None
+    assert acknowledgement.name == "whatsapp-webhook-ack"
 
 
 @pytest.mark.asyncio

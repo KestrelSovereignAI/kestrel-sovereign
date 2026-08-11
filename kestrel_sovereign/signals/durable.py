@@ -37,6 +37,11 @@ _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
+# Callers that own a managed dispatcher normally supply their configured
+# threshold explicitly.  Keep direct-store compatibility conservative: a
+# recently registered dispatcher must not lose a lease simply because a
+# polling caller has no dispatcher instance from which to obtain that policy.
+_DEFAULT_RUNTIME_OWNER_STALE_AFTER = timedelta(minutes=2)
 
 
 @dataclass(frozen=True)
@@ -616,6 +621,13 @@ class DurableSignalStore(UnifiedStoreBase):
             await self._lock_scope_handoff(
                 agent_id=agent_id, source=expected_signal.source
             )
+            # This upgrade is a live redelivery operation, not a historical
+            # repair.  Sample once after the transaction has acquired the
+            # source handoff lock and use that same instant for both retention
+            # admission and the new delivery's timestamps.  Backfill retains
+            # the exact boundary (``retention_until >= now``), so a row at the
+            # boundary is still eligible here as well.
+            now = self.now_utc()
             consumer = await self._get_consumer(agent_id, consumer_id)
             if consumer is None or not consumer[4] or consumer[0] != expected_signal.source:
                 return False
@@ -633,6 +645,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 return False
             event = self._row_to_event(row)
             if (
+                event.retention_until < now
+                or
                 event.caller_identity is not None
                 or not self._legacy_event_matches_redelivery(
                     event, expected_signal, source_event_id
@@ -680,7 +694,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 consumer_id=consumer_id,
                 event_id=event_id,
                 max_attempts=int(consumer[2]),
-                now=self.now_utc(),
+                now=now,
             )
             if delivery_id is None:
                 # This transaction owns the source handoff lock, so an
@@ -700,6 +714,7 @@ class DurableSignalStore(UnifiedStoreBase):
         consumer_id: str,
         executor_id: str,
         now: Optional[datetime] = None,
+        runtime_owner_stale_before: Optional[datetime] = None,
     ) -> Optional[DurableDelivery]:
         """Atomically lease one due delivery for this scoped consumer.
 
@@ -716,7 +731,14 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer is None or not consumer[4]:
             return None
         await self._recover_expired_leases(
-            agent_id=agent_id, consumer_id=consumer_id, now=now
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            now=now,
+            runtime_owner_stale_before=(
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            ),
         )
         # Catch events committed while a consumer was restarting.  The unique
         # delivery key makes this safe to do on every poll.
@@ -787,6 +809,7 @@ class DurableSignalStore(UnifiedStoreBase):
         event_id: str,
         executor_id: str,
         now: Optional[datetime] = None,
+        runtime_owner_stale_before: Optional[datetime] = None,
     ) -> Optional[DurableDelivery]:
         """Atomically claim this consumer's delivery for one persisted event.
 
@@ -803,7 +826,14 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer is None or not consumer[4]:
             return None
         await self._recover_expired_leases(
-            agent_id=agent_id, consumer_id=consumer_id, now=now
+            agent_id=agent_id,
+            consumer_id=consumer_id,
+            now=now,
+            runtime_owner_stale_before=(
+                _as_utc(runtime_owner_stale_before)
+                if runtime_owner_stale_before is not None
+                else now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+            ),
         )
         lease_token = secrets.token_urlsafe(24)
         lease_expires_at = now + timedelta(seconds=int(consumer[3]))
@@ -1402,6 +1432,74 @@ class DurableSignalStore(UnifiedStoreBase):
             agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
         )
 
+    async def release_managed_delivery_after_task(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        owner_id: str,
+        error: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DurableDelivery]:
+        """Release a completed local task's exact managed lease.
+
+        A dispatcher may learn that its renewal path is lost while the
+        cognition coroutine ignores cancellation.  Normal NACK intentionally
+        refuses an expired lease, but the live managed-owner heartbeat keeps
+        that lease out of generic expiry recovery until this exact coroutine
+        has settled.  At that point this owner/token conditional transition is
+        safe even after the nominal deadline: no other claimant could have
+        acquired the row while the owner was live.  The owner predicate keeps
+        this narrow escape hatch unavailable to public or unknown executors.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("lease_token", lease_token)
+        self._require_nonempty("owner_id", owner_id)
+        self._require_nonempty("error", error)
+        if not owner_id.startswith("dispatcher:"):
+            raise ValueError("owner_id must identify a managed dispatcher")
+        now = _as_utc(now or self.now_utc())
+        timestamp = self._timestamp_placeholder()
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET status = CASE WHEN max_attempts > 0 AND attempts >= max_attempts THEN ? ELSE ? END,
+                lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                next_attempt_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
+                    THEN NULL ELSE {timestamp} END,
+                last_error = ?,
+                terminal_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
+                    THEN {timestamp} ELSE NULL END,
+                updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+              AND status = ? AND lease_owner = ? AND lease_token = ?
+            """,
+            (
+                FAILED,
+                RETRY,
+                self.to_timestamp_param(now),
+                error,
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+                LEASED,
+                owner_id,
+                lease_token,
+            ),
+        )
+        if updated == 0:
+            return None
+        return await self.get_delivery(
+            agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
+        )
+
     async def get_delivery(
         self, *, agent_id: str, consumer_id: str, delivery_id: str
     ) -> Optional[DurableDelivery]:
@@ -1723,8 +1821,23 @@ class DurableSignalStore(UnifiedStoreBase):
             )
 
     async def _recover_expired_leases(
-        self, *, agent_id: str, consumer_id: str, now: datetime
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        now: datetime,
+        runtime_owner_stale_before: datetime,
     ) -> None:
+        """Requeue expired work without stealing from a live dispatcher.
+
+        Leases owned by public or unknown executors retain ordinary expiry
+        behavior because there is no durable liveness contract for them.  A
+        ``dispatcher:`` owner is different: its heartbeat proves that an
+        in-process cognition task may still be draining a cancellation.  Such
+        a row is recoverable only once that managed owner is explicitly
+        stopped or its heartbeat is stale.
+        """
+
         timestamp = self._timestamp_placeholder()
         await self._backend.execute(
             f"""
@@ -1739,6 +1852,17 @@ class DurableSignalStore(UnifiedStoreBase):
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND status = ?
               AND lease_expires_at <= ?
+              AND (
+                  lease_owner IS NULL
+                  OR lease_owner NOT LIKE 'dispatcher:%'
+                  OR NOT EXISTS (
+                      SELECT 1 FROM {self.RUNTIME_OWNERS} owner
+                      WHERE owner.agent_id = {self.DELIVERIES}.agent_id
+                        AND owner.owner_id = {self.DELIVERIES}.lease_owner
+                        AND owner.stopped_at IS NULL
+                        AND owner.heartbeat_at >= ?
+                  )
+              )
             """,
             (
                 FAILED,
@@ -1750,6 +1874,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 consumer_id,
                 LEASED,
                 self.to_timestamp_param(now),
+                self.to_timestamp_param(runtime_owner_stale_before),
             ),
         )
 

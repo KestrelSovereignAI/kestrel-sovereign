@@ -6702,6 +6702,15 @@ class ProxyFeature(Feature):
         descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
         if type(message) is not dict or type(descriptor) is not dict:
             return message, None
+        # Telegram polling is a cursor-owning protocol, not a convention
+        # inferred from an arbitrary child descriptor name.  Classify it from
+        # the canonical normalized message identity and require its complete
+        # ACK/NACK pair before Core is allowed to advance or release a poll.
+        # This prevents a Telegram-shaped message from smuggling a tokenless
+        # other-provider completion through the generic descriptor path.
+        if self._is_canonical_telegram_message(message):
+            pair = self._telegram_polling_completion_pair(payload, message)
+            return message, pair[0] if pair is not None else None
         if set(descriptor) != {"name", "payload"}:
             return message, None
         request = _prepare_host_ingress_request(
@@ -6741,6 +6750,70 @@ class ProxyFeature(Feature):
         ):
             return message, None
         return message, request
+
+    @staticmethod
+    def _is_canonical_telegram_message(message: dict[str, Any]) -> bool:
+        """Whether a normalized inbound message authoritatively identifies Telegram."""
+
+        return message.get("channel_type") == "telegram"
+
+    @staticmethod
+    def _telegram_polling_completion_pair(
+        payload: dict[str, Any], message: dict[str, Any]
+    ) -> tuple[_HostIngressRequest, _HostIngressRequest] | None:
+        """Validate Telegram's exact, attempt-fenced ACK/NACK descriptor pair."""
+
+        if set(payload) != {
+            _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+            _EVENT_HOST_INGRESS_ACK_FIELD,
+            _EVENT_HOST_INGRESS_RETRY_FIELD,
+        }:
+            return None
+        acknowledgement_descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
+        retry_descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
+        if (
+            type(acknowledgement_descriptor) is not dict
+            or type(retry_descriptor) is not dict
+            or set(acknowledgement_descriptor) != {"name", "payload"}
+            or set(retry_descriptor) != {"name", "payload"}
+        ):
+            return None
+        acknowledgement = _prepare_host_ingress_request(
+            acknowledgement_descriptor.get("name"),
+            acknowledgement_descriptor.get("payload"),
+        )
+        retry = _prepare_host_ingress_request(
+            retry_descriptor.get("name"), retry_descriptor.get("payload")
+        )
+        if (
+            acknowledgement is None
+            or retry is None
+            or acknowledgement.name != _TELEGRAM_POLLING_ACK
+            or retry.name != _TELEGRAM_POLLING_NACK
+            or type(acknowledgement.payload) is not dict
+            or type(retry.payload) is not dict
+            or set(acknowledgement.payload) != {"dedupe_key", "attempt_token"}
+            or set(retry.payload) != {"dedupe_key", "attempt_token"}
+        ):
+            return None
+        metadata = message.get("metadata")
+        dedupe_key = metadata.get("dedupe_key") if type(metadata) is dict else None
+        acknowledgement_token = acknowledgement.payload.get("attempt_token")
+        retry_token = retry.payload.get("attempt_token")
+        if (
+            type(dedupe_key) is not str
+            or message.get("id") != dedupe_key
+            or acknowledgement.payload.get("dedupe_key") != dedupe_key
+            or retry.payload.get("dedupe_key") != dedupe_key
+            or type(acknowledgement_token) is not str
+            or type(retry_token) is not str
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(acknowledgement_token)
+            is None
+            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(retry_token) is None
+            or not secrets.compare_digest(acknowledgement_token, retry_token)
+        ):
+            return None
+        return acknowledgement, retry
 
     def _inbound_event_retry_completion(
         self, payload: Any
