@@ -272,6 +272,33 @@ async def test_nested_budgeted_spawn_unwraps_delegated_parent():
     assert isinstance(gc._wallet, FakeWallet)      # not a nested DelegatedWallet
 
 
+@pytest.mark.asyncio
+async def test_nested_legacy_release_does_not_proxy_root_child_release_contract():
+    """A grandchild's legacy hold returns through its immediate delegated parent."""
+
+    class RootWithLegacyNestedAffordability(DurableProvisioningWallet):
+        # The outer provider is durable, while its manually wrapped delegated
+        # child follows the legacy nested-transfer path.
+        can_afford = FakeWallet.can_afford
+
+    root = RootWithLegacyNestedAffordability(initial_balance=Decimal("100"))
+    child = DelegatedWallet(
+        root, BudgetAllocation(child_did="did:child", amount=Decimal("50"))
+    )
+    grandchild = await create_delegated_wallet(
+        child, "did:child", "did:grandchild", Decimal("20")
+    )
+    assert await grandchild.transfer(Decimal("5"), "grandchild work") is True
+
+    # ``child`` proxies normal deposits to ``root``, but its legacy grandchild
+    # allocation has no root-owned child-release ledger entry. Looking through
+    # __getattr__ would invoke the root protocol and strand the refund.
+    assert await release_delegated_wallet(grandchild, child) == Decimal("15")
+    assert root.get_balance() == Decimal("95")
+    assert child.spent == Decimal("5")
+    assert root.release_calls == []
+
+
 class _InitFailWallet(FakeWallet):
     async def initialize(self):
         raise RuntimeError("wallet provider init failed")

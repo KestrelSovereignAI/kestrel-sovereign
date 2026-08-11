@@ -13,6 +13,7 @@ Hold/Release Lifecycle:
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -138,6 +139,24 @@ class DurableDelegatedChildWalletReleaseProviderProtocol(Protocol):
     ) -> Decimal: ...
 
 
+def _has_direct_callable_contract(wallet: object, name: str) -> bool:
+    """Whether ``wallet`` itself declares one callable provider method.
+
+    ``DelegatedWallet`` deliberately proxies ordinary wallet operations through
+    ``__getattr__``.  Provider contracts are different: they authorize a
+    specific allocation ledger, so discovering one through a wrapper would
+    select an ancestor's ledger for a nested, legacy allocation.  Static lookup
+    verifies that the immediate object exposes the method before normal binding
+    obtains the callable.
+    """
+
+    try:
+        inspect.getattr_static(wallet, name)
+    except AttributeError:
+        return False
+    return callable(getattr(wallet, name))
+
+
 def has_durable_delegated_child_wallet_provisioning_contract(wallet: object) -> bool:
     """Whether *wallet* atomically reserves and provisions a durable child.
 
@@ -147,8 +166,8 @@ def has_durable_delegated_child_wallet_provisioning_contract(wallet: object) -> 
     idempotent reserve.
     """
 
-    return callable(
-        getattr(wallet, "reserve_and_provision_delegated_child_wallet", None)
+    return _has_direct_callable_contract(
+        wallet, "reserve_and_provision_delegated_child_wallet"
     )
 
 
@@ -235,7 +254,7 @@ class DelegatedWallet:
             "execute_debit_intent",
             "resolve_debit_intent",
         )
-        if not all(callable(getattr(provider, name, None)) for name in required):
+        if not all(_has_direct_callable_contract(provider, name) for name in required):
             raise RuntimeError(
                 "delegated child spending requires a provider-owned durable "
                 "idempotent debit intent contract"
@@ -250,7 +269,7 @@ class DelegatedWallet:
             "reserve_delegated_allocation",
             "release_delegated_allocation",
         )
-        if all(callable(getattr(wallet, name, None)) for name in required):
+        if all(_has_direct_callable_contract(wallet, name) for name in required):
             return wallet  # type: ignore[return-value]
         return None
 
@@ -266,8 +285,9 @@ class DelegatedWallet:
     def _durable_child_wallet_release_provider(
         wallet: WalletProtocol,
     ) -> DurableDelegatedChildWalletReleaseProviderProtocol | None:
-        release = getattr(wallet, "release_and_fence_delegated_child_wallet", None)
-        if callable(release):
+        if _has_direct_callable_contract(
+            wallet, "release_and_fence_delegated_child_wallet"
+        ):
             return wallet  # type: ignore[return-value]
         return None
 
