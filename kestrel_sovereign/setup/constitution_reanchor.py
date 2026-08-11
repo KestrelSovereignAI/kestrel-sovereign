@@ -210,7 +210,17 @@ async def resolve_reanchor_target(
     # ``KESTREL_DB_BACKEND="postgres "`` starts the agent on SQLite; stripping
     # here would point the reanchor at PostgreSQL instead — #2890 again with
     # the two databases exchanged. Copying the rule means copying it exactly.
-    resolved = (backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")).lower()
+    #
+    # ``is not None``, not ``or``: an empty string is an *answer*, not a
+    # missing argument. A project ``.env`` that blanks ``KESTREL_DATABASE_URL``
+    # puts the spawned agent on SQLite, and a caller relaying that answer must
+    # not have it fall through to whatever DSN is still exported in the shell —
+    # which would send `--force` into an unrelated PostgreSQL while the tool
+    # that prescribed it was reading the local file.
+    resolved = (
+        backend if backend is not None
+        else os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+    ).lower()
     if resolved not in ("sqlite", "postgres"):
         # The runtime does not validate this either — ``_initialize_agent``
         # tests `== "postgres"` and falls through to SQLite for anything else,
@@ -255,7 +265,9 @@ async def resolve_reanchor_target(
             f"every backend."
         ) from exc
 
-    resolved_dsn = dsn or os.environ.get("KESTREL_DATABASE_URL")
+    resolved_dsn = (
+        dsn if dsn is not None else os.environ.get("KESTREL_DATABASE_URL")
+    )
     if resolved == "postgres" and resolved_dsn:
         return ReanchorTarget(
             anchor_path=anchor_path,

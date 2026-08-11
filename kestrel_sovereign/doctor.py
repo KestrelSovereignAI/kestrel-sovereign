@@ -298,16 +298,28 @@ def _discover_agent_did(anchor_path: Path):
     """
     try:
         with sqlite3.connect(str(anchor_path)) as conn:
-            row = conn.execute(_DISCOVER_AGENT_SQLITE).fetchone()
+            rows = conn.execute(_DISCOVER_AGENT_SQLITE).fetchall()
     except sqlite3.DatabaseError as exc:
         # 'file is not a database' (sqlcipher-encrypted) lands here.
         return _UnreadableDB(reason=f"DB unreadable ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
 
-    if row is None or not row[0]:
+    if len(rows) > 1:
+        # The same refusal boot makes, for the same reason: a damaged or
+        # half-imported anchor holding two agent roots has no single answer to
+        # "whose governance is this", and choosing one would have doctor
+        # certify a tenant it picked by row order.
+        return _UnreadableDB(
+            reason=(
+                f"the local anchor {anchor_path} holds more than one agent "
+                "root, so it cannot say whose governance to check — the "
+                "runtime refuses to boot from it for the same reason"
+            )
+        )
+    if not rows or not rows[0][0]:
         return _NoAgentNode()
-    return row[0]
+    return rows[0][0]
 
 
 def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
@@ -326,6 +338,13 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
     When the ledger is absent, the legacy unscoped reads are the faithful ones:
     every row in a per-agent file belongs to that agent, and the backfill is
     what will shortly say so.
+
+    Returns ``_UnreadableDB`` rather than a guess when the probe itself cannot
+    run. Guessing ``True`` there looked harmless and was not: on an unreachable
+    PostgreSQL this waited out a whole connection timeout, discarded the
+    failure, and the node read then opened the same DSN and waited again —
+    reintroducing, one function earlier, the doubled timeout that sharing a
+    per-agent reading had just removed.
     """
     if source.reads_the_anchor:
         try:
@@ -334,9 +353,10 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type='table' AND name='graph_node_owners'"
                 ).fetchone()
-        except sqlite3.Error:
-            # Let the real read report the real problem.
-            return True
+        except sqlite3.DatabaseError as exc:
+            return _UnreadableDB(reason=f"DB unreadable ({exc})")
+        except sqlite3.Error as exc:
+            return _UnreadableDB(reason=f"sqlite error ({exc})")
         return row is not None
 
     try:
@@ -345,8 +365,10 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
             "SELECT 1",
             "SELECT to_regclass('graph_node_owners') IS NOT NULL",
         )
-    except Exception:  # noqa: BLE001 — the real read reports the real problem
-        return True
+    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+        return _UnreadableDB(
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+        )
     return bool(rows and rows[0][0])
 
 
@@ -375,7 +397,10 @@ def _resolve_governance_source(anchor_path: Path, env: dict):
             agent_did=agent_did,
             dsn=env["KESTREL_DATABASE_URL"],
         )
-    return replace(source, ownership_ledger=_has_ownership_ledger(source))
+    ledger = _has_ownership_ledger(source)
+    if isinstance(ledger, _UnreadableDB):
+        return ledger
+    return replace(source, ownership_ledger=ledger)
 
 
 #: Seconds doctor will wait for a PostgreSQL connection before calling the
@@ -681,7 +706,7 @@ def _check_constitution_drift(
                 f"{name}: constitution drift — stored {stored_hash[:12]}… "
                 f"does not match {canonical} ({on_disk_hash[:12]}…). "
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
-                f"to update (DB is backed up first)."
+                f"to update ({_rollback_advice(source)})."
             )
 
 
@@ -765,7 +790,7 @@ def _check_governance_edge(
             f"requires an edge at the anchored constitution and will "
             f"safe-mode this agent at next boot. Run `kestrel constitution "
             f"reanchor --agent-name {name} --force` with a signed artifact "
-            f"to repair (DB is backed up first)."
+            f"to repair ({_rollback_advice(source)})."
         )
         return
 
@@ -793,7 +818,7 @@ def _check_governance_edge(
             f"The fail-closed integrity audit (proof 2) will safe-mode this "
             f"agent at next boot. Run `kestrel constitution reanchor "
             f"--agent-name {name} --force` with a signed artifact to repair "
-            f"(DB is backed up first)."
+            f"({_rollback_advice(source)})."
         )
     else:
         report.fail.append(
@@ -801,7 +826,7 @@ def _check_governance_edge(
             f"constitution ({stored_hash[:12]}…). The fail-closed integrity "
             f"audit (proof 2) will safe-mode this agent at next boot. Run "
             f"`kestrel constitution reanchor --agent-name {name} --force` "
-            f"with a signed artifact to repair (DB is backed up first)."
+            f"with a signed artifact to repair ({_rollback_advice(source)})."
         )
 
 
@@ -897,6 +922,25 @@ def _check_overlay_anchor(
         )
 
 
+def _rollback_advice(source: "_GovernanceSource") -> str:
+    """What an operator actually gets to undo the prescribed repair.
+
+    "DB is backed up first" is true of a SQLite anchor, which the reanchor
+    copies aside before it writes. It is false of PostgreSQL: that path
+    deliberately takes no backup — there is no file to copy — and the CLI tells
+    operators to snapshot the database themselves. Now that doctor prescribes
+    repairs against PostgreSQL, repeating the SQLite promise would send someone
+    to mutate live governance believing a rollback copy exists.
+    """
+    if source.reads_the_anchor:
+        return "DB is backed up first"
+    return (
+        "governance for this agent lives in PostgreSQL — there is no local "
+        "file to copy, so snapshot that database first if you want to be able "
+        "to undo it"
+    )
+
+
 def _canonical_constitution_path() -> Path:
     """Return the package's canonical constitution path (config.CONSTITUTION_PATH).
 
@@ -914,8 +958,16 @@ def _canonical_constitution_path() -> Path:
 #: anchor is this?" Identity is born in the local ``kestrel_prime.db`` on every
 #: backend (#2871, #2894), so this one is deliberately unscoped and takes the
 #: single agent row. Everything below then scopes by the DID it returns.
+#:
+#: ``LIMIT 2``, not ``LIMIT 1``: the canonical reader
+#: (``identity.local_anchor.read_anchor_agent_did``) *refuses* an anchor
+#: holding more than one agent root rather than picking one by incidental row
+#: order, and boot goes through it. Taking the first row would let doctor scope
+#: its checks to an arbitrary tenant, find that one healthy, and report Ready
+#: for an agent the runtime will not start at all. Two rows is all it takes to
+#: know there are too many.
 _DISCOVER_AGENT_SQLITE = (
-    "SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 1"
+    "SELECT node_id FROM graph_nodes WHERE node_type='agent' LIMIT 2"
 )
 
 #: **Governance** reads must see exactly what the booting agent sees, and the

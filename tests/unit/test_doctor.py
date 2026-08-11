@@ -1091,6 +1091,116 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_an_anchor_with_two_agent_roots_is_refused(tmp_path):
+    """The refusal boot already makes.
+
+    ``identity.local_anchor.read_anchor_agent_did`` rejects an anchor holding
+    more than one agent root rather than choosing by row order, and boot goes
+    through it. Choosing here would let doctor scope its checks to an arbitrary
+    tenant, find that one healthy, and report Ready for an agent the runtime
+    will not start.
+    """
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[
+            ("did:one", "agent", "One", "{}"),
+            ("did:two", "agent", "Two", "{}"),
+        ],
+        node_owners=[("did:one", "did:one"), ("did:two", "did:two")],
+    )
+
+    result = _resolve_governance_source(db, {})
+
+    assert isinstance(result, _UnreadableDB)
+    assert "more than one agent root" in result.reason
+
+
+def test_an_unreachable_database_is_probed_once(tmp_path, monkeypatch):
+    """The ledger probe must not spend a connection timeout and throw it away.
+
+    It returned ``True`` on failure, so the node read opened the same DSN and
+    waited again — putting back, one function earlier, the doubled timeout that
+    sharing a per-agent reading had just removed.
+    """
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    attempts = []
+
+    class _Unreachable:
+        extensions = _real_psycopg2_extensions()
+
+        def connect(self, dsn, **kwargs):
+            attempts.append(dsn)
+            raise OSError("connection timed out")
+
+    _postgres_host(monkeypatch, _Unreachable())
+    db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
+
+    result = _resolve_governance_source(
+        db_path,
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://durable.example/kestrel",
+        },
+    )
+
+    assert isinstance(result, _UnreadableDB)
+    assert len(attempts) == 1, f"connected {len(attempts)}× : {attempts}"
+
+
+def test_postgres_repairs_do_not_promise_a_backup(tmp_path, monkeypatch):
+    """PostgreSQL reanchor takes no backup — there is no file to copy.
+
+    Repeating the SQLite promise would send an operator to mutate live
+    governance believing a rollback copy exists.
+    """
+    stored = _seed_matching_anchor(tmp_path, monkeypatch)
+    drifted = hashlib.sha256(b"what postgres holds").hexdigest()
+    properties = json.dumps({"name": "Test", "constitution_hash": drifted})
+    fake = _FakePostgres(
+        {
+            "SELECT to_regclass": [(True,)],
+            "SELECT node_id, properties FROM graph_nodes": [
+                ("did:test:Test", properties)
+            ],
+            "FROM graph_edges": [(drifted,)],
+        }
+    )
+    _postgres_host(monkeypatch, fake)
+
+    report = diagnose(tmp_path)
+
+    drift = [m for m in report.fail if "constitution drift" in m]
+    assert drift, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert "DB is backed up first" not in drift[0]
+    assert "snapshot that database first" in drift[0]
+    # PostgreSQL's hash is the anchored one; the canonical file's is what it
+    # failed to match. Both belong in the message.
+    assert drifted[:12] in drift[0]
+    assert stored[:12] in drift[0]
+
+
+def test_sqlite_repairs_still_promise_the_backup(tmp_path, monkeypatch):
+    """It is true there: the reanchor copies the anchor aside before writing."""
+    text = b"# Kestrel Constitution\nv1\n"
+    canonical = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
+    )
+    _seed_with_anchored_constitution(
+        tmp_path, constitution_text=text, stored_hash="f" * 64
+    )
+
+    report = diagnose(tmp_path)
+
+    drift = [m for m in report.fail if "constitution drift" in m]
+    assert drift, f"fail={report.fail}"
+    assert "DB is backed up first" in drift[0]
+
+
 def test_a_driver_error_never_carries_the_dsn(tmp_path):
     """An unmatched ``[`` in the URI is enough to make libpq quote the whole
     connection string back, password included."""
