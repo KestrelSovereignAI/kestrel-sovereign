@@ -24,7 +24,7 @@ from .backup import BackupMixin
 from .orchestrator_engine import OrchestratorEngineMixin, ContextStats
 from .tool_registry import ToolRegistryMixin
 from .model_preference import ModelPreferenceMixin
-from .event_manager import EventManagerMixin
+from .event_manager import EventDeliveryReceipt, EventManagerMixin
 from .request_lifecycle import RequestLifecycleMixin
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget
@@ -41,6 +41,7 @@ __all__ = [
     'ToolRegistryMixin',
     'ModelPreferenceMixin',
     'EventManagerMixin',
+    'EventDeliveryReceipt',
     'RequestLifecycleMixin',
     'TokenCounter',
     'get_token_counter',

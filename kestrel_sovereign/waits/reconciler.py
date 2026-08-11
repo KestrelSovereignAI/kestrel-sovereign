@@ -28,6 +28,23 @@ The dedup/delivery ledger lives in the ``wait_signal_state`` table
 talon_monitor stashed inside ``jobs.json``. The reconciler instance is held
 as a singleton on the agent (``agent._wait_reconciler``) so the in-memory
 ``_pending_signal_tasks`` map survives across cron ticks.
+
+PERSISTED IS NOT SURFACED (#2922). The ledger used to record the bare
+dispatcher status, so a wake that ran, wrote its turn, and reached no human
+still read ``ok``. That is the self-reporting failure that hid #2877 for
+months: the system claimed success while the observer's chat stayed blank.
+Phase 0 now composes each accepted wake's dispatch status with a VISIBILITY
+verdict drawn from what the dispatcher observed of the ``signal_completed``
+emit — ``ok_queued``, ``ok_unsurfaced``, ``ok_unbound``, or
+``ok_visibility_unknown`` — and there is no longer any path that writes a
+bare ``ok``.
+
+The ceiling on those verdicts is deliberate. ``queued`` means the SSE event
+was accepted by at least one live listener, which is server-side queue
+admission; the browser still discards a wake bound to a session other than
+the open pane's. No server-side observation can prove a render, so nothing
+here claims one, and anything unobserved is reported as unknown rather than
+guessed in the flattering direction.
 """
 
 from __future__ import annotations
@@ -41,6 +58,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult
 
+from kestrel_sovereign.signals.dispatcher import (
+    SURFACE_QUEUED,
+    SURFACE_UNSURFACED_STATES,
+)
 from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
 
 logger = logging.getLogger(__name__)
@@ -51,9 +72,54 @@ logger = logging.getLogger(__name__)
 # ``max_attempts_exceeded`` delivery status for operator review.
 MAX_DELIVERY_ATTEMPTS = 10
 
-# Dispatcher result statuses, classified exactly as talon_monitor did.
-_DELIVERED_STATES = {"ok", "coalesced"}
+# Dispatcher result statuses that mean the wake was ACCEPTED and its turn ran
+# — i.e. it was PERSISTED. Formerly ``_DELIVERED_STATES``, and the rename is
+# the point of #2922: acceptance by the dispatcher says nothing about whether
+# a human can see the result, and calling it "delivered" is what let a
+# stranded wake report success for months (#2877).
+_PERSISTED_STATES = {"ok", "coalesced"}
 _HARD_FAIL_STATES = {"dropped_validation", "dropped_cycle"}
+
+# ---------------------------------------------------------------------------
+# Visibility verdicts (#2922)
+# ---------------------------------------------------------------------------
+#
+# ``last_delivery_status`` used to be the bare dispatcher status, so a wake
+# with no resolvable origin session — or one whose SSE emit reached nobody —
+# still read ``ok``. Persistence and visibility are now composed into ONE
+# recorded state (``ok_queued``, ``ok_unsurfaced``, ``ok_unbound``,
+# ``ok_visibility_unknown``) so the ledger can never again say "ok" about a
+# wake the user never saw.
+#
+# On the ceiling of these claims: ``QUEUED`` is the strongest verdict that
+# exists, and it means only that the ``signal_completed`` event was accepted
+# by at least one live listener — server-side queue admission. The browser
+# still discards a wake bound to a session other than the open pane's
+# (``chat.js``). Nothing here asserts a render, which is why no verdict is
+# named "surfaced": when the server cannot tell, it says so.
+
+# The emit reached at least one live consumer's queue. NOT proof of render.
+VISIBILITY_QUEUED = "queued"
+# The emit demonstrably reached no live consumer (buffered with nobody
+# connected, every listener rejected it, the emit raised, or no emitter).
+VISIBILITY_UNSURFACED = "unsurfaced"
+# No origin session resolved, so the wake was built INTERNAL and there was no
+# chat window to surface into. Correct behavior, but not a delivery.
+VISIBILITY_UNBOUND = "unbound"
+# The dispatcher reported no verdict for this signal — a foreign dispatcher, a
+# stand-in predating #2922, or a record lost to a restart. Explicitly unknown
+# rather than assumed either way.
+VISIBILITY_UNKNOWN = "visibility_unknown"
+
+
+def compose_delivery_status(dispatch_status: str, visibility: str) -> str:
+    """Join a dispatch status and a visibility verdict into one ledger state.
+
+    ``ok`` + ``queued`` -> ``ok_queued``. Deliberately NOT a bare dispatch
+    status: the whole failure #2922 fixes is a ledger that recorded ``ok`` for
+    a wake nobody could see.
+    """
+    return f"{dispatch_status}_{visibility}"
 
 
 class WaitReconciler:
@@ -70,6 +136,15 @@ class WaitReconciler:
         # awaiting harvest. Survives across ticks because the reconciler is a
         # singleton on the agent.
         self._pending_signal_tasks: Dict[Tuple[str, str], Any] = {}
+        # (kind, handle) -> whether the in-flight wake was bound to an origin
+        # chat session (#2922). Kept beside the task map rather than derived at
+        # harvest time: the reconciler is the component that decided to build
+        # the signal INTERNAL for want of an origin, so it is the honest source
+        # for "this wake never had a window to surface into". Populated and
+        # dropped in lockstep with ``_pending_signal_tasks`` — an entry missing
+        # from that map is already a ``lost_at_restart`` soft-fail that never
+        # reaches the visibility accounting.
+        self._pending_signal_bindings: Dict[Tuple[str, str], bool] = {}
         agent_id = (
             getattr(agent, "did", None)
             or getattr(agent, "agent_id", None)
@@ -124,8 +199,14 @@ class WaitReconciler:
     async def _reconcile_once(self) -> ToolResult:
         store = self._store
         transitions: List[Dict[str, Any]] = []
-        # delivered = dispatcher returned OK or COALESCED on a PRIOR enqueue.
-        signals_delivered = 0
+        # persisted = dispatcher returned OK or COALESCED on a PRIOR enqueue,
+        # i.e. the wake ran and its turn was written down. NOT a visibility
+        # claim — the four counters below split that out (#2922).
+        signals_persisted = 0
+        signals_queued = 0
+        signals_unsurfaced = 0
+        signals_unbound = 0
+        signals_visibility_unknown = 0
         # hard_fail = permanent rejection (dropped_validation/cycle, cap).
         signals_hard_failed = 0
         # soft_fail = retriable (rate_limit/quiet_hours/failed/raised/lost).
@@ -154,6 +235,7 @@ class WaitReconciler:
                 # parent; we can't know whether the cognition turn fired.
                 # Soft-fail (DON'T set signaled_outcome) so the next tick
                 # re-detects + re-emits. record_delivery clears pending.
+                self._pending_signal_bindings.pop((kind, handle), None)
                 await store.record_delivery(
                     kind, handle,
                     delivery_status="lost_at_restart",
@@ -182,20 +264,51 @@ class WaitReconciler:
                 delivery_error = f"{type(e).__name__}: {e}"
 
             self._pending_signal_tasks.pop((kind, handle), None)
+            bound = self._pending_signal_bindings.pop((kind, handle), None)
 
-            if status_value in _DELIVERED_STATES:
-                # Lock the transition so we don't re-emit it.
+            if status_value in _PERSISTED_STATES:
+                # The dispatcher accepted the wake and its turn ran, so the
+                # transition is locked against re-emit. Whether anyone can SEE
+                # it is a separate question, answered by the dispatcher's
+                # record of the actual ``signal_completed`` emit (#2922) — not
+                # inferred from this status, which is what made a stranded
+                # wake report ``ok`` for months.
+                visibility, surface_status = self._resolve_visibility(
+                    dispatcher,
+                    signal_id=getattr(handle_obj, "signal_id", None),
+                    bound=bound,
+                )
+                recorded_status = compose_delivery_status(status_value, visibility)
                 await store.record_delivery(
                     kind, handle,
-                    delivery_status=status_value,
+                    delivery_status=recorded_status,
                     delivery_error=delivery_error,
                     signaled_outcome=target,
                     attempt_at=now,
+                    surface_status=surface_status,
                 )
-                signals_delivered += 1
+                signals_persisted += 1
+                if visibility == VISIBILITY_QUEUED:
+                    signals_queued += 1
+                elif visibility == VISIBILITY_UNSURFACED:
+                    signals_unsurfaced += 1
+                elif visibility == VISIBILITY_UNBOUND:
+                    signals_unbound += 1
+                else:
+                    signals_visibility_unknown += 1
+                if visibility != VISIBILITY_QUEUED:
+                    logger.info(
+                        "wait_reconcile: %s:%s persisted (%s) but not shown to "
+                        "a live consumer — visibility=%s surface=%s",
+                        kind, handle, status_value, visibility,
+                        surface_status or "none",
+                    )
                 transitions.append({
                     "kind": kind, "handle": handle, "outcome": target,
-                    "delivery_status": status_value,
+                    "delivery_status": recorded_status,
+                    "dispatch_status": status_value,
+                    "visibility": visibility,
+                    "surface_status": surface_status or "",
                 })
             elif status_value in _HARD_FAIL_STATES:
                 # Permanent rejection — lock signaled to stop re-emit loops.
@@ -296,9 +409,22 @@ class WaitReconciler:
         signals_skipped_no_dispatcher += counters["signals_skipped_no_dispatcher"]
 
         parts = [
-            f"delivered={signals_delivered}",
+            f"persisted={signals_persisted}",
             f"enqueued={signals_enqueued}",
         ]
+        # Report the visibility split whenever anything was persisted, INCLUDING
+        # the zeros. "persisted=1" alone is the sentence that hid #2877; the
+        # reader needs to see "queued=0, unsurfaced=1" in the same breath.
+        if signals_persisted:
+            parts.append(f"queued={signals_queued}")
+            if signals_unsurfaced:
+                parts.append(f"unsurfaced={signals_unsurfaced}")
+            if signals_unbound:
+                parts.append(f"unbound={signals_unbound}")
+            if signals_visibility_unknown:
+                parts.append(
+                    f"visibility_unknown={signals_visibility_unknown}"
+                )
         if signals_hard_failed:
             parts.append(f"hard_failed={signals_hard_failed}")
         if signals_soft_failed:
@@ -314,10 +440,21 @@ class WaitReconciler:
             ),
             data={
                 "scanned": scanned,
-                # signals_emitted = deliveries CONFIRMED this tick (from a
-                # prior tick's enqueues). signals_enqueued = this tick's NEW
-                # emits awaiting confirmation.
-                "signals_emitted": signals_delivered,
+                # signals_persisted = wakes CONFIRMED accepted this tick (from
+                # a prior tick's enqueues), i.e. the turn ran and was written
+                # down. signals_enqueued = this tick's NEW emits awaiting
+                # confirmation.
+                "signals_persisted": signals_persisted,
+                # Back-compat alias. It always counted persistence; #2922 only
+                # stopped the name from implying the user saw anything.
+                "signals_emitted": signals_persisted,
+                # The visibility split of signals_persisted. signals_queued is
+                # the CEILING of what the server can attest — the event reached
+                # a live consumer's queue, not necessarily a rendered pane.
+                "signals_queued": signals_queued,
+                "signals_unsurfaced": signals_unsurfaced,
+                "signals_unbound": signals_unbound,
+                "signals_visibility_unknown": signals_visibility_unknown,
                 "signals_enqueued": signals_enqueued,
                 "signals_hard_failed": signals_hard_failed,
                 "signals_soft_failed": signals_soft_failed,
@@ -326,6 +463,61 @@ class WaitReconciler:
                 "transitions": transitions,
             },
         )
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_visibility(
+        dispatcher: Any,
+        *,
+        signal_id: Optional[str],
+        bound: Optional[bool],
+    ) -> Tuple[str, Optional[str]]:
+        """Decide what this reconciler may honestly claim about one wake's
+        visibility, and return ``(verdict, raw dispatcher surface status)``.
+
+        Two independent facts feed the verdict, and neither is the dispatch
+        status:
+
+        * ``bound`` — whether THIS reconciler resolved an origin chat session
+          when it built the signal. Unbound wakes are built ``INTERNAL`` on
+          purpose (unattended cron/CLI work has no window), so they were never
+          candidates for surfacing and must not be counted as delivered to a
+          user.
+        * the dispatcher's :meth:`~SignalDispatcher.surface_record` — what the
+          ``signal_completed`` emit actually did.
+
+        Anything the dispatcher did not observe — no ledger method, no record,
+        or a receipt-less ``emit_event`` — is :data:`VISIBILITY_UNKNOWN`. The
+        temptation to read a missing record as success is precisely the bug
+        (#2877 attempt-2 P2: report unknown, do not assert from ledger
+        contents alone).
+        """
+        record = None
+        lookup = getattr(dispatcher, "surface_record", None)
+        if callable(lookup) and signal_id:
+            try:
+                record = lookup(signal_id)
+            except Exception as exc:  # a broken ledger is not a verdict
+                logger.debug(
+                    "surface_record(%r) raised on the dispatcher: %s",
+                    signal_id, exc,
+                )
+                record = None
+        raw = getattr(record, "status", None)
+        raw = str(raw) if raw is not None else None
+
+        if bound is False:
+            return VISIBILITY_UNBOUND, raw
+        if raw == SURFACE_QUEUED:
+            return VISIBILITY_QUEUED, raw
+        if raw in SURFACE_UNSURFACED_STATES:
+            return VISIBILITY_UNSURFACED, raw
+        # Includes ``not_applicable`` (the dispatcher saw an INTERNAL signal
+        # while this reconciler believed it bound one — a contradiction we
+        # report as unknown rather than resolve in either direction),
+        # ``unknown``, and no record at all.
+        return VISIBILITY_UNKNOWN, raw
 
     # ------------------------------------------------------------------
 
@@ -437,6 +629,12 @@ class WaitReconciler:
             return
 
         self._pending_signal_tasks[(kind, handle)] = handle_obj
+        # Remember whether this wake had a chat window to surface into, so the
+        # next tick's harvest can tell "nobody was listening" from "there was
+        # nowhere to listen" (#2922) instead of collapsing both into ``ok``.
+        self._pending_signal_bindings[(kind, handle)] = (
+            signal.visibility != Visibility.INTERNAL
+        )
         counters["signals_enqueued"] += 1
 
     @staticmethod

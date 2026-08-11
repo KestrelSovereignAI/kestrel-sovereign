@@ -602,7 +602,18 @@ CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
 --                            value we have already delivered a signal for, so
 --                            the next tick does not re-fire the same transition
 --   - last_delivery_*        diagnostics plus retry accounting (attempts caps
---                            the soft-fail retry loop, MAX_DELIVERY_ATTEMPTS)
+--                            the soft-fail retry loop, MAX_DELIVERY_ATTEMPTS).
+--                            last_delivery_status composes the dispatch result
+--                            with a VISIBILITY verdict (ok_queued /
+--                            ok_unsurfaced / ok_unbound /
+--                            ok_visibility_unknown) so it can never again read
+--                            a bare "ok" for a wake nobody could see (#2922)
+--   - last_surface_status    the dispatcher's raw account of what the
+--                            signal_completed SSE emit did (queued / buffered
+--                            / rejected / emit_failed / no_emitter /
+--                            not_applicable / unknown). Diagnostic provenance
+--                            for the composed status above. NULL on rows
+--                            predating #2922 and on non-delivery outcomes
 --   - pending_signal_*       the two-phase harvest set: a signal we enqueued
 --                            but have not yet confirmed delivered, cleared on
 --                            harvest (record_delivery) so a restart that lost
@@ -623,6 +634,7 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     handle TEXT NOT NULL,
     last_signaled_outcome TEXT,
     last_delivery_status TEXT,
+    last_surface_status TEXT,
     last_delivery_error TEXT,
     last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_delivery_attempt_at TIMESTAMP,
@@ -1016,6 +1028,16 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "agent_service_keys", "is_active", "INTEGER DEFAULT 1"
+        )
+        # Wait-reconciler visibility accounting (#2922): the ledger gained a
+        # column recording what the dispatcher's signal_completed emit actually
+        # did, so "persisted" and "reached a live consumer" stop sharing one
+        # field. wait_signal_state is created with CREATE TABLE IF NOT EXISTS,
+        # so databases predating this column never receive it from the schema;
+        # migrate it idempotently. Legacy rows keep NULL — genuinely unknown,
+        # which is what the reconciler reports for them.
+        await self._migrate_add_column(
+            "wait_signal_state", "last_surface_status", "TEXT"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(

@@ -6,7 +6,62 @@ listener management, and background task notification queuing.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+# ---------------------------------------------------------------------------
+# emit_event delivery receipt (#2922)
+# ---------------------------------------------------------------------------
+#
+# ``emit_event`` used to return ``None`` unconditionally, and it swallows every
+# listener exception. A caller therefore could not tell "every SSE forwarder
+# failed" from "the event went out" — so the wait reconciler recorded a bare
+# ``ok`` for wakes that reached nobody, which is the self-reporting failure
+# #2877/#2922 exist to remove.
+#
+# The receipt reports the three outcomes an emitter can actually distinguish.
+# NONE of them means a human saw anything: ``ACCEPTED`` means a listener
+# callback returned without raising, which for the ``/notifications/sse``
+# forwarder means the event entered a server-side queue. The browser can still
+# discard it (``chat.js`` drops a wake whose ``session_id`` is not the pane's
+# open conversation). Server-side truth stops at acceptance; callers must not
+# promote it to "rendered".
+
+EVENT_BUFFERED = "buffered"
+EVENT_ACCEPTED = "accepted"
+EVENT_REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class EventDeliveryReceipt:
+    """Aggregate outcome of one :meth:`EventManagerMixin.emit_event` call.
+
+    Attributes:
+        listeners: Listeners the event was offered to (0 when buffered).
+        accepted: Listeners whose callback returned without raising.
+        rejected: Listeners whose callback raised (the failure is logged and
+            swallowed, so this counter is the only way a caller learns of it).
+        buffered: True when no listener was connected and the event was
+            buffered for replay to the next one (see ``get_pending_events``).
+    """
+
+    listeners: int
+    accepted: int
+    rejected: int
+    buffered: bool
+
+    @property
+    def outcome(self) -> str:
+        """``buffered`` / ``accepted`` / ``rejected`` — in that precedence.
+
+        ``accepted`` requires at least one listener to have taken the event;
+        an emit whose every listener raised is ``rejected``, never ``accepted``.
+        """
+        if self.buffered:
+            return EVENT_BUFFERED
+        if self.accepted > 0:
+            return EVENT_ACCEPTED
+        return EVENT_REJECTED
 
 
 def describe_background_task(task) -> Tuple[str, str]:
@@ -115,7 +170,9 @@ class EventManagerMixin:
     # buffered events drop first once the cap is exceeded.
     _MAX_PENDING_EVENTS = 100
 
-    async def emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
+    async def emit_event(
+        self, event_type: str, data: Dict[str, Any]
+    ) -> EventDeliveryReceipt:
         """
         Emit an event to all registered listeners (for SSE notifications).
 
@@ -128,20 +185,50 @@ class EventManagerMixin:
         stream. That is the one transition that straddles the restart, so
         losing it defeated the issue's primary acceptance criterion (#1551).
 
+        A listener that raises is logged and skipped — one broken forwarder
+        must not deny the event to the others, and a UI notification is never
+        worth failing the work that produced it. But swallowing the failure
+        and returning ``None`` also left the caller unable to tell a total
+        delivery failure from a success (#2922): the wait reconciler read
+        "emit returned" as "the user can see it" and recorded a bare ``ok``
+        for wakes that reached nobody. So the aggregate outcome is RETURNED
+        rather than only logged.
+
         Args:
             event_type: Type of event (e.g., 'approval_request')
             data: Event data to send
+
+        Returns:
+            An :class:`EventDeliveryReceipt`. ``accepted`` counts listeners
+            that took the event without raising — for the SSE forwarder that
+            is server-side queue admission, NOT proof that anything rendered.
+            Callers must not report an accepted emit as "seen by the user".
         """
         if not self._event_listeners:
             self._buffer_pending_event(event_type, data)
-            return
-        for listener in self._event_listeners:
+            return EventDeliveryReceipt(
+                listeners=0, accepted=0, rejected=0, buffered=True
+            )
+        accepted = 0
+        rejected = 0
+        listeners = list(self._event_listeners)
+        for listener in listeners:
             try:
                 await listener(event_type, data)
             except (TypeError, AttributeError, ConnectionError) as e:
+                rejected += 1
                 logging.warning(f"Failed to emit event to listener: {e}")
             except Exception as e:
+                rejected += 1
                 logging.warning(f"Failed to emit event to listener: {e}", exc_info=True)
+            else:
+                accepted += 1
+        return EventDeliveryReceipt(
+            listeners=len(listeners),
+            accepted=accepted,
+            rejected=rejected,
+            buffered=False,
+        )
 
     def _buffer_pending_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """Buffer an event emitted while no listener was connected.
