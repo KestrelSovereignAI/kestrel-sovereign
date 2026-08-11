@@ -255,6 +255,16 @@ KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
 )
 
 
+def _raise_unexpected_lifecycle_exception_group(
+    error: BaseExceptionGroup,
+) -> None:
+    """Propagate process-control leaves from an owned lifecycle outcome."""
+
+    _expected, unexpected = error.split((asyncio.CancelledError, Exception))
+    if unexpected is not None:
+        raise unexpected
+
+
 async def await_lifecycle_task_completion(
     task: "asyncio.Future[object]",
 ) -> tuple[bool, BaseException | None]:
@@ -280,6 +290,15 @@ async def await_lifecycle_task_completion(
         except asyncio.CancelledError:
             if joiner is not None and joiner.cancelling():
                 cancelled = True
+        except BaseExceptionGroup as error:
+            # A lifecycle owner can deliberately retain cancellation and an
+            # ordinary cleanup failure in one group.  Like an Exception, that
+            # is the owned task's terminal outcome, not a reason to abandon
+            # later cleanup owners that the caller must still join.
+            # Process-control exceptions are not lifecycle failure data.
+            # Preserve their grouping and propagate them immediately.
+            _raise_unexpected_lifecycle_exception_group(error)
+            assert task.done()
         except Exception:
             # ``shield`` re-raises the owned task's terminal exception into
             # this joiner.  The lifecycle contract returns that outcome as
@@ -290,7 +309,12 @@ async def await_lifecycle_task_completion(
 
     if task.cancelled():
         return cancelled, asyncio.CancelledError()
-    return cancelled, task.exception()
+    failure = task.exception()
+    if isinstance(failure, BaseExceptionGroup):
+        # A task can already be terminal when this helper is entered, in which
+        # case the loop above never observes its raised group.
+        _raise_unexpected_lifecycle_exception_group(failure)
+    return cancelled, failure
 
 
 async def await_agent_shutdown_completion(agent: object) -> bool:

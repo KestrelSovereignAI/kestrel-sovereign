@@ -421,7 +421,15 @@ class TestAgentManagerSpawn:
             ttl_seconds=600,
         )
 
-        with patch.object(manager, "create_agent", new_callable=AsyncMock, return_value=child):
+        async def create_and_publish(name, **_kwargs):
+            # Public spawn commits its mandate only for the exact child already
+            # published by create/load; this fake keeps the test on that
+            # production contract.
+            manager._agents[name] = child
+            manager._agent_names[child.agent_id] = name
+            return child
+
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
             result = await manager.spawn_agent("helper", parent, mandate)
 
         assert result is child
@@ -440,6 +448,130 @@ class TestAgentManagerSpawn:
 
         with pytest.raises(ValueError, match="already exists"):
             await manager.spawn_agent("helper", parent, mandate)
+
+    @pytest.mark.asyncio
+    async def test_failed_spawn_surfaces_live_uncommitted_child_rollback_failure(self):
+        """A refused rollback cannot masquerade as a completed failed spawn."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        child.shutdown.side_effect = RuntimeError("shutdown refused")
+        manager = AgentManager()
+        mandate = SpawnMandate(parent_did="did:parent", purpose="test")
+
+        async def create_and_publish(name, **_kwargs):
+            manager._agents[name] = child
+            manager._agent_names[child.agent_id] = name
+            return child
+
+        manager._apply_delegated_budget = AsyncMock(
+            side_effect=RuntimeError("budget setup failed")
+        )
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
+            with pytest.raises(ExceptionGroup) as exc_info:
+                await manager.spawn_agent("helper", parent, mandate)
+
+        assert any(
+            "did not remove its live routable child" in str(error)
+            for error in exc_info.value.exceptions
+        )
+        # The failed rollback is surfaced instead of returning a child whose
+        # parent edge/mandate never committed.  The admission and cap slot still
+        # retire so a later explicit cleanup/retry is not itself stranded.
+        assert manager.get_agent("helper") is child
+        assert manager.get_children("did:parent") == []
+        assert manager.get_mandate("helper") is None
+        assert manager._pending_spawns == 0
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_spawn_surfaces_live_uncommitted_child_rollback_failure(self):
+        """Cancellation cannot hide a rollback that left a child routable."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        child.shutdown.side_effect = RuntimeError("shutdown refused")
+        manager = AgentManager()
+        mandate = SpawnMandate(parent_did="did:parent", purpose="test")
+
+        async def create_and_publish(name, **_kwargs):
+            manager._agents[name] = child
+            manager._agent_names[child.agent_id] = name
+            return child
+
+        budget_started = asyncio.Event()
+
+        async def wait_for_cancellation(*_args, **_kwargs):
+            budget_started.set()
+            await asyncio.Event().wait()
+
+        manager._apply_delegated_budget = wait_for_cancellation
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
+            spawn = asyncio.create_task(manager.spawn_agent("helper", parent, mandate))
+            await asyncio.wait_for(budget_started.wait(), timeout=1.0)
+            spawn.cancel()
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                await spawn
+
+        assert any(
+            "did not remove its live routable child" in str(error)
+            for error in exc_info.value.exceptions
+        )
+        assert any(
+            isinstance(error, asyncio.CancelledError)
+            for error in exc_info.value.exceptions
+        )
+        assert manager.get_agent("helper") is child
+        assert manager._pending_spawns == 0
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_spawn_preserves_rollback_refund_failure_group(self):
+        """Final slot retirement cannot replace rollback evidence with cancellation."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = AgentManager()
+        mandate = SpawnMandate(parent_did="did:parent", purpose="test")
+        budget_entry = (object(), object())
+        budget_started = asyncio.Event()
+
+        async def create_and_publish(name, **_kwargs):
+            manager._agents[name] = child
+            manager._agent_names[child.agent_id] = name
+            return child
+
+        async def allocate_then_wait(name, *_args, **_kwargs):
+            manager._child_budgets[name] = budget_entry
+            budget_started.set()
+            await asyncio.Event().wait()
+
+        async def fail_refund(name: str) -> bool:
+            assert name == "helper"
+            assert manager._child_budgets[name] is budget_entry
+            raise RuntimeError("rollback refund failed")
+
+        manager._apply_delegated_budget = allocate_then_wait
+        manager._release_child_budget_cancellation_safe = fail_refund
+        with patch.object(manager, "create_agent", side_effect=create_and_publish):
+            spawn = asyncio.create_task(manager.spawn_agent("helper", parent, mandate))
+            await asyncio.wait_for(budget_started.wait(), timeout=1.0)
+            spawn.cancel()
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                await asyncio.wait_for(spawn, timeout=1.0)
+
+        assert any(
+            isinstance(error, asyncio.CancelledError)
+            for error in exc_info.value.exceptions
+        )
+        assert any(
+            "rollback refund failed" in str(error)
+            for error in exc_info.value.exceptions
+        )
+        assert manager.get_agent("helper") is None
+        assert manager._child_budgets["helper"] is budget_entry
+        assert manager._pending_spawns == 0
+        assert manager._agent_operations == {}
 
     @pytest.mark.asyncio
     async def test_terminate_child(self):

@@ -9,6 +9,7 @@ paths, so a `budget` was a no-op (later an interim rejection). These tests cover
     terminate, and refusal of a budget with no funded parent wallet.
 """
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -446,6 +447,73 @@ async def test_spawn_holds_budget_and_terminate_releases():
 
 
 @pytest.mark.asyncio
+async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold() -> None:
+    """A cancellation blocked on lifecycle admission cannot leak a new hold."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    provider_returned_with_lifecycle_lock = asyncio.Event()
+
+    class LockHoldingProvisioner(DurableProvisioningWallet):
+        async def reserve_and_provision_delegated_child_wallet(self, **kwargs):
+            child_wallet = await super().reserve_and_provision_delegated_child_wallet(
+                **kwargs
+            )
+            await manager._a2a_lifecycle_lock.acquire()
+            provider_returned_with_lifecycle_lock.set()
+            return child_wallet
+
+    parent = SimpleNamespace(
+        _private_key=None,
+        identity=None,
+        agent_id="did:test:provider-parent",
+        features={},
+        wallet=LockHoldingProvisioner(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(
+        agent_id="did:test:provider-child", wallet=None, wallet_agent=None,
+        shutdown=AsyncMock(),
+    )
+
+    async def fake_create_agent(name, **_kwargs):
+        manager._agents[name] = child
+        manager._agent_names[child.agent_id] = name
+        return child
+
+    manager.create_agent = fake_create_agent
+    mandate = SpawnMandate(
+        parent_did=parent.agent_id,
+        purpose="allocation cancellation regression",
+        budget_allocation=Decimal("30"),
+        ttl_seconds=60,
+    )
+    spawn = asyncio.create_task(manager.spawn_agent("Kid", parent, mandate))
+    await asyncio.wait_for(provider_returned_with_lifecycle_lock.wait(), timeout=1.0)
+    try:
+        # The provider has returned a durable positive allocation, and the
+        # spawn is now waiting to re-enter the lifecycle writer. Tracking must
+        # already be visible to rollback before this cancellation is delivered.
+        await asyncio.sleep(0)
+        assert "Kid" in manager._child_budgets
+        spawn.cancel()
+        await asyncio.sleep(0)
+    finally:
+        manager._a2a_lifecycle_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(spawn, timeout=1.0)
+
+    assert parent.wallet.get_balance() == Decimal("100")
+    assert manager._child_budgets == {}
+    assert manager.get_agent("Kid") is None
+    assert manager.get_children(parent.agent_id) == []
+    assert manager.get_mandate("Kid") is None
+    child.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_releases_nested_budgets_leaf_first():
     """Graceful shutdown releases a budgeted grandchild before its budgeted
     parent, so ALL unspent funds flow back to the root (not stranded in an
@@ -478,10 +546,16 @@ async def test_direct_remove_agent_releases_budget():
         _private_key=None, identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
     )
-    child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
+    child = SimpleNamespace(
+        agent_id="did:c", wallet=None, wallet_agent=None, shutdown=AsyncMock()
+    )
     mgr = AgentManager()
 
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
+        # Match the public create/load contract: a spawn may only commit after
+        # its exact child is published to both routing maps.
+        mgr._agents[name] = child
+        mgr._agent_names[child.agent_id] = name
         return child
 
     mgr.create_agent = fake_create_agent  # real remove_agent (the path under test)
@@ -492,6 +566,105 @@ async def test_direct_remove_agent_releases_budget():
 
     await mgr.remove_agent("Kid")
     assert parent.wallet.get_balance() == Decimal("100")   # hold released on delete
+
+
+@pytest.mark.asyncio
+async def test_casefolded_delegated_hold_blocks_new_child_admission() -> None:
+    """A restored Foo hold must reserve foo before any new child initializes."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+    manager = AgentManager()
+    manager._child_budgets["Foo"] = (object(), object())
+    initialize = AsyncMock()
+    manager._initialize_agent = initialize
+
+    with pytest.raises(RuntimeError, match="unresolved delegated budget cleanup"):
+        await manager.load_agent("foo", LocalAgentConfig(data_dir="foo", port=8801))
+
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_keeps_retry_tracking_after_refund_failure() -> None:
+    """A failed stop-then-refund retains the parent edge and mandate for retry."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    child = SimpleNamespace(agent_id="did:test:retry-child", shutdown=AsyncMock())
+    entry = (object(), object())
+    mandate = SpawnMandate(parent_did="did:test:retry-parent", purpose="retry")
+    manager._agents["retry-child"] = child
+    manager._agent_names[child.agent_id] = "retry-child"
+    manager._child_budgets["retry-child"] = entry
+    manager._parent_children["did:test:retry-parent"] = ["retry-child"]
+    manager._child_mandates["retry-child"] = mandate
+
+    async def fail_refund(name: str) -> bool:
+        assert name == "retry-child"
+        raise RuntimeError("refund provider failed")
+
+    manager._release_child_budget_cancellation_safe = fail_refund
+    with pytest.raises(RuntimeError, match="refund provider failed"):
+        await manager.terminate_child("did:test:retry-parent", "retry-child")
+
+    # remove_agent has withdrawn the stopped child, but it retained the exact
+    # hold.  terminate_child must preserve the relation that permits the
+    # normal retry to find that hold and its governance mandate.
+    assert manager.get_children("did:test:retry-parent") == ["retry-child"]
+    assert manager.get_mandate("retry-child") is mandate
+    assert manager._child_budgets["retry-child"] is entry
+
+    async def release_refund(name: str) -> bool:
+        assert name == "retry-child"
+        assert manager._child_budgets.pop(name) is entry
+        return False
+
+    manager._release_child_budget_cancellation_safe = release_refund
+    assert await manager.terminate_child("did:test:retry-parent", "retry-child")
+    assert manager.get_children("did:test:retry-parent") == []
+    assert manager.get_mandate("retry-child") is None
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_prunes_tracking_after_completed_removal_cancellation() -> None:
+    """A terminal DELETE cancellation must not consume a spawn-cap slot forever."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    manager = AgentManager()
+    child = SimpleNamespace(
+        agent_id="did:test:cancelled-child", shutdown=AsyncMock()
+    )
+    entry = (object(), object())
+    mandate = SpawnMandate(parent_did="did:test:cancelled-parent", purpose="retry")
+    manager._agents["cancelled-child"] = child
+    manager._agent_names[child.agent_id] = "cancelled-child"
+    manager._child_budgets["cancelled-child"] = entry
+    manager._parent_children["did:test:cancelled-parent"] = ["cancelled-child"]
+    manager._child_mandates["cancelled-child"] = mandate
+
+    async def refund_then_report_cancellation(name: str) -> bool:
+        assert name == "cancelled-child"
+        assert manager._child_budgets.pop(name) is entry
+        # This is the remove_agent contract after shutdown and refund have
+        # completed while the caller's cancellation is still pending.
+        return True
+
+    manager._release_child_budget_cancellation_safe = refund_then_report_cancellation
+    with pytest.raises(asyncio.CancelledError):
+        await manager.terminate_child("did:test:cancelled-parent", "cancelled-child")
+
+    child.shutdown.assert_awaited_once()
+    assert manager.get_agent("cancelled-child") is None
+    assert "cancelled-child" not in manager._child_budgets
+    assert manager.get_children("did:test:cancelled-parent") == []
+    assert manager.get_mandate("cancelled-child") is None
+    assert manager._pending_spawns == 0
 
 
 @pytest.mark.asyncio
