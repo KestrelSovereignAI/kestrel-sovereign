@@ -370,11 +370,33 @@ class ChannelFeature(Feature):
 
     async def _migrate_postgres_channel_message_identity(self) -> None:
         async with self._channel_identity_migration_transaction():
+            # ``LOCK TABLE`` cannot protect the absent-table branch. Serialize
+            # that branch with a transaction-scoped advisory lock, then use the
+            # relation lock below once a table exists. This lets a rolling old
+            # creator race only against one canonical migration transaction;
+            # the re-read after CREATE observes and repairs whichever schema
+            # became real rather than returning into an outside CREATE path.
+            await self._db.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))"
+            )
             table_exists = await self._channel_db_fetch_one(
                 "SELECT to_regclass('channel_messages')"
             )
             if table_exists is None or table_exists[0] is None:
-                return
+                # Fresh PostgreSQL creation belongs to this migration
+                # transaction, not the later best-effort table bootstrap.
+                # Otherwise two rolling initializers can both observe absence,
+                # then let an old creator publish ``PRIMARY KEY (id)`` outside
+                # the lock window. Re-read and lock the relation we created so
+                # this path has exactly the same postcondition as migration.
+                await self._db.execute(CHANNEL_MESSAGES_TABLE_SQL)
+                table_exists = await self._channel_db_fetch_one(
+                    "SELECT to_regclass('channel_messages')"
+                )
+                if table_exists is None or table_exists[0] is None:
+                    raise RuntimeError(
+                        "channel_messages creation did not become visible in migration transaction"
+                    )
             # Re-read every catalog value after the exclusive relation lock.
             # Without it, two initializers can both observe the old key; one
             # then drops a constraint the first transaction has already

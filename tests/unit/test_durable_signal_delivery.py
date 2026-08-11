@@ -641,7 +641,7 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
         )
         assert (
             await redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.DUPLICATE
+        ).disposition is DurableAdmissionDisposition.TERMINAL
         assert (await redelivery.wait()).status is Status.COALESCED
         replayed = await dispatcher.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
@@ -680,8 +680,33 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
         )
         assert (
             await ordinary_redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.DUPLICATE
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
         assert (await ordinary_redelivery.wait()).status is Status.FAILED
+
+        # A deduplicated source event with its selected row absent has no
+        # durable retry owner at all. It must be just as non-ACKable as an
+        # ordinary FAILED row.
+        missing = _channel_signal(agent.did, "selected-delivery-missing")
+        missing_persistence = await dispatcher._durable_store.persist_signal(
+            missing,
+            agent_id=agent.did,
+            source_event_id="telegram:update:selected-delivery-missing",
+            retention_days=7,
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_deliveries "
+            "WHERE agent_id = ? AND consumer_id = ? AND event_id = ?",
+            (agent.did, consumer.consumer_id, missing_persistence.event_id),
+        )
+        missing_redelivery = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "selected-delivery-missing"),
+            source_event_id="telegram:update:selected-delivery-missing",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await missing_redelivery.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        assert (await missing_redelivery.wait()).status is Status.FAILED
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
@@ -754,7 +779,7 @@ async def test_expired_terminal_nack_uses_managed_token_before_provider_receipt(
         )
         assert (
             await redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.DUPLICATE
+        ).disposition is DurableAdmissionDisposition.TERMINAL
 
         async def ordinary_failure(signal, _registration, start):
             return dispatcher._failure_result(
@@ -838,6 +863,13 @@ async def test_legacy_channel_redelivery_upgrades_only_matching_normal_event(tmp
             consumer_id=consumer.consumer_id,
         )
         assert (await rejected.wait()).status is Status.FAILED
+        # The legacy upgrade returned False for this non-canonical redelivery.
+        # With no selected delivery to prove retry ownership, the provider
+        # cursor must remain unchanged rather than treating event dedupe as an
+        # ACK receipt.
+        assert (
+            await rejected.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
         assert await dispatcher.list_durable_deliveries() == []
         row = await backend.fetch_one(
             "SELECT caller_identity FROM durable_signal_events WHERE event_id = ?",

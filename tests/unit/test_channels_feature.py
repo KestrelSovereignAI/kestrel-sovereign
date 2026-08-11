@@ -1164,10 +1164,47 @@ class TestChannelFeature:
         await feature._migrate_channel_message_identity()
 
         assert [call.args[0] for call in db.execute.await_args_list] == [
+            "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))",
             "LOCK TABLE channel_messages IN ACCESS EXCLUSIVE MODE",
             'ALTER TABLE channel_messages DROP CONSTRAINT "legacy""pkey"',
             "ALTER TABLE channel_messages ADD PRIMARY KEY (agent_id, id)",
         ]
+        assert transaction_events == ["begin", "end"]
+
+    @pytest.mark.asyncio
+    async def test_postgres_absent_channel_table_is_created_and_locked_in_migration_transaction(self):
+        """A cold creator establishes canonical identity before bootstrap returns."""
+
+        db = AsyncMock()
+        db.backend_type = "postgres"
+        # absent -> visible after CREATE -> composite primary key after LOCK
+        db.fetchone = AsyncMock(
+            side_effect=[None, ("channel_messages",), ("channel_messages_pkey",)]
+        )
+        db.fetchall = AsyncMock(return_value=[("agent_id",), ("id",)])
+        db.execute = AsyncMock(return_value=0)
+        transaction_events = []
+
+        @asynccontextmanager
+        async def transaction():
+            transaction_events.append("begin")
+            try:
+                yield
+            finally:
+                transaction_events.append("end")
+
+        db.backend = SimpleNamespace(backend_type="postgres", transaction=transaction)
+        feature = ChannelFeature(_make_agent(db=db))
+        feature._db = db
+
+        await feature._migrate_channel_message_identity()
+
+        executed = [call.args[0] for call in db.execute.await_args_list]
+        assert executed[0] == (
+            "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))"
+        )
+        assert executed[1].strip().startswith("CREATE TABLE IF NOT EXISTS channel_messages")
+        assert executed[2] == "LOCK TABLE channel_messages IN ACCESS EXCLUSIVE MODE"
         assert transaction_events == ["begin", "end"]
 
     @pytest.mark.asyncio

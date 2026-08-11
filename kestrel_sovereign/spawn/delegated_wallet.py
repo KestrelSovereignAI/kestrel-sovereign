@@ -92,6 +92,23 @@ class DelegatedWallet:
         # must not be able to spend funds after they return to the parent.
         self._revoked = False
         self._spend_lock = asyncio.Lock()
+        # A refund may await arbitrary parent-wallet I/O. Record its attempt
+        # under the same lock so a cancelled/ambiguous deposit is never blindly
+        # replayed and credited twice.
+        self._refund_attempted = False
+        self._refund_completed = False
+
+    def fence_spending(self) -> None:
+        """Immediately refuse new spends without waiting for wallet I/O.
+
+        A spend already holding ``_spend_lock`` may still be inside the wrapped
+        wallet transfer.  The eventual refund waits for that exact transfer,
+        so it snapshots the final amount and cannot refund before a late debit.
+        This synchronous fence lets a bounded control-plane removal hand the
+        remaining wait to a retained cleanup owner instead of blocking forever.
+        """
+
+        self._revoked = True
 
     @property
     def ceiling(self) -> Decimal:
@@ -123,9 +140,51 @@ class DelegatedWallet:
         refund is calculated or is refused after revocation; it cannot debit
         after the parent has recovered the unspent allocation.
         """
+        self.fence_spending()
         async with self._spend_lock:
-            self._revoked = True
             return self.allocation.remaining
+
+    async def refund_to_parent(
+        self, parent_wallet: WalletProtocol, *, currency: Any
+    ) -> Decimal:
+        """Fence, serialize, and perform this allocation's one refund.
+
+        The parent deposit intentionally occurs while holding ``_spend_lock``.
+        That makes the final child debit/refund ordering atomic from Core's
+        perspective: a spend completes before the snapshot, or it observes the
+        fence and never debits after the refund.  If provider I/O reports an
+        exception after an ambiguous side effect, later calls refuse to replay
+        the credit; the caller retains an unsafe cleanup record for operators.
+        """
+
+        self.fence_spending()
+        async with self._spend_lock:
+            if self._refund_completed:
+                return Decimal("0")
+            if self._refund_attempted:
+                raise RuntimeError(
+                    "delegated wallet refund outcome is uncertain; refusing duplicate credit"
+                )
+            self._refund_attempted = True
+            unspent = self.allocation.remaining
+            if unspent <= 0:
+                self._refund_completed = True
+                return unspent
+            deposited = await parent_wallet.deposit(
+                unspent,
+                currency,
+                to_audit=False,
+                memo=f"budget release from child {self.allocation.child_did}",
+            )
+            if deposited is not True:
+                raise RuntimeError("parent wallet refused delegated budget refund")
+            # If the parent is itself budgeted (a grandchild being released
+            # back into its budgeted parent), restore headroom only after the
+            # single confirmed credit.
+            if isinstance(parent_wallet, DelegatedWallet):
+                parent_wallet.restore_headroom(unspent)
+            self._refund_completed = True
+            return unspent
 
     # ------------------------------------------------------------------
     # WalletProtocol drop-in surface (#2113).
@@ -395,21 +454,9 @@ async def release_delegated_wallet(
         The amount returned to the parent.
     """
     currency = currency or _default_currency_for(parent_wallet)
-    unspent = await delegated_wallet.revoke_and_get_unspent()
-
-    if unspent > 0:
-        await parent_wallet.deposit(
-            unspent,
-            currency,
-            to_audit=False,
-            memo=f"budget release from child {delegated_wallet.allocation.child_did}",
-        )
-        # If the parent is itself budgeted (a grandchild being released back into
-        # its budgeted parent), restore that parent's budget headroom for the
-        # refunded amount — its ceiling had counted the whole child hold as spent.
-        # Done here (not in deposit) so ONLY an explicit release adjusts spent.
-        if isinstance(parent_wallet, DelegatedWallet):
-            parent_wallet.restore_headroom(unspent)
+    unspent = await delegated_wallet.refund_to_parent(
+        parent_wallet, currency=currency
+    )
 
     logger.info(
         "Released delegated wallet: child=%s, returned=%s %s, spent=%s %s",

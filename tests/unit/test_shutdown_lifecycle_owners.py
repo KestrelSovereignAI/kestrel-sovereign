@@ -6,6 +6,7 @@ import asyncio
 import sys
 import threading
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -21,6 +22,11 @@ from kestrel_sovereign.kestrel_agent import (
     await_lifecycle_task_completion,
 )
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.spawn.delegated_wallet import (
+    BudgetAllocation,
+    BudgetExceededError,
+    DelegatedWallet,
+)
 
 
 class _DeferredShutdownAgent:
@@ -1078,6 +1084,131 @@ async def test_manager_quarantines_cancellation_hostile_cognition_within_shutdow
             break
         await asyncio.sleep(0)
     assert next(iter(manager.quarantined_shutdowns().values()))["pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_quarantined_removal_fences_blocked_wallet_transfer_then_refunds_once(
+    monkeypatch,
+) -> None:
+    """A blocked child debit cannot pin DELETE or spend after its later refund."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+
+    class BlockingChildWallet:
+        _balances = {"FIL": {"main": Decimal("10")}}
+
+        def __init__(self) -> None:
+            self.transfer_entered = asyncio.Event()
+            self.allow_transfer = asyncio.Event()
+
+        def can_afford(self, amount, currency):
+            return True
+
+        def get_balance(self, currency, balance_type="main"):
+            return self._balances[currency][balance_type]
+
+        async def transfer(self, amount, memo="", currency=None):
+            self.transfer_entered.set()
+            await self.allow_transfer.wait()
+            self._balances[currency]["main"] -= amount
+            return True
+
+    class ParentWallet:
+        _balances = {"FIL": {"main": Decimal("0")}}
+
+        def __init__(self) -> None:
+            self.deposits: list[Decimal] = []
+
+        async def deposit(self, amount, currency=None, to_audit=False, memo=""):
+            self.deposits.append(amount)
+            self._balances[currency]["main"] += amount
+            return True
+
+    manager = AgentManager()
+    agent = _CancellationHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    child_wallet = BlockingChildWallet()
+    parent_wallet = ParentWallet()
+    delegated = DelegatedWallet(
+        child_wallet,
+        BudgetAllocation(child_did=agent.agent_id, parent_did="did:parent", amount=Decimal("10")),
+    )
+    manager._child_budgets["hostile"] = (delegated, parent_wallet)
+
+    spending = asyncio.create_task(delegated.spend(Decimal("3"), "blocked debit", "FIL"))
+    await asyncio.wait_for(child_wallet.transfer_entered.wait(), timeout=1.0)
+    removal = asyncio.create_task(manager.remove_agent("hostile"))
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+
+    assert await asyncio.wait_for(removal, timeout=0.2) is True
+    assert manager.get_agent("hostile") is None
+    assert "hostile" not in manager._child_budgets
+    assert delegated.can_spend(Decimal("1")) is False
+    assert parent_wallet.deposits == []
+
+    child_wallet.allow_transfer.set()
+    assert await asyncio.wait_for(spending, timeout=1.0) is True
+    for _ in range(100):
+        if parent_wallet.deposits:
+            break
+        await asyncio.sleep(0)
+    assert parent_wallet.deposits == [Decimal("7")]
+    with pytest.raises(BudgetExceededError):
+        await delegated.spend(Decimal("1"), "post-refund", "FIL")
+
+    agent.allow_shutdown_finish.set()
+    for _ in range(100):
+        if all(not item["pending"] for item in manager.quarantined_shutdowns().values()):
+            break
+        await asyncio.sleep(0)
+    assert all(not item["pending"] for item in manager.quarantined_shutdowns().values())
+
+
+@pytest.mark.asyncio
+async def test_completed_quarantine_reaper_keeps_only_bounded_metadata() -> None:
+    """Finished cleanup does not retain a Task/coroutine traceback forever."""
+
+    manager = AgentManager()
+
+    async def complete() -> None:
+        return None
+
+    task = asyncio.create_task(complete())
+    reaper_id = manager._retain_quarantined_cleanup(
+        name="retired", agent_id="did:test:retired", task=task
+    )
+    await task
+    await asyncio.sleep(0)
+
+    assert manager._quarantined_shutdown_reapers == {}
+    assert len(manager._quarantined_shutdown_history) == 1
+    assert manager.quarantined_shutdowns()[reaper_id] == {
+        "agent_name": "retired",
+        "agent_id": "did:test:retired",
+        "pending": False,
+        "started_monotonic": manager._quarantined_shutdown_history[0].started_monotonic,
+        "completed_monotonic": manager._quarantined_shutdown_history[0].completed_monotonic,
+        "failure": None,
+    }
+
+    async def fail() -> None:
+        raise RuntimeError("wallet refund remained unsafe")
+
+    failed_task = asyncio.create_task(fail())
+    failed_reaper_id = manager._retain_quarantined_cleanup(
+        name="unsafe", agent_id="did:test:unsafe", task=failed_task
+    )
+    with pytest.raises(RuntimeError, match="remained unsafe"):
+        await failed_task
+    await asyncio.sleep(0)
+    assert manager._quarantined_shutdown_reapers == {}
+    assert failed_reaper_id in manager._unsafe_quarantined_shutdown_failures
+    assert manager.quarantined_shutdowns()[failed_reaper_id]["failure"] == (
+        "RuntimeError: wallet refund remained unsafe"
+    )
 
 
 @pytest.mark.asyncio

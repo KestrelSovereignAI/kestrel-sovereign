@@ -2591,7 +2591,7 @@ class SignalDispatcher:
             )
             if legacy_signal is not None and source_event_id is not None:
                 try:
-                    await self._durable_store.upgrade_legacy_delivery_for_redelivery(
+                    upgraded_legacy_delivery = await self._durable_store.upgrade_legacy_delivery_for_redelivery(
                         agent_id=self._agent.did,
                         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
                         event_id=persisted.event_id,
@@ -2603,6 +2603,17 @@ class SignalDispatcher:
                             )
                         ),
                     )
+                    if not upgraded_legacy_delivery:
+                        # ``False`` deliberately carries no admission meaning:
+                        # the row may be absent, mismatched, expired, already
+                        # terminal, or an ordinary FAILED delivery. The exact
+                        # selected-delivery read/claim below is the only
+                        # cursor-receipt proof.
+                        logger.debug(
+                            "Legacy durable channel redelivery was not upgraded; "
+                            "requiring selected delivery proof: event=%s",
+                            persisted.event_id,
+                        )
                 except Exception:
                     logger.exception(
                         "Could not upgrade legacy durable channel redelivery: event=%s",
@@ -2617,23 +2628,11 @@ class SignalDispatcher:
                     )
 
         if durable_delivery_consumer_id is not None:
-            # The event transaction has atomically materialized the selected
-            # consumer delivery.  This is the producer receipt boundary: the
-            # durable executor below owns cognition, lease renewal, and any
-            # retry/NACK transition independently of a Telegram poll cursor.
-            # A duplicate points at that same durable row, so it is equally
-            # safe for the producer to advance without creating another turn.
-            if durable_admission is not None and not durable_admission.done():
-                durable_admission.set_result(
-                    DurableAdmissionResult(
-                        (
-                            DurableAdmissionDisposition.COMMITTED
-                            if persisted.created
-                            else DurableAdmissionDisposition.DUPLICATE
-                        ),
-                        signal.id,
-                    )
-                )
+            # Do not publish a cursor receipt merely because the source event
+            # deduplicated. Legacy rows can lack the selected delivery, and an
+            # ordinary FAILED delivery is explicitly non-ACKable. The route
+            # below first proves an ACKable terminal row or claims an exact
+            # Core-owned retry lease, then resolves durable_admission.
             return await self._route_durable_cognition_delivery(
                 signal,
                 registration,
@@ -2641,6 +2640,7 @@ class SignalDispatcher:
                 persisted_event_id=persisted.event_id,
                 consumer_id=durable_delivery_consumer_id,
                 durable_admission=durable_admission,
+                durable_created=persisted.created,
                 use_live_signal=(
                     durable_projection.payload_elided and persisted.created
                 )
@@ -2672,6 +2672,7 @@ class SignalDispatcher:
         persisted_event_id: str,
         consumer_id: str,
         durable_admission: asyncio.Future[DurableAdmissionResult] | None,
+        durable_created: bool,
         use_live_signal: bool,
     ) -> SignalResult:
         """Route cursor-owned work and ACK only its durable cognition lease."""
@@ -2724,6 +2725,23 @@ class SignalDispatcher:
                     "retry without advancing its cursor"
                 ),
                 registration=registration,
+            )
+
+        # This exact selected delivery is now leased to the current dispatcher
+        # owner.  That durable lease is the retry authority a cursor-owning
+        # producer needs; later cognition/NACK work can no longer make an
+        # absent or ordinary-FAILED row look ACKable. Resolve only after the
+        # claim succeeds, not at source-event deduplication above.
+        if durable_admission is not None and not durable_admission.done():
+            durable_admission.set_result(
+                DurableAdmissionResult(
+                    (
+                        DurableAdmissionDisposition.COMMITTED
+                        if durable_created
+                        else DurableAdmissionDisposition.DUPLICATE
+                    ),
+                    signal.id,
+                )
             )
 
         # A retried persistence-allowed event must execute the canonical

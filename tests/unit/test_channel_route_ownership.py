@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteClaim,
     ChannelRouteOwnershipStore,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
@@ -41,18 +42,21 @@ async def test_route_claim_is_exclusive_reconcilable_and_does_not_leak_competing
                 agent_id=second_agent,
             ),
         )
-        assert [first_claim, second_claim].count(True) == 1
-        winner, loser = (
-            (first, first_agent) if first_claim else (second, second_agent)
+        assert sum(claim is not None for claim in (first_claim, second_claim)) == 1
+        winner, winning_agent, winning_claim = (
+            (first, first_agent, first_claim)
+            if first_claim is not None
+            else (second, second_agent, second_claim)
         )
         losing_store, losing_agent = (
-            (second, second_agent) if first_claim else (first, first_agent)
+            (second, second_agent) if first_claim is not None else (first, first_agent)
         )
+        assert winning_claim is not None
 
         assert await winner.is_claimed_by(
             channel_type="telegram",
             canonical_route_identity=bot_identity,
-            agent_id=loser,
+            agent_id=winning_agent,
         ) is True
         # A contending user can learn only that THEIR request failed.  The
         # primitive neither returns nor exposes the winning agent identity.
@@ -63,28 +67,41 @@ async def test_route_claim_is_exclusive_reconcilable_and_does_not_leak_competing
         ) is False
         assert not hasattr(losing_store, "get_owner")
 
-        # Same-agent reconciliation is idempotent, while another agent cannot
-        # release a route it does not own.
-        assert await winner.claim(
+        # Reassertion replaces the generation. A stale same-agent release and
+        # a competing-agent release can never delete that replacement.
+        replacement_claim = await winner.claim(
             channel_type="telegram",
             canonical_route_identity=bot_identity,
-            agent_id=loser,
-        ) is True
+            agent_id=winning_agent,
+        )
+        assert replacement_claim is not None
+        assert replacement_claim != winning_claim
+        assert await winner.release(
+            channel_type="telegram",
+            canonical_route_identity=bot_identity,
+            agent_id=winning_agent,
+            claim=winning_claim,
+        ) is False
         assert await losing_store.release(
             channel_type="telegram",
             canonical_route_identity=bot_identity,
             agent_id=losing_agent,
+            claim=ChannelRouteClaim(generation="competing-generation"),
         ) is False
         assert await winner.release(
             channel_type="telegram",
             canonical_route_identity=bot_identity,
-            agent_id=loser,
+            agent_id=winning_agent,
+            claim=replacement_claim,
         ) is True
-        assert await losing_store.claim(
+        assert (
+            await losing_store.claim(
             channel_type="telegram",
             canonical_route_identity=bot_identity,
             agent_id=losing_agent,
-        ) is True
+            )
+            is not None
+        )
     finally:
         await second_backend.close()
         await first_backend.close()

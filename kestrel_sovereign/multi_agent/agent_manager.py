@@ -14,6 +14,7 @@ import inspect
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -62,9 +63,9 @@ class QuarantinedShutdownReaper:
     """Observable ownership record for cleanup that outlived agent removal.
 
     The control plane has already withdrawn this generation from routing and
-    released any delegated budget.  The reaper still retains the exact agent
-    shutdown task, so its durable signal owner and storage cannot be reclaimed
-    or garbage-collected underneath cancellation-resistant cognition.
+    fenced any delegated budget.  The reaper retains an exact shutdown or
+    refund task, so durable storage and a blocked spend/refund cannot be
+    reclaimed or garbage-collected underneath cancellation-resistant work.
     """
 
     reaper_id: str
@@ -74,6 +75,18 @@ class QuarantinedShutdownReaper:
     started_monotonic: float
     completed_monotonic: Optional[float] = None
     failure: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class QuarantinedShutdownHistory:
+    """Bounded, metadata-only outcome retained after a cleanup task settles."""
+
+    reaper_id: str
+    agent_name: str
+    agent_id: str
+    started_monotonic: float
+    completed_monotonic: float
+    failure: Optional[str]
 
 
 class _DynamicSchedulerTenantRegistration:
@@ -209,6 +222,18 @@ class AgentManager:
         # Retain those tasks independently of ``_agents`` so removal/restart
         # has a finite control-plane bound without abandoning durable state.
         self._quarantined_shutdown_reapers: dict[str, QuarantinedShutdownReaper] = {}
+        # Completed asyncio tasks retain their coroutine frames and exception
+        # tracebacks. Keep only bounded metadata after either safe completion
+        # or an unsafe failure; active cleanup alone owns a live task.
+        self._quarantined_shutdown_history: deque[QuarantinedShutdownHistory] = deque(
+            maxlen=128
+        )
+        # Unsafe outcomes remain operator-visible until explicit process/host
+        # remediation, but retain only strings/timestamps — never the finished
+        # task or its traceback-bearing coroutine frame.
+        self._unsafe_quarantined_shutdown_failures: dict[
+            str, QuarantinedShutdownHistory
+        ] = {}
         self._next_shutdown_reaper_id = 0
         # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
         # monotonic counter avoided unload-reuse but couldn't express "this
@@ -1487,13 +1512,34 @@ class AgentManager:
                 "agent shutdown reaper handoff must return an asyncio future"
             )
 
+        self._retain_quarantined_cleanup(
+            name=name,
+            agent_id=_loaded_agent_did(agent) or "<unknown>",
+            task=reaper_task,
+        )
+        logger.warning(
+            "Handed agent %r to quarantined shutdown cleanup; routing is "
+            "withdrawn but durable owner/storage remain retained until it settles.",
+            name,
+        )
+        return True
+
+    def _retain_quarantined_cleanup(
+        self,
+        *,
+        name: str,
+        agent_id: str,
+        task: "asyncio.Future[object]",
+    ) -> str:
+        """Keep one live cleanup task, then collapse it to bounded metadata."""
+
         self._next_shutdown_reaper_id += 1
         reaper_id = f"{name}:{self._next_shutdown_reaper_id}"
         record = QuarantinedShutdownReaper(
             reaper_id=reaper_id,
             agent_name=name,
-            agent_id=_loaded_agent_did(agent) or "<unknown>",
-            task=reaper_task,
+            agent_id=agent_id,
+            task=task,
             started_monotonic=time.monotonic(),
         )
         self._quarantined_shutdown_reapers[reaper_id] = record
@@ -1506,6 +1552,22 @@ class AgentManager:
                 failure = task.exception()
                 if failure is not None:
                     record.failure = f"{type(failure).__name__}: {failure}"
+            # Do not keep a completed Task: it retains coroutine locals and,
+            # on failure, the full traceback. Operators still receive a
+            # bounded history entry with the safety outcome.
+            self._quarantined_shutdown_reapers.pop(record.reaper_id, None)
+            history = QuarantinedShutdownHistory(
+                reaper_id=record.reaper_id,
+                agent_name=record.agent_name,
+                agent_id=record.agent_id,
+                started_monotonic=record.started_monotonic,
+                completed_monotonic=record.completed_monotonic or time.monotonic(),
+                failure=record.failure,
+            )
+            if history.failure is None:
+                self._quarantined_shutdown_history.append(history)
+            else:
+                self._unsafe_quarantined_shutdown_failures[history.reaper_id] = history
             if record.failure is None:
                 logger.info(
                     "Quarantined shutdown reaper %s completed for agent %r",
@@ -1520,14 +1582,8 @@ class AgentManager:
                     record.failure,
                 )
 
-        reaper_task.add_done_callback(observe_reaper_completion)
-        logger.warning(
-            "Handed agent %r to quarantined shutdown reaper %s; routing is "
-            "withdrawn but durable owner/storage remain retained until it settles.",
-            name,
-            reaper_id,
-        )
-        return True
+        task.add_done_callback(observe_reaper_completion)
+        return reaper_id
 
     def quarantined_shutdowns(self) -> dict[str, dict[str, object]]:
         """Return operational status for cleanup retained after removal.
@@ -1537,7 +1593,7 @@ class AgentManager:
         host operator to distinguish a still-draining reaper from a completed
         or failed one.
         """
-        return {
+        active = {
             reaper_id: {
                 "agent_name": record.agent_name,
                 "agent_id": record.agent_id,
@@ -1548,6 +1604,29 @@ class AgentManager:
             }
             for reaper_id, record in self._quarantined_shutdown_reapers.items()
         }
+        history = {
+            record.reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": False,
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for record in self._quarantined_shutdown_history
+        }
+        unsafe_failures = {
+            record.reaper_id: {
+                "agent_name": record.agent_name,
+                "agent_id": record.agent_id,
+                "pending": False,
+                "started_monotonic": record.started_monotonic,
+                "completed_monotonic": record.completed_monotonic,
+                "failure": record.failure,
+            }
+            for record in self._unsafe_quarantined_shutdown_failures.values()
+        }
+        return {**history, **unsafe_failures, **active}
 
     async def _remove_agent_without_scheduler_lifecycle(self, name: str) -> bool:
         """Shutdown and remove an agent.
@@ -1715,7 +1794,25 @@ class AgentManager:
         # required for removal.  Retain its task through repeated cancellation
         # before propagating cancellation to the caller; otherwise a closed
         # child can strand its delegated hold.
-        release_cancelled = await self._release_child_budget_cancellation_safe(name)
+        if shutdown_handed_off:
+            # The shutdown reaper proves the agent's durable owner/storage are
+            # retained, but a still-running cognition can also be blocked
+            # inside DelegatedWallet.spend(). Do not let that spend lock extend
+            # DELETE/restart indefinitely: fence immediately and retain the
+            # one refund task under the same observable quarantine ownership.
+            budget_handed_off = self._handoff_child_budget_release_to_quarantined_reaper(
+                name, agent_id=_loaded_agent_did(agent) or "<unknown>"
+            )
+            # No delegated hold is ordinarily a no-op. Preserve the existing
+            # release hook for legacy/custom managers, whose accounting may
+            # live behind an override rather than ``_child_budgets``.
+            release_cancelled = (
+                False
+                if budget_handed_off
+                else await self._release_child_budget_cancellation_safe(name)
+            )
+        else:
+            release_cancelled = await self._release_child_budget_cancellation_safe(name)
         if caller_cancelled or release_cancelled:
             raise asyncio.CancelledError()
         return True
@@ -2020,6 +2117,14 @@ class AgentManager:
         if entry is None:
             return
         delegated, parent_wallet = entry
+        await self._release_child_budget_entry(
+            child_name, delegated=delegated, parent_wallet=parent_wallet
+        )
+
+    async def _release_child_budget_entry(
+        self, child_name: str, *, delegated, parent_wallet
+    ) -> None:
+        """Release an already-reserved hold, keeping legacy callers best-effort."""
         try:
             returned = await release_delegated_wallet(delegated, parent_wallet)
             logger.info(
@@ -2030,6 +2135,45 @@ class AgentManager:
             logger.warning(
                 "Failed to release delegated budget for '%s': %s", child_name, e
             )
+
+    def _handoff_child_budget_release_to_quarantined_reaper(
+        self, child_name: str, *, agent_id: str
+    ) -> bool:
+        """Fence a budget now and retain its blocked refund outside DELETE.
+
+        A cancellation-resistant cognition turn can hold the delegated wallet's
+        spend lock while arbitrary provider I/O is blocked.  Fencing is
+        synchronous, so no later spend can begin; the retained reaper then
+        waits for the in-flight transfer and performs exactly one refund.
+        """
+
+        entry = self._child_budgets.pop(child_name, None)
+        if entry is None:
+            return False
+        delegated, parent_wallet = entry
+        delegated.fence_spending()
+
+        async def release() -> None:
+            returned = await release_delegated_wallet(delegated, parent_wallet)
+            logger.info(
+                "Released quarantined delegated budget for '%s': returned %s to parent (#2113).",
+                child_name,
+                returned,
+            )
+
+        task = asyncio.create_task(
+            release(), name=f"agent_budget_release_quarantine:{child_name}"
+        )
+        self._retain_quarantined_cleanup(
+            name=child_name,
+            agent_id=agent_id,
+            task=task,
+        )
+        logger.warning(
+            "Handed delegated budget for %r to quarantined cleanup after immediate spend fence.",
+            child_name,
+        )
+        return True
 
     async def _release_child_budget_cancellation_safe(self, child_name: str) -> bool:
         """Release one removed child's hold before reporting caller cancellation."""

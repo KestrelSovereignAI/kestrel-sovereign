@@ -54,10 +54,60 @@ from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolS
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 from kestrel_sovereign.features.channels.route_ownership import (
+    ChannelRouteClaim,
     ChannelRouteOwnershipStore,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_telegram_bot_id(value: object) -> str:
+    """Normalize one Telegram bot ID for Core's route-ownership boundary.
+
+    Telegram accepts decimal IDs, while route ownership must not let a host
+    accidentally split one bot across textual aliases.  In particular,
+    ``000123`` normalizes to ``123`` and provider-prefixed strings such as
+    ``telegram-bot:123`` are rejected rather than treated as already
+    canonical.
+    """
+
+    if type(value) is not str or not value.isascii() or not value.isdecimal():
+        raise ValueError("Telegram bot ID must be a positive decimal string")
+    normalized = value.lstrip("0")
+    if not normalized:
+        raise ValueError("Telegram bot ID must be positive")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class HostedTelegramRouteAttestation:
+    """Host-supplied route evidence consumed before a Telegram child starts.
+
+    The host (for example Frinz) remains responsible for concrete provider and
+    HTTP provisioning.  Core only receives this typed, provider-neutral
+    ownership input and establishes its own durable ledger fence before the
+    child handshake can start polling or receive the hosted-ingress capability.
+    """
+
+    ownership_store: ChannelRouteOwnershipStore
+    bot_id: str
+
+
+def set_hosted_telegram_route_attestation_resolver(
+    agent: Any, resolver: Callable[["ProxyFeature"], Any]
+) -> None:
+    """Inject a host's pre-initialize Telegram route resolver.
+
+    This is Core's generic boot seam: a host installs it while constructing an
+    agent, before feature discovery invokes :meth:`ProxyFeature.initialize`.
+    The resolver supplies only typed route evidence; Core performs the durable
+    ownership claim itself. Concrete webhook and provider provisioning remain
+    outside Core.
+    """
+
+    if not callable(resolver):
+        raise TypeError("hosted Telegram route attestation resolver must be callable")
+    setattr(agent, "hosted_telegram_route_attestation_resolver", resolver)
 
 # Upper bound on a single supervision health probe. A wedged child that never
 # answers health() must not silently kill supervision forever (F013) — treat a
@@ -2292,6 +2342,8 @@ class ProxyFeature(Feature):
         self._host_config: Dict[str, Any] = {}
         self._hosted_telegram_startup_attested = False
         self._hosted_telegram_route_identity: Optional[str] = None
+        self._hosted_telegram_route_claim: Optional[ChannelRouteClaim] = None
+        self._hosted_telegram_ownership_store: Optional[ChannelRouteOwnershipStore] = None
         # Process-local identity for the durable pending lease.  A new proxy
         # instance (including one after a crash/restart) never impersonates an
         # earlier writer; it may only reclaim that writer after its lease has
@@ -2322,21 +2374,113 @@ class ProxyFeature(Feature):
             return self.runtime.description
         return f"Isolated feature service for {self.name}"
 
+    def _is_telegram_runtime(self) -> bool:
+        return (
+            re.sub(r"[-_.]+", "-", self.runtime.distribution.strip().lower())
+            == "kestrel-channel-telegram"
+        )
+
     def _require_telegram_runtime(self) -> None:
         """Reject route attestation for any non-Telegram isolated runtime."""
-        runtime_distribution = re.sub(
-            r"[-_.]+", "-", self.runtime.distribution.strip().lower()
-        )
-        if runtime_distribution != "kestrel-channel-telegram":
+        if not self._is_telegram_runtime():
             raise RuntimeError(
                 "hosted Telegram startup attestation is valid only for the Telegram feature"
+            )
+
+    @staticmethod
+    def _telegram_route_identity(bot_id: object) -> str:
+        """Build the only Telegram route spelling Core places in the ledger."""
+
+        return f"telegram-bot:{canonical_telegram_bot_id(bot_id)}"
+
+    def _clear_hosted_telegram_startup_attestation(self) -> None:
+        self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_route_identity = None
+        self._hosted_telegram_route_claim = None
+        self._hosted_telegram_ownership_store = None
+
+    async def _resolve_hosted_telegram_startup_attestation(self) -> None:
+        """Resolve host route evidence before a Telegram child handshake.
+
+        A normal Core boot discovers isolated features before the caller can
+        obtain the new proxy instance.  Hosts therefore inject the resolver on
+        the agent *before* initialization under the explicit
+        ``hosted_telegram_route_attestation_resolver`` seam.  Returning
+        ``None`` means this is an ordinary polling route.  Returning typed
+        hosted-route evidence requires a successful durable claim; any
+        conflict aborts startup before the child can touch provider ingress.
+        """
+
+        self._require_telegram_runtime()
+        # Do not use bare ``getattr`` here: dynamic integration proxies (and
+        # unittest mocks) manufacture callable-looking attributes that were
+        # never a host injection. Only an explicitly stored instance value or
+        # a concrete class-level resolver opens this hosted-route path.
+        resolver_name = "hosted_telegram_route_attestation_resolver"
+        instance_attributes = getattr(self.agent, "__dict__", None)
+        resolver = (
+            instance_attributes.get(resolver_name)
+            if isinstance(instance_attributes, dict)
+            else None
+        )
+        if resolver is None:
+            class_resolver = getattr(type(self.agent), resolver_name, None)
+            if class_resolver is not None:
+                resolver = getattr(self.agent, resolver_name)
+        if resolver is None:
+            # Preserve the narrow pre-initialize injection API for hosts that
+            # already hold the proxy, but reassert its generation before a new
+            # handshake. A stale in-memory boolean is never sufficient.
+            if (
+                self._hosted_telegram_ownership_store is not None
+                and self._hosted_telegram_route_identity is not None
+            ):
+                bot_id = self._hosted_telegram_route_identity.removeprefix(
+                    "telegram-bot:"
+                )
+                claimed = await self.reconcile_hosted_telegram_route_claim(
+                    ownership_store=self._hosted_telegram_ownership_store,
+                    bot_id=bot_id,
+                )
+                if not claimed:
+                    raise RuntimeError(
+                        "Hosted Telegram route is already owned; refusing to start child"
+                    )
+            else:
+                self._clear_hosted_telegram_startup_attestation()
+            return
+        if not callable(resolver):
+            raise TypeError(
+                "hosted_telegram_route_attestation_resolver must be callable"
+            )
+        resolved = await _maybe_await(resolver(self))
+        if resolved is None:
+            if self._hosted_telegram_route_claim is not None:
+                raise RuntimeError(
+                    "cannot remove hosted Telegram route evidence while its "
+                    "generation remains claimed; release it first"
+                )
+            self._clear_hosted_telegram_startup_attestation()
+            return
+        if not isinstance(resolved, HostedTelegramRouteAttestation):
+            raise TypeError(
+                "hosted Telegram route resolver must return "
+                "HostedTelegramRouteAttestation or None"
+            )
+        claimed = await self.reconcile_hosted_telegram_route_claim(
+            ownership_store=resolved.ownership_store,
+            bot_id=resolved.bot_id,
+        )
+        if not claimed:
+            raise RuntimeError(
+                "Hosted Telegram route is already owned; refusing to start child"
             )
 
     async def reconcile_hosted_telegram_route_claim(
         self,
         *,
         ownership_store: ChannelRouteOwnershipStore,
-        canonical_bot_identity: str,
+        bot_id: str,
     ) -> bool:
         """Durably claim/reconcile the host-provisioned Telegram route.
 
@@ -2353,24 +2497,37 @@ class ProxyFeature(Feature):
             raise TypeError(
                 "hosted Telegram route attestation requires ChannelRouteOwnershipStore"
             )
-        claimed = await ownership_store.claim(
+        route_identity = self._telegram_route_identity(bot_id)
+        if (
+            self._hosted_telegram_route_claim is not None
+            and (
+                self._hosted_telegram_route_identity != route_identity
+                or self._hosted_telegram_ownership_store is not ownership_store
+            )
+        ):
+            raise RuntimeError(
+                "cannot reconcile a different hosted Telegram route ledger or "
+                "identity while the current generation remains claimed; release it first"
+            )
+        claim = await ownership_store.claim(
             channel_type="telegram",
-            canonical_route_identity=canonical_bot_identity,
+            canonical_route_identity=route_identity,
             agent_id=self._config_agent_did(),
         )
-        if not claimed:
-            self._hosted_telegram_startup_attested = False
-            self._hosted_telegram_route_identity = None
+        if claim is None:
+            self._clear_hosted_telegram_startup_attestation()
             return False
         self._hosted_telegram_startup_attested = True
-        self._hosted_telegram_route_identity = canonical_bot_identity
+        self._hosted_telegram_route_identity = route_identity
+        self._hosted_telegram_route_claim = claim
+        self._hosted_telegram_ownership_store = ownership_store
         return True
 
     async def release_hosted_telegram_route_claim(
         self,
         *,
         ownership_store: ChannelRouteOwnershipStore,
-        canonical_bot_identity: str,
+        bot_id: str,
     ) -> bool:
         """Release this proxy's route claim and revoke its launch attestation."""
         self._require_telegram_runtime()
@@ -2378,14 +2535,21 @@ class ProxyFeature(Feature):
             raise TypeError(
                 "hosted Telegram route release requires ChannelRouteOwnershipStore"
             )
+        route_identity = self._telegram_route_identity(bot_id)
+        claim = self._hosted_telegram_route_claim
+        if (
+            claim is None
+            or self._hosted_telegram_ownership_store is not ownership_store
+            or self._hosted_telegram_route_identity != route_identity
+        ):
+            return False
         released = await ownership_store.release(
             channel_type="telegram",
-            canonical_route_identity=canonical_bot_identity,
+            canonical_route_identity=route_identity,
             agent_id=self._config_agent_did(),
+            claim=claim,
         )
-        if self._hosted_telegram_route_identity == canonical_bot_identity:
-            self._hosted_telegram_startup_attested = False
-            self._hosted_telegram_route_identity = None
+        self._clear_hosted_telegram_startup_attestation()
         return released
 
     def _config_agent_did(self) -> str:
@@ -2728,6 +2892,8 @@ class ProxyFeature(Feature):
             # forwarded to the isolated service through the initialize handshake (the
             # service is otherwise launched bare, with only env vars).
             await self._ensure_host_config_loaded()
+            if self._is_telegram_runtime():
+                await self._resolve_hosted_telegram_startup_attestation()
             self._assert_child_start_allowed()
             await self._connect_client()
             self._assert_child_start_allowed()

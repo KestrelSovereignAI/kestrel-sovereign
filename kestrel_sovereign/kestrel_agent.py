@@ -533,6 +533,7 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
         sovereign_trust_root_path: Optional[str] = None,
@@ -579,6 +580,12 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            hosted_telegram_route_attestation_resolver: Optional host-owned
+                       pre-initialize resolver for a Telegram route already
+                       provisioned outside Core. It supplies typed ledger
+                       evidence before isolated feature discovery can start
+                       the child handshake; Core never provisions provider
+                       HTTP/webhooks through this seam.
             peer_directory_router: Optional hosted peer-directory/router.  When
                        supplied it replaces the local multi-agent HTTP adapter
                        used by ``PeersFeature``.
@@ -636,6 +643,14 @@ class KestrelAgent(
         # on-disk host.db lookups during credential resolution at init.
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
+        if hosted_telegram_route_attestation_resolver is not None:
+            from kestrel_sovereign.features.isolated_runtime import (
+                set_hosted_telegram_route_attestation_resolver,
+            )
+
+            set_hosted_telegram_route_attestation_resolver(
+                self, hosted_telegram_route_attestation_resolver
+            )
         # Scoped peer routing is an explicit dependency-injection seam for
         # hosted multi-tenant runtimes.  PeersFeature validates the pair at
         # initialization; keeping the opaque scope here avoids serializing it

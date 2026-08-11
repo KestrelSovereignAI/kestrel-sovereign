@@ -11,7 +11,21 @@ provisioning endpoint.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from dataclasses import dataclass
+import secrets
+from typing import Any, AsyncIterator, Optional
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelRouteClaim:
+    """Opaque generation capability for one route-ownership claim.
+
+    A same-agent reassertion replaces the live generation.  A stale teardown
+    therefore cannot delete a newer claim that happens to have the same
+    ``(channel_type, route, agent_id)`` tuple.
+    """
+
+    generation: str
 
 
 class ChannelRouteOwnershipStore:
@@ -119,6 +133,14 @@ class ChannelRouteOwnershipStore:
             raise RuntimeError("channel route ownership database has no fetch-one API")
         return await fetch(query, params)
 
+    async def _fetchall(self, query: str, params: tuple = ()) -> list[Any]:
+        fetch = getattr(self._database, "fetchall", None)
+        if not callable(fetch):
+            fetch = getattr(self._database, "fetch_all", None)
+        if not callable(fetch):
+            raise RuntimeError("channel route ownership database has no fetch-all API")
+        return await fetch(query, params)
+
     async def initialize(self) -> None:
         """Create the shared ownership ledger once, safely under contention."""
 
@@ -130,12 +152,41 @@ class ChannelRouteOwnershipStore:
                     channel_type TEXT NOT NULL,
                     canonical_route_identity TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
+                    generation TEXT NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (channel_type, canonical_route_identity)
                 )"""
             )
+            await self._ensure_generation_column()
         self._initialized = True
+
+    async def _ensure_generation_column(self) -> None:
+        """Add an ABA fence for databases created before generations existed.
+
+        A pre-generation row remains non-releasable until its owner reasserts
+        it.  That is intentional: manufacturing a token for a live legacy
+        process would make a stale release unsafe during a rolling upgrade.
+        """
+
+        if self.backend_type == "sqlite":
+            columns = await self._fetchall(f"PRAGMA table_info({self.TABLE})")
+            if any(row[1] == "generation" for row in columns):
+                return
+        elif self.backend_type == "postgres":
+            column = await self._fetchone(
+                """SELECT 1 FROM pg_attribute
+                   WHERE attrelid = to_regclass('channel_route_ownership')
+                     AND attname = 'generation'
+                     AND attnum > 0 AND NOT attisdropped"""
+            )
+            if column is not None:
+                return
+        else:
+            raise RuntimeError(
+                "channel route ownership supports only sqlite or postgres databases"
+            )
+        await self._execute(f"ALTER TABLE {self.TABLE} ADD COLUMN generation TEXT")
 
     async def claim(
         self,
@@ -143,13 +194,13 @@ class ChannelRouteOwnershipStore:
         channel_type: str,
         canonical_route_identity: str,
         agent_id: str,
-    ) -> bool:
+    ) -> Optional[ChannelRouteClaim]:
         """Create or reconcile an exclusive claim without exposing its owner.
 
-        A same-agent call is idempotent and refreshes observability metadata;
-        a different-agent call affects zero rows and receives only ``False``.
-        The single UPSERT makes that decision atomic across separate Core
-        processes.
+        A same-agent reassertion replaces its opaque generation capability;
+        a stale release cannot delete that replacement. A different-agent call
+        affects zero rows and receives only ``None``. The single UPSERT makes
+        that decision atomic across separate Core processes.
         """
 
         channel, route, agent = self._validate_scope(
@@ -158,17 +209,19 @@ class ChannelRouteOwnershipStore:
             agent_id=agent_id,
         )
         await self.initialize()
+        claim = ChannelRouteClaim(generation=secrets.token_urlsafe(24))
         async with self._transaction():
             affected = await self._execute(
                 f"""INSERT INTO {self.TABLE}
-                    (channel_type, canonical_route_identity, agent_id)
-                    VALUES (?, ?, ?)
+                    (channel_type, canonical_route_identity, agent_id, generation)
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(channel_type, canonical_route_identity) DO UPDATE
-                    SET updated_at = CURRENT_TIMESTAMP
+                    SET generation = excluded.generation,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE {self.TABLE}.agent_id = excluded.agent_id""",
-                (channel, route, agent),
+                (channel, route, agent, claim.generation),
             )
-        return int(affected or 0) == 1
+        return claim if int(affected or 0) == 1 else None
 
     async def is_claimed_by(
         self,
@@ -199,20 +252,26 @@ class ChannelRouteOwnershipStore:
         channel_type: str,
         canonical_route_identity: str,
         agent_id: str,
+        claim: ChannelRouteClaim,
     ) -> bool:
-        """Release only this agent's claim, without revealing competing state."""
+        """Release one exact claim generation without revealing competing state."""
 
         channel, route, agent = self._validate_scope(
             channel_type=channel_type,
             canonical_route_identity=canonical_route_identity,
             agent_id=agent_id,
         )
+        if not isinstance(claim, ChannelRouteClaim):
+            raise TypeError("channel route release requires a ChannelRouteClaim")
+        generation = self._require_identifier(
+            claim.generation, label="claim generation", maximum=512
+        )
         await self.initialize()
         async with self._transaction():
             affected = await self._execute(
                 f"""DELETE FROM {self.TABLE}
                     WHERE channel_type = ? AND canonical_route_identity = ?
-                      AND agent_id = ?""",
-                (channel, route, agent),
+                      AND agent_id = ? AND generation = ?""",
+                (channel, route, agent, generation),
             )
         return int(affected or 0) == 1

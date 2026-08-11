@@ -30,9 +30,12 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
 from kestrel_sovereign.features.isolated_runtime import (
+    HostedTelegramRouteAttestation,
     ProxyFeature,
     SchedulerExecutionContextUnavailable,
     SchedulerTerminalAdmissionError,
+    canonical_telegram_bot_id,
+    set_hosted_telegram_route_attestation_resolver,
 )
 from kestrel_sovereign.features.channels.route_ownership import (
     ChannelRouteOwnershipStore,
@@ -1879,7 +1882,7 @@ async def test_build_client_injects_durably_claimed_telegram_startup_fence(tmp_p
     try:
         assert await feature.reconcile_hosted_telegram_route_claim(
             ownership_store=ChannelRouteOwnershipStore(backend),
-            canonical_bot_identity="telegram-bot:123456",
+            bot_id="123456",
         ) is True
         feature._build_client()
 
@@ -1939,11 +1942,11 @@ async def test_hosted_telegram_attestation_requires_exclusive_claim_and_reconcil
     try:
         assert await first.reconcile_hosted_telegram_route_claim(
             ownership_store=store,
-            canonical_bot_identity="telegram-bot:123456",
+            bot_id="123456",
         ) is True
         assert await second.reconcile_hosted_telegram_route_claim(
             ownership_store=store,
-            canonical_bot_identity="telegram-bot:123456",
+            bot_id="123456",
         ) is False
         first._build_client()
         second._build_client()
@@ -1956,14 +1959,172 @@ async def test_hosted_telegram_attestation_requires_exclusive_claim_and_reconcil
 
         assert await first.release_hosted_telegram_route_claim(
             ownership_store=store,
-            canonical_bot_identity="telegram-bot:123456",
+            bot_id="123456",
         ) is True
         assert await second.reconcile_hosted_telegram_route_claim(
             ownership_store=store,
-            canonical_bot_identity="telegram-bot:123456",
+            bot_id="123456",
         ) is True
     finally:
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_reassertion_cannot_release_replacement_claim(tmp_path):
+    """An older proxy instance cannot ABA-delete its successor's same-DID claim."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "same-agent-route-aba.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    first = ProxyFeature(Mock(did="did:test:telegram", features={}), runtime)
+    replacement = ProxyFeature(Mock(did="did:test:telegram", features={}), runtime)
+    try:
+        assert await first.reconcile_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="000123"
+        )
+        with pytest.raises(RuntimeError, match="release it first"):
+            await first.reconcile_hosted_telegram_route_claim(
+                ownership_store=store, bot_id="456"
+            )
+        assert await replacement.reconcile_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        )
+        assert await first.release_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        ) is False
+        assert await store.is_claimed_by(
+            channel_type="telegram",
+            canonical_route_identity="telegram-bot:123",
+            agent_id="did:test:telegram",
+        )
+        assert await replacement.release_hosted_telegram_route_claim(
+            ownership_store=store, bot_id="123"
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_telegram_initialize_resolves_route_fence_before_child_start(
+    monkeypatch, tmp_path
+):
+    """The boot seam claims hosted ingress before the child can start polling."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "boot-route-fence.db"))
+    await backend.connect()
+    captured: dict = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    agent = SimpleNamespace(
+        did="did:test:telegram-boot",
+        features={},
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+    )
+    set_hosted_telegram_route_attestation_resolver(
+        agent,
+        lambda _proxy: HostedTelegramRouteAttestation(
+            ownership_store=ChannelRouteOwnershipStore(backend), bot_id="000123"
+        ),
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+
+    async def load_host_config():
+        return {"enabled": True}
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/test-service")
+    try:
+        await feature.initialize()
+        assert captured["config"]["_kestrel_host_runtime_capabilities"] == [
+            "channel-inbound-acknowledgement-v1",
+            "telegram-hosted-ingress-owner-v1",
+        ]
+        assert await ChannelRouteOwnershipStore(backend).is_claimed_by(
+            channel_type="telegram",
+            canonical_route_identity="telegram-bot:123",
+            agent_id=agent.did,
+        )
+    finally:
+        await feature.shutdown()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_telegram_initialize_refuses_existing_hosted_route_before_child_start(
+    monkeypatch, tmp_path
+):
+    """A resolver conflict fails before the child factory/start handshake runs."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+    )
+    backend = SQLiteBackend(str(tmp_path / "boot-route-conflict.db"))
+    await backend.connect()
+    store = ChannelRouteOwnershipStore(backend)
+    assert await store.claim(
+        channel_type="telegram",
+        canonical_route_identity="telegram-bot:123",
+        agent_id="did:test:existing-host",
+    )
+    built: list[object] = []
+
+    def client_factory(**kwargs):
+        built.append(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    agent = SimpleNamespace(
+        did="did:test:blocked-host",
+        features={},
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        hosted_telegram_route_attestation_resolver=(
+            lambda _proxy: HostedTelegramRouteAttestation(store, "123")
+        ),
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+
+    async def load_host_config():
+        return {"enabled": True}
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/test-service")
+    try:
+        with pytest.raises(RuntimeError, match="already owned"):
+            await feature.initialize()
+        assert built == []
+    finally:
+        await feature.shutdown()
+        await backend.close()
+
+
+def test_telegram_route_identity_accepts_only_canonicalized_decimal_bot_ids():
+    """Provider prefixes cannot forge a second Telegram ownership key."""
+
+    assert canonical_telegram_bot_id("000123") == "123"
+    with pytest.raises(ValueError, match="positive decimal"):
+        canonical_telegram_bot_id("telegram-bot:123")
+    with pytest.raises(ValueError, match="positive"):
+        canonical_telegram_bot_id("000")
 
 
 class _FakeStorage:
