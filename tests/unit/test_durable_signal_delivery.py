@@ -1614,7 +1614,7 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
     backend_b, agent_b, dispatcher_b = await _channel_dispatcher(path, "did:agent:one")
     # Shorten only the test's owner-staleness window. The fence must continue
     # its private heartbeat after ordinary shutdown closes public admission.
-    dispatcher_a._runtime_owner_stale_after = timedelta(milliseconds=45)
+    dispatcher_a._runtime_owner_stale_after = timedelta(milliseconds=500)
     consumer = DurableConsumerRegistration(
         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
         source="channel.message",
@@ -1646,8 +1646,23 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
     async def reject_renewal(**_kwargs):
         return None
 
+    original_owner_heartbeat = dispatcher_a._durable_store.heartbeat_runtime_owner
+    fenced_heartbeat_times: list[float] = []
+    repeated_fenced_heartbeat = asyncio.Event()
+
+    async def observe_owner_heartbeat(**kwargs):
+        await original_owner_heartbeat(**kwargs)
+        if dispatcher_a.durable_shutdown_owner_fenced:
+            committed_at = time.monotonic()
+            fenced_heartbeat_times.append(committed_at)
+            if committed_at - fenced_heartbeat_times[0] >= (
+                2 * dispatcher_a._runtime_owner_stale_after.total_seconds()
+            ):
+                repeated_fenced_heartbeat.set()
+
     agent_a.process_input = hostile_turn
     dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
+    dispatcher_a._durable_store.heartbeat_runtime_owner = observe_owner_heartbeat
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         await dispatcher_b.register_durable_consumer(consumer)
@@ -1671,10 +1686,18 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         )
         assert owner is not None and owner[0] is None
 
-        # Crossing multiple stale windows must not make retained work
-        # reclaimable: the fence timer runs a private owner heartbeat even
-        # though public durable APIs remain closed.
-        await asyncio.sleep(0.12)
+        # Observe committed private fence heartbeats spanning two complete
+        # stale-owner windows before testing recovery. Waiting on the writes,
+        # rather than sleeping for an assumed scheduler cadence, stays
+        # deterministic on a loaded event loop and proves that the timer keeps
+        # the owner live after ordinary durable admission has closed.
+        await asyncio.wait_for(repeated_fenced_heartbeat.wait(), timeout=4)
+        assert all(
+            later - earlier < dispatcher_a._runtime_owner_stale_after.total_seconds()
+            for earlier, later in zip(
+                fenced_heartbeat_times, fenced_heartbeat_times[1:]
+            )
+        )
         assert await dispatcher_b._durable_store.recover_abandoned_leases(
             agent_id=agent_b.did,
             recovering_owner_id=dispatcher_b._durable_delivery_owner,
@@ -1717,10 +1740,18 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         ) is not None
     finally:
         allow_exit.set()
-        await dispatcher_a.wait_for_durable_shutdown_release()
-        await dispatcher_b.shutdown_durable_delivery()
-        await _close(backend_a, agent_a)
-        await _close(backend_b, agent_b)
+        dispatcher_a._durable_store.heartbeat_runtime_owner = original_owner_heartbeat
+        try:
+            await dispatcher_a.shutdown_durable_delivery()
+            await dispatcher_a.wait_for_durable_shutdown_release()
+        finally:
+            try:
+                await dispatcher_b.shutdown_durable_delivery()
+            finally:
+                try:
+                    await _close(backend_a, agent_a)
+                finally:
+                    await _close(backend_b, agent_b)
 
 
 @pytest.mark.asyncio
