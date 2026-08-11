@@ -372,11 +372,18 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
     return bool(rows and rows[0][0])
 
 
-def _resolve_governance_source(anchor_path: Path, env: dict):
+def _resolve_governance_source(
+    anchor_path: Path, env: dict, ledger_by_dsn: dict | None = None
+):
     """Resolve where to read this agent's governance from, and as whom.
 
     Returns a :class:`_GovernanceSource`, or an ``_UnreadableDB`` sentinel when
     the anchor cannot name the tenant to read as.
+
+    ``ledger_by_dsn`` memoises the ownership-ledger probe across agents that
+    share a database — including a *failed* probe, since one unreachable
+    endpoint is unreachable for the whole fleet and re-proving that per agent
+    is the outage cost this bound exists to avoid.
     """
     agent_did = _discover_agent_did(anchor_path)
     if isinstance(agent_did, _UnreadableDB):
@@ -397,7 +404,16 @@ def _resolve_governance_source(anchor_path: Path, env: dict):
             agent_did=agent_did,
             dsn=env["KESTREL_DATABASE_URL"],
         )
-    ledger = _has_ownership_ledger(source)
+    # Keyed on the DSN, or on the anchor path for a SQLite host where each
+    # agent genuinely has its own file and its own answer.
+    cache_key = source.dsn or str(source.anchor_path)
+    if ledger_by_dsn is not None and cache_key in ledger_by_dsn:
+        ledger = ledger_by_dsn[cache_key]
+    else:
+        ledger = _has_ownership_ledger(source)
+        if ledger_by_dsn is not None:
+            ledger_by_dsn[cache_key] = ledger
+
     if isinstance(ledger, _UnreadableDB):
         return ledger
     return replace(source, ownership_ledger=ledger)
@@ -434,12 +450,23 @@ def _safe(exc: object, source: "_GovernanceSource") -> str:
 
     text = text.replace(source.dsn, "<dsn>")
 
-    # And the password on its own, because the whole-string replace above only
-    # catches an echo that is byte-identical to what we passed. libpq is free
-    # to truncate or normalise the URI it quotes back, and a redaction that
-    # depends on the driver quoting us exactly is not a redaction.
+    # Then the individual fields, because the whole-string replace above only
+    # fires on a byte-identical echo — and that is the *rare* case. A malformed
+    # URI gets quoted back verbatim, but an ordinary DNS, connection, or
+    # authentication failure names the parts instead:
+    #
+    #     could not translate host name "db.internal" to address
+    #     FATAL:  password authentication failed for user "kestrel"
+    #
+    # so a redaction that only handled the verbatim echo left the database
+    # topology and account names in every routine outage message. Password
+    # first: it is the one field whose disclosure is unrecoverable, and
+    # redacting longest-first stops a shorter token reappearing inside a
+    # replacement.
     for secret in _dsn_secrets(source.dsn):
         text = text.replace(secret, "<redacted>")
+    for field_name, value in _dsn_identity(source.dsn):
+        text = text.replace(value, f"<{field_name}>")
     return text
 
 
@@ -466,6 +493,35 @@ def _dsn_secrets(dsn: str) -> tuple:
         secrets.add(match.group(1))
 
     return tuple(sorted(secrets, key=len, reverse=True))
+
+
+#: Identity-bearing DSN fields, and the placeholder each becomes. Not secrets,
+#: but not things to scatter through CI logs either: together they are the map
+#: of an operator's database estate.
+_DSN_IDENTITY_FIELDS = ("host", "user", "dbname")
+
+
+def _dsn_identity(dsn: str) -> tuple:
+    """``(field, value)`` for each identity field in ``dsn``, longest first.
+
+    Length-sorted for the same reason as the secrets, and short values are
+    dropped: a one- or two-character host or user is common enough as an
+    ordinary English fragment that replacing it would corrupt the message it
+    is meant to keep readable.
+    """
+    try:
+        from psycopg2.extensions import parse_dsn
+
+        parsed = parse_dsn(dsn)
+    except Exception:  # noqa: BLE001 — unparseable; the whole-DSN replace stands
+        return ()
+
+    found = [
+        (field, parsed[field])
+        for field in _DSN_IDENTITY_FIELDS
+        if isinstance(parsed.get(field), str) and len(parsed[field]) > 2
+    ]
+    return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
 def _bounded_dsn(dsn: str) -> str:
@@ -545,6 +601,10 @@ class _AgentGovernance:
     agent_dir: Path
     source: object
     node: object
+    #: True when the runtime database holds no row for this agent yet and the
+    #: reading above therefore comes from the anchor — see
+    #: ``_read_agent_governance``.
+    pending_replication: bool = False
 
 
 def _read_agent_governance(
@@ -555,8 +615,15 @@ def _read_agent_governance(
     Agents whose anchor file is missing are skipped silently: that is already
     a fail from ``_check_multi_agent``, and re-reporting it would say the same
     thing twice in one report.
+
+    The ownership-ledger probe is memoised per DSN. Every local agent on a
+    PostgreSQL host shares one database, so probing per agent meant a
+    black-holed endpoint cost the connection timeout once per agent — a
+    ten-agent fleet waiting fifty seconds under a five-second bound. The
+    schema question is a property of the database, not of the tenant asking.
     """
     multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    ledger_by_dsn: dict = {}
     readings: list[_AgentGovernance] = []
     for name, cfg in multi_agent.get_local_agents().items():
         agent_dir = (project_dir / cfg.data_dir).resolve()
@@ -564,15 +631,40 @@ def _read_agent_governance(
         if not db_path.exists():
             continue
 
-        source = _resolve_governance_source(db_path, env)
+        source = _resolve_governance_source(db_path, env, ledger_by_dsn)
         node = (
             source
             if isinstance(source, _UnreadableDB)
             else _read_agent_node(source)
         )
+
+        # A PostgreSQL runtime that holds no row for this agent has not been
+        # replicated into yet. Boot does not fail there — it copies the birth
+        # record out of the anchor (#2871) and *then* runs the integrity audit.
+        # So the governance that will be audited is the anchor's, and reporting
+        # "nothing to check" would let a stale anchor pass review and safe-mode
+        # the agent moments later. Check what is about to be copied.
+        pending = False
+        if (
+            isinstance(node, _NoAgentNode)
+            and isinstance(source, _GovernanceSource)
+            and not source.reads_the_anchor
+        ):
+            anchor_source = _resolve_governance_source(db_path, {}, ledger_by_dsn)
+            if isinstance(anchor_source, _GovernanceSource):
+                source, node, pending = (
+                    anchor_source,
+                    _read_agent_node(anchor_source),
+                    True,
+                )
+
         readings.append(
             _AgentGovernance(
-                name=name, agent_dir=agent_dir, source=source, node=node
+                name=name,
+                agent_dir=agent_dir,
+                source=source,
+                node=node,
+                pending_replication=pending,
             )
         )
     return readings
@@ -629,16 +721,12 @@ def _check_constitution_drift(
         name = reading.name
         source = reading.source
         if isinstance(source, _UnreadableDB):
-            report.warn.append(
-                f"{name}: constitution drift check skipped — {source.reason}"
-            )
+            _report_unexamined(name, source.reason, source, report)
             continue
 
         node = reading.node
         if isinstance(node, _UnreadableDB):
-            report.warn.append(
-                f"{name}: constitution drift check skipped — {node.reason}"
-            )
+            _report_unexamined(name, node.reason, source, report)
             continue
         if isinstance(node, _NoAgentNode):
             report.warn.append(
@@ -696,6 +784,13 @@ def _check_constitution_drift(
                 f"governing constitution: {exc}"
             )
             continue
+
+        if reading.pending_replication:
+            report.warn.append(
+                f"{name}: PostgreSQL holds no record for this agent yet — boot "
+                f"will copy the birth record from {source.anchor_path} and "
+                f"audit that. The verdict below is about those pending bytes."
+            )
 
         if stored_hash == on_disk_hash:
             report.ok.append(
@@ -919,6 +1014,56 @@ def _check_overlay_anchor(
             f"safe-mode this agent at next boot. Restore the overlay file, or "
             f"re-run `kestrel constitution anchor-overlay --agent-name {name}` "
             f"after restoring the intended content."
+        )
+
+
+def _report_unexamined(
+    name: str, reason: str, source: object, report: DoctorReport
+) -> None:
+    """Record that this agent's governance could not be read.
+
+    Whether that is a *fail* turns on one question: can the **agent** open this
+    database either?
+
+    On PostgreSQL it cannot. A database that is down, misconfigured, or
+    refusing this account refuses the runtime too, so readiness is false and
+    must say so — ``ready`` is ``not report.fail``, and a warning here made
+    ``kestrel doctor`` print "Ready" and exit 0 having inspected no governance
+    at all, in exactly the state an operator most needs told about. "I did not
+    check" and "I checked and it is fine" are different answers.
+
+    On the local anchor it usually can. ``KESTREL_DB_KEY`` at inception gives a
+    whole-DB sqlcipher file that stock ``sqlite3`` cannot open and the agent
+    reads perfectly well — a supported configuration, in which doctor alone is
+    blind. Failing there would mark every sqlcipher host permanently not-ready
+    for a problem that does not exist. Corruption presents identically to
+    encryption through stock ``sqlite3``, so the two cannot be told apart here;
+    the warning stays a warning and names what it could not read.
+
+    Either way this is deliberately not phrased as *drift*: the remedy is to
+    make the database readable, not to reanchor. Prescribing a reanchor on the
+    strength of a read that never happened is how an operator rewrites
+    governance to fix a network problem.
+    """
+    if isinstance(source, _GovernanceSource) and not source.reads_the_anchor:
+        agent_blind = True
+    elif isinstance(source, _UnreadableDB):
+        # Resolution failed before a source existed. Only PostgreSQL hosts
+        # reach that through a network read; name it from the reason.
+        agent_blind = "PostgreSQL" in reason
+    else:
+        agent_blind = False
+
+    if agent_blind:
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. Doctor cannot say "
+            f"whether this agent is correctly anchored, and the runtime cannot "
+            f"reach that database either; fix the access problem and re-run "
+            f"before treating this host as ready."
+        )
+    else:
+        report.warn.append(
+            f"{name}: constitution drift check skipped — {reason}"
         )
 
 

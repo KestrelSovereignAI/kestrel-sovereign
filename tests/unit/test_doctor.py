@@ -1091,6 +1091,81 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_an_unreachable_postgres_is_not_ready(tmp_path, monkeypatch):
+    """"I did not check" must not print as "Ready".
+
+    ``ready`` is ``not report.fail``, so warning here made ``kestrel doctor``
+    exit 0 and print Ready having inspected no governance at all — on a host
+    whose database is down, misconfigured, or refusing this account, which is
+    the state an operator most needs told about. The runtime cannot reach that
+    database either, so readiness really is false.
+    """
+    _seed_matching_anchor(tmp_path, monkeypatch)
+
+    class _Unreachable:
+        extensions = _real_psycopg2_extensions()
+
+        def connect(self, dsn, **kwargs):
+            raise OSError("connection timed out")
+
+    _postgres_host(monkeypatch, _Unreachable())
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    assert any("governance NOT verified" in m for m in report.fail), report.fail
+    # Not phrased as drift: the remedy is access, not a reanchor.
+    assert not any("reanchor" in m for m in report.fail)
+
+
+def test_an_unreadable_sqlite_anchor_still_only_warns(tmp_path, monkeypatch):
+    """``KESTREL_DB_KEY`` at inception makes a whole-DB sqlcipher file.
+
+    Stock ``sqlite3`` cannot open it and the agent reads it perfectly well — a
+    supported configuration in which doctor alone is blind. Failing would mark
+    every sqlcipher host permanently not-ready for a problem that is not there.
+    """
+    _seed_ready(tmp_path)
+    db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"SQLite format 3\x00" + b"\xde\xad\xbe\xef" * 64)
+
+    report = diagnose(tmp_path)
+
+    assert any("drift check skipped" in m for m in report.warn), report.warn
+    assert not any("governance NOT verified" in m for m in report.fail)
+
+
+def test_one_probe_serves_a_whole_postgres_fleet(tmp_path, monkeypatch):
+    """Every local agent shares the database; the schema question is about it.
+
+    Probing per agent meant a black-holed endpoint cost the connection timeout
+    once per agent — a ten-agent fleet waiting fifty seconds under a
+    five-second bound.
+    """
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    # A second agent pointed at the same anchor directory: one shared DSN.
+    multi_agent_path = tmp_path / MULTI_AGENT_CONFIG_FILENAME
+    raw = toml.load(multi_agent_path)
+    raw["agents"]["Second"] = dict(raw["agents"]["Test"], port=8802)
+    multi_agent_path.write_text(toml.dumps(raw))
+
+    attempts = []
+
+    class _Unreachable:
+        extensions = _real_psycopg2_extensions()
+
+        def connect(self, dsn, **kwargs):
+            attempts.append(dsn)
+            raise OSError("connection timed out")
+
+    _postgres_host(monkeypatch, _Unreachable())
+
+    diagnose(tmp_path)
+
+    assert len(attempts) == 1, f"probed {len(attempts)}× for one shared DSN"
+
+
 def test_an_anchor_with_two_agent_roots_is_refused(tmp_path):
     """The refusal boot already makes.
 
@@ -1216,6 +1291,62 @@ def test_a_driver_error_never_carries_the_dsn(tmp_path):
     assert isinstance(result, _UnreadableDB)
     assert "hunter2" not in result.reason
     assert dsn not in result.reason
+
+
+@pytest.mark.parametrize(
+    "message, leaked",
+    [
+        ('could not translate host name "db.internal" to address', "db.internal"),
+        ('FATAL:  password authentication failed for user "kestrel_prod"',
+         "kestrel_prod"),
+        ('FATAL:  database "governance_prod" does not exist', "governance_prod"),
+    ],
+)
+def test_routine_failures_do_not_leak_the_database_estate(
+    tmp_path, message, leaked,
+):
+    """The common case, and the one a whole-DSN replace never catches.
+
+    libpq quotes the connection string back only for a *malformed* URI. Every
+    ordinary DNS, authentication, or missing-database failure names the fields
+    individually instead — so a redaction that handled only the verbatim echo
+    left hostnames and account names in every routine outage message doctor
+    prints to a terminal and CI archives.
+    """
+    from kestrel_sovereign.doctor import _GovernanceSource, _safe
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:x",
+        dsn=(
+            "postgresql://kestrel_prod:hunter2@db.internal:5432/governance_prod"
+        ),
+    )
+
+    redacted = _safe(message, source)
+
+    assert leaked not in redacted
+    # Still a usable message: the failure itself survives redaction.
+    assert "FATAL" in redacted or "could not translate" in redacted
+
+
+def test_redaction_leaves_short_values_alone(tmp_path):
+    """A one- or two-character host or user is an ordinary English fragment.
+
+    Replacing it would corrupt the very message redaction exists to keep
+    readable.
+    """
+    from kestrel_sovereign.doctor import _GovernanceSource, _safe
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:x",
+        dsn="postgresql://a:p@db/x",
+    )
+
+    assert _safe("could not connect: a database is required", source) == (
+        "could not connect: a database is required"
+    )
 
 
 def test_the_password_is_redacted_even_if_the_dsn_is_not_quoted_whole(tmp_path):

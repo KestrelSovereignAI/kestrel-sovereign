@@ -361,12 +361,18 @@ def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
     ``_node_scope`` / ``_edge_scope`` require a row in ``graph_node_owners`` /
     ``graph_edge_owners`` — not a matching ``node_id``. The boot integrity
     audit reads through that bound store, so without the witnesses it sees no
-    agent node and no ``governed_by`` edge, fails proof 2, and safe-modes.
+    agent node at all.
 
-    A doctor filtering on ``node_id`` alone would find both rows, agree with
-    the canonical file, and report Ready — sending an operator to a host that
-    then refuses to run. False reassurance from a governance tool is a worse
-    failure than the false alarm this issue began as.
+    An earlier version of this test asserted doctor must therefore refuse. That
+    was built on an incomplete reading of boot: ``kestrel_agent`` computes the
+    runtime birth-record *shortfall* first and, finding one, replicates from
+    the local anchor (#2871) — bound, so the copy lays down the witnesses —
+    and only then audits. An unwitnessed row is not a dead end; it is one more
+    thing replication repairs.
+
+    So the honest report is neither "Ready" nor a refusal: it is that the
+    runtime holds nothing readable for this agent yet, and the verdict on offer
+    describes the anchor bytes boot is about to copy.
     """
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
@@ -381,9 +387,33 @@ def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
 
     report = diagnose(tmp_path)
 
-    assert not any(
-        "constitution anchored to current file" in m for m in report.ok
-    ), "doctor certified an agent whose governance the runtime cannot see"
     assert any(
-        "no agent node owned by" in m and AGENT_DID in m for m in report.warn
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    # And it says which bytes it judged, rather than reporting silently.
+    assert any("boot will copy the birth record" in m for m in report.warn)
+
+
+async def test_a_stale_anchor_awaiting_replication_is_not_ready(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """The case the pending-replication path exists for.
+
+    PostgreSQL holds nothing for this agent, so boot will copy the anchor and
+    audit it — and this anchor is drifted. Reporting "nothing to check" would
+    pass a host whose very next boot safe-modes.
+    """
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    # Nothing seeded into PostgreSQL at all: an agent not yet replicated.
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+
+    report = diagnose(tmp_path)
+
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
     ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
