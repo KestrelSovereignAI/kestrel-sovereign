@@ -6082,10 +6082,22 @@ class ProxyFeature(Feature):
         stamped_child_version = manifest.get("child_feature_distribution_version")
         if not isinstance(stamped_child_version, str):
             return True
-        if (
-            installed_version != "unknown"
-            and stamped_child_version != installed_version
-        ):
+        # A fresh manifest proves only what was installed previously. Every
+        # unchanged-environment check must probe the child interpreter again:
+        # an index repair, manual downgrade, or stale editable metadata can
+        # otherwise leave the host running an older service indefinitely.
+        child_version = _venv_feature_distribution_version(
+            _venv_python(self._venv_path), self.runtime.distribution
+        )
+        # Known desired or recorded versions require a verifiable installed
+        # child. Fully source/unknown targets remain supported: they stamp and
+        # probe as ``unknown`` without a permanent reinstall loop.
+        if installed_version != "unknown" or stamped_child_version != "unknown":
+            if child_version == "unknown":
+                return True
+        if installed_version != "unknown" and child_version != installed_version:
+            return True
+        if stamped_child_version != "unknown" and child_version != stamped_child_version:
             return True
         return False
 
@@ -6715,6 +6727,19 @@ class ProxyFeature(Feature):
             )
             return
 
+        # A legitimate serial provider can emit callback two after callback
+        # one's child-side Future is resolved but before Core receives that
+        # completion RPC response. Retain exactly that next callback as the
+        # single active route task, but do not execute its cognition until the
+        # preceding provider completion settles. This keeps an untrusted child
+        # from building an unbounded completion queue while preserving the
+        # already-emitted callback instead of dropping it.
+        completion_predecessors = tuple(
+            task
+            for client, task in self._event_ack_clients
+            if client is source_client and not task.done()
+        )
+
         async def route() -> None:
             retry: _HostIngressRequest | None = None
             try:
@@ -6728,6 +6753,22 @@ class ProxyFeature(Feature):
                 retry = self._inbound_event_retry_completion(data)
                 try:
                     async with self._traffic_gate.admit(wait_for_open=False):
+                        for predecessor in completion_predecessors:
+                            try:
+                                await asyncio.shield(predecessor)
+                            except asyncio.CancelledError:
+                                if (
+                                    asyncio.current_task() is not None
+                                    and asyncio.current_task().cancelling()
+                                ):
+                                    raise
+                            except BaseException:  # noqa: BLE001 - predecessor audited
+                                logger.warning(
+                                    "Prior inbound completion from isolated feature %s "
+                                    "failed; rechecking the queued callback against "
+                                    "source ownership",
+                                    self.name,
+                                )
                         if source_client is not self._client:
                             return
                         admission = await self._route_inbound(inbound)
@@ -7204,18 +7245,16 @@ class ProxyFeature(Feature):
 
         if self._terminal_lifecycle_latched or source_client is not self._client:
             return
-        if any(
-            client is source_client and not task.done()
+        # Routing finishes before the provider RPC response comes back. A
+        # cross-process child can therefore deliver callback two while callback
+        # one is still awaiting its ACK response. Keep the source serialized,
+        # but do not discard that already-routed completion: queue it behind
+        # the exact active completions in arrival order.
+        predecessors = tuple(
+            task
             for client, task in self._event_ack_clients
-        ):
-            # Polling ingress is sequential. A second unacknowledged event from
-            # the same facade is not queued in host memory; its source retains
-            # the cursor and retries after this one settles.
-            logger.warning(
-                "Ignoring concurrent ingress completion from isolated feature %s",
-                self.name,
-            )
-            return
+            if client is source_client and not task.done()
+        )
 
         try:
             capabilities = getattr(source_client, "host_ingress_capabilities", None)
@@ -7241,6 +7280,28 @@ class ProxyFeature(Feature):
             return
 
         async def complete() -> None:
+            for predecessor in predecessors:
+                try:
+                    # Shield the predecessor so shutdown/cancellation of this
+                    # queued completion cannot create a second completion RPC
+                    # for the same provider callback.
+                    await asyncio.shield(predecessor)
+                except asyncio.CancelledError:
+                    if (
+                        asyncio.current_task() is not None
+                        and asyncio.current_task().cancelling()
+                    ):
+                        raise
+                    # A predecessor may have been cancelled by an older
+                    # lifecycle transition. Recheck the current source below;
+                    # if it remains current, this exact callback still needs
+                    # its own completion attempt.
+                except BaseException:  # noqa: BLE001 - predecessor already audited
+                    logger.warning(
+                        "Prior inbound completion from isolated feature %s failed; "
+                        "continuing the queued provider callback",
+                        self.name,
+                    )
             for attempt in range(_EVENT_INGRESS_ACK_ATTEMPTS):
                 if self._terminal_lifecycle_latched or source_client is not self._client:
                     return

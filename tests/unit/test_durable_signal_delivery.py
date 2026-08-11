@@ -27,6 +27,7 @@ from kestrel_sovereign.signals import (
     FAILED,
     LEASED,
     RETRY,
+    TERMINAL_ACKABLE,
     DurableAdmissionDisposition,
     DurableConsumerRegistration,
     DurableSignalStore,
@@ -529,6 +530,108 @@ async def test_cognition_retry_uses_canonical_persisted_channel_input(tmp_path):
         assert "original Telegram content" in prompts[1]
         assert "attacker replacement content" not in prompts[1]
         assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_lost_ack(
+    tmp_path, monkeypatch
+):
+    """A terminal no-op is a durable receipt; a normal FAILED delivery is not."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "terminal-channel-redelivery.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+
+    async def terminal_noop(signal, _registration, start):
+        return dispatcher._failure_result(
+            signal,
+            start,
+            error="terminal validation refusal",
+            status=Status.DROPPED_VALIDATION,
+        )
+
+    monkeypatch.setattr(dispatcher, "_route_after_durable_persistence", terminal_noop)
+    terminal_source_event = "telegram:update:terminal-noop"
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "terminal-noop"),
+            source_event_id=terminal_source_event,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await first.wait()).status is Status.DROPPED_VALIDATION
+        assert (
+            await first.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+        stored = await dispatcher.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=first.signal_id,
+        )
+        assert stored is not None and stored.status == TERMINAL_ACKABLE
+
+        # Simulate a provider ACK lost after Core has reached the proven
+        # terminal no-op. The source replays the identical provider identity.
+        redelivery = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "terminal-noop"),
+            source_event_id=terminal_source_event,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await redelivery.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.TERMINAL
+        assert (await redelivery.wait()).status is Status.COALESCED
+        replayed = await dispatcher.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=first.signal_id,
+        )
+        assert replayed is not None and replayed.status == TERMINAL_ACKABLE
+
+        # A caller marking an ordinary worker failure terminal must still not
+        # advance a provider cursor when it redelivers the same source event.
+        ordinary = _channel_signal(agent.did, "ordinary-terminal-failure")
+        persisted = await dispatcher._durable_store.persist_signal(
+            ordinary,
+            agent_id=agent.did,
+            source_event_id="telegram:update:ordinary-terminal-failure",
+            retention_days=7,
+        )
+        claimed = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=persisted.event_id,
+            executor_id=dispatcher._durable_delivery_owner,
+        )
+        assert claimed is not None
+        failed = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token or "",
+            error="ordinary terminal worker failure",
+            terminal=True,
+        )
+        assert failed is not None and failed.status == FAILED
+
+        ordinary_redelivery = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "ordinary-terminal-failure"),
+            source_event_id="telegram:update:ordinary-terminal-failure",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await ordinary_redelivery.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        assert (await ordinary_redelivery.wait()).status is Status.FAILED
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
@@ -2739,6 +2842,152 @@ async def test_nack_retry_lease_expiry_terminal_failure_and_retention_are_observ
     ) == 1
     assert await store.list_deliveries(agent_id=agent_id) == []
     await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event_claim", (False, True), ids=("ordinary", "exact"))
+async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
+    tmp_path, exact_event_claim
+):
+    """A contended implicit claim gets a full lease from the serialized clock."""
+
+    path = tmp_path / f"contended-claim-{exact_event_claim}.db"
+    backend = SQLiteBackend(str(path))
+    peer = SQLiteBackend(str(path))
+    await backend.connect()
+    await peer.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:contended"
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    store.now_utc = lambda: clock["now"]  # type: ignore[method-assign]
+    consumer = DurableConsumerRegistration(
+        consumer_id="contended-worker",
+        source="provider.message",
+        agent_id=agent_id,
+        lease_seconds=1,
+    )
+    await store.register_consumer(consumer)
+    persisted = await store.persist_signal(
+        _signal(agent_id=agent_id),
+        agent_id=agent_id,
+        source_event_id="provider:contended-claim",
+        retention_days=7,
+    )
+    entered_handoff = asyncio.Event()
+    writer_acquired = asyncio.Event()
+    release_writer = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
+
+    async def hold_peer_writer():
+        async with peer.transaction():
+            await peer.execute("DELETE FROM durable_signal_consumers WHERE 0")
+            writer_acquired.set()
+            await release_writer.wait()
+
+    blocker = asyncio.create_task(hold_peer_writer())
+    try:
+        await asyncio.wait_for(writer_acquired.wait(), timeout=1)
+        if exact_event_claim:
+            claim_task = asyncio.create_task(
+                store.claim_delivery_for_event(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    event_id=persisted.event_id,
+                    executor_id="worker",
+                )
+            )
+        else:
+            claim_task = asyncio.create_task(
+                store.claim_delivery(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    executor_id="worker",
+                )
+            )
+        await asyncio.wait_for(entered_handoff.wait(), timeout=1)
+        # The method is now blocked at the database handoff, after its caller
+        # began but before it owns the serialization point.
+        clock["now"] = base + timedelta(seconds=2)
+        release_writer.set()
+        claimed = await asyncio.wait_for(claim_task, timeout=1)
+        assert claimed is not None
+        assert claimed.lease_expires_at == base + timedelta(seconds=3)
+    finally:
+        release_writer.set()
+        await asyncio.gather(blocker, return_exceptions=True)
+        await peer.close()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_registration_backfill_clock_is_sampled_after_contended_scope_handoff(tmp_path):
+    """Registration does not backfill an event that expires while it waits for a writer."""
+
+    path = tmp_path / "contended-registration-backfill.db"
+    backend = SQLiteBackend(str(path))
+    peer = SQLiteBackend(str(path))
+    await backend.connect()
+    await peer.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:contended-registration"
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    store.now_utc = lambda: clock["now"]  # type: ignore[method-assign]
+    persisted = await store.persist_signal(
+        _signal(agent_id=agent_id),
+        agent_id=agent_id,
+        source_event_id="provider:contended-registration",
+        retention_days=7,
+    )
+    await backend.execute(
+        "UPDATE durable_signal_events SET retention_until = ? WHERE event_id = ?",
+        (base + timedelta(seconds=1), persisted.event_id),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="late-registration",
+        source="provider.message",
+        agent_id=agent_id,
+    )
+    entered_handoff = asyncio.Event()
+    writer_acquired = asyncio.Event()
+    release_writer = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
+
+    async def hold_peer_writer():
+        async with peer.transaction():
+            await peer.execute("DELETE FROM durable_signal_consumers WHERE 0")
+            writer_acquired.set()
+            await release_writer.wait()
+
+    blocker = asyncio.create_task(hold_peer_writer())
+    try:
+        await asyncio.wait_for(writer_acquired.wait(), timeout=1)
+        registration_task = asyncio.create_task(store.register_consumer(consumer))
+        await asyncio.wait_for(entered_handoff.wait(), timeout=1)
+        clock["now"] = base + timedelta(seconds=2)
+        release_writer.set()
+        await asyncio.wait_for(registration_task, timeout=1)
+        assert await store.list_deliveries(agent_id=agent_id) == []
+    finally:
+        release_writer.set()
+        await asyncio.gather(blocker, return_exceptions=True)
+        await peer.close()
+        await backend.close()
 
 
 @pytest.mark.asyncio

@@ -141,6 +141,152 @@ async def _assert_one_pending_delivery(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+@pytest.mark.parametrize("exact_event_claim", (False, True), ids=("ordinary", "exact"))
+async def test_implicit_claim_clock_follows_contended_scope_handoff_on_both_backends(
+    db_backend, monkeypatch, exact_event_claim
+):
+    """A delayed claim takes its implicit lease clock after the real DB lock."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:durable-claim-clock:{uuid4()}"
+    consumer = DurableConsumerRegistration(
+        consumer_id="clock-worker",
+        source="provider.message",
+        agent_id=agent_id,
+        lease_seconds=1,
+    )
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    monkeypatch.setattr(store, "now_utc", lambda: clock["now"])
+    await store.register_consumer(consumer)
+    persisted = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"claim-clock:{uuid4()}",
+        retention_days=7,
+    )
+    lock_acquired = asyncio.Event()
+    entered_handoff = asyncio.Event()
+    release_lock = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+
+    async def hold_peer_scope() -> None:
+        async with peer_backend.transaction():
+            await peer_store._lock_scope_handoff(
+                agent_id=agent_id, source=consumer.source
+            )
+            lock_acquired.set()
+            await release_lock.wait()
+
+    blocker = asyncio.create_task(hold_peer_scope())
+    try:
+        await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+        if exact_event_claim:
+            claim = asyncio.create_task(
+                store.claim_delivery_for_event(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    event_id=persisted.event_id,
+                    executor_id="worker",
+                )
+            )
+        else:
+            claim = asyncio.create_task(
+                store.claim_delivery(
+                    agent_id=agent_id,
+                    consumer_id=consumer.consumer_id,
+                    executor_id="worker",
+                )
+            )
+        await asyncio.wait_for(entered_handoff.wait(), timeout=5)
+        clock["now"] = base + timedelta(seconds=2)
+        release_lock.set()
+        claimed = await asyncio.wait_for(claim, timeout=5)
+        assert claimed is not None
+        assert claimed.lease_expires_at == base + timedelta(seconds=3)
+    finally:
+        release_lock.set()
+        await _cancel_and_drain(blocker)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_registration_backfill_clock_follows_contended_scope_handoff_on_both_backends(
+    db_backend, monkeypatch
+):
+    """Backfill evaluates retention after the real database serialization point."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:durable-registration-clock:{uuid4()}"
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    clock = {"now": base}
+    monkeypatch.setattr(store, "now_utc", lambda: clock["now"])
+    persisted = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"registration-clock:{uuid4()}",
+        retention_days=7,
+    )
+    await db_backend.execute(
+        "UPDATE durable_signal_events SET retention_until = ? WHERE event_id = ?",
+        (base + timedelta(seconds=1), persisted.event_id),
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="late-clock-worker",
+        source="provider.message",
+        agent_id=agent_id,
+    )
+    lock_acquired = asyncio.Event()
+    entered_handoff = asyncio.Event()
+    release_lock = asyncio.Event()
+    original_handoff = store._lock_scope_handoff
+
+    async def observe_handoff(**kwargs):
+        entered_handoff.set()
+        await original_handoff(**kwargs)
+
+    monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+
+    async def hold_peer_scope() -> None:
+        async with peer_backend.transaction():
+            await peer_store._lock_scope_handoff(
+                agent_id=agent_id, source=consumer.source
+            )
+            lock_acquired.set()
+            await release_lock.wait()
+
+    blocker = asyncio.create_task(hold_peer_scope())
+    try:
+        await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+        registration = asyncio.create_task(store.register_consumer(consumer))
+        await asyncio.wait_for(entered_handoff.wait(), timeout=5)
+        clock["now"] = base + timedelta(seconds=2)
+        release_lock.set()
+        await asyncio.wait_for(registration, timeout=5)
+        assert await store.list_deliveries(agent_id=agent_id) == []
+    finally:
+        release_lock.set()
+        await _cancel_and_drain(blocker)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_durable_delivery_claim_is_scoped_and_single_owner_on_both_backends(db_backend):
     store = DurableSignalStore(db_backend)
     await store.initialize()
@@ -442,7 +588,9 @@ async def test_startup_recovers_only_a_stale_unactivated_owner_as_marker_work(
         await emitting_store.initialize()
         agent_id = f"did:test:durable-stale-owner:{uuid4()}"
         consumer_id = "workflow-wait"
-        owner_id = "crashed-dispatcher"
+        # Recovery deliberately considers only managed dispatcher owners;
+        # arbitrary executor namespaces must never be stolen as crashed hosts.
+        owner_id = "dispatcher:crashed-dispatcher"
         now = datetime.now(timezone.utc)
         await emitting_store.register_consumer(
             DurableConsumerRegistration(

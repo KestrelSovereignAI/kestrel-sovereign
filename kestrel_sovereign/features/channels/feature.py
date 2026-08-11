@@ -189,23 +189,44 @@ class ChannelFeature(Feature):
 
     def _register_channel_signal_source(self) -> None:
         signal_registry = getattr(self.agent, "signal_registry", None)
-        if signal_registry is None or not hasattr(
-            signal_registry, "register_with_policy"
-        ):
+        register = getattr(signal_registry, "register_with_policy", None)
+        get_registration = getattr(signal_registry, "get", None)
+        if not callable(register) or not callable(get_registration):
+            self._durable_cognition_registration_failed = True
+            logger.error(
+                "Channel signal registry cannot verify the required channel.message "
+                "contract; ACK-bearing ingress will remain retryable"
+            )
             return
-        from kestrel_sovereign.signals import RegistrationPolicy
+        from kestrel_sovereign.signals import (
+            RegistrationOutcome,
+            RegistrationPolicy,
+            SourceRegistry,
+        )
 
         # OPTIONAL policy (#2522): idempotent on re-init, but an existing
         # channel.message source with a DIFFERENT contract is reported rather
         # than silently accepted by a precheck-by-name skip. Never raises.
-        outcome = signal_registry.register_with_policy(
-            build_channel_message_registration(),
-            RegistrationPolicy.OPTIONAL,
-        )
-        # Own the source we newly registered so shutdown / boot rollback
-        # unregisters it (#2522 P2).
-        self._own_signal_sources(outcome)
-        if not outcome.ok:
+        required = build_channel_message_registration()
+        try:
+            outcome = register(required, RegistrationPolicy.OPTIONAL)
+            # A host which merely claims registration succeeded is insufficient
+            # for cursor-owned ingress. Verify the installed source itself so
+            # an older/embedder registry cannot ACK an unknown contract.
+            actual = get_registration(required.name)
+            verified = (
+                isinstance(outcome, RegistrationOutcome)
+                and outcome.ok
+                and SourceRegistry.contract_equivalent(actual, required)
+            )
+        except Exception:
+            self._durable_cognition_registration_failed = True
+            logger.exception(
+                "Could not register and verify the channel.message signal source; "
+                "ACK-bearing ingress will remain retryable"
+            )
+            return
+        if not verified:
             # ``OPTIONAL`` keeps a pre-existing source alive on a mismatch or
             # validation failure.  That is tolerable for an ordinary optional
             # feature, but not for cursor-owning channel ingress: its durable
@@ -215,11 +236,17 @@ class ChannelFeature(Feature):
             # this feature can start against its intended contract.
             self._durable_cognition_registration_failed = True
             logger.error(
-                "Channel signal source registration is not usable for durable "
-                "cognition (state=%s): %s; ACK-bearing ingress will remain retryable",
-                outcome.state.value,
-                outcome.detail,
+                "Channel signal source registration is not verifiably usable for "
+                "durable cognition (state=%s): %s; ACK-bearing ingress will "
+                "remain retryable",
+                getattr(getattr(outcome, "state", None), "value", "unknown"),
+                getattr(outcome, "detail", "required contract missing or mismatched"),
             )
+            return
+        # Own the source we newly registered so shutdown / boot rollback
+        # unregisters it (#2522 P2). This is deliberately after verifying the
+        # actual registration rather than trusting an embedder's return value.
+        self._own_signal_sources(outcome)
 
     async def _register_durable_cognition_consumer(self) -> None:
         """Register the restart-safe delivery behind ACK-bearing channels.
@@ -636,12 +663,23 @@ class ChannelFeature(Feature):
         Args:
             message: The inbound ChannelMessage.
         """
-        # Check sender filtering
+        # The child transport is not an authorization boundary. Enforce the
+        # host adapter's enabled state and sender policy before logging,
+        # dispatching, or issuing a cursor-advancing receipt.
         adapter = self.registry.get(message.channel_type)
         if adapter and adapter.config:
-            if not adapter.config.is_sender_allowed(message.sender):
+            config = adapter.config
+            telegram_default_deny = (
+                message.channel_type == "telegram"
+                and not getattr(config, "allowed_senders", None)
+            )
+            if (
+                not config.enabled
+                or telegram_default_deny
+                or not config.is_sender_allowed(message.sender)
+            ):
                 logger.info(
-                    "Blocked message from disallowed sender '%s' on channel '%s'",
+                    "Blocked inbound message from sender '%s' on channel '%s'",
                     message.sender,
                     message.channel_type,
                 )

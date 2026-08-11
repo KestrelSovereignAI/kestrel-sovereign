@@ -41,6 +41,7 @@ from kestrel_sovereign.signals.dispatcher import (
 from kestrel_sovereign.signals.registry import (
     RegistrationOutcome,
     RegistrationState,
+    SourceRegistry,
 )
 
 # ============================================================================
@@ -121,6 +122,11 @@ def _make_agent(db=None, agent_id="test-agent", privacy_preset=None):
     storage.agent_id = agent_id
     agent.storage = storage
     agent._raw_storage = None
+    # Channel ingress now requires a verifiable source contract. Give ordinary
+    # feature tests the production registry rather than a permissive MagicMock
+    # so their legacy-routing assertions retain their intended meaning.
+    agent.signal_registry = SourceRegistry()
+    agent.dispatcher = None
 
     if privacy_preset is not None:
         from kestrel_sovereign.privacy import get_privacy_preset
@@ -742,6 +748,61 @@ class TestChannelFeature:
         router.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "registry",
+        (
+            None,
+            object(),
+            type(
+                "UnverifiableRegistry",
+                (),
+                {
+                    "register_with_policy": lambda self, registration, policy: RegistrationOutcome(
+                        registration.name, RegistrationState.REGISTERED
+                    ),
+                    "get": lambda self, name: None,
+                },
+            )(),
+        ),
+    )
+    async def test_handle_inbound_fails_closed_when_channel_source_cannot_be_verified(
+        self, registry
+    ):
+        """Older/embedder registries may not turn an unknown source into an ACK."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.signal_registry = registry
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="retain my provider cursor",
+            )
+        )
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.register_durable_consumer.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_handle_inbound_does_not_treat_background_dispatch_as_durable(self):
         """A legacy/background dispatcher result cannot advance a channel cursor."""
 
@@ -830,6 +891,74 @@ class TestChannelFeature:
 
         # Message should NOT be routed
         router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_rejects_disabled_adapter(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(
+                channel="slack",
+                config=ChannelConfig(
+                    channel_type="slack", enabled=False, allowed_senders=["alice"]
+                ),
+            )
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="slack",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="disabled host adapter",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_defaults_telegram_to_deny_without_allowlist(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(channel="telegram", config=ChannelConfig(channel_type="telegram"))
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="untrusted",
+                recipient="bot",
+                content="faulty child notification",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_preserves_generic_empty_allowlist_behavior(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(channel="slack", config=ChannelConfig(channel_type="slack"))
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="slack",
+                direction=MessageDirection.INBOUND,
+                sender="generic-sender",
+                recipient="bot",
+                content="normal generic channel behavior",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_handle_inbound_allowed_sender(self, feature):

@@ -42,6 +42,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     _SchedulerExecutionScope,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -770,7 +771,7 @@ async def test_replacement_bridge_uses_effective_config_for_outbound_and_inbound
         did=_TEST_AGENT_DID,
         storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
         dispatcher=None,
-        signal_registry=None,
+        signal_registry=SourceRegistry(),
         features={},
     )
     channel_feature = ChannelFeature(channel_agent)
@@ -1159,6 +1160,67 @@ def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, 
     runs.clear()
     feature.ensure_venv()
     assert runs == [], "the new Telegram release stamp must converge after one upgrade"
+
+
+@pytest.mark.parametrize("current_child_version", ("0.1.1", "unknown"))
+def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifest(
+    tmp_path, monkeypatch, current_child_version
+):
+    """Freshness probes the child, not just the recorded successful install."""
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    python = feature._venv_path / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    feature._write_provision_manifest(
+        runtime.project,
+        "0.35.1",
+        "0.35.1",
+        "0.1.2",
+        "0.1.2",
+    )
+    child_version = {"value": current_child_version}
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        if "pip" in cmd and "install" in cmd:
+            child_version["value"] = "0.1.2"
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(ir, "_feature_distribution_version", lambda _d, _t: "0.1.2")
+    monkeypatch.setattr(
+        ir,
+        "_venv_feature_distribution_version",
+        lambda _path, _distribution: child_version["value"],
+    )
+
+    feature.ensure_venv()
+
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+    assert child_version["value"] == "0.1.2"
+
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == []
 
 
 def test_feature_distribution_version_reads_local_editable_project_metadata(
@@ -6048,7 +6110,7 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         did=_TEST_AGENT_DID,
         storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
         dispatcher=None,
-        signal_registry=None,
+        signal_registry=SourceRegistry(),
         features={},
     )
     channel_feature = ChannelFeature(channel_agent)
@@ -6059,12 +6121,16 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
     feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TelegramClient)
-    feature._host_config = {
+    host_config = {
         "agent_id": _TEST_AGENT_DID,
         "enabled": True,
         "allowed_senders": ["555"],
     }
-    feature._host_config_loaded = True
+
+    async def load_host_config():
+        return host_config
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
     try:
         await feature.initialize()
         event = _acknowledged_telegram_event("telegram:v2:bot:42:update:spoofed")
@@ -6073,7 +6139,9 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         event["payload"]["_host_ingress_retry"]["name"] = "renamed-nack"
 
         await feature._client.event_handler(event)
-        await asyncio.sleep(0)
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
 
         # The authoritative Telegram identity rejects the renamed pair; it
         # cannot fall through to WhatsApp's absent adapter/filter. Real
@@ -6085,15 +6153,95 @@ async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_teleg
         denied["payload"]["message"]["channel_type"] = "whatsapp"
         denied["payload"]["message"]["sender"] = "not-allowed"
         await feature._client.event_handler(denied)
-        await asyncio.sleep(0)
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
         assert routed == [("telegram", "555")]
 
         channel_feature.registry.unregister("telegram")
         await feature._client.event_handler(_acknowledged_telegram_event(
             "telegram:v2:bot:42:update:missing-adapter"
         ))
-        await asyncio.sleep(0)
+        await asyncio.gather(
+            *tuple(feature._event_ingress_tasks), return_exceptions=True
+        )
         assert routed == [("telegram", "555")]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_config",
+    (
+        {"enabled": False, "allowed_senders": ["555"]},
+        {"enabled": True, "allowed_senders": []},
+    ),
+    ids=("disabled-adapter", "telegram-default-deny"),
+)
+async def test_host_telegram_authorization_nacks_faulty_child_notifications(
+    monkeypatch, tmp_path, host_config
+):
+    """The host adapter policy controls ACKs even if an isolated child is faulty."""
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+
+    routed = []
+    nacked = asyncio.Event()
+
+    async def route_inbound(message):
+        routed.append(message)
+
+    class CompletionClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=SourceRegistry(),
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    channel_feature.registry.set_inbound_router(route_inbound)
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CompletionClient)
+    configured_host = {"agent_id": _TEST_AGENT_DID, **host_config}
+
+    async def load_host_config():
+        return configured_host
+
+    feature._load_host_config = load_host_config  # type: ignore[method-assign]
+    dedupe_key = "telegram:v2:bot:42:update:host-policy"
+    try:
+        await feature.initialize()
+        await feature._client.event_handler(_retryable_telegram_event(dedupe_key))
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+
+        assert routed == []
+        assert feature._client.completions == [
+            (
+                "telegram-polling-nack",
+                {"dedupe_key": dedupe_key, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN},
+            )
+        ]
     finally:
         await feature.shutdown()
         await channel_feature.shutdown()
@@ -6508,6 +6656,83 @@ async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(m
         release_ack.set()
     finally:
         release_ack.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cross_process_callbacks_chain_attempt_scoped_completions_per_source(
+    monkeypatch, tmp_path
+):
+    """A second child callback waits for, rather than losing to, a delayed ACK RPC."""
+
+    first_ack_started = asyncio.Event()
+    release_first_ack = asyncio.Event()
+    second_ack_started = asyncio.Event()
+    routed = []
+
+    class ChannelFeature(FakeChannelFeature):
+        async def handle_inbound(self, message):
+            routed.append(message.id)
+            return SimpleNamespace(durably_admitted=True)
+
+    class DelayedAckClient(TelegramChannelClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack",)
+            )
+            self.acknowledgements = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.acknowledgements.append((name, payload))
+            if len(self.acknowledgements) == 1:
+                first_ack_started.set()
+                await release_first_ack.wait()
+            else:
+                second_ack_started.set()
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": ChannelFeature()})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=DelayedAckClient)
+    first_key = "telegram:v2:bot:42:update:completion-one"
+    second_key = "telegram:v2:bot:42:update:completion-two"
+    try:
+        await feature.initialize()
+        client = feature._client
+        first = _acknowledged_telegram_event(first_key)
+        second = _acknowledged_telegram_event(second_key)
+        first["payload"]["_host_ingress_ack"]["payload"]["attempt_token"] = "a" * 43
+        second["payload"]["_host_ingress_ack"]["payload"]["attempt_token"] = "b" * 43
+        # The retry half is still required to authenticate the Telegram pair.
+        first["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = "a" * 43
+        second["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = "b" * 43
+
+        await client.event_handler(first)
+        await asyncio.wait_for(first_ack_started.wait(), timeout=1)
+        # Callback one has completed host routing, but its source RPC remains
+        # in flight. This mirrors the child process receiving the next callback
+        # before its first private RPC response is delivered.
+        await client.event_handler(second)
+        await asyncio.sleep(0)
+        assert routed == [first_key]
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": first_key, "attempt_token": "a" * 43})
+        ]
+
+        release_first_ack.set()
+        await asyncio.wait_for(second_ack_started.wait(), timeout=1)
+        assert routed == [first_key, second_key]
+        assert client.acknowledgements == [
+            ("telegram-polling-ack", {"dedupe_key": first_key, "attempt_token": "a" * 43}),
+            ("telegram-polling-ack", {"dedupe_key": second_key, "attempt_token": "b" * 43}),
+        ]
+        await asyncio.gather(*tuple(feature._event_ack_tasks))
+        assert feature._event_ack_tasks == set()
+    finally:
+        release_first_ack.set()
         await feature.shutdown()
 
 

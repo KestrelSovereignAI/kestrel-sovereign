@@ -132,6 +132,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     FAILED,
+    TERMINAL_ACKABLE,
     DurableConsumerRegistration,
     DurableDelivery,
     DurableSignalStore,
@@ -1155,6 +1156,7 @@ class SignalDispatcher:
         error: str,
         retry_delay: timedelta = timedelta(),
         terminal: bool = False,
+        terminal_ackable: bool = False,
     ) -> Optional[DurableDelivery]:
         """Release a claimed delivery for a bounded retry or terminal failure."""
         async with self._admit_durable_operation():
@@ -1167,8 +1169,9 @@ class SignalDispatcher:
                 error=error,
                 retry_delay=retry_delay,
                 terminal=terminal,
+                terminal_ackable=terminal_ackable,
             )
-            if delivery is not None and delivery.status == FAILED:
+            if delivery is not None and delivery.status in {FAILED, TERMINAL_ACKABLE}:
                 self._discard_transient_durable_handoff(delivery_id)
             return delivery
 
@@ -2659,11 +2662,19 @@ class SignalDispatcher:
                 consumer_id=consumer_id,
                 event_id=persisted_event_id,
             )
-            if existing is not None and existing.status == ACKNOWLEDGED:
+            if existing is not None and existing.status in {
+                ACKNOWLEDGED,
+                TERMINAL_ACKABLE,
+            }:
                 if durable_admission is not None and not durable_admission.done():
                     durable_admission.set_result(
                         DurableAdmissionResult(
-                            DurableAdmissionDisposition.DUPLICATE, signal.id
+                            (
+                                DurableAdmissionDisposition.DUPLICATE
+                                if existing.status == ACKNOWLEDGED
+                                else DurableAdmissionDisposition.TERMINAL
+                            ),
+                            signal.id,
                         )
                     )
                 return self._fail(
@@ -2671,8 +2682,13 @@ class SignalDispatcher:
                     start,
                     Status.COALESCED,
                     error=(
-                        "Duplicate source event ID already acknowledged by "
-                        f"durable consumer {consumer_id}"
+                        (
+                            "Duplicate source event ID already acknowledged by "
+                            f"durable consumer {consumer_id}"
+                            if existing.status == ACKNOWLEDGED
+                            else "Duplicate source event ID already completed as a "
+                            f"terminal no-op by durable consumer {consumer_id}"
+                        )
                     ),
                     registration=registration,
                 )
@@ -2903,6 +2919,7 @@ class SignalDispatcher:
             lease_token=delivery.lease_token or "",
             error=result.error or f"Cognition delivery returned {result.status.value}",
             terminal=terminal,
+            terminal_ackable=terminal,
         )
         if released is None:
             await self.release_durable_delivery_after_task(

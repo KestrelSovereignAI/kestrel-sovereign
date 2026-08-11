@@ -52,6 +52,7 @@ from kestrel_sovereign.signals.durable import (
     LEASED,
     PENDING,
     RETRY,
+    TERMINAL_ACKABLE,
     DurableConsumerRegistration,
     DurableDelivery,
     DurableEventPersistence,
@@ -122,6 +123,7 @@ __all__ = [
     "SignalLogStore",
     "SignalLogWriteFailure",
     "RETRY",
+    "TERMINAL_ACKABLE",
     "SourceRegistry",
     "template_artifact_handler",
 ]

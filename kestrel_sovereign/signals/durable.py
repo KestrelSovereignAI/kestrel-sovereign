@@ -33,7 +33,12 @@ LEASED = "leased"
 RETRY = "retry"
 ACKNOWLEDGED = "acknowledged"
 FAILED = "failed"
-_TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED})
+# A validation/cycle refusal has no effects to retry, but an ACK-bearing
+# provider can redeliver it when its provider-side ACK was lost.  Keep that
+# fact distinct from a normal terminal worker failure: only this state is a
+# durable, idempotent receipt for a redelivery.
+TERMINAL_ACKABLE = "terminal_ackable"
+_TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
@@ -327,7 +332,6 @@ class DurableSignalStore(UnifiedStoreBase):
         identity is unique on ``(agent_id, consumer_id, event_id)``.
         """
         self._validate_registration(registration)
-        now = self.now_utc()
         async with self._backend.transaction():
             # Consumer registration and event persistence must share one
             # serialization point.  Without it on PostgreSQL, an event can
@@ -340,6 +344,11 @@ class DurableSignalStore(UnifiedStoreBase):
             await self._lock_scope_handoff(
                 agent_id=registration.agent_id, source=registration.source
             )
+            # The SQLite writer reservation / PostgreSQL advisory lock is the
+            # serialization point. Sampling before it can make a retention
+            # backfill admit an event that is already expired by the time this
+            # transaction owns the handoff.
+            now = self.now_utc()
             row = await self._backend.fetch_one(
                 f"""
                 SELECT source, correlation_selector, max_attempts,
@@ -727,20 +736,10 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
         self._require_nonempty("executor_id", executor_id)
-        now = _as_utc(now or self.now_utc())
+        explicit_now = _as_utc(now) if now is not None else None
         consumer = await self._get_consumer(agent_id, consumer_id)
         if consumer is None or not consumer[4]:
             return None
-        await self._recover_expired_leases(
-            agent_id=agent_id,
-            consumer_id=consumer_id,
-            now=now,
-            runtime_owner_stale_before=(
-                _as_utc(runtime_owner_stale_before)
-                if runtime_owner_stale_before is not None
-                else now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-            ),
-        )
         # Catch events committed while a consumer was restarting.  The unique
         # delivery key makes this safe to do on every poll.
         registration = DurableConsumerRegistration(
@@ -752,48 +751,63 @@ class DurableSignalStore(UnifiedStoreBase):
             lease_seconds=int(consumer[3]),
             active=bool(consumer[4]),
         )
-        # Backfill is idempotent (unique delivery identity) but deliberately
-        # separate from the claim statement.  Keeping the actual conditional
-        # handoff as one autocommit UPDATE means two independent SQLite
-        # processes never hold competing read transactions while deciding who
-        # owns a delivery; PostgreSQL receives the same atomic predicate.
-        await self._backfill_consumer(registration, now=now)
-        lease_token = secrets.token_urlsafe(24)
-        lease_expires_at = now + timedelta(seconds=registration.lease_seconds)
-        updated = await self._backend.execute(
-            f"""
-            UPDATE {self.DELIVERIES}
-            SET status = ?, attempts = attempts + 1, lease_owner = ?,
-                lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
-                updated_at = ?
-            WHERE delivery_id = (
-                SELECT delivery_id FROM {self.DELIVERIES}
-                WHERE agent_id = ? AND consumer_id = ?
+        # Claim, recovery, and restart backfill all serialize with event
+        # persistence for this source.  Besides avoiding a registration/event
+        # visibility gap, sampling an implicit clock *after* this point gives a
+        # newly issued lease its full duration under writer contention.
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=registration.source)
+            effective_now = explicit_now or self.now_utc()
+            await self._recover_expired_leases(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                now=effective_now,
+                runtime_owner_stale_before=(
+                    _as_utc(runtime_owner_stale_before)
+                    if runtime_owner_stale_before is not None
+                    else effective_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+                ),
+            )
+            # Backfill is idempotent because delivery identity is unique.
+            await self._backfill_consumer(registration, now=effective_now)
+            lease_token = secrets.token_urlsafe(24)
+            lease_expires_at = effective_now + timedelta(
+                seconds=registration.lease_seconds
+            )
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, attempts = attempts + 1, lease_owner = ?,
+                    lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE delivery_id = (
+                    SELECT delivery_id FROM {self.DELIVERIES}
+                    WHERE agent_id = ? AND consumer_id = ?
+                      AND status IN ('{PENDING}', '{RETRY}')
+                      AND (max_attempts = 0 OR attempts < max_attempts)
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                    ORDER BY created_at, delivery_id
+                    LIMIT 1
+                )
+                  AND agent_id = ? AND consumer_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY created_at, delivery_id
-                LIMIT 1
+                """,
+                (
+                    LEASED,
+                    executor_id,
+                    lease_token,
+                    self.to_timestamp_param(lease_expires_at),
+                    self.to_timestamp_param(effective_now),
+                    agent_id,
+                    consumer_id,
+                    self.to_timestamp_param(effective_now),
+                    agent_id,
+                    consumer_id,
+                    self.to_timestamp_param(effective_now),
+                ),
             )
-              AND agent_id = ? AND consumer_id = ?
-              AND status IN ('{PENDING}', '{RETRY}')
-              AND (max_attempts = 0 OR attempts < max_attempts)
-              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-            """,
-            (
-                LEASED,
-                executor_id,
-                lease_token,
-                self.to_timestamp_param(lease_expires_at),
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                self.to_timestamp_param(now),
-            ),
-        )
         if updated == 0:
             return None
         return await self._delivery_for_lease_locked(
@@ -822,45 +836,48 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("consumer_id", consumer_id)
         self._require_nonempty("event_id", event_id)
         self._require_nonempty("executor_id", executor_id)
-        now = _as_utc(now or self.now_utc())
+        explicit_now = _as_utc(now) if now is not None else None
         consumer = await self._get_consumer(agent_id, consumer_id)
         if consumer is None or not consumer[4]:
             return None
-        await self._recover_expired_leases(
-            agent_id=agent_id,
-            consumer_id=consumer_id,
-            now=now,
-            runtime_owner_stale_before=(
-                _as_utc(runtime_owner_stale_before)
-                if runtime_owner_stale_before is not None
-                else now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
-            ),
-        )
-        lease_token = secrets.token_urlsafe(24)
-        lease_expires_at = now + timedelta(seconds=int(consumer[3]))
-        updated = await self._backend.execute(
-            f"""
-            UPDATE {self.DELIVERIES}
-            SET status = ?, attempts = attempts + 1, lease_owner = ?,
-                lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
-                updated_at = ?
-            WHERE agent_id = ? AND consumer_id = ? AND event_id = ?
-              AND status IN ('{PENDING}', '{RETRY}')
-              AND (max_attempts = 0 OR attempts < max_attempts)
-              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-            """,
-            (
-                LEASED,
-                executor_id,
-                lease_token,
-                self.to_timestamp_param(lease_expires_at),
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                event_id,
-                self.to_timestamp_param(now),
-            ),
-        )
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=consumer[0])
+            effective_now = explicit_now or self.now_utc()
+            await self._recover_expired_leases(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                now=effective_now,
+                runtime_owner_stale_before=(
+                    _as_utc(runtime_owner_stale_before)
+                    if runtime_owner_stale_before is not None
+                    else effective_now - _DEFAULT_RUNTIME_OWNER_STALE_AFTER
+                ),
+            )
+            lease_token = secrets.token_urlsafe(24)
+            lease_expires_at = effective_now + timedelta(seconds=int(consumer[3]))
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, attempts = attempts + 1, lease_owner = ?,
+                    lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND event_id = ?
+                  AND status IN ('{PENDING}', '{RETRY}')
+                  AND (max_attempts = 0 OR attempts < max_attempts)
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                """,
+                (
+                    LEASED,
+                    executor_id,
+                    lease_token,
+                    self.to_timestamp_param(lease_expires_at),
+                    self.to_timestamp_param(effective_now),
+                    agent_id,
+                    consumer_id,
+                    event_id,
+                    self.to_timestamp_param(effective_now),
+                ),
+            )
         if updated == 0:
             return None
         return await self._delivery_for_lease_locked(
@@ -1386,6 +1403,7 @@ class DurableSignalStore(UnifiedStoreBase):
         error: str,
         retry_delay: timedelta = timedelta(),
         terminal: bool = False,
+        terminal_ackable: bool = False,
         now: Optional[datetime] = None,
     ) -> Optional[DurableDelivery]:
         """Release a failed lease for retry or mark a terminal failure.
@@ -1397,30 +1415,43 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("error", error)
         if retry_delay.total_seconds() < 0:
             raise ValueError("retry_delay must not be negative")
+        if terminal_ackable and not terminal:
+            raise ValueError("terminal_ackable deliveries must be terminal")
         now = _as_utc(now or self.now_utc())
         retry_at = now + retry_delay
         timestamp = self._timestamp_placeholder()
         updated = await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
-            SET status = CASE WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ? ELSE ? END,
+            SET status = CASE
+                    WHEN ? THEN ?
+                    WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN ?
+                    ELSE ?
+                END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                 next_attempt_at = CASE
-                    WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts) THEN NULL ELSE {timestamp} END,
+                    WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
+                        THEN NULL ELSE {timestamp} END,
                 last_error = ?,
-                terminal_at = CASE WHEN ? OR (max_attempts > 0 AND attempts >= max_attempts)
-                    THEN {timestamp} ELSE NULL END,
+                terminal_at = CASE
+                    WHEN ? OR ? OR (max_attempts > 0 AND attempts >= max_attempts)
+                        THEN {timestamp} ELSE NULL
+                    END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
               AND status = ? AND lease_token = ? AND lease_expires_at > ?
             """,
             (
+                self.to_bool_param(terminal_ackable),
+                TERMINAL_ACKABLE,
                 self.to_bool_param(terminal),
                 FAILED,
                 RETRY,
+                self.to_bool_param(terminal_ackable),
                 self.to_bool_param(terminal),
                 self.to_timestamp_param(retry_at),
                 error,
+                self.to_bool_param(terminal_ackable),
                 self.to_bool_param(terminal),
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
@@ -1602,7 +1633,7 @@ class DurableSignalStore(UnifiedStoreBase):
               AND NOT EXISTS (
                   SELECT 1 FROM {self.DELIVERIES} d
                   WHERE d.event_id = {self.EVENTS}.event_id
-                    AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}')
+                    AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}')
               )
             """,
             (agent_id, self.to_timestamp_param(now)),
@@ -2107,6 +2138,7 @@ __all__ = [
     "LEASED",
     "PENDING",
     "RETRY",
+    "TERMINAL_ACKABLE",
     "DurableConsumerRegistration",
     "DurableDelivery",
     "DurableEventPersistence",
