@@ -46,6 +46,7 @@ def _base_agent():
     agent._build_all_tools = MagicMock(return_value=[])
     agent._visible_features_by_tool_name = MagicMock(return_value={})
     agent._visible_known_tool_names = MagicMock(return_value=set())
+    agent._known_tool_names = MagicMock(return_value=set())
     agent._make_inline_tool_executor = MagicMock(return_value=None)
     # Identity prune so the assertion sees exactly what the handler built.
     agent._prune_orchestrator_messages = MagicMock(

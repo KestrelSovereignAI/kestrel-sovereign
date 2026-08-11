@@ -288,7 +288,12 @@ class TestBuildAllTools:
         assert "fetch_issue" not in prompt
 
     def test_visible_known_tool_names_excludes_hidden_context_tools(self, agent):
-        """Orchestrator guardrails use only currently visible context tools."""
+        """The advertised schema view drops context-hidden tools.
+
+        This is the LLM-facing view only. The orchestrator's guardrail
+        allowlist is ``_known_tool_names`` (registry-derived), which keeps a
+        hidden tool known — see test_tool_allowlist_registry (#2929).
+        """
         feature = _make_mock_feature(
             "model_agent",
             [
@@ -304,6 +309,7 @@ class TestBuildAllTools:
 
         assert "list_models" in known_tools
         assert "get_current_model" not in known_tools
+        assert "get_current_model" in agent._known_tool_names()
 
     def test_visible_features_by_tool_name_excludes_hidden_features(self, agent):
         """Hidden feature dispatchers are not valid orchestrator targets."""
