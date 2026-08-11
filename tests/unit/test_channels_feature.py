@@ -680,6 +680,49 @@ class TestChannelFeature:
         assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
 
     @pytest.mark.asyncio
+    async def test_volatile_telegram_cursor_waits_for_terminal_durable_outcome(self):
+        """A marker-only privacy row cannot advance Telegram before cognition ends."""
+
+        db = _make_db()
+        agent = _make_agent(db=db, privacy_preset="ephemeral")
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        handle.wait = AsyncMock(return_value=MagicMock())
+        handle.signal_id = "durable-signal-1"
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        agent.dispatcher.get_durable_delivery_for_event = AsyncMock(
+            return_value=SimpleNamespace(status="acknowledged")
+        )
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(_cursor_owned_telegram(ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="555",
+            recipient="bot",
+            content="do not acknowledge a marker-only handoff",
+        )))
+
+        handle.wait.assert_awaited_once()
+        handle.wait_for_durable_admission.assert_not_awaited()
+        agent.dispatcher.get_durable_delivery_for_event.assert_awaited_once()
+        assert agent.dispatcher.get_durable_delivery_for_event.await_args.kwargs == {
+            "consumer_id": "core.channel-cognition-v1",
+            "event_id": "durable-signal-1",
+        }
+        assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+    @pytest.mark.asyncio
     async def test_handle_inbound_fails_closed_when_durable_consumer_registration_fails(self):
         """Registration failure cannot fall back to ordinary queued routing."""
 

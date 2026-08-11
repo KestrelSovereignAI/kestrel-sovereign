@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 _CANONICAL_TELEGRAM_UPDATE_ID = re.compile(
     r"telegram:v2:bot:[1-9][0-9]*:update:[0-9]+\Z"
 )
+_TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
+    {
+        "malformed_update",
+        "unsupported_update",
+        "senderless_update",
+        "unauthorized_sender",
+    }
+)
 
 # Key version stamped into channel_messages metadata when a row is
 # encrypted at rest. Mirrors
@@ -964,10 +972,10 @@ class ChannelFeature(Feature):
     async def handle_terminal_inbound(
         self, message: ChannelMessage, *, disposition: str
     ) -> InboundAdmission:
-        """Durably own a malformed Telegram update without routing cognition."""
+        """Durably own a bounded Telegram terminal update without cognition."""
 
         if (
-            disposition != "malformed_update"
+            disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
             or message.channel_type != "telegram"
             or getattr(message, "_kestrel_cursor_owned_protocol", False) is not True
             or _CANONICAL_TELEGRAM_UPDATE_ID.fullmatch(message.id or "") is None
@@ -999,7 +1007,7 @@ class ChannelFeature(Feature):
             receipt = await handle.wait_for_durable_admission()
         except Exception:
             logger.exception(
-                "Failed to durably record malformed Telegram update id=%s", message.id
+                "Failed to durably record terminal Telegram update id=%s", message.id
             )
             return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
         if getattr(receipt, "acknowledged", False) is True:
@@ -1126,6 +1134,46 @@ class ChannelFeature(Feature):
                             "for message id=%s",
                             message.id,
                         )
+                    elif self._persistent_content_hidden():
+                        # Privacy-elided durable rows intentionally retain
+                        # only a marker plus a process-local handoff.  An
+                        # admission ACK at that point would let Telegram
+                        # advance its cursor even though a restart could no
+                        # longer recover caller/content.  Keep the provider
+                        # cursor until cognition reaches a terminal durable
+                        # outcome; raw content still never enters storage.
+                        wait_for_terminal = getattr(handle, "wait", None)
+                        delivery_for_event = getattr(
+                            dispatcher, "get_durable_delivery_for_event", None
+                        )
+                        if not callable(wait_for_terminal) or not callable(
+                            delivery_for_event
+                        ):
+                            logger.error(
+                                "Volatile Telegram cognition has no terminal durable "
+                                "receipt for message id=%s",
+                                message.id,
+                            )
+                        else:
+                            await wait_for_terminal()
+                            event_id = getattr(handle, "signal_id", None)
+                            if not isinstance(event_id, str) or not event_id:
+                                logger.error(
+                                    "Volatile Telegram cognition has no durable event ID "
+                                    "for message id=%s",
+                                    message.id,
+                                )
+                                return InboundAdmission(
+                                    InboundAdmissionDisposition.RETRYABLE
+                                )
+                            delivery = await delivery_for_event(
+                                consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                                event_id=event_id,
+                            )
+                            durable_admission = getattr(delivery, "status", None) in {
+                                "acknowledged",
+                                "terminal_ackable",
+                            }
                     else:
                         receipt = await wait_for_durable_admission()
                         durable_admission = (

@@ -152,6 +152,14 @@ _EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
 _EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
 _EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
 _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD = "_telegram_terminal_disposition"
+_TELEGRAM_TERMINAL_DISPOSITIONS = frozenset(
+    {
+        "malformed_update",
+        "unsupported_update",
+        "senderless_update",
+        "unauthorized_sender",
+    }
+)
 _EVENT_INGRESS_ATTEMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _TELEGRAM_POLLING_ACK = "telegram-polling-ack"
 _TELEGRAM_POLLING_NACK = "telegram-polling-nack"
@@ -2086,6 +2094,13 @@ def _env_key(feature_name: str, suffix: str) -> str:
 
 
 def _agent_data_dir(agent: Any) -> Path:
+    # A PostgreSQL-backed multi-tenant host has no SQLite ``storage_path`` to
+    # derive from, yet each agent still needs a private isolated-feature venv.
+    # The embedding host supplies this path before feature discovery; it never
+    # comes from feature configuration or a tool request.
+    isolated_feature_data_dir = getattr(agent, "isolated_feature_data_dir", None)
+    if isinstance(isolated_feature_data_dir, (str, os.PathLike)):
+        return Path(isolated_feature_data_dir).expanduser().resolve()
     storage_path = getattr(agent, "storage_path", None)
     if storage_path:
         return Path(storage_path).expanduser().resolve().parent
@@ -7507,14 +7522,34 @@ class ProxyFeature(Feature):
         bot/update after a successful delivery.
         """
 
-        if type(payload) is not dict or set(payload) not in (
-            {_EVENT_HOST_INGRESS_MESSAGE_FIELD, _EVENT_HOST_INGRESS_ACK_FIELD},
-            {
-                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
-                _EVENT_HOST_INGRESS_ACK_FIELD,
-                _EVENT_HOST_INGRESS_RETRY_FIELD,
-            },
-        ):
+        allowed_payload_keys = {
+            frozenset(
+                {_EVENT_HOST_INGRESS_MESSAGE_FIELD, _EVENT_HOST_INGRESS_ACK_FIELD}
+            ),
+            frozenset(
+                {
+                    _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                    _EVENT_HOST_INGRESS_ACK_FIELD,
+                    _EVENT_HOST_INGRESS_RETRY_FIELD,
+                }
+            ),
+        }
+        # Telegram's polling protocol adds a bounded, host-validated terminal
+        # disposition.  It is intentionally not accepted for generic channel
+        # events, where it would otherwise become an unreviewed extension of
+        # the acknowledgement envelope.
+        if self._authoritative_inbound_channel_type() == "telegram":
+            allowed_payload_keys.add(
+                frozenset(
+                    {
+                        _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                        _EVENT_HOST_INGRESS_ACK_FIELD,
+                        _EVENT_HOST_INGRESS_RETRY_FIELD,
+                        _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+                    }
+                )
+            )
+        if type(payload) is not dict or frozenset(payload) not in allowed_payload_keys:
             return payload, None
         message = payload.get(_EVENT_HOST_INGRESS_MESSAGE_FIELD)
         descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
@@ -7600,11 +7635,19 @@ class ProxyFeature(Feature):
     ) -> tuple[_HostIngressRequest, _HostIngressRequest] | None:
         """Validate Telegram's exact, attempt-fenced ACK/NACK descriptor pair."""
 
-        if set(payload) != {
-            _EVENT_HOST_INGRESS_MESSAGE_FIELD,
-            _EVENT_HOST_INGRESS_ACK_FIELD,
-            _EVENT_HOST_INGRESS_RETRY_FIELD,
-        }:
+        if set(payload) not in (
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+            },
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+                _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+            },
+        ):
             return None
         acknowledgement_descriptor = payload.get(_EVENT_HOST_INGRESS_ACK_FIELD)
         retry_descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
@@ -7657,11 +7700,19 @@ class ProxyFeature(Feature):
     ) -> _HostIngressRequest | None:
         """Return a validated retry completion paired to one inbound ACK key."""
 
-        if type(payload) is not dict or set(payload) != {
-            _EVENT_HOST_INGRESS_MESSAGE_FIELD,
-            _EVENT_HOST_INGRESS_ACK_FIELD,
-            _EVENT_HOST_INGRESS_RETRY_FIELD,
-        }:
+        if type(payload) is not dict or set(payload) not in (
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+            },
+            {
+                _EVENT_HOST_INGRESS_MESSAGE_FIELD,
+                _EVENT_HOST_INGRESS_ACK_FIELD,
+                _EVENT_HOST_INGRESS_RETRY_FIELD,
+                _EVENT_TELEGRAM_TERMINAL_DISPOSITION_FIELD,
+            },
+        ):
             return None
         message, acknowledgement = self._split_inbound_event_acknowledgement(payload)
         descriptor = payload.get(_EVENT_HOST_INGRESS_RETRY_FIELD)
@@ -8151,7 +8202,7 @@ class ProxyFeature(Feature):
     def _telegram_terminal_disposition(
         self, data: Any, *, cursor_owned_protocol: bool
     ) -> str | None:
-        """Validate the private malformed-update terminal descriptor."""
+        """Validate one bounded, non-cognitive Telegram terminal descriptor."""
 
         if not isinstance(data, dict):
             return None
@@ -8162,10 +8213,11 @@ class ProxyFeature(Feature):
             self._authoritative_inbound_channel_type() != "telegram"
             or not cursor_owned_protocol
             or type(descriptor) is not dict
-            or descriptor != {"kind": "malformed_update"}
+            or set(descriptor) != {"kind"}
+            or descriptor.get("kind") not in _TELEGRAM_TERMINAL_DISPOSITIONS
         ):
             raise ProtocolError("invalid Telegram terminal inbound disposition")
-        return "malformed_update"
+        return descriptor["kind"]
 
     async def _route_validated_inbound(
         self,
@@ -8192,6 +8244,41 @@ class ProxyFeature(Feature):
         finally:
             _cursor_owned_inbound_protocol.reset(token)
             _telegram_terminal_inbound_disposition.reset(terminal_token)
+
+    async def admit_hosted_telegram_ingress(
+        self,
+        payload: dict[str, Any],
+        *,
+        terminal_disposition: str | None = None,
+    ) -> Any:
+        """Durably admit one host-authenticated Telegram webhook result.
+
+        Frinz first gives the authenticated provider update to the isolated
+        child, which validates its active binding and normalizes it without
+        retaining a bot token.  A hosted delivery has no child-side polling
+        cursor/RPC pair, so the host must explicitly drive its resulting event
+        through the same Core durable channel boundary before returning HTTP
+        success to Telegram.  This narrow host API preserves the proxy-owned
+        agent/channel binding and refuses ordinary polling or un-attested
+        children from manufacturing hosted admission.
+        """
+
+        if (
+            not self._is_telegram_runtime()
+            or not self._hosted_telegram_startup_attested
+            or type(payload) is not dict
+        ):
+            return None
+        if (
+            terminal_disposition is not None
+            and terminal_disposition not in _TELEGRAM_TERMINAL_DISPOSITIONS
+        ):
+            raise ProtocolError("invalid hosted Telegram terminal disposition")
+        return await self._route_validated_inbound(
+            payload,
+            cursor_owned_protocol=True,
+            telegram_terminal_disposition=terminal_disposition,
+        )
 
     async def _route_inbound(self, payload: Any) -> Any:
         channel = self._channel_feature()

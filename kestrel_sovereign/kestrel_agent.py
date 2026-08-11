@@ -536,6 +536,7 @@ class KestrelAgent(
         hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
+        isolated_feature_data_dir: Optional[Path] = None,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
         semantic_inference_profile: Optional["InferenceProfile"] = None,
@@ -593,6 +594,11 @@ class KestrelAgent(
                        opaque authorization scope for ``peer_directory_router``.
                        This is injected by the embedding runtime, never derived
                        from a tool caller or user-id field.
+            isolated_feature_data_dir: Optional host-owned per-agent directory
+                       for isolated feature venvs and provisioning manifests.
+                       This lets a PostgreSQL-backed multi-tenant embedding
+                       isolate feature runtimes without pretending it owns a
+                       SQLite storage path.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -657,6 +663,11 @@ class KestrelAgent(
         # into agent state or accepting any caller-controlled substitute.
         self.peer_directory_router = peer_directory_router
         self.peer_requester = peer_requester
+        self.isolated_feature_data_dir = (
+            Path(isolated_feature_data_dir).expanduser().resolve()
+            if isolated_feature_data_dir is not None
+            else None
+        )
         self._sovereign_trust_root_path = sovereign_trust_root_path
         self.identity_export_dir = identity_export_dir
 

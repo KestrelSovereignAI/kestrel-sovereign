@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kestrel_sdk.isolated_feature import (
@@ -6597,6 +6597,58 @@ def test_telegram_polling_completion_descriptors_require_an_authoritative_pair()
     assert acknowledgement is not None
     assert acknowledgement.name == "whatsapp-webhook-ack"
 
+
+def test_telegram_terminal_envelope_preserves_the_attempt_fenced_ack_nack_pair():
+    """Terminal dispositions are bounded metadata, not a reason to drop ACK/NACK."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._authoritative_inbound_channel_type = lambda: "telegram"
+    event = _acknowledged_telegram_event("telegram:v2:bot:42:update:terminal")
+    event["payload"]["_telegram_terminal_disposition"] = {
+        "kind": "unauthorized_sender"
+    }
+    message, acknowledgement = feature._split_inbound_event_acknowledgement(
+        event["payload"]
+    )
+    assert message["id"] == "telegram:v2:bot:42:update:terminal"
+    assert acknowledgement is not None
+    assert feature._inbound_event_retry_completion(event["payload"]) is not None
+    assert feature._telegram_terminal_disposition(
+        event["payload"], cursor_owned_protocol=True
+    ) == "unauthorized_sender"
+
+
+@pytest.mark.asyncio
+async def test_hosted_telegram_ingress_is_admitted_only_through_the_durable_route():
+    """A host cannot treat the child's normalized event as an HTTP-only success."""
+
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock(return_value={"durably_admitted": True})
+
+    payload = {"id": "telegram:v2:bot:42:update:12", "content": "hello"}
+    assert await feature.admit_hosted_telegram_ingress(
+        payload, terminal_disposition="unsupported_update"
+    ) == {"durably_admitted": True}
+    feature._route_validated_inbound.assert_awaited_once_with(
+        payload,
+        cursor_owned_protocol=True,
+        telegram_terminal_disposition="unsupported_update",
+    )
+
+
+def test_explicit_isolated_feature_data_directory_wins_over_storage_path(tmp_path):
+    """Postgres-backed hosts can isolate venvs without a SQLite storage file."""
+
+    agent = SimpleNamespace(
+        storage_path=str(tmp_path / "legacy" / "agent.db"),
+        isolated_feature_data_dir=tmp_path / "host-owned" / "agent-a",
+    )
+
+    assert isolated_runtime._agent_data_dir(agent) == (
+        tmp_path / "host-owned" / "agent-a"
+    ).resolve()
 
 @pytest.mark.parametrize(
     ("allowed_senders", "expected"),
