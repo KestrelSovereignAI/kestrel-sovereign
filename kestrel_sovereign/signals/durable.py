@@ -20,7 +20,17 @@ import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Callable, Iterable, Optional
+from typing import (
+    Any,
+    AsyncContextManager,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Optional,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 
 from kestrel_sdk.signals import Signal
 
@@ -48,6 +58,13 @@ _PERSISTED_PAYLOAD = object()
 # recently registered dispatcher must not lose a lease simply because a
 # polling caller has no dispatcher instance from which to obtain that policy.
 _DEFAULT_RUNTIME_OWNER_STALE_AFTER = timedelta(minutes=2)
+
+
+@runtime_checkable
+class SQLiteImmediateTransactionBackend(Protocol):
+    """SQLite capability required to serialize durable-ledger bootstrap."""
+
+    def transaction(self, *, immediate: bool = False) -> AsyncContextManager[None]: ...
 
 
 @dataclass(frozen=True)
@@ -351,11 +368,29 @@ class DurableSignalStore(UnifiedStoreBase):
                 )
                 yield
             return
-        if self._backend.backend_type == "sqlite":
-            async with self._backend.transaction(immediate=True):
+        if self.is_sqlite:
+            transaction = self._sqlite_immediate_transaction()
+            async with transaction:
                 yield
             return
         raise RuntimeError("Durable signal delivery supports only sqlite or postgres databases")
+
+    def _sqlite_immediate_transaction(self) -> AsyncContextManager[None]:
+        """Return a SQLite transaction that reserves the writer before reads."""
+
+        if not isinstance(self._backend, SQLiteImmediateTransactionBackend):
+            raise RuntimeError(
+                "SQLite durable signal delivery requires transaction(immediate=True) "
+                "for schema bootstrap"
+            )
+        transaction = cast(SQLiteImmediateTransactionBackend, self._backend).transaction
+        try:
+            return transaction(immediate=True)
+        except TypeError as exc:
+            raise RuntimeError(
+                "SQLite durable signal delivery requires transaction(immediate=True) "
+                "for schema bootstrap"
+            ) from exc
 
     async def _ensure_caller_identity_column(self) -> None:
         """Apply the sole additive event-table migration under the schema lock."""

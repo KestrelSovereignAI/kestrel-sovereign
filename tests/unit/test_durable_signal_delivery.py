@@ -3862,6 +3862,73 @@ async def test_postgres_registration_handoff_uses_a_transaction_scoped_scope_loc
 
 
 @pytest.mark.asyncio
+async def test_postgres_schema_bootstrap_uses_its_standard_advisory_lock_transaction():
+    """PostgreSQL bootstrap retains its ordinary transaction capability."""
+
+    transaction_entries: list[None] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+        fetch_val = AsyncMock(return_value=None)
+
+        @asynccontextmanager
+        async def transaction(self):
+            transaction_entries.append(None)
+            yield
+
+    store = DurableSignalStore(_PostgresBackend())
+    async with store._schema_bootstrap_transaction():
+        pass
+
+    assert transaction_entries == [None]
+    _PostgresBackend.fetch_val.assert_awaited_once_with(
+        "SELECT pg_advisory_xact_lock(hashtext('kestrel.durable_signal.bootstrap'))"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_schema_bootstrap_requests_an_immediate_transaction():
+    """Schema migration acquires SQLite's writer slot before inspecting tables."""
+
+    immediate_requests: list[bool] = []
+
+    class _SQLiteBackend:
+        backend_type = "sqlite"
+
+        @asynccontextmanager
+        async def transaction(self, *, immediate: bool = False):
+            immediate_requests.append(immediate)
+            yield
+
+    store = DurableSignalStore(_SQLiteBackend())
+    async with store._schema_bootstrap_transaction():
+        pass
+
+    assert immediate_requests == [True]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_schema_bootstrap_rejects_backends_without_immediate_transactions():
+    """A SQLite backend cannot silently fall back to a deferred bootstrap."""
+
+    class _IncompatibleSQLiteBackend:
+        backend_type = "sqlite"
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    store = DurableSignalStore(_IncompatibleSQLiteBackend())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"SQLite durable signal delivery requires transaction\(immediate=True\)",
+    ):
+        async with store._schema_bootstrap_transaction():
+            pass
+
+
+@pytest.mark.asyncio
 async def test_postgres_durable_owner_and_recovery_binds_preserve_aware_utc_instants():
     """TIMESTAMPTZ owner/lease operations retain instants, unlike naive TIMESTAMP binds."""
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
