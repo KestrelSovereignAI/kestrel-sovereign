@@ -1806,6 +1806,55 @@ def _host_sdk_version() -> str:
     return "unknown"
 
 
+def _feature_distribution_version(distribution: str, install_target: str) -> str:
+    """Return the host-visible feature release used to provision a child.
+
+    The install target is often deliberately unversioned (for example
+    ``kestrel-channel-telegram[service]``), so it cannot tell a provisioned
+    venv that the host's feature distribution has changed. Explicit local
+    project metadata wins for editable targets; installed distribution
+    metadata covers normal package targets.
+
+    ``unknown`` is an honest non-version rather than a moving value: callers
+    stamp it once and do not reprovision forever when a target has no readable
+    version metadata.
+    """
+    # Editable installs retain their original ``.dist-info`` version until
+    # they are reinstalled. For an explicit local project, its source metadata
+    # therefore has to win over that stale installed record or a source version
+    # bump could not trigger the very reprovision it requires.
+    if isinstance(install_target, str) and install_target:
+        local_target = install_target.removeprefix("-e ").strip()
+        is_local_target = local_target.startswith((".", "/", "~", "file://"))
+        if is_local_target:
+            if local_target.startswith("file://"):
+                local_target = local_target.removeprefix("file://")
+            # pip permits extras on a local directory target; they are not
+            # part of the filesystem path containing project metadata.
+            local_target = re.sub(r"\[[^]]*\]$", "", local_target)
+            pyproject = Path(local_target).expanduser() / "pyproject.toml"
+            if pyproject.is_file():
+                try:
+                    try:
+                        import tomllib
+                    except ImportError:  # pragma: no cover - Python < 3.11 support
+                        import tomli as tomllib  # type: ignore[no-redef]
+
+                    data = tomllib.loads(pyproject.read_text())
+                    version = data.get("project", {}).get("version")
+                    if isinstance(version, str) and version:
+                        return version
+                except Exception:  # noqa: BLE001 - use installed metadata below
+                    pass
+
+    if isinstance(distribution, str) and distribution:
+        try:
+            return importlib_metadata.version(distribution)
+        except Exception:  # noqa: BLE001 - a non-installed target is stable below
+            pass
+    return "unknown"
+
+
 # Probe run *inside* a feature venv to report the kestrel-sdk version actually
 # installed there — mirrors _host_sdk_version's distribution resolution.
 _CHILD_SDK_PROBE = (
@@ -5685,6 +5734,8 @@ class ProxyFeature(Feature):
             if not callable(getter) or getter(self._channel_adapter.channel_type) is self._channel_adapter:
                 registry.unregister(self._channel_adapter.channel_type)
         self._channel_adapter = None
+        self._channel_type = None
+        self._link_tool = None
 
     def _channel_feature(self) -> Any:
         features = getattr(self.agent, "features", None)
@@ -5933,7 +5984,11 @@ class ProxyFeature(Feature):
             return {}
 
     def _write_provision_manifest(
-        self, install_target: str, host_sdk: str, child_sdk: str
+        self,
+        install_target: str,
+        host_sdk: str,
+        child_sdk: str,
+        feature_distribution_version: str,
     ) -> None:
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -5948,20 +6003,39 @@ class ProxyFeature(Feature):
                     # The SDK version that actually landed in the venv (may lag
                     # host_sdk if the feature pins it); recorded for diagnosis.
                     "child_sdk_version": child_sdk,
+                    # ``project`` is commonly an unversioned pip target. Keep
+                    # the host-visible distribution release separately so an
+                    # upgraded isolated feature cannot keep running an older
+                    # child merely because its target string did not change.
+                    "feature_distribution_version": feature_distribution_version,
                 },
                 indent=2,
             )
         )
 
     def _provision_is_stale(self, install_target: str) -> bool:
-        """A provisioned venv is stale if the install target changed or the host
-        has upgraded kestrel-sdk since we last provisioned against it (F019: a
-        stale wire contract — e.g. pre-0.28 serial dispatch — must not silently
-        survive a host update)."""
+        """Return whether this host-owned venv must be reprovisioned.
+
+        The stamp covers the exact project target, the host SDK wire contract,
+        and the feature distribution release.  An unavailable distribution
+        version does not become a moving stale marker: it is stamped as
+        ``unknown`` and remains fresh until a concrete version is observable.
+        """
         manifest = self._read_provision_manifest()
         if manifest.get("install_target") != install_target:
             return True
         if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
+            return True
+        installed_version = _feature_distribution_version(
+            self.runtime.distribution, install_target
+        )
+        stamped_version = manifest.get("feature_distribution_version")
+        # Old manifests predate this stamp. Reprovision once even when the
+        # version cannot be observed, then treat an ``unknown`` stamp as stable
+        # so local/dynamic targets do not reinstall on every startup.
+        if not isinstance(stamped_version, str):
+            return True
+        if installed_version != "unknown" and stamped_version != installed_version:
             return True
         return False
 
@@ -6028,7 +6102,12 @@ class ProxyFeature(Feature):
         host_sdk = _host_sdk_version()
         child_sdk = _venv_sdk_version(python_path)
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
-        self._write_provision_manifest(install_target, host_sdk, child_sdk)
+        self._write_provision_manifest(
+            install_target,
+            host_sdk,
+            child_sdk,
+            _feature_distribution_version(self.runtime.distribution, install_target),
+        )
 
     def _warn_on_sdk_mismatch(
         self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
@@ -6703,12 +6782,11 @@ class ProxyFeature(Feature):
         if type(message) is not dict or type(descriptor) is not dict:
             return message, None
         # Telegram polling is a cursor-owning protocol, not a convention
-        # inferred from an arbitrary child descriptor name.  Classify it from
-        # the canonical normalized message identity and require its complete
-        # ACK/NACK pair before Core is allowed to advance or release a poll.
-        # This prevents a Telegram-shaped message from smuggling a tokenless
-        # other-provider completion through the generic descriptor path.
-        if self._is_canonical_telegram_message(message):
+        # inferred from an arbitrary child descriptor name *or* a child-owned
+        # field in an inbound message.  The registered proxy bridge is the
+        # only host-negotiated identity that can classify this callback, and
+        # therefore the only identity allowed to select its ACK/NACK contract.
+        if self._authoritative_inbound_channel_type() == "telegram":
             pair = self._telegram_polling_completion_pair(payload, message)
             return message, pair[0] if pair is not None else None
         if set(descriptor) != {"name", "payload"}:
@@ -6744,18 +6822,38 @@ class ProxyFeature(Feature):
         if (telegram_polling_ack and type(attempt_token) is not str) or (
             attempt_token is not None
             and (
-            type(attempt_token) is not str
-            or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
+                type(attempt_token) is not str
+                or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
             )
         ):
             return message, None
         return message, request
 
-    @staticmethod
-    def _is_canonical_telegram_message(message: dict[str, Any]) -> bool:
-        """Whether a normalized inbound message authoritatively identifies Telegram."""
+    def _authoritative_inbound_channel_type(self) -> str | None:
+        """Return this proxy's currently registered inbound channel identity.
 
-        return message.get("channel_type") == "telegram"
+        The isolated child owns every event field, including ``channel_type``.
+        It may not select an allowlist, routing adapter, or cursor-completion
+        protocol by changing that field.  A channel is authoritative only
+        while this exact proxy adapter remains registered in the host's
+        ChannelFeature; a missing/replaced bridge fails closed instead of
+        bypassing the sender filter through a generic route.
+        """
+        channel_type = self._channel_type
+        adapter = self._channel_adapter
+        if (
+            not isinstance(channel_type, str)
+            or not channel_type
+            or adapter is None
+            or getattr(adapter, "channel_type", None) != channel_type
+        ):
+            return None
+        channel_feature = self._channel_feature()
+        registry = getattr(channel_feature, "registry", None) if channel_feature else None
+        getter = getattr(registry, "get", None)
+        if not callable(getter) or getter(channel_type) is not adapter:
+            return None
+        return channel_type
 
     @staticmethod
     def _telegram_polling_completion_pair(
@@ -7282,6 +7380,14 @@ class ProxyFeature(Feature):
             )
             return None
 
+        authoritative_channel_type = self._authoritative_inbound_channel_type()
+        if authoritative_channel_type is None:
+            logger.warning(
+                "Inbound notification from %s dropped: no registered host channel bridge",
+                self.name,
+            )
+            return None
+
         from kestrel_sovereign.features.channels.models import ChannelMessage
 
         message = payload
@@ -7307,6 +7413,9 @@ class ProxyFeature(Feature):
         # ChannelFeature repeats this binding before its own persistence so a
         # direct caller cannot bypass the proxy's authoritative scope either.
         message.agent_id = authoritative_agent_id
+        # Route and sender filtering must use the host-negotiated proxy
+        # identity, never the isolated child's mutable wire field.
+        message.channel_type = authoritative_channel_type
         return await channel.handle_inbound(message)
 
 

@@ -1122,11 +1122,15 @@ class DurableSignalStore(UnifiedStoreBase):
         agent_id: str,
         owner_id: str,
         now: Optional[datetime] = None,
+        mark_owner_stopped: bool = True,
     ) -> int:
-        """Gracefully turn this runtime's unactivated rows into marker replay.
+        """Release this runtime's unactivated rows into marker replay.
 
         This is deliberately scoped to one runtime owner.  A concurrent live
         dispatcher cannot release another emitter's raw-payload reservation.
+        A cancellation-resistant cognition task can outlive ordinary shutdown;
+        callers retain that owner's liveness fence by passing
+        ``mark_owner_stopped=False`` until the task is actually settled.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
@@ -1150,20 +1154,21 @@ class DurableSignalStore(UnifiedStoreBase):
                     owner_id,
                 ),
             )
-            await self._backend.execute(
-                f"""
-                UPDATE {self.RUNTIME_OWNERS}
-                SET heartbeat_at = ?, stopped_at = ?, updated_at = ?
-                WHERE agent_id = ? AND owner_id = ?
-                """,
-                (
-                    self.to_timestamp_param(now),
-                    self.to_timestamp_param(now),
-                    self.to_timestamp_param(now),
-                    agent_id,
-                    owner_id,
-                ),
-            )
+            if mark_owner_stopped:
+                await self._backend.execute(
+                    f"""
+                    UPDATE {self.RUNTIME_OWNERS}
+                    SET heartbeat_at = ?, stopped_at = ?, updated_at = ?
+                    WHERE agent_id = ? AND owner_id = ?
+                    """,
+                    (
+                        self.to_timestamp_param(now),
+                        self.to_timestamp_param(now),
+                        self.to_timestamp_param(now),
+                        agent_id,
+                        owner_id,
+                    ),
+                )
         return released
 
     async def abandon_initial_reservation(

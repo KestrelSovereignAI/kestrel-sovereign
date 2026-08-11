@@ -96,6 +96,19 @@ class FakeIsolatedClient:
         self.event_handler = handler
 
 
+class TelegramChannelClient(FakeIsolatedClient):
+    """An isolated client which explicitly negotiates the Telegram bridge."""
+
+    @property
+    def capabilities(self):
+        return {
+            "channel": {
+                "channel_type": "telegram",
+                "send_tool": "telegram_send",
+            }
+        }
+
+
 @pytest.mark.asyncio
 async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_path):
     agent = Mock(did=_TEST_AGENT_DID)
@@ -1043,6 +1056,9 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     # Child venv python is a stub (empty file) — report a concrete SDK version
     # rather than shelling out to it.
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+    monkeypatch.setattr(
+        ir, "_feature_distribution_version", lambda _distribution, _target: "1.0.0"
+    )
 
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
     feature.ensure_venv()  # fresh: uv venv + uv pip install (no --upgrade)
@@ -1052,6 +1068,7 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
     assert manifest["provisioned_against_host_sdk"] == "0.28.0"
     assert manifest["child_sdk_version"] == "0.28.0"
+    assert manifest["feature_distribution_version"] == "1.0.0"
 
     runs.clear()
     # Same host SDK → no reprovision.
@@ -1079,6 +1096,134 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert manifest["child_sdk_version"] == "0.28.0"
     runs.clear()
     feature.ensure_venv()  # not stale now (host unchanged) → no thrash
+    assert runs == []
+
+
+def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, monkeypatch):
+    """An unversioned Telegram service target still follows its distribution release."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project="kestrel-channel-telegram[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    version = {"value": "0.1.1"}
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    monkeypatch.setattr(
+        ir,
+        "_feature_distribution_version",
+        lambda distribution, target: version["value"],
+    )
+
+    feature.ensure_venv()
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == [], "an unchanged Telegram release must remain fresh"
+
+    version["value"] = "0.1.2"
+    feature.ensure_venv()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == [], "the new Telegram release stamp must converge after one upgrade"
+
+
+def test_feature_distribution_version_reads_local_editable_project_metadata(
+    tmp_path, monkeypatch
+):
+    """Editable source metadata wins over its stale installed dist-info stamp."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.2'\n"
+    )
+    monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
+
+    assert (
+        ir._feature_distribution_version(
+            "kestrel-channel-telegram", f"-e {project}[service]"
+        )
+        == "0.1.2"
+    )
+
+
+def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatch):
+    """A local editable source upgrade reprovisions once, then stays fresh."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    project = tmp_path / "telegram"
+    project.mkdir()
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.1'\n"
+    )
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature",
+        entry_point="kestrel_channel_telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram",
+        runtime="isolated-venv",
+        service="kestrel-telegram-service",
+        project=f"-e {project}[service]",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        python = feature._venv_path / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _path: "0.35.1")
+    # A real editable installation can retain this old dist-info version until
+    # it is reinstalled; the local source stamp must still see the upgrade.
+    monkeypatch.setattr(ir.importlib_metadata, "version", lambda _name: "0.1.1")
+
+    feature.ensure_venv()
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == []
+
+    pyproject.write_text(
+        "[project]\nname = 'kestrel-channel-telegram'\nversion = '0.1.2'\n"
+    )
+    feature.ensure_venv()
+    installs = [cmd for cmd in runs if "pip" in cmd and "install" in cmd]
+    assert installs and "--upgrade" in installs[-1]
+
+    runs.clear()
+    feature.ensure_venv()
     assert runs == []
 
 
@@ -5453,7 +5598,7 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
     release_acknowledgement = asyncio.Event()
     delivered = []
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             delivery_started.set()
             await release_delivery.wait()
@@ -5461,6 +5606,15 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
             return SimpleNamespace(durably_admitted=True)
 
     class AcknowledgingClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -5559,12 +5713,12 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
     delivered = []
     acknowledged = asyncio.Event()
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             delivered.append(message.id)
             return SimpleNamespace(durably_admitted=True)
 
-    class AckClient(FakeIsolatedClient):
+    class AckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -5670,9 +5824,10 @@ def _retryable_telegram_event(dedupe_key: str) -> dict:
 
 
 def test_telegram_polling_completion_descriptors_require_an_authoritative_pair():
-    """Telegram classification comes from the message, never descriptor names."""
+    """Telegram completion semantics come from the registered proxy identity."""
 
     feature = object.__new__(ProxyFeature)
+    feature._authoritative_inbound_channel_type = lambda: "telegram"
     valid = _retryable_telegram_event("telegram:v2:bot:42:update:attempt-fenced")
     assert feature._inbound_event_retry_completion(valid["payload"]) is not None
 
@@ -5710,7 +5865,9 @@ def test_telegram_polling_completion_descriptors_require_an_authoritative_pair()
     assert acknowledgement is None
     assert feature._inbound_event_retry_completion(renamed["payload"]) is None
 
-    # Non-Telegram descriptors retain their established generic contract.
+    # A different host-negotiated channel retains its established generic
+    # completion contract; the child message field does not choose it.
+    feature._authoritative_inbound_channel_type = lambda: "whatsapp"
     non_telegram = _acknowledged_telegram_event("whatsapp:v1:message:1")
     non_telegram["payload"]["message"]["channel_type"] = "whatsapp"
     non_telegram["payload"]["_host_ingress_ack"] = {
@@ -5723,6 +5880,95 @@ def test_telegram_polling_completion_descriptors_require_an_authoritative_pair()
     )
     assert acknowledgement is not None
     assert acknowledgement.name == "whatsapp-webhook-ack"
+
+
+@pytest.mark.asyncio
+async def test_spoofed_child_channel_type_cannot_bypass_proxy_allowlist_or_telegram_pair(
+    monkeypatch, tmp_path
+):
+    """A Telegram child cannot select another adapter/filter with wire data."""
+
+    routed = []
+
+    from kestrel_sovereign.features.channels.feature import ChannelFeature
+
+    async def route_inbound(message):
+        routed.append((message.channel_type, message.sender))
+
+    class TelegramClient(FakeIsolatedClient):
+        @property
+        def capabilities(self):
+            return {
+                "channel": {
+                    "channel_type": "telegram",
+                    "send_tool": "telegram_send",
+                }
+            }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    channel_agent = SimpleNamespace(
+        did=_TEST_AGENT_DID,
+        storage=SimpleNamespace(agent_id=_TEST_AGENT_DID),
+        dispatcher=None,
+        signal_registry=None,
+        features={},
+    )
+    channel_feature = ChannelFeature(channel_agent)
+    await channel_feature.initialize()
+    channel_feature.registry.set_inbound_router(route_inbound)
+    agent = Mock(did=_TEST_AGENT_DID, features={"ChannelFeature": channel_feature})
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=TelegramClient)
+    feature._host_config = {
+        "agent_id": _TEST_AGENT_DID,
+        "enabled": True,
+        "allowed_senders": ["555"],
+    }
+    feature._host_config_loaded = True
+    try:
+        await feature.initialize()
+        event = _acknowledged_telegram_event("telegram:v2:bot:42:update:spoofed")
+        event["payload"]["message"]["channel_type"] = "whatsapp"
+        event["payload"]["_host_ingress_ack"]["name"] = "renamed-ack"
+        event["payload"]["_host_ingress_retry"]["name"] = "renamed-nack"
+
+        await feature._client.event_handler(event)
+        await asyncio.sleep(0)
+
+        # The authoritative Telegram identity rejects the renamed pair; it
+        # cannot fall through to WhatsApp's absent adapter/filter. Real
+        # ChannelFeature authorization sees the Telegram bridge's allowlist.
+        assert routed == [("telegram", "555")]
+        assert feature._client.completions == []
+
+        denied = _acknowledged_telegram_event("telegram:v2:bot:42:update:denied")
+        denied["payload"]["message"]["channel_type"] = "whatsapp"
+        denied["payload"]["message"]["sender"] = "not-allowed"
+        await feature._client.event_handler(denied)
+        await asyncio.sleep(0)
+        assert routed == [("telegram", "555")]
+
+        channel_feature.registry.unregister("telegram")
+        await feature._client.event_handler(_acknowledged_telegram_event(
+            "telegram:v2:bot:42:update:missing-adapter"
+        ))
+        await asyncio.sleep(0)
+        assert routed == [("telegram", "555")]
+    finally:
+        await feature.shutdown()
+        await channel_feature.shutdown()
 
 
 @pytest.mark.asyncio
@@ -5854,12 +6100,12 @@ async def test_retired_source_event_is_rejected_under_traffic_admission(monkeypa
     dedupe_key = "telegram:v2:bot:42:update:202"
     delivered = []
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             delivered.append(message.id)
             return SimpleNamespace(durably_admitted=True)
 
-    class AckClient(FakeIsolatedClient):
+    class AckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -5904,12 +6150,12 @@ async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypat
     delivered = []
     acknowledged = []
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             delivered.append(message.id)
             return SimpleNamespace(durably_admitted=True)
 
-    class AckClient(FakeIsolatedClient):
+    class AckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -5960,11 +6206,11 @@ async def test_deferred_acknowledged_ingress_exception_nacks_exact_live_callback
     dedupe_key = "telegram:v2:bot:42:update:deferred-route-failure"
     nacked = asyncio.Event()
 
-    class FailingChannelFeature:
+    class FailingChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, _message):
             raise RuntimeError("cognition route failed")
 
-    class CompletionClient(FakeIsolatedClient):
+    class CompletionClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -6015,12 +6261,12 @@ async def test_ingress_workers_are_bounded_to_one_per_source_under_1000_events(m
     ack_started = asyncio.Event()
     delivered = []
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             delivered.append(message.id)
             return SimpleNamespace(durably_admitted=True)
 
-    class SlowAckClient(FakeIsolatedClient):
+    class SlowAckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -6067,11 +6313,11 @@ async def test_rejected_ack_retries_then_terminally_retires_exact_source(monkeyp
     monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
     dedupe_key = "telegram:v2:bot:42:update:205"
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             return SimpleNamespace(durably_admitted=True)
 
-    class RejectingAckClient(FakeIsolatedClient):
+    class RejectingAckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -6123,11 +6369,11 @@ async def test_hung_ack_times_out_with_bounded_retries_then_retires_source(
     monkeypatch.setattr(isolated_runtime, "_EVENT_INGRESS_ACK_BACKOFF", 0)
     dedupe_key = "telegram:v2:bot:42:update:208"
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             return SimpleNamespace(durably_admitted=True)
 
-    class HungAckClient(FakeIsolatedClient):
+    class HungAckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(
@@ -6177,11 +6423,11 @@ async def test_terminal_owner_joins_ack_and_deferred_workers_and_blocks_new_ack(
     ack_started = asyncio.Event()
     release_ack = asyncio.Event()
 
-    class ChannelFeature:
+    class ChannelFeature(FakeChannelFeature):
         async def handle_inbound(self, message):
             return SimpleNamespace(durably_admitted=True)
 
-    class SlowAckClient(FakeIsolatedClient):
+    class SlowAckClient(TelegramChannelClient):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.host_ingress_capabilities = HostIngressCapabilities(

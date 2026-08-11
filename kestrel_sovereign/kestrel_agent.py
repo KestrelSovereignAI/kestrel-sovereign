@@ -6125,6 +6125,11 @@ Expected Duration: {expected_duration}
         the agent or releasing its budget.
         """
         await dispatcher.shutdown_durable_delivery()
+        wait_for_owner_release = getattr(
+            dispatcher, "wait_for_durable_shutdown_release", None
+        )
+        if callable(wait_for_owner_release):
+            await wait_for_owner_release()
         if storage_preclose is not None:
             await storage_preclose()
         if storage is not None and hasattr(storage, "close"):
@@ -6720,11 +6725,19 @@ Expected Duration: {expected_duration}
         # lifecycle timeout already cancelled us, leave the continuation
         # shielded and let that lifecycle owner join it before removing the
         # agent; re-raising below preserves the cancellation contract.
-        if not shutdown_cancelled:
+        dispatcher_owner_fenced = bool(
+            getattr(dispatcher, "durable_shutdown_owner_fenced", False)
+        )
+        if not shutdown_cancelled and not dispatcher_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion()
             except asyncio.CancelledError:
                 shutdown_cancelled = True
+        elif dispatcher_owner_fenced:
+            # The continuation owns storage close after the hostile cognition
+            # task settles. Returning degraded keeps shutdown bounded without
+            # making that live task peer-reclaimable in this process.
+            tail_degraded = True
         elif (
             self._durable_shutdown_continuation is not None
             and not self._durable_shutdown_continuation.done()
@@ -7066,6 +7079,18 @@ Expected Duration: {expected_duration}
                 "durable-signal-dispatcher",
             )
             dispatcher_shutdown_complete = dispatcher_shutdown_status == "ok"
+            if getattr(dispatcher, "durable_shutdown_owner_fenced", False):
+                await self._ensure_durable_shutdown_continuation(dispatcher)
+                logging.warning(
+                    "Durable cognition is still running after shutdown cancellation; "
+                    "keeping owner liveness and storage fenced until it settles."
+                )
+                # Other bounded shutdown work remains safe and useful (memory
+                # bookkeeping and sync workers do not own the retained
+                # delivery lease). The continuation observed below is the
+                # sole fence around shared storage close.
+                state["degraded"] = True
+                dispatcher_shutdown_complete = False
             # The dispatcher owns an independent, shielded teardown task, so
             # caller cancellation cannot strand committed work.  If its task
             # outlives this guard, it may still be using the same backend;

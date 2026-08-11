@@ -1261,6 +1261,173 @@ async def test_renewal_loss_quarantines_cancellation_resistant_cognition_until_i
 
 
 @pytest.mark.asyncio
+async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_peer_safe(
+    tmp_path, monkeypatch
+):
+    """Bounded unload cannot mark a still-acting cognition owner reclaimable."""
+    monkeypatch.setattr(dispatcher_module, "_DURABLE_COGNITION_CANCELLATION_GRACE", 0.01)
+    path = tmp_path / "shutdown-cognition-owner-fence.db"
+    backend_a, agent_a, dispatcher_a = await _channel_dispatcher(path, "did:agent:one")
+    backend_b, agent_b, dispatcher_b = await _channel_dispatcher(path, "did:agent:one")
+    # Shorten only the test's owner-staleness window. The fence must continue
+    # its private heartbeat after ordinary shutdown closes public admission.
+    dispatcher_a._runtime_owner_stale_after = timedelta(milliseconds=45)
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent_a.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+        lease_seconds=1,
+    )
+    started = asyncio.Event()
+    repeated_cancellation = asyncio.Event()
+    allow_exit = asyncio.Event()
+    cancellation_count = 0
+
+    async def hostile_turn(_prompt: str):
+        nonlocal cancellation_count
+        started.set()
+        while True:
+            try:
+                await allow_exit.wait()
+                return "settled after hostile cancellation"
+            except asyncio.CancelledError:
+                cancellation_count += 1
+                if cancellation_count >= 3:
+                    repeated_cancellation.set()
+
+    async def reject_renewal(**_kwargs):
+        return None
+
+    agent_a.process_input = hostile_turn
+    dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        await dispatcher_b.register_durable_consumer(consumer)
+        first = await dispatcher_a.enqueue_durable_cognition(
+            _channel_signal(agent_a.did, "shutdown-owner-fence"),
+            source_event_id="telegram:update:shutdown-owner-fence",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert (await asyncio.wait_for(first.wait(), timeout=1)).status is Status.FAILED
+        leased = (await dispatcher_a.list_durable_deliveries())[0]
+
+        # The public shutdown is bounded. It returns with a live ownership
+        # fence while the task keeps suppressing cancellation in the process.
+        assert await asyncio.wait_for(dispatcher_a.shutdown_durable_delivery(), timeout=1) is False
+        await asyncio.wait_for(repeated_cancellation.wait(), timeout=1)
+        assert dispatcher_a.durable_shutdown_owner_fenced is True
+        owner = await backend_a.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
+            (agent_a.did, dispatcher_a._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is None
+
+        # Crossing multiple stale windows must not make retained work
+        # reclaimable: the fence timer runs a private owner heartbeat even
+        # though public durable APIs remain closed.
+        await asyncio.sleep(0.12)
+        assert await dispatcher_b._durable_store.recover_abandoned_leases(
+            agent_id=agent_b.did,
+            recovering_owner_id=dispatcher_b._durable_delivery_owner,
+            stale_before=datetime.now(timezone.utc)
+            - dispatcher_a._runtime_owner_stale_after,
+        ) == 0
+
+        # Even after its lease's nominal deadline, a peer cannot reclaim while
+        # the original coroutine could still make a side effect.
+        assert await dispatcher_b._durable_store.claim_delivery_for_event(
+            agent_id=agent_b.did,
+            consumer_id=consumer.consumer_id,
+            event_id=leased.event.event_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+            now=leased.lease_expires_at + timedelta(microseconds=1),
+            runtime_owner_stale_before=leased.lease_expires_at - timedelta(minutes=1),
+        ) is None
+
+        allow_exit.set()
+        await asyncio.wait_for(dispatcher_a.wait_for_durable_shutdown_release(), timeout=1)
+        assert dispatcher_a.durable_shutdown_owner_fenced is False
+        owner = await backend_a.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
+            (agent_a.did, dispatcher_a._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+
+        # Now recovery is legitimate: the old task is terminal before the peer
+        # can obtain the delivery again.
+        assert await dispatcher_b._durable_store.recover_abandoned_leases(
+            agent_id=agent_b.did,
+            recovering_owner_id=dispatcher_b._durable_delivery_owner,
+            stale_before=datetime.now(timezone.utc),
+        ) == 1
+        assert await dispatcher_b._durable_store.claim_delivery_for_event(
+            agent_id=agent_b.did,
+            consumer_id=consumer.consumer_id,
+            event_id=leased.event.event_id,
+            executor_id=dispatcher_b._durable_delivery_owner,
+        ) is not None
+    finally:
+        allow_exit.set()
+        await dispatcher_a.wait_for_durable_shutdown_release()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_durable_cognition_nested_and_background_dispatches_keep_one_audit_each(tmp_path):
+    """Nested dispatch ContextVars cannot append outcomes into the outer lease audit."""
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "isolated-deferred-outcomes.db", "did:agent:one"
+    )
+    dispatcher._registry.register(_registration(agent))
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    awaited = _signal(agent_id=agent.did, message="awaited nested")
+    created = _signal(agent_id=agent.did, message="created nested")
+    enqueued = _signal(agent_id=agent.did, message="enqueued nested")
+
+    async def cognition_turn(_prompt: str):
+        assert (await dispatcher.dispatch_signal(awaited)).status is Status.OK
+        created_task = asyncio.create_task(dispatcher.dispatch_signal(created))
+        assert (await created_task).status is Status.OK
+        handle = await dispatcher.enqueue_signal(enqueued)
+        assert (await handle.task).status is Status.OK
+        return "outer complete"
+
+    agent.process_input = cognition_turn
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        outer = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "isolated-deferred-outcomes"),
+            source_event_id="telegram:update:isolated-deferred-outcomes",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await outer.wait()).status is Status.OK
+        for signal_id in (outer.signal_id, awaited.id, created.id, enqueued.id):
+            assert await backend.fetch_val(
+                "SELECT COUNT(*) FROM signal_log WHERE id = ?", (signal_id,)
+            ) == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("acknowledged", (True, False))
 async def test_simultaneous_route_success_and_lease_loss_finalizes_once(
     tmp_path, acknowledged
@@ -3015,6 +3182,63 @@ async def test_postgres_registration_handoff_uses_a_transaction_scoped_scope_loc
         "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
         ("durable-signal:did:agent:one:provider.message",),
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_durable_owner_and_recovery_binds_preserve_aware_utc_instants():
+    """TIMESTAMPTZ owner/lease operations retain instants, unlike naive TIMESTAMP binds."""
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    captured: list[tuple[str, tuple]] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        async def execute(self, query, params=()):
+            captured.append((query, PostgresBackend._strip_tz(params)))
+            return 1
+
+    store = DurableSignalStore(_PostgresBackend())
+    central = datetime(2026, 8, 10, 7, tzinfo=timezone(timedelta(hours=-5)))
+    expected = datetime(2026, 8, 10, 12, tzinfo=timezone.utc)
+
+    await store.heartbeat_runtime_owner(
+        agent_id="did:agent:one", owner_id="dispatcher:owner", now=central
+    )
+    await store.recover_abandoned_leases(
+        agent_id="did:agent:one",
+        recovering_owner_id="dispatcher:recovery",
+        stale_before=central - timedelta(minutes=2),
+        now=central,
+    )
+
+    bound_instants = [
+        value
+        for _query, params in captured
+        for value in params
+        if isinstance(value, datetime)
+    ]
+    assert bound_instants
+    assert all(value.tzinfo == timezone.utc for value in bound_instants)
+    assert expected in bound_instants
+    assert all("::TIMESTAMPTZ" in query for query, _params in captured[1:])
+
+    # The generic Postgres path retains its legacy naive TIMESTAMP behavior.
+    naive = datetime(2026, 8, 10, 12)
+    legacy_aware = datetime(2026, 8, 10, 7, tzinfo=timezone(timedelta(hours=-5)))
+    assert PostgresBackend._strip_tz((naive, legacy_aware)) == (
+        naive,
+        legacy_aware.replace(tzinfo=None),
+    )
+
+    class _SQLiteBackend:
+        backend_type = "sqlite"
+
+    assert DurableSignalStore(_SQLiteBackend()).to_timestamp_param(central) == central.isoformat()
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ import contextvars
 import logging
 from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -41,6 +41,7 @@ from .interface import (
     TransactionError,
 )
 from .placeholder import sqlite_to_postgres
+from .timestamp import TimestamptzParameter
 from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
@@ -482,17 +483,27 @@ class PostgresBackend(DatabaseBackend):
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
-        """Strip timezone info from datetime params.
+        """Adapt timestamp parameters without changing their SQL contract.
 
-        The schema uses TIMESTAMP (naive), not TIMESTAMPTZ. asyncpg
-        raises errors when mixing offset-naive and offset-aware datetimes,
-        so we strip tzinfo from any aware datetime params.
+        Legacy callers bind to genuinely timezone-naive ``TIMESTAMP`` columns,
+        where asyncpg requires a naive datetime. Unified stores that declare
+        ``TIMESTAMPTZ`` use :class:`TimestamptzParameter` explicitly; preserve
+        an aware value there (normalizing to UTC) so its absolute instant does
+        not become process-local wall time before asyncpg sees it.
         """
-        return tuple(
-            p.replace(tzinfo=None) if isinstance(p, datetime) and p.tzinfo is not None
-            else p
-            for p in params
-        )
+        adapted: list[Any] = []
+        for param in params:
+            if isinstance(param, TimestamptzParameter):
+                value = param.value
+                if value.tzinfo is not None and value.utcoffset() is not None:
+                    adapted.append(value.astimezone(timezone.utc))
+                else:
+                    adapted.append(value)
+            elif isinstance(param, datetime) and param.tzinfo is not None:
+                adapted.append(param.replace(tzinfo=None))
+            else:
+                adapted.append(param)
+        return tuple(adapted)
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
