@@ -984,6 +984,48 @@ class TestAgentManagerBasics:
         assert not manager.is_scheduler_agent_authorized(mock.agent_id)
 
     @pytest.mark.asyncio
+    async def test_stale_delete_never_removes_same_name_replacement(self):
+        """A DELETE holding DID A's lock cannot unpublish replacement DID B."""
+
+        manager = AgentManager()
+        old_config = LocalAgentConfig(data_dir="old", port=8801)
+        new_config = LocalAgentConfig(data_dir="new", port=8802)
+        old = _make_mock_agent("did:pkh:old-delete-target")
+        replacement = _make_mock_agent("did:pkh:same-name-replacement")
+        manager._agents["Managed"] = old
+        manager._agent_names[old.agent_id] = "Managed"
+        manager._seed_scheduler_authority(
+            {old.agent_id: ("Managed", old_config)}
+        )
+
+        lifecycle_lock = manager.scheduler_lifecycle_lock(old.agent_id)
+        await lifecycle_lock.acquire_read()
+        deletion = asyncio.create_task(manager.remove_agent("Managed"))
+        try:
+            while lifecycle_lock._waiting_writers == 0:
+                await asyncio.sleep(0)
+
+            async with manager._a2a_lifecycle_lock:
+                manager._agents["Managed"] = replacement
+                manager._agent_names.pop(old.agent_id)
+                manager._agent_names[replacement.agent_id] = "Managed"
+                manager._revoke_scheduler_authority("Managed", old.agent_id)
+                manager._scheduler_revoked_names.discard("Managed")
+                manager._scheduler_authority_by_did[replacement.agent_id] = (
+                    "Managed",
+                    new_config,
+                )
+                manager._scheduler_authority_by_name["Managed"] = replacement.agent_id
+                manager._scheduler_execution_scope.add(replacement.agent_id)
+        finally:
+            lifecycle_lock.release_read()
+
+        assert await asyncio.wait_for(deletion, timeout=1) is False
+        assert manager.get_agent("Managed") is replacement
+        replacement.shutdown.assert_not_awaited()
+        assert manager.is_scheduler_agent_authorized(replacement.agent_id)
+
+    @pytest.mark.asyncio
     async def test_hosted_effects_share_lifecycle_read_lease_before_delete(self):
         """Sibling schedules overlap, while DELETE drains both before revoking."""
 

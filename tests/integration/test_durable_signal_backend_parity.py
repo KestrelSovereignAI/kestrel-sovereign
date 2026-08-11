@@ -938,10 +938,10 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     """A local claimant must not discard a sidecar before its row commits.
 
     PostgreSQL claims run in a separate transaction.  Pause the emitting
-    transaction after the synchronous sidecar callback, make the same
-    dispatcher perform its ordinary durable poll (which cannot see the row),
-    then release commit.  The claim must transfer the now-visible initial
-    lease and receive the raw live payload.
+    transaction after the synchronous sidecar callback, start the same
+    dispatcher's durable claim, then release commit.  Whether PostgreSQL
+    blocks that claim on the source handoff lock or its initial-handoff lock,
+    it must transfer the now-visible reservation and receive the raw payload.
     """
     if db_backend.backend_type != "postgres":
         pytest.skip("PostgreSQL-specific separate-transaction visibility race")
@@ -950,9 +950,9 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     consumer_id = "workflow-wait"
     agent, dispatcher = await _ephemeral_dispatcher(db_backend, agent_id=agent_id)
     original_transaction = db_backend.transaction
-    original_claim_delivery = dispatcher._durable_store.claim_delivery
+    original_fetch_val = db_backend.fetch_val
     commit_boundary = asyncio.Event()
-    ordinary_claim_missed = asyncio.Event()
+    claim_scope_waiting = asyncio.Event()
     release_commit = asyncio.Event()
     dispatch_task = None
     claim_task = None
@@ -965,12 +965,6 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
             # has not committed its event/delivery rows yet.
             commit_boundary.set()
             await release_commit.wait()
-
-    async def note_uncommitted_ordinary_claim(**kwargs):
-        delivery = await original_claim_delivery(**kwargs)
-        if delivery is None:
-            ordinary_claim_missed.set()
-        return delivery
 
     try:
         await asyncio.wait_for(
@@ -989,7 +983,6 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
         # transaction, and pausing registration here would block the test
         # before it starts the emitting transaction it is meant to observe.
         db_backend.transaction = pause_after_before_commit
-        dispatcher._durable_store.claim_delivery = note_uncommitted_ordinary_claim
         secret = "same-dispatcher-commit-boundary@example.com"
         event = _signal(agent_id)
         event.payload["message"] = secret
@@ -1002,15 +995,25 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
         await asyncio.wait_for(commit_boundary.wait(), timeout=5)
         assert len(dispatcher._transient_durable_handoffs) == 1
 
+        async def note_claim_scope_wait(query, params=()):
+            if _is_scope_handoff_lock(query):
+                claim_scope_waiting.set()
+            return await original_fetch_val(query, params)
+
+        # Install only after persistence reaches its pre-commit barrier; its
+        # own earlier acquisition of this same lock is not the observation.
+        db_backend.fetch_val = note_claim_scope_wait
+
         claim_task = asyncio.create_task(
             dispatcher.claim_durable_delivery(
                 consumer_id=consumer_id,
                 executor_id="local-worker",
             )
         )
-        await asyncio.wait_for(ordinary_claim_missed.wait(), timeout=5)
-        # The caller has performed the separate-transaction poll but must wait
-        # on the same local handoff lock that protects the commit boundary.
+        await asyncio.wait_for(claim_scope_waiting.wait(), timeout=5)
+        # The source-level database handoff lock may serialize the ordinary
+        # poll before it can observe the uncommitted row. If it does not, the
+        # local handoff lock still protects the sidecar-to-reservation transfer.
         assert not claim_task.done()
 
         release_commit.set()
@@ -1029,7 +1032,7 @@ async def test_same_dispatcher_initial_claim_waits_for_postgres_commit_boundary(
     finally:
         release_commit.set()
         db_backend.transaction = original_transaction
-        dispatcher._durable_store.claim_delivery = original_claim_delivery
+        db_backend.fetch_val = original_fetch_val
         try:
             await _cancel_and_drain(claim_task, dispatch_task)
         finally:

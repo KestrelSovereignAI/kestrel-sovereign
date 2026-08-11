@@ -2178,14 +2178,27 @@ class AgentManager:
                             "Revoked cold scheduler authority for agent %r",
                             name,
                         )
+                        reconciliation_cancelled = (
+                            await self._reconcile_fully_removed_child_tracking()
+                        )
+                        if reconciliation_cancelled:
+                            raise asyncio.CancelledError()
                         return True
                     return await self._remove_agent_without_scheduler_lifecycle(
                         name
                     )
                 if current_did != agent_id:
-                    return await self._remove_agent_without_scheduler_lifecycle(
-                        name
+                    # This DELETE resolved ``name`` to ``agent_id`` before it
+                    # waited for that DID's scheduler writer. A replacement
+                    # identity may publish after an earlier same-name DELETE
+                    # completes. Never remove that replacement while holding
+                    # the obsolete identity's lifecycle lock.
+                    logger.info(
+                        "Agent %r changed identity while waiting for removal; "
+                        "refusing to remove the replacement",
+                        name,
                     )
+                    return False
 
                 revoked = None
                 if authority is not None and authority[0] == name:
@@ -2809,10 +2822,21 @@ class AgentManager:
                 ordinary_budget_release = self._start_child_budget_release(name)
         if unpublished_hold:
             assert ordinary_budget_release is not None
-            release_cancelled = await self._await_child_budget_release_cancellation_safe(
-                ordinary_budget_release.task
+            try:
+                release_cancelled = (
+                    await self._await_child_budget_release_cancellation_safe(
+                        ordinary_budget_release.task
+                    )
+                )
+            except asyncio.CancelledError:
+                # The admitted release has reached a terminal state before its
+                # cancellation-safe join propagates. Reconcile the now-settled
+                # ownership maps before reporting cancellation to DELETE.
+                release_cancelled = True
+            reconciliation_cancelled = (
+                await self._reconcile_fully_removed_child_tracking()
             )
-            if release_cancelled:
+            if release_cancelled or reconciliation_cancelled:
                 raise asyncio.CancelledError()
             return True
 
@@ -2975,14 +2999,26 @@ class AgentManager:
         # DELETE bounded. Otherwise this is the same ordinary stop-then-
         # release task DELETE has always joined, now admitted early enough for
         # a terminal manager drain to join it too.
-        release_cancelled = (
-            False
-            if ordinary_budget_release is None
-            else await self._await_child_budget_release_cancellation_safe(
-                ordinary_budget_release.task
-            )
+        release_cancelled = False
+        if ordinary_budget_release is not None:
+            try:
+                release_cancelled = (
+                    await self._await_child_budget_release_cancellation_safe(
+                        ordinary_budget_release.task
+                    )
+                )
+            except asyncio.CancelledError:
+                # The release join is terminal even when it must propagate a
+                # caller cancellation. Finish child-name reconciliation first.
+                release_cancelled = True
+        # Direct DELETE is also a supported child-removal path. Reconcile its
+        # parent edge before releasing the same A2A lifecycle boundary used by
+        # name admission. Quarantined cleanup remains reserved because the
+        # pruning predicate treats its live reaper as authoritative ownership.
+        reconciliation_cancelled = (
+            await self._reconcile_fully_removed_child_tracking()
         )
-        if caller_cancelled or release_cancelled:
+        if caller_cancelled or release_cancelled or reconciliation_cancelled:
             raise asyncio.CancelledError()
         return True
 
@@ -3937,13 +3973,13 @@ class AgentManager:
             return True
 
     async def _prune_all_fully_removed_child_tracking(self) -> None:
-        """Reconcile completed child removals while the terminal drain is sealed.
+        """Reconcile completed child removals at a serialized lifecycle boundary.
 
         A bounded ``remove_agent`` may return after handing shutdown and/or a
         delegated refund to quarantine.  Its parent edge is deliberately kept
-        while that reaper owns the name, so the terminal drain is the only
-        point that may prune the edge after a successful handoff completion.
-        The drain seal excludes a new handoff between this check and pruning.
+        while that reaper owns the name. Direct removal and the terminal drain
+        both call this helper while holding the A2A lifecycle boundary, which
+        excludes same-name admission between this check and pruning.
         """
 
         async with self._lock:
@@ -3962,6 +3998,18 @@ class AgentManager:
                         self._prune_child_relationship_and_mandate(
                             parent_did, child_name
                         )
+
+    async def _reconcile_fully_removed_child_tracking(self) -> bool:
+        """Own child-tracking reconciliation through repeated cancellation."""
+
+        reconciliation = asyncio.create_task(
+            self._prune_all_fully_removed_child_tracking(),
+            name="agent_manager:reconcile_removed_child_tracking",
+        )
+        cancelled, failure = await await_lifecycle_task_completion(reconciliation)
+        if failure is not None:
+            raise failure
+        return cancelled
 
     async def _join_admitted_spawn_operations(
         self,

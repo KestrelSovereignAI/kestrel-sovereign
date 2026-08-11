@@ -1074,6 +1074,8 @@ async def test_manager_unpublishes_a_cancelled_terminal_shutdown_without_continu
     agent = _CancellationTailWithoutContinuation()
     manager._agents["terminal"] = agent
     manager._agent_names[agent.agent_id] = "terminal"
+    manager._parent_children = {"did:test:parent": ["terminal"]}
+    manager._child_mandates = {"terminal": object()}
 
     removal = asyncio.create_task(manager.remove_agent("terminal"))
     await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
@@ -1081,6 +1083,14 @@ async def test_manager_unpublishes_a_cancelled_terminal_shutdown_without_continu
     assert await asyncio.wait_for(removal, timeout=1.0) is True
     assert agent.storage_closed.is_set()
     assert manager.get_agent("terminal") is None
+    assert manager._parent_children == {}
+    assert manager._child_mandates == {}
+
+    admission, owns_admission = await manager._admit_agent_operation(
+        "terminal", kind="load"
+    )
+    assert owns_admission
+    await manager._release_agent_operation(admission)
 
 
 @pytest.mark.asyncio
@@ -1900,6 +1910,34 @@ async def test_retained_child_tracking_reserves_name_until_drain_reconciliation(
 
 
 @pytest.mark.asyncio
+async def test_direct_child_removal_prunes_tracking_before_name_admission_reopens() -> None:
+    """A completed direct DELETE cannot permanently reserve its old child name."""
+
+    class SuccessfulShutdownAgent:
+        agent_id = "did:test:direct-child-removal"
+
+        async def shutdown(self) -> None:
+            return None
+
+    manager = AgentManager()
+    agent = SuccessfulShutdownAgent()
+    manager._agents["Retained"] = agent
+    manager._agent_names[agent.agent_id] = "Retained"
+    manager._parent_children = {"did:test:parent": ["Retained"]}
+    manager._child_mandates = {"Retained": object()}
+
+    assert await manager.remove_agent("Retained") is True
+    assert manager._parent_children == {}
+    assert manager._child_mandates == {}
+
+    admission, owns_admission = await manager._admit_agent_operation(
+        "retained", kind="load"
+    )
+    assert owns_admission
+    await manager._release_agent_operation(admission)
+
+
+@pytest.mark.asyncio
 async def test_default_budget_release_failure_remains_terminal_evidence(
     monkeypatch,
 ) -> None:
@@ -2377,6 +2415,8 @@ async def test_manager_unpublishes_and_releases_before_propagating_cancellation(
     agent = _CancellationTailWithoutContinuation()
     manager._agents["terminal"] = agent
     manager._agent_names[agent.agent_id] = "terminal"
+    manager._parent_children = {"did:test:parent": ["terminal"]}
+    manager._child_mandates = {"terminal": object()}
 
     removal = asyncio.create_task(manager.remove_agent("terminal"))
     await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
@@ -2386,6 +2426,14 @@ async def test_manager_unpublishes_and_releases_before_propagating_cancellation(
         await asyncio.wait_for(removal, timeout=1.0)
     assert agent.storage_closed.is_set()
     assert manager.get_agent("terminal") is None
+    assert manager._parent_children == {}
+    assert manager._child_mandates == {}
+
+    admission, owns_admission = await manager._admit_agent_operation(
+        "terminal", kind="load"
+    )
+    assert owns_admission
+    await manager._release_agent_operation(admission)
 
 
 @pytest.mark.asyncio
