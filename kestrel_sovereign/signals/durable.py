@@ -393,6 +393,7 @@ class DurableSignalStore(UnifiedStoreBase):
         initial_lease_owner: Optional[str] = None,
         integrity_binding: Optional[str] = None,
         caller_identity: Optional[str] = None,
+        caller_identity_factory: Optional[Callable[[], str]] = None,
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
     ) -> DurableEventPersistence:
@@ -440,6 +441,12 @@ class DurableSignalStore(UnifiedStoreBase):
             raise ValueError("integrity_binding must be a SHA-256 hex digest")
         if caller_identity is not None and type(caller_identity) is not str:
             raise ValueError("caller_identity must be an opaque string when set")
+        if caller_identity is not None and caller_identity_factory is not None:
+            raise ValueError(
+                "caller_identity and caller_identity_factory are mutually exclusive"
+            )
+        if caller_identity_factory is not None and not callable(caller_identity_factory):
+            raise ValueError("caller_identity_factory must be callable when set")
         source_event_id = self._normalize_source_event_id(source_event_id)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
@@ -486,6 +493,21 @@ class DurableSignalStore(UnifiedStoreBase):
                         agent_id, signal, source_event_id
                     )
                     return DurableEventPersistence(event_id=existing, created=False)
+
+                if caller_identity_factory is not None:
+                    caller_identity = caller_identity_factory()
+                    if type(caller_identity) is not str:
+                        raise RuntimeError(
+                            "caller_identity_factory returned a non-string value"
+                        )
+                    await self._backend.execute(
+                        f"""
+                        UPDATE {self.EVENTS}
+                        SET caller_identity = ?
+                        WHERE event_id = ? AND agent_id = ?
+                        """,
+                        (caller_identity, signal.id, agent_id),
+                    )
 
                 if integrity_binding is not None:
                     await self._backend.execute(
@@ -560,6 +582,112 @@ class DurableSignalStore(UnifiedStoreBase):
             raise
         assert persistence is not None
         return persistence
+
+    async def upgrade_legacy_delivery_for_redelivery(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        event_id: str,
+        source_event_id: str,
+        expected_signal: Signal,
+        caller_identity_factory: Callable[[], str],
+    ) -> bool:
+        """Atomically add one delivery to a verified pre-consumer event.
+
+        This deliberately is *not* a consumer backfill.  It upgrades only the
+        immutable event named by a provider's current redelivery, after the
+        caller has proved that its normalized live envelope matches the old
+        retained event.  The caller identity was not protected by the
+        pre-upgrade schema, so it is sealed and the exact delivery is created
+        in the same transaction.  Privacy-elided rows carry an integrity row
+        and are refused here; their keyed-MAC retry path remains fail-closed.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("event_id", event_id)
+        self._require_nonempty("source_event_id", source_event_id)
+        self._require_nonempty("source", expected_signal.source)
+        if not callable(caller_identity_factory):
+            raise ValueError("caller_identity_factory must be callable")
+
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(
+                agent_id=agent_id, source=expected_signal.source
+            )
+            consumer = await self._get_consumer(agent_id, consumer_id)
+            if consumer is None or not consumer[4] or consumer[0] != expected_signal.source:
+                return False
+            row = await self._backend.fetch_one(
+                f"""
+                SELECT event_id, source_event_id, agent_id, target_agent, source, kind, mode, payload,
+                       session_id, caller_identity, visibility, urgency, dedupe_key,
+                       causation_chain, arrived_at, committed_at, retention_until
+                FROM {self.EVENTS}
+                WHERE event_id = ? AND agent_id = ? AND source = ?
+                """,
+                (event_id, agent_id, expected_signal.source),
+            )
+            if row is None:
+                return False
+            event = self._row_to_event(row)
+            if (
+                event.caller_identity is not None
+                or not self._legacy_event_matches_redelivery(
+                    event, expected_signal, source_event_id
+                )
+                # An event that would already have matched the registered
+                # selector is not a marker-era legacy row.  Never use a
+                # redelivery to alter such historical work.
+                or self._matches_selector(event, consumer[1])
+            ):
+                return False
+            integrity = await self._backend.fetch_one(
+                f"SELECT 1 FROM {self.EVENT_INTEGRITY} WHERE event_id = ?",
+                (event_id,),
+            )
+            if integrity is not None:
+                return False
+            delivery = await self._backend.fetch_one(
+                f"""
+                SELECT 1 FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND event_id = ?
+                """,
+                (agent_id, consumer_id, event_id),
+            )
+            if delivery is not None:
+                return False
+
+            caller_identity = caller_identity_factory()
+            if type(caller_identity) is not str or not caller_identity:
+                raise RuntimeError(
+                    "caller_identity_factory returned an invalid protected value"
+                )
+
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.EVENTS}
+                SET caller_identity = ?
+                WHERE event_id = ? AND agent_id = ? AND caller_identity IS NULL
+                """,
+                (caller_identity, event_id, agent_id),
+            )
+            if updated != 1:
+                return False
+            delivery_id = await self._insert_delivery_locked(
+                agent_id=agent_id,
+                consumer_id=consumer_id,
+                event_id=event_id,
+                max_attempts=int(consumer[2]),
+                now=self.now_utc(),
+            )
+            if delivery_id is None:
+                # This transaction owns the source handoff lock, so an
+                # unexpected duplicate would otherwise leave an identity-only
+                # partial upgrade.  Raising rolls every change back together.
+                raise RuntimeError("legacy delivery upgrade conflicted unexpectedly")
+            return True
 
     # ------------------------------------------------------------------
     # Claim / lease / acknowledgement API
@@ -1439,6 +1567,32 @@ class DurableSignalStore(UnifiedStoreBase):
         if row is None:
             raise RuntimeError("durable event insert conflicted without an existing event")
         return row[0]
+
+    @staticmethod
+    def _legacy_event_matches_redelivery(
+        event: DurableSignalEvent,
+        signal: Signal,
+        source_event_id: str,
+    ) -> bool:
+        """Compare the retained canonical envelope, excluding fresh attempt IDs.
+
+        A provider retry receives a new signal/outcome ID and causation frame,
+        neither of which was stable in the pre-consumer ledger.  Every source
+        identity and normalized payload field that *was* retained must match.
+        """
+
+        return (
+            event.source_event_id == source_event_id
+            and event.target_agent == signal.target_agent
+            and event.source == signal.source
+            and event.kind == signal.kind
+            and event.mode == signal.mode.value
+            and event.payload == signal.payload
+            and event.session_id == signal.session_id
+            and event.visibility == signal.visibility.value
+            and event.urgency == signal.urgency.value
+            and event.dedupe_key == signal.dedupe_key
+        )
 
     async def _lock_scope_handoff(self, *, agent_id: str, source: str) -> None:
         """Serialize registration and persistence for one subscription scope.

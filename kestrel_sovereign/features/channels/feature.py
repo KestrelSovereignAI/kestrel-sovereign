@@ -35,6 +35,7 @@ from kestrel_sovereign.security.encryption import (
     get_fernet,
 )
 from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
     build_channel_message_registration,
@@ -57,9 +58,6 @@ logger = logging.getLogger(__name__)
 # so channel content matches the conversation_history encryption
 # guarantee (#2096 / F112).
 CHANNEL_KEY_VERSION = 1
-_DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
-
-
 class InboundAdmissionDisposition(str, Enum):
     """What the channel feature proved about one inbound message."""
 
@@ -225,7 +223,7 @@ class ChannelFeature(Feature):
 
             await register(
                 DurableConsumerRegistration(
-                    consumer_id=_DURABLE_COGNITION_CONSUMER_ID,
+                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
                     source="channel.message",
                     agent_id=agent_did,
                     correlation_selector=(
@@ -667,7 +665,7 @@ class ChannelFeature(Feature):
                     handle = await enqueue_durable_cognition(
                         signal,
                         source_event_id=message.id,
-                        consumer_id=_DURABLE_COGNITION_CONSUMER_ID,
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
                     )
                 else:
                     handle = await dispatcher.enqueue_signal(

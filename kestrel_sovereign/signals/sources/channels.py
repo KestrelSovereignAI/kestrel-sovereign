@@ -25,6 +25,10 @@ SOURCE_NAME = "channel.message"
 # backfilling every historic channel row into a fresh cognition turn.
 DURABLE_COGNITION_MARKER = "_durable_cognition"
 DURABLE_COGNITION_MARKER_VALUE = "channel-v1"
+# The cursor-owning channel consumer is a Core contract rather than a
+# feature-instance detail: durable redelivery recovery must be able to name
+# this exact consumer without broadening delivery to other subscriptions.
+DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
 PROMPT_TEMPLATE = (
     Path(__file__).resolve().parents[2]
     / "prompts"
@@ -138,6 +142,7 @@ def build_signal_for_channel_message(
 
 
 __all__ = [
+    "DURABLE_COGNITION_CONSUMER_ID",
     "DURABLE_COGNITION_MARKER",
     "DURABLE_COGNITION_MARKER_VALUE",
     "PROMPT_TEMPLATE",

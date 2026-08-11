@@ -45,6 +45,7 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 _TEST_AGENT_DID = "did:test:isolated-runtime"
 _TEST_CONFIG_NODE_ID = f"feature_config:v2:{_TEST_AGENT_DID}:TestFeature"
+_TELEGRAM_ATTEMPT_TOKEN = "t" * 43
 
 
 class FakeIsolatedClient:
@@ -1696,7 +1697,10 @@ async def test_external_ingress_quiesces_callback_while_admission_is_open_then_d
                         },
                         "_host_ingress_ack": {
                             "name": "telegram-polling-ack",
-                            "payload": {"dedupe_key": "late-update"},
+                            "payload": {
+                                "dedupe_key": "late-update",
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
                         },
                     },
                 }
@@ -5495,7 +5499,10 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
                         },
                         "_host_ingress_ack": {
                             "name": "telegram-polling-ack",
-                            "payload": {"dedupe_key": dedupe_key},
+                            "payload": {
+                                "dedupe_key": dedupe_key,
+                                "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                            },
                         },
                     },
                 }
@@ -5509,7 +5516,13 @@ async def test_channel_inbound_acknowledges_exact_source_only_after_host_deliver
         await asyncio.wait_for(acknowledgement_started.wait(), timeout=1)
         assert delivered == [dedupe_key]
         assert client.acknowledgements == [
-            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
         ]
         # The acknowledgement remains independently in-flight so an SDK event
         # reader can return to consume its JSON-RPC response instead of waiting
@@ -5554,7 +5567,10 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
         async def call_host_ingress(self, name, payload=None):
             assert (name, payload) == (
                 "telegram-polling-ack",
-                {"dedupe_key": dedupe_key},
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
             )
             acknowledged.set()
             return {"status": "ok", "http_status": 200, "state": "acknowledged"}
@@ -5582,7 +5598,10 @@ async def test_current_replacement_acknowledged_event_waits_for_reopened_gate(
                     },
                     "_host_ingress_ack": {
                         "name": "telegram-polling-ack",
-                        "payload": {"dedupe_key": dedupe_key},
+                        "payload": {
+                            "dedupe_key": dedupe_key,
+                            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                        },
                     },
                 },
             }
@@ -5614,7 +5633,10 @@ def _acknowledged_telegram_event(dedupe_key: str) -> dict:
             },
             "_host_ingress_ack": {
                 "name": "telegram-polling-ack",
-                "payload": {"dedupe_key": dedupe_key},
+                "payload": {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
             },
         },
     }
@@ -5626,9 +5648,35 @@ def _retryable_telegram_event(dedupe_key: str) -> dict:
     event = _acknowledged_telegram_event(dedupe_key)
     event["payload"]["_host_ingress_retry"] = {
         "name": "telegram-polling-nack",
-        "payload": {"dedupe_key": dedupe_key},
+        "payload": {
+            "dedupe_key": dedupe_key,
+            "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+        },
     }
     return event
+
+
+def test_telegram_polling_completion_descriptors_require_one_attempt_token():
+    """Core refuses tokenless or cross-attempt Telegram completions."""
+
+    feature = object.__new__(ProxyFeature)
+    valid = _retryable_telegram_event("telegram:v2:bot:42:update:attempt-fenced")
+    assert feature._inbound_event_retry_completion(valid["payload"]) is not None
+
+    tokenless = _retryable_telegram_event("telegram:v2:bot:42:update:tokenless")
+    del tokenless["payload"]["_host_ingress_ack"]["payload"]["attempt_token"]
+    del tokenless["payload"]["_host_ingress_retry"]["payload"]["attempt_token"]
+    _, acknowledgement = feature._split_inbound_event_acknowledgement(
+        tokenless["payload"]
+    )
+    assert acknowledgement is None
+    assert feature._inbound_event_retry_completion(tokenless["payload"]) is None
+
+    mismatched = _retryable_telegram_event("telegram:v2:bot:42:update:mismatched")
+    mismatched["payload"]["_host_ingress_retry"]["payload"]["attempt_token"] = (
+        "n" * 43
+    )
+    assert feature._inbound_event_retry_completion(mismatched["payload"]) is None
 
 
 @pytest.mark.asyncio
@@ -5702,7 +5750,13 @@ async def test_inbound_reader_returns_before_cognition_and_nacks_retryable_resul
         release_cognition.set()
         await asyncio.wait_for(retry_completed.wait(), timeout=1)
         assert client.completions == [
-            ("telegram-polling-nack", {"dedupe_key": dedupe_key})
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
         ]
     finally:
         release_cognition.set()
@@ -5841,7 +5895,68 @@ async def test_deferred_acknowledged_ingress_uses_detached_k1_snapshot(monkeypat
                 break
             await asyncio.sleep(0)
         assert delivered == [k1]
-        assert acknowledged == [("telegram-polling-ack", {"dedupe_key": k1})]
+        assert acknowledged == [
+            (
+                "telegram-polling-ack",
+                {"dedupe_key": k1, "attempt_token": _TELEGRAM_ATTEMPT_TOKEN},
+            )
+        ]
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_acknowledged_ingress_exception_nacks_exact_live_callback(
+    monkeypatch, tmp_path
+):
+    """A reopened deferred route failure releases Telegram for redelivery."""
+
+    dedupe_key = "telegram:v2:bot:42:update:deferred-route-failure"
+    nacked = asyncio.Event()
+
+    class FailingChannelFeature:
+        async def handle_inbound(self, _message):
+            raise RuntimeError("cognition route failed")
+
+    class CompletionClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.host_ingress_capabilities = HostIngressCapabilities(
+                names=("telegram-polling-ack", "telegram-polling-nack")
+            )
+            self.completions = []
+
+        async def call_host_ingress(self, name, payload=None):
+            self.completions.append((name, payload))
+            if name == "telegram-polling-nack":
+                nacked.set()
+                return {"status": "ok", "http_status": 200, "state": "retrying"}
+            return {"status": "ok", "http_status": 200, "state": "acknowledged"}
+
+    agent = Mock(
+        did=_TEST_AGENT_DID,
+        features={"ChannelFeature": FailingChannelFeature()},
+    )
+    agent.storage = _CASStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=CompletionClient)
+    try:
+        await feature.initialize()
+        client = feature._client
+        await feature._close_traffic_gate()
+        await client.event_handler(_retryable_telegram_event(dedupe_key))
+        await feature._reopen_traffic_gate()
+        await asyncio.wait_for(nacked.wait(), timeout=1)
+        assert client.completions == [
+            (
+                "telegram-polling-nack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
+        ]
     finally:
         await feature.shutdown()
 
@@ -5936,7 +6051,13 @@ async def test_rejected_ack_retries_then_terminally_retires_exact_source(monkeyp
                 break
             await asyncio.sleep(0)
         assert client.acknowledgements == [
-            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
         ] * 3
         assert feature._terminal_lifecycle_latched is True
         assert client.stopped is True
@@ -5986,7 +6107,13 @@ async def test_hung_ack_times_out_with_bounded_retries_then_retires_source(
                 break
             await asyncio.sleep(0.01)
         assert client.acknowledgements == [
-            ("telegram-polling-ack", {"dedupe_key": dedupe_key})
+            (
+                "telegram-polling-ack",
+                {
+                    "dedupe_key": dedupe_key,
+                    "attempt_token": _TELEGRAM_ATTEMPT_TOKEN,
+                },
+            )
         ] * 3
         assert feature._terminal_lifecycle_latched is True
         assert client.stopped is True

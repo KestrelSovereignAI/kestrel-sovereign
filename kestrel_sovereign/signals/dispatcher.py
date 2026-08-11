@@ -137,6 +137,11 @@ from kestrel_sovereign.signals.durable import (
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import SourceRegistry
+from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
+)
 from kestrel_sovereign.signals.store import SignalLogStore
 from kestrel_sovereign.storage.db.write_audit import (
     capture_write_queries,
@@ -1765,7 +1770,16 @@ class SignalDispatcher:
     def _protect_durable_caller_identity(self, signal: Signal) -> str:
         """Return tenant/event-bound encrypted caller storage for a normal row."""
 
-        caller = self._canonical_caller_identity(signal.caller)
+        return self._protect_durable_caller_identity_for_event(
+            signal.caller, event_id=signal.id
+        )
+
+    def _protect_durable_caller_identity_for_event(
+        self, caller: Any, *, event_id: str
+    ) -> str:
+        """Seal one canonical caller against the event that retains it."""
+
+        caller = self._canonical_caller_identity(caller)
         if caller is None:
             return _DURABLE_CALLER_IDENTITY_NONE
         cipher = get_agent_fernet(self._durable_agent_id())
@@ -1775,7 +1789,7 @@ class SignalDispatcher:
                 "per-agent key hierarchy"
             )
         return _DURABLE_CALLER_IDENTITY_PREFIX + cipher.encrypt(
-            caller.encode("utf-8"), aad=self._durable_caller_identity_aad(signal.id)
+            caller.encode("utf-8"), aad=self._durable_caller_identity_aad(event_id)
         ).decode("ascii")
 
     def _recover_durable_caller_identity(self, event) -> Optional[str]:
@@ -1852,53 +1866,105 @@ class SignalDispatcher:
     async def _renew_durable_cognition_lease(self, delivery: DurableDelivery):
         """Keep a cursor-owned cognition lease alive until its turn settles."""
 
-        if delivery.lease_expires_at is None or delivery.lease_token is None:
-            yield
-            return
         stop = asyncio.Event()
+        lost: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+        def report_loss(reason: str) -> None:
+            if not lost.done():
+                lost.set_result(reason)
+
+        if delivery.lease_expires_at is None or delivery.lease_token is None:
+            report_loss("Durable cognition delivery has no live lease")
+            yield lost
+            return
 
         async def renew() -> None:
-            expires_at = delivery.lease_expires_at
-            while not stop.is_set():
-                remaining = max(
-                    0.01, (expires_at - datetime.now(timezone.utc)).total_seconds()
+            try:
+                expires_at = delivery.lease_expires_at
+                while not stop.is_set():
+                    remaining = max(
+                        0.01, (expires_at - datetime.now(timezone.utc)).total_seconds()
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=max(0.01, remaining / 3)
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    try:
+                        renewed = await self.renew_durable_delivery_lease(
+                            consumer_id=delivery.consumer_id,
+                            delivery_id=delivery.delivery_id,
+                            lease_token=delivery.lease_token,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not renew durable cognition lease: delivery=%s",
+                            delivery.delivery_id,
+                        )
+                        report_loss("Durable cognition lease renewal failed")
+                        return
+                    if (
+                        renewed is None
+                        or renewed.lease_expires_at is None
+                        or renewed.lease_token is None
+                        or not secrets.compare_digest(
+                            renewed.lease_token, delivery.lease_token
+                        )
+                    ):
+                        logger.error(
+                            "Lost durable cognition lease while turn was running: delivery=%s",
+                            delivery.delivery_id,
+                        )
+                        report_loss("Durable cognition lease ownership was lost")
+                        return
+                    expires_at = renewed.lease_expires_at
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Durable cognition lease renewal task failed: delivery=%s",
+                    delivery.delivery_id,
                 )
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=max(0.01, remaining / 3))
-                    return
-                except asyncio.TimeoutError:
-                    pass
-                try:
-                    renewed = await self.renew_durable_delivery_lease(
-                        consumer_id=delivery.consumer_id,
-                        delivery_id=delivery.delivery_id,
-                        lease_token=delivery.lease_token,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not renew durable cognition lease: delivery=%s",
-                        delivery.delivery_id,
-                    )
-                    return
-                if renewed is None or renewed.lease_expires_at is None:
-                    logger.error(
-                        "Lost durable cognition lease while turn was running: delivery=%s",
-                        delivery.delivery_id,
-                    )
-                    return
-                expires_at = renewed.lease_expires_at
+                report_loss("Durable cognition lease renewal failed")
 
         task = asyncio.create_task(
             renew(), name=f"durable_cognition_lease_renewal:{delivery.delivery_id}"
         )
         try:
-            yield
+            yield lost
         finally:
             stop.set()
             if not task.done():
                 task.cancel()
             with suppress(asyncio.CancelledError):
                 await asyncio.shield(task)
+
+    @staticmethod
+    def _legacy_channel_cognition_signal(
+        signal: Signal, *, consumer_id: str
+    ) -> Signal | None:
+        """Return the precise pre-marker envelope eligible for one upgrade.
+
+        Only a live channel redelivery addressed to Core's cursor-owning
+        consumer can enter the legacy path.  Removing the one new selector
+        marker gives the store an exact normalized envelope to compare with
+        the old retained event; it does not make historical rows eligible on
+        their own.
+        """
+
+        if (
+            consumer_id != DURABLE_COGNITION_CONSUMER_ID
+            or signal.source != "channel.message"
+            or type(signal.payload) is not dict
+            or signal.payload.get(DURABLE_COGNITION_MARKER)
+            != DURABLE_COGNITION_MARKER_VALUE
+        ):
+            return None
+        legacy_payload = dict(signal.payload)
+        legacy_payload.pop(DURABLE_COGNITION_MARKER)
+        return replace(signal, payload=legacy_payload)
 
     # ------------------------------------------------------------------
     # Pipeline
@@ -2038,11 +2104,6 @@ class SignalDispatcher:
                 # redacted display field.  It is encrypted and AAD-bound to
                 # this tenant/event for normal rows; privacy-elided rows retain
                 # no caller at all and instead bind it through the live MAC.
-                caller_identity = (
-                    None
-                    if durable_projection.payload_elided
-                    else self._protect_durable_caller_identity(signal)
-                )
                 committed_reservations = None
 
                 def install_transient_handoffs(persisted) -> None:
@@ -2106,7 +2167,16 @@ class SignalDispatcher:
                         else None
                     ),
                     "integrity_binding": volatile_integrity_binding,
-                    "caller_identity": caller_identity,
+                    # A duplicate reuses its retained, AAD-bound caller.  Do
+                    # not require current key material before the store has
+                    # determined whether this attempt actually creates an
+                    # event; otherwise a lost/rotated key masks the claimed
+                    # delivery recovery path below.
+                    "caller_identity_factory": (
+                        None
+                        if durable_projection.payload_elided
+                        else lambda: self._protect_durable_caller_identity(signal)
+                    ),
                     "before_commit": (
                         install_transient_handoffs
                         if durable_projection.payload_elided
@@ -2276,6 +2346,42 @@ class SignalDispatcher:
                     registration=registration,
                 )
 
+            # Before the marker-selected cognition consumer existed, normal
+            # channel rows were retained without this delivery or a protected
+            # caller field.  Upgrade one only when its provider redelivers the
+            # exact canonical envelope.  This is intentionally after the
+            # privacy-integrity branch above: payload-elided rows never take
+            # this path and no historical scan/backfill is performed.
+            legacy_signal = self._legacy_channel_cognition_signal(
+                signal, consumer_id=durable_delivery_consumer_id or ""
+            )
+            if legacy_signal is not None and source_event_id is not None:
+                try:
+                    await self._durable_store.upgrade_legacy_delivery_for_redelivery(
+                        agent_id=self._agent.did,
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        event_id=persisted.event_id,
+                        source_event_id=source_event_id,
+                        expected_signal=legacy_signal,
+                        caller_identity_factory=(
+                            lambda: self._protect_durable_caller_identity_for_event(
+                                signal.caller, event_id=persisted.event_id
+                            )
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not upgrade legacy durable channel redelivery: event=%s",
+                        persisted.event_id,
+                    )
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.FAILED,
+                        error="Legacy durable channel redelivery upgrade failed",
+                        registration=registration,
+                    )
+
         if durable_delivery_consumer_id is not None:
             return await self._route_durable_cognition_delivery(
                 signal,
@@ -2360,17 +2466,83 @@ class SignalDispatcher:
         # durable envelope, not whatever a duplicate provider callback happens
         # to carry. Volatile privacy modes retain no content in the ledger, so
         # their live callback is usable only after the integrity check above.
-        routing_signal = (
-            signal
-            if use_live_signal
-            else self._signal_from_durable_event(
-                delivery.event, dispatch_signal=signal
+        try:
+            routing_signal = (
+                signal
+                if use_live_signal
+                else self._signal_from_durable_event(
+                    delivery.event, dispatch_signal=signal
+                )
             )
-        )
-        async with self._renew_durable_cognition_lease(delivery):
-            result = await self._route_after_durable_persistence(
-                routing_signal, registration, start
+        except Exception:
+            # A claim without a recoverable canonical caller must never wait
+            # for its lease to expire.  Release this exact token before
+            # producing the ordinary audited failure so cursor-owning ingress
+            # can NACK/retry rather than treating persistence as an ACK.
+            try:
+                await self.nack_durable_delivery(
+                    consumer_id=consumer_id,
+                    delivery_id=delivery.delivery_id,
+                    lease_token=delivery.lease_token or "",
+                    error="Durable cognition caller recovery failed",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not release durable cognition lease after caller recovery failure: "
+                    "delivery=%s",
+                    delivery.delivery_id,
+                )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error="Durable cognition caller recovery failed",
+                registration=registration,
             )
+
+        routing_task: asyncio.Task[SignalResult] | None = None
+        try:
+            async with self._renew_durable_cognition_lease(delivery) as lease_lost:
+                routing_task = asyncio.create_task(
+                    self._route_after_durable_persistence(
+                        routing_signal, registration, start
+                    ),
+                    name=f"durable_cognition_route:{delivery.delivery_id}",
+                )
+                completed, _ = await asyncio.wait(
+                    {routing_task, lease_lost},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if lease_lost in completed:
+                    if not routing_task.done():
+                        routing_task.cancel()
+                    await asyncio.gather(routing_task, return_exceptions=True)
+                    try:
+                        await self.nack_durable_delivery(
+                            consumer_id=consumer_id,
+                            delivery_id=delivery.delivery_id,
+                            lease_token=delivery.lease_token or "",
+                            error=lease_lost.result(),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not release durable cognition lease after renewal loss: "
+                            "delivery=%s",
+                            delivery.delivery_id,
+                        )
+                    return self._fail(
+                        signal,
+                        start,
+                        Status.FAILED,
+                        error=lease_lost.result(),
+                        registration=registration,
+                    )
+                result = await routing_task
+        except asyncio.CancelledError:
+            if routing_task is not None and not routing_task.done():
+                routing_task.cancel()
+                await asyncio.gather(routing_task, return_exceptions=True)
+            raise
         if result.status is Status.OK:
             acknowledged = await self.ack_durable_delivery(
                 consumer_id=consumer_id,

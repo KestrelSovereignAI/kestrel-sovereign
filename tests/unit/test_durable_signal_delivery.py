@@ -35,7 +35,9 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.signals import dispatcher as dispatcher_module
 from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
     DURABLE_COGNITION_MARKER_VALUE,
     build_channel_message_registration,
@@ -533,6 +535,93 @@ async def test_cognition_retry_uses_canonical_persisted_channel_input(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_channel_redelivery_upgrades_only_matching_normal_event(tmp_path):
+    """One matching retry repairs an origin/main row without bulk backfill."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "legacy-channel-redelivery.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = "telegram:update:origin-main"
+    # This is the retained normal ledger shape from before the cognition
+    # marker/consumer: no marker, no delivery, and no protected caller field.
+    legacy = _channel_signal(agent.did, "origin-main")
+    legacy.payload.pop(DURABLE_COGNITION_MARKER)
+    attempts = 0
+
+    async def fail_once_then_succeed(_prompt: str):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("retry the upgraded delivery")
+        return "ok"
+
+    agent.process_input = fail_once_then_succeed
+    try:
+        persisted = await dispatcher._durable_store.persist_signal(
+            legacy,
+            agent_id=agent.did,
+            source_event_id=source_event_id,
+            retention_days=14,
+        )
+        assert persisted.created is True
+        await dispatcher.register_durable_consumer(consumer)
+        assert await dispatcher.list_durable_deliveries() == []
+
+        mismatched = _channel_signal(agent.did, "origin-main")
+        mismatched.payload["content"] = "not the retained canonical message"
+        rejected = await dispatcher.enqueue_durable_cognition(
+            mismatched,
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await rejected.wait()).status is Status.FAILED
+        assert await dispatcher.list_durable_deliveries() == []
+        row = await backend.fetch_one(
+            "SELECT caller_identity FROM durable_signal_events WHERE event_id = ?",
+            (persisted.event_id,),
+        )
+        assert row == (None,)
+
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "origin-main"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await first.wait()).status is Status.FAILED
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert delivery.event.event_id == persisted.event_id
+        assert delivery.status == RETRY
+        row = await backend.fetch_one(
+            "SELECT caller_identity FROM durable_signal_events WHERE event_id = ?",
+            (persisted.event_id,),
+        )
+        assert row is not None and row[0] is not None and "555" not in row[0]
+
+        dispatcher._coalescing.reset()
+        retry = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "origin-main"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await retry.wait()).status is Status.OK
+        assert attempts == 2
+        assert (await dispatcher.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 async def test_elided_row_allows_verified_live_redelivery_after_privacy_becomes_normal(
     tmp_path,
 ):
@@ -656,6 +745,77 @@ async def test_durable_caller_identity_is_tenant_bound_encrypted_and_reconstruct
             changed, source_event_id=source_event_id, consumer_id=consumer.consumer_id
         )
         assert (await retry.wait()).status is Status.OK
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_failure", ("missing-key", "rotated-key", "corrupt-cipher"))
+async def test_caller_recovery_failure_after_claim_releases_retry_and_logs_outcome(
+    monkeypatch, tmp_path, recovery_failure
+):
+    """A claimed delivery is NACKed and audited when caller recovery fails."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / f"caller-recovery-{recovery_failure}.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    source_event_id = f"telegram:update:caller-recovery:{recovery_failure}"
+
+    async def fail_first_turn(_prompt: str):
+        raise RuntimeError("leave one retryable delivery")
+
+    agent.process_input = fail_first_turn
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, f"caller-recovery-{recovery_failure}"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await first.wait()).status is Status.FAILED
+        delivery = (await dispatcher.list_durable_deliveries())[0]
+        assert delivery.status == RETRY
+
+        if recovery_failure == "missing-key":
+            monkeypatch.setattr(dispatcher_module, "get_agent_fernet", lambda _agent: None)
+        elif recovery_failure == "rotated-key":
+            monkeypatch.setenv("KESTREL_DATA_KEY", "caller-recovery-rotated-key")
+        else:
+            await backend.execute(
+                "UPDATE durable_signal_events SET caller_identity = ? WHERE event_id = ?",
+                ("v1:corrupt-ciphertext", delivery.event_id),
+            )
+
+        dispatcher._coalescing.reset()
+        retry = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, f"caller-recovery-{recovery_failure}"),
+            source_event_id=source_event_id,
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await retry.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+        assert (await retry.wait()).status is Status.FAILED
+        recovered = (await dispatcher.list_durable_deliveries())[0]
+        # Attempt two proves failure happened after this retry claimed the
+        # durable lease; RETRY proves its exact lease was released, not ACKed.
+        assert recovered.attempts == 2
+        assert recovered.status == RETRY
+        outcome = await backend.fetch_one(
+            "SELECT id FROM signal_log WHERE id = ?", (retry.signal_id,)
+        )
+        assert outcome == (retry.signal_id,)
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
@@ -844,6 +1004,88 @@ async def test_cognition_renews_short_durable_lease_until_turn_completes(tmp_pat
         release.set()
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_renewal_loss_cancels_cognition_before_a_second_executor_retries(tmp_path):
+    """Lease loss cannot leave the original turn live beside a retry worker."""
+
+    path = tmp_path / "cognition-renewal-loss.db"
+    backend_a, agent_a, dispatcher_a = await _channel_dispatcher(path, "did:agent:one")
+    backend_b, agent_b, dispatcher_b = await _channel_dispatcher(path, "did:agent:one")
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent_a.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+        lease_seconds=1,
+    )
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    active_turns = 0
+    peak_active_turns = 0
+
+    async def first_turn(_prompt: str):
+        nonlocal active_turns, peak_active_turns
+        active_turns += 1
+        peak_active_turns = max(peak_active_turns, active_turns)
+        first_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        finally:
+            active_turns -= 1
+
+    async def second_turn(_prompt: str):
+        nonlocal active_turns, peak_active_turns
+        assert first_cancelled.is_set()
+        active_turns += 1
+        peak_active_turns = max(peak_active_turns, active_turns)
+        active_turns -= 1
+        return "retry complete"
+
+    renewal_rejected = asyncio.Event()
+
+    async def reject_renewal(**_kwargs):
+        renewal_rejected.set()
+        return None
+
+    agent_a.process_input = first_turn
+    agent_b.process_input = second_turn
+    dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        await dispatcher_b.register_durable_consumer(consumer)
+        first = await dispatcher_a.enqueue_durable_cognition(
+            _channel_signal(agent_a.did, "renewal-loss"),
+            source_event_id="telegram:update:renewal-loss",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.wait_for(renewal_rejected.wait(), timeout=2)
+        assert (await first.wait()).status is Status.FAILED
+        await asyncio.wait_for(first_cancelled.wait(), timeout=1)
+        assert (await dispatcher_a.list_durable_deliveries())[0].status == RETRY
+
+        retry = await dispatcher_b.enqueue_durable_cognition(
+            _channel_signal(agent_b.did, "renewal-loss"),
+            source_event_id="telegram:update:renewal-loss",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (await retry.wait()).status is Status.OK
+        assert peak_active_turns == 1
+        assert (await dispatcher_b.list_durable_deliveries())[0].status == ACKNOWLEDGED
+    finally:
+        await dispatcher_a.shutdown_durable_delivery()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
 
 
 @pytest.mark.asyncio

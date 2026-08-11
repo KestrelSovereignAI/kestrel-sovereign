@@ -99,6 +99,8 @@ _EVENT_HOST_INGRESS_ACK_FIELD = "_host_ingress_ack"
 _EVENT_HOST_INGRESS_RETRY_FIELD = "_host_ingress_retry"
 _EVENT_HOST_INGRESS_MESSAGE_FIELD = "message"
 _EVENT_INGRESS_ATTEMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+_TELEGRAM_POLLING_ACK = "telegram-polling-ack"
+_TELEGRAM_POLLING_NACK = "telegram-polling-nack"
 # Polling is sequential: an acknowledged source cannot emit its next update
 # until Core acknowledges the current one. Retaining one current-child event
 # during a finite gate close therefore preserves no-loss startup without
@@ -6707,8 +6709,15 @@ class ProxyFeature(Feature):
         )
         if request is None or type(request.payload) is not dict:
             return message, None
+        # A polling NACK is meaningful only as the paired retry descriptor;
+        # accepting it in the ACK slot could invert a successful delivery.
+        if request.name == _TELEGRAM_POLLING_NACK:
+            return message, None
         payload_keys = set(request.payload)
+        telegram_polling_ack = request.name == _TELEGRAM_POLLING_ACK
         if payload_keys not in ({"dedupe_key"}, {"dedupe_key", "attempt_token"}):
+            return message, None
+        if telegram_polling_ack and payload_keys != {"dedupe_key", "attempt_token"}:
             return message, None
         message_metadata = message.get("metadata")
         dedupe_key = (
@@ -6723,9 +6732,12 @@ class ProxyFeature(Feature):
         ):
             return message, None
         attempt_token = request.payload.get("attempt_token")
-        if attempt_token is not None and (
+        if (telegram_polling_ack and type(attempt_token) is not str) or (
+            attempt_token is not None
+            and (
             type(attempt_token) is not str
             or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
+            )
         ):
             return message, None
         return message, request
@@ -6761,6 +6773,10 @@ class ProxyFeature(Feature):
             if type(message_metadata) is dict
             else None
         )
+        telegram_polling_pair = (
+            acknowledgement.name == _TELEGRAM_POLLING_ACK
+            or request.name == _TELEGRAM_POLLING_NACK
+        )
         if (
             type(dedupe_key) is not str
             or set(request.payload) not in (
@@ -6769,10 +6785,24 @@ class ProxyFeature(Feature):
             or request.payload.get("dedupe_key") != dedupe_key
         ):
             return None
+        if telegram_polling_pair and (
+            acknowledgement.name != _TELEGRAM_POLLING_ACK
+            or request.name != _TELEGRAM_POLLING_NACK
+            or set(request.payload) != {"dedupe_key", "attempt_token"}
+        ):
+            return None
         attempt_token = request.payload.get("attempt_token")
-        if attempt_token is not None and (
+        if (telegram_polling_pair and type(attempt_token) is not str) or (
+            attempt_token is not None
+            and (
             type(attempt_token) is not str
             or _EVENT_INGRESS_ATTEMPT_TOKEN_RE.fullmatch(attempt_token) is None
+            )
+        ):
+            return None
+        acknowledgement_token = acknowledgement.payload.get("attempt_token")
+        if telegram_polling_pair and not secrets.compare_digest(
+            acknowledgement_token, attempt_token
         ):
             return None
         return request
@@ -6865,6 +6895,14 @@ class ProxyFeature(Feature):
                     "Deferred acknowledged ingress from isolated feature %s failed",
                     self.name,
                 )
+                # Match detached ingress: a validated NACK reaches the exact
+                # still-live facade after a routing exception, while any
+                # replacement/terminal lifecycle state retains the provider
+                # callback for its normal retry instead.
+                if deferred.retry is not None:
+                    self._schedule_event_ingress_retry(
+                        deferred.source_client, deferred.retry
+                    )
 
         task = asyncio.create_task(
             deliver_after_reopen(),
