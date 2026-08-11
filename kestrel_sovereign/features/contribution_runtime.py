@@ -36,6 +36,41 @@ class FeatureContributionRuntimeError(RuntimeError):
     """A contribution transition cannot be committed or exactly reversed."""
 
 
+class FeatureContributionCollectionError(FeatureContributionRuntimeError):
+    """A sanitized failure from one declarative collection boundary.
+
+    The exact feature and fixed boundary remain inspectable, while the public
+    message omits both the feature representation and original exception text.
+    The original failure is retained as ``__cause__``.
+    """
+
+    _STAGES_BY_GETTER = {
+        "contribution_owner": "contribution collection",
+        "get_tools": "tool collection",
+        "get_service_registrations": "service collection",
+        "get_wait_provider_registrations": "wait-provider collection",
+        "get_workflow_registrations": "workflow collection",
+        "get_feature_permission_defaults": "permission-default collection",
+        "get_setup_step_registrations": "setup-step collection",
+        "validate_feature_contributions": "contribution validation",
+        "validate_contribution_owner_uniqueness": "contribution validation",
+    }
+    _UNKNOWN_GETTER = "unknown contribution boundary"
+
+    def __init__(self, feature: object, getter: str) -> None:
+        self.feature = feature
+        self.getter = (
+            getter if getter in self._STAGES_BY_GETTER else self._UNKNOWN_GETTER
+        )
+        self.stage = self._STAGES_BY_GETTER.get(
+            getter, "contribution collection"
+        )
+        super().__init__(
+            f"feature contribution failure during {self.stage} "
+            f"({self.getter})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PermissionDefaultRegistration:
     """Exact feature-name projection of one SDK permission descriptor."""
@@ -232,9 +267,18 @@ class FeatureContributionRuntime:
 
         prepared = tuple(self._collect(feature) for feature in feature_values)
         active_prepared = tuple(item.prepared for item in self._active.values())
-        validate_contribution_owner_uniqueness(
-            item.owner for item in (*active_prepared, *prepared)
-        )
+        try:
+            validate_contribution_owner_uniqueness(
+                item.owner for item in (*active_prepared, *prepared)
+            )
+        except Exception as exc:
+            failing = self._first_owner_conflict(active_prepared, prepared)
+            if failing is None:
+                raise
+            raise FeatureContributionCollectionError(
+                failing.feature,
+                "validate_contribution_owner_uniqueness",
+            ) from exc
         self._preflight_keys(prepared, validate_setup_order=True)
         return prepared
 
@@ -458,51 +502,112 @@ class FeatureContributionRuntime:
                 feature_name=feature_name,
                 contributions=contributions,
             )
-        owner = feature.contribution_owner
+        try:
+            owner = feature.contribution_owner
+        except Exception as exc:
+            raise FeatureContributionCollectionError(
+                feature, "contribution_owner"
+            ) from exc
         feature_name = getattr(feature, "name", type(feature).__name__)
-        tools = tuple(feature.get_tools()) if hasattr(feature, "get_tools") else ()
-        tool_names = tuple(tool.name for tool in tools)
         # These are deliberately single reads: getters may return bound or
         # generated implementation objects whose identity is lifecycle state.
-        services = feature.get_service_registrations()
-        waits = feature.get_wait_provider_registrations()
-        workflows = feature.get_workflow_registrations()
-        permissions = feature.get_feature_permission_defaults()
-        setup_steps = feature.get_setup_step_registrations()
-        contributions = validate_feature_contributions(
-            owner,
-            tool_names=tool_names,
-            services=services,
-            wait_providers=waits,
-            workflows=workflows,
-            permission_defaults=permissions,
-            setup_steps=setup_steps,
+        tools = FeatureContributionRuntime._call_collection_getter(
+            feature,
+            "get_tools",
+            materialize=True,
+            optional=True,
         )
-        if isinstance(feature, Feature):
-            agent_id = getattr(feature.agent, "agent_id", None) or getattr(
-                feature.agent, "did", None
+        try:
+            tool_names = tuple(tool.name for tool in tools)
+        except Exception as exc:
+            raise FeatureContributionCollectionError(feature, "get_tools") from exc
+        services = FeatureContributionRuntime._call_collection_getter(
+            feature, "get_service_registrations", materialize=True
+        )
+        waits = FeatureContributionRuntime._call_collection_getter(
+            feature, "get_wait_provider_registrations", materialize=True
+        )
+        workflows = FeatureContributionRuntime._call_collection_getter(
+            feature, "get_workflow_registrations", materialize=True
+        )
+        permissions = FeatureContributionRuntime._call_collection_getter(
+            feature, "get_feature_permission_defaults", materialize=False
+        )
+        setup_steps = FeatureContributionRuntime._call_collection_getter(
+            feature, "get_setup_step_registrations", materialize=True
+        )
+        try:
+            contributions = validate_feature_contributions(
+                owner,
+                tool_names=tool_names,
+                services=services,
+                wait_providers=waits,
+                workflows=workflows,
+                permission_defaults=permissions,
+                setup_steps=setup_steps,
             )
-            for registration in contributions.services:
-                if registration.descriptor.scope is not ServiceScope.AGENT:
-                    raise ContributionContractError(
-                        "agent Feature services must use ServiceScope.AGENT"
-                    )
-                if registration.agent_id != agent_id:
-                    raise ContributionContractError(
-                        "agent Feature service agent_id must match its agent"
-                    )
-        else:
-            for registration in contributions.services:
-                if registration.descriptor.scope is not ServiceScope.HOST:
-                    raise ContributionContractError(
-                        "HostFeature services must use ServiceScope.HOST"
-                    )
+            if isinstance(feature, Feature):
+                agent_id = getattr(feature.agent, "agent_id", None) or getattr(
+                    feature.agent, "did", None
+                )
+                for registration in contributions.services:
+                    if registration.descriptor.scope is not ServiceScope.AGENT:
+                        raise ContributionContractError(
+                            "agent Feature services must use ServiceScope.AGENT"
+                        )
+                    if registration.agent_id != agent_id:
+                        raise ContributionContractError(
+                            "agent Feature service agent_id must match its agent"
+                        )
+            else:
+                for registration in contributions.services:
+                    if registration.descriptor.scope is not ServiceScope.HOST:
+                        raise ContributionContractError(
+                            "HostFeature services must use ServiceScope.HOST"
+                        )
+        except Exception as exc:
+            raise FeatureContributionCollectionError(
+                feature, "validate_feature_contributions"
+            ) from exc
         return PreparedFeatureContributions(
             feature=feature,
             owner=owner,
             feature_name=feature_name,
             contributions=contributions,
         )
+
+    @staticmethod
+    def _call_collection_getter(
+        feature: object,
+        getter: str,
+        *,
+        materialize: bool,
+        optional: bool = False,
+    ) -> object:
+        """Read one SDK getter once and keep all failures at one typed edge."""
+
+        try:
+            method = getattr(feature, getter, None)
+            if method is None and optional:
+                return ()
+            value = method()
+            return tuple(value) if materialize else value
+        except Exception as exc:
+            raise FeatureContributionCollectionError(feature, getter) from exc
+
+    @staticmethod
+    def _first_owner_conflict(
+        active: tuple[PreparedFeatureContributions, ...],
+        prepared: tuple[PreparedFeatureContributions, ...],
+    ) -> PreparedFeatureContributions | None:
+        """Return the incoming member that first duplicates an active owner."""
+
+        seen = {item.owner for item in active}
+        for item in prepared:
+            if item.owner in seen:
+                return item
+            seen.add(item.owner)
+        return None
 
     def _preflight_keys(
         self,
@@ -586,6 +691,7 @@ class FeatureContributionRuntime:
 
 __all__ = [
     "ActiveFeatureContributions",
+    "FeatureContributionCollectionError",
     "FeatureContributionRuntime",
     "FeatureContributionRuntimeError",
     "PermissionDefaultRegistration",

@@ -175,6 +175,8 @@ async def start_host_features(
     An ordinary feature start failure remains isolated, but its declarative
     registrations are exactly reversed before a later feature is started.
     Contribution contract and owner conflicts raise before any mutation.
+    Typed collection failures likewise remain fatal at this host boundary;
+    their sanitized wrapper crosses intact with the original failure chained.
     """
     runtime = _host_contribution_runtime(ctx)
     prepared = runtime.prepare_transition(features)

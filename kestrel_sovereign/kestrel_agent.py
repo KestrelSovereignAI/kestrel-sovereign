@@ -4115,7 +4115,33 @@ class KestrelAgent(
 
     def _prepare_feature_contribution_transition(self, features):
         """Collect and prevalidate one complete feature activation transition."""
-        return self._ensure_feature_contribution_runtime().prepare_transition(features)
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionCollectionError,
+        )
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        try:
+            return self._ensure_feature_contribution_runtime().prepare_transition(
+                features
+            )
+        except FeatureContributionCollectionError as exc:
+            feature_class_name = type(exc.feature).__name__
+            cause = exc.__cause__
+            if feature_class_name in MANDATORY_FEATURES:
+                if exc.stage == "tool collection":
+                    stage = "registration"
+                    problem = "could not register its tools"
+                else:
+                    stage = "contribution registration"
+                    problem = "could not register its SDK contributions"
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    stage,
+                    problem,
+                ) from cause
+            if cause is None:  # Defensive: collection failures always chain.
+                raise
+            raise cause.with_traceback(cause.__traceback__) from cause.__cause__
 
     async def _shutdown_failed_feature(self, feature: Feature) -> None:
         """Drain EVERY registration of a feature whose registration failed mid-way.

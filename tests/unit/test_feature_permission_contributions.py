@@ -11,6 +11,7 @@ from kestrel_sdk.features import (
 )
 
 from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
     FeatureContributionRuntime,
     PermissionDefaultRegistration,
     PermissionDefaultsRegistry,
@@ -149,15 +150,30 @@ def test_unknown_declared_tool_override_is_rejected_by_sdk_validation():
     feature = SDKFixtureFeature(
         SimpleNamespace(did="did:test:permissions", agent_id="did:test:permissions")
     )
-    feature.permission_defaults = FeaturePermissionDefaults(
+    permission_defaults = FeaturePermissionDefaults(
         tool_overrides={"not_a_real_tool": SDKPermissionLevel.ALLOW}
     )
+    feature.permission_defaults = permission_defaults
 
-    with pytest.raises(
-        ContributionContractError,
-        match="permission overrides reference unknown feature tools",
-    ):
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
         FeatureContributionRuntime._collect(feature)
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.stage == "contribution validation"
+    assert error.getter == "validate_feature_contributions"
+    assert str(error) == (
+        "feature contribution failure during contribution validation "
+        "(validate_feature_contributions)"
+    )
+    assert "not_a_real_tool" not in str(error)
+    assert type(error.__cause__) is ContributionContractError
+    assert str(error.__cause__) == (
+        "permission overrides reference unknown feature tools: not_a_real_tool"
+    )
+    assert feature.permission_defaults is permission_defaults
+    assert not feature.initialized
+    assert not feature.disabled
 
 
 @pytest.mark.asyncio

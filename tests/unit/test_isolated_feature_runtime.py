@@ -14,6 +14,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.isolated_feature import (
     ConfigTransitionError,
     ConfigTransitionResult,
@@ -27,6 +28,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features import isolated_runtime
 from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
     FeatureContributionRuntime,
 )
 from kestrel_sovereign.features.isolated_runtime import (
@@ -92,8 +94,6 @@ def test_proxy_contribution_owners_are_stable_and_runtime_specific():
 
 
 def test_proxy_duplicate_runtime_owner_is_rejected_before_transition_mutation():
-    from kestrel_sdk.features import ContributionContractError
-
     agent = Mock(did=_TEST_AGENT_DID, agent_id=_TEST_AGENT_DID)
     runtime_metadata = InstalledFeatureRuntime(
         class_name="ConflictingIsolatedFeature",
@@ -110,12 +110,21 @@ def test_proxy_duplicate_runtime_owner_is_rejected_before_transition_mutation():
         source_registry=SourceRegistry(),
     )
 
-    with pytest.raises(
-        ContributionContractError,
-        match="duplicate active feature contribution_owner",
-    ):
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
         runtime.prepare_transition((first, duplicate))
 
+    error = exc_info.value
+    assert error.feature is duplicate
+    assert error.stage == "contribution validation"
+    assert error.getter == "validate_contribution_owner_uniqueness"
+    assert str(error) == (
+        "feature contribution failure during contribution validation "
+        "(validate_contribution_owner_uniqueness)"
+    )
+    assert duplicate.contribution_owner not in str(error)
+    assert "duplicate active feature contribution_owner" not in str(error)
+    assert type(error.__cause__) is ContributionContractError
+    assert "duplicate active feature contribution_owner" in str(error.__cause__)
     assert runtime.active_owners() == ()
 
 

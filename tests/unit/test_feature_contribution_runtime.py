@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,9 @@ from kestrel_sdk.operator import ExecutionTargetDescriptor
 
 from kestrel_sovereign import server
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
+from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
+)
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.operator import (
     ExecutionTargetRegistration,
@@ -114,6 +118,29 @@ async def test_owner_conflict_rejects_complete_transition_before_mutation(tmp_pa
     assert len(agent.signal_registry) == 0
 
 
+def test_owner_validation_failure_is_typed_and_identifies_incoming_owner(tmp_path):
+    agent = _agent(tmp_path)
+
+    class SameOwnerFixture(SDKFixtureFeature):
+        @property
+        def contribution_owner(self):
+            return "tests:shared-owner"
+
+    first = SameOwnerFixture(agent)
+    second = SameOwnerFixture(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((first, second))
+
+    error = exc_info.value
+    assert error.feature is second
+    assert error.stage == "contribution validation"
+    assert error.getter == "validate_contribution_owner_uniqueness"
+    assert isinstance(error.__cause__, ContributionContractError)
+    assert runtime.active_owners() == ()
+
+
 @pytest.mark.asyncio
 async def test_activation_failure_reverses_declarative_contributions(tmp_path):
     agent = _agent(tmp_path)
@@ -168,6 +195,232 @@ async def test_mandatory_contribution_failure_has_actionable_sanitized_diagnosti
     assert arbitrary.problem == "failed"
     assert "secret-stage" not in str(arbitrary)
     assert "secret-problem" not in str(arbitrary)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "getter",
+    ["get_tools", "get_service_registrations"],
+)
+async def test_non_mandatory_collection_failure_remains_actionable(
+    tmp_path, monkeypatch, getter
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    original = RuntimeError(f"actionable {getter} diagnostic")
+
+    def fail_collection():
+        raise original
+
+    monkeypatch.setattr(feature, getter, fail_collection)
+
+    with pytest.raises(RuntimeError, match=f"actionable {getter}") as exc_info:
+        await agent._register_feature(feature)
+
+    assert exc_info.value is original
+    assert feature.name not in agent.features
+    assert agent._ensure_feature_contribution_runtime().active_owners() == ()
+
+
+@pytest.mark.asyncio
+async def test_non_mandatory_collection_failure_preserves_original_nested_cause(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    root = ValueError("root")
+    original = RuntimeError("outer")
+
+    def fail_collection():
+        raise original from root
+
+    monkeypatch.setattr(feature, "get_tools", fail_collection)
+
+    with pytest.raises(RuntimeError, match="outer") as exc_info:
+        await agent._register_feature(feature)
+
+    assert exc_info.value is original
+    assert exc_info.value.__cause__ is root
+    visible_chain = "".join(traceback.format_exception(exc_info.value))
+    assert "ValueError: root" in visible_chain
+    assert "FeatureContributionCollectionError" not in visible_chain
+    assert feature.name not in agent.features
+    assert agent._ensure_feature_contribution_runtime().active_owners() == ()
+
+
+@pytest.mark.asyncio
+async def test_mandatory_non_tool_collection_failure_uses_contribution_diagnostic(
+    tmp_path,
+):
+    agent = _agent(tmp_path)
+    original = ContributionContractError("secret service diagnostic")
+
+    class SecurityFeature(SDKFixtureFeature):
+        def get_service_registrations(self):
+            raise original
+
+    feature = SecurityFeature(agent)
+
+    with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+        await agent._register_feature(feature)
+
+    error = exc_info.value
+    assert error.stage == "contribution registration"
+    assert error.problem == "could not register its SDK contributions"
+    assert error.stage != "registration"
+    assert "tools" not in str(error)
+    assert "secret service diagnostic" not in str(error)
+    assert error.__cause__ is original
+    assert feature.name not in agent.features
+    assert agent._ensure_feature_contribution_runtime().active_owners() == ()
+
+
+def test_tool_name_projection_uses_tool_collection_boundary(tmp_path, monkeypatch):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    monkeypatch.setattr(feature, "get_tools", lambda: (object(),))
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.stage == "tool collection"
+    assert error.getter == "get_tools"
+    assert "has no attribute" not in str(error)
+    assert isinstance(error.__cause__, AttributeError)
+    assert runtime.active_owners() == ()
+
+
+@pytest.mark.asyncio
+async def test_mandatory_tool_name_projection_failure_uses_tool_diagnostic(tmp_path):
+    agent = _agent(tmp_path)
+
+    class SecurityFeature(SDKFixtureFeature):
+        def get_tools(self):
+            return (object(),)
+
+    feature = SecurityFeature(agent)
+
+    with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+        await agent._register_feature(feature)
+
+    error = exc_info.value
+    assert error.stage == "registration"
+    assert error.problem == "could not register its tools"
+    assert "has no attribute" not in str(error)
+    assert isinstance(error.__cause__, AttributeError)
+    assert feature.name not in agent.features
+    assert agent._ensure_feature_contribution_runtime().active_owners() == ()
+
+
+@pytest.mark.parametrize(
+    ("getter", "expected_stage"),
+    [
+        ("get_tools", "tool collection"),
+        ("get_service_registrations", "service collection"),
+        ("get_wait_provider_registrations", "wait-provider collection"),
+        ("get_workflow_registrations", "workflow collection"),
+        ("get_feature_permission_defaults", "permission-default collection"),
+        ("get_setup_step_registrations", "setup-step collection"),
+    ],
+)
+def test_every_contribution_getter_uses_one_sanitized_typed_boundary(
+    tmp_path, monkeypatch, getter, expected_stage
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    original = RuntimeError(f"credential-from-{getter}")
+
+    def fail_collection():
+        raise original
+
+    monkeypatch.setattr(feature, getter, fail_collection)
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == getter
+    assert error.stage == expected_stage
+    assert f"credential-from-{getter}" not in str(error)
+    assert error.__cause__ is original
+    assert runtime.active_owners() == ()
+
+
+def test_contribution_validation_uses_same_sanitized_typed_boundary(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    original = ContributionContractError("token=validation-secret")
+
+    def fail_validation(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.contribution_runtime."
+        "validate_feature_contributions",
+        fail_validation,
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "validate_feature_contributions"
+    assert error.stage == "contribution validation"
+    assert "validation-secret" not in str(error)
+    assert error.__cause__ is original
+    assert runtime.active_owners() == ()
+
+
+def test_collection_error_rejects_arbitrary_public_boundary_text():
+    feature = object()
+    error = FeatureContributionCollectionError(
+        feature,
+        "secret-getter=/private/credentials",
+    )
+
+    assert error.feature is feature
+    assert error.getter == "unknown contribution boundary"
+    assert error.stage == "contribution collection"
+    assert "secret-getter" not in str(error)
+    assert "/private/credentials" not in str(error)
+
+
+def test_batch_getter_failure_leaves_every_collected_owner_uncommitted(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+
+    class SecondFixture(SDKFixtureFeature):
+        name = "second-fixture"
+        contribution_prefix = "second-fixture"
+
+    second = SecondFixture(agent)
+    original = RuntimeError("secret second workflow failure")
+
+    def fail_collection():
+        raise original
+
+    monkeypatch.setattr(second, "get_workflow_registrations", fail_collection)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((first, second))
+
+    assert exc_info.value.feature is second
+    assert exc_info.value.__cause__ is original
+    assert runtime.active_owners() == ()
+    assert len(agent.wait_registry.kinds()) == 0
+    assert len(agent.signal_registry) == 0
 
 
 def test_permission_registration_failure_preserves_original_error_and_cleans_peers(

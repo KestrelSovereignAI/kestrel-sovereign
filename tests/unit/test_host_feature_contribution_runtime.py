@@ -14,6 +14,7 @@ from kestrel_sovereign.host_features import (
     unmount_host_features,
 )
 from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
     FeatureContributionRuntimeError,
 )
 from tests.fixtures.sdk_contribution_fixture import SDKFixtureHostFeature
@@ -113,12 +114,12 @@ async def test_host_owner_conflict_fails_before_either_feature_starts():
     second.contribution_prefix = "shared-host-two"
     ctx = SovereignHostContext()
 
-    with pytest.raises(
-        ContributionContractError,
-        match="duplicate active feature contribution_owner",
-    ):
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
         await start_host_features([first, second], ctx)
 
+    assert exc_info.value.feature is second
+    assert exc_info.value.getter == "validate_contribution_owner_uniqueness"
+    assert isinstance(exc_info.value.__cause__, ContributionContractError)
     assert not first.started
     assert not second.started
     assert len(ctx.feature_contribution_runtime.wait_registry.kinds()) == 0
@@ -181,16 +182,38 @@ async def test_invalid_restart_candidate_preserves_already_valid_host_state():
             return healthy.contribution_owner
 
     candidate = ConflictingRestartFeature()
-    with pytest.raises(
-        ContributionContractError,
-        match="duplicate active feature contribution_owner",
-    ):
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
         await start_host_features([candidate], ctx)
 
+    assert exc_info.value.feature is candidate
+    assert isinstance(exc_info.value.__cause__, ContributionContractError)
     _assert_live(ctx, healthy, True)
     assert healthy.started
     assert not candidate.started
     await stop_host_features([healthy], ctx)
+
+
+@pytest.mark.asyncio
+async def test_host_collection_failure_is_sanitized_fatal_and_pre_mutation():
+    original = RuntimeError("host-token=must-stay-private")
+
+    class FailingHostFeature(SDKFixtureHostFeature):
+        def get_setup_step_registrations(self):
+            raise original
+
+    feature = FailingHostFeature()
+    ctx = SovereignHostContext()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        await start_host_features([feature], ctx)
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "get_setup_step_registrations"
+    assert "host-token" not in str(error)
+    assert error.__cause__ is original
+    assert not feature.started
+    assert ctx.feature_contribution_runtime.active_owners() == ()
 
 
 @pytest.mark.asyncio
