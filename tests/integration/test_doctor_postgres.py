@@ -69,6 +69,12 @@ def runtime_db():
 
     Doctor's whole job here is to read what the *runtime* holds, so the fixture
     writes rows the way the runtime would rather than going through storage.
+
+    "The way the runtime would" includes the ownership ledgers. A bound
+    ``AsyncGraphStore`` matches on ``graph_node_owners`` / ``graph_edge_owners``
+    rather than on ``node_id``, so a fixture that seeds only the rows describes
+    a database in which the agent can see nothing at all — and any assertion
+    about what doctor reports would then be about the wrong host entirely.
     """
     import psycopg2
 
@@ -93,20 +99,47 @@ def runtime_db():
             "CREATE TABLE graph_edges ("
             " source_id TEXT, target_id TEXT, label TEXT)"
         )
+        cursor.execute(
+            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
+        )
+        cursor.execute(
+            "CREATE TABLE graph_edge_owners ("
+            " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
+        )
 
-    def seed(did: str, properties: dict, governed_by: str | None):
+    def seed(
+        did: str,
+        properties: dict,
+        governed_by: str | None,
+        *,
+        witness_node: bool = True,
+        witness_edge: bool = True,
+    ):
         with connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO graph_nodes (node_id, node_type, properties) "
                 "VALUES (%s, 'agent', %s)",
                 (did, json.dumps(properties)),
             )
+            if witness_node:
+                cursor.execute(
+                    "INSERT INTO graph_node_owners (node_id, agent_id) "
+                    "VALUES (%s, %s)",
+                    (did, did),
+                )
             if governed_by is not None:
                 cursor.execute(
                     "INSERT INTO graph_edges (source_id, target_id, label) "
                     "VALUES (%s, %s, 'governed_by')",
                     (did, governed_by),
                 )
+                if witness_edge:
+                    cursor.execute(
+                        "INSERT INTO graph_edge_owners "
+                        "(source_id, target_id, label, agent_id) "
+                        "VALUES (%s, %s, 'governed_by', %s)",
+                        (did, governed_by, did),
+                    )
 
     seed.dsn = dsn
     try:
@@ -317,3 +350,40 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     assert "KESTREL_DB_BACKEND" not in os.environ, (
         "a diagnostic must not export the project's environment"
     )
+
+
+def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Everything is in place except the ownership witnesses.
+
+    ``AsyncGraphStore`` binds to the agent's DID on this backend, and its
+    ``_node_scope`` / ``_edge_scope`` require a row in ``graph_node_owners`` /
+    ``graph_edge_owners`` — not a matching ``node_id``. The boot integrity
+    audit reads through that bound store, so without the witnesses it sees no
+    agent node and no ``governed_by`` edge, fails proof 2, and safe-modes.
+
+    A doctor filtering on ``node_id`` alone would find both rows, agree with
+    the canonical file, and report Ready — sending an operator to a host that
+    then refuses to run. False reassurance from a governance tool is a worse
+    failure than the false alarm this issue began as.
+    """
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+        witness_node=False,
+        witness_edge=False,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+
+    report = diagnose(tmp_path)
+
+    assert not any(
+        "constitution anchored to current file" in m for m in report.ok
+    ), "doctor certified an agent whose governance the runtime cannot see"
+    assert any(
+        "no agent node owned by" in m and AGENT_DID in m for m in report.warn
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"

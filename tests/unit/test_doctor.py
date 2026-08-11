@@ -215,6 +215,8 @@ import hashlib  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import sqlite3  # noqa: E402
+
+import pytest  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 
 from kestrel_sovereign.doctor import (  # noqa: E402
@@ -222,11 +224,14 @@ from kestrel_sovereign.doctor import (  # noqa: E402
     _NoHashProperty,
     _UnreadableDB,
     _GovernanceSource,
-    _read_anchored_constitution_hash,
+    _anchored_constitution_hash,
+    _anchored_emancipation_contract,
 )
 
+_TEST_DID = "did:test:Test"
 
-def _anchor(db_path) -> _GovernanceSource:
+
+def _anchor(db_path, agent_did: str = _TEST_DID) -> _GovernanceSource:
     """A source that reads the local anchor — the SQLite host's shape.
 
     The readers take a :class:`_GovernanceSource` rather than a path, because
@@ -234,8 +239,11 @@ def _anchor(db_path) -> _GovernanceSource:
     governance is elsewhere (#2892). These helper-level tests are about the
     SQLite reading itself, so they say which database they mean rather than
     relying on a default.
+
+    ``agent_did`` is required on both backends: the runtime's store is bound to
+    it everywhere, so every governance read carries an ownership predicate.
     """
-    return _GovernanceSource(anchor_path=db_path)
+    return _GovernanceSource(anchor_path=db_path, agent_did=agent_did)
 
 
 # Sentinel default: "make the governed_by edge target the stored hash",
@@ -251,6 +259,8 @@ def _seed_with_anchored_constitution(
     governed_by_target: object = _EDGE_MATCHES_ANCHOR,
     overlay_anchor: object = None,
     create_edges_table: bool = True,
+    witness_node: bool = True,
+    witness_edge: bool = True,
 ) -> None:
     """Build a project tree where the agent's anchored hash is exactly ``stored_hash``.
 
@@ -298,6 +308,16 @@ def _seed_with_anchored_constitution(
                 label TEXT,
                 properties TEXT
             );
+            CREATE TABLE graph_node_owners (
+                node_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL
+            );
+            CREATE TABLE graph_edge_owners (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                agent_id TEXT NOT NULL
+            );
             """
         )
         if create_edges_table:
@@ -316,12 +336,28 @@ def _seed_with_anchored_constitution(
             "VALUES (?, 'agent', ?, ?)",
             ("did:test:Test", "Test", json.dumps(properties)),
         )
+        # The ownership witness a real write always lays down beside the row
+        # (``AsyncGraphStore.add_node`` -> ``record_graph_node_owner``). It is
+        # what the bound runtime store actually matches on, so a seed without
+        # it is not a healthy agent — it is the invisible-row case.
+        if witness_node:
+            conn.execute(
+                "INSERT INTO graph_node_owners(node_id, agent_id) VALUES (?, ?)",
+                ("did:test:Test", "did:test:Test"),
+            )
         if create_edges_table and governed_by_target is not None:
             conn.execute(
                 "INSERT INTO graph_edges(source_id, target_id, label, properties) "
                 "VALUES (?, ?, 'governed_by', NULL)",
                 ("did:test:Test", governed_by_target),
             )
+            if witness_edge:
+                conn.execute(
+                    "INSERT INTO graph_edge_owners"
+                    "(source_id, target_id, label, agent_id) "
+                    "VALUES (?, ?, 'governed_by', ?)",
+                    ("did:test:Test", governed_by_target, "did:test:Test"),
+                )
         conn.commit()
 
 
@@ -500,54 +536,48 @@ def test_constitution_drift_skips_when_db_missing(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_read_hash_returns_string_on_happy_path(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
-            ("did:x", "x", json.dumps({"constitution_hash": "abc123"})),
-        )
-        conn.commit()
-    assert _read_anchored_constitution_hash(_anchor(db)) == "abc123"
+def test_reads_the_hash_off_the_properties_it_was_given():
+    assert _anchored_constitution_hash({"constitution_hash": "abc123"}) == "abc123"
 
 
-def test_read_hash_handles_no_graph_nodes_table(tmp_path):
-    db = tmp_path / "k.db"
-    sqlite3.connect(str(db)).close()  # Empty DB.
-    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _UnreadableDB)
+@pytest.mark.parametrize(
+    "properties",
+    [
+        None,                                  # corrupt/absent properties column
+        {},                                     # older agent, never anchored
+        {"constitution_hash": ""},              # present but empty
+        {"constitution_hash": 12345},           # present but not a string
+        "not a dict",                           # properties parsed to a scalar
+    ],
+)
+def test_no_usable_hash_is_its_own_verdict(properties):
+    """``_NoHashProperty`` is distinct from "unreadable" on purpose: doctor
+    tells an older agent to re-incept, and tells an unreadable database
+    nothing at all."""
+    assert isinstance(_anchored_constitution_hash(properties), _NoHashProperty)
 
 
-def test_read_hash_handles_no_agent_node(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.commit()
-    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _NoAgentNode)
+def test_the_emancipation_contract_comes_from_the_same_row():
+    """No second query, so no second failure to mistake for "no contract".
+
+    Reading it separately meant one transient PostgreSQL error made doctor
+    render the dormant constitution for an emancipated agent and report drift
+    that was not there — a governance failure manufactured from a hiccup.
+    """
+    properties = {
+        "constitution_hash": "abc123",
+        "emancipation_contract": '{"enabled": true}',
+    }
+    assert _anchored_constitution_hash(properties) == "abc123"
+    assert _anchored_emancipation_contract(properties) == '{"enabled": true}'
 
 
-def test_read_hash_handles_corrupt_properties_json(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
-            ("did:x", "x", "{not valid json"),
-        )
-        conn.commit()
-    assert isinstance(_read_anchored_constitution_hash(_anchor(db)), _NoHashProperty)
+@pytest.mark.parametrize("properties", [None, {}, "not a dict"])
+def test_an_agent_without_a_contract_reads_as_dormant(properties):
+    """``None`` is the right answer *for an absent contract* — it resolves to
+    the canonical bytes, which is what a non-emancipated agent should hash
+    against. It is only wrong as the answer to a failed read."""
+    assert _anchored_emancipation_contract(properties) is None
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +688,16 @@ def test_governed_by_stale_extra_edge_warns_but_passes(tmp_path, monkeypatch):
             "INSERT INTO graph_edges(source_id, target_id, label, properties) "
             "VALUES (?, ?, 'governed_by', NULL)",
             ("did:test:Test", ancient),
+        )
+        # With its witness: this is a dangling edge a *real* reanchor left
+        # behind, so the agent genuinely owns it and genuinely sees it. An
+        # unwitnessed edge is a different case, covered separately — and it
+        # would make this test pass for the wrong reason, by being invisible.
+        conn.execute(
+            "INSERT INTO graph_edge_owners"
+            "(source_id, target_id, label, agent_id) "
+            "VALUES (?, ?, 'governed_by', ?)",
+            ("did:test:Test", ancient, "did:test:Test"),
         )
         conn.commit()
     report = diagnose(tmp_path)
@@ -850,39 +890,60 @@ def test_overlay_checked_for_legacy_agent_without_base_anchor(
 
 # Helper-level tests for the new readers.
 
+_GRAPH_SCHEMA = """
+CREATE TABLE graph_nodes (
+    node_id TEXT, node_type TEXT, label TEXT, properties TEXT
+);
+CREATE TABLE graph_edges (
+    source_id TEXT, target_id TEXT, label TEXT, properties TEXT
+);
+CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT);
+CREATE TABLE graph_edge_owners (
+    source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT
+);
+"""
 
-def test_read_agent_node_returns_id_and_properties(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
+
+def _graph_db(path, *, nodes=(), edges=(), node_owners=(), edge_owners=()):
+    """A Kestrel graph with the ownership ledgers a real write maintains.
+
+    Seeding rows without their witnesses is what an earlier version of these
+    tests did, and it made every reader look correct while the bound runtime
+    saw nothing — so the ledgers are part of the schema here, and a test that
+    wants an unwitnessed row has to say so.
+    """
+    with sqlite3.connect(str(path)) as conn:
+        conn.executescript(_GRAPH_SCHEMA)
+        conn.executemany("INSERT INTO graph_nodes VALUES (?, ?, ?, ?)", nodes)
+        conn.executemany("INSERT INTO graph_edges VALUES (?, ?, ?, NULL)", edges)
+        conn.executemany(
+            "INSERT INTO graph_node_owners VALUES (?, ?)", node_owners
         )
-        conn.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
-            ("did:x", "x", json.dumps({"constitution_hash": "abc123"})),
+        conn.executemany(
+            "INSERT INTO graph_edge_owners VALUES (?, ?, ?, ?)", edge_owners
         )
         conn.commit()
-    node_id, properties = _read_agent_node(_anchor(db))
+    return path
+
+
+def test_read_agent_node_returns_id_and_properties(tmp_path):
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc123"}))],
+        node_owners=[("did:x", "did:x")],
+    )
+    node_id, properties = _read_agent_node(_anchor(db, "did:x"))
     assert node_id == "did:x"
     assert properties == {"constitution_hash": "abc123"}
 
 
 def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
-            ("did:x", "x", "{not valid json"),
-        )
-        conn.commit()
-    node_id, properties = _read_agent_node(_anchor(db))
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", "{not valid json")],
+        node_owners=[("did:x", "did:x")],
+    )
+    node_id, properties = _read_agent_node(_anchor(db, "did:x"))
     assert node_id == "did:x"
     assert properties is None
 
@@ -890,43 +951,76 @@ def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
 def test_read_agent_node_sentinels(tmp_path):
     empty = tmp_path / "empty.db"
     sqlite3.connect(str(empty)).close()
-    assert isinstance(_read_agent_node(_anchor(empty)), _UnreadableDB)
+    assert isinstance(_read_agent_node(_anchor(empty, "did:x")), _UnreadableDB)
 
-    no_agent = tmp_path / "noagent.db"
-    with sqlite3.connect(str(no_agent)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_nodes (
-                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.commit()
-    assert isinstance(_read_agent_node(_anchor(no_agent)), _NoAgentNode)
+    no_agent = _graph_db(tmp_path / "noagent.db")
+    assert isinstance(_read_agent_node(_anchor(no_agent, "did:x")), _NoAgentNode)
+
+
+def test_an_agent_node_without_its_ownership_witness_is_invisible(tmp_path):
+    """The runtime's bound store matches on the ledger, not on ``node_id``.
+
+    ``AsyncGraphStore._node_scope`` requires a ``graph_node_owners`` row for
+    the bound DID, and the boot integrity audit reads through it
+    (``storage.get_node``). A raw row without that witness is a row the agent
+    cannot see, so doctor must not see it either — otherwise it certifies an
+    agent healthy and the agent safe-modes at its next boot.
+    """
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+        node_owners=[],  # the row exists; nobody witnesses owning it
+    )
+    assert isinstance(_read_agent_node(_anchor(db, "did:x")), _NoAgentNode)
+
+
+def test_an_agent_node_owned_by_someone_else_is_invisible(tmp_path):
+    """One PostgreSQL holds every local agent; a neighbour's witness is not
+    this agent's capability."""
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+        node_owners=[("did:x", "did:neighbour")],
+    )
+    assert isinstance(_read_agent_node(_anchor(db, "did:x")), _NoAgentNode)
 
 
 def test_read_governed_by_targets_filters_by_source_and_label(tmp_path):
-    db = tmp_path / "k.db"
-    with sqlite3.connect(str(db)) as conn:
-        conn.executescript(
-            """CREATE TABLE graph_edges (
-                source_id TEXT, target_id TEXT, label TEXT, properties TEXT
-            );"""
-        )
-        conn.executemany(
-            "INSERT INTO graph_edges VALUES (?, ?, ?, NULL)",
-            [
-                ("did:x", "hash-a", "governed_by"),
-                ("did:x", "hash-b", "knows"),
-                ("did:other", "hash-c", "governed_by"),
-            ],
-        )
-        conn.commit()
-    assert _read_governed_by_targets(_anchor(db), "did:x") == ("hash-a",)
+    db = _graph_db(
+        tmp_path / "k.db",
+        edges=[
+            ("did:x", "hash-a", "governed_by"),
+            ("did:x", "hash-b", "knows"),
+            ("did:other", "hash-c", "governed_by"),
+        ],
+        edge_owners=[
+            ("did:x", "hash-a", "governed_by", "did:x"),
+            ("did:x", "hash-b", "knows", "did:x"),
+            ("did:other", "hash-c", "governed_by", "did:other"),
+        ],
+    )
+    assert _read_governed_by_targets(_anchor(db, "did:x"), "did:x") == ("hash-a",)
+
+
+def test_a_governed_by_edge_without_its_witness_is_invisible(tmp_path):
+    """The proof-2 counterpart: ``_edge_scope`` joins ``graph_edge_owners``,
+    and the audit reads ``storage.get_edges_from``. An unwitnessed edge cannot
+    satisfy proof 2, so reporting it as satisfying proof 2 is the failure
+    mode — doctor says Ready, boot safe-modes."""
+    db = _graph_db(
+        tmp_path / "k.db",
+        edges=[("did:x", "hash-a", "governed_by")],
+        edge_owners=[],
+    )
+    assert _read_governed_by_targets(_anchor(db, "did:x"), "did:x") == ()
 
 
 def test_read_governed_by_targets_unreadable_without_table(tmp_path):
     db = tmp_path / "k.db"
     sqlite3.connect(str(db)).close()
-    assert isinstance(_read_governed_by_targets(_anchor(db), "did:x"), _UnreadableDB)
+    assert isinstance(
+        _read_governed_by_targets(_anchor(db, "did:x"), "did:x"), _UnreadableDB
+    )
 
 
 def test_doctor_accepts_openrouter_management_key_only(tmp_path):
@@ -997,19 +1091,44 @@ def test_the_database_settings_are_read_from_the_project_env(tmp_path, monkeypat
     assert resolved["KESTREL_DATABASE_URL"] == "postgresql://durable.example/kestrel"
 
 
-def test_an_exported_setting_still_outranks_the_project_env(tmp_path, monkeypatch):
-    """``paths.load_project_env`` uses ``setdefault``; this must match it.
+def test_the_project_env_outranks_an_exported_setting(tmp_path, monkeypatch):
+    """The launcher's precedence, which is what the agents actually get.
 
-    Reading the file *instead of* the environment would be the same mistake
-    pointing the other way — an operator who exports a DSN to aim a tool at one
-    database would be diagnosed against another.
+    ``ProcessManager._load_env`` copies ``os.environ`` and then lets ``.env``
+    overwrite it, so the file wins. This is the **opposite** of
+    ``paths.load_project_env``'s ``setdefault``, and an earlier version of this
+    test asserted that other direction — which would have doctor inspect the
+    exported database while the agents it is diagnosing open the file's one.
+    Diagnosing the wrong database is this issue's whole defect; getting there
+    by copying the wrong precedence would just be a longer route to it.
     """
     from kestrel_sovereign.doctor import runtime_env
 
     (tmp_path / ".env").write_text("KESTREL_DATABASE_URL=postgresql://from-file/db\n")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://exported/db")
 
-    assert runtime_env(tmp_path)["KESTREL_DATABASE_URL"] == "postgresql://exported/db"
+    assert runtime_env(tmp_path)["KESTREL_DATABASE_URL"] == "postgresql://from-file/db"
+
+
+def test_doctor_and_the_launcher_resolve_identically(tmp_path, monkeypatch):
+    """Not "the same rule" — the same function.
+
+    Two copies of a precedence is how they drift, and a drift here means
+    doctor certifies one database while ``kestrel start`` opens another.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    (tmp_path / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://from-file/db\n"
+    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://exported/db")
+
+    launcher = ProcessManager.__new__(ProcessManager)
+    launcher.project_dir = tmp_path
+
+    assert runtime_env(tmp_path) == launcher._load_env()
 
 
 def test_diagnose_does_not_export_the_project_env(tmp_path, monkeypatch):

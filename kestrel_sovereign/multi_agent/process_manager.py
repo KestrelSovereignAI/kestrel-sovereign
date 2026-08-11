@@ -242,17 +242,15 @@ class ProcessManager:
     # ------------------------------------------------------------------
 
     def _load_env(self) -> dict:
-        """Load .env file into an env dict copy."""
-        from dotenv import dotenv_values
+        """Load .env file into an env dict copy.
 
-        env = os.environ.copy()
-        env_file = self.project_dir / ".env"
-        if env_file.exists():
-            env.update({
-                k: v for k, v in dotenv_values(env_file).items()
-                if v is not None
-            })
-        return env
+        The body moved to ``paths.spawned_agent_env`` so ``kestrel doctor`` can
+        ask this launcher which database a spawned agent will open instead of
+        reimplementing the precedence and quietly disagreeing with it (#2892).
+        """
+        from kestrel_sovereign.paths import spawned_agent_env
+
+        return spawned_agent_env(self.project_dir)
 
     def _spawn_detached(
         self,
