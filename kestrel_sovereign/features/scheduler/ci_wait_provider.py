@@ -6,12 +6,13 @@ restart (#2729). This module is that provider. A handle is a PR reference —
 ``owner/repo#123`` — and the provider reads the PR's current state plus its
 head-commit check runs and combined status to decide a terminal verdict:
 
-  * PR merged                       -> DONE   (the happy terminal)
+  * PR merged                       -> DONE    (the happy terminal)
   * PR closed without merge         -> FAILED
   * open + all checks passed        -> DONE
   * open + a check failed           -> FAILED
+  * open + no checks ran at all     -> PARTIAL (terminal; ``checks: "none"``)
   * open + checks still running,
-    or no CI configured yet         -> PENDING (keep watching)
+    or the rollup was not read      -> PENDING (keep watching)
 
 The change-detection primitives (``fetch``/``summarize_checks``) are reused
 from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`, which is pure
@@ -21,21 +22,59 @@ Transient failures (no token, auth error, network blip) return
 :class:`Outcome.PENDING`, never a terminal failure: a durable
 ``wait("ci:...", mode="signal")`` must re-arm and complete once when the PR
 truly settles, not fabricate a merge/close from a flaky poll.
+
+Every observed state must be either terminal or provably still-progressing
+(#2939). A state that is neither is how this provider stalled a merge on
+``kestrel-sovereign#2934`` for three hours: it reported ``checks: "pending"``
+against a head SHA whose 18 check runs had *all* completed, because GitHub's
+combined-status endpoint reports ``state: "pending"`` for a commit carrying
+**zero** legacy statuses — the shape of every Actions-only repository. Two
+rules follow, and both are load-bearing:
+
+  * an absence of evidence is never read as "still running"
+    (:func:`_check_verdict` ignores a combined state with no statuses), and
+  * an empty rollup is terminal-but-caveated, not pending — there is nothing
+    to wait for, and a ``mode="signal"`` watch on it would otherwise never
+    fire.
+
+The empty rollup is terminal *immediately*, with no grace period for check
+runs GitHub may still be creating. A settle window was tried and removed: a
+single poll carries no immutable anchor to bound one from. The PR's
+``updated_at`` is the only timestamp on the payload, and it is mutable — a
+comment, a label, or any automation touching the PR refreshes it while the
+same head SHA stays checkless, so every minute-level reconciliation would
+re-enter the window and the wait would never converge. That is the #2939
+stall in a different shape. Reporting "nothing ran" a few seconds early is a
+caveated PARTIAL the waiter can see and act on; a wait that never fires is
+not.
+
+The converse rule holds too: a *pending* read is never promoted to a terminal
+verdict. A PR that GitHub calls ``clean``/mergeable while the rollup still
+reads pending is surfaced as a ``contradiction`` marker on the PENDING
+payload, because a repository with no required checks is reported ``clean``
+while its CI is still queued — resolving that to DONE would fabricate a merge
+signal out of a race.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
+
+logger = logging.getLogger(__name__)
 
 # A CI handle is a PR reference: ``owner/repo#123``. The owner/repo half may
 # contain the usual GitHub name characters; the number is the PR/issue id.
 _CI_HANDLE_RE = re.compile(r"^(?P<repo>[^\s#]+/[^\s#]+)#(?P<number>\d+)$")
 
 # GitHub check-run conclusions that mean the check did NOT pass. ``success``,
-# ``neutral`` and ``skipped`` are treated as non-blocking passes.
+# ``neutral`` and ``skipped`` are treated as non-blocking passes: they mean
+# the check did not need to run. ``cancelled`` deliberately stays a failure —
+# it means the check was stopped before it could tell us anything, which is an
+# absence of evidence rather than a pass (#2939).
 _FAIL_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "cancelled", "action_required", "stale",
      "startup_failure"}
@@ -57,17 +96,36 @@ def parse_ci_handle(handle: str) -> Tuple[str, int]:
     return m.group("repo"), int(m.group("number"))
 
 
+def _positive_count(value: Any) -> bool:
+    """Whether ``value`` is a GitHub ``total_count`` greater than zero.
+
+    Tolerates the field being absent, ``null``, or a string; anything that is
+    not a positive integer reads as "no statuses reported".
+    """
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _check_verdict(
     check_runs: Any = None, combined_status: Any = None
 ) -> str:
     """Reduce raw check-runs + combined commit status to a coarse verdict.
 
     Returns one of:
-      * ``"none"``    — no checks or statuses exist at all (no CI configured),
+      * ``"unknown"`` — the rollup was not read at all (neither payload was
+        fetched); an evidence gap, NOT a statement about the checks,
+      * ``"none"``    — read successfully and empty: no check runs and no
+        statuses exist for this commit (no CI ran),
       * ``"pending"`` — at least one check/status is not yet terminal,
       * ``"failure"`` — everything terminal and at least one failed,
       * ``"success"`` — everything terminal and all passed.
+
+    A check run counts as terminal on ``status == "completed"`` whatever its
+    conclusion, so ``skipped``/``neutral`` never hold the rollup open.
     """
+    runs_read = isinstance(check_runs, (dict, list))
     runs: List[dict] = []
     if isinstance(check_runs, dict):
         raw_runs = check_runs.get("check_runs", []) or []
@@ -79,14 +137,23 @@ def _check_verdict(
         if isinstance(r, dict):
             runs.append(r)
 
+    status_read = isinstance(combined_status, dict)
     combined_state = ""
     statuses: List[dict] = []
     if isinstance(combined_status, dict):
-        combined_state = str(combined_status.get("state", "") or "").lower()
         for s in combined_status.get("statuses", []) or []:
             if isinstance(s, dict):
                 statuses.append(s)
+        # GitHub reports the combined ``state`` as "pending" for a commit that
+        # carries ZERO legacy statuses — the shape of every Actions-only repo,
+        # where CI reports through check runs instead. Reading that as "a
+        # check is still running" pins the verdict at pending forever (#2939),
+        # so the combined state is evidence only when a status backs it.
+        if statuses or _positive_count(combined_status.get("total_count")):
+            combined_state = str(combined_status.get("state", "") or "").lower()
 
+    if not runs_read and not status_read:
+        return "unknown"
     if not runs and not statuses and not combined_state:
         return "none"
 
@@ -114,6 +181,21 @@ def _check_verdict(
     return "success"
 
 
+def _mergeability(pr_raw: Dict[str, Any]) -> Tuple[Optional[bool], str]:
+    """Read ``(mergeable, mergeable_state)`` off a GitHub pull payload.
+
+    Both fields are already on the fetched pull payload, so this costs no
+    extra request. ``mergeable`` is ``None`` while GitHub is still computing
+    the merge commit — deliberately preserved as ``None`` rather than
+    collapsed to ``False``, since "not yet known" and "not mergeable" are
+    different claims.
+    """
+    mergeable = pr_raw.get("mergeable")
+    if not isinstance(mergeable, bool):
+        mergeable = None
+    return mergeable, str(pr_raw.get("mergeable_state", "") or "").strip().lower()
+
+
 def classify_ci_state(
     pr_raw: Dict[str, Any],
     *,
@@ -124,11 +206,12 @@ def classify_ci_state(
 ) -> WaitStatus:
     """Classify a PR's merge/CI state onto the generic :class:`Outcome`.
 
-    Pure and side-effect free so the terminal contract is unit-testable with
-    fabricated payloads (no network). ``pr_raw`` is the GitHub pull payload;
-    ``check_runs``/``combined_status`` are the head commit's check-runs and
-    combined status JSON (both optional — an open PR with neither stays
-    PENDING).
+    Pure and side-effect free (bar one diagnostic log line) so the terminal
+    contract is unit-testable with fabricated payloads (no network).
+    ``pr_raw`` is the GitHub pull payload; ``check_runs``/``combined_status``
+    are the head commit's check-runs and combined status JSON. Passing
+    *neither* means the rollup was never read — an evidence gap that stays
+    PENDING — which is distinct from reading it and finding it empty.
     """
     state = str(pr_raw.get("state", "") or "").strip().lower()
     merged = bool(pr_raw.get("merged", False))
@@ -152,7 +235,42 @@ def classify_ci_state(
         return WaitStatus(Outcome.FAILED, f"{label} CI checks failed", data=data)
     if verdict == "success":
         return WaitStatus(Outcome.DONE, f"{label} CI checks passed", data=data)
-    # open + checks pending / no CI yet — keep the wait armed.
+    if verdict == "none":
+        # Read the rollup and it is empty: no CI is configured for this head
+        # SHA, or no workflow matched its paths. Terminal — there is nothing
+        # to wait for, and staying PENDING would stall a mode="signal" watch
+        # forever (#2939). PARTIAL, not DONE: "nothing ran" must not read as
+        # "everything passed", so the caveat rides all the way out to the
+        # waiter via ToolResult.partial. Terminal on the FIRST such read: the
+        # payload carries no immutable anchor (``updated_at`` is refreshed by
+        # any unrelated PR edit) to bound a settle window against, so a grace
+        # period here would re-arm indefinitely on a checkless head SHA.
+        data["caveat"] = f"no checks ran on {label} head commit"
+        return WaitStatus(
+            Outcome.PARTIAL, f"{label} open, no checks ran", data=data
+        )
+
+    # open + checks pending, or the rollup was never read — keep the wait
+    # armed. A pending read is NEVER promoted to a terminal verdict here.
+    mergeable, mergeable_state = _mergeability(pr_raw)
+    if mergeable_state:
+        data["mergeable_state"] = mergeable_state
+    if mergeable is not None:
+        data["mergeable"] = mergeable
+    if verdict == "pending" and mergeable_state == "clean" and mergeable is not False:
+        # GitHub says the PR is clean/mergeable while our rollup still reads
+        # pending. Surface the contradiction rather than resolving it: a repo
+        # with no *required* checks is reported "clean" while CI is still
+        # queued, so trusting it would fabricate a terminal from a race. The
+        # marker exists because the #2939 stall survived three hours with no
+        # way to see why the provider was saying pending.
+        data["contradiction"] = "clean_but_pending"
+        logger.warning(
+            "ci wait %s: GitHub reports mergeable_state=clean but the check "
+            "rollup reads pending — reporting pending (contradiction: "
+            "clean_but_pending)",
+            label,
+        )
     return WaitStatus(
         Outcome.PENDING,
         f"{label} open, checks {verdict}",
