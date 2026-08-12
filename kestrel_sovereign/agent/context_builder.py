@@ -322,7 +322,8 @@ class ContextBuilder:
         return True
 
     async def retrieve_context(
-        self, query: str, min_score: Optional[float] = None, max_tokens: Optional[int] = None
+        self, query: str, min_score: Optional[float] = None, max_tokens: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
@@ -335,6 +336,10 @@ class ContextBuilder:
                 weak matches don't get stamped into the rendered
                 transport form. ``None`` falls back to the storage
                 layer's default (no floor, all candidates merge).
+            session_id: Chat session of the turn being served, for span
+                attribution only (#2940). Semantic recall reuses the same
+                answerability judge as memory retrieval, so its LLM call
+                needs the same session to land in the turn's Timeline band.
 
         Returns:
             Formatted context string with relevant documents
@@ -383,6 +388,7 @@ class ContextBuilder:
                         query, recalled.candidates,
                         max_claim_characters=recall_config.max_claim_characters,
                         batch_size=recall_config.embedding_batch_size,
+                        session_id=session_id,
                     )
                     ordered = sorted(
                         (item for item in recalled.candidates if item.assertion.assertion_id in semantic_scores),
@@ -459,7 +465,10 @@ class ContextBuilder:
             for res in rag_results
         )
 
-    async def _semantic_scores(self, query: str, candidates, *, max_claim_characters: int, batch_size: int) -> Dict[str, float]:
+    async def _semantic_scores(
+        self, query: str, candidates, *, max_claim_characters: int, batch_size: int,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, float]:
         """Score already-authorized candidates in one embedding batch.
 
         Assertions never get a second persisted vector index. The existing
@@ -515,6 +524,7 @@ class ContextBuilder:
                     )
                     for item in ranked
                 ],
+                session_id=session_id,
             )
             if not getattr(decision, "completed", False):
                 raise RuntimeError("semantic_answerability_gate_unavailable")

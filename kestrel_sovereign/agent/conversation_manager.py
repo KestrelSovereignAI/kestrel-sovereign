@@ -203,6 +203,9 @@ SUMMARY:"""
                 system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
                 user_prompt=summary_prompt,
                 model_override=None,  # Use default model
+                # The session being compacted is the session this call belongs
+                # to; None (global !compact) leaves the span unstamped (#2940).
+                session_id=session_id,
             )
 
             if isinstance(summary_response, str):
@@ -711,7 +714,8 @@ SUMMARY:"""
         llm_service,
         counter,
         message_ids: List[int],
-        preserve_key_facts: bool = True
+        preserve_key_facts: bool = True,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Summarize specific messages and replace them with a summary.
@@ -721,6 +725,11 @@ SUMMARY:"""
             counter: TokenCounter for token counting
             message_ids: Message IDs to summarize
             preserve_key_facts: Keep facts, decisions, commitments in summary
+            session_id: Span attribution only (#2940) — the turn this summary
+                was requested from, so its ``llm.generate`` span lands in that
+                turn's Timeline band. Unlike ``compact_session``'s parameter of
+                the same name this does NOT scope the work: which messages get
+                summarized is decided solely by ``message_ids``.
 
         Returns:
             Result dict with summary and stats
@@ -791,6 +800,7 @@ SUMMARY:"""
                 system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
                 user_prompt=summary_prompt,
                 model_override=None,
+                session_id=session_id,
             )
 
             if isinstance(summary_response, str):

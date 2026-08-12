@@ -356,6 +356,11 @@ class ReflectionSleepHook:
             "Answer as JSON only, with this shape: "
             '{"applied": true|false, "reason": "one sentence"}.'
         )
+        # No ``session_id`` on purpose (#2940). This attestation runs in the
+        # sleep cycle, over every memory retrieved since a time cutoff — which
+        # can span several chat windows and belongs to none of them. Naming any
+        # one of them would file the span in a band it did not happen in, and
+        # #2916's rule is that the attribute stays absent rather than wrong.
         response = await llm_service.generate(
             system_prompt=(
                 "You are auditing memory application. Be conservative. "

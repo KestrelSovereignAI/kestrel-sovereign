@@ -162,6 +162,7 @@ from kestrel_sovereign.telemetry import (
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
+    session_span_attributes,
 )
 
 logger = logging.getLogger(__name__)
@@ -3865,6 +3866,12 @@ class SignalDispatcher:
             "kestrel.constitution.injection": registration.constitution_injection,
             "kestrel.constitution.format": registration.prompt_template_format,
             "kestrel.constitution.echo_required": registration.require_constitution_echo,
+            # A signal that carries a session was filed FROM that chat window and
+            # its wake is routed back there (#1809), so the dispatch span joins
+            # that session's Timeline band instead of opening one of its own
+            # (#2940). ``Signal.session_id`` is None for system-initiated work
+            # (cron ticks, webhooks) — that and any sentinel stamp nothing.
+            **session_span_attributes(signal.session_id),
         }
         if audit.constitution_hash:
             span_attrs["kestrel.constitution.hash"] = audit.constitution_hash[:16]

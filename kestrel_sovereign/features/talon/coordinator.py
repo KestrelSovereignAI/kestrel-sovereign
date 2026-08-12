@@ -4160,20 +4160,13 @@ class TalonCoordinatorFeature(Feature):
         Empty for CLI/scheduler/unattended dispatch, and for any agent double
         that does not implement the accessor → the wake stays system-initiated
         in a fresh session, exactly as before.
+
+        The resolution itself lives once on :class:`Feature` as
+        ``_turn_session_id`` (#2940 gave the LLM spans the same question to
+        answer); the ``""`` for "no session" is this record's own storage
+        contract, applied at the boundary rather than duplicated in the lookup.
         """
-        agent = getattr(self, "agent", None)
-        if agent is None:
-            return ""
-        resolve = getattr(agent, "_get_turn_bound_session_id", None)
-        if not callable(resolve):
-            return ""
-        try:
-            session_id = resolve()
-        except Exception:  # pragma: no cover - defensive; stub agents
-            return ""
-        if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
-        return ""
+        return self._turn_session_id() or ""
 
     @staticmethod
     def _stage_name_from_signal(signal: Any) -> Optional[str]:

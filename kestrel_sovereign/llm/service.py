@@ -770,8 +770,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     user_prompt=user_prompt,
                     messages=messages,
                 )
-            if session_id and session_id.strip():
-                span_attributes = {telemetry.OI_SESSION_ID: session_id}
+            # Both session keys, from the one resolver every span type shares
+            # (#2940): the fleet Timeline groups a lane on ``kestrel.session_id``,
+            # Phoenix's session view on ``session.id``. Stamping only the latter
+            # left every ``llm.*`` span in its own Timeline band. Blank and
+            # sentinel values yield no attribute at all rather than an empty one.
+            span_attributes = telemetry.session_span_attributes(session_id) or None
         with telemetry.llm_span(
             f"llm.{method}",
             input_value=span_input,
@@ -4745,6 +4749,7 @@ No other text or formatting.
         model_override: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
+        session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
@@ -4764,12 +4769,22 @@ No other text or formatting.
             model_override: Override model selection
             tools: Optional tools for function calling
             response_format: Optional Pydantic model for structured output
+            session_id: Chat session this call belongs to, mirroring
+                ``generate_with_messages``. Without it this entry point could
+                not name its session at all, so every ``llm.generate`` span
+                exported sessionless and became its own Timeline band (#2940).
+                Callers with genuinely no session (the sleep-cycle memory
+                attestation, the salvage janitor) pass nothing and stay
+                unstamped rather than stamping an empty value.
 
         Returns:
             String content or LLMResponse (if tools/structured output)
         """
         self._check_policy()
-        invocation_context = self._resolve_invocation_context(invocation_context)
+        invocation_context = self._resolve_invocation_context(
+            invocation_context,
+            session_id=session_id,
+        )
         _redact = invocation_context.redact_content
         with self._llm_request_span(
             "generate",
