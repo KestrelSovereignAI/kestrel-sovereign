@@ -500,7 +500,29 @@ jobs:
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
         run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
-        timeout-minutes: 20
+        # 20 was too tight and started killing PASSING runs, the same way 10
+        # did for the unit tier above (#2795). Successes cluster tightly at
+        # 13.8-15.2 min, so the cap sat at only ~1.4x the median and a slow
+        # runner cleared it.
+        #
+        # Measured on #2939's head 58144815, which ran this tier TWICE: the
+        # push run passed in 13.8 min (31622820974) and the pull_request run
+        # on the identical SHA timed out at 68% (31624099416). Reconstructing
+        # both logs, the second runner was 1.99x slower at the same progress
+        # point, uniformly across every file — no single test regressed, and
+        # the largest gap between two consecutive lines was 61s. Projected
+        # full duration was 25.6 min. An unrelated branch (issue-2940, run
+        # 31611668739) timed out the same way 2h earlier, so this is runner
+        # luck, not a property of either change.
+        #
+        # 30 covers that observed worst case with ~17% to spare and is 2.1x
+        # the median. This does not mask a hang: per-test `--timeout=120`
+        # above is what catches those, and it bounds a stuck test long before
+        # the wall clock. The cap is only reached by a tier that would
+        # otherwise have passed, so raising it costs nothing on a healthy run
+        # — it decides how much passing work gets thrown away. Runner sizing,
+        # the real fix, stays in #2795.
+        timeout-minutes: 30
         env:
           KESTREL_AUDIT_MODE: skip
           KESTREL_SKIP_REACHABILITY_PROBE: "1"
