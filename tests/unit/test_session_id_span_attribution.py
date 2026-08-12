@@ -42,6 +42,7 @@ from kestrel_sdk.tracing import KestrelTracer
 
 from kestrel_sdk.features.base import tool
 from kestrel_sdk.hooks.base import HookOutput
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sdk.signals import (
     RedactionPolicy,
     Signal,
@@ -59,6 +60,8 @@ from kestrel_sovereign.agent.context_manager import ContextManager
 from kestrel_sovereign.agent.memory_manager import MemoryManager
 from kestrel_sovereign.agent.streaming import StreamingMixin
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.context.feature import ContextFeature
+from kestrel_sovereign.features.memory.feature import MemoryFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.service import LLMService
@@ -627,9 +630,8 @@ class _EmbeddingStub:
         return 0.0
 
 
-async def _retrieve_through_the_judge(session_id, *, verdict='{"answerable_ids":["c0"]}'):
-    """Real retriever → real gate → real ``LLMService.generate``, stubbed below
-    the span, so the assertion is on the span production actually exports."""
+def _judge_store():
+    """A conversation store holding one candidate the judge gets to rule on."""
     store = AsyncMock()
     store.embedding_service = _EmbeddingStub()
     store.get_conversation_history.return_value = [
@@ -637,19 +639,33 @@ async def _retrieve_through_the_judge(session_id, *, verdict='{"answerable_ids":
     ]
     store.get_salient_memory_candidates.return_value = []
     store.get_lexical_memory_candidates.return_value = []
+    return store
+
+
+def _judge_backed_retriever(store, service):
+    """Real retriever over a real gate over a real service — stubbed only
+    below the span, so assertions land on what production exports."""
+    retriever = MemoryRetriever(
+        store,
+        answerability_gate=LLMAnswerabilityGate(service),
+    )
+    retriever._embed_query = AsyncMock(return_value=[1.0, 0.0])
+    retriever._semantic_similarities_via_vector_backend = AsyncMock(
+        return_value={"1": 0.9}
+    )
+    return retriever
+
+
+async def _retrieve_through_the_judge(session_id, *, verdict='{"answerable_ids":["c0"]}'):
+    """Real retriever → real gate → real ``LLMService.generate``, stubbed below
+    the span, so the assertion is on the span production actually exports."""
+    store = _judge_store()
 
     service = LLMService()
     try:
         service._get_response_frozen = AsyncMock(return_value=verdict)
         service.get_last_response_identity = lambda: {"model": "m"}
-        retriever = MemoryRetriever(
-            store,
-            answerability_gate=LLMAnswerabilityGate(service),
-        )
-        retriever._embed_query = AsyncMock(return_value=[1.0, 0.0])
-        retriever._semantic_similarities_via_vector_backend = AsyncMock(
-            return_value={"1": 0.9}
-        )
+        retriever = _judge_backed_retriever(store, service)
         kwargs = {"session_id": session_id} if session_id is not None else {}
         results = await retriever.retrieve(
             "favorite planet", "test", min_score=0.0, read_only=True, **kwargs
@@ -888,3 +904,252 @@ class TestSubagentContinuationSpansCarrySession:
         for call in service._generate_with_messages_inner.await_args_list:
             assert call.kwargs.get("session_id") is None
             assert call.kwargs["invocation_context"].session_id == SESSION
+
+
+# ---------------------------------------------------------------------------
+# #2940 — the two tool call sites that still reached an LLM sessionless
+# ---------------------------------------------------------------------------
+
+
+def _memory_feature(retriever, session_id):
+    """A ``MemoryFeature`` over one retriever, running inside a turn.
+
+    Constructed with ``__new__`` like the other ``MemoryFeature`` unit tests:
+    ``initialize`` wants a whole agent, and everything ``recall_emotional``
+    touches is set here — the retriever arrives through the MemorySystem facade
+    and the session through the turn lifecycle accessor ``_turn_session_id``
+    reads.
+    """
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature.agent_id = "test-agent"
+    feature._memory_system = SimpleNamespace(retriever=retriever)
+    feature.agent = SimpleNamespace(
+        _get_turn_bound_session_id=lambda: session_id
+    )
+    return feature
+
+
+async def _recall_emotional_through_the_judge(session_id):
+    """Drive the real ``recall_emotional`` tool down to the real judge."""
+    service = LLMService()
+    try:
+        service._get_response_frozen = AsyncMock(
+            return_value='{"answerable_ids":["c0"]}'
+        )
+        service.get_last_response_identity = lambda: {"model": "m"}
+        retriever = _judge_backed_retriever(_judge_store(), service)
+        result = await _memory_feature(retriever, session_id).recall_emotional(
+            query="favorite planet", mood="neutral", min_relevance=0.0
+        )
+        assert result.data["count"] == 1, result
+        assert retriever.answerability_stats["calls"] == 1
+        # The tool is not read-only, so it schedules rehearsal writes; settle
+        # them here rather than leaving tasks pending past the test.
+        await retriever.drain_access_updates()
+    finally:
+        await service.close()
+
+
+class TestRecallEmotionalJudgeSpanCarriesSession:
+    """``!memory recall`` is invoked BY a turn, so its judge belongs to it.
+
+    With answerability gating on, this tool owns an ``llm.generate`` of its
+    own. It reached the retriever with no session, so a recall the user asked
+    for mid-conversation exported a sessionless root beside their turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_tools_judge_call_joins_the_turns_band(
+        self, llm_span_exporter
+    ):
+        await _recall_emotional_through_the_judge(SESSION)
+
+        spans = _roots(llm_span_exporter, "llm.generate")
+        assert len(spans) == 1
+        attrs = dict(spans[0].attributes)
+        assert attrs.get(KESTREL_SESSION_ID) == SESSION
+        assert attrs.get(OI_SESSION_ID) == SESSION
+
+    @pytest.mark.asyncio
+    async def test_recall_outside_a_turn_stays_unstamped(self, llm_span_exporter):
+        """The same tool driven by unattended work has no chat window."""
+        await _recall_emotional_through_the_judge(None)
+
+        attrs = dict(_roots(llm_span_exporter, "llm.generate")[0].attributes)
+        assert KESTREL_SESSION_ID not in attrs
+        assert OI_SESSION_ID not in attrs
+
+    @staticmethod
+    def _retriever_double():
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(return_value=[])
+        return retriever
+
+    @pytest.mark.asyncio
+    async def test_the_session_reaches_the_retriever(self):
+        retriever = self._retriever_double()
+
+        await _memory_feature(retriever, SESSION).recall_emotional(query="q")
+
+        assert retriever.retrieve.await_args.kwargs["session_id"] == SESSION
+
+    @pytest.mark.asyncio
+    async def test_no_session_forwards_no_keyword_at_all(self):
+        """Matches ``MemoryManager.retrieve_memories``: unset is not passed.
+
+        The retriever arrives through the MemorySystem facade, so a retriever
+        predating the parameter keeps working on the sessionless path.
+        """
+        retriever = self._retriever_double()
+
+        await _memory_feature(retriever, None).recall_emotional(query="q")
+
+        assert "session_id" not in retriever.retrieve.await_args.kwargs
+
+
+def _compaction_storage(messages):
+    storage = MagicMock()
+    storage.conversation = AsyncMock()
+    storage.conversation.get_conversation_history = AsyncMock(
+        return_value=messages
+    )
+    storage.conversation.add_conversation = AsyncMock()
+    storage.conversation.update_messages_metadata = AsyncMock()
+    storage.conversation.db = AsyncMock()
+    storage.conversation.db.fetchone = AsyncMock(return_value=[999])
+    storage.conversation.agent_id = "agent-x"
+    return storage
+
+
+async def _compact_through_the_summarizer(**kwargs):
+    """Drive the real ``compact_session`` down to the real ``generate``."""
+    messages = [
+        {
+            "id": i,
+            "role": "user" if i % 2 == 0 else "assistant",
+            "content": f"message {i} with content",
+        }
+        for i in range(20)
+    ]
+    storage = _compaction_storage(messages)
+    service = LLMService()
+    try:
+        service._get_response_frozen = AsyncMock(
+            return_value="SUMMARY: key points preserved."
+        )
+        service.get_last_response_identity = lambda: {"model": "m"}
+        manager = ContextManager(storage=storage, model="gpt-4")
+        result = await manager.compact_session(
+            llm_service=service, preserve_recent=5, **kwargs
+        )
+        assert result["success"] is True, result
+        return storage
+    finally:
+        await service.close()
+
+
+class TestGlobalCompactionNamesTheRequestingTurn:
+    """``compact_session`` needed a SECOND session parameter, not a reused one.
+
+    Its ``session_id`` selects: it filters the rows read and tags the summary
+    marker (#1844 Stage 2). Passing the requesting turn there to name a span
+    would silently narrow the global ``!context compact`` to the current chat
+    window — a behaviour change wearing a telemetry costume. So attribution
+    gets its own parameter, and these tests pin both halves.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_requesting_turn_stamps_the_summarizers_span(
+        self, llm_span_exporter
+    ):
+        await _compact_through_the_summarizer(attribution_session_id=SESSION)
+
+        spans = _roots(llm_span_exporter, "llm.generate")
+        assert len(spans) == 1
+        attrs = dict(spans[0].attributes)
+        assert attrs.get(KESTREL_SESSION_ID) == SESSION
+        assert attrs.get(OI_SESSION_ID) == SESSION
+
+    @pytest.mark.asyncio
+    async def test_attribution_alone_changes_nothing_about_selection(
+        self, llm_span_exporter
+    ):
+        """Still global: full history read, marker left untagged."""
+        storage = await _compact_through_the_summarizer(
+            attribution_session_id=SESSION
+        )
+
+        read = storage.conversation.get_conversation_history.await_args
+        assert read.kwargs["session_id"] is None
+        marker = storage.conversation.add_conversation.await_args
+        assert marker.kwargs["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_session_scoped_compaction_still_stamps_that_session(
+        self, llm_span_exporter
+    ):
+        """The #1844 caller names one session and gets both meanings from it."""
+        storage = await _compact_through_the_summarizer(session_id=SESSION)
+
+        attrs = dict(_roots(llm_span_exporter, "llm.generate")[0].attributes)
+        assert attrs.get(KESTREL_SESSION_ID) == SESSION
+        assert attrs.get(OI_SESSION_ID) == SESSION
+        read = storage.conversation.get_conversation_history.await_args
+        assert read.kwargs["session_id"] == SESSION
+
+    @pytest.mark.asyncio
+    async def test_a_background_compaction_stays_unstamped(
+        self, llm_span_exporter
+    ):
+        await _compact_through_the_summarizer()
+
+        attrs = dict(_roots(llm_span_exporter, "llm.generate")[0].attributes)
+        assert KESTREL_SESSION_ID not in attrs
+        assert OI_SESSION_ID not in attrs
+
+
+class TestCompactContextToolNamesTheRequestingTurn:
+    """``!context compact`` compacts the FULL history, from inside a turn."""
+
+    @staticmethod
+    def _feature(session_id):
+        feature = ContextFeature.__new__(ContextFeature)
+        feature.agent = SimpleNamespace(
+            _get_turn_bound_session_id=lambda: session_id,
+            context_stats=None,
+        )
+        feature.context_manager = AsyncMock()
+        feature.context_manager.compact_session = AsyncMock(
+            return_value={
+                "success": True,
+                "messages_compacted": 5,
+                "messages_preserved": 10,
+                "tokens_saved": 500,
+                "tokens_before": 1500,
+                "tokens_after": 1000,
+            }
+        )
+        feature.llm_service = MagicMock()
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_the_turn_is_named_without_scoping_the_compaction(self):
+        feature = self._feature(SESSION)
+
+        result = await feature.compact_context(keep_recent=10)
+        assert result.status is ToolResultStatus.OK, result
+
+        kwargs = feature.context_manager.compact_session.await_args.kwargs
+        assert kwargs["attribution_session_id"] == SESSION
+        # The selecting parameter stays untouched: the tool is global.
+        assert kwargs.get("session_id") is None
+
+    @pytest.mark.asyncio
+    async def test_compaction_outside_a_turn_names_nothing(self):
+        feature = self._feature(None)
+
+        result = await feature.compact_context(keep_recent=10)
+        assert result.status is ToolResultStatus.OK, result
+
+        kwargs = feature.context_manager.compact_session.await_args.kwargs
+        assert kwargs["attribution_session_id"] is None

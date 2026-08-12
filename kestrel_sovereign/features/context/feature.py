@@ -533,6 +533,13 @@ class ContextFeature(Feature):
                 llm_service=self.llm_service,
                 preserve_recent=keep_val,
                 force=force,
+                # ``!context compact`` compacts the agent's FULL history, so
+                # ``session_id`` stays unset — it selects the rows to compact
+                # and tags the marker. The requesting turn is named separately,
+                # for span attribution only, so the summarizer's LLM call joins
+                # this turn's Timeline band without narrowing what is compacted
+                # (#2940).
+                attribution_session_id=self._turn_session_id(),
             )
 
             # Reset context stats after compaction — accumulated

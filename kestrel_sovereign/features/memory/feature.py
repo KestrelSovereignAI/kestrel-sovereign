@@ -791,12 +791,24 @@ class MemoryFeature(Feature):
                 emotional_intensity=0.5 if mood_valence != 0.0 else 0.0,
             )
 
+            # Retrieval runs an answerability judge through the LLM, so this
+            # tool owns an ``llm.generate`` span. It is invoked from inside a
+            # chat turn, so that span belongs in the turn's Timeline band
+            # (#2940) — without the session it exported a root of its own.
+            # Forwarded only when set, matching ``MemoryManager.retrieve_memories``:
+            # the retriever arrives through the MemorySystem facade, so a
+            # sessionless recall must reach it exactly as it did before.
+            turn_session_id = self._turn_session_id()
+            session_kwargs: Dict[str, Any] = (
+                {"session_id": turn_session_id} if turn_session_id else {}
+            )
             memories = await self.memory_retriever.retrieve(
                 query=query,
                 agent_id=self.agent_id,
                 emotional_context=emotional_context,
                 limit=limit_val,
                 min_relevance=min_relevance_val,
+                **session_kwargs,
             )
         except (AttributeError, TypeError, KeyError, ValueError) as e:
             logger.error(f"recall_emotional failed: {e}")

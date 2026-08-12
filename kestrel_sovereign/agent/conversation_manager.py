@@ -107,6 +107,7 @@ class ConversationManager:
         preserve_recent: int = 10,
         force: bool = False,
         session_id: Optional[str] = None,
+        attribution_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Compact the current session by summarizing older messages.
@@ -129,6 +130,15 @@ class ConversationManager:
                 than a marker written under an implicit/different session. When
                 ``None`` (e.g. the global ``!compact``), behaviour is unchanged:
                 compact across the agent's full history.
+            attribution_session_id: Span attribution ONLY (#2940) — the turn
+                that ASKED for the compaction, for callers whose compaction is
+                deliberately global. ``session_id`` cannot carry that fact: it
+                SELECTS (which rows are read, which session the marker is
+                tagged to), so handing it a turn id merely to name a span would
+                silently narrow a global ``!context compact`` to the current
+                chat window — a behaviour change wearing a telemetry costume.
+                Unset falls back to ``session_id``, since a session-scoped
+                compaction belongs to that session's band by construction.
 
         Returns:
             Dict with compaction results (messages_compacted, tokens_saved, etc.)
@@ -204,8 +214,11 @@ SUMMARY:"""
                 user_prompt=summary_prompt,
                 model_override=None,  # Use default model
                 # The session being compacted is the session this call belongs
-                # to; None (global !compact) leaves the span unstamped (#2940).
-                session_id=session_id,
+                # to, unless the caller named the requesting turn separately
+                # for a deliberately global compaction. Neither present (a
+                # background compaction with no chat window) leaves the span
+                # unstamped (#2940).
+                session_id=attribution_session_id or session_id,
             )
 
             if isinstance(summary_response, str):
