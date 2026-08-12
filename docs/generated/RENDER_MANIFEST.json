@@ -241,7 +241,8 @@
       "existing_code_refs": [
         "kestrel_sovereign/features/base.py",
         "kestrel_sovereign/kestrel_agent.py",
-        "kestrel_sovereign/prompts/system_prompt.md"
+        "kestrel_sovereign/prompts/system_prompt.md",
+        "tests/unit/test_tool_allowlist_registry.py"
       ],
       "findings": [],
       "missing_code_refs": [],

@@ -415,8 +415,15 @@ class TestDispatchToolCallRecording:
         agent._tool_to_feature = {}
         agent.hooks_manager = AsyncMock()
 
-        # Bind the mixin's method
+        # Bind the mixin's method (+ the registry lookups the unknown-tool
+        # path consults before reporting a name unresolvable — #2929)
+        from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+
         agent._dispatch_tool_call = OrchestratorEngineMixin._dispatch_tool_call.__get__(agent)
+        agent._resolve_named_tool = OrchestratorEngineMixin._resolve_named_tool.__get__(agent)
+        agent._registered_features_by_tool_name = (
+            ToolRegistryMixin._registered_features_by_tool_name.__get__(agent)
+        )
 
         # Create a mock tool_call — use a name that's in known_tools
         # so validation passes, but not in features_by_tool_name or _direct_tools

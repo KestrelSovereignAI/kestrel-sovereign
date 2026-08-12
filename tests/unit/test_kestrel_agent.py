@@ -3521,6 +3521,7 @@ class TestInvocationContextEndToEndThreading:
         agent._make_inline_tool_executor = lambda sid: None
         agent._visible_features_by_tool_name = lambda: {}
         agent._visible_known_tool_names = lambda: set()
+        agent._known_tool_names = lambda: set()
         agent._execute_tool_batch = _AsyncMockCallable()
         agent._build_all_tools = lambda: []
         agent._prune_orchestrator_messages = lambda m, t, **_kw: m

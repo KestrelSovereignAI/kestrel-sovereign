@@ -320,6 +320,18 @@ In practice, current tools already use descriptive names (`list_models`, `memory
 
 **Mitigation**: This is already handled. The orchestrator receives tool results as JSON in the `tool` role message regardless of whether the result came from a subagent or direct execution. The `_serialize_tool_result()` function ensures consistent JSON serialization. The subagent path wraps results in `{"success": True, "result": ...}`, and direct calls will use the same wrapper via `tool.execute()` which already returns that format (see `DynamicTool.execute()` in `base.py` line 593).
 
+### Guardrail allowlist drift (#2929)
+
+**Risk**: Every mechanism on this page *mutates the advertised tool list mid-turn* — exploration removes a feature's dispatcher from the schema view, LRU eviction sheds direct tools, and a context profile can hide either. The orchestrator's pre-execution guardrail (`validate_tool_arguments(..., known_tools=...)`) originally took that advertised view as its allowlist, so a name that dispatched successfully one call ago was rejected as "unknown" on the next — before the permission layer, and therefore with no `security_audit_log` row.
+
+**Mitigation**: The allowlist is *derived*, never advertised-view-shaped:
+
+- `_known_tool_names()` = the advertised view ∪ `_registered_tool_names()` (every enabled feature's dispatcher name and `@tool` names, plus every mounted direct tool). Loaded ⇒ known, by construction.
+- `_dispatch_tool_call` resolves a name the visible maps don't carry against the same registry (a context-hidden dispatcher, or an unpromoted `@tool`) and dispatches it through the identical `PRE_TOOL_USE`/`POST_TOOL_USE` envelope — visibility is a prompt-budget decision, not a capability boundary. A soft-disabled feature (`enabled=False`) *is* a boundary and stays excluded.
+- Both refusal paths (`tool_validation`, `tool_resolution`) write a `security_audit_log` row via `kestrel_sovereign.security.tool_audit.record_tool_rejection`, so a bounce is observable instead of inferred.
+
+Regression coverage: `tests/unit/test_tool_allowlist_registry.py`.
+
 ### Session persistence
 
 **Risk**: If explored tools persist across sessions, the tool list could be stale after feature code changes or restarts.

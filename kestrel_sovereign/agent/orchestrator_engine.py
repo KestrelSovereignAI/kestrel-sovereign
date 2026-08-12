@@ -49,6 +49,11 @@ from kestrel_sovereign.agent.streaming import (
     _build_tool_sentinel,
 )
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
+from kestrel_sovereign.security.tool_audit import (
+    ACTION_TOOL_RESOLUTION,
+    ACTION_TOOL_VALIDATION,
+    record_tool_rejection,
+)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -1532,6 +1537,16 @@ class OrchestratorEngineMixin:
         )
         if not is_valid:
             logging.warning(f"{log_prefix} Tool validation failed: {validation_error}")
+            # #2929: this refusal happens BEFORE PRE_TOOL_USE, so nothing else
+            # in the stack will record it. Write the security-audit row here or
+            # the call vanishes with no evidence it was ever attempted.
+            await record_tool_rejection(
+                self,
+                tool_name=tool_name,
+                reason=validation_error or "tool validation failed",
+                action=ACTION_TOOL_VALIDATION,
+                args=args,
+            )
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
             # #1659: a start sentinel was already emitted for this call, so it
             # must terminate — record start+error tool_events here (this path
@@ -1589,6 +1604,19 @@ class OrchestratorEngineMixin:
 
         feature = features_by_tool_name.get(tool_name)
         result = None
+        # A name the *visible* maps don't carry may still be live: a
+        # context-hidden feature dispatcher, or a feature tool that hasn't been
+        # promoted to a direct schema yet. Resolve those against the registry
+        # rather than reporting a loaded capability as unknown (#2929) — the
+        # governance envelope is identical either way, since both branches
+        # dispatch through the same PRE/POST_TOOL_USE path.
+        registered_tool = registered_feature = None
+        if feature is None and tool_name not in self._direct_tools:
+            feature = self._registered_features_by_tool_name().get(tool_name)
+            if feature is None:
+                registered_tool, registered_feature = self._resolve_named_tool(
+                    tool_name
+                )
 
         if feature:
             result = await self._dispatch_feature_tool(
@@ -1602,6 +1630,17 @@ class OrchestratorEngineMixin:
                 tool_call, tool_name, args, dispatch_start, dispatch_event_id,
                 tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
+            )
+        elif registered_tool is not None:
+            result = await self._dispatch_direct_tool(
+                tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                tool_events=tool_events, streaming=streaming,
+                session_id=session_id, dispatch_meta=dispatch_meta,
+                tool=registered_tool,
+                feature_name=(
+                    getattr(registered_feature, "name", None)
+                    or type(registered_feature).__name__
+                ),
             )
         else:
             result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
@@ -1626,6 +1665,16 @@ class OrchestratorEngineMixin:
                 )
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'error', 'tool': tool_name, 'error': f'Unknown feature tool: {tool_name}'})
+            # #2929: a name that survived the allowlist but resolves to no
+            # loaded feature is still a refused capability request — record it
+            # in the security audit alongside the guardrail rejections.
+            await record_tool_rejection(
+                self,
+                tool_name=tool_name,
+                reason=f"Unknown feature tool: {tool_name}",
+                action=ACTION_TOOL_RESOLUTION,
+                args=args,
+            )
 
         # Add tool result to messages (with persistence for large results)
         from kestrel_sovereign.features.base import _serialize_tool_result
@@ -2001,11 +2050,20 @@ class OrchestratorEngineMixin:
     async def _dispatch_direct_tool(
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
         *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None,
+        dispatch_meta=None, tool=None, feature_name=None,
     ):
-        """Dispatch a direct tool call (no subagent LLM hop)."""
-        tool = self._direct_tools[tool_name]
-        hook_feature_name = self._security_feature_name_for_tool(tool_name)
+        """Dispatch a direct tool call (no subagent LLM hop).
+
+        ``tool`` / ``feature_name`` let a caller dispatch a tool resolved
+        straight off its owning feature (#2929) — an unpromoted ``@tool`` never
+        entered ``_direct_tools``, and ``_security_feature_name_for_tool``
+        would fall back to the tool's own name for it, silently detaching the
+        permission lookup from the feature that owns the tool.
+        """
+        tool = tool if tool is not None else self._direct_tools[tool_name]
+        hook_feature_name = (
+            feature_name or self._security_feature_name_for_tool(tool_name)
+        )
 
         async def _exec_direct(effective_args, t=tool):
             return await t.execute(**effective_args)
@@ -2415,7 +2473,7 @@ class OrchestratorEngineMixin:
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
 
             features_by_tool_name = self._visible_features_by_tool_name()
-            known_tools = self._visible_known_tool_names()
+            known_tools = self._known_tool_names()
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
@@ -2891,7 +2949,7 @@ class OrchestratorEngineMixin:
                 yield _build_tool_sentinel("start", tc.name, index=tc_index)
 
             features_by_tool_name = self._visible_features_by_tool_name()
-            known_tools = self._visible_known_tool_names()
+            known_tools = self._known_tool_names()
             events_before = len(tool_events) if tool_events is not None else 0
             # #1914: per-tool part associations recorded by _execute_tool_batch,
             # as (terminal_event_index, [parts]). Lets us yield each component
