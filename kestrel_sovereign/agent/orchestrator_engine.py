@@ -60,6 +60,9 @@ from kestrel_sovereign.telemetry import (
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
+    # One definition of "is this an actual session?", shared with the LLM and
+    # signal-dispatch spans that stamp the same value (#2940).
+    real_session_id,
 )
 
 # These constants are also defined in kestrel_agent.py — import from there at
@@ -87,22 +90,6 @@ _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
-
-# The dispatch path's ``session_id`` parameter doubles as a source tag: callers
-# that have no conversation session pass a sentinel ("orchestrator" is the
-# parameter default, "original" comes from the re-entrant chat path) rather than
-# a session UUID. Anything that records the session — the a2a dispatch row, the
-# ``agent.feature_dispatch`` span (#2916) — must agree on which of those is a
-# real session, so the test lives here once instead of at each consumer.
-_SESSION_ID_SENTINELS = ("", "original", "orchestrator")
-
-
-def real_session_id(session_id: Optional[str]) -> Optional[str]:
-    """Return ``session_id`` when it names an actual session, else ``None``."""
-    if session_id in _SESSION_ID_SENTINELS:
-        return None
-    return session_id
-
 
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("

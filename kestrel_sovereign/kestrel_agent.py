@@ -5635,6 +5635,11 @@ Expected Duration: {expected_duration}
             system_prompt_budget_bytes=system_prompt_budget_bytes,
             anchored_doctrine=anchored_doctrine,
             tools=feature_tools,
+            # Span attribution only (#2940): memory retrieval's answerability
+            # judge issues its own LLM call, and this is the only place the
+            # turn's session is in scope to name it. History filtering is
+            # already done — ``conversation_history`` above is the session's.
+            session_id=session_id,
         )
         from kestrel_sovereign.agent.semantic_recall import (
             persistence_dependency_metadata,

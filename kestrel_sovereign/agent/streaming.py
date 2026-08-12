@@ -1262,6 +1262,8 @@ class StreamingMixin:
             conversation_history=history,
             reflection_guidance=reflection_guidance,
             tools=feature_tools,
+            # Span attribution only (#2940) — same as the non-streaming path.
+            session_id=session_id,
         )
         semantic_recall_metadata = persistence_dependency_metadata(
             getattr(context_result, "semantic_recall_dependencies", ())

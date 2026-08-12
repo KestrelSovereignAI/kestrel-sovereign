@@ -165,6 +165,10 @@ class ConsentFeature(Feature):
         agent_view = await self.agent.llm_service.generate(
             system_prompt="You are reflecting on a change to your own configuration. Be concise and honest.",
             user_prompt=prompt,
+            # Consent is asked about a change requested inside a turn, so the
+            # reflection belongs in that turn's session band (#2940). None when
+            # the change came from a scheduler/CLI path with no chat window.
+            session_id=self._turn_session_id(),
         )
         duration_ms = (time.monotonic() - start) * 1000
 

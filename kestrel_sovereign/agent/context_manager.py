@@ -341,6 +341,9 @@ class ContextManager:
             # so we accept either.
             user_prompt = kwargs.pop("user_prompt", None) or kwargs.pop("prompt", "")
             system_prompt = kwargs.pop("system_prompt", None)
+            # No ``session_id`` (#2940): the salvage janitor drains rows
+            # queued by earlier, already-finished turns, so there is no chat
+            # window this call belongs to.
             return await self.llm_service.generate(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -429,6 +432,7 @@ class ContextManager:
         system_prompt_budget_bytes: Optional[int] = None,
         anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
     ) -> ContextResult:
         """Plan, commit, and render the production context for one turn."""
 
@@ -447,6 +451,7 @@ class ContextManager:
             anchored_doctrine=anchored_doctrine,
             tools=tools,
             mode=ContextBuildMode.LIVE,
+            session_id=session_id,
         )
         return await self._commit_and_render_plan(plan)
 
@@ -469,6 +474,7 @@ class ContextManager:
         mode: ContextBuildMode = ContextBuildMode.DRY_RUN,
         measure_expensive_sections: bool = True,
         message_count_override: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> ContextBuildPlan:
         """
         Build the canonical read-only plan for an LLM request.
@@ -498,6 +504,13 @@ class ContextManager:
             emotional_context: Current emotional state for mood-congruent recall
             conversation_history: Pre-fetched conversation history (e.g., session-filtered).
                                   If None, fetches full history from storage.
+            session_id: Chat session of the turn being built, for span
+                attribution only (#2940). Memory retrieval runs an
+                answerability judge through the LLM; naming the session keeps
+                that call in the turn's Timeline band instead of a band of its
+                own. It selects nothing — history filtering is still the
+                caller's job via ``conversation_history``. The context-status
+                poll and other dry-run callers have no turn and pass nothing.
 
         ``measure_expensive_sections=False`` preserves the cheap footer poll:
         memory/RAG rows are marked ``unknown`` or ``skipped`` with
@@ -742,6 +755,7 @@ class ContextManager:
                 retrieval_cfg,
                 include_memories=include_memories,
                 trivial_turn=trivial_turn,
+                session_id=session_id,
             )
         self._commit_dynamic_section(assembly, budget, memory_result)
         memory_access_ids: Tuple[int, ...] = ()
@@ -848,6 +862,7 @@ class ContextManager:
                 retrieval_cfg,
                 include_rag=include_rag,
                 trivial_turn=trivial_turn,
+                session_id=session_id,
             )
         self._commit_dynamic_section(assembly, budget, rag_result)
         if rag_result is not None and rag_result.committed:
@@ -1515,6 +1530,7 @@ class ContextManager:
         *,
         include_memories: bool,
         trivial_turn: bool,
+        session_id: Optional[str] = None,
     ) -> Optional[SectionResult]:
         """Retrieve emotionally-weighted memories for dynamic user context."""
         if not (include_memories and self.memory_retriever and not trivial_turn):
@@ -1529,6 +1545,7 @@ class ContextManager:
                 min_relevance=retrieval_cfg["memory_min_relevance"],
                 read_only=True,
                 return_details=True,
+                session_id=session_id,
             )
         except Exception as e:
             logger.warning(f"Memory retrieval failed: {e}")
@@ -1559,13 +1576,21 @@ class ContextManager:
         *,
         include_rag: bool,
         trivial_turn: bool,
+        session_id: Optional[str] = None,
     ) -> Optional[SectionResult]:
         """Retrieve RAG documents for dynamic user context."""
         if not (include_rag and not trivial_turn):
             return None
         try:
+            # ``session_id`` forwarded only when there is one, matching this
+            # file's ``min_score`` idiom: the ContextBuilder is an injected
+            # seam, so a sessionless build must reach it exactly as before.
+            rag_kwargs: Dict[str, Any] = (
+                {"session_id": session_id} if session_id else {}
+            )
             rag_context = await self.context_builder.retrieve_context(
                 query, min_score=retrieval_cfg["rag_min_score"], max_tokens=budget.rag,
+                **rag_kwargs,
             )
         except Exception as e:
             logger.warning(f"RAG retrieval failed: {e}")
@@ -2027,10 +2052,11 @@ class ContextManager:
             return None
         return getter()
 
-    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None, attribution_session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.compact_session(
-            llm_service, self.counter, preserve_recent, force, session_id=session_id
+            llm_service, self.counter, preserve_recent, force, session_id=session_id,
+            attribution_session_id=attribution_session_id,
         )
 
     async def check_compaction_needed(self, utilization_threshold: float = 70.0) -> Dict[str, Any]:
@@ -2055,10 +2081,11 @@ class ContextManager:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.restore_messages(message_ids)
 
-    async def summarize_messages(self, llm_service, message_ids: List[int], preserve_key_facts: bool = True) -> Dict[str, Any]:
+    async def summarize_messages(self, llm_service, message_ids: List[int], preserve_key_facts: bool = True, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.summarize_messages(
-            llm_service, self.counter, message_ids, preserve_key_facts
+            llm_service, self.counter, message_ids, preserve_key_facts,
+            session_id=session_id,
         )
 
     # Delegate to MemoryManager
@@ -2098,10 +2125,11 @@ class ContextManager:
         """Delegate to MemoryManager."""
         return await self.memory_manager.stash_peek(stash_id, max_chars)
 
-    async def hierarchical_compact(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3) -> Dict[str, Any]:
+    async def hierarchical_compact(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to MemoryManager."""
         return await self.memory_manager.hierarchical_compact(
-            llm_service, self.counter, chunk_size, preserve_recent, max_depth
+            llm_service, self.counter, chunk_size, preserve_recent, max_depth,
+            session_id=session_id,
         )
 
     # Delegate to ToolContextManager

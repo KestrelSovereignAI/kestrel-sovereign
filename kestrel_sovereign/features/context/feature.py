@@ -376,6 +376,7 @@ class ContextFeature(Feature):
                 llm_service=self.llm_service,
                 message_ids=message_ids,
                 preserve_key_facts=preserve_key_facts,
+                session_id=self._turn_session_id(),
             )
         except (AttributeError, TypeError, ValueError, KeyError) as e:
             logger.error(f"summarize_section failed: {e}")
@@ -532,6 +533,13 @@ class ContextFeature(Feature):
                 llm_service=self.llm_service,
                 preserve_recent=keep_val,
                 force=force,
+                # ``!context compact`` compacts the agent's FULL history, so
+                # ``session_id`` stays unset — it selects the rows to compact
+                # and tags the marker. The requesting turn is named separately,
+                # for span attribution only, so the summarizer's LLM call joins
+                # this turn's Timeline band without narrowing what is compacted
+                # (#2940).
+                attribution_session_id=self._turn_session_id(),
             )
 
             # Reset context stats after compaction — accumulated
@@ -1012,6 +1020,7 @@ class ContextFeature(Feature):
                 chunk_size=chunk_val,
                 preserve_recent=keep_val,
                 max_depth=depth_val,
+                session_id=self._turn_session_id(),
             )
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"hierarchical_compact failed: {e}")
@@ -1172,6 +1181,7 @@ ANSWER:"""
                 system_prompt="You are answering questions about conversation context. Be concise and accurate.",
                 user_prompt=prompt,
                 model_override=model_override,
+                session_id=self._turn_session_id(),
             )
         except ValueError as e:
             logger.error(f"recursive_query failed: {e}")

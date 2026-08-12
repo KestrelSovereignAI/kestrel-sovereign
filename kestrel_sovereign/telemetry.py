@@ -246,6 +246,44 @@ KESTREL_AGENT_NAME = "kestrel.agent_name"
 # the same to the consumer but only one of them is noise.
 KESTREL_SESSION_ID = "kestrel.session_id"
 
+# A ``session_id`` in flight doubles as a source tag: callers with no
+# conversation session pass a sentinel ("orchestrator" is the dispatch
+# parameter's own default, "original" comes from the re-entrant chat path)
+# rather than a session UUID. Everything that RECORDS a session — the a2a
+# dispatch row, ``agent.feature_dispatch`` (#2916), the ``llm.*`` and
+# ``signal.dispatch.cognition`` spans (#2940) — must agree on which of those is
+# a real session, so the test lives here once instead of at each consumer.
+_SESSION_ID_SENTINELS = ("", "original", "orchestrator")
+
+
+def real_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return ``session_id`` when it names an actual session, else ``None``."""
+    if session_id in _SESSION_ID_SENTINELS:
+        return None
+    return session_id
+
+
+def session_span_attributes(session_id: Optional[str]) -> Dict[str, str]:
+    """Both session keys for one span, or ``{}`` when there is no session.
+
+    One session id, two attribute names, because two consumers read different
+    ones: the fleet Timeline groups a lane on ``kestrel.session_id`` first, and
+    Phoenix's own session view reads OpenInference's ``session.id``. Every span
+    type that knows its session stamps BOTH (#2940) so a single band holds the
+    turn, its feature dispatches, its LLM calls, and the cognition wake —
+    instead of one session splitting into a band per span type.
+
+    Returns an empty mapping for ``None``, blank, and sentinel values: an absent
+    attribute and an empty one read the same to both consumers, and stamping a
+    sentinel would invent a fleet-wide session shared by every sessionless call
+    on every agent.
+    """
+    resolved = real_session_id(session_id)
+    if not isinstance(resolved, str) or not resolved.strip():
+        return {}
+    resolved = resolved.strip()
+    return {KESTREL_SESSION_ID: resolved, OI_SESSION_ID: resolved}
+
 
 def _resolved_otlp_endpoint() -> Optional[str]:
     """Return the configured OTLP endpoint (traces-specific wins), or None."""
