@@ -21,7 +21,7 @@ How it works:
 """
 import logging
 
-from .anthropic_adapter import AnthropicAdapter
+from .anthropic_adapter import AnthropicAdapter, anthropic_model_info
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +51,15 @@ class ClaudeMaxAdapter(AnthropicAdapter):
         return False
 
     async def list_models(self, client=None):
-        """Claude plan uses Anthropic discovery; this execution wrapper has no catalog.
+        """List models using this route's OAuth-authenticated SDK client."""
+        if client is None:
+            raise ValueError("Claude plan model discovery requires its Anthropic client")
 
-        ``client`` is accepted for contract symmetry with the SDK 0.5.0
-        :meth:`LLMAdapter.list_models` signature; not used because this
-        wrapper deliberately raises rather than producing a catalog.
-        """
-        raise NotImplementedError(
-            "Claude plan model discovery is provided by the canonical anthropic provider."
-        )
+        await self._ensure_fresh_oauth_token(client)
+        page = await client.models.list()
+        models = [anthropic_model_info(model) for model in page.data]
+        logger.info("Anthropic OAuth returned %d models", len(models))
+        return models
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------
     #

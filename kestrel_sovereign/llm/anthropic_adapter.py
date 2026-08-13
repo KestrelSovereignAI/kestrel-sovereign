@@ -45,6 +45,30 @@ from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 logger = logging.getLogger(__name__)
 
 
+def anthropic_model_info(model_data: Any) -> ModelInfo:
+    """Translate an Anthropic API/SDK model record into shared metadata."""
+    if isinstance(model_data, dict):
+        get = model_data.get
+    else:
+        get = lambda field, default=None: getattr(model_data, field, default)
+
+    model_id = get("id", "")
+    created_at = get("created_at")
+    if hasattr(created_at, "isoformat"):
+        created_at = created_at.isoformat()
+    return ModelInfo(
+        id=model_id,
+        provider="anthropic",
+        display_name=get("display_name", model_id),
+        category=ModelCategory.CHAT,
+        created_at=created_at,
+        context_limit=get("max_input_tokens"),
+        supports_vision=True,
+        supports_tools=True,
+        supports_streaming=True,
+    )
+
+
 @asynccontextmanager
 async def _anthropic_stream_with_retry(client, api_params):
     """Open an Anthropic streaming response, retrying the OPEN on transient
@@ -1552,29 +1576,8 @@ class AnthropicAdapter(LLMAdapter):
 
             models = []
             for model_data in data.get("data", []):
-                model_id = model_data.get("id", "")
-                display_name = model_data.get("display_name", model_id)
-
-                # Anthropic's /v1/models returns the input window as
-                # ``max_input_tokens``. Without reading it, every model
-                # gets ``context_limit=None`` and ``register_discovered_limits``
-                # skips it — lookups then fall to DEFAULT_CONTEXT_LIMIT=32768,
-                # which surfaced as bogus "Context 100% full" warnings on
-                # Opus 4.7's 1M-token window.
-                context_limit = model_data.get("max_input_tokens")
-
-                # All Anthropic models are chat models
-                models.append(ModelInfo(
-                    id=model_id,
-                    provider="anthropic",
-                    display_name=display_name,
-                    category=ModelCategory.CHAT,
-                    created_at=model_data.get("created_at"),
-                    context_limit=context_limit,
-                    supports_vision=True,  # Claude 3+ supports vision
-                    supports_tools=True,   # Claude supports tools
-                    supports_streaming=True,
-                ))
+                # Keep API-key and OAuth discovery metadata identical.
+                models.append(anthropic_model_info(model_data))
 
             logger.info(f"Anthropic returned {len(models)} models")
             return models
