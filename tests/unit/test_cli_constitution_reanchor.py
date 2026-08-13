@@ -486,7 +486,11 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "postgres" in err
+    # The label's own shape, not the bare word: ``target.describe()`` renders a
+    # PostgreSQL target as ``postgres:postgresql://…``, whereas a bare
+    # "postgres" could just as well have come out of the tmp_path this message
+    # embeds — one test rename away from asserting nothing (round 10).
+    assert "postgres:postgresql://" in err
     assert "Nothing was written" in err
     assert "u:p@" not in err
     # And it did not quietly rewrite the anchor on the way past.
@@ -607,7 +611,11 @@ def test_anchor_overlay_reads_the_agent_homes_env_too(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "postgres" in err
+    # The label's own shape, not the bare word: ``target.describe()`` renders a
+    # PostgreSQL target as ``postgres:postgresql://…``, whereas a bare
+    # "postgres" could just as well have come out of the tmp_path this message
+    # embeds — one test rename away from asserting nothing (round 10).
+    assert "postgres:postgresql://" in err
     assert "Nothing was written" in err
     assert "u:p@" not in err
     assert (agent_dir / "kestrel_prime.db").read_bytes() == before
