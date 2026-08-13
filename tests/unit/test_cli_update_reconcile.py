@@ -9,6 +9,8 @@ editable vs PyPI update modes dispatch to ``git pull`` vs ``pip --upgrade``.
 from __future__ import annotations
 
 import argparse
+import shlex
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -206,7 +208,7 @@ def test_execute_pinned_pypi_does_not_fall_back_to_unpinned_git():
     that would violate the operator's declared pin (codex round 7 P2)."""
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="update", mode="pypi",
-        source="kestrel-feature-voice>=0.3,<0.4", pinned=True,
+        source="kestrel-feature-voice>=0.3,<0.4", source_declared=True,
     )
     with patch.object(cli, "_extension_install_run", return_value=_ok(rc=1, stderr="no match")) as install:
         ok, _ = cli_lifecycle._execute_reconcile_action(
@@ -215,6 +217,54 @@ def test_execute_pinned_pypi_does_not_fall_back_to_unpinned_git():
         )
     assert ok is False
     assert install.call_count == 1  # NO git fallback for a pinned entry
+
+
+def test_plan_marks_an_unpinned_pypi_declaration_as_a_declared_source():
+    """``pypi = ""`` pins no version but still NAMES the index as the source.
+
+    The plan has to carry that, because the executor's only other option is the
+    registry's git URL — repo HEAD, a different source entirely. Truthiness on
+    the spec cannot tell ``""`` (declared, any version) from absent (legacy, no
+    declaration), and reads both as "substitution allowed".
+    """
+    info = _registry()["voice"]
+    actions, _ = fr.plan_reconcile(
+        {"kestrel-feature-voice": info},
+        {"kestrel-feature-voice": fr.SourceEntry(
+            package="kestrel-feature-voice", pypi="",
+        )},
+        {"kestrel-feature-voice": None},
+        {},
+        {"VoiceFeature": "kestrel-feature-voice"},
+    )
+    assert actions[0].source == "kestrel-feature-voice"  # no version pin
+    assert actions[0].source_declared is True
+
+    # The legacy entry — no source at all — is the one that may fall back.
+    legacy, _ = fr.plan_reconcile(
+        {"kestrel-feature-voice": info},
+        {"kestrel-feature-voice": fr.SourceEntry(package="kestrel-feature-voice")},
+        {"kestrel-feature-voice": None},
+        {},
+        {"VoiceFeature": "kestrel-feature-voice"},
+    )
+    assert legacy[0].source_declared is False
+
+
+def test_execute_unpinned_pypi_declaration_does_not_fall_back_to_git():
+    """The executor half: a failed index install for a ``pypi = ""`` entry is a
+    failure, not a licence to install repo HEAD from somewhere else."""
+    action = fr.ReconcileAction(
+        package="kestrel-feature-voice", op="install", mode="pypi",
+        source="kestrel-feature-voice", source_declared=True,
+    )
+    with patch.object(cli, "_extension_install_run", return_value=_ok(rc=1, stderr="no match")) as install:
+        ok, _ = cli_lifecycle._execute_reconcile_action(
+            action, {"kestrel-feature-voice": "https://example/voice.git"},
+            allow_dirty=False, guard=_unguarded(),
+        )
+    assert ok is False
+    assert install.call_count == 1
 
 
 def test_execute_pypi_force_reinstall_switches_off_editable():
@@ -247,11 +297,6 @@ def test_execute_pypi_falls_back_to_git_url():
     assert install.call_args[0][0] == ["git+https://example/voice.git"]
 
 
-# --------------------------------------------------------------------------
-# core install guard (#2949) — reconcile holds core to the SAME source-map
-# policy the feature commands do.
-# --------------------------------------------------------------------------
-
 def _reconcile(patched, **kw):
     """Run the reconcile step against the fake host."""
     return cli_lifecycle._run_feature_reconcile(
@@ -259,6 +304,96 @@ def _reconcile(patched, **kw):
         allow_dirty=False, continue_on_error=False, prefer=None, **kw
     )
 
+
+# --------------------------------------------------------------------------
+# distribution identity — live metadata, registry, and source map name the
+# same package three ways (#2949)
+# --------------------------------------------------------------------------
+
+def test_reconcile_honours_the_source_map_when_live_metadata_uses_underscores(
+    monkeypatch, patched, tmp_path,
+):
+    """``ep.dist.name`` is whatever the installed package's METADATA spells.
+
+    A project built as ``kestrel_feature_voice`` reports the underscore form,
+    while the registry and the operator's source map spell it with hyphens —
+    PEP 503 says those are one distribution. Compared raw, the plan's package
+    misses its own source entry, the declared pin evaporates, and the package is
+    reported ``present (no managed source)``: reconcile silently stops managing
+    a package the operator explicitly declared.
+    """
+    manifest = tmp_path / "hosts.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-feature-voice"\npypi = ">=0.3,<0.4"\n'
+    )
+    monkeypatch.setattr(cli, "_host_manifest_path", lambda ns: manifest)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.discover_entrypoint_feature_dists",
+        lambda: {"VoiceFeature": "kestrel_feature_voice"},
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.discover_local_feature_class_names", lambda: set(),
+    )
+
+    with patch("importlib.metadata.version", lambda pkg: "0.3.0"), \
+         patch.object(cli, "_editable_install_path", lambda p: None), \
+         patch.object(cli, "_extension_install_run", return_value=_ok()) as install:
+        rc = _reconcile(patched)
+
+    assert rc == 0
+    # The declared pin was applied — not dropped as "no managed source".
+    assert install.called, "the source map's entry was not matched to the package"
+    assert install.call_args[0][0] == ["--upgrade", "kestrel-feature-voice>=0.3,<0.4"]
+
+
+def test_reconcile_git_fallback_finds_a_catalog_row_spelled_differently(
+    monkeypatch, patched,
+):
+    """The executor's registry lookup is keyed like the plan's package identity.
+
+    An action carries the canonical distribution name, so a catalog row spelling
+    its own ``package`` another way must still resolve to a git URL — otherwise
+    a package that HAS a remote source is reported as unrecoverable.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.feature_registry.load_registry",
+        lambda *a, **k: {"voice": FeaturePackageInfo(
+            name="voice", package="Kestrel_Feature_Voice",
+            git="https://example/voice.git",
+            features=["VoiceFeature"], description="", core=False,
+        )},
+    )
+    pnf = __import__("importlib.metadata", fromlist=["PackageNotFoundError"]).PackageNotFoundError
+    results = [_ok(rc=1, stderr="not found"), _ok(rc=0)]
+    with patch("importlib.metadata.version", side_effect=pnf), \
+         patch.object(cli, "_editable_install_path", lambda p: None), \
+         patch.object(cli, "_extension_install_run", side_effect=results) as install:
+        rc = _reconcile(patched)
+
+    assert rc == 0
+    assert install.call_count == 2
+    assert install.call_args[0][0] == ["git+https://example/voice.git"]
+
+
+def test_resolve_packages_canonicalizes_live_distribution_names():
+    """The planning half: whichever spelling live metadata reports, the package
+    identity handed to the plan is the one the source index is keyed on."""
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"VoiceFeature"}, _registry(),
+        entrypoint_dists={"VoiceFeature": "Kestrel_Feature_Voice"},
+    )
+    assert unresolved == []
+    assert class_to_pkg == {"VoiceFeature": "kestrel-feature-voice"}
+    # Canonical enough to find the catalogued row (git URL, extras) too, rather
+    # than synthesizing a sourceless info from the live spelling.
+    assert list(pkg_infos) == ["kestrel-feature-voice"]
+    assert pkg_infos["kestrel-feature-voice"].git == "https://example/voice.git"
+
+
+# --------------------------------------------------------------------------
+# core install guard (#2949) — reconcile holds core to the SAME source-map
+# policy the feature commands do.
+# --------------------------------------------------------------------------
 
 def test_reconcile_pins_core_to_the_editable_checkout(monkeypatch, patched, capsys):
     """The regression, through `kestrel update`: editable core at X plus a
@@ -335,7 +470,10 @@ def test_reconcile_fails_when_an_install_replaced_the_editable_core(
     assert venv.installed[CORE] == "0.52.0"
     err = capsys.readouterr().err
     assert "was replaced during the install batch" in err
-    assert "restored: uv pip install -e /src/core" in err
+    assert (
+        f"restored: uv pip install --python {shlex.quote(sys.executable)} "
+        "-e /src/core"
+    ) in err
 
 
 def test_reconcile_reports_a_core_that_could_not_be_restored(
@@ -354,4 +492,7 @@ def test_reconcile_reports_a_core_that_could_not_be_restored(
     assert rc == 1
     assert venv.editable.get(CORE) is None  # still swapped
     err = capsys.readouterr().err
-    assert "RESTORE FAILED — run `uv pip install -e /src/core` by hand." in err
+    assert (
+        "RESTORE FAILED — run `uv pip install --python "
+        f"{shlex.quote(sys.executable)} -e /src/core` by hand."
+    ) in err

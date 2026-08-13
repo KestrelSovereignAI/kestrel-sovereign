@@ -159,6 +159,40 @@ def test_resolve_packages_local_core_class_needs_no_install():
     assert class_to_pkg["AttachmentsFeature"] == fr.CORE_DISTRIBUTION
 
 
+def test_resolve_packages_matches_a_catalog_row_spelled_differently():
+    """Live metadata and the catalog may spell one distribution two ways.
+
+    ``ep.dist.name`` reports whatever the installed package's METADATA says;
+    the catalog row carries the git URL and extras the plan needs. Matched raw,
+    the two miss each other and the package is planned from a synthesized
+    sourceless info — no git URL, and (via the source index, keyed the same
+    way) no declared source or pin either (#2949).
+    """
+    reg = {
+        "reflection": FeaturePackageInfo(
+            name="reflection", package="Kestrel_Feature_Reflection",
+            git="https://example/reflection.git",
+            features=["ReflectionFeature"], description="", core=False,
+        ),
+    }
+    # 1. Installed: resolved from live metadata, matched to the catalog row.
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"ReflectionFeature"}, reg,
+        entrypoint_dists={"ReflectionFeature": "kestrel_feature_reflection"},
+    )
+    assert unresolved == []
+    assert class_to_pkg == {"ReflectionFeature": "kestrel-feature-reflection"}
+    assert pkg_infos["kestrel-feature-reflection"].git == "https://example/reflection.git"
+
+    # 2. Not installed: resolved from the catalog alone, same identity.
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"ReflectionFeature"}, reg,
+    )
+    assert unresolved == []
+    assert class_to_pkg == {"ReflectionFeature": "kestrel-feature-reflection"}
+    assert list(pkg_infos) == ["kestrel-feature-reflection"]
+
+
 def test_resolve_packages_uncatalogued_uninstalled_class_is_unresolved():
     """The motivating bug: an allowlist names a feature that is neither
     installed nor catalogued nor bundled -> hard error."""
@@ -187,6 +221,35 @@ def test_build_source_index_resolves_names_and_dist_names():
     assert idx["kestrel-feature-voice"].mode == "editable"
     assert idx["kestrel-feature-reflection"].pypi == ">=0.2,<0.3"
     assert idx["kestrel-feature-reflection"].mode == "pypi"
+
+
+def test_source_index_keys_are_canonical_whoever_spelled_the_name():
+    """One key per distribution, whichever of the three sources named it.
+
+    The operator's spelling, the catalog's ``package``, and live metadata all
+    reach this index; :func:`resolve_packages` looks it up under
+    :func:`canonical_package` form, so anything that keys it otherwise is a
+    silently unmanaged package (#2949).
+    """
+    reg = dict(_registry())
+    # A catalog row that spells its own distribution with underscores.
+    reg["reflection"] = FeaturePackageInfo(
+        name="reflection", package="Kestrel_Feature_Reflection",
+        git="https://example/reflection.git",
+        features=["ReflectionFeature"], description="", core=False,
+    )
+    entries = [
+        # Operator's spelling differs from the catalog's, which differs again
+        # from the canonical form. All three are one distribution (PEP 503).
+        {"name": "KESTREL.FEATURE.REFLECTION", "editable": None,
+         "pypi": ">=0.2,<0.3", "extras": []},
+        {"name": "some_private_pkg", "editable": None, "pypi": "", "extras": []},
+    ]
+    idx = fr.build_source_index(entries, reg)
+    assert idx["kestrel-feature-reflection"].pypi == ">=0.2,<0.3"
+    # Unknown to the catalog: still canonical, so a live dist reporting
+    # ``some-private-pkg`` finds it.
+    assert idx["some-private-pkg"].pypi == ""
 
 
 # --------------------------------------------------------------------------

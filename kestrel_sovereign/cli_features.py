@@ -13,50 +13,40 @@ here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
 import os
+import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from packaging.utils import canonicalize_name
-
 # Non-patched constants — import directly. (``MultiAgentConfig`` itself is
 # referenced as ``cli.MultiAgentConfig`` because the test suite patches it.)
 # ``feature_reconcile`` holds the pure planning types and imports nothing from
 # the CLI, so naming the core distribution here is not a cycle.
-from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION
+from kestrel_sovereign.feature_reconcile import (
+    CORE_DISTRIBUTION,
+    canonical_package,
+    package_for_label,
+    resolve_registry_name,
+)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+
+# A ``file:`` URL path that is really a Windows drive: ``/C:/src`` — or the
+# legacy bar spelling ``/C|/src`` that older tools still emit.
+_DRIVE_URL_PATH = re.compile(r"^/[A-Za-z][:|](/|$)")
 
 
 def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
+    """Resolve a user-provided name to a registry short name.
+
+    The implementation lives in
+    :func:`kestrel_sovereign.feature_reconcile.resolve_registry_name` so the
+    reconcile planner resolves manifest names by exactly these rules; this is
+    the CLI's long-standing name (and patch seam) for it.
     """
-    Resolve a user-provided name to a registry short name.
-
-    Accepts a registry short name ("voice"), registered distribution name
-    ("kestrel-feature-voice"), or feature/provider class name
-    ("VoiceFeature"). Package-style names use Python's normalized-name rules,
-    so case and runs of ``-``, ``_``, or ``.`` are equivalent.
-    """
-    # Preserve the cheapest and most common exact registry-key lookup.
-    if name in registry:
-        return name
-
-    normalized = canonicalize_name(name)
-    for pkg_name, info in registry.items():
-        if (
-            canonicalize_name(pkg_name) == normalized
-            or canonicalize_name(info.package) == normalized
-        ):
-            return pkg_name
-
-    # Feature lifecycle or provider implementation class-name match.
-    for pkg_name, info in registry.items():
-        components = getattr(info, "runtime_components", info.features)
-        if name in components:
-            return pkg_name
-
-    return None
+    return resolve_registry_name(name, registry)
 
 
 def _status_icon(status) -> str:
@@ -235,6 +225,39 @@ def cmd_feature_install(args) -> int:
         return 1
 
 
+def _file_url_to_path(url: str) -> str:
+    """Decode a PEP 610 ``file:`` URL into a filesystem path.
+
+    ``direct_url.json`` records a URL, not a path: a checkout under
+    ``/src/My Project`` arrives as ``file:///src/My%20Project``, and one on
+    Windows as ``file:///C:/src/kestrel`` (``file://server/share/...`` for a UNC
+    share). Chopping the scheme off textually leaves ``/src/My%20Project`` or
+    ``/C:/src/kestrel`` — paths that do not exist, which here is worse than
+    merely untidy: :class:`CoreInstallGuard` captures this value as the checkout
+    core must be restored *from*, so a mangled path turns a recoverable swap
+    into an unrecoverable one (issue #2949).
+
+    The URL's own shape picks the conversion, not the host platform, so a record
+    decodes to the path whoever wrote it meant, wherever it is read. A
+    Windows-authored path read on POSIX then simply does not exist there, which
+    is the honest answer — synthesising ``/C:/src/kestrel`` instead invites a
+    match against something that was never the checkout.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    parts = urlsplit(url)
+    path = unquote(parts.path)
+    host = unquote(parts.netloc)
+    if host and host.lower() != "localhost":
+        # RFC 8089 non-local authority: a Windows UNC share.
+        return "\\\\" + host + path.replace("/", "\\")
+    if _DRIVE_URL_PATH.match(path):
+        # urlsplit keeps the URL's leading slash on ``/C:/src`` (and on the
+        # legacy ``/C|/src`` spelling); the drive letter is the real root.
+        return path[1] + ":" + (path[3:].replace("/", "\\") or "\\")
+    return path
+
+
 def _editable_install_path(dist_name: str) -> Optional[str]:
     """Return the local source path if *dist_name* is an editable install.
 
@@ -258,7 +281,9 @@ def _editable_install_path(dist_name: str) -> Optional[str]:
     if not data.get("dir_info", {}).get("editable"):
         return None
     url = data.get("url", "")
-    return url[len("file://") :] if url.startswith("file://") else url or None
+    if url.startswith("file:"):
+        return _file_url_to_path(url) or None
+    return url or None
 
 
 def _installed_extension_distributions() -> list:
@@ -513,6 +538,101 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _install_backend_argv(pip_args: list, extra_args=()) -> list:
+    """The exact argv an extension install runs as.
+
+    uv-created virtualenvs frequently ship without ``pip``, so a bare
+    ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
+    (pinned to *this* interpreter so a worktree can't retarget the wrong env),
+    and fall back to ``python -m pip install`` only when uv isn't on PATH.
+
+    Split out of :func:`_extension_install_run` because the recovery command the
+    guard hands an operator after a failed automatic repair must be the command
+    that actually ran. Rendering ``uv pip install ...`` unconditionally
+    advertises a uv this host may not have, and drops ``--python``, so running
+    the advertised "fix" by hand could mutate a different environment — the
+    retargeting this guard exists to prevent (issue #2949).
+    """
+    import shutil
+
+    if shutil.which("uv"):
+        return [
+            "uv", "pip", "install", "--python", sys.executable,
+            *extra_args, *pip_args,
+        ]
+    return [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
+
+
+def _is_windows() -> bool:
+    """Whether a command printed for the operator needs Windows quoting."""
+    return os.name == "nt"
+
+
+#: The Windows shell :func:`_render_command` quotes for. One string cannot serve
+#: both of Windows' shells: PowerShell needs the ``&`` call operator before a
+#: quoted program, and a leading ``&`` is a syntax error to ``cmd.exe``. So the
+#: operator is told which shell the printed command is quoted for rather than
+#: handed a coin flip. PowerShell is the choice because it is what Windows
+#: presents by default (Windows Terminal, the Start-menu entry) and what this
+#: project's own Windows guidance in ``README.md`` already assumes.
+WINDOWS_SHELL = "PowerShell"
+
+#: Tokens PowerShell's argument-mode parser passes through verbatim, so the
+#: common ``-m`` / ``--python`` / ``C:\\venv\\python.exe`` stay readable.
+#: Deliberately narrow: everything else — including ``,`` (array operator),
+#: ``@`` (splat), ``$``, and the redirection pair — is quoted.
+_PS_BARE_TOKEN = re.compile(r"^[A-Za-z0-9_.:=+/\\-]+$")
+
+
+def _powershell_quote(arg: str) -> str:
+    """Quote *arg* as a PowerShell literal string.
+
+    Single quotes suppress every parse rule PowerShell would otherwise apply —
+    ``$`` expansion, the backtick escape, and the argument-mode metacharacters
+    ``< > | & , ; @ ( ) { }`` — so a requirement such as
+    ``kestrel-sovereign>=0.52,<0.53`` survives as ONE argument. A literal
+    single quote doubles, which is PowerShell's only escape inside them.
+    """
+    if _PS_BARE_TOKEN.match(arg):
+        return arg
+    return "'" + arg.replace("'", "''") + "'"
+
+
+def _render_command(argv: list) -> str:
+    """Render *argv* as a command the operator's shell will run as this argv.
+
+    A recovery command exists solely to be pasted after an automatic repair
+    failed, so one the shell rejects is worth no more than printing nothing —
+    and one the shell silently reads as something ELSE is worse than both.
+
+    ``shlex.join`` speaks POSIX ``sh`` only, and :func:`subprocess.list2cmdline`
+    is not its Windows counterpart: it quotes for the MS C runtime the *child*
+    parses, not for the shell that reads the line first. It leaves a version
+    window like ``kestrel-sovereign>=0.52,<0.53`` bare, and ``<`` / ``>`` are
+    shell syntax before they are ever an argument — PowerShell refuses the line
+    outright, ``cmd.exe`` redirects into a file instead of passing the pin. Both
+    ends of that are the retargeting this guard exists to prevent (issue #2949),
+    re-entered through the printed fix.
+
+    Windows therefore gets :data:`WINDOWS_SHELL` quoting: literal single-quoted
+    arguments, behind the ``&`` call operator so a quoted interpreter path is
+    RUN rather than echoed back as a string.
+    """
+    if _is_windows():
+        return "& " + " ".join(_powershell_quote(a) for a in argv)
+    return shlex.join(argv)
+
+
+def _render_shell() -> Optional[str]:
+    """Name the shell :func:`_render_command` just quoted for, when it matters.
+
+    ``None`` on POSIX: ``sh`` quoting is what a POSIX operator's shell reads
+    anyway, so naming it would be noise. On Windows the name is load-bearing —
+    it is the difference between a command that runs and one that errors.
+    """
+    return WINDOWS_SHELL if _is_windows() else None
+
+
 def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     """Install via uv when available, else the interpreter's own pip.
 
@@ -522,10 +642,9 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     a silent default that reopens issue #2949; pass ``None`` only when core
     itself is the install target (it is never constrained against itself).
 
-    uv-created virtualenvs frequently ship without ``pip``, so a bare
-    ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
-    (pinned to *this* interpreter so a worktree can't retarget the wrong env),
-    and fall back to ``python -m pip install`` only when uv isn't on PATH.
+    The installer backend (uv, else this interpreter's pip) is chosen by
+    :func:`_install_backend_argv`, which the guard also renders its recovery
+    command from.
 
     ``uv pip`` vs ``uv sync`` — do NOT "fix" this by switching installers.
     ``uv pip`` is uv's *pip-compatible* layer: it operates on a bare virtualenv
@@ -547,7 +666,6 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     ``--no-deps`` is NOT the fix: it stops feature dependencies resolving at all
     and hides the version-skew signal rather than surfacing it.
     """
-    import shutil
     import tempfile
 
     constraint_file = None
@@ -561,13 +679,7 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
         extra_args = ["-c", constraint_file]
 
     try:
-        if shutil.which("uv"):
-            cmd = [
-                "uv", "pip", "install", "--python", sys.executable,
-                *extra_args, *pip_args,
-            ]
-        else:
-            cmd = [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
+        cmd = _install_backend_argv(pip_args, extra_args)
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     finally:
         if constraint_file:
@@ -613,6 +725,9 @@ class CoreGuardOutcome:
     replaced: bool = False
     repaired: bool = False
     command: Optional[str] = None
+    # Which shell ``command`` is quoted for, captured with it (see
+    # :func:`_render_shell`). ``None`` where the platform has only one answer.
+    shell: Optional[str] = None
     output: str = ""  # tail of a failed repair's stderr/stdout
 
     @property
@@ -632,6 +747,19 @@ class CoreGuardOutcome:
             else f"{CORE_DISTRIBUTION} is not installed from its declared source"
         )
 
+    @property
+    def restore_instruction(self) -> str:
+        """The 'we could not put it back, here is how' line — worded once.
+
+        The CLI prints it and the HTTP surface embeds it via :meth:`describe`,
+        so it lives here rather than at both call sites: an operator comparing
+        the two must not have to wonder whether they mean the same thing. Names
+        the shell when :attr:`shell` says the quoting is specific to one, since
+        a command pasted into the other shell is not the command that ran.
+        """
+        where = f" in {self.shell}" if self.shell else ""
+        return f"RESTORE FAILED — run `{self.command}`{where} by hand."
+
     def describe(self) -> str:
         """One operator-readable block: what moved, and what was done about it.
 
@@ -645,7 +773,7 @@ class CoreGuardOutcome:
         if self.repaired:
             lines.append(f"restored: {self.command}")
         else:
-            lines.append(f"RESTORE FAILED — run `{self.command}` by hand.")
+            lines.append(self.restore_instruction)
             lines.extend(self.output.splitlines()[-3:])
         return "\n".join(lines)
 
@@ -764,7 +892,21 @@ class CoreInstallGuard:
         return describe_core_change(self.before, cli._core_install_shape(), self.policy)
 
     def _repair(self):
-        """Reinstall core from its declared source. Returns ``(ok, command, result)``."""
+        """Reinstall core from its declared source.
+
+        Returns ``(ok, command, shell, result)`` — ``shell`` naming what
+        ``command`` is quoted for, captured here so the label can never describe
+        a different rendering than the one it travels with.
+
+        ``command`` is rendered from the SAME backend selection the repair just
+        ran through (:func:`_install_backend_argv`), interpreter included, and
+        quoted for THIS host's shell (:func:`_render_command`). An operator only
+        sees it when the automatic restore failed, which is precisely when a
+        command naming a uv this host lacks — or omitting ``--python`` and so
+        landing in whichever environment is active — would retarget core
+        somewhere new instead of putting it back, and when a command their shell
+        will not parse at all leaves them with nothing.
+        """
         if self.policy.editable:
             checkout = str(Path(self.policy.editable).expanduser())
             pip_args = ["-e", checkout]
@@ -778,10 +920,10 @@ class CoreInstallGuard:
                 if cli._editable_install_path(CORE_DISTRIBUTION) else [spec]
             )
         result = cli._extension_install_run(pip_args, constraints=None)
-        rendered = "uv pip install " + " ".join(pip_args)
+        rendered = _render_command(cli._install_backend_argv(pip_args))
         if result.returncode == 0:
             self.refresh()
-        return result.returncode == 0, rendered, result
+        return result.returncode == 0, rendered, _render_shell(), result
 
     def resolve(self) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
@@ -804,13 +946,14 @@ class CoreInstallGuard:
         # Distinguish "the batch broke it" from "it never got there": both are
         # failures, but only the first is a swap.
         replaced = core_install_matches(self._baseline, self.policy)
-        ok, rendered, result = self._repair()
+        ok, rendered, shell, result = self._repair()
         repaired = ok and self._check() is None
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=repaired,
             command=rendered,
+            shell=shell,
             output="" if repaired else (result.stderr or result.stdout or "").strip(),
         )
 
@@ -831,10 +974,7 @@ class CoreInstallGuard:
         if outcome.repaired:
             print(f"    restored: {outcome.command}", file=sys.stderr)
         else:
-            print(
-                f"    RESTORE FAILED — run `{outcome.command}` by hand.",
-                file=sys.stderr,
-            )
+            print(f"    {outcome.restore_instruction}", file=sys.stderr)
             for line in outcome.output.splitlines()[-3:]:
                 print(f"      {line}", file=sys.stderr)
         return 1
@@ -927,8 +1067,9 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     """
     import importlib.metadata as md
 
-    info = _registry_info_for(entry["name"], registry)
-    target = info.package if info else entry["name"]
+    # Same resolver the source index keys on, so "this entry is core" and
+    # "this is core's declared source" can never disagree (issue #2949).
+    target = package_for_label(entry["name"], registry)
     extras = entry["extras"]
     editable_want = entry["editable"]
     pypi_want = entry.get("pypi")
@@ -973,8 +1114,7 @@ def _core_entry_first(entries: list, registry: dict) -> list:
     the operator's file still reads the way it runs (issue #2949).
     """
     def is_core(entry) -> bool:
-        info = _registry_info_for(entry["name"], registry)
-        return (info.package if info else entry["name"]) == CORE_DISTRIBUTION
+        return package_for_label(entry["name"], registry) == CORE_DISTRIBUTION
 
     core = [e for e in entries if is_core(e)]
     return core + [e for e in entries if not is_core(e)] if core else entries
@@ -1008,7 +1148,12 @@ def cmd_feature_sync(args) -> int:
         return 0
 
     registry = load_registry()
-    git_urls = {info.package: info.git for info in registry.values() if info.package}
+    # Keyed on the same canonical identity ``_resolve_manifest_action`` resolves
+    # an entry's target to, so the lookup can't miss on spelling alone.
+    git_urls = {
+        canonical_package(info.package): info.git
+        for info in registry.values() if info.package
+    }
     dry_run = getattr(args, "dry_run", False)
 
     # Every kestrel-feature-* depends on kestrel-sovereign, so any of these
@@ -1073,15 +1218,24 @@ def cmd_feature_sync(args) -> int:
         run = guard.install_core if is_core else guard.run
         result = run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
-        # `feature install`). Editable installs have no remote fallback. A
-        # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
-        # with no version constraint, which would silently violate the pin.
+        # `feature install`) — but ONLY the legacy entry that declares no source
+        # at all, which has always meant "wherever this package comes from".
+        # The git URL installs repo HEAD with no version constraint, so it is
+        # both a different SOURCE and an unpinned one: substituting it for a
+        # declared source is the same silent retargeting this ticket exists to
+        # stop. `editable` has no remote form; `pypi = ">=x,<y"` would be moved
+        # outside its pin; and `pypi = ""` names the index as the source — "any
+        # version" is a statement about the VERSION, not a waiver of where the
+        # package comes from — so `""` must be told apart from "absent", which a
+        # truthiness test cannot do. (An empty `editable` is the other way
+        # round: it names no checkout, so it declares nothing — which is how the
+        # rest of this function reads it too.)
         # Carry extras across via PEP 508 form (``pkg[extra] @ git+url``) so a
         # git fallback doesn't silently drop the local-pipeline deps.
         if (
             result.returncode != 0
             and not editable_want
-            and not pypi_want
+            and pypi_want is None
             and git_urls.get(target)
         ):
             git_ref = f"git+{git_urls[target]}"

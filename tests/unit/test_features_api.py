@@ -1,5 +1,7 @@
 """Tests for the Feature Store API endpoints (endpoints/features.py)."""
 
+import shlex
+import sys
 from dataclasses import asdict
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -633,7 +635,10 @@ class TestInstallFeature:
         detail = resp.json()["detail"]
         assert "Installation failed" in detail
         assert "was replaced during the install batch" in detail
-        assert "restored: uv pip install -e /src/core" in detail
+        assert (
+            f"restored: uv pip install --python {shlex.quote(sys.executable)} "
+            "-e /src/core"
+        ) in detail
         assert venv.editable[CORE] == "/src/core"  # repaired despite the failure
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
@@ -676,7 +681,10 @@ class TestInstallFeature:
         assert "was replaced during the install batch" in detail
         # The operator's command, verbatim — the response is the only place
         # they will see it.
-        assert "RESTORE FAILED — run `uv pip install -e /src/core` by hand." in detail
+        assert (
+            "RESTORE FAILED — run `uv pip install --python "
+            f"{shlex.quote(sys.executable)} -e /src/core` by hand."
+        ) in detail
         assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
         assert venv.installed["kestrel-feature-test"] == "0.4.0"
 

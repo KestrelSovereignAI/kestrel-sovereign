@@ -22,8 +22,16 @@
 # decide each feature's update mode. Each entry records ONE source:
 #   - `editable = "/path"`  -> git pull --ff-only the checkout on update
 #   - `pypi = ">=x,<y"`     -> pip install --upgrade within the pin on update
+#   - `pypi = ""`           -> from the index, any version
 #   - neither               -> install latest from PyPI (back-compat)
 # `editable` and `pypi` are mutually exclusive — a feature has one source.
+#
+# `pypi = ""` and omitting the key are NOT the same. A failed install of an
+# entry that declares no source falls back to the registry's git URL (repo
+# HEAD) — the back-compat behaviour from before this file was a source map.
+# Writing `pypi = ""` says the index IS this package's source: "any version" is
+# a statement about the VERSION, not permission to fetch it from somewhere
+# else, so a failure is reported rather than silently satisfied from git.
 
 # The core distribution is a first-class entry here (issue #2949). Every
 # `kestrel-feature-*` depends on `kestrel-sovereign`, and the installer

@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from packaging.utils import canonicalize_name
+
 from kestrel_sovereign.feature_registry import FeaturePackageInfo
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
@@ -34,6 +36,24 @@ from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 # into kestrel-sovereign itself (step 1 of ``kestrel update`` pulls + reinstalls
 # it) — reconcile must NOT try to pip-install them as separate extensions.
 CORE_DISTRIBUTION = "kestrel-sovereign"
+
+
+def canonical_package(name: str) -> str:
+    """The one spelling of a distribution name this module keys everything on.
+
+    Three sources name the same distribution three ways: the source map uses
+    whatever the operator typed, the static registry uses hyphens, and live
+    metadata (``ep.dist.name``) uses whatever the package's own build wrote —
+    ``kestrel_feature_voice`` is a legal ``Name:`` for the project the registry
+    calls ``kestrel-feature-voice``. PEP 503 says those are one distribution, so
+    the reconcile pipeline resolves each to this form before it becomes a dict
+    key; comparing raw spellings instead makes a declared source or pin
+    invisible, and the package is then reconciled as if unmanaged (issue #2949).
+
+    Safe as an install target too: pip and uv accept the canonical name, and
+    ``importlib.metadata`` normalizes before it looks a distribution up.
+    """
+    return str(canonicalize_name(name))
 
 
 @dataclass
@@ -71,10 +91,13 @@ class ReconcileAction:
     # the package is absent OR currently linked to a different checkout (or to a
     # non-editable PyPI build). A git pull alone would leave the venv stale.
     relink: bool = False
-    # PyPI only: the source carries an explicit version pin, so the executor
-    # must NOT fall back to an unpinned git URL on failure (that would silently
-    # move the feature outside the operator's declared pin).
-    pinned: bool = False
+    # PyPI only: the source map declared where this package comes from, so the
+    # executor must NOT substitute the registry's git URL on failure. That URL
+    # installs repo HEAD — a different source, and an unpinned one — which would
+    # move the package outside a declared window (``pypi = ">=x,<y"``) or off
+    # the declared index entirely (``pypi = ""``, which pins no version but does
+    # name a source). Only the legacy entry that declares neither may fall back.
+    source_declared: bool = False
     # PyPI only: the package is CURRENTLY installed editable but the source map
     # now declares PyPI, so the executor must ``--force-reinstall`` to replace
     # the editable link with the wheel — a plain ``--upgrade`` is a no-op when
@@ -301,7 +324,9 @@ def resolve_packages(
 
     Returns ``(pkg_infos, class_to_pkg, unresolved)`` where ``pkg_infos`` is
     ``{package: FeaturePackageInfo}`` for every required, non-core, installable
-    package.
+    package. Package keys are :func:`canonical_package` form regardless of which
+    of the three sources above named them, so the source index (also keyed that
+    way, via :func:`package_for_label`) lines up.
     """
     entrypoint_dists = entrypoint_dists or {}
     local_core_classes = local_core_classes or set()
@@ -310,7 +335,7 @@ def resolve_packages(
     reg_by_package: Dict[str, "FeaturePackageInfo"] = {}
     for info in registry.values():
         if info.package:
-            reg_by_package.setdefault(info.package, info)
+            reg_by_package.setdefault(canonical_package(info.package), info)
         for cls in info.features:
             reg_by_class.setdefault(cls, info)
 
@@ -330,8 +355,14 @@ def resolve_packages(
             continue
 
         # 2. Installed external package (live entry-point truth).
+        #    ``ep.dist.name`` is whatever the package's own METADATA spells —
+        #    a project built as ``kestrel_feature_voice`` reports the underscore
+        #    form. Canonicalize it so the identity lines up with the source
+        #    index and the registry, which spell it with hyphens: a mismatch
+        #    silently drops the entry's declared source/pin (issue #2949).
         dist = entrypoint_dists.get(cls)
         if dist:
+            dist = canonical_package(dist)
             class_to_pkg[cls] = dist
             if dist != CORE_DISTRIBUTION:
                 # Prefer registry metadata (git URL, extras) when catalogued;
@@ -345,9 +376,10 @@ def resolve_packages(
         # 3. Catalogued external package (maybe not yet installed → install).
         info = reg_by_class.get(cls)
         if info is not None:
-            class_to_pkg[cls] = info.package
-            if info.package and info.package != CORE_DISTRIBUTION:
-                pkg_infos[info.package] = info
+            package = canonical_package(info.package) if info.package else ""
+            class_to_pkg[cls] = package
+            if package and package != CORE_DISTRIBUTION:
+                pkg_infos[package] = info
             continue
 
         # 4. Mandatory features are guaranteed by core even when uncatalogued.
@@ -365,11 +397,12 @@ def build_source_index(manifest_entries, registry) -> Dict[str, SourceEntry]:
 
     Manifest entries name a registry short-name ("voice") or a raw dist name
     ("kestrel-feature-voice"); both resolve to the package (dist) name so the
-    index keys line up with :func:`resolve_packages`.
+    index keys line up with :func:`resolve_packages` — and with the target the
+    CLI installs, which is why both go through :func:`package_for_label`.
     """
     index: Dict[str, SourceEntry] = {}
     for entry in manifest_entries:
-        package = _entry_package(entry, registry)
+        package = package_for_label(entry["name"], registry)
         index[package] = SourceEntry(
             package=package,
             editable=entry.get("editable"),
@@ -401,18 +434,62 @@ def _pypi_requirement(package: str, spec: Optional[str], extras: List[str]) -> s
     return f"{base}{spec}" if spec else base
 
 
-def _entry_package(entry: dict, registry) -> str:
-    """Resolve a manifest entry's ``name`` to its package (dist) name."""
-    label = entry["name"]
-    # registry short-name -> package
-    if label in registry and registry[label].package:
-        return registry[label].package
-    # already a dist name present in some registry entry
-    for info in registry.values():
-        if info.package == label:
-            return info.package
-    # unknown to the registry: trust the manifest's name verbatim
-    return label
+def resolve_registry_name(name: str, registry: dict) -> Optional[str]:
+    """Resolve a user-provided name to a registry short name.
+
+    Accepts a registry short name ("voice"), registered distribution name
+    ("kestrel-feature-voice"), or feature/provider class name
+    ("VoiceFeature"). Package-style names use Python's normalized-name rules,
+    so case and runs of ``-``, ``_``, or ``.`` are equivalent.
+
+    Lives here rather than in the CLI because the reconcile planner resolves the
+    same names (see :func:`package_for_label`) and a second implementation is
+    how the two answers drift apart. ``cli_features._resolve_feature_name`` is
+    the CLI's name for this function.
+    """
+    # Preserve the cheapest and most common exact registry-key lookup.
+    if name in registry:
+        return name
+
+    normalized = canonicalize_name(name)
+    for pkg_name, info in registry.items():
+        if (
+            canonicalize_name(pkg_name) == normalized
+            or canonicalize_name(info.package) == normalized
+        ):
+            return pkg_name
+
+    # Feature lifecycle or provider implementation class-name match.
+    for pkg_name, info in registry.items():
+        components = getattr(info, "runtime_components", info.features)
+        if name in components:
+            return pkg_name
+
+    return None
+
+
+def package_for_label(label: str, registry) -> str:
+    """The distribution (dist) name *label* installs — one answer per label.
+
+    ``feature sync`` decides an entry IS core (``target == CORE_DISTRIBUTION``,
+    so it is installed unconstrained and re-derives the batch pin) while
+    :func:`build_source_index` decides which entry core's *policy* is read from.
+    Those two questions must never get different answers, so both resolve the
+    label here: registry lookup under Python's normalized-name rules, falling
+    back to the normalized label itself when no registry row claims it.
+
+    ``kestrel_sovereign`` and ``kestrel-sovereign`` are one distribution
+    (PEP 503). Indexing the source policy under the raw spelling while executing
+    the entry as core left the guard protecting — and restoring — a checkout the
+    manifest never declared (issue #2949). The answer is always
+    :func:`canonical_package` form — including when the registry supplied it —
+    because :func:`resolve_packages` keys the packages this index is looked up
+    with on exactly that.
+    """
+    key = resolve_registry_name(label, registry)
+    if key and registry[key].package:
+        return canonical_package(registry[key].package)
+    return canonical_package(label)
 
 
 def plan_reconcile(
@@ -485,7 +562,7 @@ def plan_reconcile(
             mode = "pypi"
 
         relink = False
-        pinned = False
+        source_declared = False
         force_reinstall = False
         op = "update" if current is not None else "install"
         if mode == "editable":
@@ -514,8 +591,11 @@ def plan_reconcile(
             force_reinstall = bool(detected_editable)
             if pypi_spec is not None:
                 source = _pypi_requirement(package, pypi_spec, extras)
-                # A non-empty spec is a real pin (``""`` means "any version").
-                pinned = bool(pypi_spec)
+                # The entry named the index as this package's source. That holds
+                # whether or not it also pinned a version: ``""`` means "any
+                # version FROM THE INDEX", so the git-URL substitution below is
+                # off the table either way (see ``source_declared``).
+                source_declared = True
             elif info.git:
                 source = _pypi_requirement(package, None, extras)
             elif current is not None:
@@ -540,7 +620,7 @@ def plan_reconcile(
                 current_version=current,
                 extras=extras,
                 relink=relink,
-                pinned=pinned,
+                source_declared=source_declared,
                 force_reinstall=force_reinstall and op != "present",
             )
         )

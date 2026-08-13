@@ -1600,8 +1600,12 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     # (_extension_install_run, _query_agent_feature_catalog) are called back
     # through the ``cli`` module inside cli_features so the patch takes effect.
     _extension_install_run,
+    _install_backend_argv,
+    _render_command,
+    _render_shell,
     _query_agent_feature_catalog,
     _editable_install_path,
+    _file_url_to_path,
     _core_install_shape,
     CoreInstallGuard,
     _installed_extension_distributions,

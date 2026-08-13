@@ -892,8 +892,12 @@ def _run_feature_reconcile(
         print("• reconcile: host venv already satisfies the agent allowlists.")
         return 0
 
+    # Keyed the way every package identity in the plan is keyed
+    # (``fr.canonical_package``) — an action carrying the canonical name must
+    # not miss a registry row the catalog happened to spell differently.
     git_urls = {
-        info.package: info.git for info in registry.values() if info.package
+        fr.canonical_package(info.package): info.git
+        for info in registry.values() if info.package
     }
 
     # 4. Guard the core install across the whole batch.
@@ -1010,10 +1014,16 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guar
         pip_args.append("--force-reinstall")
     pip_args.append(spec)
     result = guard.run(pip_args)
-    # The git-URL fallback installs the repo HEAD with NO version constraint, so
-    # it must NOT be used for a pinned entry — that would silently move the
-    # feature outside the operator's declared pin (codex round 7 P2).
-    if result.returncode != 0 and not action.pinned and git_urls.get(action.package):
+    # The git-URL fallback installs the repo HEAD from a DIFFERENT source with
+    # NO version constraint, so it is only available to an entry that declared
+    # no source of its own — substituting it for a declared one moves the
+    # feature outside the operator's window, or off the index they named
+    # (codex round 7 P2; ``ReconcileAction.source_declared``).
+    if (
+        result.returncode != 0
+        and not action.source_declared
+        and git_urls.get(action.package)
+    ):
         git_ref = f"git+{git_urls[action.package]}"
         git_spec = (
             f"{_pip_spec(action.package, action.extras)} @ {git_ref}"
