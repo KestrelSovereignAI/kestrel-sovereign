@@ -692,3 +692,55 @@ async def test_only_governed_by_edges_count_as_governance(pg, tmp_path, monkeypa
     # governing document and must never be offered up for deletion.
     assert result.stale_edge_targets == (v1_hash,)
     assert OTHER_DID not in result.stale_edge_targets
+
+
+async def test_a_forced_reanchor_repairs_an_unwitnessed_governed_by_edge(
+    pg, tmp_path, monkeypatch,
+):
+    """Detecting the drift is only half a remedy.
+
+    A physical ``governed_by`` edge at the right hash with no
+    ``graph_edge_owners`` witness is invisible to the bound store, so integrity
+    proof 2 fails and the agent safe-modes. ``add_edge`` also refuses to claim
+    an edge nobody owns, so the forced repair rolled its whole transaction back
+    — doctor prescribing a command that could never clear the finding it
+    raised. The writer now drops the witness-less row first and lets
+    ``add_edge`` recreate it with its ledger entry.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    # Strip the witness, leaving the physical edge: the damaged state.
+    await pg.execute(
+        "DELETE FROM graph_edge_owners WHERE source_id = $1 AND label = 'governed_by'",
+        (AGENT_DID,),
+    )
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V1)
+    agent_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    result = await reanchor_constitution(
+        agent_name="First",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+
+    owners = await pg.fetchall(
+        "SELECT agent_id FROM graph_edge_owners "
+        "WHERE source_id = $1 AND target_id = $2 AND label = 'governed_by'",
+        (AGENT_DID, v1_hash),
+    )
+    assert [row[0] for row in owners] == [AGENT_DID], (
+        "the repaired edge still has no ownership witness, so proof 2 still fails"
+    )

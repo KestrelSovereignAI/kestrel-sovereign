@@ -1132,6 +1132,40 @@ async def _write_reanchor(
                 (agent_did, new_hash),
             )
             stale_edge_targets = sorted({row[0] for row in stale_rows})
+
+            # A physical edge at the correct hash with no ownership witness is
+            # invisible to the bound store — it fails integrity proof 2 — and
+            # ``add_edge`` refuses to claim it (``Cannot claim or overwrite an
+            # unowned graph edge``), so the whole transaction would roll back
+            # and the repair this command was prescribed for could never
+            # complete. Drop the witness-less row first and let ``add_edge``
+            # lay it down properly, with its ledger entry.
+            #
+            # Only when it is owned by *nobody*. A row someone else witnesses
+            # is not this repair's to delete, and ``add_edge`` refusing there
+            # is the correct outcome.
+            unwitnessed = await storage.db.fetchall(
+                "SELECT 1 FROM graph_edges "
+                "WHERE source_id = ? AND target_id = ? AND label = 'governed_by' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM graph_edge_owners AS owner "
+                "  WHERE owner.source_id = graph_edges.source_id "
+                "  AND owner.target_id = graph_edges.target_id "
+                "  AND owner.label = graph_edges.label)",
+                (agent_did, new_hash),
+            )
+            if unwitnessed:
+                logger.info(
+                    "Removing an unwitnessed governed_by edge for %s so it can "
+                    "be re-created with its ownership row.", agent_did,
+                )
+                await storage.db.execute(
+                    "DELETE FROM graph_edges "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by'",
+                    (agent_did, new_hash),
+                )
+
             await storage.graph.add_edge(agent_did, new_hash, "governed_by")
             for stale_target in stale_edge_targets:
                 await storage.db.execute(

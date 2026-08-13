@@ -231,7 +231,9 @@ from kestrel_sovereign.doctor import (  # noqa: E402
 _TEST_DID = "did:test:Test"
 
 
-def _anchor(db_path, agent_did: str = _TEST_DID) -> _GovernanceSource:
+def _anchor(
+    db_path, agent_did: str = _TEST_DID, *, ownership_settled: bool = True
+) -> _GovernanceSource:
     """A source that reads the local anchor — the SQLite host's shape.
 
     The readers take a :class:`_GovernanceSource` rather than a path, because
@@ -242,8 +244,18 @@ def _anchor(db_path, agent_did: str = _TEST_DID) -> _GovernanceSource:
 
     ``agent_did`` is required on both backends: the runtime's store is bound to
     it everywhere, so every governance read carries an ownership predicate.
+
+    ``ownership_settled`` defaults to True — a database the runtime has already
+    booted against, which is what these reader tests are about. It is what
+    selects the scoped SQL; before #2649 is recorded complete the legacy reads
+    are the faithful ones, because boot is about to assign the witnesses a
+    scoped read would hide.
     """
-    return _GovernanceSource(anchor_path=db_path, agent_did=agent_did)
+    return _GovernanceSource(
+        anchor_path=db_path,
+        agent_did=agent_did,
+        ownership_settled=ownership_settled,
+    )
 
 
 # Sentinel default: "make the governed_by edge target the stored hash",

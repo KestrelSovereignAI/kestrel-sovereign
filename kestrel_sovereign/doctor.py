@@ -380,8 +380,7 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
             "SELECT 1",
             "SELECT to_regclass('graph_nodes') IS NOT NULL, "
             "to_regclass('graph_node_owners') IS NOT NULL, "
-            "COALESCE((SELECT true FROM schema_backfills "
-            f"          WHERE name = '{_OWNERSHIP_BACKFILL}'), false)",
+            "to_regclass('schema_backfills') IS NOT NULL",
         )
         if rows and not rows[0][0]:
             # No graph schema at all: a PostgreSQL database that has never been
@@ -395,10 +394,29 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
         return _UnreadableDB(
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
         )
-    return _LedgerState(
-        present=bool(rows and rows[0][1]),
-        settled=bool(rows and rows[0][2]),
-    )
+    # The marker is read in a *second* statement, on purpose. PostgreSQL
+    # resolves every relation in a statement before evaluating any of it, so a
+    # ``SELECT ... FROM schema_backfills`` folded into the probe above raises
+    # ``undefined_table`` on a database that does not have it yet — which is
+    # precisely the never-booted database the ``to_regclass`` checks exist to
+    # recognise. One statement made ``_SchemaAbsent`` unreachable and put a
+    # valid first boot back to "unreadable", undoing the fix three commits
+    # earlier. Costs nothing in practice: this whole probe is memoised per DSN.
+    if not (rows and rows[0][2]):
+        return _LedgerState(present=bool(rows and rows[0][1]), settled=False)
+
+    try:
+        marker = _fetch_rows(
+            source,
+            "SELECT 1",
+            "SELECT 1 FROM schema_backfills WHERE name = %s",
+            postgres_params=(_OWNERSHIP_BACKFILL,),
+        )
+    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+        return _UnreadableDB(
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+        )
+    return _LedgerState(present=bool(rows[0][1]), settled=bool(marker))
 
 
 def _resolve_governance_source(
@@ -677,6 +695,32 @@ def _is_placeholder_node(node: object) -> bool:
     )
 
 
+def _row_physically_exists(source: "_GovernanceSource") -> bool:
+    """Whether the agent row is in the table at all, ownership aside.
+
+    The scoped read cannot tell "no row" from "a row this agent does not own",
+    and the two need opposite handling: first-boot replication repairs the
+    first and *cannot* repair the second, because ``AsyncGraphStore.add_node``
+    refuses to claim an existing unowned or foreign-owned row. Treating an
+    unowned row as an empty runtime let doctor judge the anchor instead and
+    report Ready for a host whose boot cannot get past its own agent node.
+
+    Fails closed to ``True`` — "something is there, do not call this empty" —
+    so a probe that cannot run never manufactures a pending-replication verdict.
+    """
+    try:
+        rows = _fetch_rows(
+            source,
+            "SELECT 1 FROM graph_nodes WHERE node_id = ? AND node_type = 'agent'",
+            "SELECT 1 FROM graph_nodes WHERE node_id = %s AND node_type = 'agent'",
+            sqlite_params=(source.agent_did,),
+            postgres_params=(source.agent_did,),
+        )
+    except Exception:  # noqa: BLE001 — the caller's own read reports it
+        return True
+    return bool(rows)
+
+
 def _read_agent_governance(
     multi_agent_path: Path, project_dir: Path, env: dict
 ) -> "list[_AgentGovernance]":
@@ -720,7 +764,17 @@ def _read_agent_governance(
         on_postgres = isinstance(source, _SchemaAbsent) or (
             isinstance(source, _GovernanceSource) and not source.reads_the_anchor
         )
-        runtime_is_empty = on_postgres and (
+        # ...but only when the runtime really is empty. A row present without
+        # this agent's ownership witness reads back identically to a missing
+        # one and is the opposite situation: replication cannot claim it, so
+        # the agent cannot boot and the anchor is not what will be audited.
+        unowned = (
+            isinstance(node, _NoAgentNode)
+            and isinstance(source, _GovernanceSource)
+            and source.ownership_settled
+            and _row_physically_exists(source)
+        )
+        runtime_is_empty = on_postgres and not unowned and (
             isinstance(node, (_NoAgentNode, _SchemaAbsent))
             # A boot-fabricated placeholder is *present* but is not a birth
             # record, and boot does not keep it: ``birth_record`` counts it as
@@ -811,7 +865,11 @@ def _check_constitution_drift(
             _report_unexamined(name, node.reason, source, report)
             continue
         if isinstance(node, _NoAgentNode):
-            if source.reads_the_anchor and source.ownership_settled:
+            # The same verdict on either backend: the row is there, #2649 is
+            # settled so boot will not backfill a witness, and replication
+            # cannot claim an unowned row. Only the sentence differs, because
+            # only the database does.
+            if source.ownership_settled and _row_physically_exists(source):
                 # The anchor is the file DID discovery just read a DID *out
                 # of*, so the row is certainly there — and #2649's backfill is
                 # already recorded complete, so boot will not re-run it and
@@ -825,9 +883,10 @@ def _check_constitution_drift(
                 # doctor exit Ready, having also skipped the edge and overlay
                 # checks, for a host that cannot boot.
                 report.fail.append(
-                    f"{name}: the agent row in {source.anchor_path} is not "
+                    f"{name}: the agent row in {source.describe()} is not "
                     f"owned by {source.agent_did} — the agent's own storage "
-                    f"cannot see it, so startup fails. This is an ownership "
+                    f"cannot see it, so startup fails, and replication cannot "
+                    f"claim an existing unowned row. This is an ownership "
                     f"ledger problem, not constitution drift; reanchoring will "
                     f"not clear it."
                 )
@@ -1389,9 +1448,9 @@ def _read_agent_node(source: "_GovernanceSource"):
     try:
         rows = _fetch_rows(
             source,
-            _AGENT_NODE_SQLITE if source.ownership_ledger
+            _AGENT_NODE_SQLITE if source.ownership_settled
             else _AGENT_NODE_SQLITE_LEGACY,
-            _AGENT_NODE_PG if source.ownership_ledger
+            _AGENT_NODE_PG if source.ownership_settled
             else _AGENT_NODE_PG_LEGACY,
             sqlite_params=(source.agent_did, source.agent_did),
             postgres_params=(source.agent_did, source.agent_did),
@@ -1438,9 +1497,9 @@ def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
     try:
         rows = _fetch_rows(
             source,
-            _GOVERNED_BY_SQLITE if source.ownership_ledger
+            _GOVERNED_BY_SQLITE if source.ownership_settled
             else _GOVERNED_BY_SQLITE_LEGACY,
-            _GOVERNED_BY_PG if source.ownership_ledger
+            _GOVERNED_BY_PG if source.ownership_settled
             else _GOVERNED_BY_PG_LEGACY,
             sqlite_params=(source_id, source.agent_did),
             postgres_params=(source_id, source.agent_did),

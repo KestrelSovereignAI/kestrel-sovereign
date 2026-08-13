@@ -412,16 +412,18 @@ def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
     audit reads through that bound store, so without the witnesses it sees no
     agent node at all.
 
-    An earlier version of this test asserted doctor must therefore refuse. That
-    was built on an incomplete reading of boot: ``kestrel_agent`` computes the
-    runtime birth-record *shortfall* first and, finding one, replicates from
-    the local anchor (#2871) — bound, so the copy lays down the witnesses —
-    and only then audits. An unwitnessed row is not a dead end; it is one more
-    thing replication repairs.
+    This test's expectation has moved twice, each time because the model of
+    boot got more accurate, and it is worth recording where it landed.
 
-    So the honest report is neither "Ready" nor a refusal: it is that the
-    runtime holds nothing readable for this agent yet, and the verdict on offer
-    describes the anchor bytes boot is about to copy.
+    First it asserted a refusal. Then — on learning that boot computes a
+    birth-record shortfall and replicates from the anchor before auditing — it
+    asserted pending replication. Both were wrong for the same missing fact:
+    ``AsyncGraphStore.add_node`` raises ``Cannot claim or overwrite an unowned
+    graph node``, so replication cannot repair *this* state. The row is there,
+    the agent cannot see it, and nothing at boot will fix it.
+
+    So it is a failure, and specifically an ownership failure — naming it drift
+    would send an operator to a reanchor that cannot clear it.
     """
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
@@ -436,11 +438,12 @@ def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
 
     report = diagnose(tmp_path)
 
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
     assert any(
-        "holds no record for this agent yet" in m for m in report.warn
-    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    # And it says which bytes it judged, rather than reporting silently.
-    assert any("boot will copy the birth record" in m for m in report.warn)
+        "is not owned by" in m and "reanchoring will not clear it" in m
+        for m in report.fail
+    ), f"fail={report.fail}"
+    assert not any("holds no record for this agent yet" in m for m in report.warn)
 
 
 async def test_a_stale_anchor_awaiting_replication_is_not_ready(
@@ -486,9 +489,13 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
+            # ``schema_backfills`` too: a database the runtime has never
+            # opened has *nothing*, and leaving the marker table behind made
+            # this test pass against a probe that cannot survive its absence.
             for table in (
                 "graph_nodes", "graph_edges",
                 "graph_node_owners", "graph_edge_owners",
+                "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
     finally:
@@ -517,9 +524,13 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
+            # ``schema_backfills`` too: a database the runtime has never
+            # opened has *nothing*, and leaving the marker table behind made
+            # this test pass against a probe that cannot survive its absence.
             for table in (
                 "graph_nodes", "graph_edges",
                 "graph_node_owners", "graph_edge_owners",
+                "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
     finally:
@@ -788,3 +799,4 @@ async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
 
     assert not result.unchanged, "reported nothing to do for a failing proof 2"
     assert result.drift_unforced, result
+
