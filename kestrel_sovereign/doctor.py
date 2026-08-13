@@ -533,85 +533,6 @@ def _dsn_identity(dsn: str) -> tuple:
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
-def _libpq_dsn(dsn: str) -> str:
-    """``dsn`` with asyncpg's server-setting query options translated for libpq.
-
-    The runtime connects with **asyncpg**, which accepts any unrecognised URI
-    query parameter as a server setting — ``postgresql://…/db?search_path=tenant``
-    is a valid runtime DSN, and non-default-schema deployments use exactly that.
-    libpq rejects it outright (``invalid URI query parameter: "search_path"``),
-    so doctor called a database inaccessible that the agent connects to fine.
-
-    Earlier rounds framed this as a choice between *stripping* the parameter —
-    which would silently read the default schema, this cluster's own defect —
-    and *refusing*, which was at least safe. That was a false pair. libpq takes
-    ``options=-c search_path=tenant`` and **applies** the setting, so the
-    faithful move is to translate: doctor then reads the same schema the agent
-    does. Refusing was never safe either, only quiet; since a failed read now
-    fails readiness, it turned a working deployment into "Not ready".
-
-    Parameters libpq already understands (``sslmode``, ``connect_timeout``, …)
-    are left in the query string. Which is which is decided by asking libpq,
-    not by a list kept here that would drift from it.
-    """
-    from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
-
-    parts = urlsplit(dsn)
-    if not parts.query:
-        return dsn
-
-    keep: list = []
-    settings: list = []
-    for key, value in parse_qsl(parts.query, keep_blank_values=True):
-        if key == "options":
-            keep.append((key, value))
-        elif _libpq_knows(key):
-            keep.append((key, value))
-        else:
-            settings.append((key, value))
-
-    if not settings:
-        return dsn
-
-    # Merge with any ``options`` the operator already set, theirs first so a
-    # deliberate ``-c`` is not overridden by a translated one.
-    existing = " ".join(value for key, value in keep if key == "options")
-    translated = " ".join(f"-c {key}={value}" for key, value in settings)
-    merged = f"{existing} {translated}".strip()
-    keep = [(key, value) for key, value in keep if key != "options"]
-    keep.append(("options", merged))
-
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            parts.path,
-            # ``quote_via=quote`` so a space becomes %20, not '+'. libpq
-            # percent-decodes a URI query per RFC 3986 and leaves '+' alone, so
-            # the default encoding would hand the server a literal
-            # ``-c+search_path=tenant`` — a broken option that looks correct in
-            # the DSN.
-            urlencode(keep, quote_via=quote),
-            parts.fragment,
-        )
-    )
-
-
-def _libpq_knows(key: str) -> bool:
-    """Whether libpq recognises ``key`` as a connection parameter.
-
-    Asked of libpq itself — through a throwaway parse — rather than answered
-    from a list in this file, which would silently fall behind the driver.
-    """
-    try:
-        from psycopg2.extensions import parse_dsn
-
-        parse_dsn(f"postgresql:///?{key}=x")
-        return True
-    except Exception:  # noqa: BLE001 — a rejected keyword is the answer "no"
-        return False
-
-
 def _bounded_dsn(dsn: str) -> str:
     """``dsn`` with a connection timeout, unless it already states one.
 
@@ -665,7 +586,7 @@ def _fetch_rows(
     # A fresh connection per query: doctor makes a handful of reads per agent,
     # is not a hot path, and a connection that closes with its query cannot
     # outlive a diagnostic that fails halfway.
-    connection = psycopg2.connect(_bounded_dsn(_libpq_dsn(source.dsn)))
+    connection = psycopg2.connect(_bounded_dsn(source.dsn))
     try:
         with connection.cursor() as cursor:
             cursor.execute(postgres_sql, postgres_params)
@@ -679,7 +600,7 @@ class _AgentGovernance:
     """One agent's governance, read once and shared by every check.
 
     ``source`` is a :class:`_GovernanceSource` or an ``_UnreadableDB``;
-    ``node`` is ``(node_id, properties)`` or one of the read sentinels. Both
+    ``node`` is ``(node_id, label, properties)`` or a read sentinel. Both
     checks below interpret the same values rather than fetching their own, so
     an agent costs one resolve and one row read per ``diagnose`` — not one per
     check, which on an unreachable PostgreSQL doubled every connection timeout.
@@ -693,6 +614,43 @@ class _AgentGovernance:
     #: reading above therefore comes from the anchor — see
     #: ``_read_agent_governance``.
     pending_replication: bool = False
+
+
+def _is_placeholder_node(node: object) -> bool:
+    """Whether this read is a boot-fabricated stand-in rather than a record.
+
+    Delegates to ``identity.birth_record.is_fabricated_placeholder``, the
+    predicate boot itself uses, rather than restating the shape here — a copy
+    would drift, and this is the same "don't re-describe a constant you can
+    import" mistake that silently disabled a fix in the sibling issue.
+
+    ``is_fabricated_placeholder`` takes a ``GraphNode``; doctor holds a
+    ``(node_id, label, properties)`` tuple read with stock drivers, so the shape
+    is adapted here rather than doctor being made to build graph objects. The
+    label is read from the row, never synthesised: the predicate matches label
+    *and* properties, and handing it a label built from the node id would make
+    it always agree on that half — a check loosened to fit its own adapter.
+    """
+    if not isinstance(node, tuple) or len(node) != 3:
+        return False
+    node_id, label, properties = node
+    if not isinstance(properties, dict):
+        return False
+
+    from kestrel_sovereign.identity.birth_record import (
+        is_fabricated_placeholder,
+    )
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    return is_fabricated_placeholder(
+        GraphNode(
+            node_id=node_id,
+            node_type="agent",
+            label=label,
+            properties=properties,
+        ),
+        node_id,
+    )
 
 
 def _read_agent_governance(
@@ -735,12 +693,19 @@ def _read_agent_governance(
         # Reporting "nothing to check" would let a stale anchor pass review and
         # safe-mode the agent moments later. Check what is about to be copied.
         pending = False
-        runtime_is_empty = isinstance(node, (_NoAgentNode, _SchemaAbsent)) and (
-            isinstance(source, _SchemaAbsent)
-            or (
-                isinstance(source, _GovernanceSource)
-                and not source.reads_the_anchor
-            )
+        on_postgres = isinstance(source, _SchemaAbsent) or (
+            isinstance(source, _GovernanceSource) and not source.reads_the_anchor
+        )
+        runtime_is_empty = on_postgres and (
+            isinstance(node, (_NoAgentNode, _SchemaAbsent))
+            # A boot-fabricated placeholder is *present* but is not a birth
+            # record, and boot does not keep it: ``birth_record`` counts it as
+            # an identity shortfall and replaces it from the anchor before the
+            # audit. Reading it as populated made doctor judge a row nobody
+            # will be governed by, warn only that it had no hash, and exit
+            # Ready while the stale anchor about to replace it safe-modes the
+            # agent.
+            or _is_placeholder_node(node)
         )
         if runtime_is_empty:
             anchor_source = _resolve_governance_source(db_path, {}, ledger_by_dsn)
@@ -827,7 +792,7 @@ def _check_constitution_drift(
                 f"owned by {source.agent_did} in {source.describe()}"
             )
             continue
-        _, properties = node
+        _, _, properties = node
 
         stored_hash = _anchored_constitution_hash(properties)
         if isinstance(stored_hash, _NoHashProperty):
@@ -940,7 +905,7 @@ def _check_anchor_consistency(
         if isinstance(node, (_UnreadableDB, _NoAgentNode)):
             # Already warned by _check_constitution_drift.
             continue
-        node_id, properties = node
+        node_id, _, properties = node
         if properties is None:
             # Unparseable properties — _check_constitution_drift already
             # warns (missing constitution_hash); nothing verifiable here.
@@ -1220,13 +1185,13 @@ _DISCOVER_AGENT_SQLITE = (
 #: safe-modes at its next boot. False reassurance from a governance tool is
 #: worse than the false alarm this issue started from.
 _AGENT_NODE_SQLITE = (
-    "SELECT node_id, properties FROM graph_nodes "
+    "SELECT node_id, label, properties FROM graph_nodes "
     "WHERE node_id = ? AND node_type = 'agent' AND EXISTS ("
     "  SELECT 1 FROM graph_node_owners AS owner "
     "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = ?)"
 )
 _AGENT_NODE_PG = (
-    "SELECT node_id, properties FROM graph_nodes "
+    "SELECT node_id, label, properties FROM graph_nodes "
     "WHERE node_id = %s AND node_type = 'agent' AND EXISTS ("
     "  SELECT 1 FROM graph_node_owners AS owner "
     "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = %s)"
@@ -1253,11 +1218,11 @@ _GOVERNED_BY_PG = (
 #: still bound — and still the DID — so the two forms stay parameter-compatible
 #: and a caller cannot pick the wrong argument list with the wrong query.
 _AGENT_NODE_SQLITE_LEGACY = (
-    "SELECT node_id, properties FROM graph_nodes "
+    "SELECT node_id, label, properties FROM graph_nodes "
     "WHERE node_id = ? AND node_type = 'agent' AND ? IS NOT NULL"
 )
 _AGENT_NODE_PG_LEGACY = (
-    "SELECT node_id, properties FROM graph_nodes "
+    "SELECT node_id, label, properties FROM graph_nodes "
     "WHERE node_id = %s AND node_type = 'agent' AND %s IS NOT NULL"
 )
 _GOVERNED_BY_SQLITE_LEGACY = (
@@ -1350,8 +1315,8 @@ def _read_agent_node(source: "_GovernanceSource"):
     why an ownership witness, not a ``node_id`` match, is the runtime's scope.
 
     Returns:
-        - ``(node_id, properties_dict)`` on success.
-        - ``(node_id, None)`` when the properties column is missing,
+        - ``(node_id, label, properties_dict)`` on success.
+        - ``(node_id, label, None)`` when the properties column is missing,
           unparseable, or not a JSON object.
         - ``_UnreadableDB(reason=...)`` / ``_NoAgentNode()`` sentinels.
     """
@@ -1377,9 +1342,9 @@ def _read_agent_node(source: "_GovernanceSource"):
     if not rows:
         return _NoAgentNode()
 
-    node_id, properties_raw = rows[0]
+    node_id, label, properties_raw = rows[0]
     if properties_raw is None:
-        return node_id, None
+        return node_id, label, None
 
     try:
         properties = (
@@ -1388,12 +1353,12 @@ def _read_agent_node(source: "_GovernanceSource"):
             else properties_raw
         )
     except (TypeError, ValueError):
-        return node_id, None
+        return node_id, label, None
 
     if not isinstance(properties, dict):
-        return node_id, None
+        return node_id, label, None
 
-    return node_id, properties
+    return node_id, label, properties
 
 
 def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):

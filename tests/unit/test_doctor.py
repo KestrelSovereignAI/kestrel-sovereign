@@ -932,7 +932,7 @@ def test_read_agent_node_returns_id_and_properties(tmp_path):
         nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc123"}))],
         node_owners=[("did:x", "did:x")],
     )
-    node_id, properties = _read_agent_node(_anchor(db, "did:x"))
+    node_id, _label, properties = _read_agent_node(_anchor(db, "did:x"))
     assert node_id == "did:x"
     assert properties == {"constitution_hash": "abc123"}
 
@@ -943,7 +943,7 @@ def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
         nodes=[("did:x", "agent", "x", "{not valid json")],
         node_owners=[("did:x", "did:x")],
     )
-    node_id, properties = _read_agent_node(_anchor(db, "did:x"))
+    node_id, _label, properties = _read_agent_node(_anchor(db, "did:x"))
     assert node_id == "did:x"
     assert properties is None
 
@@ -1068,7 +1068,7 @@ def test_a_pre_migration_database_is_still_read(tmp_path, monkeypatch):
     source = _resolve_governance_source(db, {})
 
     assert source.ownership_ledger is False
-    node_id, properties = _read_agent_node(source)
+    node_id, _label, properties = _read_agent_node(source)
     assert node_id == "did:x"
     assert properties == {"constitution_hash": "abc"}
     assert _read_governed_by_targets(source, "did:x") == ("abc",)
@@ -1089,53 +1089,6 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
 # Driver errors reach report.warn, which operators read on a terminal and CI
 # archives. libpq echoes the DSN it could not parse.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "dsn, expected",
-    [
-        # asyncpg takes an unrecognised query option as a server setting; libpq
-        # rejects it outright. Translating preserves the setting, so doctor
-        # reads the schema the agent reads. Stripping would read the *default*
-        # schema — this cluster's own defect, quietly.
-        (
-            "postgresql://u@h/db?search_path=tenant",
-            {"options": "-c search_path=tenant"},
-        ),
-        # Parameters libpq understands stay where they are.
-        ("postgresql://u@h/db?sslmode=require", {"sslmode": "require"}),
-        (
-            "postgresql://u@h/db?sslmode=require&search_path=tenant",
-            {"sslmode": "require", "options": "-c search_path=tenant"},
-        ),
-    ],
-)
-def test_asyncpg_server_settings_are_translated_not_dropped(dsn, expected):
-    from psycopg2.extensions import parse_dsn
-
-    from kestrel_sovereign.doctor import _libpq_dsn
-
-    parsed = parse_dsn(_libpq_dsn(dsn))
-
-    for key, value in expected.items():
-        assert parsed.get(key) == value, parsed
-
-
-def test_an_operators_own_connection_options_are_kept():
-    """Theirs first, so a deliberate ``-c`` outranks a translated one."""
-    from psycopg2.extensions import parse_dsn
-
-    from kestrel_sovereign.doctor import _libpq_dsn
-
-    dsn = (
-        "postgresql://u@h/db"
-        "?options=-c%20statement_timeout%3D5000&search_path=tenant"
-    )
-    options = parse_dsn(_libpq_dsn(dsn))["options"]
-
-    assert "statement_timeout=5000" in options
-    assert "search_path=tenant" in options
-    assert options.index("statement_timeout") < options.index("search_path")
 
 
 def test_an_unreachable_postgres_is_not_ready(tmp_path, monkeypatch):
@@ -1286,8 +1239,8 @@ def test_postgres_repairs_do_not_promise_a_backup(tmp_path, monkeypatch):
         {
             # Two columns, as the real probe asks: graph schema, then ledger.
             "SELECT to_regclass": [(True, True)],
-            "SELECT node_id, properties FROM graph_nodes": [
-                ("did:test:Test", properties)
+            "SELECT node_id, label, properties FROM graph_nodes": [
+                ("did:test:Test", "Test", properties)
             ],
             "FROM graph_edges": [(drifted,)],
         }
@@ -1649,8 +1602,8 @@ def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
             # `node_id` belongs and the check silently degrades to "older
             # agent, no anchor". Keyed on the full projection for that reason.
             "SELECT properties FROM graph_nodes": [(properties,)],
-            "SELECT node_id, properties FROM graph_nodes": [
-                ("did:web:test", properties)
+            "SELECT node_id, label, properties FROM graph_nodes": [
+                ("did:web:test", "Test", properties)
             ],
             "FROM graph_edges": [(drifted,)],
         }
@@ -1674,7 +1627,7 @@ def test_the_runtime_read_is_scoped_to_this_agent(tmp_path, monkeypatch):
     fake = _FakePostgres(
         {
             "SELECT properties FROM graph_nodes": [],
-            "SELECT node_id, properties FROM graph_nodes": [],
+            "SELECT node_id, label, properties FROM graph_nodes": [],
             "FROM graph_edges": [],
         }
     )
@@ -1705,7 +1658,7 @@ def test_the_diagnostic_connection_is_bounded(tmp_path, monkeypatch):
     from psycopg2.extensions import parse_dsn
 
     _seed_matching_anchor(tmp_path, monkeypatch)
-    fake = _FakePostgres({"SELECT node_id, properties FROM graph_nodes": []})
+    fake = _FakePostgres({"SELECT node_id, label, properties FROM graph_nodes": []})
     _postgres_host(monkeypatch, fake)
 
     diagnose(tmp_path)
@@ -1725,8 +1678,8 @@ def test_an_agent_costs_one_postgres_connection(tmp_path, monkeypatch):
     properties = json.dumps({"name": "Test", "constitution_hash": "a" * 64})
     fake = _FakePostgres(
         {
-            "SELECT node_id, properties FROM graph_nodes": [
-                ("did:test:Test", properties)
+            "SELECT node_id, label, properties FROM graph_nodes": [
+                ("did:test:Test", "Test", properties)
             ],
             "FROM graph_edges": [("a" * 64,)],
         }
@@ -1754,7 +1707,7 @@ def test_a_dsn_that_sets_its_own_timeout_keeps_it(tmp_path, monkeypatch):
     from psycopg2.extensions import parse_dsn
 
     _seed_matching_anchor(tmp_path, monkeypatch)
-    fake = _FakePostgres({"SELECT node_id, properties FROM graph_nodes": []})
+    fake = _FakePostgres({"SELECT node_id, label, properties FROM graph_nodes": []})
     _postgres_host(monkeypatch, fake)
     monkeypatch.setenv(
         "KESTREL_DATABASE_URL",

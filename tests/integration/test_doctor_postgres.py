@@ -210,16 +210,18 @@ def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
     try:
         connection.execute(
             "CREATE TABLE graph_nodes ("
-            " node_id TEXT PRIMARY KEY, node_type TEXT, properties TEXT)"
+            " node_id TEXT PRIMARY KEY, node_type TEXT,"
+            " label TEXT, properties TEXT)"
         )
         connection.execute(
             "CREATE TABLE graph_edges ("
             " source_id TEXT, target_id TEXT, label TEXT)"
         )
         connection.execute(
-            "INSERT INTO graph_nodes VALUES (?, 'agent', ?)",
+            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
             (
                 AGENT_DID,
+                "Test",
                 json.dumps({"name": "Test", "constitution_hash": anchored_hash}),
             ),
         )
@@ -494,58 +496,130 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     ), f"fail={report.fail}"
 
 
-async def test_the_prescribed_repair_reaches_a_pending_anchor(
+async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """Doctor's remedy has to work in the state doctor found.
+    """A database damaged by a pre-#2878 boot holds a stand-in, not a record.
 
-    When PostgreSQL holds nothing for this agent, doctor reports on the anchor
-    — the bytes first boot will copy and audit. The reanchor CLI resolves the
-    same way for the same reason: pointed at PostgreSQL it would find no
-    ``constitution_hash``, report nothing to do, and leave the stale anchor to
-    safe-mode the agent on boot.
+    ``birth_record.is_fabricated_placeholder`` matches the exact shape one code
+    path writes, and boot counts such a row as an identity shortfall: it is
+    replaced from the local anchor *before* the audit runs. Reading it as
+    populated made doctor judge a row nobody will be governed by — warning only
+    that it had no hash — and exit Ready while the stale anchor about to
+    replace it safe-modes the agent.
     """
-    from kestrel_sovereign.setup.constitution_reanchor import (
-        resolve_reanchor_target,
-    )
-
     stale = hashlib.sha256(b"an older constitution").hexdigest()
     _seed_project(tmp_path, anchored_hash=stale)
-    agent_dir = tmp_path / "agent_data" / "test"
+    runtime_db(AGENT_DID, {"initialBalance": "100.0"}, governed_by=None)
+    # The label half of the predicate, as _ensure_agent_node_present writes it.
+    import psycopg2
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE graph_nodes SET label = %s WHERE node_id = %s",
+                (f"Agent {AGENT_DID}", AGENT_DID),
+            )
+    finally:
+        connection.close()
 
-    target = await resolve_reanchor_target(
-        agent_dir,
-        backend="postgres",
-        dsn=runtime_db.dsn,
-        anchor_when_runtime_empty=True,
-    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
 
-    assert target.backend == "sqlite"
-    assert target.anchor_path == agent_dir / "kestrel_prime.db"
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"fail={report.fail}"
 
 
-async def test_a_replicated_agent_still_reanchors_in_postgres(
+async def test_a_real_agent_row_is_not_mistaken_for_a_placeholder(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """The fallback is for an *empty* runtime, not a licence to prefer the file."""
-    from kestrel_sovereign.setup.constitution_reanchor import (
-        resolve_reanchor_target,
-    )
-
+    """The predicate matches an exact shape, so a genuine record still counts."""
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
     )
-    agent_dir = tmp_path / "agent_data" / "test"
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
 
-    target = await resolve_reanchor_target(
-        agent_dir,
-        backend="postgres",
-        dsn=runtime_db.dsn,
-        anchor_when_runtime_empty=True,
+    report = diagnose(tmp_path)
+
+    assert not any("holds no record" in m for m in report.warn), report.warn
+    assert any("constitution anchored to current file" in m for m in report.ok)
+
+
+async def test_the_prescribed_repair_reaches_a_pending_anchor(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor's remedy has to work in the state doctor found.
+
+    With PostgreSQL holding nothing for this agent, doctor reports on the
+    anchor — the bytes first boot will copy and audit. Pointed at PostgreSQL,
+    the reanchor would answer "no constitution_hash", change nothing, and leave
+    the stale anchor to safe-mode the agent: a remedy that cannot clear the
+    finding that prescribed it.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
     )
 
-    assert target.backend == "postgres"
-    assert target.dsn == runtime_db.dsn
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION)
+    agent_dir = tmp_path / "agent_data" / "test"
+
+    result = await reanchor_constitution(
+        agent_name="Test",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=runtime_db.dsn,
+    )
+
+    # It found the anchor's stale hash rather than reporting nothing to do.
+    assert result.old_hash == stale, result.error
+    assert "sqlite" in (result.target_label or "")
+
+
+async def test_a_replicated_agent_still_reanchors_in_postgres(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """The retarget is for an *empty* runtime, not a licence to prefer the file."""
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
+    )
+
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": stale},
+        governed_by=stale,
+    )
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION)
+    agent_dir = tmp_path / "agent_data" / "test"
+
+    result = await reanchor_constitution(
+        agent_name="Test",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=runtime_db.dsn,
+    )
+
+    # PostgreSQL's hash, not the anchor's: the runtime holds this agent.
+    assert result.old_hash == stale
+    assert "postgres" in (result.target_label or "")
