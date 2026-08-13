@@ -91,13 +91,19 @@ def runtime_db():
     connection = psycopg2.connect(dsn)
     connection.autocommit = True
     with connection.cursor() as cursor:
+        # The real columns (async_database._SCHEMA). A hand-rolled subset
+        # made the bound store raise on a plain get_node, which reads as
+        # "database unreachable" to any caller that fails closed.
         cursor.execute(
             "CREATE TABLE graph_nodes ("
-            " node_id TEXT PRIMARY KEY, node_type TEXT, properties TEXT)"
+            " node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL,"
+            " label TEXT NOT NULL, properties TEXT)"
         )
         cursor.execute(
             "CREATE TABLE graph_edges ("
-            " source_id TEXT, target_id TEXT, label TEXT)"
+            " source_id TEXT NOT NULL, target_id TEXT NOT NULL,"
+            " label TEXT NOT NULL, properties TEXT,"
+            " PRIMARY KEY (source_id, target_id, label))"
         )
         cursor.execute(
             "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
@@ -117,9 +123,10 @@ def runtime_db():
     ):
         with connection.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO graph_nodes (node_id, node_type, properties) "
-                "VALUES (%s, 'agent', %s)",
-                (did, json.dumps(properties)),
+                "INSERT INTO graph_nodes "
+                "(node_id, node_type, label, properties) "
+                "VALUES (%s, 'agent', %s, %s)",
+                (did, properties.get("name", "agent"), json.dumps(properties)),
             )
             if witness_node:
                 cursor.execute(
@@ -417,3 +424,128 @@ async def test_a_stale_anchor_awaiting_replication_is_not_ready(
     assert any(
         "constitution drift" in m and stale[:12] in m for m in report.fail
     ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """A freshly configured database has no Kestrel schema at all.
+
+    ``AsyncDatabase.postgres()`` creates the tables and replicates the anchor
+    on first boot, so this is a valid starting state. Treating the missing
+    ``graph_nodes`` as "cannot read" made doctor answer **Not ready** to a
+    correctly configured first boot — and after readiness started failing on
+    unreadable databases, that became a hard stop rather than a warning.
+    """
+    _seed_project(tmp_path, anchored_hash=canonical)
+    # Drop the schema the fixture created: this database has never been booted.
+    import psycopg2
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            for table in (
+                "graph_nodes", "graph_edges",
+                "graph_node_owners", "graph_edge_owners",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"fail={report.fail}"
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
+    assert any("constitution anchored to current file" in m for m in report.ok)
+
+
+async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """...and the drift in those pending bytes is still reported."""
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    import psycopg2
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            for table in (
+                "graph_nodes", "graph_edges",
+                "graph_node_owners", "graph_edge_owners",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"fail={report.fail}"
+
+
+async def test_the_prescribed_repair_reaches_a_pending_anchor(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor's remedy has to work in the state doctor found.
+
+    When PostgreSQL holds nothing for this agent, doctor reports on the anchor
+    — the bytes first boot will copy and audit. The reanchor CLI resolves the
+    same way for the same reason: pointed at PostgreSQL it would find no
+    ``constitution_hash``, report nothing to do, and leave the stale anchor to
+    safe-mode the agent on boot.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        resolve_reanchor_target,
+    )
+
+    stale = hashlib.sha256(b"an older constitution").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    agent_dir = tmp_path / "agent_data" / "test"
+
+    target = await resolve_reanchor_target(
+        agent_dir,
+        backend="postgres",
+        dsn=runtime_db.dsn,
+        anchor_when_runtime_empty=True,
+    )
+
+    assert target.backend == "sqlite"
+    assert target.anchor_path == agent_dir / "kestrel_prime.db"
+
+
+async def test_a_replicated_agent_still_reanchors_in_postgres(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """The fallback is for an *empty* runtime, not a licence to prefer the file."""
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        resolve_reanchor_target,
+    )
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    agent_dir = tmp_path / "agent_data" / "test"
+
+    target = await resolve_reanchor_target(
+        agent_dir,
+        backend="postgres",
+        dsn=runtime_db.dsn,
+        anchor_when_runtime_empty=True,
+    )
+
+    assert target.backend == "postgres"
+    assert target.dsn == runtime_db.dsn

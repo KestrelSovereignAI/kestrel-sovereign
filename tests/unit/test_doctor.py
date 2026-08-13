@@ -1091,6 +1091,53 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "dsn, expected",
+    [
+        # asyncpg takes an unrecognised query option as a server setting; libpq
+        # rejects it outright. Translating preserves the setting, so doctor
+        # reads the schema the agent reads. Stripping would read the *default*
+        # schema — this cluster's own defect, quietly.
+        (
+            "postgresql://u@h/db?search_path=tenant",
+            {"options": "-c search_path=tenant"},
+        ),
+        # Parameters libpq understands stay where they are.
+        ("postgresql://u@h/db?sslmode=require", {"sslmode": "require"}),
+        (
+            "postgresql://u@h/db?sslmode=require&search_path=tenant",
+            {"sslmode": "require", "options": "-c search_path=tenant"},
+        ),
+    ],
+)
+def test_asyncpg_server_settings_are_translated_not_dropped(dsn, expected):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _libpq_dsn
+
+    parsed = parse_dsn(_libpq_dsn(dsn))
+
+    for key, value in expected.items():
+        assert parsed.get(key) == value, parsed
+
+
+def test_an_operators_own_connection_options_are_kept():
+    """Theirs first, so a deliberate ``-c`` outranks a translated one."""
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _libpq_dsn
+
+    dsn = (
+        "postgresql://u@h/db"
+        "?options=-c%20statement_timeout%3D5000&search_path=tenant"
+    )
+    options = parse_dsn(_libpq_dsn(dsn))["options"]
+
+    assert "statement_timeout=5000" in options
+    assert "search_path=tenant" in options
+    assert options.index("statement_timeout") < options.index("search_path")
+
+
 def test_an_unreachable_postgres_is_not_ready(tmp_path, monkeypatch):
     """"I did not check" must not print as "Ready".
 
@@ -1237,7 +1284,8 @@ def test_postgres_repairs_do_not_promise_a_backup(tmp_path, monkeypatch):
     properties = json.dumps({"name": "Test", "constitution_hash": drifted})
     fake = _FakePostgres(
         {
-            "SELECT to_regclass": [(True,)],
+            # Two columns, as the real probe asks: graph schema, then ledger.
+            "SELECT to_regclass": [(True, True)],
             "SELECT node_id, properties FROM graph_nodes": [
                 ("did:test:Test", properties)
             ],
@@ -1635,7 +1683,9 @@ def test_the_runtime_read_is_scoped_to_this_agent(tmp_path, monkeypatch):
     diagnose(tmp_path)
 
     node_reads = [
-        (sql, params) for sql, params in fake.executed if "graph_nodes" in sql
+        (sql, params)
+        for sql, params in fake.executed
+        if "FROM graph_nodes" in sql
     ]
     assert node_reads, "doctor never asked PostgreSQL anything"
     for sql, params in node_reads:
@@ -1688,7 +1738,9 @@ def test_an_agent_costs_one_postgres_connection(tmp_path, monkeypatch):
 
     diagnose(tmp_path)
 
-    node_reads = [sql for sql, _ in fake.executed if "graph_nodes" in sql]
+    # "FROM graph_nodes", not "graph_nodes": the schema probe names the
+    # table inside a to_regclass() literal and is not a read of the row.
+    node_reads = [sql for sql, _ in fake.executed if "FROM graph_nodes" in sql]
     assert len(node_reads) == 1, f"agent node read {len(node_reads)}× : {node_reads}"
 
 

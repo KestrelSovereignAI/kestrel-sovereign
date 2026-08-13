@@ -363,13 +363,22 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
         rows = _fetch_rows(
             source,
             "SELECT 1",
-            "SELECT to_regclass('graph_node_owners') IS NOT NULL",
+            "SELECT to_regclass('graph_nodes') IS NOT NULL, "
+            "to_regclass('graph_node_owners') IS NOT NULL",
         )
+        if rows and not rows[0][0]:
+            # No graph schema at all: a PostgreSQL database that has never been
+            # booted against. ``AsyncDatabase.postgres()`` creates the schema
+            # and replicates the anchor on first boot, so this is a valid
+            # starting state, not a broken one — and the governance that will
+            # be audited is the anchor's. Reporting it unreadable made doctor
+            # answer "Not ready" to a correctly configured first boot.
+            return _SchemaAbsent()
     except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
         return _UnreadableDB(
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
         )
-    return bool(rows and rows[0][0])
+    return bool(rows and rows[0][1])
 
 
 def _resolve_governance_source(
@@ -414,7 +423,7 @@ def _resolve_governance_source(
         if ledger_by_dsn is not None:
             ledger_by_dsn[cache_key] = ledger
 
-    if isinstance(ledger, _UnreadableDB):
+    if isinstance(ledger, (_UnreadableDB, _SchemaAbsent)):
         return ledger
     return replace(source, ownership_ledger=ledger)
 
@@ -524,6 +533,85 @@ def _dsn_identity(dsn: str) -> tuple:
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
+def _libpq_dsn(dsn: str) -> str:
+    """``dsn`` with asyncpg's server-setting query options translated for libpq.
+
+    The runtime connects with **asyncpg**, which accepts any unrecognised URI
+    query parameter as a server setting — ``postgresql://…/db?search_path=tenant``
+    is a valid runtime DSN, and non-default-schema deployments use exactly that.
+    libpq rejects it outright (``invalid URI query parameter: "search_path"``),
+    so doctor called a database inaccessible that the agent connects to fine.
+
+    Earlier rounds framed this as a choice between *stripping* the parameter —
+    which would silently read the default schema, this cluster's own defect —
+    and *refusing*, which was at least safe. That was a false pair. libpq takes
+    ``options=-c search_path=tenant`` and **applies** the setting, so the
+    faithful move is to translate: doctor then reads the same schema the agent
+    does. Refusing was never safe either, only quiet; since a failed read now
+    fails readiness, it turned a working deployment into "Not ready".
+
+    Parameters libpq already understands (``sslmode``, ``connect_timeout``, …)
+    are left in the query string. Which is which is decided by asking libpq,
+    not by a list kept here that would drift from it.
+    """
+    from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(dsn)
+    if not parts.query:
+        return dsn
+
+    keep: list = []
+    settings: list = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key == "options":
+            keep.append((key, value))
+        elif _libpq_knows(key):
+            keep.append((key, value))
+        else:
+            settings.append((key, value))
+
+    if not settings:
+        return dsn
+
+    # Merge with any ``options`` the operator already set, theirs first so a
+    # deliberate ``-c`` is not overridden by a translated one.
+    existing = " ".join(value for key, value in keep if key == "options")
+    translated = " ".join(f"-c {key}={value}" for key, value in settings)
+    merged = f"{existing} {translated}".strip()
+    keep = [(key, value) for key, value in keep if key != "options"]
+    keep.append(("options", merged))
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            # ``quote_via=quote`` so a space becomes %20, not '+'. libpq
+            # percent-decodes a URI query per RFC 3986 and leaves '+' alone, so
+            # the default encoding would hand the server a literal
+            # ``-c+search_path=tenant`` — a broken option that looks correct in
+            # the DSN.
+            urlencode(keep, quote_via=quote),
+            parts.fragment,
+        )
+    )
+
+
+def _libpq_knows(key: str) -> bool:
+    """Whether libpq recognises ``key`` as a connection parameter.
+
+    Asked of libpq itself — through a throwaway parse — rather than answered
+    from a list in this file, which would silently fall behind the driver.
+    """
+    try:
+        from psycopg2.extensions import parse_dsn
+
+        parse_dsn(f"postgresql:///?{key}=x")
+        return True
+    except Exception:  # noqa: BLE001 — a rejected keyword is the answer "no"
+        return False
+
+
 def _bounded_dsn(dsn: str) -> str:
     """``dsn`` with a connection timeout, unless it already states one.
 
@@ -577,7 +665,7 @@ def _fetch_rows(
     # A fresh connection per query: doctor makes a handful of reads per agent,
     # is not a hot path, and a connection that closes with its query cannot
     # outlive a diagnostic that fails halfway.
-    connection = psycopg2.connect(_bounded_dsn(source.dsn))
+    connection = psycopg2.connect(_bounded_dsn(_libpq_dsn(source.dsn)))
     try:
         with connection.cursor() as cursor:
             cursor.execute(postgres_sql, postgres_params)
@@ -634,22 +722,27 @@ def _read_agent_governance(
         source = _resolve_governance_source(db_path, env, ledger_by_dsn)
         node = (
             source
-            if isinstance(source, _UnreadableDB)
+            if isinstance(source, (_UnreadableDB, _SchemaAbsent))
             else _read_agent_node(source)
         )
 
-        # A PostgreSQL runtime that holds no row for this agent has not been
-        # replicated into yet. Boot does not fail there — it copies the birth
-        # record out of the anchor (#2871) and *then* runs the integrity audit.
-        # So the governance that will be audited is the anchor's, and reporting
-        # "nothing to check" would let a stale anchor pass review and safe-mode
-        # the agent moments later. Check what is about to be copied.
+        # Two ways a PostgreSQL runtime can hold nothing for this agent, and
+        # boot treats them alike: the schema does not exist yet (a database
+        # never booted against — ``AsyncDatabase.postgres()`` creates it), or
+        # it exists and this tenant is not in it. Either way boot copies the
+        # birth record out of the anchor (#2871) and *then* runs the integrity
+        # audit, so the governance about to be audited is the anchor's.
+        # Reporting "nothing to check" would let a stale anchor pass review and
+        # safe-mode the agent moments later. Check what is about to be copied.
         pending = False
-        if (
-            isinstance(node, _NoAgentNode)
-            and isinstance(source, _GovernanceSource)
-            and not source.reads_the_anchor
-        ):
+        runtime_is_empty = isinstance(node, (_NoAgentNode, _SchemaAbsent)) and (
+            isinstance(source, _SchemaAbsent)
+            or (
+                isinstance(source, _GovernanceSource)
+                and not source.reads_the_anchor
+            )
+        )
+        if runtime_is_empty:
             anchor_source = _resolve_governance_source(db_path, {}, ledger_by_dsn)
             if isinstance(anchor_source, _GovernanceSource):
                 source, node, pending = (
@@ -1192,6 +1285,19 @@ class _NoAgentNode:
 @dataclass(frozen=True)
 class _NoHashProperty:
     """Sentinel: agent node found but properties has no constitution_hash."""
+
+
+@dataclass(frozen=True)
+class _SchemaAbsent:
+    """Sentinel: a PostgreSQL database with no Kestrel graph schema yet.
+
+    Reachable, empty, and about to be initialised — ``AsyncDatabase.postgres()``
+    creates the tables and replicates the anchor on first boot. Distinct from
+    ``_UnreadableDB``, which means doctor could not look, and from
+    ``_NoAgentNode``, which means the schema exists and this tenant is not in
+    it. All three end at the same place — read the anchor, because that is what
+    boot will copy — but only this one is a *healthy* state.
+    """
 
 
 def _anchored_constitution_hash(properties: dict | None):

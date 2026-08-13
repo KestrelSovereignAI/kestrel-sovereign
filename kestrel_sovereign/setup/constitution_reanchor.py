@@ -179,6 +179,7 @@ async def resolve_reanchor_target(
     *,
     backend: str | None = None,
     dsn: str | None = None,
+    anchor_when_runtime_empty: bool = False,
 ) -> ReanchorTarget:
     """Resolve the database the *runtime* would open for this agent, and the
     tenant it would bind.
@@ -199,6 +200,20 @@ async def resolve_reanchor_target(
     uses (``identity.local_anchor.read_anchor_agent_did``), which refuses a
     directory holding more than one agent root rather than picking by
     incidental row order.
+
+    ``anchor_when_runtime_empty`` opts into one extra step: when PostgreSQL
+    holds no node for this agent, target the local anchor instead, because
+    first boot copies the birth record out of it and audits *that* (#2871). It
+    is **off by default and taken deliberately**, not folded into the general
+    rule, because the callers differ. A constitution reanchor writes the bytes
+    that will govern the agent, so pre-replication those bytes are the
+    anchor's, and pointing at PostgreSQL would report "no constitution_hash"
+    and leave a stale anchor to safe-mode the agent — a repair that cannot
+    clear the finding that prescribed it (#2892).
+    ``setup.overlay_anchor`` is not in that position: an Amendment IX overlay
+    hash is read from the runtime database, so writing it to the local file on
+    a PostgreSQL host reports success while every grant stays denied. It must
+    keep refusing, and it does, because it does not pass this flag.
 
     Raises:
         ReanchorTargetError: Unsupported backend, or the anchor cannot name
@@ -269,15 +284,56 @@ async def resolve_reanchor_target(
         dsn if dsn is not None else os.environ.get("KESTREL_DATABASE_URL")
     )
     if resolved == "postgres" and resolved_dsn:
-        return ReanchorTarget(
+        postgres = ReanchorTarget(
             anchor_path=anchor_path,
             backend="postgres",
             agent_did=agent_did,
             dsn=resolved_dsn,
         )
+        if not anchor_when_runtime_empty or await _runtime_holds_agent(postgres):
+            return postgres
+        # PostgreSQL has nothing for this agent yet. Boot will copy the birth
+        # record out of the anchor (#2871) and audit *that*, so the bytes that
+        # will govern this agent at its next start are the anchor's — and the
+        # anchor is therefore what a pre-boot repair has to change. Targeting
+        # PostgreSQL here would find no ``constitution_hash``, report nothing
+        # to do, and leave the stale anchor to safe-mode the agent on boot:
+        # a remediation command that cannot clear the finding that prescribed
+        # it. ``kestrel doctor`` reads the anchor in this state for the same
+        # reason (#2892); the two have to mean the same bytes.
+        logger.info(
+            "%s holds no record for %s yet; targeting the local anchor, which "
+            "is what first boot will replicate and audit.",
+            _redacted_dsn(resolved_dsn), agent_did,
+        )
     return ReanchorTarget(
         anchor_path=anchor_path, backend="sqlite", agent_did=agent_did
     )
+
+
+async def _runtime_holds_agent(target: ReanchorTarget) -> bool:
+    """Whether the runtime database already has this agent's node.
+
+    Read through the same bound store the runtime uses, so "holds" means the
+    agent can *see* it — an unwitnessed row is invisible to a bound reader and
+    is one more thing first-boot replication repairs.
+
+    Fails closed to ``True``: if the database cannot be inspected, keep the
+    resolution the environment asked for and let the reanchor itself report
+    the connection failure with its own message. Guessing "empty" here would
+    silently redirect a write to the local file on a host whose PostgreSQL was
+    merely unreachable — the wrong-database defect this module exists to fix.
+    """
+    try:
+        async with target.open_storage() as storage:
+            node = await storage.graph.get_node(target.agent_did)
+    except Exception:  # noqa: BLE001 — the reanchor reports it properly
+        logger.debug(
+            "Could not check whether %s holds %s; assuming it does",
+            target.describe(), target.agent_did, exc_info=True,
+        )
+        return True
+    return node is not None
 
 
 @dataclass(frozen=True)
@@ -389,7 +445,14 @@ async def reanchor_constitution(
     db_path = agent_dir / "kestrel_prime.db"
     try:
         target = await resolve_reanchor_target(
-            agent_dir, backend=runtime_backend, dsn=runtime_dsn
+            agent_dir,
+            backend=runtime_backend,
+            dsn=runtime_dsn,
+            # A reanchor writes the bytes that will govern this agent. Before
+            # replication those bytes are the anchor's, and doctor reports on
+            # them for the same reason — a finding and its remedy have to mean
+            # the same database (#2892).
+            anchor_when_runtime_empty=True,
         )
     except ReanchorTargetError as exc:
         return ReanchorResult(
