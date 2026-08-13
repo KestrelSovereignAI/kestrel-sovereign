@@ -872,3 +872,50 @@ async def test_a_pending_overlay_is_anchored_where_boot_will_find_it(
                             backend="sqlite", agent_id=AGENT_DID) as storage:
         agent = await storage.graph.get_node(AGENT_DID)
     assert agent.properties.get(OVERLAY_HASH_PROPERTY) == result.new_hash
+
+
+async def test_a_foreign_owner_row_is_not_pending_replication(
+    pg, tmp_path, monkeypatch,
+):
+    """Ledger damage can wear the shape of a state boot repairs.
+
+    An *absent* ``graph_nodes`` row whose ownership ledger still carries a
+    foreign witness looks exactly like a clean pending replication — and is
+    not: ``add_node`` refuses a row owned by another agent, so boot cannot
+    land the copy. Calling it pending would retarget the repair to the local
+    anchor and leave PostgreSQL unusable while reporting success.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        runtime_record_is_pending,
+        resolve_reanchor_target,
+    )
+
+    await pg.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES ($1, $2)",
+        (AGENT_DID, OTHER_DID),
+    )
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    target = await resolve_reanchor_target(
+        agent_dir, backend="postgres", dsn=POSTGRES_URL
+    )
+
+    assert await runtime_record_is_pending(target) is False
+
+
+async def test_a_genuinely_absent_record_is_still_pending(pg, tmp_path):
+    """The veto is about *conflicting* ownership, not about caution."""
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        runtime_record_is_pending,
+        resolve_reanchor_target,
+    )
+
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+
+    target = await resolve_reanchor_target(
+        agent_dir, backend="postgres", dsn=POSTGRES_URL
+    )
+
+    assert await runtime_record_is_pending(target) is True

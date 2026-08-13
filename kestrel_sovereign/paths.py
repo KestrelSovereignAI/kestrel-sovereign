@@ -165,6 +165,23 @@ def spawned_agent_env(project_dir: Path) -> dict:
     return env
 
 
+def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
+    """The ``KESTREL_DATA_KEY`` a *named* agent is actually started with.
+
+    ``ProcessManager.start_agent`` applies ``KESTREL_DATA_KEY_<NAME>`` over the
+    fleet-wide key *after* building the environment, so the value in
+    :func:`spawned_agent_env` is the pre-override one. A caller comparing
+    custody against that would reject a correct per-agent key and accept a
+    wrong one — which is worse, because it writes blobs the agent cannot read.
+
+    Kept beside ``spawned_agent_env`` so the pair stays a faithful description
+    of one launch, rather than two half-descriptions that drift apart.
+    """
+    return env.get(f"KESTREL_DATA_KEY_{agent_name.upper()}") or env.get(
+        "KESTREL_DATA_KEY"
+    )
+
+
 def host_data_dir() -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 

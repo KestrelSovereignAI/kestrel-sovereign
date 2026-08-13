@@ -888,6 +888,21 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
     from kestrel_sovereign.identity.birth_record import is_fabricated_placeholder
 
     async with target.open_storage() as storage:
+        # Ownership first, because it can veto both of the states below.
+        # ``add_node`` refuses a row owned by anyone other than this agent, and
+        # refuses one with several owners, so replication cannot land there —
+        # an absent row with a stale foreign witness, or a placeholder a second
+        # tenant also claims, is ledger damage wearing the shape of something
+        # boot repairs. Calling it pending would send the repair to the anchor
+        # and leave PostgreSQL unusable while reporting success.
+        owner_rows = await storage.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (target.agent_did,),
+        )
+        owners = {row[0] for row in owner_rows}
+        if owners - {target.agent_did}:
+            return False
+
         agent = await storage.graph.get_node(target.agent_did)
         if agent is not None:
             return is_fabricated_placeholder(agent, target.agent_did)

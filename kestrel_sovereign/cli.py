@@ -962,8 +962,14 @@ def cmd_constitution_reanchor(args) -> int:
     # cannot read. Empty is an answer, not an absence — the same lesson the
     # DSN resolution learned two rounds earlier, in a place it had not been
     # carried to.
-    exported_key = os.environ.get(DATA_KEY_ENV)
-    launch_key = launch_env.get(DATA_KEY_ENV)
+    # The *effective* key for this named agent, not the fleet-wide one:
+    # ``ProcessManager`` applies ``KESTREL_DATA_KEY_<NAME>`` over it when it
+    # starts the agent, so comparing the fleet key would reject a correct
+    # per-agent setup — and, worse, accept a wrong one.
+    from kestrel_sovereign.paths import spawned_agent_data_key
+
+    exported_key = spawned_agent_data_key(os.environ, args.agent_name)
+    launch_key = spawned_agent_data_key(launch_env, args.agent_name)
     if exported_key != launch_key:
         print(
             f"error: {DATA_KEY_ENV} in the environment does not match the one "
@@ -1119,6 +1125,15 @@ def cmd_constitution_anchor_overlay(args) -> int:
     # grant in the overlay permanently denied while reporting success.
     load_project_env(project_dir)
 
+    # ...and the database target comes from the launcher's precedence, exactly
+    # as it does for `constitution reanchor`. Without this, `kestrel doctor`
+    # could report an overlay problem in the PostgreSQL the agents open while
+    # this command wrote the local SQLite file and reported success — a
+    # finding and its prescribed remedy naming different databases (#2892).
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -1142,7 +1157,12 @@ def cmd_constitution_anchor_overlay(args) -> int:
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
     result = asyncio.run(
-        anchor_overlay(agent_name=args.agent_name, agent_dir=agent_dir)
+        anchor_overlay(
+            agent_name=args.agent_name,
+            agent_dir=agent_dir,
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
+        )
     )
 
     if result.error:
