@@ -1217,9 +1217,11 @@ def _host_config_mapping(config) -> dict:
     """Read-only host config mapping handed to host features via HostContext.
 
     Deliberately minimal: enough for a host feature to learn the host's
-    bind/port and agent roster without coupling to the full config object
-    shape. Carries only the tenant resolver (below) when no multi-agent config
-    is available (e.g. a single-agent boot) — host features are host-scoped and
+    bind/port and agent roster, plus only the operator-selected mappings under
+    ``[host.features.<name>]``. This avoids coupling extensions to the full
+    config object or exposing agent definitions and unrelated host settings.
+    Carries only the tenant resolver (below) when no multi-agent config is
+    available (e.g. a single-agent boot) — host features are host-scoped and
     must still mount. (Moved from the retired ``kestrel_sovereign.host`` — issue
     #2382.)
 
@@ -1230,15 +1232,20 @@ def _host_config_mapping(config) -> dict:
     tenant-scoped regardless of deployment shape; zero-config resolves every
     request to one stable default personal tenant (INV-SOLO).
     """
+    from copy import deepcopy
+
     from kestrel_sovereign.security.tenant_resolver import (
         HOST_CONFIG_KEY as _TENANT_RESOLVER_KEY,
         build_tenant_resolver,
     )
 
-    mapping: dict = {_TENANT_RESOLVER_KEY: build_tenant_resolver()}
+    mapping: dict = {}
     if config is None:
-        return mapping
+        return {_TENANT_RESOLVER_KEY: build_tenant_resolver()}
     try:
+        feature_config = getattr(config.host, "features", {})
+        if isinstance(feature_config, dict):
+            mapping.update(deepcopy(feature_config))
         mapping.update(
             {
                 "host_bind": config.host.bind,
@@ -1248,6 +1255,10 @@ def _host_config_mapping(config) -> dict:
         )
     except Exception:  # noqa: BLE001
         pass
+    # Security-owned runtime values are written last. Besides the typed
+    # HostConfig validator, this protects duck-typed/alternate config objects
+    # from shadowing the identity→tenant resolver.
+    mapping[_TENANT_RESOLVER_KEY] = build_tenant_resolver()
     return mapping
 
 

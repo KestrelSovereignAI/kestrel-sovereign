@@ -17,6 +17,8 @@ from typing import Any, List, Optional, Union
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST_BIND = "0.0.0.0"
@@ -57,6 +59,34 @@ class HostConfig(BaseModel):
         default=DEFAULT_HOST_BIND,
         description="Interface to bind to (0.0.0.0 for all interfaces)",
     )
+    features: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Host-scoped feature configuration keyed by feature name. Each "
+            "mapping is forwarded through the public HostContext config seam."
+        ),
+    )
+
+    @field_validator("features")
+    @classmethod
+    def validate_feature_config_names(
+        cls, value: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Keep extension keys distinct from Sovereign's host metadata seam."""
+
+        reserved = {
+            "agents",
+            "host_bind",
+            "host_port",
+            HOST_CONFIG_KEY,
+        }
+        conflicts = sorted(set(value) & reserved)
+        if conflicts:
+            raise ValueError(
+                "host feature configuration uses reserved key(s): "
+                + ", ".join(conflicts)
+            )
+        return value
 
 
 class LocalAgentConfig(BaseModel):
@@ -400,6 +430,11 @@ class MultiAgentConfig(BaseModel):
             },
             "agents": {},
         }
+        # Host-feature configuration is operator policy. Dropping it during a
+        # create-agent rewrite would silently disable external host features on
+        # the next restart, so preserve the complete validated mapping.
+        if self.host.features:
+            data["host"]["features"] = self.host.features
 
         for name, agent in self.agents.items():
             if isinstance(agent, LocalAgentConfig):

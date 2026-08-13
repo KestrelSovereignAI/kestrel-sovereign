@@ -43,6 +43,28 @@ CLI values always win. For example, `PORT=8080 ... --port 9999` binds port
 `9999`. Kestrel mirrors the resolved values into its runtime environment so
 Uvicorn's socket and the host-feature `HostContext` report the same address.
 
+In a managed multi-agent host, extension-specific host settings live beneath
+`[host.features.<name>]` in `multi_agent.toml`. Kestrel copies each explicitly
+selected mapping into the public `HostContext.config` under `<name>`; it does
+not expose the whole registry or agent definitions to extensions. The context
+is host-wide: every installed host feature can read these mappings. Put only
+non-secret routing and policy values here; keep credentials in the feature's
+private store, a referenced private config file, or the deployment secret
+manager. For example:
+
+```toml
+[host.features.talon]
+operator_state_path = "/srv/kestrel/state/talon"
+
+[host.features.talon.runtime]
+project_parent = "/srv/kestrel/projects"
+running_agent_source_root = "/srv/kestrel/kestrel-sovereign"
+```
+
+The keys `host_bind`, `host_port`, `agents`, and
+`observability_tenant_resolver` are platform-owned and cannot be used as
+feature names.
+
 Hosts must be non-empty. Ports must be integers from 1 through 65535. Unknown
 options and invalid values print argparse usage, exit with status 2, and never
 start Uvicorn. This means a misspelled or unsupported security-sensitive option
