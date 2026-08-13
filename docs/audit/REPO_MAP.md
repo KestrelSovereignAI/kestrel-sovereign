@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-12
-**Scope:** 2332 tracked files (1565 `.py`, 345 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-13
+**Scope:** 2334 tracked files (1567 `.py`, 345 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -167,7 +167,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/operator_signals.py** — Operator-signal producer seam for turn-time LLM delivery.
   - `class OperatorSignalProducer`; `class OperatorNoticeLifecycle`; `class OperatorSignalEvent`; `class OperatorSignalBatch`; `class OperatorTurnInjectionResult`; `async def inject_operator_turn(agent, messages, context_result, session_id, …)`; `def supports_inline_system_for_next_route(llm_service)`; `def state_of_mind_snapshot(state)`
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
-  - `def real_session_id(session_id)`; `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
+  - `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/parts.py** — In-band typed-part emission for first-class console components (#1914).
   - `def part_collector()`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def sanitize_part(entry)`; `def drain_parts()`; `def build_part_sentinel(part)`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
@@ -1028,6 +1028,8 @@ Repo entry points and standard project files.
   - `class SSRFError`; `class ValidatedOutboundURL`; `def validate_outbound_url(url)`; `async def assert_safe_url(url)`; `def pinned_httpx_async_transport(validated)`; `def pinned_urllib_https_opener(validated)`
 - **kestrel_sovereign/security/tenant_resolver.py** — Identity→tenant resolution at the host auth edge (issue #2444).
   - `def bind_org_tenant_provider(provider)`; `def tenant_id_for_identity(identity)`; `def resolve_tenant(request)`; `def build_tenant_resolver()`
+- **kestrel_sovereign/security/tool_audit.py** — Security-audit writes for tool calls that never reach the permission layer.
+  - `async def record_tool_rejection(agent)`
 - **kestrel_sovereign/security/user_byok_key_storage.py** — Zero-knowledge user BYOK service-key storage.
   - `class UserBYOKKeyInfo`; `class UserBYOKKeyStorage`; `class UserBYOKKeyResolutionService`
 - **kestrel_sovereign/security/user_master_key_storage.py** — User Master Key Storage for Kestrel.
@@ -1384,7 +1386,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/streams/tap.py** — Agent stream tap — shared infrastructure for tapping into active agent streams.
   - `class AgentStreamTap`
 - **kestrel_sovereign/telemetry.py** — OpenTelemetry tracing integration for Kestrel Sovereign.
-  - `def is_tracing_enabled()`; `def setup_tracing(app)`; `def get_tracer()`; `def optional_span(name, attributes)`; `def start_span(name, attributes)`; `def end_span(span, error)`; `def get_kestrel_tracer()`; `def llm_tracing_enabled()`; `…`
+  - `def is_tracing_enabled()`; `def setup_tracing(app)`; `def get_tracer()`; `def optional_span(name, attributes)`; `def start_span(name, attributes)`; `def end_span(span, error)`; `def real_session_id(session_id)`; `def session_span_attributes(session_id)`; `…`
 - **kestrel_sovereign/templates/default_soul.md** — SOUL.md - Default Personality — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
 - **kestrel_sovereign/testing/__init__.py** — Kestrel Sovereign Testing Utilities.
 - **kestrel_sovereign/testing/feature_test_case.py** — FeatureTestCase — async test base class for Kestrel features.
@@ -2887,7 +2889,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
   - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
 - **tests/unit/test_external_feature_subagent_dispatch.py** — External (SDK-base) features must be dispatchable like in-tree features.
-  - `def test_sdk_base_feature_lacks_dispatch_by_default()`; `def test_injection_makes_external_feature_dispatchable()`; `def test_intree_feature_returned_unchanged()`; `def test_injection_does_not_clobber_feature_supplied_dispatch()`; `def test_dispatch_method_closure_is_present_on_sovereign_base()`; `async def test_external_feature_executes_as_subagent_end_to_end()`
+  - `def test_sdk_base_feature_lacks_dispatch_by_default()`; `def test_injection_makes_external_feature_dispatchable()`; `def test_intree_feature_returned_unchanged()`; `def test_injection_does_not_clobber_feature_supplied_dispatch()`; `def test_dispatch_method_closure_is_present_on_sovereign_base()`; `def test_subagent_dispatch_closure_is_complete()`; `async def test_external_feature_executes_as_subagent_end_to_end()`
 - **tests/unit/test_extract_raw_user_content.py** — Tests for ``context_builder.extract_raw_user_content``.
   - `def test_strips_full_sent_form_with_retrieved_context()`; `def test_strips_sent_form_without_retrieved_context()`; `def test_strips_sent_form_round_trips_wrap_user_input()`; `def test_legacy_raw_content_unchanged()`; `def test_preserves_inner_newlines_in_raw()`; `def test_preserves_inner_tag_like_content()`; `def test_malformed_partial_wrappers_left_alone()`; `def test_retrieved_context_only_no_user_input_wrap()`
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
@@ -3447,7 +3449,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
   - `class TestSessionIdInHooks`
 - **tests/unit/test_session_id_span_attribution.py** — Session-id span attribution on the agent runtime's turn spans (issue #2916).
-  - `def span_exporter(monkeypatch)`; `class TestTurnSpansCarryTimelineSessionKey`; `class TestFeatureDispatchSpansCarrySession`; `class TestRealSessionId`
+  - `def span_exporter(monkeypatch)`; `class TestTurnSpansCarryTimelineSessionKey`; `class TestFeatureDispatchSpansCarrySession`; `class TestRealSessionId`; `def llm_span_exporter()`; `class TestLLMGenerateSpansCarrySession`; `class TestCognitionDispatchSpanCarriesSession`; `class TestSessionSpanAttributes`; `…`
 - **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
   - `class TestSignatures`; `class TestOrchestratorThreadsSessionId`
 - **tests/unit/test_session_log_talon.py** — Tests for Talon PR detection in Session Log collector.
@@ -3674,6 +3676,8 @@ Repo entry points and standard project files.
   - `async def test_tools_are_discoverable()`; `async def test_todo_add_persists_session_scoped_todo_with_terminal_condition()`; `async def test_todo_add_accepts_priority_medium_synonym()`; `async def test_todo_add_normalizes_priority_and_status_synonyms()`; `async def test_todo_add_still_rejects_genuinely_invalid_priority()`; `async def test_todo_update_normalizes_priority_synonym()`; `async def test_todo_add_rejects_done_status()`; `async def test_todo_update_preserves_terminal_condition_and_status_transition()`; `…`
 - **tests/unit/test_token_budget.py** — Canonical contracts for the legacy static and adaptive token budgets.
   - `def test_token_allocation_remaining_and_utilization_matrix()`; `def test_static_budget_allocates_available_context_by_default_percentages()`; `def test_use_tracks_usage_items_and_exact_fit_boundary()`; `def test_sources_account_independently()`; `def test_unknown_source_fails_without_changing_usage()`; `def test_zero_tokens_and_items_are_accepted_no_ops()`; `def test_negative_tokens_or_items_raise_and_leave_state_unchanged()`; `def test_summary_reports_budget_and_allocation_state()`; `…`
+- **tests/unit/test_tool_allowlist_registry.py** — Regression tests for the tool allowlist (#2929).
+  - `def agent()`; `def dispatch_agent(agent)`; `class TestAllowlistDerivation`; `class TestRegisteredToolDispatch`; `class TestRejectionAudit`
 - **tests/unit/test_tool_concurrency.py** — Tests for tool concurrency batching (#562 v2).
   - `class FakeToolCall`; `class FakeToolSchema`; `class FakeTool`; `class FakeFeature`; `class TestPartitionToolCalls`; `class TestIsConcurrencySafe`; `class TestMaxConcurrency`
 - **tests/unit/test_tool_description_promotions.py** — Doc-visibility assertions for #1946.
