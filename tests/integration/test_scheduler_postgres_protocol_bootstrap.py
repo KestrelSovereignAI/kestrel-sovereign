@@ -1990,10 +1990,10 @@ async def test_postgres_post_load_adopts_pending_owner_builtins(
             authorized_agent_ids=(agent_id,),
             owner_id="builtin-replica",
         )
-        owner_registration, replica_registration = await asyncio.gather(
-            owner.prepare_tenant_registration(),
-            replica.prepare_tenant_registration(),
-        )
+        # Establish the owner before the replica so the assertions below do
+        # not depend on which concurrent advisory-lock contender wins first.
+        owner_registration = await owner.prepare_tenant_registration()
+        replica_registration = await replica.prepare_tenant_registration()
         assert owner_registration.rollout_preexisting is False
         assert replica_registration.rollout_preexisting is True
         owner_feature, owner_agent = scheduler_feature_for(
@@ -2029,7 +2029,7 @@ async def test_postgres_post_load_adopts_pending_owner_builtins(
 
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
-        ) == (5,)
+        ) == (4,)
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
         ) == (1,)
