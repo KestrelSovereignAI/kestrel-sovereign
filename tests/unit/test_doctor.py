@@ -1860,3 +1860,86 @@ def test_a_missing_witness_after_the_backfill_is_permanent(tmp_path):
     source = _resolve_governance_source(db, {})
 
     assert source.ownership_settled is True
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed paths. Each of these swallows an error by design, so each one is
+# a place a wrong verdict can be manufactured silently — the failure mode this
+# whole issue is about. They are asserted rather than assumed.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_existence_probe_never_claims_the_runtime_is_empty(tmp_path):
+    """"Something is there, do not call this empty" is the safe direction.
+
+    ``_row_physically_exists`` decides whether a bound read that found nothing
+    means *absent* (replication repairs it) or *unowned* (it cannot). A probe
+    that cannot run must not vote for the first, or a database it never
+    inspected gets judged against the anchor.
+    """
+    from kestrel_sovereign.doctor import _GovernanceSource, _row_physically_exists
+
+    missing = _GovernanceSource(
+        anchor_path=tmp_path / "does-not-exist.db", agent_did="did:x"
+    )
+
+    assert _row_physically_exists(missing) is True
+
+
+def test_an_unparseable_dsn_is_left_for_connect_to_report(tmp_path):
+    """``_bounded_dsn`` must not swallow a malformed DSN into silence.
+
+    Returning it untouched lets ``psycopg2.connect`` raise its own message,
+    which the reader turns into a redacted ``_UnreadableDB``. Raising here
+    instead would escape as a traceback out of a diagnostic.
+    """
+    from kestrel_sovereign.doctor import _bounded_dsn
+
+    assert _bounded_dsn("not a dsn at all") == "not a dsn at all"
+
+
+def test_a_bounded_dsn_keeps_every_other_parameter(tmp_path):
+    """The bound is additive: nothing else about the operator's DSN moves."""
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _bounded_dsn
+
+    parsed = parse_dsn(_bounded_dsn("postgresql://u:p@h:5445/db?sslmode=require"))
+
+    assert parsed["sslmode"] == "require"
+    assert parsed["host"] == "h"
+    assert parsed["port"] == "5445"
+    assert parsed["dbname"] == "db"
+    assert parsed["connect_timeout"] == "5"
+
+
+def test_the_emancipation_contract_survives_a_falsy_but_real_value():
+    """``None`` means "no contract"; an empty string is a *corrupt* one.
+
+    Collapsing them would render the canonical constitution for an agent whose
+    receipt is damaged, and report it correctly anchored.
+    """
+    from kestrel_sovereign.doctor import _anchored_emancipation_contract
+
+    assert _anchored_emancipation_contract({"emancipation_contract": ""}) == ""
+    assert _anchored_emancipation_contract({}) is None
+
+
+def test_an_unreadable_source_on_postgres_fails_even_before_a_source_exists(
+    tmp_path,
+):
+    """Resolution can fail before a ``_GovernanceSource`` is built at all.
+
+    ``_report_unexamined`` still has to decide fail-vs-warn, and it reads the
+    backend out of the reason text in that case. If that ever stops matching,
+    an unreachable PostgreSQL silently becomes a warning again — and warnings
+    leave ``ready`` true.
+    """
+    from kestrel_sovereign.doctor import DoctorReport, _UnreadableDB, _report_unexamined
+
+    report = DoctorReport()
+    sentinel = _UnreadableDB(reason="cannot read PostgreSQL (connection refused)")
+    _report_unexamined("Test", sentinel.reason, sentinel, report)
+
+    assert report.fail and not report.warn, (report.fail, report.warn)
+    assert not report.ready
