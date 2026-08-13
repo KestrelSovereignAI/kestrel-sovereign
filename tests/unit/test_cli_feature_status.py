@@ -272,6 +272,62 @@ def test_status_uninstalled_feature_still_gets_agent_row(monkeypatch, fake_regis
     assert "✗ —" in out            # Emma doesn't have it loaded
 
 
+def test_status_core_entry_is_source_policy_not_a_lifecycle_column(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A captured `kestrel-sovereign` entry declares where CORE comes from.
+
+    It cannot be rendered as one per-agent feature column: dozens of bundled
+    features share the `kestrel-sovereign` package, so the entry resolves to
+    whichever bundled row the registry happens to list first (`identity`), and
+    the agent's catalog collapses every bundled feature's status under that one
+    package key, last-writer-wins. A column would therefore report an arbitrary
+    bundled feature's state under core's name — here it would call Emma's
+    ENABLED Identity feature merely "installed" and raise a phantom
+    needs-restart hint (issue #2949).
+    """
+    from kestrel_sovereign.cli_features import CORE_DISTRIBUTION
+
+    # Mirror the real registry: several bundled rows share the core package.
+    fake_registry["identity"] = _info(
+        "identity", CORE_DISTRIBUTION, ["IdentityFeature"], PackageBoundary.BUNDLED,
+    )
+    fake_registry["memory"] = _info(
+        "memory", CORE_DISTRIBUTION, ["MemoryFeature"], PackageBoundary.BUNDLED,
+    )
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname="{CORE_DISTRIBUTION}"\neditable="/src/core"\n'
+        '[[feature]]\nname="kestrel-feature-voice"\n'
+    )
+    _versions(monkeypatch, {CORE_DISTRIBUTION: "0.52.0", "kestrel-feature-voice": "0.2.1"})
+    monkeypatch.setattr(cli, "_editable_install_path", lambda d: "/src/core")
+    _fake_host(monkeypatch, tmp_path, agents=("Emma",))
+    monkeypatch.setattr(
+        cli, "_detect_running_agent_server", lambda *a: ("http://h/api/agents/Emma", "k"),
+    )
+    # Identity IS enabled on Emma; a later bundled row wins the package key.
+    monkeypatch.setattr(
+        cli, "_query_agent_feature_catalog",
+        lambda b, k: {CORE_DISTRIBUTION: "installed", "kestrel-feature-voice": "enabled"},
+    )
+
+    rc = cli.cmd_feature_status(_args(manifest))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    # Core's SOURCE is reported, at the level a source policy lives at.
+    assert CORE_DISTRIBUTION in out
+    assert "manifest satisfied" in out
+    # ...but never as a lifecycle column, under core's name or identity's.
+    per_agent = out.split("Loaded per agent")[1]
+    assert "identity" not in per_agent
+    assert CORE_DISTRIBUTION not in per_agent
+    # The real feature column is unaffected, and no phantom restart hint fires.
+    assert "✓ enabled" in per_agent
+    assert "installed-but-not-loaded" not in out
+
+
 def test_status_specific_agent_not_found(monkeypatch, fake_registry, tmp_path, capsys):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname="kestrel-feature-voice"\n')

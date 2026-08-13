@@ -6,7 +6,7 @@ import logging
 import subprocess
 import sys
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -292,26 +292,66 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     if pkg_info.status != FeatureStatus.AVAILABLE:
         raise HTTPException(status_code=400, detail=f"Feature '{name}' is already installed")
 
-    # Install via pip in a subprocess
+    # Install via pip in a subprocess, through the SAME core guard the CLI uses:
+    # this package depends on kestrel-sovereign, so an unguarded install can
+    # resolve core from the index and replace the running (often editable) core
+    # with a wheel copy. Installing from the console is not a safer path than
+    # installing from the CLI (issue #2949).
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+
     package_spec = pkg_info.package
+    guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
+
+    install_error: Optional[Tuple[int, str]] = None
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [sys.executable, "-m", "pip", "install", package_spec],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        result = await asyncio.to_thread(guard.run, [package_spec], timeout=300)
         if result.returncode != 0:
             logger.error(f"pip install failed for {package_spec}: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"Installation failed: {result.stderr[:500]}")
+            install_error = (500, f"Installation failed: {result.stderr[:500]}")
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Installation timed out")
+        install_error = (504, "Installation timed out")
+
+    # Detection half, on EVERY path — a failed or timed-out install is not a
+    # reason to skip it. pip installs dependencies before the requested package
+    # can fail, and a timeout kills the process mid-write, so both can leave
+    # core swapped for an index wheel. Returning the install error without
+    # looking would leave that swap in place, unnamed (issue #2949).
+    outcome = await asyncio.to_thread(guard.resolve)
+    if outcome.drift is not None:
+        logger.error("core install changed during %s install:\n%s", package_spec, outcome.describe())
+
+    if install_error is not None:
+        status_code, detail = install_error
+        raise HTTPException(
+            status_code=status_code,
+            detail=detail if outcome.drift is None else f"{detail}\n{outcome.describe()}",
+        )
+
+    if not outcome.conforming:
+        # The package installed, but the host is now running a core nobody
+        # declared and the restore failed. That is not a 2xx: the operator has
+        # to run the named command before this host is trustworthy again.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Package '{package_spec}' installed, but {outcome.describe()}",
+        )
+
+    if outcome.drift is None:
+        return {
+            "status": "installed",
+            "package": package_spec,
+            "message": f"Package '{package_spec}' installed. Restart the agent to load the feature.",
+        }
 
     return {
-        "status": "installed",
+        "status": "installed_with_core_drift",
         "package": package_spec,
-        "message": f"Package '{package_spec}' installed. Restart the agent to load the feature.",
+        "core_drift": outcome.drift,
+        "core_restored": True,
+        "message": (
+            f"Package '{package_spec}' installed, but {outcome.headline} — "
+            "restored afterwards. Restart the agent."
+        ),
     }
 
 

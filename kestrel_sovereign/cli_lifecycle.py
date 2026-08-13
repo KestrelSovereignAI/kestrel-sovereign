@@ -787,6 +787,7 @@ def _run_feature_reconcile(
     (unless ``continue_on_error`` downgrades package failures to warnings).
     """
     from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.cli_features import CoreInstallGuard
     from kestrel_sovereign.feature_registry import load_registry
     import importlib.metadata as md
 
@@ -899,15 +900,15 @@ def _run_feature_reconcile(
     #
     # Every kestrel-feature-* depends on kestrel-sovereign. `uv pip` is
     # project-blind (see _extension_install_run), so a feature whose core pin the
-    # checkout fails resolves core from the index and replaces the editable link
-    # with a wheel copy — invisibly, because cwd=checkout keeps shadowing
+    # checkout fails resolves core from the index and replaces the operator's
+    # core with a wheel copy — invisibly, because cwd=checkout keeps shadowing
     # site-packages for anything started from inside it (issue #2949).
     #
-    # Capture the shape BEFORE any install so the guard protects the link that
-    # actually existed, then pin core to that version for every feature install.
-    core_before = cli._core_install_shape()
-    core_guard = fr.resolve_core_guard(source_index, core_before.editable_path)
-    core_constraints = fr.core_install_constraints(core_before, core_guard)
+    # Same guard object as `feature install` / `upgrade` / `sync`, holding core
+    # to the SAME source-map policy: reconcile never installs core itself (core
+    # classes are bundled, so they are excluded from the plan), so there is no
+    # core entry to apply first here — only a policy to hold everything else to.
+    guard = CoreInstallGuard.snapshot(source_index)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -930,7 +931,7 @@ def _run_feature_reconcile(
             continue
 
         ok, detail = _execute_reconcile_action(
-            action, git_urls, allow_dirty, constraints=core_constraints,
+            action, git_urls, allow_dirty, guard=guard,
         )
         if ok:
             print(f"  {label:<34} {current:<10} {action.op}d ({how})")
@@ -942,11 +943,11 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} FAILED")
             for line in (detail or "").splitlines()[-5:]:
                 print(f"      {line}")
-            if core_constraints:
+            if guard.constraints:
                 print(
-                    f"      note: core is pinned to {core_constraints[0]} for "
+                    f"      note: core is pinned to {guard.constraints[0]} for "
                     "this install so a feature cannot silently replace the "
-                    "editable checkout. If this is a version conflict, update "
+                    "declared core. If this is a version conflict, update "
                     "the checkout to satisfy the feature — do not remove the pin."
                 )
             if not continue_on_error:
@@ -959,24 +960,22 @@ def _run_feature_reconcile(
 
     # 5. Assert core survived. Runs even when the loop aborted early: a failing
     # install can be the very thing that broke the link.
-    if not dry_run and cli._restore_core_editable_install(core_before, core_guard):
+    if not dry_run and guard.verify():
         rc = 1
 
     return rc
 
 
-def _execute_reconcile_action(
-    action, git_urls: dict, allow_dirty: bool, *, constraints=None,
-):
+def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guard):
     """Execute one :class:`ReconcileAction`. Returns ``(ok, detail)``.
 
     Editable -> ``git pull --ff-only`` the checkout (plus ``pip install -e`` when
     not yet installed). PyPI -> ``pip install [--upgrade] spec`` with a git-URL
     fallback (mirrors ``feature sync``/``upgrade``).
 
-    ``constraints`` pins the core distribution to the editable checkout for the
-    duration of the install so a feature's core requirement cannot resolve a
-    wheel from the index (issue #2949).
+    *guard* is required: every install here is a feature install, and a feature
+    install without the core guard is the #2949 defect. Callers with genuinely
+    nothing to protect pass ``CoreInstallGuard.unguarded()`` and say so.
     """
     from kestrel_sovereign.cli_features import _pip_spec
 
@@ -991,10 +990,7 @@ def _execute_reconcile_action(
         # it is already editable-linked to this checkout, the pull alone is the
         # update. `relink` is decided by plan_reconcile (codex round 3 P2).
         if action.relink:
-            result = cli._extension_install_run(
-                ["-e", _pip_spec(str(checkout), action.extras)],
-                constraints=constraints,
-            )
+            result = guard.run(["-e", _pip_spec(str(checkout), action.extras)])
             if result.returncode != 0:
                 return False, (result.stderr or result.stdout or "").strip()
         return True, detail
@@ -1013,7 +1009,7 @@ def _execute_reconcile_action(
     if action.force_reinstall:
         pip_args.append("--force-reinstall")
     pip_args.append(spec)
-    result = cli._extension_install_run(pip_args, constraints=constraints)
+    result = guard.run(pip_args)
     # The git-URL fallback installs the repo HEAD with NO version constraint, so
     # it must NOT be used for a pinned entry — that would silently move the
     # feature outside the operator's declared pin (codex round 7 P2).
@@ -1026,7 +1022,7 @@ def _execute_reconcile_action(
         fallback = (
             ["--upgrade", git_spec] if action.op == "update" else [git_spec]
         )
-        result = cli._extension_install_run(fallback, constraints=constraints)
+        result = guard.run(fallback)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "").strip()
     return True, ""

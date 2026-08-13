@@ -14,6 +14,7 @@ import types
 import pytest
 
 from kestrel_sovereign import cli
+from tests.utils.fake_uv import CHECKOUT, CORE, FakeUv, use_fake_uv
 
 
 @pytest.fixture
@@ -24,11 +25,13 @@ def fake_registry(monkeypatch):
             package="kestrel-feature-github",
             git="https://github.com/KestrelSovereignAI/kestrel-feature-github.git",
             features=["GitHubFeature"],
+            core=False,
         ),
         "voice": types.SimpleNamespace(
             package="kestrel-feature-voice",
             git="https://github.com/KestrelSovereignAI/kestrel-feature-voice.git",
             features=["VoiceFeature"],
+            core=False,
         ),
     }
     import kestrel_sovereign.feature_registry as fr
@@ -46,7 +49,7 @@ class _InstallSpy:
         self.returncode = returncode
         self.stderr = stderr
 
-    def __call__(self, pip_args, constraints=None):
+    def __call__(self, pip_args, *, constraints=None, timeout=None):
         self.calls.append(list(pip_args))
         self.constraints.append(list(constraints or []))
         return subprocess.CompletedProcess(pip_args, self.returncode, stdout="", stderr=self.stderr)
@@ -80,14 +83,14 @@ def test_pip_spec_renders_extras():
 def test_extension_install_run_prefers_uv(monkeypatch):
     seen = {}
 
-    def fake_run(cmd, capture_output=True, text=True):
+    def fake_run(cmd, capture_output=True, text=True, timeout=None):
         seen["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv")
 
-    cli._extension_install_run(["kestrel-feature-voice"])
+    cli._extension_install_run(["kestrel-feature-voice"], constraints=None)
     assert seen["cmd"][:3] == ["uv", "pip", "install"]
     assert "--python" in seen["cmd"]  # pinned to this interpreter
     assert seen["cmd"][-1] == "kestrel-feature-voice"
@@ -96,14 +99,14 @@ def test_extension_install_run_prefers_uv(monkeypatch):
 def test_extension_install_run_falls_back_to_pip(monkeypatch):
     seen = {}
 
-    def fake_run(cmd, capture_output=True, text=True):
+    def fake_run(cmd, capture_output=True, text=True, timeout=None):
         seen["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv
 
-    cli._extension_install_run(["kestrel-feature-voice"])
+    cli._extension_install_run(["kestrel-feature-voice"], constraints=None)
     assert seen["cmd"][1:3] == ["-m", "pip"]
     assert seen["cmd"][0] == cli.sys.executable
 
@@ -379,7 +382,7 @@ def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, constraints=None):
+        def __call__(self, pip_args, *, constraints=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -446,7 +449,7 @@ def test_sync_git_fallback_carries_extras(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, constraints=None):
+        def __call__(self, pip_args, *, constraints=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 0 if "git+" in str(pip_args[0]) else 1
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -480,3 +483,270 @@ def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
     # The captured file must parse back to the exact path (no TOML escape break)
     entries = cli._load_host_manifest(manifest)
     assert entries[0]["editable"] == r"C:\src\voice"
+
+
+# --- core install guard (#2949) --------------------------------------------
+#
+# `uv pip` is project-blind: it never learns the lock declares the root as
+# `source = { editable = "." }`, so `kestrel-sovereign` is an ordinary
+# dependency. A feature whose core requirement the installed core fails used to
+# make uv resolve core from the index, replacing the operator's core with a
+# wheel copy — invisibly, because cwd=checkout keeps shadowing site-packages.
+#
+# These tests substitute at the `subprocess.run` seam rather than at
+# `_extension_install_run`, so the constraint-file plumbing itself is under
+# test: delete the `-c` handling and they fail.
+
+# The venv+resolver double lives in `tests/utils/fake_uv.py`: `feature sync`,
+# `feature install`, `feature upgrade`, `kestrel update`'s reconcile and the
+# HTTP install endpoint all claim to guard core identically, so they are tested
+# against ONE model of what an install does to a venv.
+
+def _voice_manifest(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.4"\n')
+    return manifest
+
+
+def test_unconstrained_feature_install_swaps_editable_core(monkeypatch):
+    """Fidelity check on the resolver double: WITHOUT a constraint the swap
+    really happens. Without this the "core survived" assertions below could
+    pass vacuously."""
+    venv = FakeUv()  # editable core 0.52.0; voice needs core >=0.53
+    use_fake_uv(monkeypatch, venv)
+
+    result = cli._extension_install_run(["kestrel-feature-voice>=0.4"], constraints=None)
+
+    assert result.returncode == 0  # resolve "succeeded"...
+    assert venv.editable.get(CORE) is None  # ...by dropping the editable link
+    assert venv.installed[CORE] == "0.53.0"  # for an index wheel
+
+
+def test_sync_constraint_stops_a_feature_replacing_editable_core(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The regression: editable core at X + a feature requiring core > X must
+    fail the resolve, not swap the install underneath the operator."""
+    venv = FakeUv()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
+
+    assert rc == 1  # loud, not silent
+    assert venv.editable[CORE] == CHECKOUT  # link intact
+    assert venv.installed[CORE] == "0.52.0"  # still the checkout's version
+    assert "kestrel-feature-voice" not in venv.installed  # feature not installed
+    # The pin was actually handed to the resolver, and the real skew surfaced.
+    assert venv.pins == ["==0.52.0"]
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "No solution found" in out
+
+
+def test_sync_constraint_does_not_block_a_compatible_feature(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The pin must not manufacture failures: a feature the checkout satisfies
+    installs normally and core is untouched."""
+    venv = FakeUv(feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
+
+    assert rc == 0
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+    assert venv.editable[CORE] == CHECKOUT
+    assert venv.installed[CORE] == "0.52.0"
+    assert "installed" in capsys.readouterr().out
+
+
+def test_sync_relinks_core_when_an_install_bypasses_the_constraint(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Detection half: an install that ignores the pin still can't leave sync
+    reporting success over a replaced core."""
+    venv = FakeUv(honours_constraints=False)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
+
+    assert rc == 1
+    # The swap happened, was named, and the checkout was re-linked.
+    assert venv.editable[CORE] == CHECKOUT
+    assert venv.installed[CORE] == "0.52.0"  # the checkout's build, restored
+    err = capsys.readouterr().err
+    assert "was replaced during the install batch" in err
+    assert f"restored: uv pip install -e {CHECKOUT}" in err
+
+
+# --- the manifest's core entry governs the whole batch ----------------------
+
+
+def test_sync_applies_core_entry_before_features_whatever_the_manifest_order(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A manifest is a declaration, not a program.
+
+    Core moved to a new checkout (0.53.0) but listed LAST, with a feature that
+    needs core >=0.53. The batch must apply the core entry first and pin the
+    version core BECAME — pinning the pre-switch 0.52.0 would fail a feature the
+    operator's own manifest makes installable.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+        f'[[feature]]\nname = "kestrel-sovereign"\neditable = "{CHECKOUT}-next"\n'
+    )
+    venv = FakeUv(checkouts={f"{CHECKOUT}-next": "0.53.0"})
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    # Core first (unpinned — never constrained against itself), then voice
+    # pinned to what core became.
+    assert venv.pins == [None, "==0.53.0"]
+    assert venv.editable[CORE] == f"{CHECKOUT}-next"
+    assert venv.installed[CORE] == "0.53.0"
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+
+
+def test_sync_holds_core_inside_the_manifest_declared_pypi_window(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A `pypi` core entry is a declaration, not a waiver.
+
+    The operator pinned core to >=0.52,<0.53. A feature requiring >=0.53 must
+    fail loudly — not quietly drag core to 0.53.0 and leave the venv violating
+    the manifest it just "synced".
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-sovereign"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+    )
+    venv = FakeUv()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 1
+    assert venv.pins == [None, ">=0.52,<0.53"]  # core itself, then the window
+    assert venv.installed[CORE] == "0.52.0"  # inside the declared window
+    assert venv.editable.get(CORE) is None  # the declared wheel took effect
+    assert "kestrel-feature-voice" not in venv.installed
+    assert "No solution found" in capsys.readouterr().out
+
+
+def test_sync_pins_core_to_the_declared_pypi_window_without_blocking_it(
+    monkeypatch, fake_registry, tmp_path
+):
+    """The window is a window: core may move inside it, and a feature that needs
+    the newer core installs cleanly."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-sovereign"\npypi = ">=0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+    )
+    venv = FakeUv()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert venv.pins == [None, ">=0.53"]
+    assert venv.editable.get(CORE) is None  # the declared wheel took effect
+    assert venv.installed[CORE] == "0.53.0"
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+
+
+def test_sync_restores_core_pushed_outside_the_declared_pypi_window(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Detection half for a PyPI-declared core: an install that bypassed the
+    window is named and rolled back inside it."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "kestrel-sovereign"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.4"\n'
+    )
+    venv = FakeUv(honours_constraints=False)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 1
+    assert venv.installed[CORE] == "0.52.0"  # pulled back into the window
+    err = capsys.readouterr().err
+    assert "was replaced during the install batch" in err
+    assert f"restored: uv pip install {CORE}>=0.52,<0.53" in err
+
+
+def test_sync_does_not_call_a_no_op_reinstall_a_restore(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A repair is judged by re-reading the venv, not by an exit code.
+
+    An installer can exit 0 and leave core exactly where it was (a resolve that
+    decided the wheel already "satisfies" the request). Reporting `restored:`
+    off that exit code would hand the operator a receipt for something that
+    never happened.
+    """
+    venv = FakeUv(honours_constraints=False, repair_noops=True)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
+
+    assert rc == 1
+    assert venv.editable.get(CORE) is None  # still swapped — the repair did nothing
+    err = capsys.readouterr().err
+    assert "restored:" not in err
+    assert f"RESTORE FAILED — run `uv pip install -e {CHECKOUT}` by hand." in err
+
+
+# --- the single-package commands are guarded too ----------------------------
+
+
+def test_feature_install_pins_core_to_the_editable_checkout(
+    monkeypatch, fake_registry, capsys
+):
+    """`kestrel feature install` is the shortest path to the #2949 swap: one
+    command, one feature, core replaced. It carries the same guard as sync."""
+    venv = FakeUv()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_install(types.SimpleNamespace(name="voice"))
+
+    assert rc == 1
+    assert venv.editable[CORE] == CHECKOUT  # link intact
+    assert venv.installed[CORE] == "0.52.0"
+    assert "kestrel-feature-voice" not in venv.installed
+    # PyPI attempt AND the git fallback are both pinned — the fallback is not
+    # a hole in the guard.
+    assert venv.pins == ["==0.52.0", "==0.52.0"]
+    assert "No solution found" in capsys.readouterr().out
+
+
+def test_feature_upgrade_pins_core_to_the_editable_checkout(
+    monkeypatch, fake_registry, capsys
+):
+    """`--upgrade` is the likeliest command to drag core forward, so it is
+    guarded exactly like sync."""
+    venv = FakeUv()
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [{
+            "dist": "kestrel-feature-voice", "version": "0.3.0",
+            "editable_path": None, "entries": [],
+        }],
+    )
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == 1
+    assert venv.editable[CORE] == CHECKOUT
+    assert venv.installed[CORE] == "0.52.0"
+    assert venv.pins == ["==0.52.0", "==0.52.0"]  # pip attempt + git fallback
+    assert "FAILED" in capsys.readouterr().out

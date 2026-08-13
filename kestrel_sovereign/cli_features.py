@@ -15,13 +15,17 @@ here through the ``cli`` module object at call time, so existing
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from packaging.utils import canonicalize_name
 
-# Non-patched constant — import directly. (``MultiAgentConfig`` itself is
+# Non-patched constants — import directly. (``MultiAgentConfig`` itself is
 # referenced as ``cli.MultiAgentConfig`` because the test suite patches it.)
+# ``feature_reconcile`` holds the pure planning types and imports nothing from
+# the CLI, so naming the core distribution here is not a cycle.
+from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 
 
@@ -195,17 +199,23 @@ def cmd_feature_install(args) -> int:
     package = info.package
     print(f"Installing {package}...")
 
-    result = _extension_install_run([package])
+    # This package depends on kestrel-sovereign, so the install can resolve core
+    # from the index and replace the operator's core with a wheel copy. Same
+    # guard as `feature sync` / `update`'s reconcile — a single command is not
+    # a safer path than a batch (issue #2949).
+    guard = CoreInstallGuard.snapshot()
+
+    result = guard.run([package])
 
     if result.returncode != 0:
         # Try git URL as fallback
         if info.git:
             print(f"pip install failed, trying git: {info.git}")
-            result = _extension_install_run([f"git+{info.git}"])
+            result = guard.run([f"git+{info.git}"])
 
     if result.returncode == 0:
         print(f"Installed {package}")
-        return 0
+        return guard.verify()
     else:
         print(f"Failed to install {package}")
         if result.stderr:
@@ -213,6 +223,15 @@ def cmd_feature_install(args) -> int:
             lines = result.stderr.strip().split("\n")
             for line in lines[-5:]:
                 print(f"  {line}")
+        if guard.constraints:
+            print(
+                f"  note: core is pinned to {guard.constraints[0]} for this "
+                "install so a feature cannot silently replace it. If this is a "
+                "version conflict, move core to a version the feature accepts "
+                "— do not remove the pin."
+            )
+        # A failed install can be the very thing that broke the link.
+        guard.verify()
         return 1
 
 
@@ -327,6 +346,12 @@ def cmd_feature_upgrade(args) -> int:
         return 0
 
     dry_run = getattr(args, "dry_run", False)
+
+    # `--upgrade` is the most likely command to drag core forward: pip is free
+    # to satisfy the newer feature's core requirement from the index, replacing
+    # the operator's core. Guard the whole batch (issue #2949).
+    guard = CoreInstallGuard.snapshot()
+
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -343,15 +368,20 @@ def cmd_feature_upgrade(args) -> int:
             print(f"  {name:<34} {current:<10} would upgrade")
             continue
 
-        result = _extension_install_run(["--upgrade", name])
+        result = guard.run(["--upgrade", name])
         if result.returncode != 0 and git_urls.get(name):
-            result = _extension_install_run(["--upgrade", f"git+{git_urls[name]}"])
+            result = guard.run(["--upgrade", f"git+{git_urls[name]}"])
 
         if result.returncode != 0:
             rc = 1
             print(f"  {name:<34} {current:<10} FAILED")
             for line in (result.stderr or "").strip().splitlines()[-3:]:
                 print(f"      {line}")
+            if guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]}; a "
+                    "version conflict here is a real skew, not the pin's fault."
+                )
             continue
 
         new_version = _parse_pip_installed_version(result.stdout, name)
@@ -366,6 +396,10 @@ def cmd_feature_upgrade(args) -> int:
         print(f"  {upgraded} package(s) upgraded.")
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
+        # Detection half: an upgrade that bypassed the pin can't leave the
+        # command reporting success over a replaced core.
+        if guard.verify():
+            rc = 1
     return rc
 
 
@@ -479,8 +513,14 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _extension_install_run(pip_args: list, constraints: Optional[list] = None):
+def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     """Install via uv when available, else the interpreter's own pip.
+
+    Prefer :meth:`CoreInstallGuard.run` — it decides ``constraints`` for you and
+    verifies the result. ``constraints`` is keyword-only and REQUIRED so a new
+    caller has to make the core-guard decision explicitly instead of inheriting
+    a silent default that reopens issue #2949; pass ``None`` only when core
+    itself is the install target (it is never constrained against itself).
 
     uv-created virtualenvs frequently ship without ``pip``, so a bare
     ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
@@ -528,7 +568,7 @@ def _extension_install_run(pip_args: list, constraints: Optional[list] = None):
             ]
         else:
             cmd = [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     finally:
         if constraint_file:
             try:
@@ -545,7 +585,7 @@ def _core_install_shape():
     """
     import importlib.metadata as md
 
-    from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION, CoreInstallShape
+    from kestrel_sovereign.feature_reconcile import CoreInstallShape
 
     try:
         version = md.version(CORE_DISTRIBUTION)
@@ -557,47 +597,247 @@ def _core_install_shape():
     )
 
 
-def _restore_core_editable_install(before, guard: Optional[str]) -> int:
-    """Assert core survived a batch of feature installs; re-link it if not.
+@dataclass
+class CoreGuardOutcome:
+    """What the guard found after a batch of installs, and what it did about it.
 
-    The prevention half (``core_install_constraints``) stops the common swap,
-    but any path that bypasses the constraint — a direct ``pip`` call, a
-    feature's own build step, an operator's manual install — can still break the
-    link. Verifying afterwards turns "silently running an old wheel copy" into a
-    named failure: re-link the checkout and return non-zero so the caller never
-    reports success (issue #2949).
-
-    Returns 0 when core is intact (or unguarded), 1 when it changed.
+    ``drift is None`` is the only state that needs no operator attention.
+    Otherwise the batch left core somewhere it was not declared to be:
+    ``repaired`` says whether reinstalling from the declared source put it back,
+    and ``command`` is what the operator must run by hand if it did not.
     """
-    from kestrel_sovereign.feature_reconcile import describe_core_change
 
-    if not guard:
-        return 0
-    after = cli._core_install_shape()
-    changed = describe_core_change(before, after, guard)
-    if changed is None:
-        return 0
+    drift: Optional[str] = None
+    # Core matched its policy at the batch's baseline, so this batch is what
+    # moved it — a swap, as opposed to a core that never conformed to begin with.
+    replaced: bool = False
+    repaired: bool = False
+    command: Optional[str] = None
+    output: str = ""  # tail of a failed repair's stderr/stdout
 
-    print(
-        "• core: ERROR — the editable kestrel-sovereign install was replaced "
-        "during the feature installs.",
-        file=sys.stderr,
-    )
-    for line in changed.splitlines():
-        print(f"    {line}", file=sys.stderr)
+    @property
+    def conforming(self) -> bool:
+        """Does core match its declared source RIGHT NOW?
 
-    checkout = str(Path(guard).expanduser())
-    result = cli._extension_install_run(["-e", checkout])
-    if result.returncode == 0:
-        print(f"    re-linked: uv pip install -e {checkout}", file=sys.stderr)
-    else:
-        print(
-            f"    RE-LINK FAILED — run `uv pip install -e {checkout}` by hand.",
-            file=sys.stderr,
+        The question every caller must answer before reporting success. A drift
+        that was repaired is conforming again; one that could not be repaired
+        leaves the host running a core nobody declared.
+        """
+        return self.drift is None or self.repaired
+
+    @property
+    def headline(self) -> str:
+        return (
+            f"{CORE_DISTRIBUTION} was replaced during the install batch" if self.replaced
+            else f"{CORE_DISTRIBUTION} is not installed from its declared source"
         )
-        for line in (result.stderr or result.stdout or "").strip().splitlines()[-3:]:
-            print(f"      {line}", file=sys.stderr)
-    return 1
+
+    def describe(self) -> str:
+        """One operator-readable block: what moved, and what was done about it.
+
+        Same facts the CLI prints to stderr, flattened for a log line or an
+        HTTP ``detail`` — including why a failed repair failed, which is the
+        one thing the operator cannot see from the response otherwise.
+        """
+        if self.drift is None:
+            return ""
+        lines = [f"{self.headline}.", self.drift]
+        if self.repaired:
+            lines.append(f"restored: {self.command}")
+        else:
+            lines.append(f"RESTORE FAILED — run `{self.command}` by hand.")
+            lines.extend(self.output.splitlines()[-3:])
+        return "\n".join(lines)
+
+
+class CoreInstallGuard:
+    """The one way to install a feature package (issue #2949).
+
+    Every ``kestrel-feature-*`` depends on ``kestrel-sovereign``, and the
+    installer is project-blind (see :func:`_extension_install_run`), so any
+    unguarded feature install can resolve core from the index and replace the
+    operator's declared core — most visibly by dropping an editable checkout for
+    a wheel copy, invisibly, because ``cwd=checkout`` keeps shadowing
+    ``site-packages`` for anything started from inside it.
+
+    Guarding is four steps that only work together, so one object owns all four
+    and every install command holds one. A caller that reaches for the raw
+    installer instead gets prevention without detection — the half-fix that let
+    #2949 stay silent:
+
+    1. **snapshot** how core is installed, before anything runs;
+    2. **resolve the policy** — the source map's explicit ``kestrel-sovereign``
+       entry if there is one, else the live editable link;
+    3. **constrain** every install in the batch to that policy;
+    4. **verify** afterwards, and repair + fail loudly if core moved anyway.
+
+    Step 3 cannot cover a path that bypasses the constraint file (a feature's
+    own build step, a direct ``pip`` call), which is exactly why step 4 is not
+    optional.
+    """
+
+    def __init__(self, policy, before):
+        self.policy = policy
+        # ``before`` is the pre-batch state, reported verbatim so the operator
+        # sees where core started. ``_baseline`` is the last state the batch
+        # deliberately put core in (it advances when the batch installs core
+        # itself) and is what decides whether a later drift is "replaced" or
+        # "never got there".
+        self.before = before
+        self._baseline = before
+        self._constraints = self._derive(before)
+
+    @classmethod
+    def snapshot(cls, source_index=None):
+        """Capture the live core install and the policy that governs it.
+
+        *source_index* is the ``{package: SourceEntry}`` map from the host
+        manifest when the caller has one (``feature sync``, ``update``'s
+        reconcile). Commands with no manifest in their contract
+        (``feature install`` / ``upgrade``, the install endpoint) pass nothing
+        and guard whatever the venv actually has.
+        """
+        from kestrel_sovereign import feature_reconcile as fr
+
+        before = cli._core_install_shape()
+        policy = fr.resolve_core_policy(source_index or {}, before.editable_path)
+        return cls(policy, before)
+
+    @classmethod
+    def unguarded(cls):
+        """A guard that constrains and verifies nothing.
+
+        For callers that provably have no core to protect — and for tests that
+        exercise install plumbing rather than the guard itself.
+        """
+        from kestrel_sovereign.feature_reconcile import CoreInstallShape, CoreSourcePolicy
+
+        return cls(CoreSourcePolicy(), CoreInstallShape())
+
+    def _derive(self, shape) -> list:
+        from kestrel_sovereign import feature_reconcile as fr
+
+        return fr.core_install_constraints(shape, self.policy)
+
+    @property
+    def constraints(self) -> list:
+        """The constraint lines applied to each guarded install (may be empty)."""
+        return list(self._constraints)
+
+    def run(self, pip_args: list, *, timeout=None):
+        """Install a FEATURE package with core held inside the policy."""
+        return cli._extension_install_run(
+            pip_args, constraints=self._constraints or None, timeout=timeout,
+        )
+
+    def install_core(self, pip_args: list, *, timeout=None):
+        """Install CORE itself — the operator deliberately moving core's source.
+
+        Never constrained against itself, and the constraints for the rest of
+        the batch are re-derived afterwards: a batch that switches core to a new
+        checkout (or a new pin) must go on to pin the version core actually
+        became, not the one it was before the switch.
+        """
+        result = cli._extension_install_run(pip_args, constraints=None, timeout=timeout)
+        self.refresh()
+        return result
+
+    def refresh(self):
+        """Re-read the live core install; re-derive constraints and baseline."""
+        shape = cli._core_install_shape()
+        self._baseline = shape
+        self._constraints = self._derive(shape)
+        return shape
+
+    def _check(self) -> Optional[str]:
+        """Describe how core drifted from the policy, or None if it conforms.
+
+        Private on purpose: asking without acting is prevention without
+        detection, the exact half-fix that let #2949 stay silent. Callers go
+        through :meth:`resolve` (or :meth:`verify`), which cannot look without
+        also repairing and reporting.
+        """
+        from kestrel_sovereign.feature_reconcile import describe_core_change
+
+        if not self.policy.guarded:
+            return None
+        return describe_core_change(self.before, cli._core_install_shape(), self.policy)
+
+    def _repair(self):
+        """Reinstall core from its declared source. Returns ``(ok, command, result)``."""
+        if self.policy.editable:
+            checkout = str(Path(self.policy.editable).expanduser())
+            pip_args = ["-e", checkout]
+        else:
+            # Declared from the index. A --force-reinstall is only needed to
+            # displace an editable link; a version outside the window is fixed
+            # by resolving the declared spec again.
+            spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
+            pip_args = (
+                ["--force-reinstall", spec]
+                if cli._editable_install_path(CORE_DISTRIBUTION) else [spec]
+            )
+        result = cli._extension_install_run(pip_args, constraints=None)
+        rendered = "uv pip install " + " ".join(pip_args)
+        if result.returncode == 0:
+            self.refresh()
+        return result.returncode == 0, rendered, result
+
+    def resolve(self) -> CoreGuardOutcome:
+        """Check core against the policy, and repair it if it drifted.
+
+        The one place that decides what a drift means and what to do about it,
+        so the CLI (:meth:`verify`) and the HTTP install endpoint cannot answer
+        that question differently — a divergence there is how one surface ends
+        up reporting success over a core the other would have refused.
+
+        Repair success is judged by RE-CHECKING core, not by the installer's
+        exit code: a reinstall that returned 0 and still left core off its
+        declared source is not a repair.
+        """
+        from kestrel_sovereign.feature_reconcile import core_install_matches
+
+        drift = self._check()
+        if drift is None:
+            return CoreGuardOutcome()
+
+        # Distinguish "the batch broke it" from "it never got there": both are
+        # failures, but only the first is a swap.
+        replaced = core_install_matches(self._baseline, self.policy)
+        ok, rendered, result = self._repair()
+        repaired = ok and self._check() is None
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=repaired,
+            command=rendered,
+            output="" if repaired else (result.stderr or result.stdout or "").strip(),
+        )
+
+    def verify(self) -> int:
+        """Assert core survived the batch; repair and report if it did not.
+
+        Returns 0 when core conforms (or nothing is guarded), 1 when it moved —
+        so no command can report success over a core that was replaced, even
+        when the re-link succeeded.
+        """
+        outcome = self.resolve()
+        if outcome.drift is None:
+            return 0
+
+        print(f"• core: ERROR — {outcome.headline}.", file=sys.stderr)
+        for line in outcome.drift.splitlines():
+            print(f"    {line}", file=sys.stderr)
+        if outcome.repaired:
+            print(f"    restored: {outcome.command}", file=sys.stderr)
+        else:
+            print(
+                f"    RESTORE FAILED — run `{outcome.command}` by hand.",
+                file=sys.stderr,
+            )
+            for line in outcome.output.splitlines()[-3:]:
+                print(f"      {line}", file=sys.stderr)
+        return 1
 
 
 def _capture_host_manifest(path: Path) -> int:
@@ -614,8 +854,6 @@ def _capture_host_manifest(path: Path) -> int:
     first-class entry makes the intended source of core explicit rather than
     assumed (issue #2949).
     """
-    from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION
-
     dists = cli._installed_extension_distributions()
 
     lines = [
@@ -669,19 +907,13 @@ def _registry_info_for(label: str, registry: dict):
 def _version_satisfies(version: str, spec: str) -> bool:
     """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
 
-    An empty spec means "any version". When the spec can't be evaluated
-    (``packaging`` missing or a malformed value) we conservatively return True
-    so sync doesn't churn-reinstall on an unparseable pin.
+    One implementation, shared with the core-guard's policy check — a second
+    copy is how "installed satisfies the pin" and "core satisfies the pin" drift
+    apart.
     """
-    if not spec:
-        return True
-    try:
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import Version
+    from kestrel_sovereign.feature_reconcile import version_satisfies
 
-        return Version(version) in SpecifierSet(spec)
-    except Exception:  # noqa: BLE001
-        return True
+    return version_satisfies(version, spec)
 
 
 def _resolve_manifest_action(entry: dict, registry: dict):
@@ -732,6 +964,22 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     return target, current, action
 
 
+def _core_entry_first(entries: list, registry: dict) -> list:
+    """Manifest order, with any ``kestrel-sovereign`` entry moved to the front.
+
+    Core's declared source has to be applied before the batch derives its pin
+    from the installed state, and before any feature can drag core somewhere the
+    manifest didn't declare. Order among the remaining entries is preserved so
+    the operator's file still reads the way it runs (issue #2949).
+    """
+    def is_core(entry) -> bool:
+        info = _registry_info_for(entry["name"], registry)
+        return (info.package if info else entry["name"]) == CORE_DISTRIBUTION
+
+    core = [e for e in entries if is_core(e)]
+    return core + [e for e in entries if not is_core(e)] if core else entries
+
+
 def cmd_feature_sync(args) -> int:
     """Restore the host's declared feature packages (counterpart to upgrade)."""
     from kestrel_sovereign.feature_registry import load_registry
@@ -764,16 +1012,20 @@ def cmd_feature_sync(args) -> int:
     dry_run = getattr(args, "dry_run", False)
 
     # Every kestrel-feature-* depends on kestrel-sovereign, so any of these
-    # installs can resolve core from the index and replace an editable checkout
-    # with a wheel copy. Pin core to the checkout's version for the whole batch
-    # (prevention) and re-check the link afterwards (detection) — issue #2949.
+    # installs can resolve core from the index and replace the declared core.
+    # Hold core inside the manifest's policy for the whole batch (prevention)
+    # and re-check it afterwards (detection) — issue #2949.
     from kestrel_sovereign import feature_reconcile as fr
 
-    core_before = cli._core_install_shape()
-    core_guard = fr.resolve_core_guard(
-        fr.build_source_index(entries, registry), core_before.editable_path,
-    )
-    core_constraints = fr.core_install_constraints(core_before, core_guard)
+    guard = CoreInstallGuard.snapshot(fr.build_source_index(entries, registry))
+
+    # The manifest is a declaration, not a program: its order says nothing about
+    # dependency order. Core is what every other entry depends on, so its
+    # declared source must be applied BEFORE the batch derives a pin from the
+    # installed state — otherwise an operator who moves core to a new checkout
+    # and lists it last pins every earlier install to the version core had
+    # *before* the switch.
+    entries = _core_entry_first(entries, registry)
 
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
@@ -816,8 +1068,10 @@ def cmd_feature_sync(args) -> int:
 
         # Core is never constrained against itself — a `kestrel-sovereign`
         # manifest entry IS the operator deliberately moving core's source.
-        constraints = None if target == fr.CORE_DISTRIBUTION else core_constraints
-        result = cli._extension_install_run(pip_args, constraints=constraints)
+        # `install_core` re-derives the batch pin from what core became.
+        is_core = target == fr.CORE_DISTRIBUTION
+        run = guard.install_core if is_core else guard.run
+        result = run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
         # `feature install`). Editable installs have no remote fallback. A
         # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
@@ -832,13 +1086,20 @@ def cmd_feature_sync(args) -> int:
         ):
             git_ref = f"git+{git_urls[target]}"
             git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
-            result = cli._extension_install_run([git_spec], constraints=constraints)
+            result = run([git_spec])
 
         if result.returncode != 0:
             rc = 1
             print(f"  {target:<34} {current or '-':<10} FAILED")
             for line in (result.stderr or "").strip().splitlines()[-3:]:
                 print(f"      {line}")
+            if not is_core and guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]} for "
+                    "this install so a feature cannot silently replace it. If "
+                    "this is a version conflict, move core to a version the "
+                    "feature accepts — do not remove the pin."
+                )
             continue
 
         installed += 1
@@ -853,7 +1114,7 @@ def cmd_feature_sync(args) -> int:
         # Constraints prevent the common swap; this catches every other path
         # (a feature's own build step, a direct pip call) so sync can never
         # report success over a core that was replaced (issue #2949).
-        if cli._restore_core_editable_install(core_before, core_guard):
+        if guard.verify():
             rc = 1
     return rc
 
@@ -927,13 +1188,28 @@ def cmd_feature_status(args) -> int:
     for entry in entries:
         info = _registry_info_for(entry["name"], registry)
         target, current, action = _resolve_manifest_action(entry, registry)
-        is_feature = bool(info) and info.boundary in {
-            PackageBoundary.BUNDLED,
-            PackageBoundary.FEATURE_PACKAGE,
-        }
+        if target == CORE_DISTRIBUTION:
+            # A `kestrel-sovereign` manifest entry (written by `sync --capture`
+            # since #2949) declares where CORE comes from. It is a source
+            # policy, not one lifecycle feature, and it cannot be rendered as
+            # one: dozens of bundled features share the `kestrel-sovereign`
+            # package, so `_registry_info_for` resolves the entry to whichever
+            # bundled row the registry happens to list first (`identity`) and
+            # the agent's catalog collapses every bundled feature's status under
+            # that one package key, last-writer-wins. A per-agent column here
+            # would report an arbitrary bundled feature's state under core's
+            # name. Its install state IS shown — in the host table below, which
+            # is the level a source policy lives at.
+            display, is_feature = CORE_DISTRIBUTION, False
+        else:
+            display = info.name if info else entry["name"]
+            is_feature = bool(info) and info.boundary in {
+                PackageBoundary.BUNDLED,
+                PackageBoundary.FEATURE_PACKAGE,
+            }
         targets.append(
             {
-                "display": info.name if info else entry["name"],
+                "display": display,
                 "package": target,
                 "current": current,
                 "action": action,

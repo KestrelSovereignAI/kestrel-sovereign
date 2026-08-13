@@ -1603,7 +1603,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _query_agent_feature_catalog,
     _editable_install_path,
     _core_install_shape,
-    _restore_core_editable_install,
+    CoreInstallGuard,
     _installed_extension_distributions,
     _registry_info_for,
     _load_host_manifest,

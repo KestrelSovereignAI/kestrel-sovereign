@@ -13,6 +13,7 @@ from kestrel_sovereign.feature_registry import (
     FeatureStatus,
     SkillInfo,
 )
+from tests.utils.fake_uv import CORE, FakeUv, use_fake_uv
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +547,138 @@ class TestInstallFeature:
             resp = client.post("/api/features/Unknown/install")
 
         assert resp.status_code == 404
+
+    # -- core install guard (#2949) -----------------------------------------
+    #
+    # Installing from the console is not a safer path than installing from the
+    # CLI: the package depends on kestrel-sovereign, so an unguarded install can
+    # resolve core from the index and replace the running editable core. Same
+    # venv/resolver double as the CLI tests (tests/utils/fake_uv.py) — the two
+    # surfaces claim identical behaviour, so they are held to one model.
+
+    @staticmethod
+    def _venv(monkeypatch, **kw):
+        venv = FakeUv(feature="kestrel-feature-test", core_checkout="/src/core", **kw)
+        use_fake_uv(monkeypatch, venv)
+        return venv
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_pins_core_to_the_editable_checkout(self, mock_registry, monkeypatch):
+        """The regression, over HTTP: a feature requiring core > the checkout's
+        version fails loudly instead of replacing the editable install."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch)  # editable core 0.52.0; feature wants >=0.53
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        assert "No solution found" in resp.json()["detail"]
+        assert venv.pins == ["==0.52.0"]  # the pin reached the resolver
+        assert venv.editable[CORE] == "/src/core"  # link intact
+        assert "kestrel-feature-test" not in venv.installed
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_succeeds_when_the_checkout_satisfies_the_feature(
+        self, mock_registry, monkeypatch
+    ):
+        """The pin must not manufacture failures."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, feature_requires=">=0.52")
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "installed"
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
+        assert venv.editable[CORE] == "/src/core"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
+        """An install that bypassed the pin cannot return a clean 'installed'."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, honours_constraints=False)
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        body = resp.json()
+        assert resp.status_code == 200  # the package really did install...
+        assert body["status"] == "installed_with_core_drift"  # ...but say so
+        assert body["core_restored"] is True
+        assert "expected: editable → /src/core" in body["core_drift"]
+        assert venv.editable[CORE] == "/src/core"  # actually re-linked
+        assert venv.installed[CORE] == "0.52.0"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_failed_install_still_verifies_and_restores_core(
+        self, mock_registry, monkeypatch
+    ):
+        """A non-zero install is not a no-op.
+
+        pip resolves and installs dependencies BEFORE the requested package, so
+        a build failure can leave core already swapped. Returning the install
+        error without checking would leave that swap in place, unnamed.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, feature_install_fails=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "Installation failed" in detail
+        assert "was replaced during the install batch" in detail
+        assert "restored: uv pip install -e /src/core" in detail
+        assert venv.editable[CORE] == "/src/core"  # repaired despite the failure
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_timed_out_install_still_verifies_and_restores_core(
+        self, mock_registry, monkeypatch
+    ):
+        """A killed install leaves whatever it had already written — including
+        a swapped core. The timeout response must not skip the check."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, feature_install_times_out=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 504
+        detail = resp.json()["detail"]
+        assert "timed out" in detail
+        assert "was replaced during the install batch" in detail
+        assert venv.editable[CORE] == "/src/core"  # repaired despite the timeout
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_fails_closed_when_core_cannot_be_restored(
+        self, mock_registry, monkeypatch
+    ):
+        """The worst case: the package installed, core was replaced, and the
+        re-link failed. The host is running a core nobody declared — that is
+        not a 2xx, whatever happened to the package."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, repair_fails=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "was replaced during the install batch" in detail
+        # The operator's command, verbatim — the response is the only place
+        # they will see it.
+        assert "RESTORE FAILED — run `uv pip install -e /src/core` by hand." in detail
+        assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
 
 
 # ---------------------------------------------------------------------------

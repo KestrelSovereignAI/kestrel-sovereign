@@ -53,7 +53,7 @@ class _PipSpy:
         self.calls = []
         self.installed_line = installed_line
 
-    def __call__(self, cmd, capture_output=True, text=True):
+    def __call__(self, cmd, capture_output=True, text=True, timeout=None):
         self.calls.append(cmd)
         return subprocess.CompletedProcess(
             cmd, 0, stdout=self.installed_line, stderr=""
@@ -221,7 +221,7 @@ def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, ca
 
     calls = []
 
-    def flaky_run(cmd, capture_output=True, text=True):
+    def flaky_run(cmd, capture_output=True, text=True, timeout=None):
         calls.append(cmd)
         # First (PyPI) attempt fails; git fallback succeeds.
         if "git+" in cmd[-1]:
@@ -241,8 +241,6 @@ def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, ca
 
 def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, capsys):
     """upgrade goes through _extension_install_run (uv-aware), not bare python -m pip."""
-    import kestrel_sovereign.cli_features as cli_features
-
     monkeypatch.setattr(
         cli,
         "_installed_extension_distributions",
@@ -251,13 +249,16 @@ def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, caps
 
     calls = []
 
-    def fake_install(pip_args):
+    def fake_install(pip_args, *, constraints=None, timeout=None):
         calls.append(pip_args)
         return subprocess.CompletedProcess(
             pip_args, 0, stdout="Successfully installed kestrel-feature-github-0.2.0", stderr=""
         )
 
-    monkeypatch.setattr(cli_features, "_extension_install_run", fake_install)
+    # Patch the seam the command actually reaches — `cli._extension_install_run`,
+    # via CoreInstallGuard. Patching the cli_features global instead leaves the
+    # command shelling out to a real `uv pip install`.
+    monkeypatch.setattr(cli, "_extension_install_run", fake_install)
 
     rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
 

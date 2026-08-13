@@ -105,35 +105,68 @@ class CoreInstallShape:
         return f"{where} ({self.version or 'not installed'})"
 
 
-def resolve_core_guard(
+@dataclass
+class CoreSourcePolicy:
+    """Where the core distribution must come from, for a batch of installs.
+
+    At most one of the two is set:
+
+      * ``editable`` — the checkout core must stay PEP 660-linked to.
+      * ``pypi`` — the operator deliberately declared core comes from the index;
+        the value is the declared PEP 440 spec (``""`` means "any version").
+
+    Neither set means core is an unmanaged wheel: nothing was declared and there
+    is no editable link to protect, so the batch imposes no policy.
+    """
+
+    editable: Optional[str] = None
+    pypi: Optional[str] = None
+
+    @property
+    def guarded(self) -> bool:
+        """Does this policy constrain and verify anything at all?"""
+        return bool(self.editable) or bool(self.pypi)
+
+    def describe_expected(self) -> str:
+        if self.editable:
+            return f"editable → {self.editable}"
+        if self.pypi:
+            return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
+        return "unconstrained"
+
+
+def resolve_core_policy(
     source_index: Dict[str, SourceEntry],
     detected_editable: Optional[str],
-) -> Optional[str]:
-    """The checkout core must stay editable-linked to, or None for "don't guard".
+) -> CoreSourcePolicy:
+    """Decide the :class:`CoreSourcePolicy` for a batch of feature installs.
 
     Every ``kestrel-feature-*`` depends on ``kestrel-sovereign``, so a feature
-    install can resolve core from the index and replace an editable link with a
-    wheel copy. Guarding requires knowing which checkout core is *supposed* to
-    come from:
+    install can resolve core from the index and replace whatever is installed.
+    Guarding requires knowing where core is *supposed* to come from:
 
-      1. An explicit ``kestrel-sovereign`` entry in the source map. ``editable``
-         names the checkout; ``pypi`` declares core is deliberately a wheel, so
-         there is nothing to guard.
+      1. An explicit ``kestrel-sovereign`` entry in the source map wins.
+         ``editable`` names the checkout; ``pypi`` declares core is deliberately
+         a wheel — and a non-empty spec is still a declaration the batch must
+         honour, so a feature cannot drag core outside the operator's window
+         (issue #2949).
       2. Otherwise the venv's own live editable link — captured *before* the
-         installs run. When core is already a wheel there is no link to protect
-         and no editable install is invented for the operator.
+         installs run. When core is already an undeclared wheel there is no link
+         to protect and no editable install is invented for the operator.
     """
     src = source_index.get(CORE_DISTRIBUTION)
     if src is not None:
         if src.editable:
-            return src.editable
+            return CoreSourcePolicy(editable=src.editable)
         if src.pypi is not None:
-            return None
-    return detected_editable or None
+            return CoreSourcePolicy(pypi=src.pypi)
+    return CoreSourcePolicy(editable=detected_editable or None)
 
 
-def core_install_constraints(shape: "CoreInstallShape", guard: Optional[str]) -> List[str]:
-    """Constraint lines that pin core to the version the checkout provides.
+def core_install_constraints(
+    shape: "CoreInstallShape", policy: "CoreSourcePolicy",
+) -> List[str]:
+    """Constraint lines that hold core inside *policy* for one install.
 
     ``uv pip`` is uv's *pip-compatible* layer: it resolves against a bare
     virtualenv and never reads ``uv.lock`` or the project config, so it cannot
@@ -142,33 +175,73 @@ def core_install_constraints(shape: "CoreInstallShape", guard: Optional[str]) ->
     installed version fails a feature's pin, fetches a wheel from the index —
     silently replacing the editable link (issue #2949).
 
-    Pinning ``kestrel-sovereign==<checkout version>`` removes the index as a
-    candidate: either the feature's requirement is satisfiable by the checkout
-    (install proceeds, link untouched) or the resolve fails loudly with the real
-    version skew. Returns an empty list when there is nothing to guard.
+    * Editable policy → ``kestrel-sovereign==<installed version>``. That removes
+      the index as a candidate: either the feature's requirement is satisfiable
+      by the checkout (install proceeds, link untouched) or the resolve fails
+      loudly with the real version skew. *shape* must be the state core is in
+      when the install runs — re-snapshot after moving core, or the batch pins a
+      version that is no longer installed.
+    * PyPI policy → the operator's own declared spec, verbatim. Core may move
+      inside the declared window (that is what declaring a range means) but a
+      feature cannot drag it outside.
+
+    Returns an empty list when there is nothing to hold.
     """
-    if not guard or not shape.version:
-        return []
-    return [f"{CORE_DISTRIBUTION}=={shape.version}"]
+    if policy.editable:
+        return [f"{CORE_DISTRIBUTION}=={shape.version}"] if shape.version else []
+    if policy.pypi:
+        return [f"{CORE_DISTRIBUTION}{policy.pypi}"]
+    return []
+
+
+def version_satisfies(version: Optional[str], spec: Optional[str]) -> bool:
+    """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
+
+    An empty spec means "any version". A missing version never satisfies a
+    non-empty spec. When the spec can't be evaluated (malformed value) we
+    conservatively return True rather than manufacture a violation.
+    """
+    if not spec:
+        return True
+    if not version:
+        return False
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        return Version(version) in SpecifierSet(spec)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") -> bool:
+    """Is core installed the way *policy* requires?
+
+    Editable policy: still linked to the declared checkout. Version drift on an
+    intact link is normal (the checkout can be reinstalled) and is not a
+    mismatch. PyPI policy: not editable *and* inside the declared window — a
+    feature that pulled core past ``<0.53`` violates the manifest just as loudly
+    as one that dropped an editable link.
+    """
+    if policy.editable:
+        return _same_path(shape.editable_path, policy.editable)
+    if policy.pypi:
+        return not shape.is_editable and version_satisfies(shape.version, policy.pypi)
+    return True
 
 
 def describe_core_change(
     before: "CoreInstallShape",
     after: "CoreInstallShape",
-    guard: str,
+    policy: "CoreSourcePolicy",
 ) -> Optional[str]:
-    """Describe how core's install shape drifted from *guard*, or None if intact.
-
-    Intact means "still editable-linked to the guarded checkout". Version drift
-    on an intact link is normal (the checkout can be reinstalled) and is not
-    reported.
-    """
-    if _same_path(after.editable_path, guard):
+    """Describe how core's install drifted from *policy*, or None if it matches."""
+    if core_install_matches(after, policy):
         return None
     return (
         f"before: {before.describe()}\n"
         f"after:  {after.describe()}\n"
-        f"expected: editable → {guard}"
+        f"expected: {policy.describe_expected()}"
     )
 
 

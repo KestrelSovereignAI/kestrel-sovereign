@@ -137,6 +137,22 @@ class TestFeatureList:
 # Tests: cmd_feature_install
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def unguarded_core(monkeypatch):
+    """Core installed as a plain wheel: nothing for the #2949 guard to pin.
+
+    ``cmd_feature_install`` snapshots the live core install to build its guard.
+    Without this the tests would read the developer's real venv, so the
+    constraint they assert on would depend on who ran them.
+    """
+    from kestrel_sovereign import cli
+    from kestrel_sovereign.feature_reconcile import CoreInstallShape
+
+    monkeypatch.setattr(
+        cli, "_core_install_shape", lambda: CoreInstallShape(version="0.52.0"),
+    )
+
+
 class TestFeatureInstall:
 
     @patch("kestrel_sovereign.feature_registry.load_registry")
@@ -159,9 +175,11 @@ class TestFeatureInstall:
         assert result == 1
         assert "Unknown" in capsys.readouterr().out
 
-    @patch("kestrel_sovereign.cli_features._extension_install_run")
+    @patch("kestrel_sovereign.cli._extension_install_run")
     @patch("kestrel_sovereign.feature_registry.load_registry")
-    def test_install_routes_through_uv_aware_helper(self, mock_load, mock_install, capsys):
+    def test_install_routes_through_uv_aware_helper(
+        self, mock_load, mock_install, unguarded_core, capsys,
+    ):
         """install goes through _extension_install_run (uv-aware), not bare python -m pip."""
         from kestrel_sovereign.cli import cmd_feature_install
 
@@ -173,12 +191,14 @@ class TestFeatureInstall:
         assert result == 0
 
         # Verify the uv-aware helper was called with the package spec
-        mock_install.assert_called_once_with(["kestrel-feature-wallet"])
+        mock_install.assert_called_once_with(
+            ["kestrel-feature-wallet"], constraints=None, timeout=None,
+        )
 
-    @patch("kestrel_sovereign.cli_features._extension_install_run")
+    @patch("kestrel_sovereign.cli._extension_install_run")
     @patch("kestrel_sovereign.feature_registry.load_registry")
     def test_install_accepts_registered_xai_distribution_name(
-        self, mock_load, mock_install, capsys,
+        self, mock_load, mock_install, unguarded_core, capsys,
     ):
         """The PyPI distribution name is a first-class install identifier."""
         from kestrel_sovereign.cli import cmd_feature_install
@@ -210,12 +230,14 @@ class TestFeatureInstall:
         result = cmd_feature_install(_make_args(name="kestrel-voice-xai"))
 
         assert result == 0
-        mock_install.assert_called_once_with(["kestrel-voice-xai"])
+        assert mock_install.call_args.args[0] == ["kestrel-voice-xai"]
         assert "Installed kestrel-voice-xai" in capsys.readouterr().out
 
-    @patch("kestrel_sovereign.cli_features._extension_install_run")
+    @patch("kestrel_sovereign.cli._extension_install_run")
     @patch("kestrel_sovereign.feature_registry.load_registry")
-    def test_install_git_fallback_uses_uv_aware_helper(self, mock_load, mock_install, capsys):
+    def test_install_git_fallback_uses_uv_aware_helper(
+        self, mock_load, mock_install, unguarded_core, capsys,
+    ):
         """A failed PyPI install falls back to git+ through the same uv-aware helper."""
         from kestrel_sovereign.cli import cmd_feature_install
 

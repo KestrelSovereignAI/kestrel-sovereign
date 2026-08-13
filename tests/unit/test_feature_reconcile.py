@@ -434,3 +434,103 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
     assert no_source == []
     (a,) = actions
     assert a.mode == "pypi" and a.source == "kestrel-feature-voice>=0.3"
+
+
+# --- core source policy (#2949) --------------------------------------------
+#
+# Every kestrel-feature-* depends on kestrel-sovereign, so a feature install can
+# resolve core from the index. These pin the *policy*: where core is supposed to
+# come from, what constraint that implies, and what counts as a violation.
+
+
+def _shape(version=None, editable_path=None):
+    return fr.CoreInstallShape(version=version, editable_path=editable_path)
+
+
+def test_core_policy_defaults_to_the_live_editable_link():
+    """No manifest entry: protect the link the venv actually has."""
+    policy = fr.resolve_core_policy({}, "/src/core")
+    assert policy.editable == "/src/core" and policy.pypi is None
+    assert policy.guarded
+
+
+def test_core_policy_is_unguarded_for_an_undeclared_wheel():
+    """Core already a wheel and nothing declared — there is no link to protect
+    and no editable install is invented for the operator."""
+    policy = fr.resolve_core_policy({}, None)
+    assert not policy.guarded
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
+
+
+def test_core_policy_prefers_the_manifest_over_the_live_link():
+    """An explicit entry is the operator moving core; the live link does not
+    override their declaration."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, editable="/src/next")}
+    policy = fr.resolve_core_policy(idx, "/src/old")
+    assert policy.editable == "/src/next"
+
+
+def test_core_policy_carries_a_declared_pypi_window():
+    """A `pypi` entry declares a wheel — and a non-empty spec is still a
+    declaration the batch must hold, not a waiver of the guard."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
+    policy = fr.resolve_core_policy(idx, "/src/old")
+    assert policy.editable is None and policy.pypi == ">=0.52,<0.53"
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == [
+        "kestrel-sovereign>=0.52,<0.53"
+    ]
+
+
+def test_core_policy_with_an_empty_pypi_spec_constrains_nothing():
+    """`pypi = ""` is "any version from the index" — nothing to hold it to."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi="")}
+    policy = fr.resolve_core_policy(idx, "/src/old")
+    assert not policy.guarded
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
+
+
+def test_editable_constraint_tracks_the_installed_version():
+    """The pin is `==<what is installed now>`, so it must be derived from the
+    shape at install time — re-snapshot after moving core."""
+    policy = fr.resolve_core_policy({}, "/src/core")
+    assert fr.core_install_constraints(_shape("0.52.0", "/src/core"), policy) == [
+        "kestrel-sovereign==0.52.0"
+    ]
+    assert fr.core_install_constraints(_shape("0.53.0", "/src/core"), policy) == [
+        "kestrel-sovereign==0.53.0"
+    ]
+
+
+def test_editable_policy_tolerates_version_drift_but_not_a_lost_link():
+    """Reinstalling the checkout is normal; losing the link is the defect."""
+    policy = fr.resolve_core_policy({}, "/src/core")
+    assert fr.core_install_matches(_shape("0.99.0", "/src/core"), policy)
+    assert not fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(_shape("0.52.0", "/src/other"), policy)
+
+
+def test_pypi_policy_is_violated_by_a_version_outside_the_window():
+    """A feature that dragged core past `<0.53` violated the manifest just as
+    loudly as one that dropped an editable link."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
+    policy = fr.resolve_core_policy(idx, None)
+    assert fr.core_install_matches(_shape("0.52.1", None), policy)
+    assert not fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(_shape("0.52.1", "/src/core"), policy)
+
+
+def test_describe_core_change_names_before_after_and_expected():
+    policy = fr.resolve_core_policy({}, "/src/core")
+    described = fr.describe_core_change(
+        _shape("0.52.0", "/src/core"), _shape("0.53.0", None), policy,
+    )
+    assert "before: editable → /src/core (0.52.0)" in described
+    assert "after:  non-editable (site-packages copy) (0.53.0)" in described
+    assert "expected: editable → /src/core" in described
+    assert fr.describe_core_change(
+        _shape("0.52.0", "/src/core"), _shape("0.53.0", "/src/core"), policy,
+    ) is None
