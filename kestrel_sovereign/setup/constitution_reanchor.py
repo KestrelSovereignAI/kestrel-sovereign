@@ -479,7 +479,14 @@ async def reanchor_constitution(
                 f"{target.describe()}: {exc!r}. Nothing was written."
             ),
         )
-    if old_hash is None and not target.writes_to_anchor:
+    # ``agent_did`` comes back ``""`` only on the absent-node return; a node
+    # that exists but carries no ``constitution_hash`` returns its real DID
+    # with ``old_hash=None``. Gating on ``old_hash`` alone conflated the two
+    # and sent a *present but unanchored* PostgreSQL agent to SQLite — writing
+    # the local file while the runtime node it will actually boot from stayed
+    # unanchored and safe-mode-bound. Absence is the only state first-boot
+    # replication repairs, so absence is the only state that retargets.
+    if not agent_did and not target.writes_to_anchor:
         # PostgreSQL has nothing for this agent. Boot does not fail there: it
         # copies the birth record out of the local anchor (#2871) and audits
         # *that*, so the bytes that will govern this agent at its next start

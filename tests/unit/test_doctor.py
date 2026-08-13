@@ -1753,3 +1753,38 @@ def test_sqlite_hosts_never_reach_for_postgres(tmp_path, monkeypatch):
 
     assert not fake.executed
     assert any(stored[:12] in m for m in report.ok)
+
+
+def test_an_unowned_row_in_the_anchor_is_not_ready(tmp_path, monkeypatch):
+    """The SQLite mirror of the PostgreSQL case, and it is not pending anything.
+
+    DID discovery reads the anchor unscoped, so a DID means the row is there.
+    The ledger exists, so this is not a database awaiting the #2649 backfill.
+    The witness is therefore missing or foreign — and the agent's own bound
+    store cannot see its agent node either, so startup fails and ``add_node``
+    will not overwrite a foreign-owned row to repair it. Warning let doctor
+    exit Ready, having also skipped the edge and overlay checks.
+    """
+    _seed_matching_anchor(tmp_path, monkeypatch, witness_node=False)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    assert any("is not owned by" in m for m in report.fail), report.fail
+    # Named as what it is: reanchoring cannot fix an ownership ledger.
+    assert any("not constitution drift" in m for m in report.fail)
+
+
+def test_a_pre_migration_anchor_still_only_warns(tmp_path, monkeypatch):
+    """Without the ledger there is nothing to be unowned by — that database is
+    simply older than #2649, and boot backfills it."""
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _legacy_graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+    )
+    source = _resolve_governance_source(db, {})
+
+    assert source.ownership_ledger is False
+    assert not isinstance(_read_agent_node(source), _NoAgentNode)

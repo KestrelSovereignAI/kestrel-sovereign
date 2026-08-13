@@ -623,3 +623,38 @@ async def test_a_replicated_agent_still_reanchors_in_postgres(
     # PostgreSQL's hash, not the anchor's: the runtime holds this agent.
     assert result.old_hash == stale
     assert "postgres" in (result.target_label or "")
+
+
+async def test_a_present_but_unanchored_postgres_node_stays_in_postgres(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Present-without-a-hash is not absent, and only absence retargets.
+
+    ``_read_agent_anchor`` returns ``old_hash=None`` for both, so gating the
+    retarget on the hash sent a *present but unanchored* PostgreSQL agent to
+    SQLite: the local file would be written while the runtime node it actually
+    boots from stayed unanchored and safe-mode-bound. Absence is the only state
+    first-boot replication repairs.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
+    )
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    # The node exists in PostgreSQL, with no constitution_hash of its own.
+    runtime_db(AGENT_DID, {"name": "Test"}, governed_by=None)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION)
+
+    result = await reanchor_constitution(
+        agent_name="Test",
+        agent_dir=tmp_path / "agent_data" / "test",
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=runtime_db.dsn,
+    )
+
+    assert "postgres" in (result.target_label or ""), result.target_label
+    assert result.error is not None
+    assert "no constitution_hash" in result.error

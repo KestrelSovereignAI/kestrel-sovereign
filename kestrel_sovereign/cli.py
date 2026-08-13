@@ -938,6 +938,35 @@ def cmd_constitution_reanchor(args) -> int:
     runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
     runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
 
+    # The database and the key that opens it must come from the same place.
+    # ``load_project_env`` above leaves an exported ``KESTREL_DATA_KEY``
+    # authoritative while the target above is the file's — so a shell still
+    # holding another home's credentials would encrypt the new constitution and
+    # its artifact into database A under key B, and the agent, opening A with
+    # A's key, would fail decryption at its next integrity audit. That is not a
+    # wrong answer an operator can see; it is a governance record nobody can
+    # read again.
+    #
+    # This refuses rather than picking a side, for the reason #2468 excludes
+    # the data key from the general load: a key conflict is the operator's to
+    # resolve, and a tool that silently chooses one has destroyed the evidence
+    # that there was a choice.
+    from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
+
+    exported_key = os.environ.get(DATA_KEY_ENV)
+    launch_key = launch_env.get(DATA_KEY_ENV)
+    if exported_key and launch_key and exported_key != launch_key:
+        print(
+            f"error: {DATA_KEY_ENV} in the environment does not match the one "
+            f"in {project_dir / '.env'}.\n"
+            f"  The agent opens its database with the file's key; a reanchor "
+            f"run now would write governance the agent cannot decrypt.\n"
+            f"  Unset {DATA_KEY_ENV} to use the project's key, or correct the "
+            f"file, then re-run.",
+            file=sys.stderr,
+        )
+        return 2
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )

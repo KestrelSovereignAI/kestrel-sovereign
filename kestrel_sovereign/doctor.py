@@ -787,6 +787,24 @@ def _check_constitution_drift(
             _report_unexamined(name, node.reason, source, report)
             continue
         if isinstance(node, _NoAgentNode):
+            if source.reads_the_anchor and source.ownership_ledger:
+                # The anchor is the file DID discovery just read a DID *out
+                # of*, so the row is certainly there — and the ledger exists,
+                # so this is not a database awaiting the ownership backfill.
+                # The witness is missing or belongs to someone else, which
+                # means the agent's own bound store cannot see its agent node
+                # either: it fails at startup, and `add_node` will not
+                # overwrite a foreign-owned row to repair it. Warning here let
+                # doctor exit Ready, having also skipped the edge and overlay
+                # checks, for a host that cannot boot.
+                report.fail.append(
+                    f"{name}: the agent row in {source.anchor_path} is not "
+                    f"owned by {source.agent_did} — the agent's own storage "
+                    f"cannot see it, so startup fails. This is an ownership "
+                    f"ledger problem, not constitution drift; reanchoring will "
+                    f"not clear it."
+                )
+                continue
             report.warn.append(
                 f"{name}: constitution drift check skipped — no agent node "
                 f"owned by {source.agent_did} in {source.describe()}"

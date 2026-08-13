@@ -623,3 +623,75 @@ def test_constitution_with_no_subcommand_prints_usage(reanchor_env, capsys):
         rc = cmd_constitution(args)
     assert rc == 1
     assert "Usage" in capsys.readouterr().out
+
+
+def test_reanchor_refuses_a_data_key_that_will_not_open_the_target(
+    reanchor_env, monkeypatch, capsys,
+):
+    """The database and the key that opens it must come from one place.
+
+    The target is resolved with the launcher's precedence (file wins) while
+    ``load_project_env`` leaves an exported ``KESTREL_DATA_KEY`` authoritative.
+    A shell still holding another home's credentials would therefore encrypt
+    the new constitution and its artifact into database A under key B — and the
+    agent, opening A with A's key, fails decryption at its next integrity
+    audit. That is not a visible wrong answer; it is a governance record nobody
+    can read again.
+    """
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=the-projects-key\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "a-stale-exported-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    called = False
+
+    async def _must_not_run(**_kwargs):
+        nonlocal called
+        called = True
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_must_not_run,
+         ):
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    assert not called, "refused runs must not reach the writer"
+    err = capsys.readouterr().err
+    assert "KESTREL_DATA_KEY" in err
+    assert "cannot decrypt" in err
+    # It refuses rather than choosing: the conflict is the operator's to settle.
+    assert "Unset" in err
+
+
+def test_reanchor_proceeds_when_the_keys_agree(reanchor_env, monkeypatch):
+    """An exported key identical to the file's is not a conflict."""
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=the-projects-key\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "the-projects-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    reached = False
+
+    async def _capture(**_kwargs):
+        nonlocal reached
+        reached = True
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64,
+            new_hash="a" * 64,
+            backup_path=None,
+            unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    assert reached
