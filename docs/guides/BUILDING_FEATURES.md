@@ -569,6 +569,37 @@ build-backend = "hatchling.build"
 
 The entry point is the key: the name (`GreeterFeature`) must match the class name, and the value is the dotted import path to the class.
 
+### Workflow Ownership Entry Points
+
+A Feature that contributes a named workflow through
+`get_workflow_registrations()` must also advertise metadata that maps the
+workflow name back to its owning Feature class. Publish both entry points from
+the same distribution:
+
+```toml
+[project.entry-points."kestrel_sovereign.features"]
+CodingFeature = "kestrel_feature_coding.feature:CodingFeature"
+
+[project.entry-points."kestrel_sovereign.workflow_features"]
+coding_pipeline = "kestrel_feature_coding.feature:CodingFeature"
+```
+
+The `kestrel_sovereign.workflow_features` contract is intentionally strict:
+
+- Its entry-point name is the stable workflow name exposed by the matching
+  `WorkflowRegistration`.
+- Its value must exactly match one `kestrel_sovereign.features` entry-point
+  value from the same installed distribution.
+- The matching Feature entry-point name must equal the terminal class name
+  (`CodingFeature` in the example).
+- A workflow name must have exactly one installed ownership claim. Missing,
+  duplicate, malformed, or cross-distribution claims fail closed.
+
+This entry point is metadata-only ownership discovery; Kestrel does not load
+the third-party target while resolving feature ceilings. It does not replace
+the runtime contribution: the Feature must still return the corresponding SDK
+`WorkflowRegistration` from `get_workflow_registrations()` when enabled.
+
 ### Entry Point Discovery
 
 When Kestrel starts, it:
@@ -771,10 +802,10 @@ core = false
 ```
 
 Standalone tools have no lifecycle/provider classes. Model them separately
-from any bundled control surface. The registry’s Talon rows are the reference:
-`talon` owns the bundled `TalonCoordinatorFeature` and points to
-`companion = "talon_cli"`; `talon_cli` owns the independently installed
-`kestrel-talon` command.
+from any Feature control surface. The registry’s Talon rows are the reference:
+`talon` is a `feature-package` row owned by `kestrel-feature-talon` and points
+to `companion = "talon_cli"`; `talon_cli` separately owns the independently
+installed `kestrel-talon` command.
 
 ## Complete Example
 
@@ -962,3 +993,4 @@ async def test_router_returned(mock_agent):
 | Feature registry | `kestrel_sovereign/data/feature_registry.toml` |
 | Feature discovery | `kestrel_sovereign.features.discover_features()` |
 | Entry point group | `kestrel_sovereign.features` |
+| Workflow ownership entry point group | `kestrel_sovereign.workflow_features` |

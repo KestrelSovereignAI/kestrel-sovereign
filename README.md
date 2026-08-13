@@ -21,9 +21,9 @@ Package ownership has four distinct runtime forms:
 | Boundary | Ownership and install behavior |
 |---|---|
 | **Bundled Feature** | A Feature lifecycle class discovered from `kestrel_sovereign/features/`; it ships in `kestrel-sovereign` and needs no separate install. |
-| **Extracted Feature package** | A separate distribution, such as voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
+| **Extracted Feature package** | A separate distribution, such as Talon, voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
 | **Provider package** | A separate backend distribution, such as RunPod, Vast.ai, GCP Compute, a voice cloud backend, or a storage backend, that implements a provider contract through a provider-specific entry point. It is not a Feature lifecycle package. |
-| **Standalone tool** | An independent control surface. `kestrel-talon`, for example, is installed separately; the bundled `TalonCoordinatorFeature` is only its in-agent coordinator. |
+| **Standalone tool** | An independent control surface. `kestrel-talon` is the standalone coding engine and is modeled separately from its independently installed `kestrel-feature-talon` coordinator. |
 
 The base install also contains runtime components that are not Feature
 lifecycle classes—for example, `PrivacyAgent`. The registry calls these

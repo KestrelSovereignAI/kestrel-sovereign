@@ -58,6 +58,7 @@ and the audited inventory in [`../KESTREL_FEATURES.md`](../KESTREL_FEATURES.md).
 
 | Repository | What it is |
 |---|---|
+| [kestrel-feature-talon](https://github.com/KestrelSovereignAI/kestrel-feature-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-talon/blob/main/AGENTS.md)) | In-agent coordinator, governed coding workflows, signals, waits, verification, setup, permissions, and host surfaces for Talon runs. |
 | [kestrel-feature-mcp](https://github.com/KestrelSovereignAI/kestrel-feature-mcp) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-mcp/blob/main/AGENTS.md)) | MCP server management and tool bridging — unified access to 311+ MCP servers via Docker MCP Toolkit. |
 | [kestrel-feature-github](https://github.com/KestrelSovereignAI/kestrel-feature-github) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-github/blob/main/AGENTS.md)) | GitHub integration — issues, pull requests, and repositories from agent conversations. |
 | [kestrel-feature-github-app](https://github.com/KestrelSovereignAI/kestrel-feature-github-app) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-github-app/blob/main/AGENTS.md)) | GitHub App webhook handler — responds to issues and discussions. |
@@ -123,7 +124,7 @@ platform.
 
 | Repository | What it is |
 |---|---|
-| [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-talon/blob/main/AGENTS.md)) | Autonomous GitHub/ADO issue processor with Kestrel governance — any LLM via OpenCode or Claude Agent SDK. |
+| [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-talon/blob/main/AGENTS.md)) | Standalone GitHub/ADO issue-processing engine used by the independently installed `kestrel-feature-talon` coordinator. |
 | [kestrel-eye](https://github.com/KestrelSovereignAI/kestrel-eye) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-eye/blob/main/AGENTS.md)) | Vision-verified E2E feedback loop — AI reviews screenshots until they're right. |
 | [kestrel-flight](https://github.com/KestrelSovereignAI/kestrel-flight) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-flight/blob/main/AGENTS.md)) | Playwright demo/test orchestration with narration, state, and dependency management. |
 | [kestrel-claws](https://github.com/KestrelSovereignAI/kestrel-claws) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-claws/blob/main/AGENTS.md)) | The Grip — sovereign fleet orchestration CLI for the Falconer. |

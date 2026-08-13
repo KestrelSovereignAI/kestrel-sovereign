@@ -318,6 +318,39 @@ class TestScheduleList:
         assert result.data["tasks"][1]["args"] == {"force": True}
 
     @pytest.mark.asyncio
+    async def test_list_exposes_durable_builtin_identity(self, feature):
+        """Boot migrations can distinguish a core row from a user row."""
+
+        feature._db.fetchall = AsyncMock(return_value=[(
+            "builtin-1",
+            "signal_dispatch",
+            "5 8 * * *",
+            "{}",
+            1,
+            None,
+            "2026-08-14T08:05:00+00:00",
+            "2026-08-13T08:00:00+00:00",
+            "cron",
+            None,
+            "UTC",
+            "skip",
+            None,
+            "scheduler:builtin:v1:signal_dispatch",
+            None,
+            None,
+            0,
+            None,
+            None,
+        )])
+
+        result = await feature.schedule_list()
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["tasks"][0]["idempotency_key"] == (
+            "scheduler:builtin:v1:signal_dispatch"
+        )
+
+    @pytest.mark.asyncio
     async def test_list_no_db(self, feature_no_db):
         result = await feature_no_db.schedule_list()
         assert result.status is ToolResultStatus.ERROR
@@ -375,10 +408,8 @@ class TestScheduleList:
 
 class TestRetiredCronCleanup:
     @pytest.mark.asyncio
-    async def test_post_load_removes_orphaned_cognition_retention(self):
-        """An agent upgraded from #1715 has a persisted cognition_retention
-        schedule. After #1674 removed its handler/source, post_all_features_loaded
-        must delete that orphan row so it doesn't fire forever as 'Unknown task'."""
+    async def test_post_load_removes_retired_builtin_schedules(self):
+        """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult
 
         agent = _make_mock_agent()
@@ -401,7 +432,8 @@ class TestRetiredCronCleanup:
         await f.post_all_features_loaded(agent)
 
         # The orphaned built-in was removed by id...
-        f.schedule_remove.assert_awaited_once_with("orphan-1")
+        removed_ids = {call.args[0] for call in f.schedule_remove.await_args_list}
+        assert removed_ids == {"orphan-1"}
         # ...and never re-seeded (it's no longer a default).
         readded = [
             c.kwargs.get("task_name")
@@ -411,6 +443,79 @@ class TestRetiredCronCleanup:
         # Existing defaults still take the authoritative transaction path so
         # a second pending host adopts a first host's registration-owned row.
         assert "backup_snapshot" in readded
+
+    @pytest.mark.asyncio
+    async def test_post_load_pauses_only_legacy_discovery_watches(self, caplog):
+        """Rows from the implicit-provider era cannot keep failing each tick.
+
+        Missing/blank ``args.tool`` rows are paused with an actionable
+        migration diagnostic. A watch that already names a feature-owned tool
+        is left intact.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-missing",
+                    "cron_expression": "*/15 * * * *",
+                    "args": {"repo": "owner/repo"},
+                    "enabled": True,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-blank",
+                    "cron_expression": "*/20 * * * *",
+                    "args": {"tool": "   ", "org": "owner"},
+                    "enabled": True,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-already-paused",
+                    "cron_expression": "*/25 * * * *",
+                    "args": {"repo": "owner/repo"},
+                    "enabled": False,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "configured",
+                    "cron_expression": "*/30 * * * *",
+                    "args": {
+                        "tool": "discover_ecosystem",
+                        "tool_args": {"repo": "owner/repo"},
+                    },
+                    "enabled": True,
+                },
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f.schedule_pause = AsyncMock(
+            return_value=ToolResult.ok(confirmation="paused")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await f.post_all_features_loaded(agent)
+
+        paused_ids = {call.args[0] for call in f.schedule_pause.await_args_list}
+        assert paused_ids == {"legacy-missing", "legacy-blank"}
+        assert "legacy-already-paused" not in paused_ids
+        assert "configured" not in paused_ids
+        assert "core no longer supplies an implicit discovery tool" in caplog.text
+        assert 'args_json containing an explicit enabled feature-owned tool' in caplog.text
 
     @pytest.mark.asyncio
     async def test_post_load_removes_autoseeded_consolidate_reflect_keeps_custom(self):
@@ -457,6 +562,63 @@ class TestRetiredCronCleanup:
         assert "sleep" in seeded                # the one memory-maintenance cron
         assert "memory_consolidate" not in seeded
         assert "reflect" not in seeded
+
+    @pytest.mark.asyncio
+    async def test_post_load_removes_only_builtin_signal_dispatch_identity_once(self):
+        """The former built-in row is removed without retiring the live tool.
+
+        A user-created row at the identical 08:05 cadence and payload has its
+        own durable identity and survives this and repeated boots unchanged.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        legacy_builtin = {
+            "task_name": "signal_dispatch",
+            "id": "dispatch-old-autoseed",
+            "cron_expression": "5 8 * * *",
+            "args": {},
+            "idempotency_key": "scheduler:builtin:v1:signal_dispatch",
+        }
+        same_cadence_user_row = {
+            "task_name": "signal_dispatch",
+            "id": "dispatch-user-same-cadence",
+            "cron_expression": "5 8 * * *",
+            "args": {},
+            "idempotency_key": "schedule:user-created-dispatch",
+        }
+        f.schedule_list = AsyncMock(side_effect=[
+            ToolResult.ok(
+                confirmation="first boot",
+                data={"tasks": [legacy_builtin, same_cadence_user_row]},
+            ),
+            ToolResult.ok(
+                confirmation="second boot",
+                data={"tasks": [same_cadence_user_row]},
+            ),
+        ])
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+        await f.post_all_features_loaded(agent)
+
+        f.schedule_remove.assert_awaited_once_with("dispatch-old-autoseed")
+        seeded = {
+            call.kwargs["task_name"]
+            for call in f._ensure_builtin_schedule.await_args_list
+        }
+        assert "signal_dispatch" not in seeded
 
 
 class TestSleepCronHandler:
@@ -1770,6 +1932,33 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_custom_signal_dispatch_schedule_routes_through_cron_source(
+        self, feature,
+    ):
+        """The supported source contract is independent of auto-seeding."""
+
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock(
+            return_value=SignalResult(
+                signal_id="sig-dispatch",
+                status=Status.OK,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                action_result="started",
+            )
+        )
+
+        result = await feature._dispatch_scheduled_task(
+            "signal_dispatch", {"mode": "execute"}
+        )
+
+        assert result == "started"
+        signal = feature.agent.dispatcher.dispatch_signal.await_args.args[0]
+        assert signal.source == "cron.signal_dispatch"
+        assert signal.mode is SignalMode.ACTION
+        assert signal.payload == {"mode": "execute"}
+
+    @pytest.mark.asyncio
     async def test_training_cycle_requires_current_durable_semantic_maintenance(
         self, feature,
     ):
@@ -2023,7 +2212,7 @@ class TestTranslateSignalResult:
             self._make_result(
                 Status.OK, mode=SignalMode.ACTION, action_result="ran-it"
             ),
-            "signal_dispatch",
+            "backup_snapshot",
         )
         assert result == "ran-it"
 
@@ -2071,7 +2260,7 @@ class TestTranslateSignalResult:
                 mode=SignalMode.ACTION,
                 action_result=("dispatched", 0.7),
             ),
-            "signal_dispatch",
+            "backup_snapshot",
         )
         assert result == ("dispatched", 0.7)
 
@@ -2528,12 +2717,23 @@ def _discovery_finding(**overrides):
 class TestEcosystemDiscoveryWatchHandler:
 
     @pytest.mark.asyncio
+    async def test_missing_discovery_tool_fails_closed(self, feature):
+        out = await feature._run_ecosystem_discovery_watch(
+            {"repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "configuration"
+        assert "requires a non-empty tool" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_clean_scan_does_not_signal(self, feature):
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2543,27 +2743,19 @@ class TestEcosystemDiscoveryWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_scan_stale_work_resolves_loaded_talon_tool(self, feature):
-        from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
-
-        talon = TalonCoordinatorFeature(feature.agent)
-        talon._reload_persisted_jobs = MagicMock()
-        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
-        talon._jobs = {
-            "job-1": {
-                "status": "running",
-                "started_at": old,
-                "repo": "owner/name",
-                "issue": 2281,
-            },
-        }
-        feature.agent.features = {"TalonCoordinatorFeature": talon}
+    async def test_explicit_discovery_tool_resolves_external_feature(self, feature):
+        external = _StubJobFeature()
+        external._tool.name = "discover_ecosystem"
+        external._tool.execute = AsyncMock(return_value=_discovery_finding())
+        feature.agent.features = {"ExternalDiscoveryFeature": external}
         feature.agent.hooks_manager = None
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
         feature._save_ecosystem_discovery_state = AsyncMock()
         _wire_watch_dispatcher(feature)
 
-        out = await feature._run_ecosystem_discovery_watch({"repo": "owner/name"})
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
+        )
 
         data = json.loads(out)
         assert data["signaled"] is True
@@ -2572,9 +2764,8 @@ class TestEcosystemDiscoveryWatchHandler:
         signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
         findings = json.loads(signal.payload["findings"])
         assert findings[0]["repo"] == "owner/name"
-        assert findings[0]["kind"] == "talon_job"
+        assert findings[0]["kind"] == "red_ci"
         assert findings[0]["number"] == "2281"
-        assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
 
     @pytest.mark.asyncio
     async def test_roster_args_forwarded_to_scan_tool(self, feature):
@@ -2585,7 +2776,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch({
-            "tool": "scan_stale_work",
+            "tool": "discover_ecosystem",
             "org": "KestrelSovereignAI",
             "repos": ["KestrelSovereignAI/kestrel-feature-*"],
             "repo_prefix": "KestrelSovereignAI/kestrel-",
@@ -2595,7 +2786,7 @@ class TestEcosystemDiscoveryWatchHandler:
         data = json.loads(out)
         assert data["watch_key"] == "ecosystem-roster"
         tool_name, tool_args = feature._lookup_and_run_tool.call_args.args
-        assert tool_name == "scan_stale_work"
+        assert tool_name == "discover_ecosystem"
         assert tool_args["org"] == "KestrelSovereignAI"
         assert tool_args["repos"] == ["KestrelSovereignAI/kestrel-feature-*"]
         assert tool_args["repo_prefix"] == "KestrelSovereignAI/kestrel-"
@@ -2611,7 +2802,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2651,7 +2842,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2677,7 +2868,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2704,7 +2895,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2738,7 +2929,7 @@ class TestEcosystemDiscoveryDeliveryGate:
         _wire_watch_dispatcher(feature, handle_factory)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
         await _settle_watch_deliveries(feature)
         return json.loads(out)
@@ -2822,10 +3013,10 @@ class TestEcosystemDiscoveryDeliveryGate:
         enqueue = _wire_watch_dispatcher(feature, _slow_handle)
 
         first = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
         second = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
 
         assert first["signaled"] is True
@@ -2839,7 +3030,7 @@ class TestEcosystemDiscoveryDeliveryGate:
         feature._save_ecosystem_discovery_state.assert_awaited_once()
         # Settled — the guard released, so a later change can dispatch again.
         third = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
         assert third["signaled"] is True
         assert enqueue.await_count == 2

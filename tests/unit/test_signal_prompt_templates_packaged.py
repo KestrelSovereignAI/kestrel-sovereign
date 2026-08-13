@@ -125,3 +125,14 @@ class TestPackagedTemplateInventory:
             f"signal source PROMPT_TEMPLATE constant: {sorted(orphaned)}. "
             "Either wire them into a source module or remove them."
         )
+
+
+@pytest.mark.parametrize(
+    "template_name",
+    ["wait_complete.md", "github_pr_activity.md"],
+)
+def test_core_workflow_prompts_are_provider_neutral(package_root, template_name):
+    """Core wake instructions must not prescribe an extracted provider."""
+
+    text = (package_root / "prompts" / "signals" / template_name).read_text()
+    assert "talon" not in text.lower()

@@ -1292,7 +1292,6 @@ async def test_postgres_concurrent_builtin_seeders_insert_each_default_once(
         ) == [
             ("backup_snapshot", 1, "scheduler:builtin:v1:backup_snapshot"),
             ("morning_signal", 1, "scheduler:builtin:v1:morning_signal"),
-            ("signal_dispatch", 1, "scheduler:builtin:v1:signal_dispatch"),
             ("trash_retention", 1, "scheduler:builtin:v1:trash_retention"),
             ("wait_reconcile", 1, "scheduler:builtin:v1:wait_reconcile"),
         ]
@@ -1459,12 +1458,10 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             ) == [
                 ("backup_snapshot", 1),
                 ("morning_signal", 1),
-                ("signal_dispatch", 1),
                 ("trash_retention", 1),
                 ("wait_reconcile", 1),
                 ("backup_snapshot", 1),
                 ("morning_signal", 1),
-                ("signal_dispatch", 1),
                 ("trash_retention", 1),
                 ("wait_reconcile", 1),
             ]

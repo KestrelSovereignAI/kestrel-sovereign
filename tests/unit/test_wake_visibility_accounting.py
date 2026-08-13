@@ -55,8 +55,8 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
-from kestrel_sovereign.signals.sources.talon import (
-    build_talon_job_complete_registration,
+from kestrel_sovereign.signals.sources.wait import (
+    build_wait_complete_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.waits.engine import WaitRegistry
@@ -125,15 +125,15 @@ class _RaisingEmitAgent(_EventAgent):
 
 
 class _JobProvider:
-    """A MonitorableWaitable over one finished Talon-shaped job.
+    """A MonitorableWaitable over one finished provider-owned job.
 
     Declares ``origin_session_id`` so the reconciler can bind the wake — the
     provider-side half of #2877, and the precondition for a wake having a chat
     window to surface into at all.
     """
 
-    kind = "talon"
-    signal = "talon.job_complete"
+    kind = "example"
+    signal = "wait.complete"
 
     def __init__(self, *, origin_session_id: str | None = "chat-sess-1"):
         self._origin = origin_session_id
@@ -166,7 +166,7 @@ async def rig(tmp_path, sqlite_database_factory):
     await store.initialize()
 
     registry = SourceRegistry()
-    registry.register(build_talon_job_complete_registration())
+    registry.register(build_wait_complete_registration())
 
     db = await sqlite_database_factory(tmp_path / "agent.db")
 
@@ -310,7 +310,7 @@ async def test_bound_wake_reaching_a_live_listener_records_ok_queued(rig):
     assert [e for e in seen if e[0] == "signal_completed"], (
         "the bound wake must reach the SSE forwarder at all"
     )
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_queued"
     assert row.last_surface_status == SURFACE_QUEUED
     assert harvest.data["signals_persisted"] == 1
@@ -340,7 +340,7 @@ async def test_every_forwarder_failing_is_recorded_unsurfaced_not_ok(rig):
     harvest = await _cycle(r)
 
     assert attempts == ["signal_completed"], "the emit must actually be tried"
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_unsurfaced", (
         "every forwarder failed — recording this as ok is the bug"
     )
@@ -370,7 +370,7 @@ async def test_one_surviving_forwarder_still_counts_as_queued(rig):
     harvest = await _cycle(r)
 
     assert delivered == ["signal_completed"]
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_queued"
     assert harvest.data["signals_queued"] == 1
 
@@ -387,7 +387,7 @@ async def test_no_listener_connected_is_unsurfaced_even_though_buffered(rig):
 
     harvest = await _cycle(r)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_unsurfaced"
     assert row.last_surface_status == SURFACE_BUFFERED
     assert harvest.data["signals_unsurfaced"] == 1
@@ -414,7 +414,7 @@ async def test_unbound_wake_is_recorded_unbound_not_ok(rig):
 
     harvest = await _cycle(r)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_unbound"
     assert row.last_surface_status == SURFACE_NOT_APPLICABLE
     assert harvest.data["signals_unbound"] == 1
@@ -436,7 +436,7 @@ async def test_receiptless_emit_event_is_visibility_unknown_not_ok(rig):
 
     harvest = await _cycle(r)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_visibility_unknown"
     assert row.last_surface_status == SURFACE_UNKNOWN
     assert harvest.data["signals_visibility_unknown"] == 1
@@ -449,7 +449,7 @@ async def test_emit_that_raises_outright_is_unsurfaced(rig):
 
     harvest = await _cycle(r)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_unsurfaced"
     assert row.last_surface_status == SURFACE_EMIT_FAILED
     assert harvest.data["signals_unsurfaced"] == 1
@@ -476,7 +476,7 @@ async def test_lost_surface_record_reports_unknown_rather_than_ok(rig):
     harvest = await r.reconciler.reconcile()
     await _drain(r.agent)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_visibility_unknown"
     assert row.last_surface_status is None
     assert harvest.data["signals_visibility_unknown"] == 1
@@ -504,7 +504,7 @@ async def test_dispatcher_without_a_surface_ledger_reports_unknown(rig):
     harvest = await r.reconciler.reconcile()
     await _drain(r.agent)
 
-    row = await r.reconciler._store.get("talon", "job-1")
+    row = await r.reconciler._store.get("example", "job-1")
     assert row.last_delivery_status == "ok_visibility_unknown"
     assert harvest.data["signals_visibility_unknown"] == 1
 

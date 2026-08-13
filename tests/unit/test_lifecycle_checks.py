@@ -450,7 +450,6 @@ def test_risky_features_default_to_ask():
         "WebhookFeature",          # external network egress; NOT WebhooksFeature
         "BridgeFeature",           # cross-agent escalation
         "DeployFeature",           # deploys infrastructure
-        "TalonCoordinatorFeature", # spawns workspaces and runs codex jobs
         # KeyManagementFeature bundles destructive credential ops
         # (delete_service_key, remove_service_key) with reads. Whole-feature
         # ALLOW would auto-grant irreversible deletion to a fresh agent.

@@ -235,7 +235,6 @@ async def test_file_sqlite_concurrent_builtin_seeders_insert_each_default_once(
         assert defaults == [
             ("backup_snapshot", 1, "scheduler:builtin:v1:backup_snapshot"),
             ("morning_signal", 1, "scheduler:builtin:v1:morning_signal"),
-            ("signal_dispatch", 1, "scheduler:builtin:v1:signal_dispatch"),
             ("trash_retention", 1, "scheduler:builtin:v1:trash_retention"),
             ("wait_reconcile", 1, "scheduler:builtin:v1:wait_reconcile"),
         ]
@@ -1004,7 +1003,6 @@ async def test_dynamic_registration_post_load_adopts_other_owner_builtins(
         ) == [
             ("backup_snapshot",),
             ("morning_signal",),
-            ("signal_dispatch",),
             ("trash_retention",),
             ("wait_reconcile",),
         ]

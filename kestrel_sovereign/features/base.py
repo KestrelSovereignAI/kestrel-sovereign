@@ -52,7 +52,8 @@ CONTINUATION_INTENT_RE = re.compile(
     r"one moment|hang on|checking|calling|running|searching|looking up"
     r")\b.{0,80}\b("
     r"check|look|search|call|run|fetch|inspect|open|query|verify|use|try|"
-    r"github|tool|cli|browser|file|repo|issue|database|db|talon"
+    r"github|tool|cli|browser|file|repo|issue|database|db|workflow|job|"
+    r"dispatch|provider"
     r")\b",
     re.IGNORECASE | re.DOTALL,
 )
@@ -337,8 +338,8 @@ class Feature(_SdkFeature):
         registered any of the following and then hit a later boot-phase failure
         must not leave feature-bound handlers / closures / loops stranded:
 
-        * dispatcher **signal sources** and ``task:`` / ``talon:`` **wait
-          providers** (P2);
+        * dispatcher **signal sources** and ``task:`` / other provider-defined
+          **wait providers** (P2);
         * long-lived **background tasks** it started via
           :meth:`_track_owned_background_task` — e.g. Peers' hourly expiry sweep,
           which the agent's global reap only cancels at FULL shutdown, so
@@ -430,8 +431,9 @@ class Feature(_SdkFeature):
     # ------------------------------------------------------------------
     # Wait-provider ownership (#2522, identity-aware stack in P3)
     #
-    # Features register a ``Waitable`` provider (``task:``, ``talon:``) with the
-    # agent's WaitRegistry in ``post_all_features_loaded``. The registry keeps a
+    # Features register a ``Waitable`` provider (for example ``task:`` or a
+    # workflow-owned kind) with the agent's WaitRegistry in
+    # ``post_all_features_loaded``. The registry keeps a
     # per-kind ownership STACK, so a feature only needs to record the exact
     # provider it pushed; on ``shutdown()`` (runtime disable AND boot rollback)
     # it removes that provider from the stack by IDENTITY, and the registry lets
@@ -1034,7 +1036,7 @@ class Feature(_SdkFeature):
         turn's session, so anything that must name it — a wake routed back to
         the originating window, the Timeline band an ``llm.*`` span belongs to
         (#2940) — has to ask the agent. Goes through the turn lifecycle's
-        :meth:`~kestrel_sovereign.agent.turn_lifecycle.TurnLifecycleMixin._get_turn_bound_session_id`
+        :meth:`~kestrel_sovereign.agent.turn_lifecycle.TurnLifecycleMixin.get_turn_bound_session_id`
         rather than reading ``agent._active_session_id`` directly: that
         attribute is agent-global, so unattended work (a cron tick, a task
         detached from a turn that has since exited) would otherwise read
@@ -1049,7 +1051,11 @@ class Feature(_SdkFeature):
         agent = getattr(self, "agent", None)
         if agent is None:
             return None
-        resolve = getattr(agent, "_get_turn_bound_session_id", None)
+        resolve = getattr(agent, "get_turn_bound_session_id", None)
+        if not callable(resolve):
+            # Compatibility for older agents while the public SDK-facing
+            # lifecycle accessor rolls out.
+            resolve = getattr(agent, "_get_turn_bound_session_id", None)
         if not callable(resolve):
             return None
         try:

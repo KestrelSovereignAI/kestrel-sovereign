@@ -804,7 +804,7 @@ def _subagent_agent(session_id, llm_service):
     agent = MagicMock()
     agent.hooks_manager = None
     agent.llm_service = llm_service
-    agent._get_turn_bound_session_id = lambda: session_id
+    agent.get_turn_bound_session_id = lambda: session_id
     return agent
 
 
@@ -924,7 +924,7 @@ def _memory_feature(retriever, session_id):
     feature.agent_id = "test-agent"
     feature._memory_system = SimpleNamespace(retriever=retriever)
     feature.agent = SimpleNamespace(
-        _get_turn_bound_session_id=lambda: session_id
+        get_turn_bound_session_id=lambda: session_id
     )
     return feature
 
@@ -1115,7 +1115,7 @@ class TestCompactContextToolNamesTheRequestingTurn:
     def _feature(session_id):
         feature = ContextFeature.__new__(ContextFeature)
         feature.agent = SimpleNamespace(
-            _get_turn_bound_session_id=lambda: session_id,
+            get_turn_bound_session_id=lambda: session_id,
             context_stats=None,
         )
         feature.context_manager = AsyncMock()

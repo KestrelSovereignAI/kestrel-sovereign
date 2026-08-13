@@ -18,21 +18,21 @@ from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
+from .issue_selection import pick_top_issue
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
-from .talon_handoff import dispatch_to_talon, pick_top_issue
 
 logger = logging.getLogger(__name__)
 
 
 # Synonyms LLMs reach for on the strategic-memory enums. severity's canonical
 # middle value is ``medium`` here (unlike todo priority's ``normal``), so the
-# alias map is local. mode aliases steer dry-run phrasings onto ``suggest`` so a
-# preview request never accidentally dispatches a real issue to Talon.
+# alias map is local.
 _SEVERITY_ALIASES = {
     "moderate": "medium", "med": "medium", "normal": "medium",
     "crit": "critical", "urgent": "critical", "blocker": "critical",
@@ -40,18 +40,21 @@ _SEVERITY_ALIASES = {
     # incident taxonomies and "high" in others; too ambiguous to guess, so they
     # fall through to a value-listing error.
 }
-# Asymmetric on purpose: ``signal_dispatch`` can ship a real issue to Talon, so
-# we only normalize synonyms onto the SAFE ``suggest`` (preview) side. We never
-# add aliases that resolve to ``execute`` — a live dispatch requires the literal
-# canonical value, so an ambiguous word ("run", "apply") errors (and lists the
-# valid values) rather than silently triggering an action (#1925).
+# Asymmetric on purpose: ``signal_dispatch`` can start real work, so only
+# preview-like synonyms normalize onto the safe ``suggest`` side.  A live
+# dispatch still requires the literal ``execute`` value.
 _DISPATCH_MODE_ALIASES = {
     "dry-run": "suggest", "dryrun": "suggest", "dry_run": "suggest",
     "preview": "suggest", "plan": "suggest", "simulate": "suggest",
     "suggestion": "suggest", "propose": "suggest",
 }
 
-
+# Strategic Memory knows a stable workflow capability name, never its provider
+# class.  An independently installed feature contributes this registration to
+# the agent's operator registry; a generic workflow runner exposes
+# ``workflow_run``.  Both must be live before execute mode is admitted.
+_DEFAULT_DISPATCH_WORKFLOW = "fleet_coding_pipeline"
+_WORKFLOW_RUN_TOOL = "workflow_run"
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
 # session_log) return when prerequisites (scan_repos config or
 # GITHUB_TOKEN) are missing. They look like report bodies but are
@@ -454,128 +457,241 @@ class StrategicMemoryFeature(Feature):
             data={"briefing": briefing},
         )
 
+    def _dispatch_workflow_name(self) -> str:
+        """Return the stable workflow capability selected by strategy config."""
+
+        config = self._data.get("morning_signal_config", {})
+        configured = (
+            config.get("dispatch_workflow") if isinstance(config, dict) else None
+        )
+        name = str(configured or _DEFAULT_DISPATCH_WORKFLOW).strip()
+        return name or _DEFAULT_DISPATCH_WORKFLOW
+
+    def _resolve_dispatch_workflow(self, name: str):
+        """Resolve one live contributed workflow without importing its owner."""
+
+        registry = getattr(self.agent, "operator_registry", None)
+        resolve = getattr(registry, "get_workflow_registration", None)
+        if not callable(resolve):
+            return None
+        try:
+            return resolve(name)
+        except Exception:  # noqa: BLE001 - capability lookup fails closed
+            logger.exception(
+                "Strategic Memory could not inspect workflow capability %r", name
+            )
+            return None
+
+    def _dispatch_session_id(self) -> str:
+        """Use the live turn session when present, else a system audit scope."""
+
+        resolve = getattr(self.agent, "get_turn_bound_session_id", None)
+        if callable(resolve):
+            try:
+                session_id = resolve()
+            except Exception:  # noqa: BLE001 - audit fallback is deterministic
+                session_id = None
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id.strip()
+        return "strategic-memory"
+
+    @staticmethod
+    def _dispatch_runner_payload(result: Any) -> Dict[str, Any]:
+        if isinstance(result, ToolResult):
+            return result.to_dict()
+        if isinstance(result, dict):
+            return dict(result)
+        return {"result": str(result)}
+
     @tool(
         name="signal_dispatch",
-        description="Pick the highest-priority issue from strategic memory and dispatch it to Talon via the Agent Mesh Protocol. Works with any signal source (morning, hygiene, event-driven, on-demand).",
+        description=(
+            "Pick the highest-priority issue from strategic memory and start "
+            "it through a live feature-contributed dispatch workflow. Preview "
+            "with mode='suggest'; execute fails closed when no compatible "
+            "workflow capability and governed runner are enabled."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!dispatch",
     )
     async def signal_dispatch(self, mode: str = "execute") -> ToolResult:
-        """Pick top issue from strategic memory and dispatch to Talon.
+        """Preview or execute the top issue through generic workflow contracts."""
 
-        Args:
-            mode: One of 'execute' (dispatch the top issue to Talon immediately)
-                or 'suggest' (preview the top issue only, dispatch nothing).
-                Defaults to 'execute'.
-        """
-        # Validate up-front. An unrecognized mode must NOT silently fall through
-        # to the live execute/dispatch path — a typo like "suggst" or casing
-        # like "Suggest" would otherwise ship a real issue to Talon (#1925).
         mode = _normalize_choice(mode or "", _DISPATCH_MODE_ALIASES)
         if mode not in ("execute", "suggest"):
             return ToolResult.failed(
                 f"Invalid mode '{mode}'. Must be one of: execute, suggest.",
-                data={"mode": mode},
+                data={"mode": mode, "dispatched": False},
             )
+
+        issue = await pick_top_issue(self._data)
+        workflow_name = self._dispatch_workflow_name()
+        if not issue:
+            return ToolResult.ok(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + "\nNo actionable issue found."
+                ),
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                },
+            )
+
         if mode == "suggest":
-            issue = await pick_top_issue(self._data)
-            if not issue:
-                return ToolResult.ok(
-                    confirmation="## Signal Dispatch (suggest)\nNo actionable issue found.",
-                    data={"mode": "suggest", "issue": None},
-                )
             body = (
-                f"## Signal Dispatch (suggest)\n"
-                f"**Top issue:** {issue['repo']}#{issue['issue_number']}: {issue['issue_title']}\n"
+                "## Signal Dispatch (suggest)\n"
+                f"**Top issue:** {issue['repo']}#{issue['issue_number']}: "
+                f"{issue['issue_title']}\n"
                 f"**Priority:** {issue['priority']}\n"
                 f"**Context:** {issue.get('context', 'N/A')}\n\n"
-                f"Use `!dispatch` or `!talon claim {issue['repo']} {issue['issue_number']}` to execute."
+                f"Execute mode will request the contributed `{workflow_name}` "
+                "workflow; no work was started by this preview."
             )
             return ToolResult.ok(
                 confirmation=body,
-                data={"mode": "suggest", "issue": issue, "body": body},
+                data={
+                    "mode": "suggest",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "body": body,
+                },
             )
 
-        # Try TalonCoordinatorFeature first (preferred path)
-        coordinator = self._get_talon_coordinator()
-        if coordinator:
-            issue = await pick_top_issue(self._data)
-            if not issue:
-                return ToolResult.ok(
-                    confirmation="## Signal Dispatch\nNo actionable issue found.",
-                    data={"mode": "execute", "issue": None},
-                )
-            # talon_claim now returns a ToolResult envelope (#1061
-            # wave 15). The legacy {"dispatched", "method", "error"}
-            # dict lives under .data.
-            claim_envelope = await coordinator.talon_claim(
-                repo=issue["repo"], issue=issue["issue_number"],
-            )
-            claim_dict = claim_envelope.data or {}
-            dispatched = bool(claim_dict.get("dispatched"))
-            method = claim_dict.get("method", "N/A")
-            err_text = claim_envelope.error or claim_dict.get("error") or "unknown"
-            body = (
-                f"## Signal Dispatch\n"
-                f"{issue['repo']}#{issue['issue_number']}: {issue['issue_title']} -- "
-                + ("dispatched" if dispatched else f"failed: {err_text}")
-                + f"\nMethod: {method}"
+        registration = self._resolve_dispatch_workflow(workflow_name)
+        if registration is None:
+            return ToolResult.failed(
+                f"Dispatch capability '{workflow_name}' is unavailable. Install "
+                "and enable a feature that contributes that workflow, and enable "
+                "a workflow runner exposing governed 'workflow_run'; the selected "
+                "issue was not dispatched.",
+                data={
+                    "mode": "execute",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "reason_code": "DISPATCH_CAPABILITY_UNAVAILABLE",
+                },
             )
 
-            data = {
+        execute_named_tool = getattr(self.agent, "execute_named_tool", None)
+        if not callable(execute_named_tool):
+            return ToolResult.failed(
+                "Governed named-tool dispatch is unavailable on this agent "
+                "runtime. Upgrade the host before enabling Strategic Memory "
+                "dispatch; the selected issue was not dispatched.",
+                data={
+                    "mode": "execute",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "reason_code": "GOVERNED_DISPATCH_UNAVAILABLE",
+                },
+            )
+
+        params = {
+            "repo": issue["repo"],
+            "issue": issue["issue_number"],
+            "issue_title": issue["issue_title"],
+            "priority": issue["priority"],
+            "context": issue.get("context", ""),
+        }
+        try:
+            runner_result = await execute_named_tool(
+                _WORKFLOW_RUN_TOOL,
+                {"name": workflow_name, "params": params},
+                session_id=self._dispatch_session_id(),
+                source="strategic_memory.signal_dispatch",
+            )
+        except ToolNotRegisteredError:
+            logger.info(
+                "Strategic Memory dispatch workflow %r has no governed runner",
+                workflow_name,
+            )
+            return ToolResult.failed(
+                "The dispatch workflow is registered, but no enabled feature "
+                "exposes the governed 'workflow_run' runner. Enable the "
+                "Workflows feature and retry; the selected issue was not "
+                "dispatched.",
+                data={
+                    "mode": "execute",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "reason_code": "WORKFLOW_RUNNER_UNAVAILABLE",
+                },
+            )
+        except Exception:  # noqa: BLE001 - sanitize the tool boundary
+            logger.exception(
+                "Strategic Memory dispatch runner failed for workflow %r",
+                workflow_name,
+            )
+            return ToolResult.failed(
+                "The governed workflow runner failed before accepting the "
+                "selected issue. Inspect workflow diagnostics and retry; no "
+                "dispatch was confirmed.",
+                data={
+                    "mode": "execute",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "reason_code": "WORKFLOW_RUNNER_FAILED",
+                },
+            )
+
+        runner_payload = self._dispatch_runner_payload(runner_result)
+        accepted = (
+            isinstance(runner_result, ToolResult)
+            and runner_result.status.value == "ok"
+        ) or (
+            isinstance(runner_result, dict)
+            and (
+                runner_result.get("status") == "ok"
+                or runner_result.get("success") is True
+            )
+        )
+        if not accepted:
+            runner_error = (
+                runner_payload.get("error")
+                or "the workflow runner did not confirm acceptance"
+            )
+            return ToolResult.failed(
+                f"Dispatch workflow '{workflow_name}' did not start: "
+                f"{runner_error}",
+                data={
+                    "mode": "execute",
+                    "issue": issue,
+                    "workflow": workflow_name,
+                    "capability_owner": getattr(registration, "owner", ""),
+                    "dispatched": False,
+                    "reason_code": "WORKFLOW_RUN_REJECTED",
+                    "runner_result": runner_payload,
+                },
+            )
+
+        result_data = runner_payload.get("data")
+        run_id = result_data.get("run_id") if isinstance(result_data, dict) else None
+        body = (
+            f"Dispatch workflow '{workflow_name}' accepted "
+            f"{issue['repo']}#{issue['issue_number']}"
+            + (f" as run {run_id}." if run_id else ".")
+        )
+        return ToolResult.ok(
+            confirmation=body,
+            data={
                 "mode": "execute",
                 "issue": issue,
-                "dispatched": dispatched,
-                "method": method,
-                "claim_result": claim_dict,
-            }
-
-            # Honesty: if the claim failed, the agent must speak the
-            # failure rather than narrate "dispatched" off a body that
-            # internally contains "failed: ...". Surface as PARTIAL so
-            # the LLM can't drop the failure detail.
-            if not dispatched:
-                return ToolResult.partial(
-                    confirmation=body,
-                    error=(
-                        f"talon_claim for {issue['repo']}#{issue['issue_number']} "
-                        f"did not dispatch: {err_text}"
-                    ),
-                    data=data,
-                )
-            return ToolResult.ok(confirmation=body, data=data)
-
-        # Fallback: direct mesh dispatch via talon_handoff. The helper
-        # returns markdown text whose first token signals the outcome:
-        # "Dispatched to ..." (success), "Failed to dispatch ..." (mesh
-        # error), or "Found issue to dispatch ... but no multi_agent
-        # host URL configured." (config gap). Wrapping all of these as
-        # OK would let the LLM narrate "dispatched" off a body that
-        # said "Failed". Detect the failure prefixes and surface PARTIAL.
-        dispatch_result = await dispatch_to_talon(self._data)
-        body = f"## Signal Dispatch\n{dispatch_result}"
-        data = {"mode": "execute", "fallback": True, "dispatch_result": dispatch_result}
-
-        failure_prefixes = ("Failed to dispatch", "Found issue to dispatch")
-        if any(dispatch_result.startswith(p) for p in failure_prefixes):
-            return ToolResult.partial(
-                confirmation=body,
-                error=(
-                    f"fallback dispatch did not place the issue with talon: "
-                    f"{dispatch_result}"
-                ),
-                data=data,
-            )
-
-        return ToolResult.ok(confirmation=body, data=data)
-
-    def _get_talon_coordinator(self):
-        """Get TalonCoordinatorFeature if loaded."""
-        if hasattr(self.agent, '_features'):
-            for f in self.agent._features:
-                if type(f).__name__ == "TalonCoordinatorFeature":
-                    return f
-        return None
+                "workflow": workflow_name,
+                "workflow_run_id": run_id,
+                "capability_owner": getattr(registration, "owner", ""),
+                "dispatched": True,
+                "runner_result": runner_payload,
+            },
+        )
 
     @tool(
         name="backlog_hygiene",

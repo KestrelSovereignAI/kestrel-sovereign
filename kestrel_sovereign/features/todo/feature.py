@@ -527,8 +527,8 @@ class TodoFeature(Feature):
         name="todo_link_task",
         description=(
             "Attach an external reference to a todo, such as a GitHub issue, "
-            "Talon job, A2A task, scheduled job, restart request, action item, "
-            "or evidence URL."
+            "coding workflow run, A2A task, scheduled job, restart request, "
+            "action item, or evidence URL."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!todo link",

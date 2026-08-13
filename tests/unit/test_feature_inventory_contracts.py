@@ -249,8 +249,8 @@ def test_core_only_inventory_stable_without_entrypoints():
     assert actual == expected
 
 
-def test_talon_replacement_rule_does_not_move_static_package_boundary():
-    """Discovery migration precedes the later catalog ownership cutover."""
+def test_talon_is_an_external_feature_without_a_replacement_bridge():
+    """The ownership cutover removes the temporary bundled predecessor."""
     from kestrel_sovereign.feature_registry import (
         PackageBoundary,
         get_extracted_feature_replacements,
@@ -258,15 +258,10 @@ def test_talon_replacement_rule_does_not_move_static_package_boundary():
     )
 
     talon = load_registry()["talon"]
-    replacement = get_extracted_feature_replacements()[
-        "TalonCoordinatorFeature"
-    ]
-
-    assert talon.boundary is PackageBoundary.BUNDLED
-    assert talon.package == "kestrel-sovereign"
-    assert replacement.bundled_distribution == "kestrel-sovereign"
-    assert replacement.extracted_distribution == "kestrel-feature-talon"
-    assert replacement.module_prefix == "kestrel_feature_talon"
+    assert talon.boundary is PackageBoundary.FEATURE_PACKAGE
+    assert talon.package == "kestrel-feature-talon"
+    assert talon.core is False
+    assert "TalonCoordinatorFeature" not in get_extracted_feature_replacements()
 
 
 def test_multiple_entrypoint_packages_all_discovered():
