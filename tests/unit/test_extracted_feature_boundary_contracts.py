@@ -42,6 +42,10 @@ def test_bundled_rows_never_advertise_an_external_install_target():
     assert bundled
     assert all(entry["package"] == "kestrel-sovereign" for entry in bundled.values())
     assert registry["talon"]["companion"] == "talon_cli"
+    assert registry["talon"]["boundary"] == "feature-package"
+    assert registry["talon"]["package"] == "kestrel-feature-talon"
+    assert registry["talon"]["core"] is False
+    assert "extracted_replacement_package" not in registry["talon"]
 
 
 def test_feature_proof_matrix_marks_mcp_as_external_package_boundary():

@@ -557,20 +557,15 @@ skill_save = { description = "Promote an insight into a saved skill", category =
 skill_delete = { description = "Delete a saved skill", category = "utility", tags = ["skills"] }
 
 [talon]
-boundary = "bundled"
-package = "kestrel-sovereign"
-git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+boundary = "feature-package"
+package = "kestrel-feature-talon"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-talon.git"
 features = ["TalonCoordinatorFeature"]
-# Temporary discovery migration: an installed extracted coordinator replaces
-# this bundled predecessor, while this row intentionally remains bundled until
-# the later ownership-cutover story.
-extracted_replacement_package = "kestrel-feature-talon"
-extracted_replacement_module_prefix = "kestrel_feature_talon"
 companion = "talon_cli"
-description = "Bundled in-agent coordinator for the standalone kestrel-talon GitHub issue processor"
+description = "Independently installed in-agent coordinator for governed coding runs"
 tags = ["automation", "github", "devtools"]
 icon = "bot"
-core = true
+core = false
 
 [talon.skills]
 claim_issue = { description = "Claim and process a GitHub issue", category = "utility", tags = ["talon", "github"] }
@@ -582,7 +577,7 @@ package = "kestrel-talon"
 git = "https://github.com/KestrelSovereignAI/kestrel-talon.git"
 features = []
 command = "kestrel-talon"
-description = "Standalone GitHub issue processor used by the bundled Talon coordinator"
+description = "Standalone GitHub issue processor used by the kestrel-feature-talon coordinator"
 tags = ["automation", "github", "devtools", "standalone"]
 icon = "bot"
 core = false

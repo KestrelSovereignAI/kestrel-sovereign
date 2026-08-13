@@ -93,7 +93,10 @@ async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
         purpose="scoped worker",
         ttl_seconds=1800,
         max_child_depth=0,
-        additional_constraints={"restricted_tools": [RESTRICTED_TOOL]},
+        additional_constraints={
+            "allowed_tools": ["workflow_run"],
+            "restricted_tools": [RESTRICTED_TOOL],
+        },
     )
     mandate = sign_mandate(mandate, parent_private)
 
@@ -114,6 +117,7 @@ async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
     finally:
         await storage.close()
     assert reconstructed is not None
+    assert reconstructed.additional_constraints["allowed_tools"] == ["workflow_run"]
     assert reconstructed.additional_constraints["restricted_tools"] == [RESTRICTED_TOOL]
 
     # And it re-applies as a real block.
@@ -130,6 +134,28 @@ async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
     )
     blocked = evaluate_blocking_decision(out)
     assert blocked is not None and blocked.decision == PermissionDecision.DENY
+
+    # The positive ceiling survives the same persisted-edge reconstruction.
+    outside = await child.hooks_manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="feature_direct_dispatch",
+            tool_input={},
+        ),
+    )
+    assert evaluate_blocking_decision(outside) is not None
+    inside = await child.hooks_manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="workflow_run",
+            tool_input={},
+        ),
+    )
+    assert evaluate_blocking_decision(inside) is None
 
 
 @pytest.mark.asyncio
@@ -214,6 +240,71 @@ async def test_restriction_hook_denies_restricted_allows_others():
         )
     )
     assert allowed.permission_decision != PermissionDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_allowed_tools_is_a_hard_positive_ceiling():
+    hook = MandateRestrictionHook([], allowed_tools=["workflow_run"])
+
+    allowed = await hook.execute(
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="workflow_run",
+            tool_input={},
+        )
+    )
+    denied = await hook.execute(
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="feature_direct_dispatch",
+            tool_input={},
+        )
+    )
+
+    assert hook.allowed_tools == frozenset({"workflow_run"})
+    assert allowed.permission_decision != PermissionDecision.DENY
+    assert denied.permission_decision == PermissionDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_explicit_restricted_tools_override_positive_ceiling():
+    hook = MandateRestrictionHook(
+        ["nominally_allowed"],
+        allowed_tools=["nominally_allowed"],
+    )
+    out = await hook.execute(
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="nominally_allowed",
+            tool_input={},
+        )
+    )
+    assert out.permission_decision == PermissionDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_empty_allowed_tools_ceiling_denies_every_tool_after_reload():
+    manager = HooksManager()
+    count = register_restriction_hook(
+        manager,
+        SimpleNamespace(additional_constraints={"allowed_tools": []}),
+    )
+    assert count == 1
+
+    out = await manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="anything",
+            tool_input={},
+        ),
+    )
+    blocked = evaluate_blocking_decision(out)
+    assert blocked is not None and blocked.decision == PermissionDecision.DENY
 
 
 @pytest.mark.asyncio

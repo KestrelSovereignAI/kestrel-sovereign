@@ -131,14 +131,15 @@ class TestLoadRegistry:
         }
         assert expected.issubset(all_classes), f"Missing: {expected - all_classes}"
 
-    def test_talon_models_bundled_coordinator_and_standalone_companion(self):
+    def test_talon_models_external_feature_and_standalone_companion(self):
         registry = load_registry()
 
         coordinator = registry["talon"]
-        assert coordinator.boundary is PackageBoundary.BUNDLED
-        assert coordinator.package == "kestrel-sovereign"
+        assert coordinator.boundary is PackageBoundary.FEATURE_PACKAGE
+        assert coordinator.package == "kestrel-feature-talon"
         assert coordinator.features == ["TalonCoordinatorFeature"]
         assert coordinator.companion == "talon_cli"
+        assert coordinator.core is False
 
         companion = registry["talon_cli"]
         assert companion.boundary is PackageBoundary.STANDALONE_TOOL

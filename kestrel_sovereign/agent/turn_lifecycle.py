@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+import warnings
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 from uuid import uuid4
@@ -100,7 +101,7 @@ class TurnLifecycleMixin:
         """Return the current agent turn id for per-turn observability."""
         return _CURRENT_TURN_ID.get()
 
-    def _get_turn_bound_session_id(self) -> Optional[str]:
+    def get_turn_bound_session_id(self) -> Optional[str]:
         """The chat session of the turn the CALLING task belongs to, or None.
 
         The one honest answer to "which chat window is this code running for",
@@ -136,6 +137,23 @@ class TurnLifecycleMixin:
         if isinstance(session_id, str) and session_id.strip():
             return session_id.strip()
         return None
+
+    def _get_turn_bound_session_id(self) -> Optional[str]:
+        """Compatibility alias for :meth:`get_turn_bound_session_id`.
+
+        Deprecated in Sovereign 0.53.0 and planned for removal in 0.54.0.
+        Feature packages must use the public accessor. The private name remains
+        for one compatibility release so older packages and agent doubles can
+        migrate without silently losing turn attribution.
+        """
+        warnings.warn(
+            "_get_turn_bound_session_id() is deprecated since Sovereign "
+            "0.53.0 and will be removed in 0.54.0; use "
+            "get_turn_bound_session_id() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_turn_bound_session_id()
 
     def _set_current_chain(
         self, chain: Optional[list[CausationFrame]]
@@ -198,7 +216,7 @@ class TurnLifecycleMixin:
             # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
             # holds the CONVERSATION lock and therefore owns the value of
             # `_active_session_id`. Set and cleared inside the lock, so at most
-            # one turn is ever live. `_get_turn_bound_session_id` compares it
+            # one turn is ever live. `get_turn_bound_session_id` compares it
             # against the task-local id to tell a caller that owns the turn
             # from one that merely inherited its ContextVar (#2877).
             self._live_turn_id = turn_id

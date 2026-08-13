@@ -287,33 +287,9 @@ async def test_demo_baseline_accepts_feature_wide_hard_tightening(
 
 
 @pytest.mark.asyncio
-async def test_extracted_talon_allow_cannot_weaken_static_feature_ask(
-    tmp_path, monkeypatch
-):
-    monkeypatch.delenv("KESTREL_DEMO_SERVER", raising=False)
-    feature = _Feature("talon_claim")
-    security, store = await _security(
-        tmp_path,
-        feature_name="TalonCoordinatorFeature",
-        feature=feature,
-        defaults=FeaturePermissionDefaults(
-            feature_default=SDKPermissionLevel.ALLOW,
-        ),
-    )
-
-    await security._register_all_tools()
-
-    assert (
-        await store.get_permission("TalonCoordinatorFeature", "talon_claim")
-        is PermissionLevel.ASK
-    )
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("feature_name", "tool_name"),
     [
-        ("TalonCoordinatorFeature", "talon_claim"),
         ("KeyManagementFeature", "list_service_keys"),
     ],
 )
@@ -348,10 +324,10 @@ async def test_declared_feature_default_can_tighten_static_feature_ask(
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("KESTREL_DEMO_SERVER", raising=False)
-    feature = _Feature("talon_claim")
+    feature = _Feature("list_service_keys")
     security, store = await _security(
         tmp_path,
-        feature_name="TalonCoordinatorFeature",
+        feature_name="KeyManagementFeature",
         feature=feature,
         defaults=FeaturePermissionDefaults(
             feature_default=SDKPermissionLevel.ALWAYS_ASK,
@@ -361,7 +337,7 @@ async def test_declared_feature_default_can_tighten_static_feature_ask(
     await security._register_all_tools()
 
     assert (
-        await store.get_permission("TalonCoordinatorFeature", "talon_claim")
+        await store.get_permission("KeyManagementFeature", "list_service_keys")
         is PermissionLevel.ALWAYS_ASK
     )
 
@@ -540,7 +516,6 @@ async def test_contributed_hard_feature_default_hardens_dispatch_row(
 @pytest.mark.parametrize(
     ("feature_name", "tool_name"),
     [
-        ("TalonCoordinatorFeature", "scan_stale_work"),
         ("InferenceLeaseFeature", "inference_lease_status"),
         ("InferenceLeaseFeature", "inference_lease_release"),
     ],

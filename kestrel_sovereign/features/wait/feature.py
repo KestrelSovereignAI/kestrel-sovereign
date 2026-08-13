@@ -10,8 +10,8 @@ It lives in its own MANDATORY feature (not on TaskFeature) on purpose:
 ``wait`` is generic — it dispatches ``"<kind>:<handle>"`` to whatever
 provider a loaded feature registered, and also serves the plain bounded
 sleep. Tying it to an optional feature (e.g. tasks) would mean an agent
-profile that loads Talon but not Tasks would have registered talon
-waitables but no ``wait`` tool to reach them. Being mandatory, ``wait``
+profile that loads another async-work feature but not Tasks could have
+registered provider-owned waitables but no ``wait`` tool to reach them. Being mandatory, ``wait``
 is always present wherever any waitable is.
 """
 
@@ -141,7 +141,6 @@ class WaitFeature(Feature):
             "registered by whatever features are loaded):\n"
             "• `task:<task_id>` — a LOCAL Kestrel background task (this "
             "agent's own store)\n"
-            "• `talon:<job_id>` — a Talon coding job\n"
             "• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via "
             "send_a2a_task (route it here, NOT `task:` — a `task:` on an "
             "outbound A2A id is a provider mismatch and is rejected at "
@@ -191,7 +190,7 @@ class WaitFeature(Feature):
 
         Args:
             target: ``"<kind>:<handle>"`` to wait on (e.g.
-                ``"talon:job_42"``). When set, ``duration_seconds`` is
+                ``"workflow:run_42"``). When set, ``duration_seconds`` is
                 ignored and the wait is driven by the registered provider.
             duration_seconds: Seconds to pause when no ``target`` is given
                 (0 to the enforced maximum).
@@ -212,7 +211,7 @@ class WaitFeature(Feature):
 
         # The first positional accepts BOTH forms so the interface stays
         # one tool: `!wait 5` (bare number) is a bounded sleep, while
-        # `!wait talon:job_42` is a handle wait. parse_command_args binds
+        # `!wait workflow:run_42` is a handle wait. parse_command_args binds
         # positional CLI tokens in signature order, so a numeric target is
         # the legacy `!wait <seconds>` command — route it to the pause.
         target = str(target).strip() if target else ""

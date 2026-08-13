@@ -309,7 +309,7 @@ async def test_turn_bound_session_is_the_live_turns_session():
     agent = _StubAgent()
     async with agent._turn_lifecycle():
         agent._active_session_id = "chat-A"
-        assert agent._get_turn_bound_session_id() == "chat-A"
+        assert agent.get_turn_bound_session_id() == "chat-A"
 
 
 @pytest.mark.asyncio
@@ -317,11 +317,11 @@ async def test_no_turn_means_no_session():
     """Out-of-turn work (a cron tick, a CLI-filed request) has no chat window,
     even if a turn left a value behind."""
     agent = _StubAgent()
-    assert agent._get_turn_bound_session_id() is None
+    assert agent.get_turn_bound_session_id() is None
 
     async with agent._turn_lifecycle():
         agent._active_session_id = "chat-A"
-    assert agent._get_turn_bound_session_id() is None
+    assert agent.get_turn_bound_session_id() is None
 
 
 @pytest.mark.asyncio
@@ -331,7 +331,7 @@ async def test_child_task_of_the_live_turn_sees_the_session():
     agent = _StubAgent()
 
     async def tool():
-        return agent._get_turn_bound_session_id()
+        return agent.get_turn_bound_session_id()
 
     async with agent._turn_lifecycle():
         agent._active_session_id = "chat-A"
@@ -353,7 +353,7 @@ async def test_detached_task_does_not_inherit_a_later_turns_session():
     async def detached():
         await turn_b_running.wait()
         seen["turn_id"] = agent._get_current_turn_id()
-        seen["session"] = agent._get_turn_bound_session_id()
+        seen["session"] = agent.get_turn_bound_session_id()
         seen["agent_global"] = agent._active_session_id
 
     async with agent._turn_lifecycle():
@@ -375,9 +375,21 @@ async def test_session_less_and_blank_sessions_resolve_to_none():
     agent = _StubAgent()
     async with agent._turn_lifecycle():
         agent._active_session_id = None
-        assert agent._get_turn_bound_session_id() is None
+        assert agent.get_turn_bound_session_id() is None
         agent._active_session_id = "   "
-        assert agent._get_turn_bound_session_id() is None
+        assert agent.get_turn_bound_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_private_turn_session_accessor_is_a_compatibility_alias():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        with pytest.warns(DeprecationWarning, match="removed in 0.54.0"):
+            assert (
+                agent._get_turn_bound_session_id()
+                == agent.get_turn_bound_session_id()
+            )
 
 
 @pytest.mark.asyncio
@@ -388,7 +400,7 @@ async def test_live_turn_id_is_cleared_even_when_the_turn_raises():
             agent._active_session_id = "chat-A"
             raise RuntimeError("boom")
     assert agent._live_turn_id is None
-    assert agent._get_turn_bound_session_id() is None
+    assert agent.get_turn_bound_session_id() is None
 
 
 # ---------------------------------------------------------------------------

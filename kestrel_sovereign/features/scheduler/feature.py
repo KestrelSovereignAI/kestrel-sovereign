@@ -13,7 +13,6 @@ silently failing every tick with "Unknown task".
 
 Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     backup_snapshot       -- snapshot the agent's data via the sync service
-    signal_dispatch       -- dispatch queued work to Talon
     trash_retention       -- hard-purge soft-deleted conversation rows
                              past their per-agent retention window (#764)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
@@ -94,16 +93,25 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
 
-# Crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3). These names are also
-# valid TOOLS a user could schedule, so they are NOT blanket-retired; only rows
-# matching the exact prior core auto-seed (cron + args) are removed on startup,
-# mapped name -> (cron_expression, parsed_args). See post_all_features_loaded.
+# Stable namespace used to distinguish core-owned schedule rows from user rows.
+_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
+
+# Obsolete core registrations whose task names remain valid user-schedulable
+# tools. Match their durable built-in identity, never their cron/args: a user is
+# allowed to choose the exact same cadence and payload. Mapped task name -> the
+# idempotency key persisted by ``_ensure_builtin_schedule``.
+_SUPERSEDED_BUILTIN_SCHEDULE_KEYS = {
+    "signal_dispatch": (
+        f"{_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX}signal_dispatch"
+    ),
+}
+
+# The existing legacy migration for memory-maintenance seeds remains
+# signature-based and scoped to those two names. Mapped name -> (cron, args).
 _SUPERSEDED_AUTOSEEDS = {
     "memory_consolidate": ("0 4 * * *", {}),
     "reflect": ("0 */4 * * *", {"scope": "all", "depth": "normal"}),
 }
-
-_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
 
 
 class SchedulerFeature(Feature):
@@ -356,6 +364,22 @@ class SchedulerFeature(Feature):
             )
             return DEFAULT_LEASE_SECONDS
 
+    @staticmethod
+    def _legacy_ecosystem_discovery_watch(task: Dict[str, Any]) -> bool:
+        """Whether a persisted watch depended on the removed provider default.
+
+        Current watches name a concrete feature-owned discovery tool. The
+        pre-extraction schema omitted that field and implicitly selected a
+        bundled provider. Empty/whitespace values are equally non-actionable.
+        """
+
+        if task.get("task_name") != "ecosystem_discovery_watch":
+            return False
+        args = task.get("args")
+        if not isinstance(args, dict):
+            return True
+        return not str(args.get("tool") or "").strip()
+
     async def post_all_features_loaded(self, agent):
         """Register default scheduled tasks after all features are loaded.
 
@@ -404,12 +428,71 @@ class SchedulerFeature(Feature):
                 )
         existing_names -= retired
 
-        # Cutover for crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3):
-        # memory_consolidate + reflect are still valid TOOLS (a user may schedule
-        # them), so we can't blanket-retire by name. Instead remove ONLY rows
-        # that exactly match what core used to AUTO-SEED (name + cron + args) —
-        # leaving any user-customized schedule intact. Without this, an upgraded
-        # agent would run both the old crons AND `sleep`, double-touching memory.
+        # Provider-ownership cutover for ecosystem discovery (#2281 / Talon
+        # extraction). Older rows relied on core's implicit
+        # ``scan_stale_work`` default and therefore carry no ``args.tool``.
+        # Core can no longer choose a concrete feature provider on their
+        # behalf. Pause only those legacy rows; explicitly configured watches
+        # remain untouched. Keeping the row (rather than deleting it) preserves
+        # its cadence/filter arguments so an operator can recreate it with an
+        # enabled feature-owned discovery tool after reading the diagnostic.
+        for task in existing_tasks:
+            if not self._legacy_ecosystem_discovery_watch(task):
+                continue
+            # ``schedule_list`` exposes the durable enabled bit. A prior boot
+            # may already have completed this cutover; do not re-run the pause
+            # transaction or repeat its warning on every subsequent boot.
+            if task.get("enabled") is False:
+                continue
+            task_id = task["id"]
+            paused = await self.schedule_pause(task_id)
+            if paused.status is ToolResultStatus.OK:
+                logger.warning(
+                    "Paused legacy ecosystem_discovery_watch schedule id=%s: "
+                    "core no longer supplies an implicit discovery tool. "
+                    "Recreate this watch with the same cron/filter arguments "
+                    "and args_json containing an explicit enabled "
+                    "feature-owned tool (for example "
+                    "{\"tool\":\"<discovery-tool>\",\"tool_args\":{...}}), "
+                    "then remove the paused legacy row.",
+                    str(task_id),
+                )
+            else:
+                logger.error(
+                    "Legacy ecosystem_discovery_watch schedule id=%s lacks "
+                    "required args.tool and could not be paused: %s. Remove "
+                    "or pause it manually, then recreate it with an explicit "
+                    "feature-owned discovery tool.",
+                    str(task_id),
+                    paused.error or "unknown scheduler error",
+                )
+
+        # Remove the former signal_dispatch auto-seed by its exact durable core
+        # identity. Cron and args are deliberately irrelevant: users may create
+        # their own signal_dispatch row at 08:05 with {} and it must survive.
+        # Once the identified row is removed it is absent from later snapshots,
+        # making this naturally one-time without a second migration marker.
+        for task in existing_tasks:
+            expected_key = _SUPERSEDED_BUILTIN_SCHEDULE_KEYS.get(
+                task["task_name"]
+            )
+            if expected_key is None:
+                continue
+            if task.get("idempotency_key") != expected_key:
+                continue
+            await self.schedule_remove(task["id"])
+            existing_names.discard(task["task_name"])
+            logger.info(
+                "Removed obsolete core schedule '%s' (id=%s, key=%s)",
+                task["task_name"],
+                str(task["id"])[:8],
+                expected_key,
+            )
+
+        # Cutover for legacy memory-maintenance auto-seeds whose task names are
+        # still valid tools. Never blanket-retire these names: remove only rows
+        # matching their former core signature, leaving customized schedules
+        # intact so the old defaults cannot duplicate nightly sleep.
         for task in existing_tasks:
             seed = _SUPERSEDED_AUTOSEEDS.get(task["task_name"])
             if seed is None:
@@ -419,8 +502,8 @@ class SchedulerFeature(Feature):
                 await self.schedule_remove(task["id"])
                 existing_names.discard(task["task_name"])
                 logger.info(
-                    "Removed auto-seeded '%s' (superseded by nightly sleep, "
-                    "id=%s)", task["task_name"], str(task["id"])[:8],
+                    "Removed obsolete core auto-seed '%s' (id=%s)",
+                    task["task_name"], str(task["id"])[:8],
                 )
 
         # Reflection-dependent schedules only if ReflectionFeature is loaded
@@ -433,7 +516,6 @@ class SchedulerFeature(Feature):
         defaults = [
             ("backup_snapshot", "0 */4 * * *", "{}"),
             ("morning_signal", "0 8 * * *", "{}"),
-            ("signal_dispatch", "5 8 * * *", "{}"),
             # Trash retention sweep (#764). Hard-purges soft-deleted
             # conversation rows past the per-agent retention window.
             # Operators tune frequency via `!schedule` and the window
@@ -464,8 +546,8 @@ class SchedulerFeature(Feature):
             )
 
         # Generic wait reconciler (Wave 2 of #1860) — the core, always-on
-        # successor to the talon-specific talon_monitor. Cheap (no LLM,
-        # just polling each MonitorableWaitable provider's in-flight
+        # monitor for all provider-owned waits. Cheap (no LLM, just polling
+        # each MonitorableWaitable provider's in-flight
         # handles) so 1/min cadence is fine. Emits one COGNITION signal
         # per terminal-state transition (provider-specific source when the
         # provider declares one, else wait.complete). Unconditional — the
@@ -1634,7 +1716,7 @@ class SchedulerFeature(Feature):
         """Run stale-work/red-CI discovery and wake on actionable changes.
 
         Args:
-            tool: discovery tool name, default ``scan_stale_work``.
+            tool: required feature-owned discovery tool name.
             tool_args: kwargs passed to that tool. Any top-level args other
                 than watcher control keys are also forwarded for convenience.
             watch_key: optional dedupe key. Defaults to tool + repo/filter args.
@@ -1642,13 +1724,18 @@ class SchedulerFeature(Feature):
             max_findings: maximum findings included in the cognition payload.
         """
         from kestrel_sovereign.signals.sources.ecosystem_discovery import (
-            DEFAULT_DISCOVERY_TOOL,
             build_signal_for_discovery_findings,
             evaluate_discovery_watch,
             state_to_json,
         )
 
-        tool_name = str(args.get("tool") or DEFAULT_DISCOVERY_TOOL)
+        tool_name = str(args.get("tool") or "").strip()
+        if not tool_name:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "configuration",
+                "error": "ecosystem_discovery_watch requires a non-empty tool",
+            })
         control_keys = {"tool", "tool_args", "watch_key", "notify", "max_findings"}
         tool_args = dict(args.get("tool_args") or {})
         for key, value in args.items():

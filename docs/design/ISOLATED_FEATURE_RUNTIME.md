@@ -44,12 +44,12 @@ This is not WhatsApp-specific: any feature pulling a heavy/native dependency
 
 | System | What it is | Isolation mechanism |
 |---|---|---|
-| **Talon** (`kestrel-talon`) | external coding-agent runner | **separate repo + its own `.venv`**, invoked as a CLI; thin `TalonCoordinatorFeature` lives in core (`features/talon/coordinator.py`), discovery is env → PATH → sibling `.venv` |
+| **Talon** (`kestrel-feature-talon` + `kestrel-talon`) | external coding coordinator + standalone runner | Both are independently installed; the feature package owns `TalonCoordinatorFeature` and invokes the standalone CLI without a core implementation fallback. |
 | **MCP** (`kestrel-feature-mcp`) | third-party tool servers | external **subprocess/SSE servers** spoken to over the MCP protocol; `manager.py` runs a background session loop with reconnect |
 | **FeatureFeature** (`kestrel-feature-features`) | agents *authoring* new features | workflow-driven build/review/**publish** of feature *packages* — **authoring only, no runtime/venv concern** |
 
-There is **no first-class "a feature runs in its own venv" capability**. Talon
-and MCP each hand-roll discovery + subprocess supervision + IPC differently;
+There is **no first-class "a feature runs in its own venv" capability**. The
+Talon and MCP feature packages each hand-roll discovery + subprocess supervision + IPC differently;
 FeatureFeature covers only authoring. Building WhatsApp's isolation as another
 one-off would be a fourth snowflake.
 

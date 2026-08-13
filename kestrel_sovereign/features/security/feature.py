@@ -79,7 +79,6 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "WebhookFeature": PermissionLevel.ASK,          # not WebhooksFeature
     "BridgeFeature": PermissionLevel.ASK,
     "DeployFeature": PermissionLevel.ASK,
-    "TalonCoordinatorFeature": PermissionLevel.ASK,
     "InferenceLeaseFeature": PermissionLevel.ASK,
     # KeyManagementFeature is ASK at the feature level because it bundles
     # destructive operations (delete_service_key, remove_service_key) with
@@ -135,12 +134,6 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         "delete_messages": PermissionLevel.ALWAYS_ASK,
         "delete_conversation": PermissionLevel.ALWAYS_ASK,
         "delete_message_by_id": PermissionLevel.ALWAYS_ASK,
-    },
-    "TalonCoordinatorFeature": {
-        # Read-only discovery must run unattended from the scheduler so
-        # ecosystem_discovery_watch can wake cognition on stale work. Talon
-        # dispatch/claim/verification tools remain feature-level ASK.
-        "scan_stale_work": PermissionLevel.ALLOW,
     },
     "InferenceLeaseFeature": {
         # Acquisition starts billable infrastructure and remains a hard

@@ -1,4 +1,4 @@
-"""Source registrations for built-in cron tasks (Phase 4 of #889).
+"""Source registrations for core cron-capable tasks (Phase 4 of #889).
 
 Each cron task gets its own SourceRegistration. The mode classification
 captures the per-task semantic — see SIGNAL_DISPATCHER.md §"The three
@@ -20,8 +20,6 @@ existing scheduler. Built-in tasks (`backup_snapshot`, `trash_retention`)
 that don't go through tool lookup get bespoke handlers wired by the
 SchedulerFeature.
 
-`signal_dispatch` is named confusingly but is unrelated to this PR —
-it's an existing scheduler tool that dispatches work to Talon. ACTION.
 """
 
 from __future__ import annotations
@@ -59,12 +57,15 @@ SOURCE_PREFIX = "cron."
 
 # (task_name, mode, resources_touched). Source registrations are built
 # from this table at agent init by `build_cron_registrations()`. To add
-# a new built-in scheduled task: append here, ensure the underlying tool
-# exists, and (if ACTION) wire the handler in SchedulerFeature.
+# a new signalized scheduled task: append here, ensure the underlying tool
+# exists, and (if it has no feature tool) wire a built-in ACTION handler in
+# SchedulerFeature. Membership does not imply that core auto-seeds a row.
 CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # Pure ops — no LLM, no shared state beyond what the handler touches.
     ("backup_snapshot", SignalMode.ACTION, frozenset()),
-    # External dispatch — sends work to Talon; agent storage untouched.
+    # Provider-neutral strategic dispatch. It remains user-schedulable even
+    # though core no longer auto-seeds it; the ACTION source preserves the
+    # normal cron signal log/span and routes to the live feature tool.
     ("signal_dispatch", SignalMode.ACTION, frozenset()),
     # Touches storage to purge soft-deleted rows past retention. MEMORY
     # is the closest existing lock; refining the lock taxonomy is a
@@ -103,8 +104,8 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # polls each provider's in-flight handles, and ENQUEUES one COGNITION
     # signal per terminal-state transition. The COGNITION wake comes from
     # that downstream signal, not from the reconcile task itself. This is
-    # the generic successor to the talon-specific talon_monitor; it's core
-    # (no feature gate). Built-in handler: run_wait_reconcile(agent).
+    # the generic monitor for all providers; it's core (no feature gate).
+    # Built-in handler: run_wait_reconcile(agent).
     ("wait_reconcile", SignalMode.ACTION, frozenset()),
     # Restart coordinator (#1512). ACTION — no LLM cost. Scans the
     # restart_requests table, evaluates safety, and spawns a detached

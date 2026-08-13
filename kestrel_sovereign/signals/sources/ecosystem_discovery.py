@@ -1,8 +1,8 @@
 """Signal source for scheduled stale-work / red-CI discovery wakes (#2281).
 
 The polling half is the ``ecosystem_discovery_watch`` ACTION cron task wired
-by ``SchedulerFeature``. It delegates to an existing discovery tool (default:
-``scan_stale_work``), normalizes the tool result into compact actionable
+by ``SchedulerFeature``. It delegates to an explicitly named feature-owned
+discovery tool, normalizes the tool result into compact actionable
 findings, fingerprints that compact state, and emits one COGNITION signal only
 when actionable findings are new, changed, or just resolved.
 
@@ -37,7 +37,6 @@ PROMPT_TEMPLATE = (
     / "prompts" / "signals" / "ecosystem_discovery_findings.md"
 )
 
-DEFAULT_DISCOVERY_TOOL = "scan_stale_work"
 DEFAULT_MAX_FINDINGS = 20
 
 _CLEAN_STATUSES = {
@@ -274,7 +273,9 @@ def _schema(payload: dict[str, Any]) -> dict[str, Any]:
             f"{type(payload).__name__}"
         )
     payload.setdefault("watch_key", "")
-    payload.setdefault("tool", DEFAULT_DISCOVERY_TOOL)
+    tool_name = payload.get("tool")
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        raise ValueError("ecosystem.discovery_findings payload requires non-empty tool")
     payload.setdefault("reason", "")
     payload.setdefault("summary", "")
     payload.setdefault("findings_count", "0")

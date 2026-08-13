@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class PressureLevel(enum.Enum):
     GREEN = "green"    # <80% — all workloads allowed
     YELLOW = "yellow"  # 80-90% — pause heavy workloads (LoRA, new batches)
-    RED = "red"        # >90% — kill LoRA, pause talon, only Kimi + embeddings
+    RED = "red"        # >90% — kill LoRA, only Kimi + embeddings
 
 
 @dataclass
@@ -225,7 +225,6 @@ class MemoryGuard:
         Workload priority (highest to lowest):
         - kimi: Always allowed (never touch)
         - embeddings: Allowed in GREEN and YELLOW
-        - talon: Allowed in GREEN only
         - lora: Allowed in GREEN only
         """
         level = self.check()
@@ -234,7 +233,7 @@ class MemoryGuard:
             return True
         elif workload == "embeddings":
             return level != PressureLevel.RED
-        elif workload in ("talon", "lora"):
+        elif workload == "lora":
             return level == PressureLevel.GREEN
         else:
             return level == PressureLevel.GREEN

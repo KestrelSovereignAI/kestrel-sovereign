@@ -4,12 +4,9 @@ Steps must be idempotent: running a step twice with the same answers
 yields the same files. The orchestrator at
 :mod:`kestrel_sovereign.setup.wizard` runs them in declared order.
 
-There are two kinds of steps:
-
-  - **Default**, listed in :data:`ORDERED` — run on every ``kestrel setup``.
-  - **Optional**, listed in :data:`BY_NAME` only — run only when the user
-    explicitly asks (``kestrel setup talon``). These exist for opt-in
-    integrations the user does not want set up automatically.
+Feature packages may contribute additional named setup steps through the
+feature contribution contract. Missing external steps are diagnosed from the
+feature registry by the setup command.
 """
 
 from kestrel_sovereign.setup.steps import (
@@ -19,7 +16,6 @@ from kestrel_sovereign.setup.steps import (
     keys,
     llm,
     payments,
-    talon,
     verify,
 )
 
@@ -51,15 +47,14 @@ ORDERED = (
     ("verify", verify.run),
 )
 
-#: Optional, opt-in steps. Not in ORDERED — only fire when named.
-OPTIONAL = (
-    ("talon", talon.run),
-)
+#: Core currently has no optional named steps. Independently installed feature
+#: packages contribute their own steps through the generic setup contract.
+OPTIONAL = ()
 
 #: Lookup for ``kestrel setup <step>``. Includes both default and optional.
 BY_NAME = {name: fn for name, fn in (*ORDERED, *OPTIONAL)}
 
 __all__ = [
     "ORDERED", "OPTIONAL", "BY_NAME",
-    "agent", "emancipation", "integrations", "keys", "llm", "payments", "talon", "verify",
+    "agent", "emancipation", "integrations", "keys", "llm", "payments", "verify",
 ]

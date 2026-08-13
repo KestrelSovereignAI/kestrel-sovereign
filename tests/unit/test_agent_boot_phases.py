@@ -161,6 +161,11 @@ async def test_clean_boot_reaches_ready(tmp_path):
         with _boot_mocks():
             await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+        from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+        # The Workflows built-in is registrable without Talon or any other
+        # domain feature: core hosts its six provider-neutral source contracts.
+        assert all(name in agent.signal_registry for name in SOURCE_NAMES)
     finally:
         await _cleanup(agent)
 

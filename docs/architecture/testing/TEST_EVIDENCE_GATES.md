@@ -53,17 +53,17 @@ fields for it:
 - `ci_status` — the CI status Talon observed.
 
 If those fields are **empty**, Talon did not report structured evidence —
-the reviewer must **not** assume tests passed. (The CLI flags that make
-Talon populate these live in the `kestrel-talon` package; this repo
-defines the contract and the receiving end.)
+the reviewer must **not** assume tests passed. The external
+`kestrel-feature-talon` package defines the signal contract, receiving path,
+and verification surface; the CLI execution flags live in `kestrel-talon`.
 
 ## 2. Review side (Kestrel Sovereign)
 
 The reviewer has an audited way to request/run verification commands
-without ad-hoc shell usage: the **`talon_verify`** tool
-(`kestrel_sovereign/features/talon/coordinator.py`), backed by the
-verification layer in
-[`kestrel_sovereign/features/talon/verification.py`](../../../kestrel_sovereign/features/talon/verification.py).
+without ad-hoc shell usage: the **`talon_verify`** tool, owned by
+`kestrel-feature-talon` and backed by its
+[`verification.py`](https://github.com/KestrelSovereignAI/kestrel-feature-talon/blob/main/kestrel_feature_talon/verification.py)
+layer.
 
 ```text
 !talon verify
@@ -135,5 +135,5 @@ sandbox/policy block to the user.
 ## See also
 
 - [`TESTING_GUIDE.md`](TESTING_GUIDE.md) — how to run the suites.
-- [`docs/architecture/SIGNAL_DISPATCHER.md`](../SIGNAL_DISPATCHER.md) — how
-  the `talon.job_complete` wake reaches the reviewer.
+- [`docs/architecture/SIGNAL_DISPATCHER.md`](../SIGNAL_DISPATCHER.md) — the
+  generic signal-dispatch contract used by feature-owned wake sources.

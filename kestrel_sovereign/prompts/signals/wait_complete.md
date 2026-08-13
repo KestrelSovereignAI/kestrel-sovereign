@@ -10,7 +10,7 @@ This wake fired from the periodic wait reconciler poll, NOT from a user prompt â
 
 Provider-specific status (the waitable's own status string, if any): `{payload[status]}`.
 
-The reconciler records this transition durably so you will not be woken again for the same `{payload[kind]}:{payload[handle]}:{payload[outcome]}`. If you need the full provider state, use the kind's own status tool (e.g. `task_status` / `talon_status`) with handle `{payload[handle]}`.
+The reconciler records this transition durably so you will not be woken again for the same `{payload[kind]}:{payload[handle]}:{payload[outcome]}`. If you need the full provider state, use the registered provider's status tool, when one is available, with handle `{payload[handle]}`.
 
 source={source}
 arrived_at={arrived_at}

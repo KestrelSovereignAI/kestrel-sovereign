@@ -84,16 +84,18 @@ async def dispatcher_components(tmp_path):
 
 
 def test_all_cron_tasks_are_classified():
-    """Spec from #893 + #1510 + #1512: the canonical built-in cron task set.
+    """Canonical cron-capable task set, including user-scheduled tools.
+
     If a new one is added or one removed, this test fails loudly so
-    the classification table stays in sync with the scheduler's
-    defaults."""
+    the classification table stays in sync with the scheduler's supported
+    dispatch surface. Not every source here is auto-seeded.
+    """
     names = [t[0] for t in CRON_TASKS]
     assert sorted(names) == sorted([
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "morning_signal",
-        "signal_dispatch",
+        "signal_dispatch",  # user-schedulable; not a core auto-seed
         "trash_retention",
         "training_cycle",
         "reflect",
@@ -116,7 +118,7 @@ def test_action_vs_artifact_split_matches_design():
     assert by_mode[SignalMode.ACTION] == {
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
-        "signal_dispatch",
+        "signal_dispatch",  # provider-neutral user-scheduled dispatch
         "trash_retention",
         "training_cycle",
         "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the
@@ -229,10 +231,16 @@ def test_builtin_handlers_override_tool_lookup():
 
 
 @pytest.mark.asyncio
-async def test_action_task_dispatches_through_handler(dispatcher_components):
-    """ACTION cron source → dispatcher invokes handler with payload →
-    result.action_result carries the return value."""
-    agent, registry, dispatcher, _ = dispatcher_components
+async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
+    dispatcher_components,
+):
+    """A custom dispatch schedule retains cron signal logging/dispatch.
+
+    Core no longer auto-seeds this task, but a user-created row still emits
+    ``cron.signal_dispatch`` and reaches the provider-neutral feature tool via
+    the ordinary ACTION handler.
+    """
+    agent, registry, dispatcher, backend = dispatcher_components
     captured = []
 
     async def fake_lookup(name, args):
@@ -253,6 +261,15 @@ async def test_action_task_dispatches_through_handler(dispatcher_components):
     assert result.status == Status.OK
     assert result.action_result == "ran:signal_dispatch"
     assert captured == [("signal_dispatch", {"mode": "execute"})]
+
+    pending = [task for task in agent.background_tasks if not task.done()]
+    if pending:
+        await asyncio.gather(*pending)
+    rows = await backend.fetch_all(
+        "SELECT source, status FROM signal_log WHERE source=?",
+        (cron_source_name("signal_dispatch"),),
+    )
+    assert rows == [("cron.signal_dispatch", Status.OK.value)]
 
 
 @pytest.mark.asyncio

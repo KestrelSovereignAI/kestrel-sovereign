@@ -447,7 +447,7 @@ Five rules:
    resolved value so an untrusted one cannot even survive into the log.
 
 3. **Capture through the turn lifecycle, not `_active_session_id`.**
-   Use `agent._get_turn_bound_session_id()`. The attribute is
+   Use the public `agent.get_turn_bound_session_id()` accessor. The attribute is
    agent-global and the turn id is a ContextVar copied into child
    tasks, so each read lies on its own: out-of-turn work (a cron tick)
    sees whatever chat turn is concurrently in flight, and a task
@@ -457,13 +457,10 @@ Five rules:
    stranger's window.
 
 4. **Don't register session-bound work on a rail that can't wake it.**
-   The binding is only as good as the completion path that carries it.
-   `talon_claim` prefers the A2A rail, but that rail creates the task
-   on the recipient agent and leaves the sender an in-memory row that
-   nothing enumerates for a wake — so a claim made from inside a chat
-   turn is routed to the durable CLI rail instead. Choose the rail at
-   registration time; a captured origin that no completion path reads
-   is worse than none, because it looks bound.
+   The binding is only as good as the completion path that carries it. Choose
+   a provider rail whose durable completion reconciler reads the captured
+   origin. A captured origin that no completion path reads is worse than none,
+   because it looks bound.
 
 5. **Persisted is not surfaced — say which one you mean (#2922).**
    `wait_signal_state.last_delivery_status` no longer records the bare

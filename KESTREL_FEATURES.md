@@ -27,7 +27,7 @@
 These ownership statements are normative and must remain intact in every
 audience-specific derivative:
 
-<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+<!-- NON_BUNDLED_SURFACE_ALIASES: talon feature|talon coordinator; voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
 
 - **Bundled Feature lifecycle modules:** Feature subclasses discovered from
   `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
@@ -37,9 +37,10 @@ audience-specific derivative:
   as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
   lifecycle classes. The registry labels these `bundled-component` rather than
   putting them in its `features` field.
-- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
-  wallet, observability, reflection, council, visual identity, legal, code
-  editing, parametric self, and WhatsApp transport are separate install targets.
+- **Not bundled — extracted Feature packages:** Talon, Voice, MCP, GitHub
+  integration, wallet, observability, reflection, council, visual identity,
+  legal, code editing, parametric self, and WhatsApp transport are separate
+  install targets.
   They register Feature subclasses through the `kestrel_sovereign.features`
   entry-point group.
 - **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
@@ -47,9 +48,9 @@ audience-specific derivative:
   implement provider contracts. They use provider-specific entry-point groups;
   installing one does not make that provider a Feature lifecycle class.
 - **Not bundled — standalone tool:** `kestrel-talon` is an independently
-  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
-  is only its bundled Kestrel control surface; the coordinator and the
-  standalone executable are separately named registry rows.
+  installed command-line issue processor. Its `TalonCoordinatorFeature` control
+  surface is also external, owned by `kestrel-feature-talon`; the feature and
+  standalone executable are separately named companion registry rows.
 
 The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
 these distinctions in `boundary`. Its `package` field is always the owning
@@ -188,7 +189,7 @@ The generated inventory below lists bundled Feature lifecycle modules only: the 
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
+- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
 
 ### `attachments` (AttachmentsFeature)
 
@@ -622,36 +623,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `backlog_hygiene` | `!hygiene` | `system` | `fix` | 88 | `enabled` |
 | `morning_signal` | `!morning` | `system` |  | 48 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
-| `signal_dispatch` | `!dispatch` | `system` | `mode` | 94 | `enabled` |
+| `signal_dispatch` | `!dispatch` | `system` | `mode` | 89 | `enabled` |
 | `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `notes` | 170 | `enabled` |
 | `strategy_add_decision` |  | `system` | `decision`, `rationale`, `session`, `impact` | 131 | `enabled` |
 | `strategy_add_pattern` |  | `system` | `pattern`, `source`, `implication` | 110 | `enabled` |
 | `strategy_resolve_blocker` |  | `system` | `issue` | 53 | `enabled` |
 | `strategy_view` | `!strategy` | `system` | `section` | 82 | `enabled` |
-
-### `talon` (TalonCoordinatorFeature)
-
-- Source: [`kestrel_sovereign/features/talon/__init__.py`](kestrel_sovereign/features/talon/__init__.py)
-- Enablement state: `enabled`
-
-| Tool | Command | Category | Params | Token cost | State |
-|---|---|---|---|---:|---|
-| `scan_stale_work` | `!talon scan-stale-work` | `utility` | `stale_days`, `repo`, `repos`, `org`, `repo_prefix`, `exclude_repos` | 280 | `enabled` |
-| `talon_batch` | `!talon batch` | `utility` | `repo`, `prd` | 292 | `enabled` |
-| `talon_claim` | `!talon claim` | `utility` | `repo`, `issue`, `max_iterations`, `max_turns`, `backend`, `model`, `auth_lane`, `skip_clarification`, `worktree`, `self_review`, `demo_check`, `eye_check` | 537 | `enabled` |
-| `talon_file_and_claim` | `!talon file-and-claim` | `utility` | `title`, `body`, `labels`, `repo` | 214 | `enabled` |
-| `talon_get_config` | `!talon config` | `utility` |  | 50 | `enabled` |
-| `talon_github_write` | `!talon github-write` | `system` | `operation`, `issue`, `repo`, `body`, `labels`, `title`, `state_reason` | 444 | `enabled` |
-| `talon_health` | `!talon health` | `system` |  | 48 | `enabled` |
-| `talon_job_log` | `!talon job-log` | `utility` | `job_id`, `lines` | 64 | `enabled` |
-| `talon_pause` | `!talon pause` | `system` |  | 21 | `enabled` |
-| `talon_resume` | `!talon resume` | `system` |  | 21 | `enabled` |
-| `talon_schedule_work_rescue` | `!talon schedule-rescue` | `system` | `cron`, `stale_days` | 160 | `enabled` |
-| `talon_set_config` | `!talon set-config` | `system` | `default_backend`, `default_model`, `default_auth_lane`, `max_iterations`, `max_turns`, `skip_clarification`, `self_review` | 602 | `enabled` |
-| `talon_setup_workspace` | `!talon setup-workspace` | `system` | `repo`, `fetch` | 129 | `enabled` |
-| `talon_status` | `!talon status` | `utility` | `source` | 188 | `enabled` |
-| `talon_verify` | `!talon verify` | `system` | `commands`, `repo`, `cwd`, `ref`, `timeout`, `note` | 350 | `enabled` |
-| `talon_workspace_status` | `!talon workspace-status` | `utility` | `repo` | 53 | `enabled` |
 
 ### `tasks` (TaskFeature)
 
@@ -678,7 +655,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `todo_add` | `!todo add` | `system` | `title`, `description`, `scope`, `status`, `priority`, `owner`, `links`, `terminal_condition`, `next_check_at`, `source_metadata` | 236 | `enabled` |
 | `todo_complete` | `!todo complete` | `system` | `todo_id`, `outcome`, `evidence`, `terminal_condition_satisfied`, `superseded_by` | 138 | `enabled` |
-| `todo_link_task` | `!todo link` | `system` | `todo_id`, `link_type`, `target`, `title`, `status`, `url`, `metadata` | 172 | `enabled` |
+| `todo_link_task` | `!todo link` | `system` | `todo_id`, `link_type`, `target`, `title`, `status`, `url`, `metadata` | 174 | `enabled` |
 | `todo_list` | `!todo list` | `system` | `scope`, `status`, `owner`, `include_done`, `include_superseded`, `limit` | 150 | `enabled` |
 | `todo_rollup` | `!todo rollup` | `system` | `include_done`, `limit` | 67 | `enabled` |
 | `todo_update` | `!todo update` | `system` | `todo_id`, `title`, `description`, `scope`, `status`, `priority`, `owner`, `links`, `terminal_condition`, `next_check_at`, `superseded_by`, `source_metadata` | 289 | `enabled` |
@@ -690,7 +667,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `wait` | `!wait` | `utility` | `target`, `duration_seconds`, `timeout_seconds`, `poll_interval_seconds`, `reason`, `mode` | 786 | `enabled` |
+| `wait` | `!wait` | `utility` | `target`, `duration_seconds`, `timeout_seconds`, `poll_interval_seconds`, `reason`, `mode` | 774 | `enabled` |
 
 ### `web_search` (WebSearchFeature)
 
@@ -1094,27 +1071,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt] [on_progress]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. storage_tier must be one of 'local', 'ipfs' (default), or 'filecoin'; an unrecognized value is rejected (it is NOT silently defaulted to ipfs). |
 | `!import-sovereignty` | `sovereignty` | `<cid>` | Restore this agent's CONVERSATION HISTORY from a prior backup (IPFS CID). Faithfully preserves message timestamps and trash state. NOTE: this currently restores conversation history only — NOT full agent state (memories, knowledge graph, saved items, files, settings). Full-state restore is tracked separately. |
 | `!state-of-mind` | `state_of_mind` |  | Get the current constitutional governance state for this agent |
-| `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and dispatch it to Talon via the Agent Mesh Protocol. Works with any signal source (morning, hygiene, event-driven, on-demand). |
+| `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and start it through a live feature-contributed dispatch workflow. Preview with mode='suggest'; execute fails closed when no compatible workflow capability and governed runner are enabled. |
 | `!hygiene` | `strategic_memory` | `[fix]` | Scan all repos for backlog hygiene issues: missing assignees, milestones, status labels. Reports gaps and flags items needing human review. |
 | `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
 | `!sessionlog` | `strategic_memory` | `[session_id] [focus]` | End-of-day session log collector. Scans all repos for today's activity (issues closed, PRs merged, comments, commits) and generates a structured session summary with outcomes and metrics. |
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
-| `!talon batch` | `talon` | `<repo> [prd]` | Dispatch a batch of issues to Talon from a PRD JSON file. ``prd`` is REQUIRED and must be an absolute path to an existing PRD JSON file (there is no label/repo-scoped batch mode — kestrel-talon's `batch` subcommand only accepts `--prd`). Runs through the same policy layer as talon_claim: ``allow_background_jobs`` and ``allowed_backends`` are enforced, the subprocess env is credential-sanitized, and a sandbox workspace clone must already be provisioned for ``repo`` (call talon_setup_workspace first) — batch never operates on the running agent's source tree. Returns immediately with a job_id; poll talon_status. |
-| `!talon claim` | `talon` | `<repo> <issue> [max_iterations] [max_turns] [backend] [model] [auth_lane] [skip_clarification] [worktree] [self_review] [demo_check] [eye_check]` | Dispatch a single issue to Talon for autonomous implementation. Returns immediately with a job_id; the actual work runs in the background. Poll talon_status or talon_job_log to follow progress. |
-| `!talon config` | `talon` |  | Read Talon runtime policy and mutable preference. This is the agent's control surface for its coding-agent backend/model, separate from normal chat LLM routing. |
-| `!talon file-and-claim` | `talon` | `<title> <body> [labels] [repo]` | Loop-closing primitive: file a GitHub issue, then immediately dispatch it to Talon. Runs `gh issue create` through the audited computer_use shell path (auto-approved if the Sovereign added a matching allowlist pattern), parses the new issue number, then calls talon_claim. Returns the issue URL and the Talon job_id. |
-| `!talon github-write` | `talon` | `<operation> <issue> [repo] [body] [labels] [title] [state_reason]` | Bounded GitHub issue-write job for orchestration (#2581 — the `github.write` / `issue.close` capability): close, reopen, comment on, label, or update a GitHub issue after work completes, closing the claim→work→close loop without a human running `gh`. The GitHub token is used in-process for a single authenticated REST call and is NEVER handed to a shell or the read-only git/verify surface. Write targets are restricted to the agent's own repo (GITHUB_SELF_REPO) plus GITHUB_FLEET_REPOS. operation ∈ {close_issue, reopen_issue, comment, add_labels, remove_labels, update_issue}. |
-| `!talon health` | `talon` |  | Check whether kestrel-talon is reachable and runnable: binary discoverable, subprocess env clean, executes ``--help`` successfully. Read-only, no dispatch. |
-| `!talon job-log` | `talon` | `<job_id> [lines]` | Tail the log file of a dispatched Talon job. Use the job_id returned by talon_claim. Read-only. |
-| `!talon pause` | `talon` |  | Pause the autonomous Talon loop (kill switch). |
-| `!talon resume` | `talon` |  | Resume the autonomous Talon loop after pause. |
-| `!talon scan-stale-work` | `talon` | `[stale_days] [repo] [repos] [org] [repo_prefix] [exclude_repos]` | Read-only ecosystem discovery scan for stale Talon work. Returns actionable findings for scheduler discovery watches; never dispatches repairs or closes issues. |
-| `!talon schedule-rescue` | `talon` | `[cron] [stale_days]` | Schedule the stalled_work_rescue workflow as a SAFE recurring loop. Each tick detects stalled fleet work and requests fresh per-run consent; the irreversible dispatch/close stages never auto-run off the schedule. Refuses to bake in repair targets, resolution evidence, or a blanket approval marker. |
-| `!talon set-config` | `talon` | `[default_backend] [default_model] [default_auth_lane] [max_iterations] [max_turns] [skip_clarification] [self_review]` | Update mutable Talon preferences only (operator policy is not changed by this tool). Writes the same defaults that talon_claim consumes per-dispatch. Allowed values: default_backend ∈ {claude, codex, opencode}; default_model — when backend=claude one of {opus, sonnet, haiku} (required), when backend=codex/opencode optional (omit to use the provider default; an explicitly blank value is rejected); default_auth_lane ∈ {oauth, api_key, provider_config}. Cross-field rules: codex ⇒ auth_lane=oauth; opencode ⇒ auth_lane=provider_config; claude ⇒ auth_lane oauth or api_key. max_iterations / max_turns are positive integer counts. |
-| `!talon setup-workspace` | `talon` | `<repo> [fetch]` | Provision (or refresh) a sandboxed talon workspace clone for a repo. The clone lives outside the running agent's source tree, so talon_claim can operate without ever touching the agent's own checkout. Approval-gated. |
-| `!talon status` | `talon` | `[source]` | Check status of Talon jobs (running, completed, failed). Merges locally-dispatched jobs (the durable registry) with jobs only observed via the shared observability store — e.g. runs driven by a Claude Code session or a peer host. Each job carries a 'source' provenance field ('registry' vs 'observability'). Pass source='observability' to list only externally-driven jobs, or source='registry' for only local ones. |
-| `!talon verify` | `talon` | `<commands> [repo] [cwd] [ref] [timeout] [note]` | Reviewer-side audited test verification. Run one or more test commands and report a precise result state per command (passed / failed / blocked_by_policy / blocked_by_user / blocked_by_sandbox / tooling_error). Allowlisted project test commands (e.g. `uv run pytest ...`) run without prompting; anything else is approval-gated. Use this instead of ad-hoc shell so test evidence is structured and audited, and so a sandbox/policy block is never mislabeled as a user denial. |
-| `!talon workspace-status` | `talon` | `<repo>` | Read-only: report on the talon workspace clone for a repo (path, exists, git HEAD, clean state, last fetch). No side effects. |
 | `!a2a attach` | `tasks` | `<task_id> <name> <content> [index] [last_chunk]` | RESPONDER-SIDE artifact attach: the RECIPIENT of an incoming A2A task uses this to attach its own output. To attach payload as the SENDER of an outgoing task, pass ``artifacts``/``references`` to send_a2a_task / send_a2a_question instead. Attach one chunk of long-form output as an Artifact to an incoming A2A task BEFORE calling respond_to_a2a_task. Use this when your reply exceeds the per-tool argument cap (10K chars) — chunk the body into segments of <=9000 chars each, call this tool once per segment with monotonically-increasing index (0, 1, 2, ...) and last_chunk=False on every segment except the final one. The sender's get_peer_task_result returns the artifacts in order so the resumed turn can reassemble the full body. After all segments are attached, call respond_to_a2a_task with a SHORT content like 'See attached artifacts (N segments).' so the sender knows where to look. |
 | `!a2a respond` | `tasks` | `<task_id> <content> [state]` | Respond to an incoming A2A task in your inbox by transitioning it to a terminal state with your reply text. Use this when another agent sent you a task via send_a2a_question (fire-and-resume — sender's turn ended, they wake on the a2a.question_answered signal when you transition), send_a2a_message (FYI, brief receipt), or send_a2a_task (delegated work, full result). The sender's subscription supervisor on the SSE stream picks up your terminal frame and fires their resumption signal. Without this tool the sender's send_a2a_question lineage never resumes until the hourly expiry sweep fires a state='expired' signal. |
 | `!cancel-task` | `tasks` | `<task_id> [reason]` | Cancel a pending or running task. |
@@ -1125,11 +1086,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!tasks` | `tasks` | `[status] [task_type] [limit]` | List background tasks, optionally filtered by status or type. status must be one of the TaskState values: submitted, working, completed, failed, canceled (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states. |
 | `!todo add` | `todo` | `<title> [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [source_metadata]` | Create a durable active todo with terminal criteria and optional external links. |
 | `!todo complete` | `todo` | `<todo_id> [outcome] [evidence] [terminal_condition_satisfied] [superseded_by]` | Mark a todo done only when its terminal condition is explicitly satisfied, or cancel/supersede it with a reason. |
-| `!todo link` | `todo` | `<todo_id> <link_type> <target> [title] [status] [url] [metadata]` | Attach an external reference to a todo, such as a GitHub issue, Talon job, A2A task, scheduled job, restart request, action item, or evidence URL. |
+| `!todo link` | `todo` | `<todo_id> <link_type> <target> [title] [status] [url] [metadata]` | Attach an external reference to a todo, such as a GitHub issue, coding workflow run, A2A task, scheduled job, restart request, action item, or evidence URL. |
 | `!todo list` | `todo` | `[scope] [status] [owner] [include_done] [include_superseded] [limit]` | List durable todos by scope/status/owner, excluding superseded items by default. |
 | `!todo rollup` | `todo` | `[include_done] [limit]` | Summarize pending/waiting/in-progress todos across sessions and linked systems. |
 | `!todo update` | `todo` | `<todo_id> [title] [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [superseded_by] [source_metadata]` | Update an active todo without marking it complete unless status is explicitly terminal. |
-| `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a LOCAL Kestrel background task (this agent's own store)<br>• `talon:<job_id>` — a Talon coding job<br>• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via send_a2a_task (route it here, NOT `task:` — a `task:` on an outbound A2A id is a provider mismatch and is rejected at registration). A2A QUESTIONS are NOT watched here: send_a2a_question already wakes you via its own `a2a.question_answered` signal, so an `a2a:<question-id>` watch is rejected to avoid waking you twice for one answer.<br>• `ci:<owner/repo#N>` — a GitHub PR's merge/CI-check state<br>• `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>A kind being LISTED here is documentation, not a guarantee it is AVAILABLE: a provider is only reachable when its feature is loaded. If you pass an unknown/unavailable kind, the error lists the kinds currently registered. A registered kind's signal-mode watch is durable and RE-ARMS across restart; availability (is the provider loaded?) and re-arming (does a live watch resume?) are separate — a documented kind whose feature is not loaded neither registers nor re-arms.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
+| `!wait` | `wait` | `[target] [duration_seconds] [timeout_seconds] [poll_interval_seconds] [reason] [mode]` | The ONE generic wait — works across EVERY feature. There is no per-feature wait tool; whatever async work a loaded feature exposes, you wait on it here with `target="<kind>:<handle>"`.<br>Known handle kinds (each contributed by a feature; more may be registered by whatever features are loaded):<br>• `task:<task_id>` — a LOCAL Kestrel background task (this agent's own store)<br>• `a2a:<task_id>` — an OUTBOUND A2A TASK you sent a peer via send_a2a_task (route it here, NOT `task:` — a `task:` on an outbound A2A id is a provider mismatch and is rejected at registration). A2A QUESTIONS are NOT watched here: send_a2a_question already wakes you via its own `a2a.question_answered` signal, so an `a2a:<question-id>` watch is rejected to avoid waking you twice for one answer.<br>• `ci:<owner/repo#N>` — a GitHub PR's merge/CI-check state<br>• `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` and others when those features are present.<br>A kind being LISTED here is documentation, not a guarantee it is AVAILABLE: a provider is only reachable when its feature is loaded. If you pass an unknown/unavailable kind, the error lists the kinds currently registered. A registered kind's signal-mode watch is durable and RE-ARMS across restart; availability (is the provider loaded?) and re-arming (does a live watch resume?) are separate — a documented kind whose feature is not loaded neither registers nor re-arms.<br><br>Three ways to call it:<br>• `target="<kind>:<handle>"` (default `mode="block"`) — hold the turn, polling until that thing reaches a terminal state or the timeout expires; returns the terminal outcome (or a still-pending result on timeout).<br>• `target="<kind>:<handle>", mode="signal"` — register a watch and return IMMEDIATELY; the wait reconciler wakes you with a `wait.complete` cognition signal once it finishes. Use this for long/unattended waits so you don't hold a turn.<br>• `duration_seconds=N` (no target) — a plain bounded pause, the native alternative to shelling out to `sleep` between polls in an autonomous loop. |
 | `!web-search` | `web_search` | `<query> [max_results]` | Search the web for information. max_results is typically 1-10 (default 5). A 'disabled' error means no search provider is configured — set a provider API key (e.g. TAVILY_API_KEY). |
 | `!webhooks history` | `webhooks` | `[limit]` | Show recent webhook receive log for security audit |
 | `!webhooks list` | `webhooks` |  | List all registered webhook endpoints |
@@ -1139,6 +1100,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
+
+
 
 
 

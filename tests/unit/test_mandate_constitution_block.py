@@ -144,6 +144,25 @@ def test_render_block_keeps_valid_typed_fields():
     assert "shell" in block
 
 
+def test_render_block_surfaces_allowed_tools_positive_ceiling():
+    block = render_mandate_constitution_block(
+        SimpleNamespace(
+            additional_constraints={"allowed_tools": ["workflow_run"]},
+            features_allowed=[],
+        )
+    )
+    assert "Allowed tools (hard ceiling): workflow_run" in block
+
+
+def test_scoped_constitution_accepts_allowed_tools_as_narrowing():
+    scoped = ScopedConstitution(
+        base_constitution="BASE",
+        additional_constraints={"allowed_tools": ["workflow_run"]},
+    )
+    ok, message = scoped.validate_constraints()
+    assert ok, message
+
+
 def test_render_block_empty_when_freetext_only():
     """A mandate carrying only a free-text constraint surfaces nothing."""
     assert render_mandate_constitution_block(

@@ -75,7 +75,7 @@ The existing `emit_event` / `add_event_listener` ([agent/event_manager.py:15-33]
 
 | Mode | Definition | LLM involvement | Enters conversation history | Implementation contract | Examples |
 |---|---|---|---|---|---|
-| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `signal_dispatch` |
+| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `wait_reconcile` |
 | **ARTIFACT** | Produces an artifact (text, JSON, etc.); does not enter a turn. May internally fetch data, mutate feature state, make one or more LLM calls. | Maybe (handler decides) | No | `artifact_handler(signal) -> ArtifactResult` | `morning_signal`, `reflect`, `memory_consolidate` |
 | **COGNITION** | Full agent turn — enters conversation history, may invoke tools, may emit further signals | Yes | Yes | Renders `prompt_template` → `process_input` (or streaming variant) | Heartbeat tick, A2A task-complete, webhook-driven decisions |
 
@@ -96,7 +96,6 @@ async def template_artifact_handler(template_path: Path) -> ArtifactHandler:
 | Heartbeat tick | COGNITION | Already a turn |
 | Cron `morning_signal` | ARTIFACT | Feature workflow; returns briefing text |
 | Cron `reflect` | ARTIFACT | LLM-authored, no follow-up cognition |
-| Cron `signal_dispatch` | ACTION | Existing side-effect tool |
 | Cron `trash_retention` | ACTION | Pure ops |
 | Cron `backup_snapshot` | ACTION | Pure ops |
 | Cron `memory_consolidate` | ARTIFACT (likely) | Feature owner confirms during migration |
