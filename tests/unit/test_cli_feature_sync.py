@@ -42,11 +42,13 @@ class _InstallSpy:
 
     def __init__(self, returncode=0, stderr=""):
         self.calls = []
+        self.constraints = []
         self.returncode = returncode
         self.stderr = stderr
 
-    def __call__(self, pip_args):
+    def __call__(self, pip_args, constraints=None):
         self.calls.append(list(pip_args))
+        self.constraints.append(list(constraints or []))
         return subprocess.CompletedProcess(pip_args, self.returncode, stdout="", stderr=self.stderr)
 
 
@@ -377,7 +379,7 @@ def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args):
+        def __call__(self, pip_args, constraints=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -444,7 +446,7 @@ def test_sync_git_fallback_carries_extras(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args):
+        def __call__(self, pip_args, constraints=None):
             self.calls.append(list(pip_args))
             rc = 0 if "git+" in str(pip_args[0]) else 1
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -472,6 +474,7 @@ def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
         "_installed_extension_distributions",
         lambda: [{"dist": "kestrel-feature-voice", "editable_path": r"C:\src\voice"}],
     )
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # core: wheel
     manifest = tmp_path / "m.toml"
     cli.cmd_feature_sync(_args(manifest, capture=True))
     # The captured file must parse back to the exact path (no TOML escape break)

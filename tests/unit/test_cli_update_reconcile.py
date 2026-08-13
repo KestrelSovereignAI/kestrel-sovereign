@@ -60,7 +60,7 @@ def test_reconcile_installs_missing_allowlisted_feature(patched, capsys):
     registry PyPI source."""
     install_calls = []
 
-    def fake_install(pip_args):
+    def fake_install(pip_args, constraints=None):
         install_calls.append(pip_args)
         return _ok(stdout="Successfully installed kestrel-feature-voice-0.3.0")
 

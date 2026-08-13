@@ -25,6 +25,20 @@
 #   - neither               -> install latest from PyPI (back-compat)
 # `editable` and `pypi` are mutually exclusive — a feature has one source.
 
+# The core distribution is a first-class entry here (issue #2949). Every
+# `kestrel-feature-*` depends on `kestrel-sovereign`, and the installer
+# (`uv pip`) is project-blind: it does not read `uv.lock`, so it treats core as
+# an ordinary dependency and will resolve a wheel from PyPI whenever the
+# installed version fails a feature's pin — silently replacing an editable
+# checkout. Declaring core here makes its intended source explicit; `feature
+# sync` and the `kestrel update` reconcile step then pin core to the checkout
+# for every feature install and re-link it if anything breaks the link.
+# Declare `pypi` instead when core is deliberately a wheel; omit the entry
+# entirely and the live editable link (if any) is guarded anyway.
+[[feature]]
+name = "kestrel-sovereign"
+editable = "/path/to/kestrel-sovereign"
+
 # Install from PyPI/git via the feature registry (name resolves through
 # `kestrel feature list`). A raw dist name like "kestrel-feature-voice" works
 # too.

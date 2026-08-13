@@ -12,6 +12,7 @@ Shared, test-patched helpers (``_get_project_dir``,
 here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -478,21 +479,125 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _extension_install_run(pip_args: list):
+def _extension_install_run(pip_args: list, constraints: Optional[list] = None):
     """Install via uv when available, else the interpreter's own pip.
 
     uv-created virtualenvs frequently ship without ``pip``, so a bare
     ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
     (pinned to *this* interpreter so a worktree can't retarget the wrong env),
     and fall back to ``python -m pip install`` only when uv isn't on PATH.
+
+    ``uv pip`` vs ``uv sync`` — do NOT "fix" this by switching installers.
+    ``uv pip`` is uv's *pip-compatible* layer: it operates on a bare virtualenv
+    and deliberately does not read ``uv.lock`` or the project config. That is
+    exactly what we want here, because feature packages are intentionally NOT
+    declared in ``pyproject.toml`` (declaring them would invert the open-core
+    dependency direction) — ``uv sync`` would prune every one of them.
+
+    The cost of project-blindness is that uv never learns the lock declares the
+    root as ``source = { editable = "." }``. It sees an ordinary dependency
+    named ``kestrel-sovereign``, and when the installed version fails a
+    feature's pin it resolves one from the index — silently replacing the
+    editable checkout with a wheel copy (issue #2949). ``constraints`` closes
+    that hole: a list of PEP 508 requirement strings written to a temporary
+    constraints file and passed as ``-c``. Callers pin core to the checkout's
+    version so the index is not a candidate; a real version skew then fails the
+    resolve loudly instead of swapping the install underneath the operator.
+
+    ``--no-deps`` is NOT the fix: it stops feature dependencies resolving at all
+    and hides the version-skew signal rather than surfacing it.
     """
     import shutil
+    import tempfile
 
-    if shutil.which("uv"):
-        cmd = ["uv", "pip", "install", "--python", sys.executable, *pip_args]
+    constraint_file = None
+    extra_args: list = []
+    if constraints:
+        fd, constraint_file = tempfile.mkstemp(
+            prefix="kestrel-constraints-", suffix=".txt",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(constraints) + "\n")
+        extra_args = ["-c", constraint_file]
+
+    try:
+        if shutil.which("uv"):
+            cmd = [
+                "uv", "pip", "install", "--python", sys.executable,
+                *extra_args, *pip_args,
+            ]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
+        return subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        if constraint_file:
+            try:
+                os.unlink(constraint_file)
+            except OSError:
+                pass
+
+
+def _core_install_shape():
+    """Snapshot how ``kestrel-sovereign`` is installed in this venv.
+
+    Returns a :class:`~kestrel_sovereign.feature_reconcile.CoreInstallShape`.
+    Read through ``cli.`` so the test suite's patch seams apply.
+    """
+    import importlib.metadata as md
+
+    from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION, CoreInstallShape
+
+    try:
+        version = md.version(CORE_DISTRIBUTION)
+    except md.PackageNotFoundError:
+        version = None
+    return CoreInstallShape(
+        version=version,
+        editable_path=cli._editable_install_path(CORE_DISTRIBUTION),
+    )
+
+
+def _restore_core_editable_install(before, guard: Optional[str]) -> int:
+    """Assert core survived a batch of feature installs; re-link it if not.
+
+    The prevention half (``core_install_constraints``) stops the common swap,
+    but any path that bypasses the constraint — a direct ``pip`` call, a
+    feature's own build step, an operator's manual install — can still break the
+    link. Verifying afterwards turns "silently running an old wheel copy" into a
+    named failure: re-link the checkout and return non-zero so the caller never
+    reports success (issue #2949).
+
+    Returns 0 when core is intact (or unguarded), 1 when it changed.
+    """
+    from kestrel_sovereign.feature_reconcile import describe_core_change
+
+    if not guard:
+        return 0
+    after = cli._core_install_shape()
+    changed = describe_core_change(before, after, guard)
+    if changed is None:
+        return 0
+
+    print(
+        "• core: ERROR — the editable kestrel-sovereign install was replaced "
+        "during the feature installs.",
+        file=sys.stderr,
+    )
+    for line in changed.splitlines():
+        print(f"    {line}", file=sys.stderr)
+
+    checkout = str(Path(guard).expanduser())
+    result = cli._extension_install_run(["-e", checkout])
+    if result.returncode == 0:
+        print(f"    re-linked: uv pip install -e {checkout}", file=sys.stderr)
     else:
-        cmd = [sys.executable, "-m", "pip", "install", *pip_args]
-    return subprocess.run(cmd, capture_output=True, text=True)
+        print(
+            f"    RE-LINK FAILED — run `uv pip install -e {checkout}` by hand.",
+            file=sys.stderr,
+        )
+        for line in (result.stderr or result.stdout or "").strip().splitlines()[-3:]:
+            print(f"      {line}", file=sys.stderr)
+    return 1
 
 
 def _capture_host_manifest(path: Path) -> int:
@@ -502,7 +607,15 @@ def _capture_host_manifest(path: Path) -> int:
     host never hand-authors the file. Editable installs are recorded with
     their checkout path; extras can't be recovered from metadata, so the user
     adds those by hand if needed.
+
+    ``kestrel-sovereign`` itself is captured too when it is editable-installed:
+    core registers no extension entry-points, so live discovery cannot see it,
+    yet every feature depends on it and can pull a wheel over the link. A
+    first-class entry makes the intended source of core explicit rather than
+    assumed (issue #2949).
     """
+    from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION
+
     dists = cli._installed_extension_distributions()
 
     lines = [
@@ -514,7 +627,24 @@ def _capture_host_manifest(path: Path) -> int:
         "# Restore with:     kestrel feature sync",
         "",
     ]
+
+    captured = 0
+    core = cli._core_install_shape()
+    if core.is_editable:
+        captured += 1
+        lines.extend([
+            "# The core distribution. Declared so feature installs cannot",
+            "# quietly resolve it from PyPI over the editable checkout.",
+            "[[feature]]",
+            f"name = {_toml_basic_string(CORE_DISTRIBUTION)}",
+            f"editable = {_toml_basic_string(core.editable_path)}",
+            "",
+        ])
+
     for d in dists:
+        if d["dist"] == CORE_DISTRIBUTION:
+            continue  # already emitted above
+        captured += 1
         lines.append("[[feature]]")
         lines.append(f'name = {_toml_basic_string(d["dist"])}')
         if d["editable_path"]:
@@ -522,7 +652,7 @@ def _capture_host_manifest(path: Path) -> int:
         lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
-    return len(dists)
+    return captured
 
 
 def _registry_info_for(label: str, registry: dict):
@@ -633,6 +763,18 @@ def cmd_feature_sync(args) -> int:
     git_urls = {info.package: info.git for info in registry.values() if info.package}
     dry_run = getattr(args, "dry_run", False)
 
+    # Every kestrel-feature-* depends on kestrel-sovereign, so any of these
+    # installs can resolve core from the index and replace an editable checkout
+    # with a wheel copy. Pin core to the checkout's version for the whole batch
+    # (prevention) and re-check the link afterwards (detection) — issue #2949.
+    from kestrel_sovereign import feature_reconcile as fr
+
+    core_before = cli._core_install_shape()
+    core_guard = fr.resolve_core_guard(
+        fr.build_source_index(entries, registry), core_before.editable_path,
+    )
+    core_constraints = fr.core_install_constraints(core_before, core_guard)
+
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -672,7 +814,10 @@ def cmd_feature_sync(args) -> int:
         else:
             pip_args = [install_target]
 
-        result = cli._extension_install_run(pip_args)
+        # Core is never constrained against itself — a `kestrel-sovereign`
+        # manifest entry IS the operator deliberately moving core's source.
+        constraints = None if target == fr.CORE_DISTRIBUTION else core_constraints
+        result = cli._extension_install_run(pip_args, constraints=constraints)
         # Registry-backed packages can fall back to their git URL (mirrors
         # `feature install`). Editable installs have no remote fallback. A
         # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
@@ -687,7 +832,7 @@ def cmd_feature_sync(args) -> int:
         ):
             git_ref = f"git+{git_urls[target]}"
             git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
-            result = cli._extension_install_run([git_spec])
+            result = cli._extension_install_run([git_spec], constraints=constraints)
 
         if result.returncode != 0:
             rc = 1
@@ -705,6 +850,11 @@ def cmd_feature_sync(args) -> int:
         print(f"  {installed} package(s) installed/restored.")
         if installed:
             print("  Restart the host/agents to load the synced features.")
+        # Constraints prevent the common swap; this catches every other path
+        # (a feature's own build step, a direct pip call) so sync can never
+        # report success over a core that was replaced (issue #2949).
+        if cli._restore_core_editable_install(core_before, core_guard):
+            rc = 1
     return rc
 
 

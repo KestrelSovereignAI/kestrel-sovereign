@@ -83,6 +83,95 @@ class ReconcileAction:
     note: str = ""
 
 
+@dataclass
+class CoreInstallShape:
+    """How the core distribution is installed in this venv, right now.
+
+    ``editable_path`` is the checkout recorded in PEP 660 ``direct_url.json``
+    (None for a wheel copy in ``site-packages``). Captured *before* a batch of
+    feature installs and compared *after* so a silent editable→wheel swap
+    becomes a named failure rather than an invisible divergence (issue #2949).
+    """
+
+    version: Optional[str] = None
+    editable_path: Optional[str] = None
+
+    @property
+    def is_editable(self) -> bool:
+        return bool(self.editable_path)
+
+    def describe(self) -> str:
+        where = f"editable → {self.editable_path}" if self.editable_path else "non-editable (site-packages copy)"
+        return f"{where} ({self.version or 'not installed'})"
+
+
+def resolve_core_guard(
+    source_index: Dict[str, SourceEntry],
+    detected_editable: Optional[str],
+) -> Optional[str]:
+    """The checkout core must stay editable-linked to, or None for "don't guard".
+
+    Every ``kestrel-feature-*`` depends on ``kestrel-sovereign``, so a feature
+    install can resolve core from the index and replace an editable link with a
+    wheel copy. Guarding requires knowing which checkout core is *supposed* to
+    come from:
+
+      1. An explicit ``kestrel-sovereign`` entry in the source map. ``editable``
+         names the checkout; ``pypi`` declares core is deliberately a wheel, so
+         there is nothing to guard.
+      2. Otherwise the venv's own live editable link — captured *before* the
+         installs run. When core is already a wheel there is no link to protect
+         and no editable install is invented for the operator.
+    """
+    src = source_index.get(CORE_DISTRIBUTION)
+    if src is not None:
+        if src.editable:
+            return src.editable
+        if src.pypi is not None:
+            return None
+    return detected_editable or None
+
+
+def core_install_constraints(shape: "CoreInstallShape", guard: Optional[str]) -> List[str]:
+    """Constraint lines that pin core to the version the checkout provides.
+
+    ``uv pip`` is uv's *pip-compatible* layer: it resolves against a bare
+    virtualenv and never reads ``uv.lock`` or the project config, so it cannot
+    know the root is declared ``source = { editable = "." }``. Left unconstrained
+    it treats ``kestrel-sovereign`` as an ordinary dependency and, whenever the
+    installed version fails a feature's pin, fetches a wheel from the index —
+    silently replacing the editable link (issue #2949).
+
+    Pinning ``kestrel-sovereign==<checkout version>`` removes the index as a
+    candidate: either the feature's requirement is satisfiable by the checkout
+    (install proceeds, link untouched) or the resolve fails loudly with the real
+    version skew. Returns an empty list when there is nothing to guard.
+    """
+    if not guard or not shape.version:
+        return []
+    return [f"{CORE_DISTRIBUTION}=={shape.version}"]
+
+
+def describe_core_change(
+    before: "CoreInstallShape",
+    after: "CoreInstallShape",
+    guard: str,
+) -> Optional[str]:
+    """Describe how core's install shape drifted from *guard*, or None if intact.
+
+    Intact means "still editable-linked to the guarded checkout". Version drift
+    on an intact link is normal (the checkout can be reinstalled) and is not
+    reported.
+    """
+    if _same_path(after.editable_path, guard):
+        return None
+    return (
+        f"before: {before.describe()}\n"
+        f"after:  {after.describe()}\n"
+        f"expected: editable → {guard}"
+    )
+
+
 def compute_required_classes(multi_agent) -> Tuple[set, List[str]]:
     """Derive the set of feature classes the host must provide.
 

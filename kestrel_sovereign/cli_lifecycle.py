@@ -895,6 +895,20 @@ def _run_feature_reconcile(
         info.package: info.git for info in registry.values() if info.package
     }
 
+    # 4. Guard the core install across the whole batch.
+    #
+    # Every kestrel-feature-* depends on kestrel-sovereign. `uv pip` is
+    # project-blind (see _extension_install_run), so a feature whose core pin the
+    # checkout fails resolves core from the index and replaces the editable link
+    # with a wheel copy — invisibly, because cwd=checkout keeps shadowing
+    # site-packages for anything started from inside it (issue #2949).
+    #
+    # Capture the shape BEFORE any install so the guard protects the link that
+    # actually existed, then pin core to that version for every feature install.
+    core_before = cli._core_install_shape()
+    core_guard = fr.resolve_core_guard(source_index, core_before.editable_path)
+    core_constraints = fr.core_install_constraints(core_before, core_guard)
+
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
 
@@ -915,7 +929,9 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} would {action.op} ({how})")
             continue
 
-        ok, detail = _execute_reconcile_action(action, git_urls, allow_dirty)
+        ok, detail = _execute_reconcile_action(
+            action, git_urls, allow_dirty, constraints=core_constraints,
+        )
         if ok:
             print(f"  {label:<34} {current:<10} {action.op}d ({how})")
             if detail:
@@ -926,23 +942,41 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} FAILED")
             for line in (detail or "").splitlines()[-5:]:
                 print(f"      {line}")
+            if core_constraints:
+                print(
+                    f"      note: core is pinned to {core_constraints[0]} for "
+                    "this install so a feature cannot silently replace the "
+                    "editable checkout. If this is a version conflict, update "
+                    "the checkout to satisfy the feature — do not remove the pin."
+                )
             if not continue_on_error:
                 print(
-                    "• reconcile: FAILED — aborting before feature sync. "
+                    "• reconcile: FAILED — aborting before restart. "
                     "Re-run with --continue-on-error to proceed anyway.",
                     file=sys.stderr,
                 )
-                return rc
+                break
+
+    # 5. Assert core survived. Runs even when the loop aborted early: a failing
+    # install can be the very thing that broke the link.
+    if not dry_run and cli._restore_core_editable_install(core_before, core_guard):
+        rc = 1
 
     return rc
 
 
-def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
+def _execute_reconcile_action(
+    action, git_urls: dict, allow_dirty: bool, *, constraints=None,
+):
     """Execute one :class:`ReconcileAction`. Returns ``(ok, detail)``.
 
     Editable -> ``git pull --ff-only`` the checkout (plus ``pip install -e`` when
     not yet installed). PyPI -> ``pip install [--upgrade] spec`` with a git-URL
     fallback (mirrors ``feature sync``/``upgrade``).
+
+    ``constraints`` pins the core distribution to the editable checkout for the
+    duration of the install so a feature's core requirement cannot resolve a
+    wheel from the index (issue #2949).
     """
     from kestrel_sovereign.cli_features import _pip_spec
 
@@ -958,7 +992,8 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         # update. `relink` is decided by plan_reconcile (codex round 3 P2).
         if action.relink:
             result = cli._extension_install_run(
-                ["-e", _pip_spec(str(checkout), action.extras)]
+                ["-e", _pip_spec(str(checkout), action.extras)],
+                constraints=constraints,
             )
             if result.returncode != 0:
                 return False, (result.stderr or result.stdout or "").strip()
@@ -978,7 +1013,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
     if action.force_reinstall:
         pip_args.append("--force-reinstall")
     pip_args.append(spec)
-    result = cli._extension_install_run(pip_args)
+    result = cli._extension_install_run(pip_args, constraints=constraints)
     # The git-URL fallback installs the repo HEAD with NO version constraint, so
     # it must NOT be used for a pinned entry — that would silently move the
     # feature outside the operator's declared pin (codex round 7 P2).
@@ -991,7 +1026,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         fallback = (
             ["--upgrade", git_spec] if action.op == "update" else [git_spec]
         )
-        result = cli._extension_install_run(fallback)
+        result = cli._extension_install_run(fallback, constraints=constraints)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "").strip()
     return True, ""
