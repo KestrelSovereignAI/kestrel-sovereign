@@ -705,14 +705,19 @@ def _row_physically_exists(source: "_GovernanceSource") -> bool:
     unowned row as an empty runtime let doctor judge the anchor instead and
     report Ready for a host whose boot cannot get past its own agent node.
 
+    By ``node_id`` alone, without the ``node_type = 'agent'`` filter: a row
+    holding this DID under another type still collides on the primary key, and
+    ``add_node`` refuses it just the same, so it is not absent in any sense
+    that matters to the caller.
+
     Fails closed to ``True`` — "something is there, do not call this empty" —
     so a probe that cannot run never manufactures a pending-replication verdict.
     """
     try:
         rows = _fetch_rows(
             source,
-            "SELECT 1 FROM graph_nodes WHERE node_id = ? AND node_type = 'agent'",
-            "SELECT 1 FROM graph_nodes WHERE node_id = %s AND node_type = 'agent'",
+            "SELECT 1 FROM graph_nodes WHERE node_id = ?",
+            "SELECT 1 FROM graph_nodes WHERE node_id = %s",
             sqlite_params=(source.agent_did,),
             postgres_params=(source.agent_did,),
         )
@@ -1051,6 +1056,28 @@ def _check_governance_edge(
         )
         return
 
+    # An edge the runtime cannot see is not the same finding as no edge. The
+    # writer deletes an *ownerless* correct edge and recreates it, so that one
+    # a forced reanchor really does repair; an edge witnessed by another tenant
+    # is refused by ``add_edge`` outright ("Cannot overwrite a graph edge owned
+    # by another agent"). Promising a repair for the second would send an
+    # operator to a command that cannot clear the finding it was given for.
+    if stored_hash not in targets:
+        physical = _read_governed_by_targets(
+            source, node_id, any_owner=True
+        )
+        if not isinstance(physical, _UnreadableDB) and stored_hash in physical:
+            report.fail.append(
+                f"{name}: the governed_by edge to {stored_hash[:12]}… exists "
+                f"in {source.describe()} but this agent does not own it, so "
+                f"integrity proof 2 cannot see it and the agent safe-modes at "
+                f"boot. If nobody owns it, `kestrel constitution reanchor "
+                f"--agent-name {name} --force` re-creates it with its ledger "
+                f"row; if another agent owns it, that is ledger damage no "
+                f"reanchor can clear."
+            )
+            return
+
     if stored_hash in targets:
         report.ok.append(
             f"{name}: governed_by edge targets the anchored constitution "
@@ -1300,6 +1327,17 @@ _AGENT_NODE_PG = (
     "  SELECT 1 FROM graph_node_owners AS owner "
     "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = %s)"
 )
+#: Physical ``governed_by`` targets regardless of who witnesses them. Compared
+#: against the scoped read to tell "no such edge" from "an edge this agent
+#: cannot use" — different findings, with different remedies.
+_GOVERNED_BY_ANY_OWNER_SQLITE = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id = ? AND label = 'governed_by'"
+)
+_GOVERNED_BY_ANY_OWNER_PG = (
+    "SELECT target_id FROM graph_edges "
+    "WHERE source_id = %s AND label = 'governed_by'"
+)
 _GOVERNED_BY_SQLITE = (
     "SELECT target_id FROM graph_edges "
     "WHERE source_id = ? AND label = 'governed_by' AND EXISTS ("
@@ -1486,7 +1524,9 @@ def _read_agent_node(source: "_GovernanceSource"):
     return node_id, label, properties
 
 
-def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
+def _read_governed_by_targets(
+    source: "_GovernanceSource", source_id: str, *, any_owner: bool = False
+):
     """Return the targets of the agent's ``governed_by`` edges.
 
     Returns a tuple of target hashes (possibly empty), or
@@ -1497,12 +1537,24 @@ def _read_governed_by_targets(source: "_GovernanceSource", source_id: str):
     try:
         rows = _fetch_rows(
             source,
-            _GOVERNED_BY_SQLITE if source.ownership_settled
+            _GOVERNED_BY_ANY_OWNER_SQLITE if any_owner
+            else _GOVERNED_BY_SQLITE if source.ownership_settled
             else _GOVERNED_BY_SQLITE_LEGACY,
-            _GOVERNED_BY_PG if source.ownership_settled
+            _GOVERNED_BY_ANY_OWNER_PG if any_owner
+            else _GOVERNED_BY_PG if source.ownership_settled
             else _GOVERNED_BY_PG_LEGACY,
-            sqlite_params=(source_id, source.agent_did),
-            postgres_params=(source_id, source.agent_did),
+            # The any-owner form binds only ``source_id``; the scoped and
+            # legacy forms bind the DID a second time. Passing the scoped
+            # argument list to a one-placeholder query raises, which this
+            # reader turns into ``_UnreadableDB`` — and the caller treats that
+            # as "cannot tell", silently skipping the very branch it was added
+            # for. Match the arguments to the query that was chosen.
+            sqlite_params=(
+                (source_id,) if any_owner else (source_id, source.agent_did)
+            ),
+            postgres_params=(
+                (source_id,) if any_owner else (source_id, source.agent_did)
+            ),
         )
     except sqlite3.DatabaseError as exc:
         return _UnreadableDB(reason=f"cannot read graph_edges ({exc})")

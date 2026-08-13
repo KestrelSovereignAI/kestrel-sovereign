@@ -490,7 +490,7 @@ async def reanchor_constitution(
     # sending the repair to SQLite would leave PostgreSQL unreadable and the
     # agent unbootable. Only a physically absent row is the state first-boot
     # replication fixes, so only that one retargets.
-    if not agent_did and not row_exists and not target.writes_to_anchor:
+    if not target.writes_to_anchor and await runtime_record_is_pending(target):
         # PostgreSQL has nothing for this agent. Boot does not fail there: it
         # copies the birth record out of the local anchor (#2871) and audits
         # *that*, so the bytes that will govern this agent at its next start
@@ -861,6 +861,47 @@ async def reanchor_constitution(
     )
 
 
+async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
+    """Whether first boot has still to put this agent into the runtime database.
+
+    One rule, asked the same way by every tool that has to decide *which bytes
+    will govern this agent next*: before replication the answer is the local
+    anchor, because that is what boot copies and then audits (#2871). Doctor
+    reports on the anchor in this state, ``reanchor_constitution`` retargets to
+    it, and ``setup.overlay_anchor`` does the same — three tools that must
+    agree, so they share this predicate rather than each carrying a copy that
+    drifts.
+
+    Pending means **absent or a boot-fabricated placeholder**, and nothing
+    else. Those are the two states replication repairs. An *unowned* or
+    *foreign-owned* row also reads back empty from a bound store, and looks
+    identical from the outside — but ``add_node`` refuses to claim either, so
+    boot cannot repair them and redirecting a repair to the anchor would leave
+    the runtime broken while reporting success. Those are ledger damage, not
+    pending replication, and no tool here can fix them.
+
+    SQLite is never pending: the anchor *is* the runtime database.
+    """
+    if target.writes_to_anchor:
+        return False
+
+    from kestrel_sovereign.identity.birth_record import is_fabricated_placeholder
+
+    async with target.open_storage() as storage:
+        agent = await storage.graph.get_node(target.agent_did)
+        if agent is not None:
+            return is_fabricated_placeholder(agent, target.agent_did)
+        # The bound read found nothing. Only a physically absent row is
+        # pending; an existing one this agent cannot see is ledger damage.
+        # By ``node_id`` alone, deliberately: a row occupying this DID under
+        # some other ``node_type`` still collides on the primary key, and
+        # ``add_node`` will refuse it just the same.
+        physical = await storage.db.fetchone(
+            "SELECT 1 FROM graph_nodes WHERE node_id = ?", (target.agent_did,)
+        )
+        return physical is None
+
+
 async def _read_agent_anchor(
     target: ReanchorTarget,
 ) -> tuple[
@@ -903,8 +944,12 @@ async def _read_agent_anchor(
             # Same privileged connection the edge read below uses, and for a
             # related reason: the bound store cannot tell "no row" from "a row
             # this agent does not own".
+            # By ``node_id`` alone: a row holding this DID under another
+            # ``node_type`` still collides on the primary key, and ``add_node``
+            # refuses it just the same, so it is not "absent" in any useful
+            # sense.
             physical = await storage.db.fetchone(
-                "SELECT 1 FROM graph_nodes WHERE node_id = ? AND node_type = 'agent'",
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?",
                 (target.agent_did,),
             )
             return None, "", None, (), None, False, physical is not None, ()

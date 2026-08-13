@@ -1943,3 +1943,26 @@ def test_an_unreadable_source_on_postgres_fails_even_before_a_source_exists(
 
     assert report.fail and not report.warn, (report.fail, report.warn)
     assert not report.ready
+
+
+def test_an_edge_the_agent_does_not_own_is_reported_as_a_ledger_problem(
+    tmp_path, monkeypatch,
+):
+    """"No edge" and "an edge I cannot use" are different findings.
+
+    The writer deletes an *ownerless* correct edge and re-creates it, so a
+    forced reanchor really does repair that one. An edge witnessed by another
+    tenant is refused outright by ``add_edge``. Reporting either as a missing
+    edge promises a repair, and for the second the promise is false.
+    """
+    stored = _seed_matching_anchor(tmp_path, monkeypatch, witness_edge=False)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    edge = [m for m in report.fail if "does not own it" in m]
+    assert edge, f"fail={report.fail}"
+    assert stored[:12] in edge[0]
+    assert "safe-modes" in edge[0]
+    # Not phrased as drift, which would send them to a plain reanchor.
+    assert "anchor drift" not in edge[0]

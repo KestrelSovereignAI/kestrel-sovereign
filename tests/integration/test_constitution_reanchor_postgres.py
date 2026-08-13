@@ -358,8 +358,21 @@ async def test_a_neighbours_agent_node_is_never_mistaken_for_this_one(
 
 
 async def test_overlay_anchor_never_writes_a_neighbours_agent_node(pg, tmp_path):
-    """Same deterministic probe for ``anchor-overlay``. An unbound read here
-    grants the neighbour a DANGEROUS Amendment IX overlay."""
+    """The guarantee is that the neighbour is never touched. That is unchanged.
+
+    This test used to assert a *refusal*, and the refusal was a means to that
+    end, not the end itself. With PostgreSQL holding only the neighbour, this
+    agent's record is pending — boot will replicate its anchor — so anchoring
+    the overlay locally is anchoring it where boot will look, exactly as the
+    constitution reanchor does in the same state. What must never happen, and
+    still does not, is the unbound read that grants the *neighbour* a
+    DANGEROUS Amendment IX overlay.
+
+    The refusal remains for the case it was written for: an agent that IS in
+    the runtime database. There, the overlay hash is read from PostgreSQL, so
+    writing it to the local file would report success while every grant stayed
+    denied — the #2890 defect. That is covered below.
+    """
     from kestrel_sovereign.setup.overlay_anchor import (
         OVERLAY_HASH_PROPERTY,
         anchor_overlay,
@@ -377,13 +390,40 @@ async def test_overlay_anchor_never_writes_a_neighbours_agent_node(pg, tmp_path)
         runtime_dsn=POSTGRES_URL,
     )
 
-    assert result.error is not None
-    assert "no agent identity node" in result.error
+    assert result.error is None, result.error
+    assert result.target_backend == "sqlite", result.target_label
+
+    # The point of the test: the neighbour is untouched.
     row = await pg.fetchone(
         "SELECT properties FROM graph_nodes WHERE node_id = $1", (OTHER_DID,)
     )
     neighbour = row[0] if isinstance(row[0], dict) else json.loads(row[0])
     assert OVERLAY_HASH_PROPERTY not in neighbour
+
+
+async def test_overlay_anchor_still_refuses_for_a_replicated_agent(pg, tmp_path):
+    """The #2890 case, unchanged: an agent PostgreSQL already holds.
+
+    Its overlay hash is read from the runtime database, so writing it to the
+    local file would report success while every Amendment IX grant stayed
+    denied. Only a *pending* record redirects to the anchor.
+    """
+    from kestrel_sovereign.setup.overlay_anchor import anchor_overlay
+
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    agent_dir = tmp_path / "agent_data" / "PgTargetAgent"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n\ngranted.\n")
+
+    result = await anchor_overlay(
+        agent_name="PgTargetAgent",
+        agent_dir=agent_dir,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+    assert result.target_backend == "postgres", result.target_label
 
 
 async def test_reanchor_touches_only_the_named_agent_on_a_shared_database(
@@ -744,3 +784,91 @@ async def test_a_forced_reanchor_repairs_an_unwitnessed_governed_by_edge(
     assert [row[0] for row in owners] == [AGENT_DID], (
         "the repaired edge still has no ownership witness, so proof 2 still fails"
     )
+
+
+async def test_a_placeholder_runtime_record_sends_the_repair_to_the_anchor(
+    pg, tmp_path, monkeypatch,
+):
+    """A boot-fabricated stand-in is pending, not present.
+
+    Doctor already treats it that way — ``birth_record`` counts it as an
+    identity shortfall and boot replaces it from the anchor before auditing —
+    and prescribes this command for drift in those pending bytes. Reading the
+    placeholder as a real record made the reanchor answer "no constitution_hash"
+    and leave the stale anchor that boot then replicates and safe-modes on: the
+    same finding and remedy disagreeing about which bytes they mean.
+    """
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    # The exact shape `_ensure_agent_node_present` writes.
+    await pg.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES ($1, 'agent', $2, $3)",
+        (AGENT_DID, f"Agent {AGENT_DID}", json.dumps({"initialBalance": "100.0"})),
+    )
+    await pg.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES ($1, $2)",
+        (AGENT_DID, AGENT_DID),
+    )
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    # Give the anchor a real anchored hash: it is the record boot will copy,
+    # and the drift under test lives in it.
+    import sqlite3
+    with sqlite3.connect(str(agent_dir / "kestrel_prime.db")) as conn:
+        conn.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+            (json.dumps({"name": "First", "constitution_hash": v1_hash}), AGENT_DID),
+        )
+        conn.commit()
+
+    result = await reanchor_constitution(
+        agent_name="First",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.target_backend == "sqlite", result.target_label
+    assert result.old_hash == v1_hash, result.error
+
+
+async def test_a_pending_overlay_is_anchored_where_boot_will_find_it(
+    pg, tmp_path, monkeypatch,
+):
+    """The third tool has to follow the same rule as the other two.
+
+    With PostgreSQL not yet holding this agent, doctor reports on the anchor
+    and prescribes ``kestrel constitution anchor-overlay``. Resolving that
+    command against PostgreSQL — where there is no agent node — failed without
+    touching the anchor, so first boot copied an unanchored overlay and
+    safe-moded. Pending is the one state where the local file is the runtime's
+    future contents.
+    """
+    from kestrel_sovereign.setup.overlay_anchor import (
+        OVERLAY_HASH_PROPERTY,
+        anchor_overlay,
+    )
+
+    agent_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n\npending.\n")
+
+    result = await anchor_overlay(
+        agent_name="First",
+        agent_dir=agent_dir,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is None, result.error
+    async with AsyncStorage(str(agent_dir / "kestrel_prime.db"),
+                            backend="sqlite", agent_id=AGENT_DID) as storage:
+        agent = await storage.graph.get_node(AGENT_DID)
+    assert agent.properties.get(OVERLAY_HASH_PROPERTY) == result.new_hash
