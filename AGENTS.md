@@ -161,7 +161,7 @@ Any step's failure short-circuits the rest — a half-applied update never reach
 ### Modifying agent behavior
 1. Check `kestrel_sovereign/agent.py`
 2. Review constitutional protections in `kestrel_sovereign/constitution.py`
-3. Run constitution-verifier tests
+3. Run the constitution tests: `pytest tests/unit -k constitution`
 
 ### Working with signals (anything that wakes the bird)
 
