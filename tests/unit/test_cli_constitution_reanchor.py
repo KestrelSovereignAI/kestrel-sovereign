@@ -695,3 +695,63 @@ def test_reanchor_proceeds_when_the_keys_agree(reanchor_env, monkeypatch):
         assert cmd_constitution(args) == 0
 
     assert reached
+
+
+def test_reanchor_refuses_a_blank_project_key_against_an_exported_one(
+    reanchor_env, monkeypatch, capsys,
+):
+    """Empty is an answer, not an absence.
+
+    A project ``.env`` that sets ``KESTREL_DATA_KEY=`` explicitly gives the
+    spawned agent an empty key. Requiring both sides to be truthy let the
+    exported key survive here, so the reanchor would encrypt blobs the agent
+    cannot read — the same lesson the DSN resolution learned, in a place it had
+    not been carried to.
+    """
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "a-stale-exported-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    assert "KESTREL_DATA_KEY" in capsys.readouterr().err
+
+
+def test_a_key_only_in_the_environment_is_not_a_conflict(
+    reanchor_env, monkeypatch,
+):
+    """The file saying nothing means the export reaches the agent too.
+
+    ``spawned_agent_env`` starts from ``os.environ``, so with no key in the
+    file the agent gets the exported one — the same key this command uses.
+    Refusing there would block a legitimate setup.
+    """
+    (reanchor_env / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "the-only-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    reached = False
+
+    async def _capture(**_kwargs):
+        nonlocal reached
+        reached = True
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64, new_hash="a" * 64,
+            backup_path=None, unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    assert reached

@@ -953,9 +953,18 @@ def cmd_constitution_reanchor(args) -> int:
     # that there was a choice.
     from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
 
+    # A plain inequality, deliberately: ``spawned_agent_env`` starts from
+    # ``os.environ`` and lets the file overwrite it, so ``launch_key`` already
+    # *is* the key the agent will get, and the two differ only where the file
+    # has its own say. Requiring both to be truthy missed the case where the
+    # file sets ``KESTREL_DATA_KEY=`` explicitly: the agent then gets an empty
+    # key while this command keeps the exported one and writes blobs the agent
+    # cannot read. Empty is an answer, not an absence — the same lesson the
+    # DSN resolution learned two rounds earlier, in a place it had not been
+    # carried to.
     exported_key = os.environ.get(DATA_KEY_ENV)
     launch_key = launch_env.get(DATA_KEY_ENV)
-    if exported_key and launch_key and exported_key != launch_key:
+    if exported_key != launch_key:
         print(
             f"error: {DATA_KEY_ENV} in the environment does not match the one "
             f"in {project_dir / '.env'}.\n"

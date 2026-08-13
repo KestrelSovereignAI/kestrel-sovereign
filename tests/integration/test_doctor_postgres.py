@@ -112,6 +112,17 @@ def runtime_db():
             "CREATE TABLE graph_edge_owners ("
             " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
         )
+        # Every real database carries this (CORE_SCHEMA), and one the runtime
+        # has opened has #2649 recorded — which is what makes a *missing*
+        # ownership witness permanent rather than merely pending.
+        cursor.execute(
+            "CREATE TABLE schema_backfills ("
+            " name TEXT PRIMARY KEY,"
+            " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cursor.execute(
+            "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
+        )
 
     def seed(
         did: str,
@@ -213,9 +224,31 @@ def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
             " node_id TEXT PRIMARY KEY, node_type TEXT,"
             " label TEXT, properties TEXT)"
         )
+        # The real columns and the real ownership ledgers. A hand-rolled
+        # subset has bitten three times on this branch: a bound read selects
+        # ``properties`` and joins ``graph_edge_owners``, so a fixture missing
+        # either makes the store raise — which every caller that fails closed
+        # reads as "database unreachable", not as "your fixture is wrong".
         connection.execute(
             "CREATE TABLE graph_edges ("
-            " source_id TEXT, target_id TEXT, label TEXT)"
+            " source_id TEXT NOT NULL, target_id TEXT NOT NULL,"
+            " label TEXT NOT NULL, properties TEXT,"
+            " PRIMARY KEY (source_id, target_id, label))"
+        )
+        connection.execute(
+            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE graph_edge_owners ("
+            " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE schema_backfills ("
+            " name TEXT PRIMARY KEY,"
+            " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.execute(
+            "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
         )
         connection.execute(
             "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
@@ -226,8 +259,15 @@ def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
             ),
         )
         connection.execute(
-            "INSERT INTO graph_edges VALUES (?, ?, 'governed_by')",
+            "INSERT INTO graph_node_owners VALUES (?, ?)", (AGENT_DID, AGENT_DID)
+        )
+        connection.execute(
+            "INSERT INTO graph_edges VALUES (?, ?, 'governed_by', NULL)",
             (AGENT_DID, anchored_hash),
+        )
+        connection.execute(
+            "INSERT INTO graph_edge_owners VALUES (?, ?, 'governed_by', ?)",
+            (AGENT_DID, anchored_hash, AGENT_DID),
         )
         connection.commit()
     finally:
@@ -589,7 +629,7 @@ async def test_the_prescribed_repair_reaches_a_pending_anchor(
 
     # It found the anchor's stale hash rather than reporting nothing to do.
     assert result.old_hash == stale, result.error
-    assert "sqlite" in (result.target_label or "")
+    assert result.target_backend == "sqlite", result.target_label
 
 
 async def test_a_replicated_agent_still_reanchors_in_postgres(
@@ -622,7 +662,7 @@ async def test_a_replicated_agent_still_reanchors_in_postgres(
 
     # PostgreSQL's hash, not the anchor's: the runtime holds this agent.
     assert result.old_hash == stale
-    assert "postgres" in (result.target_label or "")
+    assert result.target_backend == "postgres", result.target_label
 
 
 async def test_a_present_but_unanchored_postgres_node_stays_in_postgres(
@@ -655,6 +695,96 @@ async def test_a_present_but_unanchored_postgres_node_stays_in_postgres(
         runtime_dsn=runtime_db.dsn,
     )
 
-    assert "postgres" in (result.target_label or ""), result.target_label
+    # ``target_backend``, not ``target_label``: the label embeds tmp_path,
+    # which contains this test's own name — so a substring check for
+    # "postgres" passes no matter what the code does. Mutation testing found
+    # that the hard way.
+    assert result.target_backend == "postgres", result.target_label
     assert result.error is not None
     assert "no constitution_hash" in result.error
+
+
+async def test_an_unowned_postgres_row_does_not_retarget_the_anchor(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Invisible is not absent, and only absence retargets.
+
+    A row present in PostgreSQL without this agent's ``graph_node_owners``
+    witness reads back empty from the bound store, exactly like a missing one.
+    They want opposite handling: replication repairs a missing row, and cannot
+    repair an unowned one — ``add_node`` refuses to overwrite a foreign-owned
+    row. Retargeting here would write the local SQLite file while PostgreSQL
+    stayed unreadable and the agent unbootable.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
+    )
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+        witness_node=False,
+        witness_edge=False,
+    )
+    # The fixture records #2649 as complete, which is what makes the missing
+    # witness persist: opening AsyncStorage against an *unmarked* database runs
+    # the backfill and quietly creates the witness, so without this the state
+    # under test repairs itself before the read and the test proves nothing.
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION)
+
+    result = await reanchor_constitution(
+        agent_name="Test",
+        agent_dir=tmp_path / "agent_data" / "test",
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=runtime_db.dsn,
+    )
+
+    # ``target_backend``, not ``target_label``: the label embeds tmp_path,
+    # which contains this test's own name — so a substring check for
+    # "postgres" passes no matter what the code does. Mutation testing found
+    # that the hard way.
+    assert result.target_backend == "postgres", result.target_label
+
+
+async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor's finding and the reanchor's verdict must use the same view.
+
+    A physical ``governed_by`` edge at the current hash with no
+    ``graph_edge_owners`` witness is invisible to the bound store the integrity
+    audit reads through, so proof 2 fails and the agent safe-modes. The
+    reanchor reads edges unscoped — deliberately, to find pre-ledger stale
+    targets — and judging "unchanged" from that set alone reported nothing to
+    do for the very drift doctor had just prescribed this command to fix.
+    """
+    from kestrel_sovereign.setup.constitution_reanchor import (
+        reanchor_constitution,
+    )
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+        witness_edge=False,   # the node is owned; the edge is not
+    )
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION)
+
+    result = await reanchor_constitution(
+        agent_name="Test",
+        agent_dir=tmp_path / "agent_data" / "test",
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=runtime_db.dsn,
+    )
+
+    assert not result.unchanged, "reported nothing to do for a failing proof 2"
+    assert result.drift_unforced, result

@@ -274,6 +274,10 @@ class _GovernanceSource:
     anchor_path: Path
     agent_did: str
     dsn: str | None = None
+    #: Whether the #2649 ownership backfill has already been recorded as
+    #: complete. Boot re-runs it exactly once; until it has, a row with no
+    #: witness is repaired at the next start, so its absence predicts nothing.
+    ownership_settled: bool = False
     #: Whether ``graph_node_owners`` / ``graph_edge_owners`` exist here.
     #: False on a database predating the ownership migration (#2649), where
     #: the scoped reads below cannot run at all — see ``_has_ownership_ledger``.
@@ -353,18 +357,31 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type='table' AND name='graph_node_owners'"
                 ).fetchone()
+                settled = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='schema_backfills'"
+                ).fetchone()
+                if settled is not None:
+                    settled = conn.execute(
+                        "SELECT 1 FROM schema_backfills WHERE name = ?",
+                        (_OWNERSHIP_BACKFILL,),
+                    ).fetchone()
         except sqlite3.DatabaseError as exc:
             return _UnreadableDB(reason=f"DB unreadable ({exc})")
         except sqlite3.Error as exc:
             return _UnreadableDB(reason=f"sqlite error ({exc})")
-        return row is not None
+        return _LedgerState(
+            present=row is not None, settled=settled is not None
+        )
 
     try:
         rows = _fetch_rows(
             source,
             "SELECT 1",
             "SELECT to_regclass('graph_nodes') IS NOT NULL, "
-            "to_regclass('graph_node_owners') IS NOT NULL",
+            "to_regclass('graph_node_owners') IS NOT NULL, "
+            "COALESCE((SELECT true FROM schema_backfills "
+            f"          WHERE name = '{_OWNERSHIP_BACKFILL}'), false)",
         )
         if rows and not rows[0][0]:
             # No graph schema at all: a PostgreSQL database that has never been
@@ -378,7 +395,10 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
         return _UnreadableDB(
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
         )
-    return bool(rows and rows[0][1])
+    return _LedgerState(
+        present=bool(rows and rows[0][1]),
+        settled=bool(rows and rows[0][2]),
+    )
 
 
 def _resolve_governance_source(
@@ -425,7 +445,11 @@ def _resolve_governance_source(
 
     if isinstance(ledger, (_UnreadableDB, _SchemaAbsent)):
         return ledger
-    return replace(source, ownership_ledger=ledger)
+    return replace(
+        source,
+        ownership_ledger=ledger.present,
+        ownership_settled=ledger.settled,
+    )
 
 
 #: Seconds doctor will wait for a PostgreSQL connection before calling the
@@ -787,10 +811,13 @@ def _check_constitution_drift(
             _report_unexamined(name, node.reason, source, report)
             continue
         if isinstance(node, _NoAgentNode):
-            if source.reads_the_anchor and source.ownership_ledger:
+            if source.reads_the_anchor and source.ownership_settled:
                 # The anchor is the file DID discovery just read a DID *out
-                # of*, so the row is certainly there — and the ledger exists,
-                # so this is not a database awaiting the ownership backfill.
+                # of*, so the row is certainly there — and #2649's backfill is
+                # already recorded complete, so boot will not re-run it and
+                # repair this. (Table existence was the wrong proxy for that:
+                # the tables are created by schema init, which says nothing
+                # about whether the one-time backfill has run.)
                 # The witness is missing or belongs to someone else, which
                 # means the agent's own bound store cannot see its agent node
                 # either: it fails at startup, and `add_node` will not
@@ -1268,6 +1295,27 @@ class _NoAgentNode:
 @dataclass(frozen=True)
 class _NoHashProperty:
     """Sentinel: agent node found but properties has no constitution_hash."""
+
+
+#: The one-time #2649 ownership backfill's marker, as ``AsyncDatabase`` records
+#: it in ``schema_backfills``. Boot runs that backfill exactly once; before it
+#: has, a row with no ownership witness is repaired at the next start.
+_OWNERSHIP_BACKFILL = "ownership_2649"
+
+
+@dataclass(frozen=True)
+class _LedgerState:
+    """What the ownership ledgers say about this database.
+
+    ``present`` decides which SQL doctor can run at all; ``settled`` decides
+    whether a *missing* witness is permanent or merely pending. They are not
+    the same fact — schema init creates the tables, and the backfill that fills
+    them is recorded separately — and using the first as a proxy for the second
+    turned a database awaiting its migration into a readiness failure.
+    """
+
+    present: bool
+    settled: bool
 
 
 @dataclass(frozen=True)

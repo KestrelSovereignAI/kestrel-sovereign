@@ -468,6 +468,8 @@ async def reanchor_constitution(
             governed_by_targets,
             anchored_text,
             anchored_present,
+            row_exists,
+            visible_edge_targets,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
         logger.exception("Could not read the anchor from %s", target.describe())
@@ -479,14 +481,16 @@ async def reanchor_constitution(
                 f"{target.describe()}: {exc!r}. Nothing was written."
             ),
         )
-    # ``agent_did`` comes back ``""`` only on the absent-node return; a node
-    # that exists but carries no ``constitution_hash`` returns its real DID
-    # with ``old_hash=None``. Gating on ``old_hash`` alone conflated the two
-    # and sent a *present but unanchored* PostgreSQL agent to SQLite — writing
-    # the local file while the runtime node it will actually boot from stayed
-    # unanchored and safe-mode-bound. Absence is the only state first-boot
-    # replication repairs, so absence is the only state that retargets.
-    if not agent_did and not target.writes_to_anchor:
+    # Three states share ``old_hash=None`` and only one of them retargets.
+    # A node that exists and is owned but carries no ``constitution_hash``
+    # returns its real DID — retargeting there would write the local file while
+    # the runtime node it boots from stayed unanchored. A row that exists
+    # *unowned* returns an empty DID like a missing one, but replication cannot
+    # repair it either: ``add_node`` will not overwrite a foreign-owned row, so
+    # sending the repair to SQLite would leave PostgreSQL unreadable and the
+    # agent unbootable. Only a physically absent row is the state first-boot
+    # replication fixes, so only that one retargets.
+    if not agent_did and not row_exists and not target.writes_to_anchor:
         # PostgreSQL has nothing for this agent. Boot does not fail there: it
         # copies the birth record out of the local anchor (#2871) and audits
         # *that*, so the bytes that will govern this agent at its next start
@@ -519,6 +523,8 @@ async def reanchor_constitution(
                 governed_by_targets,
                 anchored_text,
                 anchored_present,
+                row_exists,
+                visible_edge_targets,
             ) = await _read_agent_anchor(target)
         except Exception as exc:  # noqa: BLE001 — surfaced to the operator
             logger.exception("Could not read the anchor at %s", target.describe())
@@ -667,8 +673,12 @@ async def reanchor_constitution(
     # targets alongside the correct edge don't fail proof 2, but they mean the
     # agent nominally has two governing constitutions — repair those too.
     stale_edge_targets = tuple(t for t in governed_by_targets if t != new_hash)
+    # Proof 2 is judged on what the runtime can see, not on what physically
+    # exists: an edge at the right hash whose ownership witness is missing is
+    # invisible to the bound store the audit reads through, so the agent
+    # safe-modes while the row sits there looking correct.
     governance_edge_drift = (
-        new_hash not in governed_by_targets or bool(stale_edge_targets)
+        new_hash not in visible_edge_targets or bool(stale_edge_targets)
     )
 
     if (
@@ -853,10 +863,13 @@ async def reanchor_constitution(
 
 async def _read_agent_anchor(
     target: ReanchorTarget,
-) -> tuple[str | None, str, dict | None, tuple[str, ...], str | None, bool]:
+) -> tuple[
+    str | None, str, dict | None, tuple[str, ...], str | None, bool, bool,
+    tuple[str, ...],
+]:
     """Return ``(constitution_hash, agent_did, emancipation_contract_json,
-    governed_by_targets, anchored_text, anchored_present)`` **from the database the runtime
-    reads**.
+    governed_by_targets, anchored_text, anchored_present, row_exists,
+    visible_edge_targets)`` **from the database the runtime reads**.
 
     Read-only — safe to call before deciding whether to touch the DB.
     Returns ``(None, "", None, (), None, False)`` if the agent node has no
@@ -866,6 +879,15 @@ async def _read_agent_anchor(
     targets feed the drift decision (#2616): integrity proof 2 requires a
     ``governed_by`` edge at the anchored hash, so the caller must not
     declare "unchanged" on the hash comparison alone.
+
+    ``row_exists`` is the one *unscoped* fact reported here, and it exists to
+    keep two different absences apart. The bound read below returns nothing
+    both when the row is missing and when it is present without this agent's
+    ``graph_node_owners`` witness — and those want opposite handling: a missing
+    row is repaired by first-boot replication from the anchor, while an unowned
+    row blocks it, because ``add_node`` will not overwrite a foreign-owned row.
+    Treating the second as the first sent a forced repair to the local SQLite
+    file while PostgreSQL stayed unreadable.
 
     ``open_storage`` binds every store to ``target.agent_did``, which is what
     stops a PostgreSQL host — one table holding every local agent — from
@@ -878,7 +900,14 @@ async def _read_agent_anchor(
     async with target.open_storage() as storage:
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
-            return None, "", None, (), None, False
+            # Same privileged connection the edge read below uses, and for a
+            # related reason: the bound store cannot tell "no row" from "a row
+            # this agent does not own".
+            physical = await storage.db.fetchone(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ? AND node_type = 'agent'",
+                (target.agent_did,),
+            )
+            return None, "", None, (), None, False, physical is not None, ()
         # Read the governance edges through the privileged maintenance
         # connection, NOT the bound graph store. This repair path exists to
         # heal PRE-LEDGER drift (#2616), and stale edges are unowned by
@@ -898,6 +927,26 @@ async def _read_agent_anchor(
             (agent.node_id,),
         )
         governed_by_targets = tuple(row[0] for row in edge_rows)
+
+        # And the same edges as the *runtime* sees them. Two reads because
+        # there are two questions. "Which stale targets are there to prune"
+        # must be unscoped, for the reason above. "Is integrity proof 2
+        # satisfied" must be scoped, because that is the read boot performs —
+        # and a physical edge at the right hash with no ``graph_edge_owners``
+        # witness answers yes to the first and no to the second. Deciding
+        # "unchanged" from the unscoped set alone meant a forced reanchor
+        # reported nothing to do while the agent kept failing proof 2, so
+        # doctor's finding named a repair that could not clear it.
+        # ``graph.get_edges(..., direction="out")`` is what
+        # ``AsyncStorage.get_edges_from`` calls, and the integrity audit reads
+        # through that same bound store.
+        visible_edges = await storage.graph.get_edges(
+            agent.node_id, direction="out"
+        )
+        visible_edge_targets = tuple(
+            edge.target_id for edge in visible_edges
+            if edge.label == "governed_by" and edge.source_id == agent.node_id
+        )
         anchored_hash = agent.properties.get("constitution_hash")
         anchored_text: str | None = None
         # ABSENT and UNREADABLE are different answers (#2465), and telling them
@@ -918,6 +967,8 @@ async def _read_agent_anchor(
             governed_by_targets,
             anchored_text,
             anchored_present,
+            True,
+            visible_edge_targets,
         )
 
 

@@ -318,6 +318,10 @@ def _seed_with_anchored_constitution(
                 label TEXT NOT NULL,
                 agent_id TEXT NOT NULL
             );
+            CREATE TABLE schema_backfills (
+                name TEXT PRIMARY KEY,
+                completed_at TIMESTAMP
+            );
             """
         )
         if create_edges_table:
@@ -340,6 +344,9 @@ def _seed_with_anchored_constitution(
         # (``AsyncGraphStore.add_node`` -> ``record_graph_node_owner``). It is
         # what the bound runtime store actually matches on, so a seed without
         # it is not a healthy agent — it is the invisible-row case.
+        conn.execute(
+            "INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)"
+        )
         if witness_node:
             conn.execute(
                 "INSERT INTO graph_node_owners(node_id, agent_id) VALUES (?, ?)",
@@ -901,10 +908,16 @@ CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT);
 CREATE TABLE graph_edge_owners (
     source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT
 );
+CREATE TABLE schema_backfills (
+    name TEXT PRIMARY KEY, completed_at TIMESTAMP
+);
 """
 
 
-def _graph_db(path, *, nodes=(), edges=(), node_owners=(), edge_owners=()):
+def _graph_db(
+    path, *, nodes=(), edges=(), node_owners=(), edge_owners=(),
+    ownership_settled=True,
+):
     """A Kestrel graph with the ownership ledgers a real write maintains.
 
     Seeding rows without their witnesses is what an earlier version of these
@@ -922,6 +935,13 @@ def _graph_db(path, *, nodes=(), edges=(), node_owners=(), edge_owners=()):
         conn.executemany(
             "INSERT INTO graph_edge_owners VALUES (?, ?, ?, ?)", edge_owners
         )
+        if ownership_settled:
+            # A database the runtime has opened has #2649 recorded. Without the
+            # marker a missing witness is *pending*, not permanent — boot
+            # backfills it — so tests about permanence must say which they mean.
+            conn.execute(
+                "INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)"
+            )
         conn.commit()
     return path
 
@@ -1237,8 +1257,9 @@ def test_postgres_repairs_do_not_promise_a_backup(tmp_path, monkeypatch):
     properties = json.dumps({"name": "Test", "constitution_hash": drifted})
     fake = _FakePostgres(
         {
-            # Two columns, as the real probe asks: graph schema, then ledger.
-            "SELECT to_regclass": [(True, True)],
+            # Three columns, as the real probe asks: graph schema, ledger,
+            # then whether #2649 is recorded complete.
+            "SELECT to_regclass": [(True, True, True)],
             "SELECT node_id, label, properties FROM graph_nodes": [
                 ("did:test:Test", "Test", properties)
             ],
@@ -1788,3 +1809,42 @@ def test_a_pre_migration_anchor_still_only_warns(tmp_path, monkeypatch):
 
     assert source.ownership_ledger is False
     assert not isinstance(_read_agent_node(source), _NoAgentNode)
+
+
+def test_a_missing_witness_before_the_backfill_is_pending_not_broken(
+    tmp_path, monkeypatch,
+):
+    """Table existence is not the same fact as backfill completion.
+
+    Schema init creates ``graph_node_owners``; the #2649 backfill that fills
+    it is recorded separately, and boot runs it exactly once. Before that
+    marker exists, a row with no witness is repaired at the next start — so
+    using "the tables exist" as the proxy turned a database awaiting its
+    migration into a readiness failure.
+    """
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+        node_owners=[],
+        ownership_settled=False,
+    )
+    source = _resolve_governance_source(db, {})
+
+    assert source.ownership_ledger is True
+    assert source.ownership_settled is False
+
+
+def test_a_missing_witness_after_the_backfill_is_permanent(tmp_path):
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
+        node_owners=[],
+        ownership_settled=True,
+    )
+    source = _resolve_governance_source(db, {})
+
+    assert source.ownership_settled is True
