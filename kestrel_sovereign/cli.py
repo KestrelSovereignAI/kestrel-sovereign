@@ -1601,7 +1601,9 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     # through the ``cli`` module inside cli_features so the patch takes effect.
     _extension_install_run,
     _install_backend_argv,
+    _install_commands,
     _render_command,
+    _render_commands,
     _render_shell,
     _query_agent_feature_catalog,
     _editable_install_path,
@@ -1612,7 +1614,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _registry_info_for,
     _load_host_manifest,
     _host_manifest_path,
-    _parse_pip_installed_version,
+    _installed_version,
     _pip_spec,
     _toml_basic_string,
 )

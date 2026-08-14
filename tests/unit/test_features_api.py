@@ -688,6 +688,72 @@ class TestInstallFeature:
         assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
         assert venv.installed["kestrel-feature-test"] == "0.4.0"
 
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_hung_repair_is_bounded_not_a_wedged_request(
+        self, mock_registry, monkeypatch
+    ):
+        """The repair runs a SECOND installer, and it must be bounded too.
+
+        The endpoint caps the install so a hung resolve becomes a 504. The
+        repair that follows a swap resolves against the same index through the
+        same resolver, so whatever hung the install hangs it as well — left
+        unbounded it holds the request open forever and the 504 never arrives.
+        ``FakeUv(repair_hangs=True)`` refuses to fake a return for an unbounded
+        call (``UnboundedInstall``), so this fails loudly if the bound is lost.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch,
+            honours_constraints=False,
+            feature_install_times_out=True,
+            repair_hangs=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        # The install's own verdict still stands...
+        assert resp.status_code == 504
+        detail = resp.json()["detail"]
+        assert "Installation timed out" in detail
+        # ...and the core it left swapped is named, with the manual command,
+        # because the automatic restore did not finish either.
+        assert "was replaced during the install batch" in detail
+        assert (
+            "RESTORE FAILED — run `uv pip install --python "
+            f"{shlex.quote(sys.executable)} -e /src/core` by hand."
+        ) in detail
+        assert "timed out after 300s" in detail  # why the repair's tail stops
+        assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
+
+    def test_the_cli_repair_stays_unbounded(self, monkeypatch):
+        """The bound is the HTTP surface's, not a new default.
+
+        An operator watching a terminal can interrupt a slow install; capping
+        the CLI's restore would abandon a genuinely slow-but-working reinstall
+        of core, which is worse than waiting. So the guard's default must stay
+        unlimited — asserted here rather than left to whoever reads the
+        signature next.
+        """
+        from kestrel_sovereign.cli_features import CoreInstallGuard
+
+        venv = FakeUv(core_checkout="/src/core")
+        use_fake_uv(monkeypatch, venv)
+        guard = CoreInstallGuard.snapshot()
+        venv.editable.pop(CORE)  # something swapped core out from under us
+        seen = []
+        real_run = venv.run
+
+        def record(cmd, **kw):
+            seen.append(kw.get("timeout"))
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr("kestrel_sovereign.cli.subprocess.run", record)
+
+        assert guard.verify() == 1  # drift reported...
+        assert venv.editable[CORE] == "/src/core"  # ...and repaired
+        assert seen == [None]
+
 
 # ---------------------------------------------------------------------------
 # POST /api/features/{name}/remove

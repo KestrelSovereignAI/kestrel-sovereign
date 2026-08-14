@@ -99,9 +99,11 @@ class ReconcileAction:
     # name a source). Only the legacy entry that declares neither may fall back.
     source_declared: bool = False
     # PyPI only: the package is CURRENTLY installed editable but the source map
-    # now declares PyPI, so the executor must ``--force-reinstall`` to replace
-    # the editable link with the wheel — a plain ``--upgrade`` is a no-op when
-    # the editable version already satisfies the spec, leaving it linked.
+    # now declares PyPI, so the executor must force a reinstall to replace the
+    # editable link with the wheel — a plain ``--upgrade`` is a no-op when the
+    # editable version already satisfies the spec, leaving it linked. The
+    # executor scopes that reinstall to THIS package; a blanket
+    # ``--force-reinstall`` would cascade into core (issue #2949).
     force_reinstall: bool = False
     note: str = ""
 
@@ -147,13 +149,20 @@ class CoreSourcePolicy:
 
     @property
     def guarded(self) -> bool:
-        """Does this policy constrain and verify anything at all?"""
-        return bool(self.editable) or bool(self.pypi)
+        """Does this policy constrain and verify anything at all?
+
+        ``pypi is not None`` rather than a truth test: ``pypi = ""`` is an
+        operator DECLARATION ("core comes from the index, any version"), and an
+        empty version window is not an empty policy — the source half still has
+        to hold. Reading it as unguarded let an editable (or absent) core pass
+        a manifest that said the opposite (issue #2949).
+        """
+        return bool(self.editable) or self.pypi is not None
 
     def describe_expected(self) -> str:
         if self.editable:
             return f"editable → {self.editable}"
-        if self.pypi:
+        if self.pypi is not None:
             return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
         return "unconstrained"
 
@@ -198,12 +207,17 @@ def core_install_constraints(
     installed version fails a feature's pin, fetches a wheel from the index —
     silently replacing the editable link (issue #2949).
 
-    * Editable policy → ``kestrel-sovereign==<installed version>``. That removes
-      the index as a candidate: either the feature's requirement is satisfiable
-      by the checkout (install proceeds, link untouched) or the resolve fails
-      loudly with the real version skew. *shape* must be the state core is in
-      when the install runs — re-snapshot after moving core, or the batch pins a
-      version that is no longer installed.
+    * Editable policy → ``kestrel-sovereign==<installed version>``. That bounds
+      core's VERSION: either the feature's requirement is satisfiable by the
+      checkout (install proceeds) or the resolve fails loudly with the real
+      version skew. It does NOT bound core's SOURCE — the index publishes the
+      same version the checkout builds, and such a wheel satisfies the pin
+      exactly, so a reinstall of core still swaps the link for a copy. Holding
+      the source is a separate job, done by scoping any force-reinstall to the
+      one package being installed (``_extension_install_run(reinstall=...)``)
+      and by verifying the shape afterwards. *shape* must be the state core is
+      in when the install runs — re-snapshot after moving core, or the batch
+      pins a version that is no longer installed.
     * PyPI policy → the operator's own declared spec, verbatim. Core may move
       inside the declared window (that is what declaring a range means) but a
       feature cannot drag it outside.
@@ -214,6 +228,11 @@ def core_install_constraints(
         return [f"{CORE_DISTRIBUTION}=={shape.version}"] if shape.version else []
     if policy.pypi:
         return [f"{CORE_DISTRIBUTION}{policy.pypi}"]
+    # A declared-but-empty spec (``pypi = ""``) has no version to constrain, so
+    # there is no line to write — a bare package name would constrain nothing
+    # and read as a pin in every message that quotes it. The policy is still
+    # guarded (:attr:`CoreSourcePolicy.guarded`); its half is the SHAPE check,
+    # which does not travel in a constraints file.
     return []
 
 
@@ -242,14 +261,21 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
 
     Editable policy: still linked to the declared checkout. Version drift on an
     intact link is normal (the checkout can be reinstalled) and is not a
-    mismatch. PyPI policy: not editable *and* inside the declared window — a
-    feature that pulled core past ``<0.53`` violates the manifest just as loudly
-    as one that dropped an editable link.
+    mismatch. PyPI policy: installed, not editable, *and* inside the declared
+    window — a feature that pulled core past ``<0.53`` violates the manifest
+    just as loudly as one that dropped an editable link.
+
+    ``pypi = ""`` is asked the same questions bar the window: it declares the
+    SOURCE and pins no version, so an editable or absent core still fails it.
     """
     if policy.editable:
         return _same_path(shape.editable_path, policy.editable)
-    if policy.pypi:
-        return not shape.is_editable and version_satisfies(shape.version, policy.pypi)
+    if policy.pypi is not None:
+        return (
+            shape.version is not None
+            and not shape.is_editable
+            and version_satisfies(shape.version, policy.pypi)
+        )
     return True
 
 

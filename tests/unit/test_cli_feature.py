@@ -192,7 +192,7 @@ class TestFeatureInstall:
 
         # Verify the uv-aware helper was called with the package spec
         mock_install.assert_called_once_with(
-            ["kestrel-feature-wallet"], constraints=None, timeout=None,
+            ["kestrel-feature-wallet"], constraints=None, reinstall=None, timeout=None,
         )
 
     @patch("kestrel_sovereign.cli._extension_install_run")

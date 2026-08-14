@@ -1007,13 +1007,15 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guar
     pip_args = []
     if action.op == "update":
         pip_args.append("--upgrade")
-    # Replacing an editable link with the PyPI wheel needs --force-reinstall;
-    # otherwise pip treats an already-satisfying editable version as done and
-    # leaves the checkout linked (codex round 9 P2).
-    if action.force_reinstall:
-        pip_args.append("--force-reinstall")
     pip_args.append(spec)
-    result = guard.run(pip_args)
+    # Replacing an editable link with the PyPI wheel needs a force reinstall;
+    # otherwise pip treats an already-satisfying editable version as done and
+    # leaves the checkout linked (codex round 9 P2). Scoped to THIS package —
+    # a bare --force-reinstall cascades to every resolved dependency, and core
+    # is one for every feature, so it would pull a same-version core wheel over
+    # the editable link that the version pin cannot exclude (issue #2949).
+    reinstall = action.package if action.force_reinstall else None
+    result = guard.run(pip_args, reinstall=reinstall)
     # The git-URL fallback installs the repo HEAD from a DIFFERENT source with
     # NO version constraint, so it is only available to an entry that declared
     # no source of its own — substituting it for a declared one moves the
@@ -1032,7 +1034,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guar
         fallback = (
             ["--upgrade", git_spec] if action.op == "update" else [git_spec]
         )
-        result = guard.run(fallback)
+        result = guard.run(fallback, reinstall=reinstall)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "").strip()
     return True, ""

@@ -39,8 +39,9 @@
 # an ordinary dependency and will resolve a wheel from PyPI whenever the
 # installed version fails a feature's pin — silently replacing an editable
 # checkout. Declaring core here makes its intended source explicit; `feature
-# sync` and the `kestrel update` reconcile step then pin core to the checkout
-# for every feature install and re-link it if anything breaks the link.
+# sync` and the `kestrel update` reconcile step then pin core's VERSION for
+# every feature install, keep core out of the reinstall set when a feature
+# switches source, and re-link it if anything breaks the link anyway.
 #
 # Whatever you declare is applied FIRST and held for the whole batch, in
 # manifest order or not:
@@ -48,7 +49,8 @@
 #     feature install is pinned to the version that checkout builds.
 #   - `pypi = ">=x,<y"`     -> core comes from the index, and features may move
 #     it only WITHIN that window; one that needs more fails loudly.
-#   - `pypi = ""`           -> from the index, any version: nothing is held.
+#   - `pypi = ""`           -> from the index, any version. No version window is
+#     held, but the SOURCE is: core must be installed, and not editable.
 # Omit the entry entirely and the live editable link (if any) is guarded anyway.
 #
 # This entry is a SOURCE POLICY, not a feature to load: `kestrel feature status`

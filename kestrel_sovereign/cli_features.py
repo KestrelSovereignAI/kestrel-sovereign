@@ -12,6 +12,7 @@ Shared, test-patched helpers (``_get_project_dir``,
 here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
+import functools
 import os
 import re
 import shlex
@@ -321,18 +322,35 @@ def _installed_extension_distributions() -> list:
     return sorted(by_dist.values(), key=lambda e: e["dist"])
 
 
-def _parse_pip_installed_version(stdout: str, dist_name: str) -> Optional[str]:
-    """Extract the post-upgrade version from pip's 'Successfully installed' line."""
-    normalized = dist_name.lower().replace("_", "-")
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("Successfully installed"):
-            continue
-        for token in line.split()[2:]:
-            pkg, _, ver = token.rpartition("-")
-            if pkg.lower().replace("_", "-") == normalized:
-                return ver
-    return None
+def _installed_version(dist_name: str) -> Optional[str]:
+    """The version of *dist_name* installed in THIS venv, right now.
+
+    Asked after an install to report what that install actually did — and read
+    from the venv, never from the installer's output. The backend is uv
+    whenever uv is on PATH (:func:`_install_backend_argv`), and the two
+    backends describe an install in prose that does not match: uv writes
+    ``+ pkg==ver`` to stderr, pip writes ``Successfully installed pkg-ver`` to
+    stdout. Parsing pip's line made every upgrade on the DEFAULT backend read
+    as "up to date", which also swallowed the restart notice that only prints
+    when something moved (issue #2949).
+
+    Lookup is by :func:`canonical_package`, so the three spellings of one
+    distribution (the operator's, the registry's, and the package's own
+    ``Name:``) resolve to one answer — including the dotted form PEP 503 folds
+    and a dash/underscore swap does not.
+
+    ``invalidate_caches`` because the install ran in a subprocess after this
+    process started: the import system's directory caches predate it, and a
+    package installed since then is otherwise invisible without re-execing.
+    """
+    import importlib
+    import importlib.metadata as md
+
+    importlib.invalidate_caches()
+    try:
+        return md.version(canonical_package(dist_name))
+    except md.PackageNotFoundError:
+        return None
 
 
 def cmd_feature_upgrade(args) -> int:
@@ -348,15 +366,25 @@ def cmd_feature_upgrade(args) -> int:
 
     requested = getattr(args, "names", None) or []
     registry = load_registry()
-    git_urls = {info.package: info.git for info in registry.values() if info.package}
+    # Three spellings of one distribution meet here: what the operator typed,
+    # what the registry catalogues, and what the package's own METADATA wrote
+    # (``ep.dist.name`` — ``Kestrel_Feature_Voice`` is legal for the project the
+    # registry calls ``kestrel-feature-voice``). PEP 503 says those are the same
+    # distribution, so every comparison and lookup is keyed on the canonical
+    # form; matching raw strings reported an installed package missing and lost
+    # its git fallback (issue #2949).
+    git_urls = {
+        canonical_package(info.package): info.git
+        for info in registry.values() if info.package
+    }
 
     if requested:
         wanted = set()
         for name in requested:
             pkg = _resolve_feature_name(name, registry)
-            wanted.add(registry[pkg].package if pkg else name)
-        unmatched = wanted - {d["dist"] for d in dists}
-        dists = [d for d in dists if d["dist"] in wanted]
+            wanted.add(canonical_package(registry[pkg].package if pkg else name))
+        unmatched = wanted - {canonical_package(d["dist"]) for d in dists}
+        dists = [d for d in dists if canonical_package(d["dist"]) in wanted]
         for name in sorted(unmatched):
             print(f"Skipping '{name}': not an installed extension package")
         if not dists:
@@ -393,9 +421,10 @@ def cmd_feature_upgrade(args) -> int:
             print(f"  {name:<34} {current:<10} would upgrade")
             continue
 
+        git_url = git_urls.get(canonical_package(name))
         result = guard.run(["--upgrade", name])
-        if result.returncode != 0 and git_urls.get(name):
-            result = guard.run(["--upgrade", f"git+{git_urls[name]}"])
+        if result.returncode != 0 and git_url:
+            result = guard.run(["--upgrade", f"git+{git_url}"])
 
         if result.returncode != 0:
             rc = 1
@@ -409,7 +438,7 @@ def cmd_feature_upgrade(args) -> int:
                 )
             continue
 
-        new_version = _parse_pip_installed_version(result.stdout, name)
+        new_version = _installed_version(name)
         if new_version and new_version != current:
             upgraded += 1
             print(f"  {name:<34} {current:<10} upgraded -> {new_version}")
@@ -538,6 +567,19 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _have_uv() -> bool:
+    """Is uv the installer backend on this host?
+
+    The two backends are not interchangeable for the core guard: uv can scope a
+    reinstall to one package, pip cannot (see :func:`_extension_install_run`).
+    One predicate so the argv builder and the reinstall-scoping logic can never
+    disagree about which backend is about to run.
+    """
+    import shutil
+
+    return shutil.which("uv") is not None
+
+
 def _install_backend_argv(pip_args: list, extra_args=()) -> list:
     """The exact argv an extension install runs as.
 
@@ -553,14 +595,57 @@ def _install_backend_argv(pip_args: list, extra_args=()) -> list:
     the advertised "fix" by hand could mutate a different environment — the
     retargeting this guard exists to prevent (issue #2949).
     """
-    import shutil
-
-    if shutil.which("uv"):
+    if _have_uv():
         return [
             "uv", "pip", "install", "--python", sys.executable,
             *extra_args, *pip_args,
         ]
     return [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
+
+
+def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
+    """Every argv one install runs as, in order.
+
+    One function so the executor and the recovery command the guard prints can
+    never describe different operations: a printed fix that drops the scoping
+    the real install used is issue #2949, re-opened by hand.
+
+    Without *reinstall* an install is one command. With it — a source switch,
+    where a plain install is a no-op because the already-linked version
+    satisfies the spec — the two backends diverge:
+
+    * uv scopes a reinstall to one package (``--reinstall-package``), so the
+      switch stays a single command and no dependency is ever a candidate.
+    * pip has no such flag; its ``--force-reinstall`` is all-or-nothing and
+      cascades to every resolved dependency, core included. So the switch
+      splits in two, and the ORDER is the protection:
+
+      1. ``--upgrade`` (non-forcing) resolves the requested version from the
+         index *with* its dependencies. A requirement the core pin forbids has
+         no solution and fails HERE — while the package on disk is still the
+         one that was working. Non-forcing, so a satisfying editable core keeps
+         its link.
+      2. ``--force-reinstall --no-deps`` replaces the package itself and only
+         it. This is the destructive pass, and it runs last: after the resolve
+         it depends on has already succeeded. It is needed because pass 1 is a
+         no-op when the index publishes the same version the checkout builds —
+         the case that motivated all of this.
+
+      Running those two the other way round is a bug, not a style choice: the
+      wheel lands, the dependency resolve then fails, and the caller reports a
+      failure over an environment it has already changed.
+    """
+    extra = list(extra_args)
+    if not reinstall:
+        return [_install_backend_argv(pip_args, extra)]
+    if _have_uv():
+        return [
+            _install_backend_argv(pip_args, [*extra, "--reinstall-package", reinstall]),
+        ]
+    return [
+        _install_backend_argv(pip_args, [*extra, "--upgrade"]),
+        _install_backend_argv(pip_args, [*extra, "--force-reinstall", "--no-deps"]),
+    ]
 
 
 def _is_windows() -> bool:
@@ -623,6 +708,38 @@ def _render_command(argv: list) -> str:
     return shlex.join(argv)
 
 
+def _render_commands(argvs: list) -> str:
+    """Render a whole install SEQUENCE as one line the operator's shell runs.
+
+    A single command renders exactly as :func:`_render_command` — the common
+    case, and the only one on a uv host. A pip source switch is two passes
+    (see :func:`_install_commands`) and both have to reach the operator:
+    printing only the first advertises a repair that does half the job.
+
+    The ORDER is the protection (:func:`_install_commands`), so the rendered
+    line has to carry it: pass 2 replaces the package with ``--no-deps`` and is
+    only correct once the resolve in pass 1 has succeeded. POSIX gets ``&&``,
+    which says exactly that.
+
+    Windows PowerShell 5.1 — what ships with Windows — has no ``&&``, and a
+    line the shell refuses is worth nothing to someone whose core is already
+    off its declared source. Joining with ``;`` parses, but it runs pass 2
+    whatever pass 1 did: the destructive pass lands after the resolve that
+    forbade it, which is the ordering hazard :func:`_install_commands` exists
+    to prevent, handed to the operator as the fix for it. So each following
+    pass is nested inside ``if ($?) { ... }`` — PowerShell sets ``$?`` from a
+    native command's exit code, and nesting rather than chaining keeps every
+    pass conditional on every pass before it.
+    """
+    rendered = [_render_command(argv) for argv in argvs]
+    if not _is_windows():
+        return " && ".join(rendered)
+    line = rendered[-1]
+    for earlier in reversed(rendered[:-1]):
+        line = f"{earlier}; if ($?) {{ {line} }}"
+    return line
+
+
 def _render_shell() -> Optional[str]:
     """Name the shell :func:`_render_command` just quoted for, when it matters.
 
@@ -633,7 +750,7 @@ def _render_shell() -> Optional[str]:
     return WINDOWS_SHELL if _is_windows() else None
 
 
-def _extension_install_run(pip_args: list, *, constraints, timeout=None):
+def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeout=None):
     """Install via uv when available, else the interpreter's own pip.
 
     Prefer :meth:`CoreInstallGuard.run` — it decides ``constraints`` for you and
@@ -642,9 +759,25 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     a silent default that reopens issue #2949; pass ``None`` only when core
     itself is the install target (it is never constrained against itself).
 
-    The installer backend (uv, else this interpreter's pip) is chosen by
-    :func:`_install_backend_argv`, which the guard also renders its recovery
-    command from.
+    ``reinstall`` names the ONE package a caller wants force-reinstalled (used
+    when a feature switches source, e.g. an editable checkout → a PyPI wheel,
+    where a plain install is a no-op because the linked version already
+    satisfies the spec). Never append a bare ``--force-reinstall`` to
+    *pip_args* instead: that flag cascades to every resolved dependency, and
+    core is a dependency of every feature package, so it reinstalls core from
+    the index as a wheel over the editable link — issue #2949 on the path most
+    likely to hit it. A version constraint cannot stop that, because the index
+    carries the same version the checkout builds and a same-version wheel
+    satisfies the pin exactly.
+
+    The backend (uv, else this interpreter's pip) and the argv sequence it runs
+    as come from :func:`_install_commands` — one command on uv, two on pip,
+    which the guard also renders its recovery command from. They run in order
+    and stop at the first failure, so the result returned is always the one
+    that decided the outcome. ``timeout`` bounds each installer subprocess (it
+    is :func:`subprocess.run`'s), so a two-pass pip switch can take up to twice
+    it; every path is still bounded, which is what a caller with nobody
+    watching needs.
 
     ``uv pip`` vs ``uv sync`` — do NOT "fix" this by switching installers.
     ``uv pip`` is uv's *pip-compatible* layer: it operates on a bare virtualenv
@@ -659,12 +792,17 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
     feature's pin it resolves one from the index — silently replacing the
     editable checkout with a wheel copy (issue #2949). ``constraints`` closes
     that hole: a list of PEP 508 requirement strings written to a temporary
-    constraints file and passed as ``-c``. Callers pin core to the checkout's
-    version so the index is not a candidate; a real version skew then fails the
-    resolve loudly instead of swapping the install underneath the operator.
+    constraints file and passed as ``-c``. Callers pin core to the version it is
+    installed at, so a real version skew fails the resolve loudly instead of
+    swapping the install underneath the operator. The pin bounds core's
+    VERSION; ``reinstall`` is what keeps its SOURCE — the two holes are
+    different and need both.
 
-    ``--no-deps`` is NOT the fix: it stops feature dependencies resolving at all
-    and hides the version-skew signal rather than surfacing it.
+    ``--no-deps`` is NOT the fix for either: on its own it stops feature
+    dependencies resolving at all and hides the version-skew signal rather than
+    surfacing it. The pip source switch does use it — but only in a pass that
+    follows one which resolved those dependencies, and fails if they do not
+    resolve (:func:`_install_commands`).
     """
     import tempfile
 
@@ -679,8 +817,12 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
         extra_args = ["-c", constraint_file]
 
     try:
-        cmd = _install_backend_argv(pip_args, extra_args)
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = None
+        for cmd in _install_commands(pip_args, extra_args, reinstall):
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                break
+        return result
     finally:
         if constraint_file:
             try:
@@ -689,22 +831,42 @@ def _extension_install_run(pip_args: list, *, constraints, timeout=None):
                 pass
 
 
+def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedProcess:
+    """A timed-out install, shaped like the result its callers already read.
+
+    ``TimeoutExpired`` is not a variant of "the installer finished badly" that
+    every reporting path would have to learn: it carries the output captured
+    before the kill, and the only extra fact is WHY that output stops where it
+    does. Folding it into a failed :class:`~subprocess.CompletedProcess` with
+    that fact in ``stderr`` keeps one shape flowing to the operator.
+    """
+    def text(stream) -> str:
+        if stream is None:
+            return ""
+        return stream if isinstance(stream, str) else stream.decode(errors="replace")
+
+    return subprocess.CompletedProcess(
+        expired.cmd,
+        returncode=1,
+        stdout=text(expired.stdout),
+        stderr=f"timed out after {expired.timeout}s\n{text(expired.stderr)}".strip(),
+    )
+
+
 def _core_install_shape():
     """Snapshot how ``kestrel-sovereign`` is installed in this venv.
 
     Returns a :class:`~kestrel_sovereign.feature_reconcile.CoreInstallShape`.
     Read through ``cli.`` so the test suite's patch seams apply.
-    """
-    import importlib.metadata as md
 
+    The version comes from :func:`_installed_version` — the same live read the
+    upgrade report uses — because this snapshot is taken *after* installer
+    subprocesses have run and has to see what they left behind.
+    """
     from kestrel_sovereign.feature_reconcile import CoreInstallShape
 
-    try:
-        version = md.version(CORE_DISTRIBUTION)
-    except md.PackageNotFoundError:
-        version = None
     return CoreInstallShape(
-        version=version,
+        version=_installed_version(CORE_DISTRIBUTION),
         editable_path=cli._editable_install_path(CORE_DISTRIBUTION),
     )
 
@@ -852,21 +1014,37 @@ class CoreInstallGuard:
         """The constraint lines applied to each guarded install (may be empty)."""
         return list(self._constraints)
 
-    def run(self, pip_args: list, *, timeout=None):
-        """Install a FEATURE package with core held inside the policy."""
+    def run(self, pip_args: list, *, reinstall=None, timeout=None):
+        """Install a FEATURE package with core held inside the policy.
+
+        *reinstall* names the feature package to force-reinstall when the
+        install is a source switch (see :func:`_extension_install_run`). It is
+        the guard's business because a bare ``--force-reinstall`` in *pip_args*
+        would reinstall core from the index straight through the constraint —
+        same version, wheel instead of link.
+        """
         return cli._extension_install_run(
-            pip_args, constraints=self._constraints or None, timeout=timeout,
+            pip_args,
+            constraints=self._constraints or None,
+            reinstall=reinstall,
+            timeout=timeout,
         )
 
-    def install_core(self, pip_args: list, *, timeout=None):
+    def install_core(self, pip_args: list, *, reinstall=None, timeout=None):
         """Install CORE itself — the operator deliberately moving core's source.
 
         Never constrained against itself, and the constraints for the rest of
         the batch are re-derived afterwards: a batch that switches core to a new
         checkout (or a new pin) must go on to pin the version core actually
         became, not the one it was before the switch.
+
+        *reinstall* is scoped the same way as :meth:`run`'s, even though core is
+        the target here: reinstalling core does not require rebuilding core's
+        own dependency tree, and a blanket flag would.
         """
-        result = cli._extension_install_run(pip_args, constraints=None, timeout=timeout)
+        result = cli._extension_install_run(
+            pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+        )
         self.refresh()
         return result
 
@@ -891,41 +1069,76 @@ class CoreInstallGuard:
             return None
         return describe_core_change(self.before, cli._core_install_shape(), self.policy)
 
-    def _repair(self):
+    def _repair(self, *, timeout=None):
         """Reinstall core from its declared source.
 
         Returns ``(ok, command, shell, result)`` — ``shell`` naming what
         ``command`` is quoted for, captured here so the label can never describe
         a different rendering than the one it travels with.
 
-        ``command`` is rendered from the SAME backend selection the repair just
-        ran through (:func:`_install_backend_argv`), interpreter included, and
-        quoted for THIS host's shell (:func:`_render_command`). An operator only
+        ``ok`` is decided by RE-READING core afterwards, in both directions —
+        the installer's exit code is evidence about the installer, not about
+        where core ended up. A nonzero exit does not mean core is still wrong:
+        a pip repair is two passes (:func:`_install_commands`) and the first
+        one restores core before the second can fail, and a subprocess killed
+        by *timeout* is killed wherever it had got to, which may be after the
+        write that put core back. Trusting the code there reports RESTORE
+        FAILED over a core that is already home — sending an operator to redo
+        an install that happened, and failing an HTTP install for a host that
+        conforms.
+
+        ``command`` is rendered from the SAME argv sequence the repair just ran
+        (:func:`_install_commands`) — backend, interpreter, and reinstall
+        scoping included — quoted for THIS host's shell
+        (:func:`_render_commands`). An operator only
         sees it when the automatic restore failed, which is precisely when a
         command naming a uv this host lacks — or omitting ``--python`` and so
         landing in whichever environment is active — would retarget core
         somewhere new instead of putting it back, and when a command their shell
         will not parse at all leaves them with nothing.
+
+        *timeout* bounds the repair's own installer subprocess — see
+        :meth:`resolve`. A repair killed by it is reported as an ordinary failed
+        repair (``ok=False``) rather than raised: the operator still needs the
+        restore command, and the caller still needs to report whatever brought
+        it here.
         """
         if self.policy.editable:
             checkout = str(Path(self.policy.editable).expanduser())
             pip_args = ["-e", checkout]
+            # Installing from a local path replaces whatever holds the name, so
+            # the link comes back without forcing anything.
+            reinstall = None
         else:
-            # Declared from the index. A --force-reinstall is only needed to
-            # displace an editable link; a version outside the window is fixed
-            # by resolving the declared spec again.
+            # Declared from the index. A reinstall is only needed to displace an
+            # editable link; a version outside the window is fixed by resolving
+            # the declared spec again. Scoped to core, never blanket: a repair
+            # that reinstalls "everything resolved" would drop an editable SDK
+            # (or any other editable dependency of core) for an index wheel —
+            # issue #2949 committed by the code that exists to undo it.
             spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
-            pip_args = (
-                ["--force-reinstall", spec]
-                if cli._editable_install_path(CORE_DISTRIBUTION) else [spec]
+            pip_args = [spec]
+            reinstall = (
+                CORE_DISTRIBUTION
+                if cli._editable_install_path(CORE_DISTRIBUTION) else None
             )
-        result = cli._extension_install_run(pip_args, constraints=None)
-        rendered = _render_command(cli._install_backend_argv(pip_args))
-        if result.returncode == 0:
+        rendered = _render_commands(
+            _install_commands(pip_args, reinstall=reinstall),
+        )
+        try:
+            result = cli._extension_install_run(
+                pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as expired:
+            result = _killed_process(expired)
+        ok = self._check() is None
+        if ok:
+            # Core is where the policy wants it: that is the state this batch
+            # now measures later drift against.
             self.refresh()
-        return result.returncode == 0, rendered, _render_shell(), result
+        return ok, rendered, _render_shell(), result
 
-    def resolve(self) -> CoreGuardOutcome:
+    def resolve(self, *, timeout=None) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
 
         The one place that decides what a drift means and what to do about it,
@@ -934,8 +1147,22 @@ class CoreInstallGuard:
         up reporting success over a core the other would have refused.
 
         Repair success is judged by RE-CHECKING core, not by the installer's
-        exit code: a reinstall that returned 0 and still left core off its
-        declared source is not a repair.
+        exit code, and that cuts both ways: a reinstall that returned 0 and
+        still left core off its declared source is not a repair, and one that
+        exited nonzero — or was killed by *timeout* — after core was already
+        back is not a failure. The installer's output is diagnostic; core
+        itself is the authority.
+
+        *timeout* bounds the repair's installer subprocess. It defaults to
+        unlimited for the CLI, where an operator is watching the run and can
+        interrupt it; a caller with nobody at the other end MUST pass one. The
+        HTTP install endpoint is the case in point: it bounds the install
+        itself, and the resolver or network problem that hung that install hangs
+        the repair the same way — an unbounded repair turns the intended 504
+        into a request that never returns. A repair that hits the bound without
+        restoring core is an unrepaired core
+        (:attr:`CoreGuardOutcome.conforming` is False) carrying the manual
+        restore command, exactly like any other failed repair.
         """
         from kestrel_sovereign.feature_reconcile import core_install_matches
 
@@ -946,8 +1173,7 @@ class CoreInstallGuard:
         # Distinguish "the batch broke it" from "it never got there": both are
         # failures, but only the first is a swap.
         replaced = core_install_matches(self._baseline, self.policy)
-        ok, rendered, shell, result = self._repair()
-        repaired = ok and self._check() is None
+        repaired, rendered, shell, result = self._repair(timeout=timeout)
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
@@ -1200,22 +1426,27 @@ def cmd_feature_sync(args) -> int:
             print(f"  {target:<34} {current or '-':<10} would {action} ({how})")
             continue
 
+        reinstall = None
         if editable_want:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
-        elif pypi_want is not None and cli._editable_install_path(target):
-            # Switching a currently-editable install to a PyPI source needs a
-            # force reinstall; a plain pip install leaves the satisfying
-            # editable link in place, so the source switch never takes effect
-            # (codex round 10 P2).
-            pip_args = ["--force-reinstall", install_target]
         else:
             pip_args = [install_target]
+            if pypi_want is not None and cli._editable_install_path(target):
+                # Switching a currently-editable install to a PyPI source needs
+                # a force reinstall; a plain pip install leaves the satisfying
+                # editable link in place, so the source switch never takes
+                # effect (codex round 10 P2). Scoped to THIS package: a blanket
+                # --force-reinstall cascades to core and swaps its editable link
+                # for a same-version index wheel, straight through the pin.
+                reinstall = target
 
         # Core is never constrained against itself — a `kestrel-sovereign`
         # manifest entry IS the operator deliberately moving core's source.
         # `install_core` re-derives the batch pin from what core became.
         is_core = target == fr.CORE_DISTRIBUTION
-        run = guard.install_core if is_core else guard.run
+        run = functools.partial(
+            guard.install_core if is_core else guard.run, reinstall=reinstall,
+        )
         result = run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
         # `feature install`) — but ONLY the legacy entry that declares no source

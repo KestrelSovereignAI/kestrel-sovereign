@@ -76,7 +76,7 @@ def test_reconcile_installs_missing_allowlisted_feature(patched, capsys):
     registry PyPI source."""
     install_calls = []
 
-    def fake_install(pip_args, *, constraints=None, timeout=None):
+    def fake_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
         install_calls.append(pip_args)
         return _ok(stdout="Successfully installed kestrel-feature-voice-0.3.0")
 
@@ -268,8 +268,12 @@ def test_execute_unpinned_pypi_declaration_does_not_fall_back_to_git():
 
 
 def test_execute_pypi_force_reinstall_switches_off_editable():
-    """A force-reinstall pypi action passes --force-reinstall so the wheel
-    replaces an editable link (codex round 9 P2)."""
+    """A force-reinstall pypi action reinstalls so the wheel replaces an
+    editable link (codex round 9 P2) — scoped to the package being switched.
+
+    A bare ``--force-reinstall`` in the argv would apply to the whole resolve,
+    and core is a resolved dependency of every feature package (#2949).
+    """
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="update", mode="pypi",
         source="kestrel-feature-voice>=0.3,<0.4", force_reinstall=True,
@@ -278,7 +282,9 @@ def test_execute_pypi_force_reinstall_switches_off_editable():
         ok, _ = cli_lifecycle._execute_reconcile_action(action, {}, allow_dirty=False, guard=_unguarded())
     assert ok is True
     args = install.call_args[0][0]
-    assert "--force-reinstall" in args and "--upgrade" in args
+    assert "--upgrade" in args
+    assert "--force-reinstall" not in args
+    assert install.call_args[1]["reinstall"] == "kestrel-feature-voice"
 
 
 def test_execute_pypi_falls_back_to_git_url():
@@ -496,3 +502,36 @@ def test_reconcile_reports_a_core_that_could_not_be_restored(
         "RESTORE FAILED — run `uv pip install --python "
         f"{shlex.quote(sys.executable)} -e /src/core` by hand."
     ) in err
+
+
+def test_reconcile_source_switch_leaves_the_editable_core_linked(
+    monkeypatch, patched, tmp_path,
+):
+    """The same regression through `kestrel update`, which is where a source
+    switch is most likely to run: an editable core at X survives a feature
+    moving off its checkout while the index carries that same X.
+
+    The version pin cannot see this one — a same-version wheel satisfies
+    `==0.52.0` — so what holds core is the reinstall being scoped to the
+    feature. `feature_requires=">=0.52"` removes the version-skew route
+    deliberately: anything that happens to core here is the cascade.
+    """
+    manifest = tmp_path / "hosts.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    monkeypatch.setattr(cli, "_host_manifest_path", lambda ns: manifest)
+    venv = FakeUv(core_checkout="/src/core", feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.3.1"
+    venv.editable["kestrel-feature-voice"] = "/src/voice"
+    use_fake_uv(monkeypatch, venv)
+
+    rc = _reconcile(patched)
+
+    assert rc == 0
+    assert venv.editable[CORE] == "/src/core"  # link intact
+    assert venv.installed[CORE] == "0.52.0"
+    # The switch still took effect — voice came off its checkout.
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+    assert "kestrel-feature-voice" not in venv.editable
+    assert not any("--force-reinstall" in c for c in venv.commands)
+    cmd = venv.commands[0]
+    assert cmd[cmd.index("--reinstall-package") + 1] == "kestrel-feature-voice"

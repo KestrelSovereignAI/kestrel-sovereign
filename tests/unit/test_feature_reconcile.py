@@ -546,13 +546,28 @@ def test_core_policy_carries_a_declared_pypi_window():
     ]
 
 
-def test_core_policy_with_an_empty_pypi_spec_constrains_nothing():
-    """`pypi = ""` is "any version from the index" — nothing to hold it to."""
+def test_core_policy_with_an_empty_pypi_spec_still_holds_the_source():
+    """`pypi = ""` is "any version FROM THE INDEX" — a declaration, not a waiver.
+
+    Half of it is empty: there is no version window, so no constraint line to
+    write. The other half is not: the entry names where core comes from, so an
+    editable link (or a core that is not installed at all) violates it exactly
+    as a version outside a window would. Reading the empty spec as "unguarded"
+    let the live link the operator declared they were leaving pass the check
+    (issue #2949).
+    """
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi="")}
     policy = fr.resolve_core_policy(idx, "/src/old")
-    assert not policy.guarded
+
+    assert policy.guarded
     assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
+    assert fr.core_install_matches(_shape("0.52.0", None), policy)  # a wheel: fine
+    assert not fr.core_install_matches(_shape("0.52.0", "/src/old"), policy)
+    assert not fr.core_install_matches(_shape(None, None), policy)  # not installed
+    assert policy.describe_expected() == (
+        "kestrel-sovereign from the index (non-editable)"
+    )
 
 
 def test_editable_constraint_tracks_the_installed_version():

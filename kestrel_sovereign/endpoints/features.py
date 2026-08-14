@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["features"])
 
+# Every installer subprocess started from an HTTP request is bounded. Nothing on
+# the other end of the socket can interrupt one, so an unbounded call is not a
+# slow request, it is a wedged one. This bounds the feature install AND the core
+# repair that may follow it (issue #2949) — the repair runs a second installer,
+# and the resolver or network problem that hung the first hangs it identically.
+#
+# The repair gets its OWN budget rather than the remainder of the install's: a
+# timed-out install is precisely when core is most likely to have been left
+# swapped mid-write, so starving the restore there would trade a hung request
+# for a host running a core nobody declared. The bound is per installer
+# subprocess, so the worst case is a small multiple of it — two here, and one
+# more on a host with no uv, where a scoped reinstall takes two passes
+# (`cli_features._install_commands`). Every path still terminates, which is the
+# property a caller with nobody watching needs; the multiple is the price.
+INSTALL_TIMEOUT_SECONDS = 300
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -304,7 +320,9 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
 
     install_error: Optional[Tuple[int, str]] = None
     try:
-        result = await asyncio.to_thread(guard.run, [package_spec], timeout=300)
+        result = await asyncio.to_thread(
+            guard.run, [package_spec], timeout=INSTALL_TIMEOUT_SECONDS,
+        )
         if result.returncode != 0:
             logger.error(f"pip install failed for {package_spec}: {result.stderr}")
             install_error = (500, f"Installation failed: {result.stderr[:500]}")
@@ -316,7 +334,12 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     # can fail, and a timeout kills the process mid-write, so both can leave
     # core swapped for an index wheel. Returning the install error without
     # looking would leave that swap in place, unnamed (issue #2949).
-    outcome = await asyncio.to_thread(guard.resolve)
+    #
+    # Bounded, because this repairs by running another installer: an unbounded
+    # one would hang the request the install timeout above exists to prevent. A
+    # repair that hits the bound comes back as an unrepaired outcome carrying
+    # the manual restore command, and the install's own status still stands.
+    outcome = await asyncio.to_thread(guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS)
     if outcome.drift is not None:
         logger.error("core install changed during %s install:\n%s", package_spec, outcome.describe())
 

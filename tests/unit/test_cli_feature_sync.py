@@ -18,7 +18,14 @@ import pytest
 
 from kestrel_sovereign import cli
 from kestrel_sovereign import cli_features
-from tests.utils.fake_uv import CHECKOUT, CORE, FakeUv, use_fake_uv
+from tests.utils.fake_uv import (
+    CHECKOUT,
+    CORE,
+    SDK,
+    SDK_CHECKOUT,
+    FakeUv,
+    use_fake_uv,
+)
 
 
 @pytest.fixture
@@ -61,12 +68,14 @@ class _InstallSpy:
     def __init__(self, returncode=0, stderr=""):
         self.calls = []
         self.constraints = []
+        self.reinstalls = []
         self.returncode = returncode
         self.stderr = stderr
 
-    def __call__(self, pip_args, *, constraints=None, timeout=None):
+    def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
         self.calls.append(list(pip_args))
         self.constraints.append(list(constraints or []))
+        self.reinstalls.append(reinstall)
         return subprocess.CompletedProcess(pip_args, self.returncode, stdout="", stderr=self.stderr)
 
 
@@ -470,8 +479,11 @@ def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_
     rc = cli.cmd_feature_sync(_args(manifest))
 
     assert rc == 0
-    # force-reinstall so the wheel replaces the editable link (round 10 P2)
-    assert spy.calls == [["--force-reinstall", "kestrel-feature-voice>=0.3,<0.4"]]
+    # The wheel must replace the editable link (round 10 P2) — via a reinstall
+    # scoped to this package, never a blanket --force-reinstall that would
+    # cascade into core (#2949).
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+    assert spy.reinstalls == ["kestrel-feature-voice"]
     assert "reinstalled" in capsys.readouterr().out
 
 
@@ -551,7 +563,7 @@ def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -590,7 +602,7 @@ def test_sync_git_fallback_finds_a_catalog_row_spelled_differently(
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 1 if not str(pip_args[0]).startswith("git+") else 0
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -657,7 +669,7 @@ def test_sync_git_fallback_carries_extras(monkeypatch, fake_registry, tmp_path):
         def __init__(self):
             self.calls = []
 
-        def __call__(self, pip_args, *, constraints=None, timeout=None):
+        def __call__(self, pip_args, *, constraints=None, reinstall=None, timeout=None):
             self.calls.append(list(pip_args))
             rc = 0 if "git+" in str(pip_args[0]) else 1
             return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
@@ -1059,4 +1071,313 @@ def test_feature_upgrade_pins_core_to_the_editable_checkout(
     assert venv.editable[CORE] == CHECKOUT
     assert venv.installed[CORE] == "0.52.0"
     assert venv.pins == ["==0.52.0", "==0.52.0"]  # pip attempt + git fallback
+    assert "FAILED" in capsys.readouterr().out
+
+
+# --- a feature's source switch must not reinstall core (#2949) --------------
+#
+# The version pin above bounds core's VERSION. It says nothing about core's
+# SOURCE, and cannot: the index publishes the same version the checkout builds,
+# so a same-version wheel satisfies `==0.52.0` exactly. The one command that
+# reaches for that wheel anyway is a source switch — `--force-reinstall`
+# applies to the whole resolve, and core is a resolved dependency of every
+# feature package. Scoping the reinstall to the package being switched is what
+# holds the source; these tests pin that, on both installer backends.
+
+def _switch_voice_to_pypi(tmp_path):
+    """Manifest that moves an editable `voice` install onto the index."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    return manifest
+
+
+def _editable_voice(**kw):
+    """A venv where BOTH core and the feature are editable checkouts.
+
+    `feature_requires=">=0.52"` removes the version-skew route deliberately:
+    the installed core satisfies the feature, so anything that happens to core
+    here is the reinstall cascade and nothing else. The index carries 0.52.0 —
+    the very version the checkout builds — which is what makes the pin blind
+    to the swap.
+    """
+    venv = FakeUv(feature_requires=">=0.52", **kw)
+    venv.installed["kestrel-feature-voice"] = "0.3.1"
+    venv.editable["kestrel-feature-voice"] = "/src/voice"
+    return venv
+
+
+def test_blanket_force_reinstall_swaps_editable_core_through_the_pin(monkeypatch):
+    """Fidelity check on the double: the pin does NOT stop a blanket reinstall.
+
+    Without this the "core survived" assertions below could pass vacuously —
+    and this is the exact claim the fix rests on, so it is asserted rather
+    than assumed.
+    """
+    venv = _editable_voice()
+    use_fake_uv(monkeypatch, venv)
+
+    result = cli._extension_install_run(
+        ["--force-reinstall", "kestrel-feature-voice>=0.3,<0.5"],
+        constraints=[f"{CORE}==0.52.0"],
+    )
+
+    assert result.returncode == 0  # the install "succeeded"...
+    assert venv.pins == ["==0.52.0"]  # ...with the pin applied...
+    assert venv.installed[CORE] == "0.52.0"  # ...at the pinned version...
+    assert venv.editable.get(CORE) is None  # ...and the link gone anyway.
+
+
+def _pypi_core_guard(monkeypatch, **kw):
+    """A guard whose manifest says core comes from the index, over an editable
+    core — so :meth:`resolve` has a real repair to perform."""
+    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.feature_reconcile import SourceEntry
+
+    venv = FakeUv(**kw)
+    use_fake_uv(monkeypatch, venv)
+    index = {CORE: SourceEntry(package=CORE, pypi=">=0.52,<0.53")}
+    return venv, CoreInstallGuard.snapshot(index)
+
+
+def test_core_repair_does_not_drag_editable_dependencies_off_their_checkouts(
+    monkeypatch,
+):
+    """The repair is scoped too — it is an install like any other.
+
+    Putting core back from the index means displacing an editable link, and the
+    blanket flag that does it reinstalls everything the resolve touches. Core's
+    own dependencies are in that set: an editable SDK checkout comes back as an
+    index wheel. That is issue #2949 committed by the code written to undo it,
+    so the repair names the one package it is for.
+    """
+    venv, guard = _pypi_core_guard(monkeypatch)
+
+    outcome = guard.resolve()
+
+    assert outcome.repaired
+    assert venv.editable.get(CORE) is None  # core is the declared wheel now...
+    assert venv.editable[SDK] == SDK_CHECKOUT  # ...and its SDK is still linked
+    assert not any("--force-reinstall" in c for c in venv.commands)
+    cmd = venv.commands[-1]
+    assert cmd[cmd.index("--reinstall-package") + 1] == CORE
+    # What the operator is told to run is what ran — scoping included.
+    assert outcome.command == (
+        f"uv pip install --python {shlex.quote(sys.executable)} "
+        f"--reinstall-package {CORE} '{CORE}>=0.52,<0.53'"
+    )
+
+
+def test_core_repair_recovery_command_carries_both_pip_passes(monkeypatch, capsys):
+    """A pip host's repair is two commands, and the operator gets both.
+
+    pip cannot scope a reinstall, so the repair splits (see
+    `_install_commands`). Printing only the first pass advertises a restore
+    that resolves dependencies and never replaces the link — half a repair,
+    handed over as the whole one.
+    """
+    venv, guard = _pypi_core_guard(monkeypatch, repair_fails=True)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    assert guard.verify() == 1
+    assert venv.editable[CORE] == CHECKOUT  # the repair failed; nothing moved
+    py = shlex.quote(sys.executable)
+    assert (
+        f"RESTORE FAILED — run `{py} -m pip install --upgrade "
+        f"'{CORE}>=0.52,<0.53' && {py} -m pip install --force-reinstall "
+        f"--no-deps '{CORE}>=0.52,<0.53'` by hand."
+    ) in capsys.readouterr().err
+
+
+def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
+    monkeypatch, capsys
+):
+    """The printed sequence has to keep the ordering that makes it safe.
+
+    Pass 2 replaces core with `--no-deps` and is only correct once pass 1's
+    resolve has succeeded (`_install_commands`). PowerShell 5.1 has no `&&`,
+    but joining with a bare `;` runs pass 2 regardless — so the command handed
+    to a Windows operator would install a core whose dependencies the pass
+    before it just refused to resolve. That is the hazard the two-pass split
+    exists to prevent, re-entered through the printed fix.
+    """
+    venv, guard = _pypi_core_guard(monkeypatch, repair_fails=True)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+    monkeypatch.setattr(cli_features, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        cli_features.sys, "executable", r"C:\Program Files\kestrel\venv\python.exe"
+    )
+
+    assert guard.verify() == 1
+    assert venv.editable[CORE] == CHECKOUT  # the repair failed; nothing moved
+    py = r"& 'C:\Program Files\kestrel\venv\python.exe'"
+    assert (
+        f"RESTORE FAILED — run `{py} -m pip install --upgrade "
+        f"'{CORE}>=0.52,<0.53'; if ($?) {{ {py} -m pip install "
+        f"--force-reinstall --no-deps '{CORE}>=0.52,<0.53' }}` in PowerShell "
+        "by hand."
+    ) in capsys.readouterr().err
+
+
+# --- a repair is judged by re-reading core, not by an exit code (#2949) -----
+#
+# The no-op repair below already pins one direction: exit 0 over an unchanged
+# venv is not a restore. These pin the mirror image, which is where the same
+# mistake costs an operator a working host: an installer that ended badly
+# AFTER core was already home.
+
+
+def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
+    monkeypatch, capsys
+):
+    """pip's repair is two passes, and the first one restores core.
+
+    `--upgrade` installs the declared wheel over the editable link; the
+    `--no-deps` pass that follows only has to displace it. When THAT pass
+    fails — a dropped connection, a build error — the installer exits nonzero
+    over a core that already conforms. Reading the exit code sends the
+    operator to run a restore that has happened, and fails the HTTP install of
+    a host that is fine.
+    """
+    venv, guard = _pypi_core_guard(monkeypatch, repair_last_pass_fails=True)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    assert guard.verify() == 1  # the swap happened, so it is still reported...
+
+    err = capsys.readouterr().err
+    assert "restored:" in err  # ...but as one that was put back
+    assert "RESTORE FAILED" not in err
+    assert len(venv.commands) == 2  # both passes ran...
+    assert venv.editable.get(CORE) is None  # ...and core is the declared wheel
+    assert venv.installed[CORE] == "0.52.0"
+    assert guard.verify() == 0  # nothing left to report on a second look
+
+
+def test_a_repair_killed_after_the_write_is_not_reported_as_a_failed_restore(
+    monkeypatch,
+):
+    """A timeout ends a process; it does not undo what the process did.
+
+    The HTTP surface bounds its repair, so the kill can land anywhere —
+    including after the write that put core back. Treating "we stopped
+    waiting" as "the restore failed" turns a host that conforms into a 500
+    naming a command the operator does not need to run.
+    """
+    venv, guard = _pypi_core_guard(monkeypatch, repair_hangs_after_restore=True)
+
+    outcome = guard.resolve(timeout=300)
+
+    assert venv.editable.get(CORE) is None  # the write landed before the kill
+    assert venv.installed[CORE] == "0.52.0"
+    assert outcome.repaired
+    assert outcome.conforming
+    assert outcome.drift is not None  # the swap is still reported...
+    assert outcome.output == ""  # ...but not as an unrepaired one
+
+
+def test_sync_source_switch_leaves_the_editable_core_linked(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The regression: an editable core at X survives a feature source switch
+    while the index carries that same X."""
+    venv = _editable_voice()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 0
+    assert venv.editable[CORE] == CHECKOUT  # the link the operator declared
+    assert venv.installed[CORE] == "0.52.0"
+    # The switch still took effect: voice IS the reinstall, off its checkout.
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+    assert "kestrel-feature-voice" not in venv.editable
+    # No command may carry the blanket flag; the reinstall names one package.
+    assert not any("--force-reinstall" in c for c in venv.commands)
+    cmd = venv.commands[0]
+    assert cmd[cmd.index("--reinstall-package") + 1] == "kestrel-feature-voice"
+    captured = capsys.readouterr()
+    assert "reinstalled" in captured.out
+    # Prevention, not a rescue: the guard had nothing to detect or repair.
+    assert "was replaced" not in captured.err
+
+
+def test_sync_source_switch_keeps_core_on_a_host_without_uv(
+    monkeypatch, fake_registry, tmp_path
+):
+    """pip has no `--reinstall-package`, and the protection is not dropped there.
+
+    The switch becomes two passes, in this order: a non-forcing `--upgrade`
+    that resolves the requested version's dependencies (so an editable core it
+    still satisfies keeps its link), then a `--no-deps` force that replaces the
+    package itself and can reach no dependency at all.
+    """
+    venv = _editable_voice()
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 0
+    assert venv.editable[CORE] == CHECKOUT
+    assert venv.installed[CORE] == "0.52.0"
+    assert venv.installed["kestrel-feature-voice"] == "0.4.0"
+    assert "kestrel-feature-voice" not in venv.editable  # switch took effect
+    assert [c[:4] for c in venv.commands] == [
+        [sys.executable, "-m", "pip", "install"],
+        [sys.executable, "-m", "pip", "install"],
+    ]
+    # Resolve first, and it forces nothing...
+    assert "--upgrade" in venv.commands[0]
+    assert "--force-reinstall" not in venv.commands[0]
+    # ...then replace, reaching nothing but the package itself.
+    assert "--force-reinstall" in venv.commands[1] and "--no-deps" in venv.commands[1]
+    # The pin still travels on both passes — bounding the version is still the
+    # other half of the guard.
+    assert venv.pins == ["==0.52.0", "==0.52.0"]
+
+
+def test_sync_pip_source_switch_fails_before_replacing_the_feature(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A switch whose dependencies cannot be satisfied changes nothing.
+
+    The index build of `voice` wants a core the manifest's own pin forbids.
+    That has no solution, and the pass that finds it out is the one that runs
+    FIRST — so the sync fails with the working editable install still in place,
+    rather than reporting a failure over a venv it already replaced.
+
+    (uv resolves the whole switch before writing anything, so this is pip's
+    ordering being asserted, not a behaviour uv shares by accident.)
+    """
+    venv = _editable_voice()
+    venv.feature_requires = ">=0.53"  # the index build outgrew the pinned core
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 1
+    # The feature is untouched: same version, still linked to its checkout.
+    assert venv.installed["kestrel-feature-voice"] == "0.3.1"
+    assert venv.editable["kestrel-feature-voice"] == "/src/voice"
+    assert venv.editable[CORE] == CHECKOUT  # and so is core
+    assert len(venv.commands) == 1  # the destructive pass never ran
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "No solution found" in out
+
+
+def test_sync_pip_source_switch_does_not_run_the_second_pass_after_a_failure(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """A failed first pass is reported, not papered over by a follow-up that
+    would replace the package the failed resolve was about."""
+    venv = _editable_voice(feature_install_fails=True)
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 1
+    assert len(venv.commands) == 1  # no second pass
+    assert venv.editable[CORE] == CHECKOUT  # and core is still where it was
     assert "FAILED" in capsys.readouterr().out
