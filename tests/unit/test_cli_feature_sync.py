@@ -1307,6 +1307,32 @@ def test_repair_displaces_a_non_editable_direct_url_core_at_a_satisfying_version
     assert guard.verify() == 0  # and it stays fixed
 
 
+def test_dry_run_previews_the_source_only_core_drift_that_sync_repairs(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """A preview that says `present` for something sync reinstalls is a lie.
+
+    Planning judged a `pypi` core by "is it editable?" while execution judges it
+    by "did it come from an index?". A non-editable direct-URL core inside the
+    declared window therefore previewed as `present` in `sync --dry-run` and
+    `feature status`, while a real sync reinstalled it. Both now ask the guard's
+    predicate, so the preview and the run cannot disagree.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n')
+    venv = FakeUv(
+        core_checkout=None,
+        direct_urls={CORE: "git+https://example.invalid/core@abc"},
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest, dry_run=True))
+
+    assert rc == 0
+    assert venv.commands == []  # a preview mutates nothing
+    assert "would reinstall" in capsys.readouterr().out
+
+
 def test_a_repair_killed_after_the_write_is_not_reported_as_a_failed_restore(
     monkeypatch,
 ):

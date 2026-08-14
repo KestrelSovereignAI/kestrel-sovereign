@@ -1376,7 +1376,31 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         # leave the venv pointed at a local checkout the manifest no longer
         # declares (codex round 8 P2) — or when a non-empty pin is violated
         # (codex round 2 P2). Both rather than a false `present`.
-        if cli._editable_install_path(target) or not _version_satisfies(current, pypi_want):
+        #
+        # For CORE, ask the guard's own predicate rather than re-deriving one.
+        # Execution repairs any core that did not come from an index, so
+        # planning has to call that same thing drift — otherwise `sync
+        # --dry-run` and `feature status` promise `present` for a core the real
+        # sync reinstalls. Sharing one predicate is what stops preview and
+        # execution disagreeing at all.
+        #
+        # Core only, deliberately: a FEATURE package legitimately arrives from
+        # the registry's git URL when its index install fails, so calling a
+        # direct URL drift there would plan a reinstall on every run forever.
+        if canonical_package(target) == CORE_DISTRIBUTION:
+            from kestrel_sovereign.feature_reconcile import (
+                CoreSourcePolicy,
+                core_install_matches,
+            )
+
+            drifted = not core_install_matches(
+                cli._core_install_shape(), CoreSourcePolicy(pypi=pypi_want),
+            )
+        else:
+            drifted = bool(
+                cli._editable_install_path(target)
+            ) or not _version_satisfies(current, pypi_want)
+        if drifted:
             action = "reinstall"
         elif extras:
             action = "ensure"
