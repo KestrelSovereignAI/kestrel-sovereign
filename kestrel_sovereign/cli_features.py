@@ -1146,17 +1146,28 @@ class CoreInstallGuard:
             # the link comes back without forcing anything.
             reinstall = None
         else:
-            # Declared from the index. A reinstall is only needed to displace an
-            # editable link; a version outside the window is fixed by resolving
-            # the declared spec again. Scoped to core, never blanket: a repair
-            # that reinstalls "everything resolved" would drop an editable SDK
-            # (or any other editable dependency of core) for an index wheel —
-            # issue #2949 committed by the code that exists to undo it.
+            # Declared from the index. A reinstall is needed to displace any
+            # install the resolver would otherwise consider done: an editable
+            # link, and equally a non-editable direct-URL copy (VCS, local path,
+            # archive) whose version already satisfies the spec — pip and uv
+            # judge "already satisfied" by VERSION, so re-resolving the spec is
+            # a no-op and the wrong source survives.
+            #
+            # Detection and repair must ask the SAME question. Asking only
+            # "is it editable?" here while _check() asks "is it from an index?"
+            # makes a drift this guard now names one it can never fix: a
+            # permanent CORE_UNSAFE, plus a printed manual command that no-ops
+            # for the operator exactly as the automatic repair did.
+            #
+            # A version outside the window is still fixed by resolving the spec
+            # again. Scoped to core, never blanket: a repair that reinstalls
+            # "everything resolved" would drop an editable SDK (or any other
+            # editable dependency of core) for an index wheel — issue #2949
+            # committed by the code that exists to undo it.
             spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
             pip_args = [spec]
             reinstall = (
-                CORE_DISTRIBUTION
-                if cli._editable_install_path(CORE_DISTRIBUTION) else None
+                None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
             )
         rendered = _render_commands(
             _install_commands(pip_args, reinstall=reinstall),

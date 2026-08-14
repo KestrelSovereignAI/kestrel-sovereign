@@ -374,10 +374,26 @@ class FakeUv:
             self.installed[CORE] = self.checkouts[target]
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         spec = SpecifierSet(target[len(CORE):])
+        current = self.installed.get(CORE)
+        if (
+            current is not None
+            and Version(current) in spec
+            and not self._reinstalls_package(cmd, CORE)
+        ):
+            # pip and uv judge "already satisfied" by VERSION alone. A spec
+            # install that is already satisfied writes nothing, so a core
+            # sitting at the right version from the WRONG source survives
+            # untouched unless the command scopes a reinstall of core. Modelling
+            # this is what lets a test see a repair that exits 0 and fixes
+            # nothing.
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         self.installed[CORE] = max(
             (v for v in self.core_index if Version(v) in spec), key=Version,
         )
         self.editable.pop(CORE, None)
+        # An index resolution records no PEP 610 provenance — landing one clears
+        # whatever direct URL was there.
+        self.direct_urls.pop(CORE, None)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     def _core_candidates(self, pin):

@@ -1240,7 +1240,7 @@ def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
 def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
     monkeypatch, capsys
 ):
-    """pip's repair is two passes, and the first one restores core.
+    """pip's repair is two passes, and the first one can restore core.
 
     `--upgrade` installs the declared wheel over the editable link; the
     `--no-deps` pass that follows only has to displace it. When THAT pass
@@ -1248,8 +1248,17 @@ def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
     over a core that already conforms. Reading the exit code sends the
     operator to run a restore that has happened, and fails the HTTP install of
     a host that is fine.
+
+    Core starts at 0.51.0, OUTSIDE the declared `>=0.52,<0.53`, because pass 1
+    is deliberately non-forcing (see `_install_commands`): it only writes when
+    the installed version does not already satisfy the spec. A same-version
+    source switch no-ops in pass 1 by design — that is the case pass 2 exists
+    for, and modelling it as a write would assert the opposite of what the
+    production code documents.
     """
-    venv, guard = _pypi_core_guard(monkeypatch, repair_last_pass_fails=True)
+    venv, guard = _pypi_core_guard(
+        monkeypatch, repair_last_pass_fails=True, core_version="0.51.0",
+    )
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
 
     assert guard.verify() == 1  # the swap happened, so it is still reported...
@@ -1261,6 +1270,41 @@ def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
     assert venv.editable.get(CORE) is None  # ...and core is the declared wheel
     assert venv.installed[CORE] == "0.52.0"
     assert guard.verify() == 0  # nothing left to report on a second look
+
+
+def test_repair_displaces_a_non_editable_direct_url_core_at_a_satisfying_version(
+    monkeypatch, capsys,
+):
+    """Detection and repair must ask the same question about core's source.
+
+    A core installed from a VCS ref (or local path, or archive) at a version
+    the declared window accepts is a source violation the guard now names. But
+    pip and uv judge "already satisfied" by VERSION, so re-resolving the spec
+    writes nothing — and a repair that only scopes its reinstall for *editable*
+    cores leaves this one exactly where it was. The drift would then be
+    permanently unfixable: every run reports CORE_UNSAFE and prints a manual
+    command that no-ops for the operator too.
+    """
+    venv, guard = _pypi_core_guard(
+        monkeypatch,
+        core_checkout=None,  # NOT editable — this is the case is_editable misses
+        direct_urls={CORE: "git+https://example.invalid/core@abc"},
+    )
+    # Preconditions: the version is fine and the install is not editable, so
+    # the ONLY thing wrong is where core came from.
+    assert venv.installed[CORE] == "0.52.0"
+    assert venv.editable.get(CORE) is None
+
+    rc = guard.verify()
+
+    # 1, not CORE_UNSAFE: the drift is still reported (nothing claims success
+    # over a core that was replaced) but it was actually put back.
+    assert rc == 1
+    assert venv.direct_urls.get(CORE) is None  # the git copy is gone
+    err = capsys.readouterr().err
+    assert "RESTORE FAILED" not in err
+    assert "--reinstall-package" in err  # the reinstall was scoped, not blanket
+    assert guard.verify() == 0  # and it stays fixed
 
 
 def test_a_repair_killed_after_the_write_is_not_reported_as_a_failed_restore(
