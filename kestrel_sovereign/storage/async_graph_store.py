@@ -150,7 +150,57 @@ def _is_shareable_amendment_artifact_properties(
     created_at = properties.get("created_at")
     if created_at is None:
         return True
-    return _is_tz_aware_iso(created_at)
+    # Bounded, but *not* required to be timezone-qualified — unlike the
+    # constitution predicate above, which validates a field this codebase
+    # writes. ``created_at`` here is a **signed** field of the artifact:
+    # ``canonical_amendment_bytes`` covers it and ``verify_reanchor_artifact``
+    # does not constrain its shape. Requiring more of it than the verifier does
+    # would let an artifact govern the first agent and not the second — the
+    # first commits, because a brand-new row is never checked against this
+    # predicate, and the second rolls back. That is the fleet split this issue
+    # exists to remove. The length cap is what keeps a shared row bounded;
+    # anyone who can choose this value already holds the Sovereign key and
+    # could choose ``signer`` too.
+    return isinstance(created_at, str) and len(created_at) <= 64
+
+
+def _canonical_shared_properties(
+    properties: Dict[str, Any], allowed: frozenset
+) -> Dict[str, Any]:
+    """``properties`` with everything outside ``allowed`` dropped."""
+    return {key: value for key, value in properties.items() if key in allowed}
+
+
+def _is_normalisable_legacy_artifact(
+    existing: Dict[str, Any], incoming: Dict[str, Any], node_id: str
+) -> bool:
+    """Whether a pre-#2893 artifact row can be normalised into a shared one.
+
+    The release before this one wrote ``source_path``, ``anchored_at`` and
+    ``verification`` onto the artifact node. A fleet that has already reanchored
+    its first agent therefore *has* such a row — and it is the exact state this
+    issue exists to repair, so refusing to share it would fix the bug only for
+    installations that never hit it. The second agent's reanchor rolled back
+    with "Cannot overwrite a graph node owned by another agent".
+
+    Normalising is safe precisely because the surviving fields are derived from
+    the artifact bytes: if the legacy row's content-derived subset is byte-equal
+    to what this writer computes from the same file, the extras are the previous
+    release's per-agent noise and dropping them is what #2893 says should happen
+    to them. It is a privacy improvement, not a rewrite of anybody's content —
+    the fields that identify the *content* do not move.
+
+    Everything else still applies: the caller has already established that this
+    writer independently owns the underlying blob.
+    """
+    trimmed = _canonical_shared_properties(existing, _SHAREABLE_ARTIFACT_KEYS)
+    if trimmed == existing:
+        return False  # nothing to normalise; the ordinary path handles it
+    if not _is_shareable_amendment_artifact_properties(trimmed, node_id):
+        return False
+    return trimmed == _canonical_shared_properties(
+        incoming, _SHAREABLE_ARTIFACT_KEYS
+    )
 
 
 #: The ``(node_type, label)`` shapes a PostgreSQL fleet may co-own, and the
@@ -517,7 +567,22 @@ class AsyncGraphStore:
                     (node.node_id, owner),
                 )
                 owns_content_reference = file_owner is not None
-            compatible_content_node = bool(
+            # A row this release would have written, or one the *previous*
+            # release left behind carrying per-agent fields. The second is the
+            # deployed state #2893 repairs, so it is admitted and normalised
+            # rather than refused — see _is_normalisable_legacy_artifact.
+            normalisable_legacy = bool(
+                existing
+                and is_shareable is _is_shareable_amendment_artifact_properties
+                and existing[0] == node.node_type
+                and existing[1] == node.label
+                and owns_content_reference
+                and is_shareable(node.properties, node.node_id)
+                and _is_normalisable_legacy_artifact(
+                    existing_properties, node.properties, node.node_id
+                )
+            )
+            compatible_content_node = normalisable_legacy or bool(
                 existing
                 and is_shareable is not None
                 and existing[0] == node.node_type
@@ -536,9 +601,16 @@ class AsyncGraphStore:
             # For an identical shared node, retain the canonical row bytes and
             # add only the second ownership witness.  This avoids one tenant
             # rewriting another tenant's content-addressed row serialization.
+            # ...except when the stored row is a legacy artifact carrying the
+            # previous release's per-agent fields. Then the write is the
+            # normalisation itself: it strips those fields and leaves only what
+            # the artifact bytes fix, which is the whole point of sharing the
+            # row. Nothing content-identifying changes, so this is not one
+            # tenant rewriting another's content — it is the row becoming what
+            # both tenants independently compute.
             current_owner_can_update = bool(
                 not existing or not owner or existing_owners == {owner}
-            )
+            ) or normalisable_legacy
             if current_owner_can_update:
                 await self.db.execute(
                     self._upsert_node_sql(),

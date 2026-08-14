@@ -147,10 +147,34 @@ class TestAmendmentArtifact:
             {"constitution_hash": "B" * 64},
             {"signer": "https://example.com/key"},
             {"signer": "did:" + "x" * 300},
-            {"created_at": "2026-08-11T00:00:00"},
+            {"created_at": "x" * 65},
         ],
     )
     def test_a_field_outside_its_declared_shape_is_refused(self, overrides):
         assert not _is_shareable_amendment_artifact_properties(
             _artifact_properties(**overrides), NODE_ID
         )
+
+
+def test_a_naive_signed_timestamp_is_still_shareable():
+    """The predicate may not be stricter than the verifier that admitted it.
+
+    ``created_at`` is a *signed* field: ``canonical_amendment_bytes`` covers it
+    and ``verify_reanchor_artifact`` does not constrain its shape, so an
+    artifact carrying a naive timestamp verifies fine. Requiring timezone
+    awareness here let such an artifact govern the first agent — a brand-new
+    row is never checked against this predicate — and roll the second one back,
+    which is the fleet split #2893 exists to remove.
+
+    The length cap is the bound that matters. Anyone able to choose this value
+    already holds the Sovereign key, and could choose ``signer`` too.
+    """
+    assert _is_shareable_amendment_artifact_properties(
+        _artifact_properties(created_at="2026-08-11T00:00:00"), NODE_ID
+    )
+
+
+def test_an_unbounded_timestamp_is_still_refused():
+    assert not _is_shareable_amendment_artifact_properties(
+        _artifact_properties(created_at="x" * 65), NODE_ID
+    )

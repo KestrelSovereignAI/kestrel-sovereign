@@ -746,3 +746,143 @@ async def test_only_governed_by_edges_count_as_governance(pg, tmp_path, monkeypa
     # governing document and must never be offered up for deletion.
     assert result.stale_edge_targets == (v1_hash,)
     assert OTHER_DID not in result.stale_edge_targets
+
+
+async def test_a_legacy_artifact_row_is_normalised_rather_than_refused(
+    pg, tmp_path, monkeypatch,
+):
+    """The fleet this issue is *for* already has the row the fix rejects.
+
+    An installation that reanchored its first agent on the previous release
+    has an artifact node carrying ``source_path``, ``anchored_at`` and
+    ``verification``. Upgrading and reanchoring the second agent found a stored
+    row that the new shareability predicate refuses, so the whole reanchor
+    rolled back with "Cannot overwrite a graph node owned by another agent" —
+    the fix working only for installations that never hit the bug.
+
+    Normalising is safe because the surviving fields are fixed by the artifact
+    bytes: if the legacy row's content-derived subset is byte-equal to what
+    this writer computes from the same file, the extras are the previous
+    release's per-agent noise, and dropping them is exactly what #2893 says
+    should happen to them.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    # The first agent reanchors normally...
+    first_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(first_dir, AGENT_DID)
+    first = await reanchor_constitution(
+        agent_name="First", agent_dir=first_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+    assert first.error is None, first.error
+
+    # ...then its artifact row is rewritten into the *pre-#2893* shape, which
+    # is what an installation upgrading from the previous release actually has.
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (artifact_hash,)
+    )
+    legacy = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    legacy.update({
+        "source_path": "/home/operator/secret/reanchor.signed.json",
+        "anchored_at": "2026-08-01T00:00:00+00:00",
+        "verification": "signature verified against did:web:example.com",
+    })
+    await pg.execute(
+        "UPDATE graph_nodes SET properties = $1 WHERE node_id = $2",
+        (json.dumps(legacy), artifact_hash),
+    )
+
+    second_dir = tmp_path / "agent_data" / "Second"
+    _make_local_anchor(second_dir, OTHER_DID)
+    second = await reanchor_constitution(
+        agent_name="Second", agent_dir=second_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+
+    assert second.error is None, second.error
+    assert await _runtime_state(pg, OTHER_DID) == (v2_hash, [v2_hash])
+
+    # One row, two owners, and the operator's path is gone from it.
+    owners = await pg.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = $1",
+        (artifact_hash,),
+    )
+    assert sorted(r[0] for r in owners) == sorted([AGENT_DID, OTHER_DID])
+
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (artifact_hash,)
+    )
+    normalised = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    assert "source_path" not in normalised
+    assert "anchored_at" not in normalised
+    assert "verification" not in normalised
+    assert normalised["hash"] == artifact_hash
+
+
+async def test_a_legacy_row_describing_different_content_is_still_refused(
+    pg, tmp_path, monkeypatch,
+):
+    """Normalisation is not a licence to overwrite a foreign row.
+
+    Only a legacy row whose content-derived subset already matches what this
+    writer computes may be trimmed. One that disagrees is a different record
+    wearing the same id, and it stays refused.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    first_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(first_dir, AGENT_DID)
+    first = await reanchor_constitution(
+        agent_name="First", agent_dir=first_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+    assert first.error is None, first.error
+
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (artifact_hash,)
+    )
+    tampered = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    tampered["signer"] = "did:web:someone-else.example"
+    tampered["source_path"] = "/home/operator/secret/reanchor.signed.json"
+    await pg.execute(
+        "UPDATE graph_nodes SET properties = $1 WHERE node_id = $2",
+        (json.dumps(tampered), artifact_hash),
+    )
+
+    second_dir = tmp_path / "agent_data" / "Second"
+    _make_local_anchor(second_dir, OTHER_DID)
+    second = await reanchor_constitution(
+        agent_name="Second", agent_dir=second_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+
+    assert second.error is not None
+    assert "owned by another agent" in second.error
