@@ -172,6 +172,55 @@ def _stubbed_helper(result: ReanchorResult):
     return _stub
 
 
+def test_reanchor_targets_the_database_doctor_reads(reanchor_env, monkeypatch):
+    """The repair and the finding must mean the same database (#2892).
+
+    ``kestrel doctor`` resolves the target through ``spawned_agent_env`` — the
+    launcher's precedence, where the project ``.env`` outranks an export,
+    because that is what a spawned agent actually gets. This command loads its
+    environment through ``load_project_env``, whose ``setdefault`` is the
+    opposite. Left to the ambient environment, a stale exported DSN would have
+    doctor report drift in database A while the repair it prescribes rewrote
+    database B: the finding survives, and a database nobody reads is modified.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://from-file/db\n"
+    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://stale-export/db")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    seen: dict = {}
+
+    async def _capture(**kwargs):
+        seen.update(kwargs)
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64,
+            new_hash="a" * 64,
+            backup_path=None,
+            unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    doctors_view = runtime_env(reanchor_env)
+    assert seen["runtime_dsn"] == doctors_view["KESTREL_DATABASE_URL"]
+    assert seen["runtime_backend"] == doctors_view["KESTREL_DB_BACKEND"]
+    assert seen["runtime_dsn"] == "postgresql://from-file/db"
+
+
 def test_reanchor_unchanged_returns_zero(reanchor_env, capsys):
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     result = ReanchorResult(
@@ -437,7 +486,11 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "postgres" in err
+    # The label's own shape, not the bare word: ``target.describe()`` renders a
+    # PostgreSQL target as ``postgres:postgresql://…``, whereas a bare
+    # "postgres" could just as well have come out of the tmp_path this message
+    # embeds — one test rename away from asserting nothing (round 10).
+    assert "postgres:postgresql://" in err
     assert "Nothing was written" in err
     assert "u:p@" not in err
     # And it did not quietly rewrite the anchor on the way past.
@@ -558,7 +611,11 @@ def test_anchor_overlay_reads_the_agent_homes_env_too(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "postgres" in err
+    # The label's own shape, not the bare word: ``target.describe()`` renders a
+    # PostgreSQL target as ``postgres:postgresql://…``, whereas a bare
+    # "postgres" could just as well have come out of the tmp_path this message
+    # embeds — one test rename away from asserting nothing (round 10).
+    assert "postgres:postgresql://" in err
     assert "Nothing was written" in err
     assert "u:p@" not in err
     assert (agent_dir / "kestrel_prime.db").read_bytes() == before
@@ -574,3 +631,247 @@ def test_constitution_with_no_subcommand_prints_usage(reanchor_env, capsys):
         rc = cmd_constitution(args)
     assert rc == 1
     assert "Usage" in capsys.readouterr().out
+
+
+def test_reanchor_refuses_a_data_key_that_will_not_open_the_target(
+    reanchor_env, monkeypatch, capsys,
+):
+    """The database and the key that opens it must come from one place.
+
+    The target is resolved with the launcher's precedence (file wins) while
+    ``load_project_env`` leaves an exported ``KESTREL_DATA_KEY`` authoritative.
+    A shell still holding another home's credentials would therefore encrypt
+    the new constitution and its artifact into database A under key B — and the
+    agent, opening A with A's key, fails decryption at its next integrity
+    audit. That is not a visible wrong answer; it is a governance record nobody
+    can read again.
+    """
+    # The repo .env that ``tests/conftest.py`` loads carries a
+    # ``KESTREL_DATA_KEY_TEST``, and a per-agent key legitimately outranks the
+    # fleet one — so this test, which is about the fleet key, has to clear it.
+    # Ambient environment leaking into a test is what #2896 was.
+    monkeypatch.delenv("KESTREL_DATA_KEY_TEST", raising=False)
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=the-projects-key\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "a-stale-exported-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    called = False
+
+    async def _must_not_run(**_kwargs):
+        nonlocal called
+        called = True
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_must_not_run,
+         ):
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    assert not called, "refused runs must not reach the writer"
+    err = capsys.readouterr().err
+    assert "KESTREL_DATA_KEY" in err
+    assert "cannot decrypt" in err
+    # It refuses rather than choosing: the conflict is the operator's to settle.
+    assert "Unset" in err
+
+
+def test_reanchor_proceeds_when_the_keys_agree(reanchor_env, monkeypatch):
+    """An exported key identical to the file's is not a conflict."""
+    monkeypatch.delenv("KESTREL_DATA_KEY_TEST", raising=False)
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=the-projects-key\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "the-projects-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    reached = False
+
+    async def _capture(**_kwargs):
+        nonlocal reached
+        reached = True
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64,
+            new_hash="a" * 64,
+            backup_path=None,
+            unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    assert reached
+
+
+def test_reanchor_refuses_a_blank_project_key_against_an_exported_one(
+    reanchor_env, monkeypatch, capsys,
+):
+    """Empty is an answer, not an absence.
+
+    A project ``.env`` that sets ``KESTREL_DATA_KEY=`` explicitly gives the
+    spawned agent an empty key. Requiring both sides to be truthy let the
+    exported key survive here, so the reanchor would encrypt blobs the agent
+    cannot read — the same lesson the DSN resolution learned, in a place it had
+    not been carried to.
+    """
+    monkeypatch.delenv("KESTREL_DATA_KEY_TEST", raising=False)
+    (reanchor_env / ".env").write_text("KESTREL_DATA_KEY=\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "a-stale-exported-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    assert "KESTREL_DATA_KEY" in capsys.readouterr().err
+
+
+def test_a_key_only_in_the_environment_is_not_a_conflict(
+    reanchor_env, monkeypatch,
+):
+    """The file saying nothing means the export reaches the agent too.
+
+    ``spawned_agent_env`` starts from ``os.environ``, so with no key in the
+    file the agent gets the exported one — the same key this command uses.
+    Refusing there would block a legitimate setup.
+    """
+    monkeypatch.delenv("KESTREL_DATA_KEY_TEST", raising=False)
+    (reanchor_env / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "the-only-key")
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    reached = False
+
+    async def _capture(**_kwargs):
+        nonlocal reached
+        reached = True
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64, new_hash="a" * 64,
+            backup_path=None, unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    assert reached
+
+
+def test_a_per_agent_key_outranks_a_mismatched_fleet_key(
+    reanchor_env, monkeypatch,
+):
+    """``KESTREL_DATA_KEY_<NAME>`` is what the agent is actually started with.
+
+    ``ProcessManager.start_agent`` applies it over the fleet-wide key *after*
+    building the environment, so comparing the fleet key would refuse a
+    perfectly good per-agent setup — and, in the mirror case, wave through a
+    mismatch that matters.
+    """
+    monkeypatch.setenv("KESTREL_DATA_KEY_TEST", "the-agents-own-key")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "some-other-fleet-key")
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DATA_KEY=a-different-fleet-key\n"
+        "KESTREL_DATA_KEY_TEST=the-agents-own-key\n"
+    )
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    reached = False
+
+    async def _capture(**_kwargs):
+        nonlocal reached
+        reached = True
+        return ReanchorResult(
+            agent_name="Test",
+            db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+            canonical_path=Path("/fake/canonical.md"),
+            old_hash="a" * 64, new_hash="a" * 64,
+            backup_path=None, unchanged=True,
+        )
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0, "a matching per-agent key is not a conflict"
+
+    assert reached
+
+
+def test_a_mismatched_per_agent_key_is_still_refused(
+    reanchor_env, monkeypatch, capsys,
+):
+    """And the override does not become a way to smuggle a wrong key past."""
+    monkeypatch.setenv("KESTREL_DATA_KEY_TEST", "a-stale-per-agent-key")
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DATA_KEY_TEST=the-agents-real-key\n"
+    )
+
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+        assert cmd_constitution(args) == 2
+
+    assert "KESTREL_DATA_KEY" in capsys.readouterr().err
+
+
+def test_anchor_overlay_targets_the_database_doctor_reads(
+    reanchor_env, monkeypatch,
+):
+    """The third tool has to name the same database as the other two (#2892).
+
+    ``kestrel doctor`` resolves through the launcher, where the project ``.env``
+    outranks an export. With a stale DSN exported, an overlay repair left to
+    the ambient environment would write SQLite and report success while doctor
+    reported the problem in PostgreSQL — a finding and its prescribed remedy
+    naming different databases, which is this issue's whole subject.
+    """
+    from kestrel_sovereign.doctor import runtime_env
+
+    (reanchor_env / ".env").write_text(
+        "KESTREL_DB_BACKEND=postgres\n"
+        "KESTREL_DATABASE_URL=postgresql://from-file/db\n"
+    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://stale-export/db")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    agent_dir = reanchor_env / "agent_data" / "Test"
+    (agent_dir / "CONSTITUTION.md").write_bytes(b"# Overlay\n")
+
+    args = _parse(["constitution", "anchor-overlay", "--agent-name", "Test"])
+    seen: dict = {}
+
+    async def _capture(**kwargs):
+        seen.update(kwargs)
+        from kestrel_sovereign.setup.overlay_anchor import OverlayAnchorResult
+
+        return OverlayAnchorResult(agent_name="Test", unchanged=True, new_hash="a" * 64)
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.overlay_anchor.anchor_overlay",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    doctors_view = runtime_env(reanchor_env)
+    assert seen["runtime_dsn"] == doctors_view["KESTREL_DATABASE_URL"]
+    assert seen["runtime_backend"] == doctors_view["KESTREL_DB_BACKEND"]
+    assert seen["runtime_dsn"] == "postgresql://from-file/db"

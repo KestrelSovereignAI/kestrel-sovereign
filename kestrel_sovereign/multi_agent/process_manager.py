@@ -242,17 +242,15 @@ class ProcessManager:
     # ------------------------------------------------------------------
 
     def _load_env(self) -> dict:
-        """Load .env file into an env dict copy."""
-        from dotenv import dotenv_values
+        """Load .env file into an env dict copy.
 
-        env = os.environ.copy()
-        env_file = self.project_dir / ".env"
-        if env_file.exists():
-            env.update({
-                k: v for k, v in dotenv_values(env_file).items()
-                if v is not None
-            })
-        return env
+        The body moved to ``paths.spawned_agent_env`` so ``kestrel doctor`` can
+        ask this launcher which database a spawned agent will open instead of
+        reimplementing the precedence and quietly disagreeing with it (#2892).
+        """
+        from kestrel_sovereign.paths import spawned_agent_env
+
+        return spawned_agent_env(self.project_dir)
 
     def _spawn_detached(
         self,
@@ -564,11 +562,16 @@ class ProcessManager:
         # agent mode, leaving app.state.agent = None → 503 on all endpoints.
         env["KESTREL_MULTI_AGENT_CONFIG"] = "__none__"
 
-        # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY
+        # Per-agent data key: KESTREL_DATA_KEY_CLAW overrides KESTREL_DATA_KEY.
+        # The resolution lives in ``paths.spawned_agent_data_key`` so an offline
+        # tool can ask which key this agent really starts with instead of
+        # reading the pre-override value out of the environment (#2892).
+        from kestrel_sovereign.paths import spawned_agent_data_key
+
         agent_key_var = f"KESTREL_DATA_KEY_{name.upper()}"
-        agent_data_key = env.get(agent_key_var)
-        if agent_data_key:
-            env["KESTREL_DATA_KEY"] = agent_data_key
+        effective_key = spawned_agent_data_key(env, name)
+        if effective_key and effective_key != env.get("KESTREL_DATA_KEY"):
+            env["KESTREL_DATA_KEY"] = effective_key
             logger.info(f"Agent '{name}' using per-agent data key from {agent_key_var}")
 
         cmd = [

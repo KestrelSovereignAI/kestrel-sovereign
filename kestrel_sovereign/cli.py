@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign import __version__
-from kestrel_sovereign.paths import load_project_env
+from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
     LocalAgentConfig,
@@ -922,6 +922,66 @@ def cmd_constitution_reanchor(args) -> int:
     # the key now gets loaded at all.
     load_project_env(project_dir)
 
+    # ...but the *database target* is resolved separately, with the launcher's
+    # precedence, where the project ``.env`` outranks a conflicting export.
+    # ``load_project_env``'s ``setdefault`` is the opposite, and the two
+    # disagreeing is not academic: ``kestrel doctor`` reads the database the
+    # agents will actually open (``paths.spawned_agent_env``, the body of
+    # ``ProcessManager._load_env``). With a stale DSN exported in the shell,
+    # doctor would report drift in database A while the repair it prescribes
+    # rewrote database B — leaving the finding standing and modifying a copy
+    # nobody reads. A finding and its remedy have to mean the same database.
+    #
+    # Targeting somewhere else deliberately is still possible; it just has to
+    # be deliberate, which is what these explicit arguments are.
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
+    # The database and the key that opens it must come from the same place.
+    # ``load_project_env`` above leaves an exported ``KESTREL_DATA_KEY``
+    # authoritative while the target above is the file's — so a shell still
+    # holding another home's credentials would encrypt the new constitution and
+    # its artifact into database A under key B, and the agent, opening A with
+    # A's key, would fail decryption at its next integrity audit. That is not a
+    # wrong answer an operator can see; it is a governance record nobody can
+    # read again.
+    #
+    # This refuses rather than picking a side, for the reason #2468 excludes
+    # the data key from the general load: a key conflict is the operator's to
+    # resolve, and a tool that silently chooses one has destroyed the evidence
+    # that there was a choice.
+    from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
+
+    # A plain inequality, deliberately: ``spawned_agent_env`` starts from
+    # ``os.environ`` and lets the file overwrite it, so ``launch_key`` already
+    # *is* the key the agent will get, and the two differ only where the file
+    # has its own say. Requiring both to be truthy missed the case where the
+    # file sets ``KESTREL_DATA_KEY=`` explicitly: the agent then gets an empty
+    # key while this command keeps the exported one and writes blobs the agent
+    # cannot read. Empty is an answer, not an absence — the same lesson the
+    # DSN resolution learned two rounds earlier, in a place it had not been
+    # carried to.
+    # The *effective* key for this named agent, not the fleet-wide one:
+    # ``ProcessManager`` applies ``KESTREL_DATA_KEY_<NAME>`` over it when it
+    # starts the agent, so comparing the fleet key would reject a correct
+    # per-agent setup — and, worse, accept a wrong one.
+    from kestrel_sovereign.paths import spawned_agent_data_key
+
+    exported_key = spawned_agent_data_key(os.environ, args.agent_name)
+    launch_key = spawned_agent_data_key(launch_env, args.agent_name)
+    if exported_key != launch_key:
+        print(
+            f"error: {DATA_KEY_ENV} in the environment does not match the one "
+            f"in {project_dir / '.env'}.\n"
+            f"  The agent opens its database with the file's key; a reanchor "
+            f"run now would write governance the agent cannot decrypt.\n"
+            f"  Unset {DATA_KEY_ENV} to use the project's key, or correct the "
+            f"file, then re-run.",
+            file=sys.stderr,
+        )
+        return 2
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -963,6 +1023,8 @@ def cmd_constitution_reanchor(args) -> int:
             sovereign_trust_root_path=(
                 Path(args.trust_root) if args.trust_root else None
             ),
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
         )
     )
 
@@ -1063,6 +1125,15 @@ def cmd_constitution_anchor_overlay(args) -> int:
     # grant in the overlay permanently denied while reporting success.
     load_project_env(project_dir)
 
+    # ...and the database target comes from the launcher's precedence, exactly
+    # as it does for `constitution reanchor`. Without this, `kestrel doctor`
+    # could report an overlay problem in the PostgreSQL the agents open while
+    # this command wrote the local SQLite file and reported success — a
+    # finding and its prescribed remedy naming different databases (#2892).
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -1086,7 +1157,12 @@ def cmd_constitution_anchor_overlay(args) -> int:
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
     result = asyncio.run(
-        anchor_overlay(agent_name=args.agent_name, agent_dir=agent_dir)
+        anchor_overlay(
+            agent_name=args.agent_name,
+            agent_dir=agent_dir,
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
+        )
     )
 
     if result.error:

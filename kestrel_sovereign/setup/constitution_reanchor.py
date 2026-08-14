@@ -210,7 +210,17 @@ async def resolve_reanchor_target(
     # ``KESTREL_DB_BACKEND="postgres "`` starts the agent on SQLite; stripping
     # here would point the reanchor at PostgreSQL instead — #2890 again with
     # the two databases exchanged. Copying the rule means copying it exactly.
-    resolved = (backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")).lower()
+    #
+    # ``is not None``, not ``or``: an empty string is an *answer*, not a
+    # missing argument. A project ``.env`` that blanks ``KESTREL_DATABASE_URL``
+    # puts the spawned agent on SQLite, and a caller relaying that answer must
+    # not have it fall through to whatever DSN is still exported in the shell —
+    # which would send `--force` into an unrelated PostgreSQL while the tool
+    # that prescribed it was reading the local file.
+    resolved = (
+        backend if backend is not None
+        else os.environ.get("KESTREL_DB_BACKEND", "sqlite")
+    ).lower()
     if resolved not in ("sqlite", "postgres"):
         # The runtime does not validate this either — ``_initialize_agent``
         # tests `== "postgres"` and falls through to SQLite for anything else,
@@ -255,14 +265,17 @@ async def resolve_reanchor_target(
             f"every backend."
         ) from exc
 
-    resolved_dsn = dsn or os.environ.get("KESTREL_DATABASE_URL")
+    resolved_dsn = (
+        dsn if dsn is not None else os.environ.get("KESTREL_DATABASE_URL")
+    )
     if resolved == "postgres" and resolved_dsn:
-        return ReanchorTarget(
+        postgres = ReanchorTarget(
             anchor_path=anchor_path,
             backend="postgres",
             agent_did=agent_did,
             dsn=resolved_dsn,
         )
+        return postgres
     return ReanchorTarget(
         anchor_path=anchor_path, backend="sqlite", agent_did=agent_did
     )
@@ -377,7 +390,9 @@ async def reanchor_constitution(
     db_path = agent_dir / "kestrel_prime.db"
     try:
         target = await resolve_reanchor_target(
-            agent_dir, backend=runtime_backend, dsn=runtime_dsn
+            agent_dir,
+            backend=runtime_backend,
+            dsn=runtime_dsn,
         )
     except ReanchorTargetError as exc:
         return ReanchorResult(
@@ -453,6 +468,8 @@ async def reanchor_constitution(
             governed_by_targets,
             anchored_text,
             anchored_present,
+            row_exists,
+            visible_edge_targets,
         ) = await _read_agent_anchor(target)
     except Exception as exc:  # noqa: BLE001 — surfaced verbatim to the operator
         logger.exception("Could not read the anchor from %s", target.describe())
@@ -464,6 +481,62 @@ async def reanchor_constitution(
                 f"{target.describe()}: {exc!r}. Nothing was written."
             ),
         )
+    # Three states share ``old_hash=None`` and only one of them retargets.
+    # A node that exists and is owned but carries no ``constitution_hash``
+    # returns its real DID — retargeting there would write the local file while
+    # the runtime node it boots from stayed unanchored. A row that exists
+    # *unowned* returns an empty DID like a missing one, but replication cannot
+    # repair it either: ``add_node`` will not overwrite a foreign-owned row, so
+    # sending the repair to SQLite would leave PostgreSQL unreadable and the
+    # agent unbootable. Only a physically absent row is the state first-boot
+    # replication fixes, so only that one retargets.
+    if not target.writes_to_anchor and await runtime_record_is_pending(target):
+        # PostgreSQL has nothing for this agent. Boot does not fail there: it
+        # copies the birth record out of the local anchor (#2871) and audits
+        # *that*, so the bytes that will govern this agent at its next start
+        # are the anchor's — and the anchor is what a pre-boot repair has to
+        # change. Reporting "no constitution_hash" here would leave a stale
+        # anchor to safe-mode the agent, and `kestrel doctor` prescribes this
+        # very command for exactly that drift: a remedy that cannot clear the
+        # finding that prescribed it. Doctor reads the anchor in this state for
+        # the same reason (#2892); the two have to mean the same bytes.
+        #
+        # Decided from the read that already happened rather than a probe
+        # before it: an extra pre-flight connection paid the whole timeout
+        # twice on an unreachable database, and did it before the canonical
+        # file had even been read.
+        logger.info(
+            "%s holds no record for %s; retargeting the local anchor, which is "
+            "what first boot will replicate and audit.",
+            target.describe(), target.agent_did,
+        )
+        target = ReanchorTarget(
+            anchor_path=target.anchor_path,
+            backend="sqlite",
+            agent_did=target.agent_did,
+        )
+        try:
+            (
+                old_hash,
+                agent_did,
+                anchored_contract_json,
+                governed_by_targets,
+                anchored_text,
+                anchored_present,
+                row_exists,
+                visible_edge_targets,
+            ) = await _read_agent_anchor(target)
+        except Exception as exc:  # noqa: BLE001 — surfaced to the operator
+            logger.exception("Could not read the anchor at %s", target.describe())
+            return _result(
+                old_hash=None,
+                new_hash=None,
+                error=(
+                    f"Could not read this agent's governance from "
+                    f"{target.describe()}: {exc!r}. Nothing was written."
+                ),
+            )
+
     if old_hash is None:
         return _result(
             old_hash=None,
@@ -600,8 +673,12 @@ async def reanchor_constitution(
     # targets alongside the correct edge don't fail proof 2, but they mean the
     # agent nominally has two governing constitutions — repair those too.
     stale_edge_targets = tuple(t for t in governed_by_targets if t != new_hash)
+    # Proof 2 is judged on what the runtime can see, not on what physically
+    # exists: an edge at the right hash whose ownership witness is missing is
+    # invisible to the bound store the audit reads through, so the agent
+    # safe-modes while the row sits there looking correct.
     governance_edge_drift = (
-        new_hash not in governed_by_targets or bool(stale_edge_targets)
+        new_hash not in visible_edge_targets or bool(stale_edge_targets)
     )
 
     if (
@@ -784,12 +861,71 @@ async def reanchor_constitution(
     )
 
 
+async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
+    """Whether first boot has still to put this agent into the runtime database.
+
+    One rule, asked the same way by every tool that has to decide *which bytes
+    will govern this agent next*: before replication the answer is the local
+    anchor, because that is what boot copies and then audits (#2871). Doctor
+    reports on the anchor in this state, ``reanchor_constitution`` retargets to
+    it, and ``setup.overlay_anchor`` does the same — three tools that must
+    agree, so they share this predicate rather than each carrying a copy that
+    drifts.
+
+    Pending means **absent or a boot-fabricated placeholder**, and nothing
+    else. Those are the two states replication repairs. An *unowned* or
+    *foreign-owned* row also reads back empty from a bound store, and looks
+    identical from the outside — but ``add_node`` refuses to claim either, so
+    boot cannot repair them and redirecting a repair to the anchor would leave
+    the runtime broken while reporting success. Those are ledger damage, not
+    pending replication, and no tool here can fix them.
+
+    SQLite is never pending: the anchor *is* the runtime database.
+    """
+    if target.writes_to_anchor:
+        return False
+
+    from kestrel_sovereign.identity.birth_record import is_fabricated_placeholder
+
+    async with target.open_storage() as storage:
+        # Ownership first, because it can veto both of the states below.
+        # ``add_node`` refuses a row owned by anyone other than this agent, and
+        # refuses one with several owners, so replication cannot land there —
+        # an absent row with a stale foreign witness, or a placeholder a second
+        # tenant also claims, is ledger damage wearing the shape of something
+        # boot repairs. Calling it pending would send the repair to the anchor
+        # and leave PostgreSQL unusable while reporting success.
+        owner_rows = await storage.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (target.agent_did,),
+        )
+        owners = {row[0] for row in owner_rows}
+        if owners - {target.agent_did}:
+            return False
+
+        agent = await storage.graph.get_node(target.agent_did)
+        if agent is not None:
+            return is_fabricated_placeholder(agent, target.agent_did)
+        # The bound read found nothing. Only a physically absent row is
+        # pending; an existing one this agent cannot see is ledger damage.
+        # By ``node_id`` alone, deliberately: a row occupying this DID under
+        # some other ``node_type`` still collides on the primary key, and
+        # ``add_node`` will refuse it just the same.
+        physical = await storage.db.fetchone(
+            "SELECT 1 FROM graph_nodes WHERE node_id = ?", (target.agent_did,)
+        )
+        return physical is None
+
+
 async def _read_agent_anchor(
     target: ReanchorTarget,
-) -> tuple[str | None, str, dict | None, tuple[str, ...], str | None, bool]:
+) -> tuple[
+    str | None, str, dict | None, tuple[str, ...], str | None, bool, bool,
+    tuple[str, ...],
+]:
     """Return ``(constitution_hash, agent_did, emancipation_contract_json,
-    governed_by_targets, anchored_text, anchored_present)`` **from the database the runtime
-    reads**.
+    governed_by_targets, anchored_text, anchored_present, row_exists,
+    visible_edge_targets)`` **from the database the runtime reads**.
 
     Read-only — safe to call before deciding whether to touch the DB.
     Returns ``(None, "", None, (), None, False)`` if the agent node has no
@@ -799,6 +935,15 @@ async def _read_agent_anchor(
     targets feed the drift decision (#2616): integrity proof 2 requires a
     ``governed_by`` edge at the anchored hash, so the caller must not
     declare "unchanged" on the hash comparison alone.
+
+    ``row_exists`` is the one *unscoped* fact reported here, and it exists to
+    keep two different absences apart. The bound read below returns nothing
+    both when the row is missing and when it is present without this agent's
+    ``graph_node_owners`` witness — and those want opposite handling: a missing
+    row is repaired by first-boot replication from the anchor, while an unowned
+    row blocks it, because ``add_node`` will not overwrite a foreign-owned row.
+    Treating the second as the first sent a forced repair to the local SQLite
+    file while PostgreSQL stayed unreadable.
 
     ``open_storage`` binds every store to ``target.agent_did``, which is what
     stops a PostgreSQL host — one table holding every local agent — from
@@ -811,7 +956,18 @@ async def _read_agent_anchor(
     async with target.open_storage() as storage:
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
-            return None, "", None, (), None, False
+            # Same privileged connection the edge read below uses, and for a
+            # related reason: the bound store cannot tell "no row" from "a row
+            # this agent does not own".
+            # By ``node_id`` alone: a row holding this DID under another
+            # ``node_type`` still collides on the primary key, and ``add_node``
+            # refuses it just the same, so it is not "absent" in any useful
+            # sense.
+            physical = await storage.db.fetchone(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?",
+                (target.agent_did,),
+            )
+            return None, "", None, (), None, False, physical is not None, ()
         # Read the governance edges through the privileged maintenance
         # connection, NOT the bound graph store. This repair path exists to
         # heal PRE-LEDGER drift (#2616), and stale edges are unowned by
@@ -831,6 +987,26 @@ async def _read_agent_anchor(
             (agent.node_id,),
         )
         governed_by_targets = tuple(row[0] for row in edge_rows)
+
+        # And the same edges as the *runtime* sees them. Two reads because
+        # there are two questions. "Which stale targets are there to prune"
+        # must be unscoped, for the reason above. "Is integrity proof 2
+        # satisfied" must be scoped, because that is the read boot performs —
+        # and a physical edge at the right hash with no ``graph_edge_owners``
+        # witness answers yes to the first and no to the second. Deciding
+        # "unchanged" from the unscoped set alone meant a forced reanchor
+        # reported nothing to do while the agent kept failing proof 2, so
+        # doctor's finding named a repair that could not clear it.
+        # ``graph.get_edges(..., direction="out")`` is what
+        # ``AsyncStorage.get_edges_from`` calls, and the integrity audit reads
+        # through that same bound store.
+        visible_edges = await storage.graph.get_edges(
+            agent.node_id, direction="out"
+        )
+        visible_edge_targets = tuple(
+            edge.target_id for edge in visible_edges
+            if edge.label == "governed_by" and edge.source_id == agent.node_id
+        )
         anchored_hash = agent.properties.get("constitution_hash")
         anchored_text: str | None = None
         # ABSENT and UNREADABLE are different answers (#2465), and telling them
@@ -851,6 +1027,8 @@ async def _read_agent_anchor(
             governed_by_targets,
             anchored_text,
             anchored_present,
+            True,
+            visible_edge_targets,
         )
 
 
@@ -1014,6 +1192,40 @@ async def _write_reanchor(
                 (agent_did, new_hash),
             )
             stale_edge_targets = sorted({row[0] for row in stale_rows})
+
+            # A physical edge at the correct hash with no ownership witness is
+            # invisible to the bound store — it fails integrity proof 2 — and
+            # ``add_edge`` refuses to claim it (``Cannot claim or overwrite an
+            # unowned graph edge``), so the whole transaction would roll back
+            # and the repair this command was prescribed for could never
+            # complete. Drop the witness-less row first and let ``add_edge``
+            # lay it down properly, with its ledger entry.
+            #
+            # Only when it is owned by *nobody*. A row someone else witnesses
+            # is not this repair's to delete, and ``add_edge`` refusing there
+            # is the correct outcome.
+            unwitnessed = await storage.db.fetchall(
+                "SELECT 1 FROM graph_edges "
+                "WHERE source_id = ? AND target_id = ? AND label = 'governed_by' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM graph_edge_owners AS owner "
+                "  WHERE owner.source_id = graph_edges.source_id "
+                "  AND owner.target_id = graph_edges.target_id "
+                "  AND owner.label = graph_edges.label)",
+                (agent_did, new_hash),
+            )
+            if unwitnessed:
+                logger.info(
+                    "Removing an unwitnessed governed_by edge for %s so it can "
+                    "be re-created with its ownership row.", agent_did,
+                )
+                await storage.db.execute(
+                    "DELETE FROM graph_edges "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by'",
+                    (agent_did, new_hash),
+                )
+
             await storage.graph.add_edge(agent_did, new_hash, "governed_by")
             for stale_target in stale_edge_targets:
                 await storage.db.execute(
