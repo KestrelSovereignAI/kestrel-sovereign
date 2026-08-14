@@ -21,6 +21,38 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
 
+def signal_wake_source(metadata: Dict[str, Any]) -> Optional[str]:
+    """Return the wake source when a row is an autonomous signal wake (#2204).
+
+    COGNITION signal wakes (heartbeat, ``talon.job_complete``,
+    ``wait.complete``, ``restart.completed``, a2a) are persisted with
+    ``role="user"`` so they replay in history, and tagged
+    ``metadata.signal_wake = {"source", "mode"}`` by the dispatcher. Returns
+    ``None`` for ordinary rows. A wake whose source is missing falls back to
+    the same generic ``"signal"`` label the transcript chip uses, so the row
+    stays recognizable as autonomous rather than silently anonymous.
+    """
+    wake = metadata.get("signal_wake")
+    if not wake:
+        return None
+    if isinstance(wake, dict):
+        source = wake.get("source")
+        if source:
+            return str(source)
+    return "signal"
+
+
+def autonomous_wake_preview(source: Optional[str]) -> str:
+    """Title a session whose only user rows were autonomous signal wakes.
+
+    Such a session has no human turn to preview, but it is not a blank "New
+    conversation" either — autonomous work actually ran in it. Name it for
+    what it is, the same honesty the transcript's "Autonomous wake" chip
+    already applies to the individual rows (#2947).
+    """
+    return f"Autonomous wake — {source or 'signal'}"
+
+
 def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     """Parse a stored timestamp into one comparable naive-UTC datetime.
 
@@ -139,6 +171,8 @@ def group_messages_into_sessions(
             ``session_id``, ``started_at`` (iso), ``last_message_at`` (iso),
             ``message_count``, ``user_message_count``,
             ``preview_content`` (raw, undecorated), ``preview_metadata`` (dict),
+            ``preview_wake_source`` (the first autonomous-wake source seen, so
+            a session with no human turn can still be titled honestly),
             and — only when ``collect_messages`` — ``messages``.
         Callers reverse / slice / decorate as needed.
     """
@@ -165,6 +199,7 @@ def group_messages_into_sessions(
             "user_message_count": 0,
             "preview_content": None,
             "preview_metadata": None,
+            "preview_wake_source": None,
         }
         if collect_messages:
             session["messages"] = []
@@ -239,12 +274,26 @@ def group_messages_into_sessions(
             current["messages"].append(msg)
         if role == "user":
             current["user_message_count"] += 1
-            # Operator-signal fallback notices (#operator_signals.py) are
-            # persisted with role="user" so they replay in history, but they
-            # are synthetic system chatter, not something the user typed —
-            # skip them when picking the preview so an auto-mode/budget/
-            # governance notice never becomes the conversation's title.
-            if current["preview_content"] is None and not meta.get("operator_signal"):
+            # Operator-signal fallback notices (#operator_signals.py) and
+            # autonomous signal wakes (#2204) are both persisted with
+            # role="user" so they replay in history, but neither is something
+            # the user typed — skip both when picking the preview so an
+            # auto-mode/budget/governance notice or a `talon.job_complete`
+            # wake never becomes the conversation's title (#2455, #2947).
+            # Memory retrieval already treats the two flags as one class
+            # (memory_retriever.py); the preview picker had only learned half
+            # the pair.
+            wake_source = signal_wake_source(meta)
+            if wake_source is not None and current["preview_wake_source"] is None:
+                # Remember the first wake so a session with NO human turn can
+                # be labeled for the autonomous work it actually ran, instead
+                # of falling through to an empty "New conversation" title.
+                current["preview_wake_source"] = wake_source
+            if (
+                current["preview_content"] is None
+                and not meta.get("operator_signal")
+                and wake_source is None
+            ):
                 current["preview_content"] = content
                 current["preview_metadata"] = meta
 
@@ -291,12 +340,16 @@ def coalesce_sessions_by_session_id(
             existing["last_message_at"] = session["last_message_at"]
         # The first occurrence is the oldest cluster, so its preview (the
         # earliest user message) is already retained — unless that cluster's
-        # only user row was a skipped operator-signal notice, leaving its
-        # preview None. In that case fall through to a later cluster's real
-        # preview so a resumed session never shows an empty title.
+        # only user rows were skipped operator-signal notices or autonomous
+        # wakes, leaving its preview None. In that case fall through to a later
+        # cluster's real preview so a resumed session never shows an empty
+        # title. The earliest wake source travels with it, so a session that
+        # never had a human turn is still labeled by the wake that started it.
         if existing["preview_content"] is None and session["preview_content"] is not None:
             existing["preview_content"] = session["preview_content"]
             existing["preview_metadata"] = session["preview_metadata"]
+        if existing.get("preview_wake_source") is None:
+            existing["preview_wake_source"] = session.get("preview_wake_source")
     return [merged[sid] for sid in order]
 
 
@@ -335,11 +388,17 @@ def summarize_sessions(
     for session in sessions:
         preview = session.pop("preview_content", None) or ""
         session.pop("preview_metadata", None)
+        wake_source = session.pop("preview_wake_source", None)
         if preview and preview_transform is not None:
             # e.g. unwrap sent-form so the preview is the raw user text.
             preview = preview_transform(preview)
         if preview:
             preview = preview[:preview_chars] + ("..." if len(preview) > preview_chars else "")
+        elif wake_source:
+            # No human turn in this session — it exists because a signal woke
+            # the agent. Say so rather than handing the agent a blank title
+            # (#2947); the UI twin applies the same label.
+            preview = autonomous_wake_preview(wake_source)
         session["preview"] = preview
         session["is_trashed"] = include_trashed
         sid = session.get("session_id")

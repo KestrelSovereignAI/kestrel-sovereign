@@ -391,9 +391,10 @@ def search_session_summaries(
     list view (and the delete/archive lifecycle) agrees exists.
 
     Returns session dicts shaped like ``group_messages_into_sessions`` output
-    (``preview_content``/``preview_metadata`` retained for the endpoint's
-    decorator) plus ``name`` (when titled), ``match_count``, ``match_role``,
-    and ``match_snippet`` — decrypted plaintext excerpts around the first hit.
+    (``preview_content``/``preview_metadata``/``preview_wake_source`` retained
+    for the endpoint's decorator) plus ``name`` (when titled), ``match_count``,
+    ``match_role``, and ``match_snippet`` — decrypted plaintext excerpts around
+    the first hit.
     """
     names = names or {}
     query_lower = query.strip().lower()
