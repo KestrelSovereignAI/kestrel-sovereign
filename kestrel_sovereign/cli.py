@@ -1607,6 +1607,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _render_shell,
     _query_agent_feature_catalog,
     _editable_install_path,
+    _direct_url_provenance,
     _file_url_to_path,
     _core_install_shape,
     CoreInstallGuard,

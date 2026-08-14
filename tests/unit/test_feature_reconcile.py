@@ -506,8 +506,24 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
 # come from, what constraint that implies, and what counts as a violation.
 
 
-def _shape(version=None, editable_path=None):
-    return fr.CoreInstallShape(version=version, editable_path=editable_path)
+_DERIVE = object()
+
+
+def _shape(version=None, editable_path=None, direct_url=_DERIVE):
+    """Build a CoreInstallShape the way real metadata would.
+
+    An editable install records a PEP 610 direct URL *as well as* the editable
+    flag, so ``direct_url`` defaults to ``editable_path`` — a shape with an
+    editable path but no direct URL is one the metadata cannot produce, and
+    asserting against it would prove nothing. Pass ``direct_url`` explicitly to
+    model a NON-editable direct install (VCS, local path, remote archive):
+    the case that ``not is_editable`` cannot distinguish from an index wheel.
+    """
+    if direct_url is _DERIVE:
+        direct_url = editable_path
+    return fr.CoreInstallShape(
+        version=version, editable_path=editable_path, direct_url=direct_url,
+    )
 
 
 def test_core_policy_defaults_to_the_live_editable_link():
@@ -601,13 +617,64 @@ def test_pypi_policy_is_violated_by_a_version_outside_the_window():
     assert not fr.core_install_matches(_shape("0.52.1", "/src/core"), policy)
 
 
+def test_pypi_policy_rejects_a_non_editable_direct_url_install():
+    """`pypi` declares a SOURCE, and "not editable" is not that source.
+
+    A core installed from a VCS ref, a local path or a remote archive is
+    non-editable and can sit inside the declared version window, so a predicate
+    built on `not is_editable` accepted it — silently satisfying a source
+    declaration it plainly violates. PEP 610 records these installs with a
+    `direct_url.json` that has no `dir_info.editable`, which is exactly the
+    evidence the version-shaped proxy threw away (issue #2949).
+    """
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, None)
+
+    # An index wheel: no direct URL recorded at all. This is the only shape
+    # that actually came from an index.
+    assert fr.core_install_matches(_shape("0.53.0", None), policy)
+
+    # Same version, same "not editable" — but installed from a git ref, and
+    # from a local directory. Both violate a `pypi` source declaration.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="git+https://example.invalid/core@abc"),
+        policy,
+    )
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="/src/core-checkout"), policy,
+    )
+
+
+def test_pypi_policy_with_no_version_window_still_rejects_a_direct_url():
+    """`pypi = ""` is a pure SOURCE declaration — the case with no version
+    opinion left to lean on, where testing the proxy could not distinguish
+    anything at all."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi="")}
+    policy = fr.resolve_core_policy(idx, None)
+    assert fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="git+https://example.invalid/core"),
+        policy,
+    )
+
+
+def test_shape_describes_a_direct_url_install_distinctly():
+    """An operator reading the failure must be told which wrong source it is."""
+    assert "index wheel" in _shape("0.53.0", None).describe()
+    assert "editable" in _shape("0.53.0", "/src/core").describe()
+    described = _shape("0.53.0", None, direct_url="git+https://x.invalid/c").describe()
+    assert "direct URL" in described and "git+https://x.invalid/c" in described
+
+
 def test_describe_core_change_names_before_after_and_expected():
     policy = fr.resolve_core_policy({}, "/src/core")
     described = fr.describe_core_change(
         _shape("0.52.0", "/src/core"), _shape("0.53.0", None), policy,
     )
     assert "before: editable → /src/core (0.52.0)" in described
-    assert "after:  non-editable (site-packages copy) (0.53.0)" in described
+    assert "after:  non-editable (index wheel in site-packages) (0.53.0)" in described
     assert "expected: editable → /src/core" in described
     assert fr.describe_core_change(
         _shape("0.52.0", "/src/core"), _shape("0.53.0", "/src/core"), policy,

@@ -18,6 +18,7 @@ import pytest
 
 from kestrel_sovereign import cli
 from kestrel_sovereign import cli_features
+from kestrel_sovereign.cli_features import CORE_UNSAFE
 from tests.utils.fake_uv import (
     CHECKOUT,
     CORE,
@@ -544,12 +545,19 @@ def test_sync_unpinned_pypi_core_declaration_never_falls_back_to_git(
     manifest.write_text(f'[[feature]]\nname = "{CORE}"\npypi = ""\n')
     _versions(monkeypatch, {})  # core absent → the entry is actually installed
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
+    # Stub provenance alongside it, or the shape read falls through to this
+    # venv's real metadata and the assertions describe the developer's machine
+    # instead of the modelled host.
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False))
     spy = _InstallSpy(returncode=1, stderr="no matching distribution")
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
     rc = cli.cmd_feature_sync(_args(manifest))
 
-    assert rc == 1
+    # CORE_UNSAFE, not 1: the declared core never installed, so the venv is left
+    # without the core the manifest names — not merely an optional package that
+    # failed, and not something --continue-on-error may carry past.
+    assert rc == CORE_UNSAFE
     assert not any("git+" in str(arg) for call in spy.calls for arg in call)
     assert "FAILED" in capsys.readouterr().out
 
@@ -698,6 +706,9 @@ def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
         lambda: [{"dist": "kestrel-feature-voice", "editable_path": r"C:\src\voice"}],
     )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # core: wheel
+    # ...and its provenance, or capture reads THIS venv's editable core and
+    # writes a real local path ahead of the entry under test.
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False))
     manifest = tmp_path / "m.toml"
     cli.cmd_feature_sync(_args(manifest, capture=True))
     # The captured file must parse back to the exact path (no TOML escape break)
@@ -954,7 +965,7 @@ def test_sync_does_not_call_a_no_op_reinstall_a_restore(
 
     rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
 
-    assert rc == 1
+    assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # still swapped — the repair did nothing
     err = capsys.readouterr().err
     assert "restored:" not in err
@@ -981,7 +992,7 @@ def test_sync_recovery_command_names_pip_on_a_host_without_uv(
 
     rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
 
-    assert rc == 1
+    assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
     err = capsys.readouterr().err
     assert (
@@ -1014,7 +1025,7 @@ def test_sync_recovery_command_is_runnable_on_windows(
 
     rc = cli.cmd_feature_sync(_args(_voice_manifest(tmp_path)))
 
-    assert rc == 1
+    assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # swapped, and the re-link failed
     err = capsys.readouterr().err
     assert (
@@ -1178,7 +1189,7 @@ def test_core_repair_recovery_command_carries_both_pip_passes(monkeypatch, capsy
     venv, guard = _pypi_core_guard(monkeypatch, repair_fails=True)
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
 
-    assert guard.verify() == 1
+    assert guard.verify() == CORE_UNSAFE  # repair failed: core is still wrong
     assert venv.editable[CORE] == CHECKOUT  # the repair failed; nothing moved
     py = shlex.quote(sys.executable)
     assert (
@@ -1207,7 +1218,7 @@ def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
         cli_features.sys, "executable", r"C:\Program Files\kestrel\venv\python.exe"
     )
 
-    assert guard.verify() == 1
+    assert guard.verify() == CORE_UNSAFE  # repair failed: core is still wrong
     assert venv.editable[CORE] == CHECKOUT  # the repair failed; nothing moved
     py = r"& 'C:\Program Files\kestrel\venv\python.exe'"
     assert (

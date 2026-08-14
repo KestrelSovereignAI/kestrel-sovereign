@@ -116,17 +116,41 @@ class CoreInstallShape:
     (None for a wheel copy in ``site-packages``). Captured *before* a batch of
     feature installs and compared *after* so a silent editable→wheel swap
     becomes a named failure rather than an invisible divergence (issue #2949).
+
+    ``direct_url`` records core's PEP 610 provenance whenever one exists —
+    editable or not. It is the difference between "where core came from" and a
+    *proxy* for it: ``not is_editable`` used to stand in for "resolved from an
+    index", but a VCS, local-path or any other direct-URL install is equally
+    non-editable, so a ``pypi`` policy silently accepted the wrong source. Only
+    an install with no recorded direct URL actually came from an index.
     """
 
     version: Optional[str] = None
     editable_path: Optional[str] = None
+    direct_url: Optional[str] = None
 
     @property
     def is_editable(self) -> bool:
         return bool(self.editable_path)
 
+    @property
+    def from_index(self) -> bool:
+        """Was core resolved from a package index (rather than a direct URL)?
+
+        PEP 610 writes ``direct_url.json`` for *every* install that named its
+        source directly — VCS, local path, remote archive, editable checkout.
+        Index resolutions record nothing. So the absence of a direct URL is the
+        positive evidence of an index install; nothing else is.
+        """
+        return self.direct_url is None
+
     def describe(self) -> str:
-        where = f"editable → {self.editable_path}" if self.editable_path else "non-editable (site-packages copy)"
+        if self.editable_path:
+            where = f"editable → {self.editable_path}"
+        elif self.direct_url:
+            where = f"non-editable direct URL → {self.direct_url}"
+        else:
+            where = "non-editable (index wheel in site-packages)"
         return f"{where} ({self.version or 'not installed'})"
 
 
@@ -267,6 +291,13 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
 
     ``pypi = ""`` is asked the same questions bar the window: it declares the
     SOURCE and pins no version, so an editable or absent core still fails it.
+
+    The PyPI branch asks for ``from_index`` rather than merely ``not
+    is_editable``. Those are not the same question: a VCS, local-path or remote
+    -archive install is non-editable too, and would otherwise satisfy a source
+    declaration it plainly violates. Since ``pypi = ""`` exists precisely to
+    declare a SOURCE and no version, testing the version-shaped proxy left it
+    unable to tell sources apart at all.
     """
     if policy.editable:
         return _same_path(shape.editable_path, policy.editable)
@@ -274,6 +305,7 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
         return (
             shape.version is not None
             and not shape.is_editable
+            and shape.from_index
             and version_satisfies(shape.version, policy.pypi)
         )
     return True

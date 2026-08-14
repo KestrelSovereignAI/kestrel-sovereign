@@ -103,6 +103,7 @@ class FakeUv:
         repair_hangs_after_restore=False,
         feature_install_fails=False,
         feature_install_times_out=False,
+        direct_urls=None,
     ):
         self.installed = {CORE: core_version}
         self.editable = {CORE: core_checkout} if core_checkout else {}
@@ -126,6 +127,10 @@ class FakeUv:
         self.repair_hangs_after_restore = repair_hangs_after_restore
         self.feature_install_fails = feature_install_fails
         self.feature_install_times_out = feature_install_times_out
+        # Non-editable direct-URL installs, by dist: a VCS ref, local path or
+        # remote archive. Distinct from `editable` (which is also a direct URL,
+        # but flagged) and from absent (an index resolution).
+        self.direct_urls = dict(direct_urls or {})
         self.commands = []
         self.pins = []  # the core pin seen per install (None = unconstrained)
 
@@ -140,6 +145,24 @@ class FakeUv:
 
     def editable_path(self, dist):
         return self.editable.get(dist)
+
+    def direct_url_provenance(self, dist):
+        """PEP 610 provenance for *dist* — ``(url, editable)``.
+
+        Models what the metadata actually records, which is the distinction the
+        guard now depends on: an editable install has a direct URL *and* the
+        editable flag; ``direct_urls`` models a NON-editable direct install
+        (VCS ref, local path, remote archive); anything else was resolved from
+        an index and records no ``direct_url.json`` at all.
+
+        Leaving this unmodelled is what made the old double unfaithful — it
+        could not express "non-editable but not from the index", so the case
+        that broke the ``pypi`` policy was invisible to every test.
+        """
+        editable = self.editable.get(dist)
+        if editable:
+            return editable, True
+        return self.direct_urls.get(dist), False
 
     # -- the resolver --------------------------------------------------------
 
@@ -387,5 +410,6 @@ def use_fake_uv(monkeypatch, venv):
 
     monkeypatch.setattr(md, "version", venv.version)
     monkeypatch.setattr(cli, "_editable_install_path", venv.editable_path)
+    monkeypatch.setattr(cli, "_direct_url_provenance", venv.direct_url_provenance)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(cli.subprocess, "run", venv.run)

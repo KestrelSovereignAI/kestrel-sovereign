@@ -34,6 +34,12 @@ from kestrel_sovereign.feature_reconcile import (
 )
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 
+# Return code for "core drifted and could not be repaired". Distinct from the
+# generic ``1`` so callers can tell an unrepaired SAFETY failure from an
+# ordinary package failure: `--continue-on-error` may wave the latter through,
+# never this (issue #2949). See :meth:`CoreInstallGuard.verify`.
+CORE_UNSAFE = 2
+
 # A ``file:`` URL path that is really a Windows drive: ``/C:/src`` — or the
 # legacy bar spelling ``/C|/src`` that older tools still emit.
 _DRIVE_URL_PATH = re.compile(r"^/[A-Za-z][:|](/|$)")
@@ -221,9 +227,11 @@ def cmd_feature_install(args) -> int:
                 "version conflict, move core to a version the feature accepts "
                 "— do not remove the pin."
             )
-        # A failed install can be the very thing that broke the link.
-        guard.verify()
-        return 1
+        # A failed install can be the very thing that broke the link. An
+        # unrepaired core outranks the install failure: the caller must be able
+        # to tell "this package did not install" from "the venv's core is not
+        # the declared one", because only the second forbids a restart.
+        return guard.verify() or 1
 
 
 def _file_url_to_path(url: str) -> str:
@@ -259,12 +267,18 @@ def _file_url_to_path(url: str) -> str:
     return path
 
 
-def _editable_install_path(dist_name: str) -> Optional[str]:
-    """Return the local source path if *dist_name* is an editable install.
+def _direct_url_provenance(dist_name: str):
+    """Read *dist_name*'s PEP 610 provenance. Returns ``(url, editable)``.
 
-    PEP 660 editable installs record ``direct_url.json`` with
-    ``dir_info.editable == true``. Editable installs track a local checkout, so
-    pip cannot meaningfully "upgrade" them.
+    ``direct_url.json`` is written by every install that named its source
+    directly — a VCS ref, a local path, a remote archive, an editable checkout.
+    An install resolved from a package index writes no such file. So ``url is
+    None`` is the *only* positive evidence that a distribution came from an
+    index, and "not editable" says nothing about it either way (issue #2949).
+
+    ``url`` is normalized to a filesystem path for ``file:`` URLs and returned
+    verbatim otherwise. Unreadable or malformed metadata degrades to
+    ``(None, False)`` — absent provenance, never a fabricated one.
     """
     import importlib.metadata as md
     import json
@@ -272,19 +286,35 @@ def _editable_install_path(dist_name: str) -> Optional[str]:
     try:
         raw = md.distribution(dist_name).read_text("direct_url.json")
     except Exception:
-        return None
+        return None, False
     if not raw:
-        return None
+        return None, False
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        return None
-    if not data.get("dir_info", {}).get("editable"):
-        return None
+        return None, False
+    editable = bool(data.get("dir_info", {}).get("editable"))
     url = data.get("url", "")
     if url.startswith("file:"):
-        return _file_url_to_path(url) or None
-    return url or None
+        url = _file_url_to_path(url) or None
+    return (url or None), editable
+
+
+def _editable_install_path(dist_name: str) -> Optional[str]:
+    """Return the local source path if *dist_name* is an editable install.
+
+    PEP 660 editable installs record ``direct_url.json`` with
+    ``dir_info.editable == true``. Editable installs track a local checkout, so
+    pip cannot meaningfully "upgrade" them.
+
+    Narrower than :func:`_direct_url_provenance` on purpose: callers asking
+    "can I upgrade this?" want the editable checkout only. Callers asking
+    "where did this come from?" must use the provenance reader, because this
+    one returns None for a non-editable direct URL exactly as it does for an
+    index wheel.
+    """
+    url, editable = _direct_url_provenance(dist_name)
+    return url if editable else None
 
 
 def _installed_extension_distributions() -> list:
@@ -451,8 +481,12 @@ def cmd_feature_upgrade(args) -> int:
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
         # Detection half: an upgrade that bypassed the pin can't leave the
-        # command reporting success over a replaced core.
-        if guard.verify():
+        # command reporting success over a replaced core. CORE_UNSAFE is
+        # returned verbatim rather than folded into rc — see verify().
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
             rc = 1
     return rc
 
@@ -865,9 +899,11 @@ def _core_install_shape():
     """
     from kestrel_sovereign.feature_reconcile import CoreInstallShape
 
+    direct_url, editable = cli._direct_url_provenance(CORE_DISTRIBUTION)
     return CoreInstallShape(
         version=_installed_version(CORE_DISTRIBUTION),
-        editable_path=cli._editable_install_path(CORE_DISTRIBUTION),
+        editable_path=direct_url if editable else None,
+        direct_url=direct_url,
     )
 
 
@@ -1186,9 +1222,20 @@ class CoreInstallGuard:
     def verify(self) -> int:
         """Assert core survived the batch; repair and report if it did not.
 
-        Returns 0 when core conforms (or nothing is guarded), 1 when it moved —
-        so no command can report success over a core that was replaced, even
-        when the re-link succeeded.
+        Three states, because two of them are not equally safe:
+
+        * ``0`` — core conforms (or nothing is guarded).
+        * ``1`` — core moved and was **repaired**. Still an error, so no command
+          reports success over a core that was replaced; but the venv is correct
+          again, so a caller told to tolerate failures may go on.
+        * :data:`CORE_UNSAFE` — core moved and the repair **failed**. The venv is
+          left running a core the manifest does not declare.
+
+        The last one is a safety assertion, not a package-level failure, and
+        must not be reachable through ``--continue-on-error`` — a flag whose
+        contract is "tolerate an optional package that would not install".
+        Folding it into ``1`` let ``kestrel update --continue-on-error`` restart
+        every agent onto an undeclared core and exit 0 (issue #2949).
         """
         outcome = self.resolve()
         if outcome.drift is None:
@@ -1199,11 +1246,11 @@ class CoreInstallGuard:
             print(f"    {line}", file=sys.stderr)
         if outcome.repaired:
             print(f"    restored: {outcome.command}", file=sys.stderr)
-        else:
-            print(f"    {outcome.restore_instruction}", file=sys.stderr)
-            for line in outcome.output.splitlines()[-3:]:
-                print(f"      {line}", file=sys.stderr)
-        return 1
+            return 1
+        print(f"    {outcome.restore_instruction}", file=sys.stderr)
+        for line in outcome.output.splitlines()[-3:]:
+            print(f"      {line}", file=sys.stderr)
+        return CORE_UNSAFE
 
 
 def _capture_host_manifest(path: Path) -> int:
@@ -1499,7 +1546,13 @@ def cmd_feature_sync(args) -> int:
         # Constraints prevent the common swap; this catches every other path
         # (a feature's own build step, a direct pip call) so sync can never
         # report success over a core that was replaced (issue #2949).
-        if guard.verify():
+        # CORE_UNSAFE is returned verbatim — `kestrel update` gates its restart
+        # on this rc under --continue-on-error exactly as reconcile does, so
+        # collapsing it into 1 would reopen the same hole one step earlier.
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
             rc = 1
     return rc
 

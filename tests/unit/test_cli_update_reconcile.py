@@ -18,6 +18,7 @@ import pytest
 
 from kestrel_sovereign import cli, cli_lifecycle
 from kestrel_sovereign import feature_reconcile as fr
+from kestrel_sovereign.cli_features import CORE_UNSAFE
 from kestrel_sovereign.feature_registry import FeaturePackageInfo
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from tests.utils.fake_uv import CORE, FakeUv, use_fake_uv
@@ -495,13 +496,29 @@ def test_reconcile_reports_a_core_that_could_not_be_restored(
 
     rc = _reconcile(patched)
 
-    assert rc == 1
+    # CORE_UNSAFE, not the generic 1: an unrepaired core is a safety failure
+    # that no caller may continue past, and `1` is the code --continue-on-error
+    # is entitled to ignore.
+    assert rc == CORE_UNSAFE
     assert venv.editable.get(CORE) is None  # still swapped
     err = capsys.readouterr().err
     assert (
         "RESTORE FAILED — run `uv pip install --python "
         f"{shlex.quote(sys.executable)} -e /src/core` by hand."
     ) in err
+
+
+def test_reconcile_repaired_core_is_an_error_but_not_unsafe(monkeypatch, patched):
+    """A drift that WAS repaired still fails the command — nothing reports
+    success over a replaced core — but the venv is correct again, so it must not
+    claim the un-continuable status reserved for a core still left wrong."""
+    venv = FakeUv(core_checkout="/src/core", honours_constraints=False)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = _reconcile(patched)
+
+    assert rc == 1 and rc != CORE_UNSAFE
+    assert venv.editable.get(CORE) == "/src/core"  # restored
 
 
 def test_reconcile_source_switch_leaves_the_editable_core_linked(

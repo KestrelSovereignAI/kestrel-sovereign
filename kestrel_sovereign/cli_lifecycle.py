@@ -787,7 +787,7 @@ def _run_feature_reconcile(
     (unless ``continue_on_error`` downgrades package failures to warnings).
     """
     from kestrel_sovereign import feature_reconcile as fr
-    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.cli_features import CORE_UNSAFE, CoreInstallGuard
     from kestrel_sovereign.feature_registry import load_registry
     import importlib.metadata as md
 
@@ -964,8 +964,17 @@ def _run_feature_reconcile(
 
     # 5. Assert core survived. Runs even when the loop aborted early: a failing
     # install can be the very thing that broke the link.
-    if not dry_run and guard.verify():
-        rc = 1
+    #
+    # ``CORE_UNSAFE`` outranks a package failure and is returned verbatim: it
+    # says the venv is running a core the manifest does not declare, which no
+    # caller may continue past. Collapsing it into ``1`` here is what let
+    # ``--continue-on-error`` restart the fleet onto an undeclared core.
+    if not dry_run:
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
+            rc = 1
 
     return rc
 
@@ -1055,8 +1064,13 @@ def cmd_update(args) -> int:
         half-applied update doesn't get restarted into.
       - ``--continue-on-error`` lets ``feature sync`` fail without
         skipping the restart (useful when a single optional feature
-        package is temporarily unreachable).
+        package is temporarily unreachable). It does NOT cover an
+        unrepaired core drift: that returns ``CORE_UNSAFE`` and always
+        aborts before the restart, because continuing would bring the
+        agents up on a core the manifest does not declare (#2949).
     """
+    from kestrel_sovereign.cli_features import CORE_UNSAFE
+
     # cli._get_project_dir() returns the RUNTIME data root (honors
     # KESTREL_HOME) which is the wrong place for git pull and
     # uv pip install -e . — use the actual editable source checkout
@@ -1298,6 +1312,17 @@ def cmd_update(args) -> int:
                 dry_run=False,
             )
             rc = cli.cmd_feature_sync(sync_args)
+            if rc == CORE_UNSAFE:
+                # Same rule as reconcile below: an unrepaired core drift is a
+                # safety failure, not an optional-package failure, so
+                # --continue-on-error does not reach it.
+                print(
+                    "• features: FAILED — core is not the declared install and "
+                    "could not be repaired. Refusing to continue onto an "
+                    "undeclared core; --continue-on-error does not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_UNSAFE
             if rc != 0 and not continue_on_error:
                 print(
                     "• features: FAILED — aborting before reconcile/restart. "
@@ -1329,6 +1354,17 @@ def cmd_update(args) -> int:
             continue_on_error=continue_on_error,
             prefer=prefer,
         )
+        if rc == CORE_UNSAFE:
+            # Not continuable, by design: restarting here would bring every
+            # agent up on a core the manifest does not declare, and returning 0
+            # would report that as a successful update.
+            print(
+                "• reconcile: FAILED — core is not the declared install and "
+                "could not be repaired. Refusing to restart agents onto an "
+                "undeclared core; --continue-on-error does not cover this.",
+                file=sys.stderr,
+            )
+            return CORE_UNSAFE
         if rc != 0 and not continue_on_error:
             print(
                 "• reconcile: FAILED — aborting before restart. "
