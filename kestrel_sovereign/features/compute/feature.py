@@ -189,6 +189,52 @@ class ComputeFeature(Feature):
 
             self._initialized = True
             logger.info("ComputeFeature async initialization complete")
+
+    @staticmethod
+    async def _executor_is_available(executor: Optional[BaseExecutor]) -> bool:
+        """Probe one executor off-loop and fail closed if its probe breaks."""
+        if executor is None:
+            return False
+        try:
+            return bool(
+                await asyncio.to_thread(getattr, executor, "is_available")
+            )
+        except Exception as error:
+            # Availability is a plugin boundary: a missing/broken property must
+            # degrade to the same structured unavailable result as a negative
+            # probe instead of escaping run_script as an implementation error.
+            logger.warning(
+                "%s availability probe failed: %s",
+                type(executor).__name__,
+                error,
+                exc_info=True,
+            )
+            return False
+
+    async def _executor_availability(
+        self,
+        known_statuses: Optional[Dict[str, bool]] = None,
+    ) -> Dict[str, bool]:
+        """Take one non-blocking availability snapshot for all executors.
+
+        Executor availability is a synchronous interface. Docker's probe can
+        wait several seconds for ``docker info``, so every probe belongs on a
+        worker thread rather than the shared agent event loop. Callers may
+        supply statuses they already probed so no executor is checked twice.
+        """
+        statuses = dict(known_statuses or {})
+        items = tuple(
+            (name, executor)
+            for name, executor in self.executors.items()
+            if name not in statuses
+        )
+        probed = await asyncio.gather(
+            *(self._executor_is_available(executor) for _, executor in items)
+        )
+        statuses.update(
+            {name: status for (name, _), status in zip(items, probed)}
+        )
+        return {name: statuses[name] for name in self.executors}
     
     async def _ensure_initialized(self):
         """Ensure async initialization is complete before operations."""
@@ -378,10 +424,11 @@ class ComputeFeature(Feature):
         description=(
             "Submit a script for execution (requires security review and user "
             "approval). executor is one of: 'uv', 'docker', 'local' "
-            "(case-insensitive). 'docker' requires a running Docker daemon and "
-            "'local' requires KESTREL_ALLOW_LOCAL_COMPUTE — either may be "
-            "unavailable on this host. Call get_compute_capabilities to discover "
-            "the live set of available executors."
+            "(case-insensitive). 'uv' requires Kestrel to run inside a Python "
+            "venv or virtualenv, 'docker' requires a running Docker daemon, and "
+            "'local' requires KESTREL_ALLOW_LOCAL_COMPUTE; any may be unavailable "
+            "on this host. Call get_compute_capabilities to discover the live "
+            "set of available executors."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-run",
@@ -404,8 +451,9 @@ class ComputeFeature(Feature):
         Args:
             script_id: ID of the script to run (full or prefix)
             executor: Execution environment ("uv", "docker", or "local",
-                case-insensitive). 'docker'/'local' may be unavailable depending
-                on the host (Docker daemon / KESTREL_ALLOW_LOCAL_COMPUTE). Call
+                case-insensitive). 'uv' requires Kestrel to run inside a Python
+                venv/virtualenv; 'docker' and 'local' require a Docker daemon and
+                KESTREL_ALLOW_LOCAL_COMPUTE, respectively. Call
                 get_compute_capabilities to discover the live set.
             timeout: Maximum execution time in seconds
 
@@ -475,15 +523,24 @@ class ComputeFeature(Feature):
             )
 
         # Check executor availability
-        if executor not in self.executors or self.executors[executor] is None:
-            available = [k for k, v in self.executors.items() if v is not None]
+        exec_obj = self.executors.get(executor)
+        executor_available = await self._executor_is_available(exec_obj)
+        if not executor_available:
+            known_statuses = (
+                {executor: False} if executor in self.executors else None
+            )
+            executor_status = await self._executor_availability(known_statuses)
+            available = [
+                name
+                for name, is_available in executor_status.items()
+                if is_available
+            ]
             return ToolResult.failed(
                 f"Error: Executor '{executor}' not available. Available: {available}",
                 data={"executor": executor, "available": available},
             )
 
         # Check language support
-        exec_obj = self.executors[executor]
         if not exec_obj.supports_language(script.language):
             return ToolResult.failed(
                 f"Error: Executor '{executor}' does not support {script.language}",
@@ -983,12 +1040,7 @@ class ComputeFeature(Feature):
         """
         Returns current compute environment so agent can adapt behavior.
         """
-        executor_status = {}
-        for name, executor in self.executors.items():
-            if executor is None:
-                executor_status[name] = False
-            else:
-                executor_status[name] = executor.is_available
+        executor_status = await self._executor_availability()
 
         data = {
             "version": "1.0",
@@ -1034,7 +1086,7 @@ class ComputeFeature(Feature):
                     f"Retention: {self.policy.trash_retention_days} days"
                 ),
                 "executors": {
-                    "uv": "Python scripts via isolated uv environments",
+                    "uv": "Python scripts via project-free ephemeral uv environments",
                     "docker": f"Sandboxed containers ({'enabled' if self.policy.allow_docker else 'disabled'})",
                     "local": f"Direct execution ({'ENABLED - dangerous!' if self.policy.allow_local else 'disabled'})",
                 },

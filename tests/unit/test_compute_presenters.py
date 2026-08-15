@@ -402,5 +402,5 @@ def test_compute_tool_inventory_and_schemas_are_byte_stable() -> None:
         separators=(",", ":"),
     ).encode()
     assert hashlib.sha256(payload).hexdigest() == (
-        "5f6e3ef51d7f792c48ed9cd99c5c812a61debc5c709c060bfc998e7bb42b8920"
+        "de94dff728a430174564f2071f69fc076e3ade123c69164045eb5b3bacfec615"
     )
