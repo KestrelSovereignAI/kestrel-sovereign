@@ -30,7 +30,7 @@ from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 try:  # pragma: no cover - Python 3.11+ uses the stdlib branch.
     import tomllib
@@ -807,7 +807,7 @@ class SemanticKnowledgeRegistry:
                 raise KnowledgeRegistryError(
                     f"{resource.key} has unsafe package resource path {resource.package_resource!r}"
                 )
-            parsed = urlparse(resource.uri)
+            parsed = _parse_stable_uri(resource.uri, resource.key)
             if parsed.scheme != "https" or not parsed.netloc:
                 raise KnowledgeRegistryError(f"{resource.key} must use an absolute HTTPS stable URI")
             if resource.uri.rstrip("/").endswith("latest"):
@@ -934,6 +934,23 @@ def _decode_manifest(manifest_bytes: bytes, source: str) -> str:
     except UnicodeDecodeError as exc:
         raise MalformedManifestError(
             f"semantic registry manifest is not valid UTF-8 ({source}): {exc}"
+        ) from exc
+
+
+def _parse_stable_uri(uri: str, resource_key: str) -> ParseResult:
+    """Parse one stable URI, reporting failure as a registry error.
+
+    ``urlparse`` raises a bare ``ValueError`` for a malformed authority such as
+    ``https://[``.  Like the TOML and UTF-8 decoders, it is a stdlib parser
+    whose exception type is not this module's to choose, so it is converted
+    where it is called — the module's own parsers already raise inside the
+    contract, and these boundaries are the only places it can leak.
+    """
+    try:
+        return urlparse(uri)
+    except ValueError as exc:
+        raise MalformedManifestError(
+            f"{resource_key} has an unparseable stable URI {uri!r}: {exc}"
         ) from exc
 
 

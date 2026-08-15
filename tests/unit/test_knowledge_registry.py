@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tomllib
 from importlib import resources
 from pathlib import Path
 
@@ -511,6 +512,33 @@ def test_an_unparseable_manifest_stays_inside_the_registry_error_contract(tmp_pa
     manifest.write_bytes(b"version = \xff\n")
     with pytest.raises(MalformedManifestError, match="not valid UTF-8"):
         audit_semantic_resources(manifest)
+
+
+def test_a_malformed_stable_uri_stays_inside_the_registry_error_contract(tmp_path):
+    """Valid TOML can still carry a URI that the stdlib parser refuses.
+
+    ``urlparse`` raises a bare ``ValueError`` on an authority like ``https://[``,
+    which is a sibling of ``KnowledgeRegistryError`` rather than a subclass — so
+    it would escape the doctor the same way the TOML decoder did, from a
+    manifest that parsed perfectly.
+    """
+    package_root = tmp_path / "kestrel_sovereign"
+    semantic_root = package_root / "data" / "semantic"
+    manifest = semantic_root / "registry.toml"
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    text = manifest.read_text(encoding="utf-8")
+    registered = load_knowledge_registry(manifest).resources[0]
+    manifest.write_text(text.replace(f'"{registered.uri}"', '"https://["', 1), encoding="utf-8")
+    # The manifest is still well-formed TOML; only the URI is unparseable.
+    assert tomllib.loads(manifest.read_text(encoding="utf-8"))
+
+    for load in (load_knowledge_registry, audit_semantic_resources):
+        with pytest.raises(MalformedManifestError, match="unparseable stable URI") as excinfo:
+            load(manifest)
+        assert isinstance(excinfo.value, KnowledgeRegistryError)
 
 
 def test_incompatible_import_version_is_rejected():
