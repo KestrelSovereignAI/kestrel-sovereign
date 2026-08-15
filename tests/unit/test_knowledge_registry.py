@@ -335,14 +335,37 @@ def test_crlf_poisoned_manifest_pin_blames_the_pin_not_the_checkout():
     assert finding.repair_commands == ()
 
 
-def test_manifest_pin_direction_normalizes_before_reapplying_crlf():
-    """Mixed endings must not be tested as "\\r\\r\\n" and go undiagnosed."""
+def test_mixed_endings_never_accuse_the_manifest_pin():
+    """Mixed endings cannot support the sentence the pin diagnosis prints.
+
+    Re-applying CRLF to these bytes does reach the pinned digest, but that
+    only shows the pin holds their all-CRLF form — not that this checkout is
+    the declared LF.  Claiming ``CRLF_MANIFEST_PIN`` would tell the operator
+    their working tree is fine and to fix the pin instead, which re-pins the
+    smudge and leaves the resource failing.  Undecided is the honest answer.
+    """
     mixed = b"first\r\nsecond\nthird\n"
     expected = hashlib.sha256(b"first\r\nsecond\r\nthird\r\n").hexdigest()
+    assert hashlib.sha256(mixed.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")).hexdigest() == expected
 
     assert (
         classify_digest_mismatch(mixed, expected)
-        is ResourceIntegrityIssue.CRLF_MANIFEST_PIN
+        is ResourceIntegrityIssue.DIGEST_MISMATCH
+    )
+
+
+def test_mixed_endings_still_convict_a_smudged_checkout():
+    """The forward direction takes mixed endings, because its remedy repairs them.
+
+    Restoring the committed bytes fixes every ending at once, so the checkout
+    accusation stays true and actionable however mixed the file is.
+    """
+    content = b"first\r\nsecond\nthird\n"
+    expected = hashlib.sha256(b"first\nsecond\nthird\n").hexdigest()
+
+    assert (
+        classify_digest_mismatch(content, expected)
+        is ResourceIntegrityIssue.CRLF_CHECKOUT
     )
 
 

@@ -322,14 +322,22 @@ def classify_digest_mismatch(content: bytes, expected_sha256: str) -> ResourceIn
     ``CRLF_MANIFEST_PIN`` means the file is the declared LF and the *pin* was
     refreshed from a smudged checkout.  Anything undecided stays
     ``DIGEST_MISMATCH``.
+
+    The two directions do not take the same evidence.  Collapsing CRLF is
+    enough to convict the checkout however mixed its endings are, because the
+    remedy — restore the committed bytes — repairs every ending at once.  The
+    reverse accuses the *pin* and tells the operator their checkout is already
+    correct, so it demands LF-only content: mixed endings would make that
+    sentence false, and re-pinning the mixed bytes would carry the smudge into
+    the manifest rather than out of the checkout.
     """
     normalized = content.replace(b"\r\n", b"\n")
     if normalized != content and hashlib.sha256(normalized).hexdigest() == expected_sha256:
         return ResourceIntegrityIssue.CRLF_CHECKOUT
-    # Normalize before re-applying so mixed-ending content cannot grow "\r\r\n".
-    reapplied = normalized.replace(b"\n", b"\r\n")
-    if reapplied != content and hashlib.sha256(reapplied).hexdigest() == expected_sha256:
-        return ResourceIntegrityIssue.CRLF_MANIFEST_PIN
+    if normalized == content:
+        reapplied = content.replace(b"\n", b"\r\n")
+        if reapplied != content and hashlib.sha256(reapplied).hexdigest() == expected_sha256:
+            return ResourceIntegrityIssue.CRLF_MANIFEST_PIN
     return ResourceIntegrityIssue.DIGEST_MISMATCH
 
 
