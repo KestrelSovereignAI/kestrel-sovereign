@@ -42,12 +42,17 @@ import pytest_asyncio
 from kestrel_sovereign.constitution.amendment_artifact import ARTIFACT_TYPE
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
-from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.async_graph_store import (
+    AsyncGraphStore,
+    GraphNode,
+    NodeSwapResult,
+)
 
 pytestmark = pytest.mark.asyncio
 
 AGENT_A = "did:web:example.com:first"
 AGENT_B = "did:web:example.com:second"
+AGENT_C = "did:web:example.com:third"
 SIGNER = "did:web:example.com:kestrel-sovereign"
 
 CONSTITUTION_HASH = "b" * 64
@@ -55,11 +60,16 @@ CONSTITUTION_HASH = "b" * 64
 ARTIFACT_TYPE_LABEL = "constitution_amendment_artifact"
 ARTIFACT_LABEL = "Signed Constitution Reanchor Artifact"
 
-#: A refusal raised *inside* ``add_node``'s transaction reaches the caller as
-#: the backend's ``TransactionError``, not as the ``ValueError`` the store
-#: raised — both backends wrap it. The message survives, so that is what these
-#: tests pin. The pre-transaction shareability refusal is *not* wrapped, which
-#: is why the tests above can pin ``ValueError`` directly.
+#: A refusal raised *inside* a transaction reaches the caller as the backend's
+#: ``TransactionError``, not as the ``ValueError`` the store raised — both
+#: backends wrap it. The message survives, so that is what these tests pin.
+#:
+#: ``add_node`` checks the shared shape *before* opening its transaction, so
+#: that one refusal arrives unwrapped and those tests can pin ``ValueError``
+#: directly. ``compare_and_swap_node`` cannot: deciding a swap needs the stored
+#: row, and reading it outside the transaction would race the very writer the
+#: primitive exists to serialise against. So the same rule surfaces as two
+#: exception types depending on the door — worth knowing when catching it.
 REFUSAL = Exception
 
 
@@ -388,3 +398,207 @@ class TestCoOwnersMustAgree:
             await _graph(db, AGENT_B).add_node(_artifact_node(node_id))
 
         assert await _owners(db, node_id) == [AGENT_A]
+
+
+# =====================================================================
+# 3. The other door: compare_and_swap_node
+# =====================================================================
+
+
+class TestTheSwapDoorObeysTheSameRules:
+    """``add_node`` is not the only writer of graph rows.
+
+    A rule enforced at one door is not a rule. ``compare_and_swap_node`` is a
+    public primitive reachable through ``AsyncStorage`` and the privacy
+    wrapper, and it writes ``properties`` onto whatever row already exists —
+    so an agent that legitimately co-owns the fleet's artifact row could have
+    swapped an operator path onto it, or rewritten the signer every co-owner
+    is governed by, and been told ``SWAPPED``.
+    """
+
+    async def test_a_create_cannot_seed_an_unshareable_shared_row(
+        self, db, artifact_bytes
+    ):
+        """Compare-and-create writes the caller's shape verbatim, so it is the
+        same order-dependence hole as ``add_node`` had, through another door."""
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+
+        with pytest.raises(REFUSAL, match="fleet-shared"):
+            await _graph(db, AGENT_A).compare_and_swap_node(
+                node_id, None, _artifact_node(node_id, created_at="x" * 65)
+            )
+
+        assert await _owners(db, node_id) == []
+
+    async def test_a_swap_cannot_put_a_per_agent_field_on_a_shared_row(
+        self, db, artifact_bytes
+    ):
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        with pytest.raises(REFUSAL, match="fleet-shared"):
+            await graph.compare_and_swap_node(
+                node_id,
+                snapshot,
+                _artifact_node(node_id, source_path="/home/operator/a.json"),
+            )
+
+        stored = await graph.get_node(node_id)
+        assert "source_path" not in stored.properties
+
+    async def test_a_swap_cannot_dodge_the_rules_by_declaring_another_type(
+        self, db, artifact_bytes
+    ):
+        """The shape must be read off the *stored* row.
+
+        A swap ignores ``new_node.node_type`` and ``label`` entirely — it
+        writes onto whatever row is at ``node_id``. Gating on the shape the
+        caller declares would therefore be no gate at all: claim to be writing
+        an episode and walk straight onto the fleet's artifact row.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        disguised = GraphNode(
+            node_id=node_id,
+            node_type="episode",
+            label="A Tuesday",
+            properties={"source_path": "/home/operator/a.json"},
+        )
+        with pytest.raises(REFUSAL, match="fleet-shared"):
+            await graph.compare_and_swap_node(node_id, snapshot, disguised)
+
+        stored = await graph.get_node(node_id)
+        assert "source_path" not in stored.properties
+
+    async def test_a_co_owner_cannot_swap_a_row_the_fleet_shares(
+        self, db, artifact_bytes
+    ):
+        """Even a well-formed swap is refused once the row has two owners.
+
+        ``add_node`` hands a second tenant an ownership witness and leaves the
+        canonical bytes alone — it will not rewrite a row more than one tenant
+        owns. A swap must not be the door that does what the front door
+        refuses, or one co-owner silently redefines what the others are
+        governed by.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _take_possession(db, AGENT_B, artifact_bytes, "a.json")
+        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+        graph_b = _graph(db, AGENT_B)
+        await graph_b.add_node(_artifact_node(node_id))
+        assert await _owners(db, node_id) == sorted([AGENT_A, AGENT_B])
+
+        snapshot = (await graph_b.get_node(node_id)).properties
+        with pytest.raises(REFUSAL, match="owned by another agent"):
+            await graph_b.compare_and_swap_node(
+                node_id,
+                snapshot,
+                _artifact_node(node_id, signer="did:web:someone-else.example"),
+            )
+
+        stored = await graph_b.get_node(node_id)
+        assert stored.properties["signer"] == SIGNER
+
+    async def test_a_lone_owner_can_still_swap_its_own_shared_row(
+        self, db, artifact_bytes
+    ):
+        """The refusal is about co-owners, not about the shape being shared.
+
+        A single owner rewriting its own row affects nobody else, and
+        ``add_node`` allows exactly that — so refusing it here would be a
+        stricter rule at one door than the other, which is the shape of bug
+        this whole change is about.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            _artifact_node(node_id, created_at="2027-01-01T00:00:00+00:00"),
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        stored = await graph.get_node(node_id)
+        assert stored.properties["created_at"] == "2027-01-01T00:00:00+00:00"
+
+    async def test_an_ordinary_node_swaps_freely(self, db):
+        """The new read must not change behaviour for the 99% of node types
+        that are not fleet-shared."""
+        graph = _graph(db, AGENT_A)
+        node_id = f"episode:{uuid.uuid4().hex}"
+        node = GraphNode(node_id, "episode", "A Tuesday", {"n": 1})
+        await graph.add_node(node)
+
+        result = await graph.compare_and_swap_node(
+            node_id, {"n": 1}, GraphNode(node_id, "episode", "A Tuesday", {"n": 2})
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        assert (await graph.get_node(node_id)).properties == {"n": 2}
+
+    async def test_a_foreign_shared_row_still_reports_not_found(
+        self, db, artifact_bytes
+    ):
+        """The refusal must not become an existence oracle.
+
+        ``compare_and_swap_node`` is careful never to let a bound tenant tell
+        "absent" apart from "owned by someone else" — both are NOT_FOUND, the
+        same answer ``get_node`` gives. A shared-shape check that read the
+        stored row *unscoped* would **raise** for a foreign row while an absent
+        one returns NOT_FOUND, handing back that distinction in the shape of an
+        exception. B never stored these bytes, so it is not a co-owner and must
+        learn nothing.
+
+        The probe has to be one the check would actually object to. An earlier
+        version of this test swapped in *well-formed* artifact properties onto
+        a single-owner row: nothing to refuse, so it fell through to the scoped
+        UPDATE and reported NOT_FOUND either way. Removing the scope left it
+        green — a surviving mutant, and the test's fault rather than the code's.
+        Both probes below trip a different refusal.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _take_possession(db, AGENT_C, artifact_bytes, "a.json")
+        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+        # A and C co-own it. B is the outsider throughout.
+        await _graph(db, AGENT_C).add_node(_artifact_node(node_id))
+
+        absent_id = "f" * 64
+        graph_b = _graph(db, AGENT_B)
+
+        # Probe 1: properties the shape check refuses outright.
+        unshareable = await graph_b.compare_and_swap_node(
+            node_id,
+            {"anything": True},
+            _artifact_node(node_id, source_path="/home/operator/a.json"),
+        )
+        unshareable_absent = await graph_b.compare_and_swap_node(
+            absent_id,
+            {"anything": True},
+            _artifact_node(absent_id, source_path="/home/operator/a.json"),
+        )
+
+        # Probe 2: well-formed properties onto a row that already has two
+        # owners, which the co-owner rule refuses.
+        multi_owner = await graph_b.compare_and_swap_node(
+            node_id, {"anything": True}, _artifact_node(node_id)
+        )
+        multi_owner_absent = await graph_b.compare_and_swap_node(
+            absent_id, {"anything": True}, _artifact_node(absent_id)
+        )
+
+        assert unshareable == NodeSwapResult.NOT_FOUND
+        assert multi_owner == NodeSwapResult.NOT_FOUND
+        assert unshareable == unshareable_absent, (
+            "an unshareable swap distinguishes a foreign row from an absent one"
+        )
+        assert multi_owner == multi_owner_absent, (
+            "a co-owned foreign row is distinguishable from an absent one"
+        )

@@ -583,6 +583,30 @@ class AsyncGraphStore:
             return "COALESCE(NULLIF(properties, '')::jsonb, '{}'::jsonb) = ?::jsonb"
         return "json(COALESCE(NULLIF(properties, ''), '{}')) = json(?)"
 
+    @staticmethod
+    def _refuse_unshareable_properties(
+        shape_key: tuple, properties: Dict[str, Any], node_id: str
+    ) -> None:
+        """Refuse a property set a fleet could not co-own.
+
+        Both writers of graph rows go through here — :meth:`add_node` and
+        :meth:`compare_and_swap_node` — because a rule enforced at one door is
+        not a rule. A shared row reached through the other door leaks exactly
+        what this issue removed: an operator filesystem path on a row every
+        tenant reads, or an authorization the other co-owners never verified.
+
+        A no-op for every node type that is not content-addressed, which is the
+        overwhelming majority.
+        """
+        shape = _SHARED_CONTENT_SHAPES.get(shape_key)
+        if shape is None or shape.is_shareable(properties, node_id):
+            return
+        node_type, label = shape_key
+        raise ValueError(
+            "Cannot store a fleet-shared graph node whose properties fall "
+            f"outside its shared shape: {node_type}/{label}"
+        )
+
     async def add_node(self, node: GraphNode) -> None:
         """Add or update a node and its ownership witness atomically.
 
@@ -607,13 +631,9 @@ class AsyncGraphStore:
         """
         owner = self._node_owner(node)
         shape = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
-        if shape is not None and not shape.is_shareable(
-            node.properties, node.node_id
-        ):
-            raise ValueError(
-                "Cannot store a fleet-shared graph node whose properties fall "
-                f"outside its shared shape: {node.node_type}/{node.label}"
-            )
+        self._refuse_unshareable_properties(
+            (node.node_type, node.label), node.properties, node.node_id
+        )
         async with self.db.transaction():
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
@@ -867,6 +887,13 @@ class AsyncGraphStore:
                     and new_node.node_type not in allowed_node_types
                 ):
                     return NodeSwapResult.TYPE_NOT_ALLOWED
+                # A create writes the shape verbatim too, so the fleet-shared
+                # rules apply here exactly as in add_node. Validated against
+                # ``node_id`` — the row identity this primitive writes — not
+                # ``new_node.node_id``, which it ignores.
+                self._refuse_unshareable_properties(
+                    (new_node.node_type, new_node.label), new_node.properties, node_id
+                )
                 affected = await self.db.execute(
                     self._insert_if_absent_node_sql(),
                     (node_id, new_node.node_type, new_node.label, new_properties),
@@ -897,6 +924,41 @@ class AsyncGraphStore:
                 if exists is not None:
                     return NodeSwapResult.PREDICATE_FAILED
                 return NodeSwapResult.NOT_FOUND
+
+            # A swap ignores ``new_node.node_type`` / ``label`` and writes onto
+            # whatever row already exists, so the fleet-shared rules have to be
+            # read off the *stored* row. Gating on the caller-supplied shape
+            # instead would be no gate at all: declaring some other node type
+            # would walk straight past it and onto the shared artifact row.
+            #
+            # Deliberately scoped. An unscoped read here would refuse (rather
+            # than report NOT_FOUND) on a foreign-owned id, telling a bound
+            # tenant that an id it cannot see exists — the existence leak this
+            # primitive's classification is built to avoid. Invisible rows fall
+            # through and the UPDATE matches nothing, exactly as before.
+            stored_shape_row = await self.db.fetchone(
+                "SELECT node_type, label FROM graph_nodes "
+                f"WHERE node_id = ? AND {scope}",
+                (node_id, *scope_params),
+            )
+            if stored_shape_row is not None:
+                stored_key = (stored_shape_row[0], stored_shape_row[1])
+                self._refuse_unshareable_properties(
+                    stored_key, new_node.properties, node_id
+                )
+                if stored_key in _SHARED_CONTENT_SHAPES:
+                    # add_node will not rewrite a row more than one tenant owns
+                    # — it hands out a second ownership witness and leaves the
+                    # canonical bytes alone. A swap must not be the door that
+                    # does what the front door refuses.
+                    owner_rows = await self.db.fetchall(
+                        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+                        (node_id,),
+                    )
+                    if len({row[0] for row in owner_rows}) > 1:
+                        raise ValueError(
+                            "Cannot overwrite a graph node owned by another agent"
+                        )
 
             expected_properties = json.dumps(expected)
             # Properties-only: the SET touches the same single column the
