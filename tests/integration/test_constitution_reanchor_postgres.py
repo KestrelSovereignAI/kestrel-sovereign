@@ -154,7 +154,16 @@ async def _purge_agent(db, agent_did: str = AGENT_DID) -> None:
         )
 
 
-def _write_authority_files(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
+def _write_authority_files(
+    tmp_path: Path, content: bytes, created_at: str | None = None
+) -> tuple[Path, Path]:
+    """Write a genuinely-signed artifact and the trust root that verifies it.
+
+    ``created_at`` is exposed because it is a *signed* field the verifier does
+    not constrain in any way — the one field an authority can put anything into
+    and still produce an artifact that verifies. That makes it how a property
+    set outside the fleet-shared shape reaches the storage layer at all.
+    """
     root_path = tmp_path / "sovereign-root.did.json"
     root_path.write_text(
         json.dumps(
@@ -166,6 +175,7 @@ def _write_authority_files(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
         signer_did=_ROOT_DID,
         constitution_sha256=hashlib.sha256(content).hexdigest(),
         private_key=_ROOT_KEYPAIR.private_key,
+        created_at=created_at,
         reason="#2890 integration",
     )
     artifact_path = tmp_path / "reanchor.signed.json"
@@ -886,3 +896,123 @@ async def test_a_legacy_row_describing_different_content_is_still_refused(
 
     assert second.error is not None
     assert "owned by another agent" in second.error
+
+
+async def test_a_row_disagreeing_on_a_signed_field_alone_is_refused(
+    pg, tmp_path, monkeypatch,
+):
+    """The stored row is shareable — it just describes a different record.
+
+    The sibling test above tampers the signer *and* adds ``source_path``, so
+    the stored row is a legacy-shaped one and the legacy branch is what turns
+    it away. Strip the per-agent field and the row is a perfectly well-formed
+    fleet-shared artifact naming a different authority, which the shareability
+    predicate has nothing to say about.
+
+    That was enough to be admitted: the second agent was added as an owner, the
+    stored row was deliberately retained, and the reanchor reported success —
+    leaving an agent owning a governance record naming a signer it never
+    verified. Shareability and agreement are two questions and both have to be
+    asked.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    await _seed_runtime_agent(CONSTITUTION_V1, OTHER_DID)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    first_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(first_dir, AGENT_DID)
+    first = await reanchor_constitution(
+        agent_name="First", agent_dir=first_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+    assert first.error is None, first.error
+
+    row = await pg.fetchone(
+        "SELECT properties FROM graph_nodes WHERE node_id = $1", (artifact_hash,)
+    )
+    tampered = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    tampered["signer"] = "did:web:someone-else.example"
+    await pg.execute(
+        "UPDATE graph_nodes SET properties = $1 WHERE node_id = $2",
+        (json.dumps(tampered), artifact_hash),
+    )
+
+    second_dir = tmp_path / "agent_data" / "Second"
+    _make_local_anchor(second_dir, OTHER_DID)
+    second = await reanchor_constitution(
+        agent_name="Second", agent_dir=second_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+
+    assert second.error is not None
+    assert "owned by another agent" in second.error
+    # Refused means refused: the second agent is not an owner and is still
+    # governed by what it was governed by before it tried.
+    owners = await pg.fetchall(
+        "SELECT agent_id FROM graph_node_owners WHERE node_id = $1",
+        (artifact_hash,),
+    )
+    assert [r[0] for r in owners] == [AGENT_DID]
+    assert await _runtime_state(pg, OTHER_DID) == (v1_hash, [v1_hash])
+
+
+async def test_an_unshareable_artifact_refuses_the_first_agent_too(
+    pg, tmp_path, monkeypatch,
+):
+    """No agent gets to be the lucky first.
+
+    ``created_at`` is signed but unconstrained by ``verify_reanchor_artifact``,
+    so an artifact carrying an unbounded one verifies and reaches the store.
+    Nothing existed at that node id yet, so the shared-shape checks were skipped
+    entirely: the first agent committed and every sibling presenting the same
+    signed authorization afterwards rolled back with an ownership error. One
+    Sovereign signature, half a fleet governed — the exact split #2893 exists
+    to remove, reintroduced by the order of arrival.
+
+    Now the first agent is refused on the same grounds as the second, and the
+    refusal arrives as a legible ``result.error`` (it is raised before the
+    write transaction opens, so it still travels the normal failure path) with
+    the runtime untouched.
+    """
+    await _seed_runtime_agent(CONSTITUTION_V1, AGENT_DID)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(
+        tmp_path, CONSTITUTION_V2, created_at="2026-08-11T00:00:00+00:00" + "0" * 40
+    )
+    artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    agent_dir = tmp_path / "agent_data" / "First"
+    _make_local_anchor(agent_dir, AGENT_DID)
+    result = await reanchor_constitution(
+        agent_name="First", agent_dir=agent_dir,
+        canonical_path=constitution_path, force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres", runtime_dsn=POSTGRES_URL,
+    )
+
+    assert result.error is not None
+    assert "fleet-shared" in result.error
+    assert result.reanchored is False
+    # The whole reanchor rolled back — not just the artifact node.
+    assert await _runtime_state(pg, AGENT_DID) == (v1_hash, [v1_hash])
+    rows = await pg.fetchall(
+        "SELECT node_id FROM graph_nodes WHERE node_id = $1", (artifact_hash,)
+    )
+    assert rows == []

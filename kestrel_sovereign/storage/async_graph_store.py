@@ -21,7 +21,7 @@ import logging
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional, List, Any
+from typing import Callable, Dict, Optional, List, Any
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
@@ -203,8 +203,39 @@ def _is_normalisable_legacy_artifact(
     )
 
 
-#: The ``(node_type, label)`` shapes a PostgreSQL fleet may co-own, and the
-#: predicate that decides whether a given row really is content-derived.
+@dataclass(frozen=True)
+class _SharedContentShape:
+    """One ``(node_type, label)`` a PostgreSQL fleet may hold a single row for.
+
+    Two questions have to be asked of a shared row, and they are not the same
+    question:
+
+    * ``is_shareable`` — *could* a sibling tenant have computed these
+      properties? That is a check on one property set in isolation.
+    * ``identity_keys`` — do the stored row and the incoming node actually
+      *agree*? Two property sets can each be shareable while describing
+      different content. Admitting the second owner then leaves the first row
+      standing and reports success to an agent that believes it stored the
+      second — a record claiming what nobody observed.
+
+    The two sets differ per shape, which is why this is a table rather than one
+    rule: every field of a signed artifact is covered by the signature and must
+    match byte for byte, but a constitution anchor's ``created_at`` is when
+    *that* tenant first stored the document and legitimately differs across the
+    fleet.
+    """
+
+    #: Whether a property set is content-derived, and so co-ownable.
+    is_shareable: Callable[[Dict[str, Any], str], bool]
+    #: The subset of properties every co-owner must agree on.
+    identity_keys: frozenset
+    #: Whether a row written by the release *before* #2893 — carrying that
+    #: release's per-agent fields — is normalised into the shared shape rather
+    #: than refused. Only the artifact node has such a deployed state.
+    normalises_legacy_rows: bool = False
+
+
+#: The ``(node_type, label)`` shapes a PostgreSQL fleet may co-own.
 #:
 #: Two node types qualify: the governing constitution document, and a
 #: Sovereign-signed reanchor artifact (#2893). Both are the same argument — the
@@ -212,13 +243,49 @@ def _is_normalisable_legacy_artifact(
 #: properties — and both are gated the same way: the writer must independently
 #: own the underlying blob, so co-ownership follows possession of the content
 #: rather than knowledge of a hash.
+#:
+#: This table is enforced in :meth:`AsyncGraphStore.add_node`, which is the only
+#: writer of either shape today (inception and both reanchor writers go through
+#: it). A future callsite that creates one of these rows through
+#: :meth:`AsyncGraphStore.compare_and_swap_node` would bypass the table entirely
+#: and has to carry the same guard, or it reopens the split this closes.
 _SHARED_CONTENT_SHAPES = {
-    ("document", "KESTREL_CONSTITUTION"): _is_shareable_constitution_properties,
+    # The anchor's agreement set is exactly what its predicate already pins, so
+    # the check can never fire on its own here: two rows shareable under the
+    # same node id necessarily agree on ``hash`` and ``type``. It is spelled out
+    # rather than left off because the alternative is a default, and a default
+    # is how the next shape added to this table ends up with no agreement check
+    # without anyone having decided it should have none.
+    ("document", "KESTREL_CONSTITUTION"): _SharedContentShape(
+        is_shareable=_is_shareable_constitution_properties,
+        identity_keys=frozenset({"hash", "type"}),
+    ),
     (
         "constitution_amendment_artifact",
         "Signed Constitution Reanchor Artifact",
-    ): _is_shareable_amendment_artifact_properties,
+    ): _SharedContentShape(
+        is_shareable=_is_shareable_amendment_artifact_properties,
+        identity_keys=_SHAREABLE_ARTIFACT_KEYS,
+        normalises_legacy_rows=True,
+    ),
 }
+
+
+def _agrees_on_shared_identity(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    shape: _SharedContentShape,
+) -> bool:
+    """Whether two co-owners of a shared row describe the same content.
+
+    Compared over the shape's ``identity_keys`` rather than the whole property
+    dict, because a wholesale comparison would refuse the constitution sharing
+    that already works: each tenant stamps its own ``created_at`` when it first
+    stores the document, and that difference is expected rather than a conflict.
+    """
+    return _canonical_shared_properties(
+        existing, shape.identity_keys
+    ) == _canonical_shared_properties(incoming, shape.identity_keys)
 
 
 def _insert_owner_sql(db: AsyncDatabase, table: str, columns: str) -> str:
@@ -526,8 +593,27 @@ class AsyncGraphStore:
         :meth:`compare_and_swap_node` instead — it closes the
         read-modify-write race that a hand-rolled retry loop around
         ``add_node`` can only ever narrow.
+
+        For the handful of content-addressed shapes a fleet co-owns
+        (``_SHARED_CONTENT_SHAPES``) the incoming node is validated *before*
+        anything is read or written, whether or not a row already exists. The
+        checks used to run only against an existing row, which made acceptance
+        depend on insertion order: a property set outside the shared shape was
+        stored happily for whichever agent got there first, and every sibling
+        that presented the same content afterwards rolled back with an ownership
+        error. Validating up front means such a node is refused for everyone or
+        for no one — a loud failure at the first agent, in a command an operator
+        is watching, instead of a silent fleet split discovered at the second.
         """
         owner = self._node_owner(node)
+        shape = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
+        if shape is not None and not shape.is_shareable(
+            node.properties, node.node_id
+        ):
+            raise ValueError(
+                "Cannot store a fleet-shared graph node whose properties fall "
+                f"outside its shared shape: {node.node_type}/{node.label}"
+            )
         async with self.db.transaction():
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
@@ -547,15 +633,11 @@ class AsyncGraphStore:
             existing_properties = (
                 json.loads(existing[2]) if existing and existing[2] else {}
             )
-            # ``None`` for every node type that is not content-addressed, which
-            # is the overwhelming majority — see _SHARED_CONTENT_SHAPES.
-            is_shareable = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
-
             owns_content_reference = False
             if (
                 existing
                 and owner
-                and is_shareable is not None
+                and shape is not None
                 and existing[0] == node.node_type
                 and existing[1] == node.label
                 and existing_properties.get("hash") == node.node_id
@@ -571,24 +653,36 @@ class AsyncGraphStore:
             # release left behind carrying per-agent fields. The second is the
             # deployed state #2893 repairs, so it is admitted and normalised
             # rather than refused — see _is_normalisable_legacy_artifact.
+            # ``node.properties`` is not re-checked in either clause below: it
+            # was validated against the shape before this transaction opened, so
+            # reaching here already means the incoming node is shareable.
             normalisable_legacy = bool(
                 existing
-                and is_shareable is _is_shareable_amendment_artifact_properties
+                and shape is not None
+                and shape.normalises_legacy_rows
                 and existing[0] == node.node_type
                 and existing[1] == node.label
                 and owns_content_reference
-                and is_shareable(node.properties, node.node_id)
                 and _is_normalisable_legacy_artifact(
                     existing_properties, node.properties, node.node_id
                 )
             )
+            # Both halves are required. Shareability asks whether each row
+            # *could* have been computed by any tenant; identity agreement asks
+            # whether these two rows describe the same content. Without the
+            # second, a node whose signed metadata disagrees with the stored row
+            # still gains an owner — and because the stored row is deliberately
+            # retained, this agent ends up owning a row that says something
+            # other than what it just anchored, with no error to show for it.
             compatible_content_node = normalisable_legacy or bool(
                 existing
-                and is_shareable is not None
+                and shape is not None
                 and existing[0] == node.node_type
                 and existing[1] == node.label
-                and is_shareable(existing_properties, node.node_id)
-                and is_shareable(node.properties, node.node_id)
+                and shape.is_shareable(existing_properties, node.node_id)
+                and _agrees_on_shared_identity(
+                    existing_properties, node.properties, shape
+                )
                 and owns_content_reference
             )
             if (

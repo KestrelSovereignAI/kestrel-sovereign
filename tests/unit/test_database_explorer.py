@@ -734,24 +734,25 @@ async def test_graph_replay_cannot_acquire_foreign_nodes_or_edges(tmp_path):
         with pytest.raises(TransactionError, match="owned by another agent"):
             await storage_b.graph.add_edge(left.node_id, right.node_id, "private")
 
+        # The constitution anchor is a *fleet-shared* shape (#2890/#2893): two
+        # agents that each possess the bytes are meant to co-own one row, so
+        # "B cannot touch A's anchor" is not the guarantee here and has not been
+        # since #2890 — B stores the same file two lines up, which is precisely
+        # what earns it a place on that row.
+        #
+        # What this case pins is the part that still holds: A cannot put private
+        # metadata on such a node in the first place. The refusal is A's, before
+        # any row exists, so there is no private payload for B to acquire by
+        # guessing a canonical payload. Until #2893 this test passed for a
+        # weaker reason — A's malformed ``created_at`` made its own row
+        # unshareable, so B was turned away by A's mistake rather than by any
+        # rule. A well-formed row would have admitted B all along.
         shared_hash = await storage_a.store_file(b"same constitution", "a.md")
         assert await storage_b.store_file(
             b"same constitution", "b.md"
         ) == shared_hash
-        await storage_a.graph.add_node(
-            GraphNode(
-                shared_hash,
-                "document",
-                "KESTREL_CONSTITUTION",
-                {
-                    "hash": shared_hash,
-                    "type": "Constitution",
-                    "created_at": "agent-a-private-metadata",
-                },
-            )
-        )
-        with pytest.raises(TransactionError, match="owned by another agent"):
-            await storage_b.graph.add_node(
+        with pytest.raises(ValueError, match="fleet-shared"):
+            await storage_a.graph.add_node(
                 GraphNode(
                     shared_hash,
                     "document",
@@ -759,7 +760,7 @@ async def test_graph_replay_cannot_acquire_foreign_nodes_or_edges(tmp_path):
                     {
                         "hash": shared_hash,
                         "type": "Constitution",
-                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "created_at": "agent-a-private-metadata",
                     },
                 )
             )
