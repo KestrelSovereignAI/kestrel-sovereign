@@ -472,7 +472,13 @@ def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
     _versions(monkeypatch, {"kestrel-feature-voice": "0.3.1"})  # in-range version...
-    # ...but currently installed EDITABLE from a checkout
+    # ...but currently installed EDITABLE from a checkout. Stub provenance, the
+    # single seam both `_editable_install_path` and `_from_index` read, so the
+    # modelled package cannot be editable to one helper and index-resolved to
+    # the other.
+    monkeypatch.setattr(
+        cli, "_direct_url_provenance", lambda dist: ("/src/voice", True),
+    )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: "/src/voice")
     spy = _InstallSpy()
     monkeypatch.setattr(cli, "_extension_install_run", spy)
@@ -1331,6 +1337,66 @@ def test_dry_run_previews_the_source_only_core_drift_that_sync_repairs(
     assert rc == 0
     assert venv.commands == []  # a preview mutates nothing
     assert "would reinstall" in capsys.readouterr().out
+
+
+def test_sync_succeeds_switching_a_direct_url_core_to_the_declared_index(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Sync's own install must make the switch, not leave it to the guard.
+
+    Scoping the reinstall only for EDITABLE cores made sync's install a
+    same-version no-op against a direct-URL core. The final guard then did the
+    real repair and reported drift, so `feature sync` — and a plain `kestrel
+    update` — exited 1 over a run that had reached exactly the declared state.
+    A command that did the right thing must not report failure for it.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n')
+    venv = FakeUv(
+        core_checkout=None,
+        direct_urls={CORE: "git+https://example.invalid/core@abc"},
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0  # the switch succeeded, so nothing reports failure
+    assert venv.direct_urls.get(CORE) is None  # and it actually happened
+    err = capsys.readouterr().err
+    assert "core: ERROR" not in err  # the guard had nothing left to repair
+
+
+def test_a_pypi_declared_feature_installed_from_git_is_drift_not_present(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """`pypi` names a SOURCE for features too, not only for core.
+
+    A feature that reached the venv from a git URL sits at a satisfying version
+    and is not editable, so a check built on editability called it `present`
+    and sync never moved it back to the declared index source. There is no
+    reinstall loop to fear here: sync's git fallback is gated on `pypi_want is
+    None`, so a declared entry never falls back.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.3.1"})  # in range...
+    # ...but installed from a git ref, not the index.
+    monkeypatch.setattr(
+        cli,
+        "_direct_url_provenance",
+        lambda dist: ("git+https://example.invalid/voice@abc", False),
+    )
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+    # Scoped, or the same-version index wheel is a no-op and nothing moves.
+    assert spy.reinstalls == ["kestrel-feature-voice"]
+    assert "reinstalled" in capsys.readouterr().out
 
 
 def test_a_repair_killed_after_the_write_is_not_reported_as_a_failed_restore(

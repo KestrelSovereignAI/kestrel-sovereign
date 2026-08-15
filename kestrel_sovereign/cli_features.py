@@ -300,6 +300,27 @@ def _direct_url_provenance(dist_name: str):
     return (url or None), editable
 
 
+def _from_index(dist_name: str) -> bool:
+    """Did *dist_name* come from a package index?
+
+    The one question a ``pypi`` source declaration actually asks. An index
+    resolution records no PEP 610 ``direct_url.json``; every other way of naming
+    a source — editable checkout, VCS ref, local path, remote archive — records
+    one. So this is the whole predicate, and ``not is_editable`` is not a
+    substitute for it: a git-installed package is non-editable too, and used to
+    satisfy a declaration it violates (issue #2949).
+
+    A distribution that is not installed has no direct URL, so it reads as
+    "from an index" here; callers check presence separately.
+
+    Read through ``cli.`` so provenance has exactly ONE patchable seam: a test
+    that stubs where a package came from must not be able to leave this helper
+    answering from the developer's real venv.
+    """
+    url, _ = cli._direct_url_provenance(dist_name)
+    return url is None
+
+
 def _editable_install_path(dist_name: str) -> Optional[str]:
     """Return the local source path if *dist_name* is an editable install.
 
@@ -1377,30 +1398,18 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         # declares (codex round 8 P2) — or when a non-empty pin is violated
         # (codex round 2 P2). Both rather than a false `present`.
         #
-        # For CORE, ask the guard's own predicate rather than re-deriving one.
-        # Execution repairs any core that did not come from an index, so
-        # planning has to call that same thing drift — otherwise `sync
-        # --dry-run` and `feature status` promise `present` for a core the real
-        # sync reinstalls. Sharing one predicate is what stops preview and
-        # execution disagreeing at all.
+        # "Not from an index" covers the editable case and the direct-URL one
+        # (VCS ref, local path, remote archive) in a single question — the same
+        # question execution and the core guard ask, so a preview can never
+        # promise `present` for something the run reinstalls.
         #
-        # Core only, deliberately: a FEATURE package legitimately arrives from
-        # the registry's git URL when its index install fails, so calling a
-        # direct URL drift there would plan a reinstall on every run forever.
-        if canonical_package(target) == CORE_DISTRIBUTION:
-            from kestrel_sovereign.feature_reconcile import (
-                CoreSourcePolicy,
-                core_install_matches,
-            )
-
-            drifted = not core_install_matches(
-                cli._core_install_shape(), CoreSourcePolicy(pypi=pypi_want),
-            )
-        else:
-            drifted = bool(
-                cli._editable_install_path(target)
-            ) or not _version_satisfies(current, pypi_want)
-        if drifted:
+        # This applies to FEATURES as well as core, and deliberately so: sync's
+        # git fallback is gated on `pypi_want is None`, so a declared entry
+        # never falls back and there is no reinstall loop to avoid. Without it,
+        # a feature that reached the venv from a git URL by some other path
+        # would sit there forever while the manifest said it comes from the
+        # index.
+        if not cli._from_index(target) or not _version_satisfies(current, pypi_want):
             action = "reinstall"
         elif extras:
             action = "ensure"
@@ -1513,13 +1522,22 @@ def cmd_feature_sync(args) -> int:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
         else:
             pip_args = [install_target]
-            if pypi_want is not None and cli._editable_install_path(target):
-                # Switching a currently-editable install to a PyPI source needs
-                # a force reinstall; a plain pip install leaves the satisfying
-                # editable link in place, so the source switch never takes
-                # effect (codex round 10 P2). Scoped to THIS package: a blanket
-                # --force-reinstall cascades to core and swaps its editable link
-                # for a same-version index wheel, straight through the pin.
+            if pypi_want is not None and not cli._from_index(target):
+                # Switching to a PyPI source needs a scoped reinstall: pip and
+                # uv judge "already satisfied" by VERSION, so a plain install
+                # leaves the satisfying non-index copy in place and the source
+                # switch never takes effect (codex round 10 P2).
+                #
+                # "Not from an index", not "is editable" — a direct-URL copy
+                # (VCS, local path, archive) is equally satisfying and equally
+                # wrong. Asking the narrower question here made sync's own
+                # install a no-op, left the final guard to do the real repair,
+                # and so failed `feature sync` and `kestrel update` with rc=1
+                # over a run that had reached exactly the declared state.
+                #
+                # Scoped to THIS package: a blanket --force-reinstall cascades
+                # to core and swaps its editable link for a same-version index
+                # wheel, straight through the pin.
                 reinstall = target
 
         # Core is never constrained against itself — a `kestrel-sovereign`
