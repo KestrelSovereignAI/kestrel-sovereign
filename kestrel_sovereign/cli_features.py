@@ -1855,7 +1855,16 @@ def _query_agent_feature_catalog(base_url: str, api_key: str):
     for f in feats:
         pkg = f.get("package") if isinstance(f, dict) else None
         if isinstance(pkg, str) and pkg:
-            out[pkg] = f.get("status")
+            # Keyed on the canonical spelling, because the lookup side is.
+            # The agent reports whatever its installed METADATA says, and
+            # `Kestrel_Feature_Voice` is a legal Name: for the distribution the
+            # registry calls `kestrel-feature-voice`. `_resolve_manifest_action`
+            # canonicalizes its target, so keying this side raw makes the two
+            # miss each other and `feature status` shows an enabled feature as
+            # not loaded. Two spellings that canonicalize alike ARE one
+            # distribution, so collapsing them is the right answer rather than a
+            # collision (issue #2949).
+            out[canonical_package(pkg)] = f.get("status")
     return out
 
 

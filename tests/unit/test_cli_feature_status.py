@@ -350,3 +350,35 @@ def test_status_no_manifest_still_lists_agents(monkeypatch, fake_registry, tmp_p
 
     assert rc == 0
     assert "Run `kestrel feature sync --capture`" in out
+
+
+def test_catalog_keys_are_canonicalized_to_match_the_lookup(monkeypatch):
+    """The agent reports its installed METADATA spelling; the lookup is canonical.
+
+    `Kestrel_Feature_Voice` is a legal `Name:` for the distribution the registry
+    calls `kestrel-feature-voice`, and `_resolve_manifest_action` canonicalizes
+    its target. Keying this side raw makes the two miss, and `feature status`
+    then reports an ENABLED feature as not loaded — a regression introduced by
+    canonicalizing only one side.
+    """
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"features": [
+                {"package": "Kestrel_Feature_Voice", "status": "enabled"},
+                {"package": "kestrel.feature.github", "status": "installed"},
+            ]}
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+    out = cli._query_agent_feature_catalog("http://x", "key")
+
+    # Keyed the one way everything else in the pipeline is keyed, so the
+    # canonical target from _resolve_manifest_action finds them.
+    assert out == {
+        "kestrel-feature-voice": "enabled",
+        "kestrel-feature-github": "installed",
+    }
