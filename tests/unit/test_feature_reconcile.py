@@ -509,7 +509,8 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
 _DERIVE = object()
 
 
-def _shape(version=None, editable_path=None, direct_url=_DERIVE, known=True):
+def _shape(version=None, editable_path=None, direct_url=_DERIVE, known=True,
+           revision=None):
     """Build a CoreInstallShape the way real metadata would.
 
     An editable install records a PEP 610 direct URL *as well as* the editable
@@ -524,7 +525,9 @@ def _shape(version=None, editable_path=None, direct_url=_DERIVE, known=True):
     if not known:
         prov = fr.Provenance.unknown()
     elif direct_url:
-        prov = fr.Provenance.direct(direct_url, editable=bool(editable_path))
+        prov = fr.Provenance.direct(
+            direct_url, editable=bool(editable_path), revision=revision,
+        )
     else:
         prov = fr.Provenance.from_index_install()
     return fr.CoreInstallShape(version=version, provenance=prov)
@@ -708,7 +711,7 @@ def test_a_known_direct_url_core_is_guarded_too():
 
     assert policy.guarded
     assert policy.hold_version == "0.53.0"
-    assert policy.hold_source == url
+    assert policy.hold_provenance.url == url
     assert fr.core_install_constraints(shape, policy) == [
         f"{fr.CORE_DISTRIBUTION}==0.53.0",
     ]
@@ -749,8 +752,25 @@ def test_holding_a_known_direct_url_catches_a_same_version_swap():
     # Unknown source: nothing to compare against, so version stability is the
     # whole assertion and a same-version shape still passes.
     blind = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
-    assert blind.hold_source is None
+    assert blind.hold_provenance is not None and not blind.hold_provenance.known
     assert fr.core_install_matches(_shape("0.53.0", known=False), blind)
+
+
+def test_a_same_version_swap_between_two_commits_is_caught():
+    """The end the url-only identity could not see.
+
+    Same repository, same package version, different commit. Every version test
+    passes and the urls match, so a check built on `url` alone reports no
+    change — while core is running different code than the batch started with.
+    """
+    repo = "https://github.com/example/core"
+    before = _shape("0.53.0", direct_url=repo, revision="aaa111")
+    policy = fr.resolve_core_policy({}, before)
+
+    assert fr.core_install_matches(before, policy)
+    after = _shape("0.53.0", direct_url=repo, revision="bbb222")
+    assert after.direct_url == before.direct_url  # the url cannot tell them apart
+    assert not fr.core_install_matches(after, policy)
 
 
 def test_a_declared_source_still_wins_over_unreadable_provenance():

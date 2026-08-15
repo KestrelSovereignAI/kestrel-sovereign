@@ -1753,3 +1753,62 @@ def test_a_genuinely_absent_direct_url_file_is_still_an_index_install(
     prov = cli_features._direct_url_provenance("kestrel-sovereign")
 
     assert prov.known and prov.is_from_index
+
+
+def test_provenance_carries_the_vcs_revision_not_just_the_repo_url(monkeypatch):
+    """PEP 610 stores the revision in `vcs_info`, not in `url`.
+
+    Two commits of one repository share a url, so a Provenance built from the
+    url alone reports them identical — and a same-version replacement between
+    them reads as no change. That is the version-pin mistake this change exists
+    to correct, moved one field inward.
+    """
+    import importlib.metadata as md
+
+    def _dist(commit):
+        class _D:
+            def read_text(self, name):
+                return json.dumps({
+                    "url": "https://github.com/example/core",
+                    "vcs_info": {"vcs": "git", "commit_id": commit,
+                                 "requested_revision": "main"},
+                })
+        return _D()
+
+    monkeypatch.setattr(md, "distribution", lambda name: _dist("aaa111"))
+    a = cli_features._direct_url_provenance("kestrel-sovereign")
+    monkeypatch.setattr(md, "distribution", lambda name: _dist("bbb222"))
+    b = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert a.url == b.url                # same repository...
+    assert a.revision != b.revision      # ...different commit
+    assert a.source_id != b.source_id    # ...so a different SOURCE
+    assert "aaa111" in a.describe()      # and the operator is told which
+
+
+def test_provenance_carries_archive_hash_and_subdirectory(monkeypatch):
+    """The same for the other identity fields PEP 610 keeps outside `url`."""
+    import importlib.metadata as md
+
+    def _dist(payload):
+        class _D:
+            def read_text(self, name):
+                return json.dumps(payload)
+        return _D()
+
+    base = {"url": "https://example.invalid/core.tar.gz"}
+    monkeypatch.setattr(md, "distribution", lambda name: _dist(
+        {**base, "archive_info": {"hashes": {"sha256": "aaa"}}}))
+    a = cli_features._direct_url_provenance("kestrel-sovereign")
+    monkeypatch.setattr(md, "distribution", lambda name: _dist(
+        {**base, "archive_info": {"hashes": {"sha256": "bbb"}}}))
+    b = cli_features._direct_url_provenance("kestrel-sovereign")
+    assert a.url == b.url and a.source_id != b.source_id
+
+    monkeypatch.setattr(md, "distribution", lambda name: _dist(
+        {**base, "subdirectory": "pkg_a"}))
+    c = cli_features._direct_url_provenance("kestrel-sovereign")
+    monkeypatch.setattr(md, "distribution", lambda name: _dist(
+        {**base, "subdirectory": "pkg_b"}))
+    d = cli_features._direct_url_provenance("kestrel-sovereign")
+    assert c.url == d.url and c.source_id != d.source_id

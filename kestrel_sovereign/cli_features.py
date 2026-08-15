@@ -375,12 +375,52 @@ def _direct_url_provenance(dist_name: str):
         return Provenance.unknown()
     dir_info = data.get("dir_info")
     editable = bool(dir_info.get("editable")) if isinstance(dir_info, dict) else False
+
+    # The rest of the identity lives OUTSIDE ``url``. PEP 610 puts a VCS
+    # revision in ``vcs_info``, an archive's hashes in ``archive_info``, and the
+    # subdirectory alongside them — so two commits of one repository, or two
+    # builds of one archive path, carry the same url. Comparing urls alone
+    # reports a real replacement as no change, which is the version-pin mistake
+    # this whole change exists to correct, one field further in.
+    def _text(value):
+        return value if isinstance(value, str) and value.strip() else None
+
+    vcs_info = data.get("vcs_info")
+    revision = None
+    if isinstance(vcs_info, dict):
+        # commit_id is the resolved pin; requested_revision is what was asked
+        # for (a branch or tag, which moves). Prefer the resolved one.
+        revision = _text(vcs_info.get("commit_id")) or _text(
+            vcs_info.get("requested_revision")
+        )
+
+    archive_info = data.get("archive_info")
+    archive_hash = None
+    if isinstance(archive_info, dict):
+        hashes = archive_info.get("hashes")
+        if isinstance(hashes, dict):
+            # Sorted so an equal set of hashes always compares equal, whatever
+            # order the writer happened to emit.
+            archive_hash = ",".join(
+                f"{name}={digest}"
+                for name, digest in sorted(hashes.items())
+                if _text(digest)
+            ) or None
+        if archive_hash is None:
+            archive_hash = _text(archive_info.get("hash"))  # legacy single field
+
     if url.startswith("file:"):
         path = _file_url_to_path(url)
         if not path:
             return Provenance.unknown()  # a file: URL that will not resolve
         url = path
-    return Provenance.direct(url, editable=editable)
+    return Provenance.direct(
+        url,
+        editable=editable,
+        revision=revision,
+        subdirectory=_text(data.get("subdirectory")),
+        archive_hash=archive_hash,
+    )
 
 
 def _from_index(dist_name: str) -> bool:
@@ -1356,10 +1396,11 @@ class CoreInstallGuard:
             #
             # The two cases say different things to an operator: one can be told
             # exactly where core came from, the other cannot be told anything.
+            held = self.policy.hold_provenance
             cause = (
-                f"core was installed from {self.policy.hold_source}, which no "
-                "manifest entry declares"
-                if self.policy.hold_source
+                f"core was installed from {held.describe()}, which no manifest "
+                "entry declares"
+                if held is not None and held.known
                 else "core's install source could not be read"
             )
             return CoreGuardOutcome(

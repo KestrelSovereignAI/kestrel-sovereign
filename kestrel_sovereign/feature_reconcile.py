@@ -134,6 +134,15 @@ class Provenance:
     url: Optional[str] = None
     editable: bool = False
     known: bool = True
+    #: The rest of the PEP 610 identity. ``url`` alone is not the source: two
+    #: commits of one repository share a url, and two archives of one path share
+    #: a url, so comparing urls calls a real replacement "no change". The
+    #: revision lives in ``vcs_info``, the hash in ``archive_info``, and the
+    #: subdirectory beside them — all outside ``url``, and all part of *which*
+    #: source this is.
+    revision: Optional[str] = None
+    subdirectory: Optional[str] = None
+    archive_hash: Optional[str] = None
 
     @classmethod
     def unknown(cls) -> "Provenance":
@@ -146,9 +155,31 @@ class Provenance:
         return cls(url=None, editable=False, known=True)
 
     @classmethod
-    def direct(cls, url: str, *, editable: bool = False) -> "Provenance":
+    def direct(
+        cls,
+        url: str,
+        *,
+        editable: bool = False,
+        revision: Optional[str] = None,
+        subdirectory: Optional[str] = None,
+        archive_hash: Optional[str] = None,
+    ) -> "Provenance":
         """A source named directly — checkout, VCS ref, path, archive."""
-        return cls(url=url, editable=editable, known=True)
+        return cls(
+            url=url, editable=editable, known=True, revision=revision,
+            subdirectory=subdirectory, archive_hash=archive_hash,
+        )
+
+    @property
+    def source_id(self) -> tuple:
+        """The complete identity of this source, for comparison.
+
+        Everything that distinguishes one direct source from another. Compare
+        this, never ``url`` alone — a url match between two different commits is
+        exactly the false "no change" a version pin already fails at, one field
+        further in.
+        """
+        return (self.url, self.revision, self.subdirectory, self.archive_hash)
 
     @property
     def is_from_index(self) -> bool:
@@ -172,7 +203,19 @@ class Provenance:
         if not self.known:
             return "unknown source (direct_url.json unreadable)"
         if self.url:
-            return f"non-editable direct URL → {self.url}"
+            # Name the revision when there is one: "the same repo" is not the
+            # same source, and an operator comparing before/after needs to see
+            # which part moved.
+            extra = "".join(
+                f" ({label} {value})"
+                for label, value in (
+                    ("rev", self.revision),
+                    ("subdir", self.subdirectory),
+                    ("hash", self.archive_hash),
+                )
+                if value
+            )
+            return f"non-editable direct URL → {self.url}{extra}"
         return "non-editable (index wheel in site-packages)"
 
 
@@ -237,8 +280,9 @@ class CoreSourcePolicy:
         that would not read. Nobody said where core *should* come from, so no
         source can be asserted — but the batch can refuse to let a feature move
         it. The installed version is pinned and any change is reported.
-        ``hold_source`` records the direct URL when it is known, so the message
-        an operator reads says which of the two cases they are in.
+        ``hold_provenance`` records the provenance when it was readable, so the
+        message an operator reads says which of the two cases they are in — and
+        so the check compares the WHOLE source identity, not just a url.
 
     None set means core is a known, undeclared index wheel: nothing to protect,
     so the batch imposes no policy. That conclusion requires *knowing* core came
@@ -249,7 +293,9 @@ class CoreSourcePolicy:
     editable: Optional[str] = None
     pypi: Optional[str] = None
     hold_version: Optional[str] = None
-    hold_source: Optional[str] = None
+    #: The provenance being held, when it was readable. Carries the WHOLE PEP
+    #: 610 identity, not just a url — see :attr:`Provenance.source_id`.
+    hold_provenance: Optional["Provenance"] = None
 
     @property
     def guarded(self) -> bool:
@@ -284,11 +330,12 @@ class CoreSourcePolicy:
         if self.pypi is not None:
             return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
         if self.hold_version is not None:
-            if self.hold_source:
+            held = self.hold_provenance
+            if held is not None and held.known:
                 return (
                     f"unchanged at {self.hold_version} "
-                    f"(installed from {self.hold_source}, not an index — "
-                    "no declared source to restore from)"
+                    f"({held.describe()}, not an index — no declared source to "
+                    "restore from)"
                 )
             return (
                 f"unchanged at {self.hold_version} "
@@ -349,7 +396,7 @@ def resolve_core_policy(
         # first fall through unguarded, which is the same fail-open one branch
         # further along.
         return CoreSourcePolicy(
-            hold_version=shape.version, hold_source=shape.direct_url,
+            hold_version=shape.version, hold_provenance=shape.provenance,
         )
     return CoreSourcePolicy()
 
@@ -452,7 +499,8 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
     if policy.hold_version is not None:
         if shape.version != policy.hold_version:
             return False
-        if policy.hold_source is not None:
+        held = policy.hold_provenance
+        if held is not None and held.known:
             # The source WAS readable when the batch started, so it can be
             # checked — and must be. A version pin cannot see a same-version
             # swap: replacing a git-installed core with the index wheel that
@@ -460,7 +508,7 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             # That is the exact defect this whole change exists to fix, and
             # asserting only the version here would have reintroduced it inside
             # the policy written to prevent it.
-            return shape.direct_url == policy.hold_source
+            return shape.provenance.source_id == held.source_id
         # Genuinely unknown source: version stability is all that can honestly
         # be asserted. Inventing a verdict about the source would be the
         # fabrication the guard refuses everywhere else.
