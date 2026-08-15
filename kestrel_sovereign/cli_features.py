@@ -267,6 +267,47 @@ def _file_url_to_path(url: str) -> str:
     return path
 
 
+#: Outcomes of re-reading ``direct_url.json`` that are not file contents.
+_ABSENT = object()
+_UNREADABLE = object()
+
+
+def _reread_direct_url(dist):
+    """Read ``direct_url.json`` ourselves, distinguishing absent from unreadable.
+
+    ``Distribution.read_text`` returns None for both, by design — it suppresses
+    ``FileNotFoundError`` and ``PermissionError`` together. The guard needs them
+    apart: absent is the positive evidence of an index install, unreadable is
+    the state where nothing may be inferred.
+
+    Returns the file's text, :data:`_ABSENT`, or :data:`_UNREADABLE`. A
+    distribution whose metadata directory we cannot identify reads as ABSENT:
+    index installs (which have no such file) are the overwhelming majority, so
+    treating an unlocatable file as unknown would hold every ordinary core on
+    any layout we cannot follow.
+
+    Anchors on ``_path`` — the metadata directory — because that is where
+    ``read_text`` looks and therefore where the file is. ``locate_file`` is the
+    tempting public alternative and it is the WRONG anchor: it resolves against
+    ``_path.parent`` (site-packages) because it exists to find *package* files,
+    so a re-read through it silently checks a path the file was never at, and
+    every unreadable file comes back "absent" — the exact fail-open this
+    function was added to close.
+    """
+    base = getattr(dist, "_path", None)
+    if base is None:
+        return _ABSENT
+    try:
+        return base.joinpath("direct_url.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _ABSENT
+    except (OSError, ValueError, AttributeError):
+        # PermissionError, IsADirectoryError, a decode failure, or a path object
+        # that does not support reading: the file's status was never established,
+        # so nothing may be concluded from it.
+        return _UNREADABLE
+
+
 def _direct_url_provenance(dist_name: str):
     """Read *dist_name*'s PEP 610 provenance. Returns a :class:`Provenance`.
 
@@ -302,8 +343,21 @@ def _direct_url_provenance(dist_name: str):
     except Exception:
         return Provenance.unknown()
     if raw is None:
-        # No direct_url.json at all: positive evidence of an index install.
-        return Provenance.from_index_install()
+        # `read_text` cannot be trusted to mean "absent". The stdlib's
+        # PathDistribution suppresses FileNotFoundError, PermissionError,
+        # IsADirectoryError, NotADirectoryError and KeyError alike and returns
+        # None for all of them — so a direct_url.json that EXISTS but cannot be
+        # read arrives here identical to one that was never written, and would
+        # be reported as positive evidence of an index install. That is the
+        # fail-open this reader exists to close, reintroduced by trusting an
+        # API that is documented to swallow the difference.
+        #
+        # So re-read it ourselves and classify by what actually goes wrong.
+        raw = _reread_direct_url(dist)
+        if raw is _ABSENT:
+            return Provenance.from_index_install()  # genuinely not there
+        if raw is _UNREADABLE:
+            return Provenance.unknown()
     if not raw.strip():
         return Provenance.unknown()  # present but empty is damage, not an index
     try:

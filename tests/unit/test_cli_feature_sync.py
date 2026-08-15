@@ -1689,3 +1689,67 @@ def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
     assert "REFUSED" in out
     assert "NOT updated" in out  # the staleness is named
     assert venv.editable.get(CORE) == str(checkout)
+
+
+def test_an_unreadable_direct_url_file_is_unknown_not_an_index_install(
+    monkeypatch, tmp_path,
+):
+    """`read_text` returning None does NOT mean the file is absent.
+
+    `importlib.metadata`'s PathDistribution suppresses FileNotFoundError and
+    PermissionError together and returns None for both, so a direct_url.json
+    that exists but cannot be read arrives identical to one never written — and
+    "never written" is the positive evidence of an index install. A
+    permission-damaged editable core would therefore have read as from-index and
+    left the guard unconstrained, which is the fail-open this reader exists to
+    close.
+
+    Uses a real unreadable file rather than a stub: the bug lives in what the
+    stdlib does with the exception, so a double that raises would test the
+    double.
+    """
+    import importlib.metadata as md
+
+    dist_info = tmp_path / "kestrel_sovereign-0.53.0.dist-info"
+    dist_info.mkdir()
+    target = dist_info / "direct_url.json"
+    target.write_text('{"url": "/src/core", "dir_info": {"editable": true}}')
+    target.chmod(0o000)
+    try:
+        readable = False
+        try:
+            target.read_text()
+            readable = True   # running as root, or a filesystem without perms
+        except PermissionError:
+            pass
+        if readable:
+            pytest.skip("filesystem does not enforce file permissions here")
+
+        monkeypatch.setattr(
+            md, "distribution", lambda name: md.PathDistribution(dist_info),
+        )
+        prov = cli_features._direct_url_provenance("kestrel-sovereign")
+    finally:
+        target.chmod(0o600)
+
+    assert not prov.known          # present but unreadable
+    assert not prov.is_from_index  # and so NOT positive evidence of an index
+
+
+def test_a_genuinely_absent_direct_url_file_is_still_an_index_install(
+    monkeypatch, tmp_path,
+):
+    """The counterpart, so 'fail closed' does not degrade into 'always hold':
+    an install with no direct_url.json is exactly what an index resolution
+    looks like, and must keep reading as one."""
+    import importlib.metadata as md
+
+    dist_info = tmp_path / "kestrel_sovereign-0.53.0.dist-info"
+    dist_info.mkdir()
+    monkeypatch.setattr(
+        md, "distribution", lambda name: md.PathDistribution(dist_info),
+    )
+
+    prov = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert prov.known and prov.is_from_index

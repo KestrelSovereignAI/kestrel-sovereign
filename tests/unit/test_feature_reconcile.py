@@ -721,6 +721,38 @@ def test_a_known_direct_url_core_is_guarded_too():
     assert url in policy.describe_expected()
 
 
+def test_holding_a_known_direct_url_catches_a_same_version_swap():
+    """A version pin cannot see a source swap — the lesson of this entire change.
+
+    Replacing a git-installed core with the index wheel that publishes that very
+    version passes every version test there is. Asserting only the version in
+    the hold branch would have rebuilt the original defect inside the policy
+    written to prevent it: `verify()` reporting success, and `kestrel update`
+    restarting, while core's source had changed underneath.
+
+    Where the source is genuinely unknown there is nothing to compare, so the
+    version is all that can honestly be asserted — the two cases must not be
+    collapsed in either direction.
+    """
+    url = "git+https://example.invalid/core@abc"
+    before = _shape("0.53.0", direct_url=url)
+    policy = fr.resolve_core_policy({}, before)
+
+    assert fr.core_install_matches(before, policy)  # untouched: fine
+    # Same version, swapped to the index wheel — invisible to a version pin.
+    assert not fr.core_install_matches(_shape("0.53.0"), policy)
+    # Same version, swapped to a DIFFERENT direct URL — equally a swap.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", direct_url="git+https://example.invalid/core@def"), policy,
+    )
+
+    # Unknown source: nothing to compare against, so version stability is the
+    # whole assertion and a same-version shape still passes.
+    blind = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert blind.hold_source is None
+    assert fr.core_install_matches(_shape("0.53.0", known=False), blind)
+
+
 def test_a_declared_source_still_wins_over_unreadable_provenance():
     """The hold policy is the *fallback*. Where the operator declared core's
     source, that declaration is still the policy — and still repairable."""

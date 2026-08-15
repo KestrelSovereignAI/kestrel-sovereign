@@ -450,11 +450,21 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             and version_satisfies(shape.version, policy.pypi)
         )
     if policy.hold_version is not None:
-        # All this policy can assert is that nobody moved core. It deliberately
-        # does not judge the SOURCE: it exists because the source is unknown,
-        # and inventing a verdict about it would be the fabrication the guard
-        # refuses everywhere else.
-        return shape.version == policy.hold_version
+        if shape.version != policy.hold_version:
+            return False
+        if policy.hold_source is not None:
+            # The source WAS readable when the batch started, so it can be
+            # checked — and must be. A version pin cannot see a same-version
+            # swap: replacing a git-installed core with the index wheel that
+            # publishes that same version passes every version test there is.
+            # That is the exact defect this whole change exists to fix, and
+            # asserting only the version here would have reintroduced it inside
+            # the policy written to prevent it.
+            return shape.direct_url == policy.hold_source
+        # Genuinely unknown source: version stability is all that can honestly
+        # be asserted. Inventing a verdict about the source would be the
+        # fabrication the guard refuses everywhere else.
+        return True
     return True
 
 
