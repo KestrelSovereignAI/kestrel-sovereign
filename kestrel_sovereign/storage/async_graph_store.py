@@ -1066,9 +1066,29 @@ class AsyncGraphStore:
             # stays true — only the transition into a fleet-shared shape is
             # refused. A row retyped underneath us matches zero rows and falls
             # to the classification read, exactly like a lost predicate race.
+            #
+            # Ownership rides along for the same reason: the owner count above
+            # is a read, not a lock, so a second tenant can commit its witness
+            # between that count and this write and the swap would rewrite a row
+            # that had become co-owned in the interval — exactly what the count
+            # exists to refuse. Spelled as "at most one distinct owner" rather
+            # than "no owner but me" so an unbound maintenance store keeps the
+            # behaviour the pre-write check gives it: it owns nothing, and a
+            # single-owner row stays writable by it.
+            #
+            # That is every pre-write gate on this path now pinned atomically.
+            # The other two were already covered and it is worth saying why, so
+            # nobody adds a third and assumes the same: the stored *properties*
+            # the identity check reads are pinned by the existing
+            # ``properties = expected`` predicate, and the stored ``node_type``
+            # the ``allowed_node_types`` gate reads is pinned by ``type_clause``.
             if stored_shape is not None:
-                shape_clause = " AND node_type = ? AND label = ?"
-                shape_params: tuple = stored_key
+                shape_clause = (
+                    " AND node_type = ? AND label = ?"
+                    " AND (SELECT COUNT(DISTINCT agent_id) FROM graph_node_owners"
+                    " WHERE node_id = ?) <= 1"
+                )
+                shape_params: tuple = (*stored_key, node_id)
             else:
                 shape_clause = "".join(
                     " AND NOT (node_type = ? AND label = ?)"

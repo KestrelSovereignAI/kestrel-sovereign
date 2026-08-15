@@ -893,6 +893,64 @@ class TestTheSwapDecidesAtomically:
             "the swap landed on a row that had stopped being the shape it checked"
         )
 
+    async def test_an_owner_joining_mid_flight_does_not_lose_its_stamp(
+        self, db, constitution_bytes, monkeypatch
+    ):
+        """The owner count is a read, not a lock.
+
+        A second tenant can commit its ownership witness between the count and
+        the UPDATE, and the swap would then rewrite a row that had become
+        co-owned in the interval — the exact write the count exists to refuse,
+        landing anyway. Injected after the *owner* read specifically: injecting
+        earlier would just make the count see two owners and raise, which is
+        the case already covered and proves nothing about the window.
+        """
+        node_id = await _take_possession(
+            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        await _take_possession(
+            db, AGENT_B, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(
+            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
+        )
+        snapshot = (await graph.get_node(node_id)).properties
+
+        original = db.fetchall
+        fired = {"done": False}
+
+        async def hooked(sql, params=None):
+            rows = await original(sql, params)
+            if (
+                not fired["done"]
+                and "FROM graph_node_owners WHERE node_id" in sql
+            ):
+                fired["done"] = True
+                await db.execute(
+                    "INSERT INTO graph_node_owners (node_id, agent_id) "
+                    "VALUES (?, ?)",
+                    (node_id, AGENT_B),
+                )
+            return rows
+
+        monkeypatch.setattr(db, "fetchall", hooked)
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
+        )
+
+        assert fired["done"], "the race was never injected; the test proves nothing"
+        assert result != NodeSwapResult.SWAPPED
+        row = await db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
+        )
+        assert "2026-01-01" in (row[0] or ""), (
+            "a co-owner's stamp was overwritten by a swap that raced its arrival"
+        )
+
     async def test_an_ordinary_concurrent_retype_still_coexists(self, db):
         """The documented behaviour this must not quietly break.
 
