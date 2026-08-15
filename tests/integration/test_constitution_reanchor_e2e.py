@@ -43,6 +43,7 @@ from kestrel_sovereign.constitution.amendment_artifact import (
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 
 CONSTITUTION_V1 = b"""# Kestrel Constitution (Test V1)
@@ -514,7 +515,24 @@ async def test_doctor_edge_drift_repaired_by_same_hash_reanchor(
     # Recreate the legacy pre-atomic-reanchor state: repoint the edge at an
     # ancient anchor while property + blob stay current.
     ancient = hashlib.sha256(b"ancient governing text").hexdigest()
-    async with AsyncStorage(str(db_path)) as storage:
+    # Bound to the agent, because the agent is what wrote this edge in the
+    # incident being recreated. An *unbound* ``AsyncStorage`` lays the row down
+    # with no ``graph_edge_owners`` witness, and a bound reader — the runtime,
+    # its integrity audit, and now doctor — cannot see such a row at all. The
+    # unbound seed was staging a state no agent can actually reach, then
+    # asserting what doctor says about it.
+    #
+    # The ancient document node has to exist and be owned, too: a stale
+    # ``governed_by`` points at the constitution this agent *used* to be
+    # governed by, which it necessarily owned. A bound writer refuses an edge
+    # to an unowned endpoint, so seeding only the edge cannot happen either.
+    async with AsyncStorage(str(db_path), agent_id=agent_did) as storage:
+        await storage.graph.add_node(GraphNode(
+            node_id=ancient,
+            node_type="document",
+            label="KESTREL_CONSTITUTION",
+            properties={"hash": ancient, "type": "Constitution"},
+        ))
         await storage.graph.add_edge(agent_did, ancient, "governed_by")
         await storage.graph.delete_edge(agent_did, v1_hash, "governed_by")
 

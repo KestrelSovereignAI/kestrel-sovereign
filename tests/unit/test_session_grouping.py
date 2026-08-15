@@ -8,10 +8,13 @@ session boundaries and the agent can soft-delete the wrong conversation.
 from datetime import datetime, timedelta, timezone
 
 from kestrel_sovereign.storage.session_grouping import (
+    autonomous_wake_preview,
     canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    signal_wake_source,
+    summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
 )
@@ -19,7 +22,8 @@ from kestrel_sovereign.storage.session_grouping import (
 BASE = datetime(2026, 6, 29, 12, 0, 0)
 
 
-def _msg(i, role, content, *, minutes=0, session_id=None, new_session=False, operator_signal=False):
+def _msg(i, role, content, *, minutes=0, session_id=None, new_session=False,
+         operator_signal=False, signal_wake=None):
     meta = {}
     if session_id is not None:
         meta["session_id"] = session_id
@@ -27,6 +31,8 @@ def _msg(i, role, content, *, minutes=0, session_id=None, new_session=False, ope
         meta["new_session"] = True
     if operator_signal:
         meta["operator_signal"] = True
+    if signal_wake is not None:
+        meta["signal_wake"] = signal_wake
     return {
         "id": i,
         "role": role,
@@ -267,6 +273,134 @@ def test_coalesce_backfills_preview_when_first_cluster_is_operator_only():
     coalesced = coalesce_sessions_by_session_id(grouped)
     assert len(coalesced) == 1
     assert coalesced[0]["preview_content"] == "real question"
+
+
+WAKE = {"source": "talon.job_complete", "mode": "cognition"}
+
+
+def test_signal_wake_is_skipped_for_preview():
+    # A COGNITION signal wake (heartbeat, talon.job_complete, wait.complete,
+    # restart.completed, a2a) persists as role="user" so it replays in history
+    # (#2204), but it is synthetic — it must never win the preview slot over
+    # the real user message (#2947).
+    msgs = [
+        _msg(1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", minutes=0,
+             session_id="s1", signal_wake=WAKE),
+        _msg(2, "user", "what's the weather", minutes=1, session_id="s1"),
+        _msg(3, "assistant", "sunny", minutes=2, session_id="s1"),
+    ]
+    sessions = group_messages_into_sessions(msgs)
+    assert len(sessions) == 1
+    assert sessions[0]["preview_content"] == "what's the weather"
+    # Still counted as real turns for message_count/user_message_count.
+    assert sessions[0]["user_message_count"] == 2
+
+
+def test_signal_wake_only_session_is_labeled_by_its_wake():
+    # Unattended dispatch (CLI, scheduler, detached) and heartbeat-born
+    # sessions have a wake as their FIRST user row and may never get a human
+    # turn. That session has no preview_content, but it is not blank either —
+    # it carries the wake source so callers can title it honestly (#2947).
+    msgs = [
+        _msg(1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", minutes=0,
+             session_id="s1", signal_wake=WAKE),
+        _msg(2, "assistant", "reviewed the PR", minutes=1, session_id="s1"),
+    ]
+    sessions = group_messages_into_sessions(msgs)
+    assert len(sessions) == 1
+    assert sessions[0]["preview_content"] is None
+    assert sessions[0]["preview_wake_source"] == "talon.job_complete"
+
+
+def test_signal_wake_without_source_still_marks_the_session_autonomous():
+    msgs = [_msg(1, "user", "wake", minutes=0, session_id="s1", signal_wake=True)]
+    sessions = group_messages_into_sessions(msgs)
+    assert sessions[0]["preview_content"] is None
+    assert sessions[0]["preview_wake_source"] == "signal"
+
+
+def test_first_wake_source_wins_over_later_wakes():
+    msgs = [
+        _msg(1, "user", "heartbeat wake", minutes=0, session_id="s1",
+             signal_wake={"source": "heartbeat", "mode": "cognition"}),
+        _msg(2, "user", "talon wake", minutes=1, session_id="s1", signal_wake=WAKE),
+    ]
+    sessions = group_messages_into_sessions(msgs)
+    assert sessions[0]["preview_wake_source"] == "heartbeat"
+
+
+def test_ordinary_rows_carry_no_wake_source():
+    msgs = [_msg(1, "user", "hi", minutes=0, session_id="s1")]
+    sessions = group_messages_into_sessions(msgs)
+    assert sessions[0]["preview_wake_source"] is None
+    assert signal_wake_source({}) is None
+    assert signal_wake_source({"signal_wake": WAKE}) == "talon.job_complete"
+
+
+def test_coalesce_backfills_preview_when_first_cluster_is_wake_only():
+    # Talon origin-session binding (#2877) lands wakes into a live session
+    # across multi-hour gaps, so the grouper emits a wake-only first cluster.
+    # Coalescing must surface the later real user message as the title while
+    # keeping the wake source for sessions that never get one.
+    msgs = [
+        _msg(1, "user", "[TALON_JOB_COMPLETE] ...", minutes=0,
+             session_id="s-resumed", signal_wake=WAKE),
+        _msg(2, "user", "real question", minutes=200, session_id="s-resumed"),
+    ]
+    grouped = group_messages_into_sessions(msgs)
+    assert len(grouped) == 2  # split by the gap
+    assert grouped[0]["preview_content"] is None
+    coalesced = coalesce_sessions_by_session_id(grouped)
+    assert len(coalesced) == 1
+    assert coalesced[0]["preview_content"] == "real question"
+    assert coalesced[0]["preview_wake_source"] == "talon.job_complete"
+
+
+def test_coalesce_carries_wake_source_forward_from_a_later_cluster():
+    msgs = [
+        _msg(1, "assistant", "orphan reply", minutes=0, session_id="s-resumed"),
+        _msg(2, "user", "[TALON_JOB_COMPLETE] ...", minutes=200,
+             session_id="s-resumed", signal_wake=WAKE),
+    ]
+    coalesced = coalesce_sessions_by_session_id(group_messages_into_sessions(msgs))
+    assert len(coalesced) == 1
+    assert coalesced[0]["preview_content"] is None
+    assert coalesced[0]["preview_wake_source"] == "talon.job_complete"
+
+
+def test_summarize_sessions_titles_a_wake_only_session():
+    # The agent-facing twin must agree with the UI: a session whose only user
+    # rows were wakes is named for the autonomous work it ran, never left
+    # blank (which the UI would render as "New conversation") (#2947).
+    msgs = [
+        _msg(1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", minutes=0,
+             session_id="s1", signal_wake=WAKE),
+        _msg(2, "assistant", "reviewed the PR", minutes=1, session_id="s1"),
+    ]
+    summaries = summarize_sessions(msgs)
+    assert len(summaries) == 1
+    assert summaries[0]["preview"] == "Autonomous wake — talon.job_complete"
+    assert summaries[0]["preview"] == autonomous_wake_preview("talon.job_complete")
+    # Raw picker fields are consumed, never leaked to the tool payload.
+    assert "preview_wake_source" not in summaries[0]
+
+
+def test_summarize_sessions_prefers_a_real_user_message_over_the_wake_label():
+    msgs = [
+        _msg(1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", minutes=0,
+             session_id="s1", signal_wake=WAKE),
+        _msg(2, "user", "what's the weather", minutes=1, session_id="s1"),
+    ]
+    summaries = summarize_sessions(msgs)
+    assert summaries[0]["preview"] == "what's the weather"
+
+
+def test_summarize_sessions_never_labels_an_ordinary_session_autonomous():
+    # No wake ran here, so the human turn is the title — the wake label must
+    # not bleed onto ordinary conversations.
+    msgs = [_msg(1, "user", "hi", minutes=0, session_id="s1")]
+    summaries = summarize_sessions(msgs)
+    assert summaries[0]["preview"] == "hi"
 
 
 def test_coalesce_leaves_distinct_sessions_untouched():

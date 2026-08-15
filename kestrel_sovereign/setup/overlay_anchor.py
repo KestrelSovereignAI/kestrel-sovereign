@@ -26,8 +26,10 @@ from pathlib import Path
 from typing import Optional
 
 from kestrel_sovereign.setup.constitution_reanchor import (
+    ReanchorTarget,
     ReanchorTargetError,
     resolve_reanchor_target,
+    runtime_record_is_pending,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,11 @@ class OverlayAnchorResult:
     #: anchor that does not say where it landed cannot be trusted to have
     #: landed anywhere the agent reads (#2890).
     target_label: str = ""
+    #: ``"sqlite"`` or ``"postgres"`` — the same fact as ``target_label`` but
+    #: as a value rather than prose. The label embeds a filesystem path, so a
+    #: caller asserting on it is one directory name away from asserting
+    #: nothing; ``ReanchorResult`` carries the pair for the same reason.
+    target_backend: str = ""
 
 
 async def anchor_overlay(
@@ -85,6 +92,27 @@ async def anchor_overlay(
         )
 
     try:
+        # Same rule as the constitution reanchor, from the same predicate: before
+        # replication the bytes that will govern this agent are the anchor's, so an
+        # overlay anchored anywhere else is anchored where boot will not look.
+        #
+        # This is *not* a licence to prefer the local file generally — that was the
+        # #2890 defect, and it stays refused. An Amendment IX overlay hash is read
+        # from the runtime database, so writing it locally on a replicated host
+        # reports success while every grant stays denied. Pending is the one state
+        # where the anchor is the runtime's future contents.
+        if not target.writes_to_anchor and await runtime_record_is_pending(target):
+            logger.info(
+                "%s has no record for %s yet; anchoring the overlay in the local "
+                "anchor, which is what first boot will replicate.",
+                target.describe(), target.agent_did,
+            )
+            target = ReanchorTarget(
+                anchor_path=target.anchor_path,
+                backend="sqlite",
+                agent_did=target.agent_did,
+            )
+
         return await _anchor_overlay_in(
             target,
             agent_name=agent_name,
@@ -100,7 +128,7 @@ async def anchor_overlay(
                 f"{exc!r}. Nothing was written."
             ),
             overlay_path=overlay_path, new_hash=new_hash,
-            target_label=target.describe(),
+            target_label=target.describe(), target_backend=target.backend,
         )
 
 
@@ -127,14 +155,14 @@ async def _anchor_overlay_in(
                     f"{target.describe()}"
                 ),
                 overlay_path=overlay_path, new_hash=new_hash,
-                target_label=target.describe(),
+                target_label=target.describe(), target_backend=target.backend,
             )
         old_hash = node.properties.get(OVERLAY_HASH_PROPERTY)
         if old_hash == new_hash:
             return OverlayAnchorResult(
                 agent_name=agent_name, unchanged=True,
                 old_hash=old_hash, new_hash=new_hash, overlay_path=overlay_path,
-                target_label=target.describe(),
+                target_label=target.describe(), target_backend=target.backend,
             )
         node.properties[OVERLAY_HASH_PROPERTY] = new_hash
         await storage.graph.add_node(node)  # upsert
@@ -144,5 +172,5 @@ async def _anchor_overlay_in(
         )
     return OverlayAnchorResult(
         agent_name=agent_name, old_hash=old_hash, new_hash=new_hash,
-        overlay_path=overlay_path, target_label=target.describe(),
+        overlay_path=overlay_path, target_label=target.describe(), target_backend=target.backend,
     )

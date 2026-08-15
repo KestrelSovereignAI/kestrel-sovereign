@@ -166,6 +166,25 @@ class TestSearchSessionSummaries:
             [marker], "zebra", names={"s-new": "Budget planning"}
         ) == []
 
+    def test_wake_only_hit_carries_its_wake_source_for_decoration(self):
+        """Search reuses the shared #2019 grouping, so it inherits the #2947
+        preview picker: a wake row never fills the preview slot, and the wake
+        source rides along so the endpoint can title the card honestly."""
+        wake = {
+            "id": 1,
+            "role": "user",
+            "content": "[TALON_JOB_COMPLETE] penguin job finished",
+            "metadata": {
+                "session_id": "s-wake",
+                "signal_wake": {"source": "talon.job_complete", "mode": "cognition"},
+            },
+            "created_at": BASE,
+        }
+        results = search_session_summaries([wake], "penguin")
+        assert [s["session_id"] for s in results] == ["s-wake"]
+        assert results[0]["preview_content"] is None
+        assert results[0]["preview_wake_source"] == "talon.job_complete"
+
     def test_resumed_session_coalesces_to_one_hit(self):
         """A session resumed past the gap must surface as ONE result (#2019)."""
         msgs = [
