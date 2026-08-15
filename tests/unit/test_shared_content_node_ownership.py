@@ -476,21 +476,34 @@ class TestTheSwapDoorObeysTheSameRules:
         assert "source_path" not in stored.properties
 
     async def test_a_co_owner_cannot_swap_a_row_the_fleet_shares(
-        self, db, artifact_bytes
+        self, db, constitution_bytes
     ):
-        """Even a well-formed swap is refused once the row has two owners.
+        """The co-owner rule, isolated from the identity rule.
+
+        Deliberately on the *anchor* rather than the artifact. Every artifact
+        field is an identity field, so any swap worth refusing there is already
+        refused for disagreeing on identity, and this test would prove nothing
+        about co-ownership — it would pass with the co-owner check deleted.
+        ``created_at`` is the one field a fleet-shared row legitimately differs
+        on, which makes it the only way to ask this question on its own.
 
         ``add_node`` hands a second tenant an ownership witness and leaves the
-        canonical bytes alone — it will not rewrite a row more than one tenant
-        owns. A swap must not be the door that does what the front door
-        refuses, or one co-owner silently redefines what the others are
-        governed by.
+        first tenant's stamp alone. A swap must not be the door that does what
+        the front door refuses.
         """
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        await _take_possession(db, AGENT_B, artifact_bytes, "a.json")
-        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+        node_id = await _take_possession(
+            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        await _take_possession(
+            db, AGENT_B, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        await _graph(db, AGENT_A).add_node(
+            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
+        )
         graph_b = _graph(db, AGENT_B)
-        await graph_b.add_node(_artifact_node(node_id))
+        await graph_b.add_node(
+            _constitution_node(node_id, "2026-08-11T00:00:00+00:00")
+        )
         assert await _owners(db, node_id) == sorted([AGENT_A, AGENT_B])
 
         snapshot = (await graph_b.get_node(node_id)).properties
@@ -498,31 +511,105 @@ class TestTheSwapDoorObeysTheSameRules:
             await graph_b.compare_and_swap_node(
                 node_id,
                 snapshot,
-                _artifact_node(node_id, signer="did:web:someone-else.example"),
+                _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
             )
 
         stored = await graph_b.get_node(node_id)
-        assert stored.properties["signer"] == SIGNER
+        assert stored.properties["created_at"] == "2026-01-01T00:00:00+00:00"
 
-    async def test_a_lone_owner_can_still_swap_its_own_shared_row(
+    async def test_a_lone_owner_cannot_swap_the_identity_either(
         self, db, artifact_bytes
     ):
-        """The refusal is about co-owners, not about the shape being shared.
+        """Being first is not a licence to redefine the row.
 
-        A single owner rewriting its own row affects nobody else, and
-        ``add_node`` allows exactly that — so refusing it here would be a
-        stricter rule at one door than the other, which is the shape of bug
-        this whole change is about.
+        An earlier version of this test asserted the opposite — that a sole
+        owner may rewrite its own shared row, on the reasoning that nobody else
+        is on it yet so nobody is harmed. That reasoning is wrong, and the test
+        was pinning the hole open. A node id here IS the hash of the bytes, so
+        identity cannot legitimately change while the id stays: a different
+        artifact is a different node. Swap in another well-formed ``signer``
+        and every sibling that later anchors the genuine file disagrees with
+        the stored row and rolls back — this issue's fleet split, reachable by
+        one agent acting alone, and unrepairable afterwards.
         """
         node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
         graph = _graph(db, AGENT_A)
         await graph.add_node(_artifact_node(node_id))
         snapshot = (await graph.get_node(node_id)).properties
 
+        with pytest.raises(REFUSAL, match="content-derived identity"):
+            await graph.compare_and_swap_node(
+                node_id,
+                snapshot,
+                _artifact_node(node_id, signer="did:web:someone-else.example"),
+            )
+
+        stored = await graph.get_node(node_id)
+        assert stored.properties["signer"] == SIGNER
+
+    async def test_a_lone_owner_cannot_rewrite_the_identity_through_add_node(
+        self, db, artifact_bytes
+    ):
+        """The same rule at the front door, or the swap check is theatre."""
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+
+        with pytest.raises(REFUSAL, match="content-derived identity"):
+            await graph.add_node(
+                _artifact_node(node_id, signer="did:web:someone-else.example")
+            )
+
+        stored = await graph.get_node(node_id)
+        assert stored.properties["signer"] == SIGNER
+
+    async def test_the_owner_may_still_restate_the_same_artifact(
+        self, db, artifact_bytes
+    ):
+        """Immutable identity is not a frozen row.
+
+        Re-anchoring the same artifact — an idempotent repeat, which the
+        reanchor writer does — presents identical properties, agrees with
+        itself, and must still land. A rule that refused this would brick the
+        ordinary path.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+
+        await graph.add_node(_artifact_node(node_id))
+        result = await graph.compare_and_swap_node(
+            node_id,
+            (await graph.get_node(node_id)).properties,
+            _artifact_node(node_id),
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        assert await _owners(db, node_id) == [AGENT_A]
+
+    async def test_an_anchors_own_timestamp_is_still_the_owners_to_change(
+        self, db, constitution_bytes
+    ):
+        """The guard against over-fixing, on the swap door.
+
+        ``created_at`` is outside the anchor's identity set — it is when *this*
+        tenant stored the document, not a property of the document — so a lone
+        owner may still update it. Folding it into identity would make the
+        rule wrong in the other direction.
+        """
+        node_id = await _take_possession(
+            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(
+            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
+        )
+        snapshot = (await graph.get_node(node_id)).properties
+
         result = await graph.compare_and_swap_node(
             node_id,
             snapshot,
-            _artifact_node(node_id, created_at="2027-01-01T00:00:00+00:00"),
+            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
         )
 
         assert result == NodeSwapResult.SWAPPED

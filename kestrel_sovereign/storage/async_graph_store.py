@@ -711,6 +711,27 @@ class AsyncGraphStore:
                 raise ValueError(
                     "Cannot overwrite a graph node owned by another agent"
                 )
+            # Being the only owner today is not a licence to redefine what the
+            # row says. These node ids ARE the hash of the bytes, so the
+            # identity fields cannot legitimately change while the id stays the
+            # same — a different artifact is a different node. Allowing a sole
+            # owner to swap in another well-formed ``signer`` looked harmless
+            # (nobody else is on the row yet) and is not: every sibling that
+            # later anchors the genuine file now disagrees with the stored row
+            # and rolls back, with no way to repair it. That is this issue's
+            # fleet split, reachable by one agent acting alone.
+            if (
+                existing
+                and shape is not None
+                and not normalisable_legacy
+                and not _agrees_on_shared_identity(
+                    existing_properties, node.properties, shape
+                )
+            ):
+                raise ValueError(
+                    "Cannot change the content-derived identity of a "
+                    f"fleet-shared graph node: {node.node_type}/{node.label}"
+                )
 
             # For an identical shared node, retain the canonical row bytes and
             # add only the second ownership witness.  This avoids one tenant
@@ -937,7 +958,7 @@ class AsyncGraphStore:
             # primitive's classification is built to avoid. Invisible rows fall
             # through and the UPDATE matches nothing, exactly as before.
             stored_shape_row = await self.db.fetchone(
-                "SELECT node_type, label FROM graph_nodes "
+                "SELECT node_type, label, properties FROM graph_nodes "
                 f"WHERE node_id = ? AND {scope}",
                 (node_id, *scope_params),
             )
@@ -946,11 +967,32 @@ class AsyncGraphStore:
                 self._refuse_unshareable_properties(
                     stored_key, new_node.properties, node_id
                 )
-                if stored_key in _SHARED_CONTENT_SHAPES:
-                    # add_node will not rewrite a row more than one tenant owns
-                    # — it hands out a second ownership witness and leaves the
-                    # canonical bytes alone. A swap must not be the door that
-                    # does what the front door refuses.
+                stored_shape = _SHARED_CONTENT_SHAPES.get(stored_key)
+                if stored_shape is not None:
+                    # Same two rules add_node applies, for the same reasons.
+                    # The identity fields of a content-addressed row cannot
+                    # change while its id stays the same, sole owner or not —
+                    # otherwise one agent alone can leave a row that every
+                    # later co-owner disagrees with and none can repair.
+                    stored_properties = (
+                        json.loads(stored_shape_row[2])
+                        if stored_shape_row[2]
+                        else {}
+                    )
+                    if not _agrees_on_shared_identity(
+                        stored_properties, new_node.properties, stored_shape
+                    ):
+                        raise ValueError(
+                            "Cannot change the content-derived identity of a "
+                            f"fleet-shared graph node: {stored_key[0]}/{stored_key[1]}"
+                        )
+                    # And add_node will not rewrite a row more than one tenant
+                    # owns — it hands out a second ownership witness and leaves
+                    # the canonical bytes alone. A swap must not be the door
+                    # that does what the front door refuses. Still needed after
+                    # the identity check: an anchor's ``created_at`` is outside
+                    # its identity set, so without this a co-owner could
+                    # overwrite the tenant-specific stamp add_node preserves.
                     owner_rows = await self.db.fetchall(
                         "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
                         (node_id,),
