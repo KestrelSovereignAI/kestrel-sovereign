@@ -243,6 +243,29 @@ function buildToolSegmentsByPos(content, cards) {
     let cursor = 0;
     let i = 0;
     const clamp = (p) => Math.max(0, Math.min(len, p == null ? len : p));
+    const snapAwayFromWordInterior = (rawPos) => {
+        const pos = clamp(rawPos);
+        const isWordCharacter = (char) => (
+            char !== undefined && /[\p{L}\p{N}]/u.test(char)
+        );
+        if (
+            pos === 0
+            || pos === len
+            || !isWordCharacter(text[pos - 1])
+            || !isWordCharacter(text[pos])
+        ) {
+            return pos;
+        }
+        // Defense in depth for stale persisted offsets inside a word. Preserve
+        // valid punctuation boundaries (for example, "." followed by "The").
+        // Keep the correction local so a badly wrong offset does not jump across
+        // unrelated prose; if no whitespace is nearby, retain the raw position.
+        const searchStart = Math.max(0, pos - 32);
+        for (let j = pos - 1; j >= searchStart; j -= 1) {
+            if (/\s/.test(text[j])) return j + 1;
+        }
+        return pos;
+    };
     // Prose that opens right after a tools batch leads with the orchestrator's
     // `\n---\n` wire delimiter (still emitted for multi-iteration turns). It is
     // protocol, not content — drop it (and surrounding blank lines) without
@@ -257,15 +280,18 @@ function buildToolSegmentsByPos(content, cards) {
         if (t.trim()) segments.push({ kind: 'prose', text: t });
     };
     while (i < sorted.length) {
-        const pos = clamp(sorted[i].pos);
+        // Form the batch from the original coordinate before snapping. Cards
+        // sharing a persisted position must remain together and in wire order.
+        const rawPos = clamp(sorted[i].pos);
+        const batch = [];
+        while (i < sorted.length && clamp(sorted[i].pos) === rawPos) {
+            batch.push(sorted[i]);
+            i += 1;
+        }
+        const pos = snapAwayFromWordInterior(rawPos);
         if (pos > cursor) {
             pushProse(text.slice(cursor, pos));
             cursor = pos;
-        }
-        const batch = [];
-        while (i < sorted.length && clamp(sorted[i].pos) === pos) {
-            batch.push(sorted[i]);
-            i += 1;
         }
         segments.push({ kind: 'tools', cards: batch });
     }
