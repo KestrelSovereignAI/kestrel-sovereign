@@ -114,7 +114,8 @@ class BaseExecutor(ABC):
     isolation, and their timeout termination strategy.
 
     Implementations:
-    - UvExecutor: Uses `uv run --isolated` for Python scripts
+    - UvExecutor: Uses `uv run --isolated --no-project` with a pinned base
+      interpreter for project-free Python scripts
     - DockerExecutor: Full container isolation for any language
     - LocalExecutor: Direct execution (development only)
     """

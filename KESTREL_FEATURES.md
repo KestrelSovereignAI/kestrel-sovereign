@@ -277,7 +277,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `list_scripts` | `!compute-list` | `system` | `state`, `limit` | 125 | `enabled` |
 | `list_trash` | `!compute-trash` | `system` | `days` | 48 | `enabled` |
 | `restore_from_trash` | `!compute-restore` | `system` | `trash_path`, `destination` | 80 | `enabled` |
-| `run_script` | `!compute-run` | `system` | `script_id`, `executor`, `timeout` | 196 | `enabled` |
+| `run_script` | `!compute-run` | `system` | `script_id`, `executor`, `timeout` | 210 | `enabled` |
 | `show_script` | `!compute-show` | `system` | `script_id` | 44 | `enabled` |
 | `write_script` | `!compute-write` | `system` | `name`, `language`, `content`, `purpose`, `requirements` | 192 | `enabled` |
 
@@ -935,7 +935,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!compute-history` | `compute` | `[script_id] [limit]` | Show script execution history |
 | `!compute-list` | `compute` | `[state] [limit]` | List all scripts or filter by state. state is one of: 'draft', 'signed', 'pending_review', 'approved', 'rejected', 'queued', 'running', 'completed', 'failed' (case-insensitive), or empty for all scripts. |
 | `!compute-restore` | `compute` | `<trash_path> [destination]` | Restore a file from trash to a destination |
-| `!compute-run` | `compute` | `<script_id> [executor] [timeout]` | Submit a script for execution (requires security review and user approval). executor is one of: 'uv', 'docker', 'local' (case-insensitive). 'docker' requires a running Docker daemon and 'local' requires KESTREL_ALLOW_LOCAL_COMPUTE — either may be unavailable on this host. Call get_compute_capabilities to discover the live set of available executors. |
+| `!compute-run` | `compute` | `<script_id> [executor] [timeout]` | Submit a script for execution (requires security review and user approval). executor is one of: 'uv', 'docker', 'local' (case-insensitive). 'uv' requires Kestrel to run inside a Python venv or virtualenv, 'docker' requires a running Docker daemon, and 'local' requires KESTREL_ALLOW_LOCAL_COMPUTE; any may be unavailable on this host. Call get_compute_capabilities to discover the live set of available executors. |
 | `!compute-show` | `compute` | `<script_id>` | Show detailed information about a script |
 | `!compute-trash` | `compute` | `[days]` | List files in the trash folder |
 | `!compute-write` | `compute` | `<name> <language> <content> <purpose> [requirements]` | Write a new script for later execution. The script is NOT executed immediately - it will be signed, reviewed, and requires user approval. language is one of: 'bash', 'python' (case-insensitive). |
