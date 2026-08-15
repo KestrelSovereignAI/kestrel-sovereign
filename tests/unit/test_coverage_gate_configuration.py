@@ -3,6 +3,7 @@
 import argparse
 from configparser import ConfigParser
 from pathlib import Path
+import sys
 import tomllib
 
 from run_tests import SmartTestRunner, configure_ci_defaults
@@ -71,7 +72,8 @@ def test_runner_emits_canonical_diagnostic_coverage_command():
         fail_fast=False,
     )
 
-    assert command[:3] == ["uv", "run", "pytest"]
+    assert command[0] == sys.executable
+    assert command[1:3] == ["-m", "pytest"]
     assert ["-n", "auto"] == command[command.index("-n"):command.index("-n") + 2]
     assert "--maxfail=0" in command
     assert "-x" not in command
