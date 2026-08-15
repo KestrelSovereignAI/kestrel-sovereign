@@ -26,6 +26,9 @@ Checks performed:
   - Legacy local identity exports are inspected by metadata only. Unsafe
     directory/file modes, links, and non-regular entries are reported without
     opening or parsing package contents.
+  - Every pinned semantic resource still matches its manifest digest. One
+    mismatch refuses agent boot wholesale, and a CRLF-smudged checkout breaks
+    all of them at once — see ``_check_semantic_registry`` (#2924).
 
 This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 — that's flaky in CI and out of scope for "is the config sane?"
@@ -100,8 +103,55 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_constitution_drift(readings, report)
     _check_anchor_consistency(readings, report)
     _check_legacy_identity_exports(project_dir, report)
+    _check_semantic_registry(report)
 
     return report
+
+
+def _check_semantic_registry(report: DoctorReport) -> None:
+    """Report pinned semantic resources that would refuse agent boot.
+
+    A single failing pin makes every agent fail to load with "semantic runtime
+    capability is unavailable", so this is a readiness question, not a
+    curiosity. It reuses the registry's own classifier rather than asking
+    ``git check-attr``: bytes answer the question in a wheel install too, where
+    there is no git to ask.
+    """
+    from kestrel_sovereign.knowledge.registry import (
+        KnowledgeRegistryError,
+        ResourceIntegrityIssue,
+        audit_semantic_resources,
+    )
+
+    try:
+        findings = audit_semantic_resources()
+    except (KnowledgeRegistryError, OSError, ImportError) as exc:
+        # A manifest this tool cannot parse is precisely what it exists to
+        # report. ``KnowledgeRegistryError`` covers that (including malformed
+        # TOML, which the registry converts rather than letting escape); the
+        # rest cover a manifest that cannot be read at all.
+        report.fail.append(f"semantic registry is unusable: {exc}")
+        return
+
+    if not findings:
+        report.ok.append("semantic registry: all pinned resources verified")
+        return
+
+    for issue in ResourceIntegrityIssue:
+        affected = [finding for finding in findings if finding.issue is issue]
+        if not affected:
+            continue
+        # Every distinct path, not an example. A CRLF-smudged checkout breaks
+        # all 29 pins at once, and naming one of them sends an operator to
+        # repair a single file while the fleet stays unbootable.
+        paths = sorted({finding.package_resource for finding in affected})
+        detail = (
+            f"{len(affected)} semantic resource(s) fail their pin "
+            f"({issue.value}), which refuses agent boot: {', '.join(paths)}"
+        )
+        # The remedy is checkout-scoped, so one line repairs the whole group.
+        remedy = affected[0].remedy
+        report.fail.append(f"{detail} — {remedy}" if remedy else detail)
 
 
 def _check_legacy_identity_exports(

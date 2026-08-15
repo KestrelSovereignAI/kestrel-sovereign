@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -15,13 +16,16 @@ import pytest
 
 from kestrel_sovereign.knowledge.registry import (
     MANIFEST_RESOURCE,
+    SEMANTIC_CHECKOUT_PATH,
     DuplicateNamespaceError,
     ExperimentalCapabilityError,
     ImportCycleError,
     IncompatibleSemanticVersionError,
     KnowledgeRegistryError,
+    MalformedManifestError,
     MissingPackageResourceError,
     ResourceDigestMismatchError,
+    ResourceIntegrityIssue,
     ResourceKind,
     ResourceNotFoundError,
     ResourceRequirement,
@@ -30,6 +34,9 @@ from kestrel_sovereign.knowledge.registry import (
     SemanticVersion,
     StandardsMaturity,
     VersionRequiredError,
+    audit_semantic_resources,
+    classify_digest_mismatch,
+    crlf_checkout_repair_commands,
     load_knowledge_registry,
     refresh_manifest_digest,
 )
@@ -266,6 +273,221 @@ def test_autocrlf_checkout_preserves_registered_resource_digests(tmp_path):
     for path, resource in resources_by_path.items():
         digest = hashlib.sha256((checkout / path).read_bytes()).hexdigest()
         assert digest == resource.sha256
+
+
+def _smudge_to_crlf(content: bytes) -> bytes:
+    """The bytes ``core.autocrlf=true`` writes into a working tree."""
+    return content.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+
+def test_crlf_smudged_checkout_is_named_as_a_line_ending_issue():
+    """A stale autocrlf checkout must say so, and must still fail closed."""
+    content = b"@prefix ex: <https://example.test/> .\nex:a ex:b ex:c .\n"
+    resource = _resource("root", sha256=hashlib.sha256(content).hexdigest())
+    registry = SemanticKnowledgeRegistry(
+        [resource], resource_reader=lambda _path: _smudge_to_crlf(content)
+    )
+
+    with pytest.raises(ResourceDigestMismatchError) as excinfo:
+        registry.verify_resources()
+
+    message = str(excinfo.value)
+    assert "digest mismatch" in message
+    assert "line-ending mismatch, not a corrupted resource" in message
+    assert "core.autocrlf false" in message
+    # The remedy repairs the whole smudged directory, and says outright that
+    # the index-only command does not — that dead end is what let the reported
+    # checkout keep failing while git called it clean.
+    for command in crlf_checkout_repair_commands():
+        assert f"`{command}`" in message
+    assert SEMANTIC_CHECKOUT_PATH in message
+    assert "`git add --renormalize` will not do it" in message
+
+    (finding,) = registry.audit_resource_digests()
+    assert finding.issue is ResourceIntegrityIssue.CRLF_CHECKOUT
+    assert finding.repair_commands == crlf_checkout_repair_commands()
+
+
+def test_crlf_poisoned_manifest_pin_blames_the_pin_not_the_checkout():
+    """A pin refreshed from a smudged checkout has the opposite remedy."""
+    content = b"@prefix ex: <https://example.test/> .\nex:a ex:b ex:c .\n"
+    # The registered digest is the CRLF form; the checkout below is correct LF.
+    resource = _resource(
+        "root", sha256=hashlib.sha256(_smudge_to_crlf(content)).hexdigest()
+    )
+    registry = SemanticKnowledgeRegistry([resource], resource_reader=lambda _path: content)
+
+    with pytest.raises(ResourceDigestMismatchError) as excinfo:
+        registry.verify_resources()
+
+    message = str(excinfo.value)
+    assert "line-ending mismatch in the manifest" in message
+    assert "data/semantic/registry.toml" in message
+    assert "do not renormalize this checkout" in message
+    # Sending this developer to rewrite a correct working tree would destroy
+    # it; the checkout repair must not appear, in prose or as commands.
+    for command in crlf_checkout_repair_commands():
+        assert command not in message
+
+    (finding,) = registry.audit_resource_digests()
+    assert finding.issue is ResourceIntegrityIssue.CRLF_MANIFEST_PIN
+    # No mechanical repair: a poisoned pin needs a reviewed manifest edit.
+    assert finding.repair_commands == ()
+
+
+def test_manifest_pin_direction_normalizes_before_reapplying_crlf():
+    """Mixed endings must not be tested as "\\r\\r\\n" and go undiagnosed."""
+    mixed = b"first\r\nsecond\nthird\n"
+    expected = hashlib.sha256(b"first\r\nsecond\r\nthird\r\n").hexdigest()
+
+    assert (
+        classify_digest_mismatch(mixed, expected)
+        is ResourceIntegrityIssue.CRLF_MANIFEST_PIN
+    )
+
+
+def test_altered_resource_still_reports_a_plain_mismatch():
+    """Tampering stays indistinguishable from tampering — no invented cause."""
+    content = b"line one\nline two\n"
+    resource = _resource("root", sha256=hashlib.sha256(b"line one\nline three\n").hexdigest())
+    registry = SemanticKnowledgeRegistry([resource], resource_reader=lambda _path: content)
+
+    with pytest.raises(ResourceDigestMismatchError) as excinfo:
+        registry.verify_resources()
+
+    message = str(excinfo.value)
+    assert "line-ending" not in message
+    assert message == (
+        "root@1.0.0 digest mismatch for semantic/root-1.0.0.json: "
+        f"expected {resource.sha256}, got {hashlib.sha256(content).hexdigest()}"
+    )
+    assert [finding.issue for finding in registry.audit_resource_digests()] == [
+        ResourceIntegrityIssue.DIGEST_MISMATCH
+    ]
+
+
+def test_audit_diagnoses_a_whole_crlf_smudged_semantic_checkout(tmp_path):
+    """The failure that bricked boot: every pin broken by one bad checkout."""
+    package_root = tmp_path / "kestrel_sovereign"
+    semantic_root = package_root / "data" / "semantic"
+    manifest = semantic_root / "registry.toml"
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    assert audit_semantic_resources(manifest) == ()
+
+    registry = load_knowledge_registry(manifest)
+    # Distinct paths, because two pins share one shape-set file.
+    for path in {
+        package_root.joinpath(*Path(resource.package_resource).parts)
+        for resource in registry.resources
+    }:
+        original = path.read_bytes()
+        smudged = _smudge_to_crlf(original)
+        assert smudged != original, f"{path} has no LF endings for autocrlf to smudge"
+        path.write_bytes(smudged)
+
+    findings = audit_semantic_resources(manifest)
+    assert {finding.key for finding in findings} == {
+        resource.key for resource in registry.resources
+    }
+    assert {finding.issue for finding in findings} == {
+        ResourceIntegrityIssue.CRLF_CHECKOUT
+    }
+
+    # Diagnosing the cause must not make the boot gate accept the bytes.
+    with pytest.raises(ResourceDigestMismatchError, match="line-ending mismatch"):
+        load_knowledge_registry(manifest)
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+
+
+def test_the_published_remedy_actually_repairs_a_smudged_checkout(tmp_path):
+    """Run the remedy verbatim against the worst reported state.
+
+    The remedy is a claim about the world, so this executes the exact commands
+    the operator is handed and then re-reads the bytes.  The state it runs
+    against is the one from the report: the index already holds LF, so
+    ``git status`` is clean while the working tree is CRLF and boot keeps
+    failing.  An index-only command such as ``git add --renormalize`` passes
+    every assertion about *messages* and still leaves the fleet unbootable —
+    only running it can tell the two apart.
+    """
+    checkout = tmp_path / "checkout"
+    semantic_root = checkout / SEMANTIC_CHECKOUT_PATH
+    manifest = semantic_root / "registry.toml"
+    package_root = semantic_root.parent.parent
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    # The shipped declaration, not a hand-written stand-in: if the repository
+    # stops declaring these paths eol=lf, this remedy stops working.
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / ".gitattributes",
+        checkout / ".gitattributes",
+    )
+
+    _git("init", "--quiet", cwd=checkout)
+    _git("config", "user.email", "tortoise@example.test", cwd=checkout)
+    _git("config", "user.name", "Tortoise", cwd=checkout)
+    _git("add", "--all", cwd=checkout)
+    _git("commit", "--quiet", "--message", "seed", cwd=checkout)
+    assert audit_semantic_resources(manifest) == ()
+
+    resource_paths = {
+        package_root.joinpath(*Path(resource.package_resource).parts)
+        for resource in load_knowledge_registry(manifest).resources
+    }
+    for path in resource_paths:
+        path.write_bytes(_smudge_to_crlf(path.read_bytes()))
+    # Reproduce the reported dead end: the index is normalized, so git calls
+    # the tree clean even though every pinned resource is still CRLF.
+    _git("-c", "core.autocrlf=true", "add", "--renormalize", "--", ".", cwd=checkout)
+    assert _git("status", "--porcelain", cwd=checkout).stdout == ""
+    findings = audit_semantic_resources(manifest)
+    assert {finding.issue for finding in findings} == {ResourceIntegrityIssue.CRLF_CHECKOUT}
+
+    for command in findings[0].repair_commands:
+        argv = shlex.split(command)
+        assert argv[0] == "git", command
+        _git(*argv[1:], cwd=checkout)
+
+    for path in resource_paths:
+        assert b"\r\n" not in path.read_bytes(), path
+    assert audit_semantic_resources(manifest) == ()
+    load_knowledge_registry(manifest)
+
+
+def test_an_unparseable_manifest_stays_inside_the_registry_error_contract(tmp_path):
+    """A broken manifest is a registry failure, not a decoder escaping.
+
+    Callers hold ``KnowledgeRegistryError`` and nothing else; letting
+    ``tomllib.TOMLDecodeError`` through ends the doctor and ``setup --check``
+    in a traceback instead of the report they exist to produce.
+    """
+    manifest = tmp_path / "kestrel_sovereign" / "data" / "semantic" / "registry.toml"
+    manifest.parent.mkdir(parents=True)
+
+    manifest.write_text("version = 1\n[resource.truncated\n", encoding="utf-8")
+    for load in (load_knowledge_registry, audit_semantic_resources):
+        with pytest.raises(MalformedManifestError, match="not valid TOML") as excinfo:
+            load(manifest)
+        assert isinstance(excinfo.value, KnowledgeRegistryError)
+
+    manifest.write_bytes(b"version = \xff\n")
+    with pytest.raises(MalformedManifestError, match="not valid UTF-8"):
+        audit_semantic_resources(manifest)
 
 
 def test_incompatible_import_version_is_rejected():

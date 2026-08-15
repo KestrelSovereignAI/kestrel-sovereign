@@ -24,7 +24,7 @@ import argparse
 import hashlib
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from importlib import resources
@@ -39,7 +39,12 @@ except ModuleNotFoundError:  # pragma: no cover - retained for downstream toolin
 
 
 PACKAGE_NAME = "kestrel_sovereign"
-MANIFEST_RESOURCE = "data/semantic/registry.toml"
+SEMANTIC_DATA_ROOT = "data/semantic"
+MANIFEST_RESOURCE = f"{SEMANTIC_DATA_ROOT}/registry.toml"
+# Where the pinned resources live relative to a source-checkout root. A
+# line-ending smudge is a property of the checkout, not of one file, so the
+# repair below is scoped to this directory rather than to any single resource.
+SEMANTIC_CHECKOUT_PATH = f"{PACKAGE_NAME}/{SEMANTIC_DATA_ROOT}"
 CONTRACT_VERSION = "semantic-kb-v1"
 REGISTRY_FORMAT_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -84,6 +89,32 @@ class MissingPackageResourceError(KnowledgeRegistryError):
 
 class ExperimentalCapabilityError(KnowledgeRegistryError):
     """An experimental resource was requested without an explicit opt-in."""
+
+
+class MalformedManifestError(KnowledgeRegistryError):
+    """The registry manifest could not be decoded or parsed as TOML.
+
+    A manifest this module cannot parse is a registry failure like any other
+    invalid manifest, so it arrives as a ``KnowledgeRegistryError``.  Letting
+    ``tomllib.TOMLDecodeError`` escape instead would end ``kestrel doctor`` and
+    ``setup --check`` in a traceback, at exactly the moment their job is to
+    report that the semantic registry is unusable.
+    """
+
+
+class ResourceIntegrityIssue(str, Enum):
+    """Why one pinned package resource failed verification.
+
+    ``DIGEST_MISMATCH`` is the honest default: the bytes are not the pinned
+    bytes and nothing further is decidable, so it stays indistinguishable from
+    tampering.  The two line-ending members are only ever used when the
+    transformed bytes actually hash to the pinned digest.
+    """
+
+    MISSING = "missing"
+    DIGEST_MISMATCH = "digest-mismatch"
+    CRLF_CHECKOUT = "crlf-checkout"
+    CRLF_MANIFEST_PIN = "crlf-manifest-pin"
 
 
 class ResourceKind(str, Enum):
@@ -275,6 +306,131 @@ class SemanticCapabilityContract:
 
 
 ResourceReader = Callable[[str], bytes]
+
+
+def classify_digest_mismatch(content: bytes, expected_sha256: str) -> ResourceIntegrityIssue:
+    """Decide which kind of wrong one digest mismatch is.
+
+    This is a decision, not a heuristic.  sha256 preimage resistance means a
+    transformed copy of the actual bytes can only hash to the pinned digest
+    when that transform is exactly what happened to them, so a match names the
+    cause outright — and needs no git, which matters because the same smudge
+    can arrive inside a wheel built from a smudged checkout.
+
+    The two directions have opposite remedies.  ``CRLF_CHECKOUT`` means the
+    working-tree copy was smudged to CRLF and the pin is right;
+    ``CRLF_MANIFEST_PIN`` means the file is the declared LF and the *pin* was
+    refreshed from a smudged checkout.  Anything undecided stays
+    ``DIGEST_MISMATCH``.
+    """
+    normalized = content.replace(b"\r\n", b"\n")
+    if normalized != content and hashlib.sha256(normalized).hexdigest() == expected_sha256:
+        return ResourceIntegrityIssue.CRLF_CHECKOUT
+    # Normalize before re-applying so mixed-ending content cannot grow "\r\r\n".
+    reapplied = normalized.replace(b"\n", b"\r\n")
+    if reapplied != content and hashlib.sha256(reapplied).hexdigest() == expected_sha256:
+        return ResourceIntegrityIssue.CRLF_MANIFEST_PIN
+    return ResourceIntegrityIssue.DIGEST_MISMATCH
+
+
+def crlf_checkout_repair_commands(
+    checkout_path: str = SEMANTIC_CHECKOUT_PATH,
+) -> tuple[str, ...]:
+    """Return commands that actually rewrite CRLF-smudged working-tree bytes.
+
+    ``git add --renormalize`` is deliberately absent.  It rewrites the *index*
+    only: where the committed blob is already LF, the renormalized entry equals
+    what is already recorded, so git reports the tree clean while the
+    working-tree bytes stay CRLF and boot keeps failing.  Worse, it refreshes
+    the index stat cache, after which a plain ``git checkout HEAD -- <path>``
+    sees an up-to-date entry and does nothing either.  Dropping the index
+    entries first is what forces a real re-checkout.
+
+    The recipe is directory-scoped because ``core.autocrlf`` smudges a whole
+    checkout, not one file, and is plain ``git`` rather than ``rm -rf`` because
+    the operators who hit this are on Windows shells.
+    """
+    return (
+        "git config core.autocrlf false",
+        f"git rm --cached -r -- {checkout_path}",
+        f"git checkout HEAD -- {checkout_path}",
+    )
+
+
+_REMEDIES = {
+    ResourceIntegrityIssue.CRLF_CHECKOUT: (
+        "this is a line-ending mismatch, not a corrupted resource: the local "
+        "copy has CRLF line endings while the pinned bytes are LF. The pin is "
+        "correct and the checkout is not. One such checkout normally smudges "
+        f"every pinned resource, so repair all of {SEMANTIC_CHECKOUT_PATH} at "
+        "once by running, from the source-checkout root: "
+        + ", then ".join(f"`{command}`" for command in crlf_checkout_repair_commands())
+        + ". That restores the committed bytes and discards any uncommitted "
+        "edit under that directory. `git add --renormalize` will not do it: it "
+        "fixes the index, leaves the working-tree bytes CRLF, and then reports "
+        "the tree clean. An installed wheel has no checkout to repair — "
+        "reinstall from a wheel built on an unsmudged checkout"
+    ),
+    ResourceIntegrityIssue.CRLF_MANIFEST_PIN: (
+        "this is a line-ending mismatch in the manifest, not in the resource: "
+        "the local copy has the declared LF line endings and the pinned digest "
+        "is the CRLF form of those same bytes, so the pin in "
+        f"{MANIFEST_RESOURCE} was refreshed from a CRLF-smudged checkout. Fix "
+        "the pin; do not renormalize this checkout"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ResourceIntegrityFinding:
+    """One resource that failed its pin, with the cause named where decidable."""
+
+    key: str
+    package_resource: str
+    issue: ResourceIntegrityIssue
+    expected_sha256: str
+    actual_sha256: str | None = None
+    read_error: BaseException | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def is_line_ending_issue(self) -> bool:
+        return self.issue in (
+            ResourceIntegrityIssue.CRLF_CHECKOUT,
+            ResourceIntegrityIssue.CRLF_MANIFEST_PIN,
+        )
+
+    @property
+    def repair_commands(self) -> tuple[str, ...]:
+        """Commands that repair this finding, or ``()`` when none are decidable.
+
+        Only the smudged-checkout direction has a mechanical repair.  A poisoned
+        pin needs a reviewed manifest edit, and an undecided mismatch is
+        indistinguishable from tampering, so neither gets commands to run.
+        """
+        if self.issue is ResourceIntegrityIssue.CRLF_CHECKOUT:
+            return crlf_checkout_repair_commands()
+        return ()
+
+    @property
+    def remedy(self) -> str:
+        """Actionable next step, or '' when the cause is not decidable.
+
+        Checkout-scoped by design: a remedy naming this one resource would
+        leave the rest of a smudged checkout broken and the fleet still unable
+        to boot. ``describe`` identifies the individual resource.
+        """
+        return _REMEDIES.get(self.issue, "")
+
+    def describe(self) -> str:
+        """The operator-facing sentence carried by the raised error."""
+        if self.issue is ResourceIntegrityIssue.MISSING:
+            return f"{self.key} package resource is missing: {self.package_resource}"
+        message = (
+            f"{self.key} digest mismatch for {self.package_resource}: "
+            f"expected {self.expected_sha256}, got {self.actual_sha256}"
+        )
+        remedy = self.remedy
+        return f"{message} — {remedy}" if remedy else message
 
 
 class SemanticKnowledgeRegistry:
@@ -540,22 +696,63 @@ class SemanticKnowledgeRegistry:
         )
 
     def verify_resources(self, entries: Iterable[SemanticResource] | None = None) -> None:
-        """Check every selected package resource exists and matches its digest."""
+        """Check every selected package resource exists and matches its digest.
+
+        A named line-ending cause never softens this: the digest is the pin, so
+        verification still fails on the first offending resource.  It only says
+        which kind of wrong it is.
+        """
         if self._resource_reader is None:
             raise MissingPackageResourceError("semantic registry has no package-resource reader")
         for resource in entries if entries is not None else self.resources:
-            try:
-                content = self._resource_reader(resource.package_resource)
-            except (FileNotFoundError, ModuleNotFoundError) as exc:
-                raise MissingPackageResourceError(
-                    f"{resource.key} package resource is missing: {resource.package_resource}"
-                ) from exc
-            actual = hashlib.sha256(content).hexdigest()
-            if actual != resource.sha256:
-                raise ResourceDigestMismatchError(
-                    f"{resource.key} digest mismatch for {resource.package_resource}: "
-                    f"expected {resource.sha256}, got {actual}"
-                )
+            finding = self._inspect_resource(resource)
+            if finding is None:
+                continue
+            if finding.issue is ResourceIntegrityIssue.MISSING:
+                raise MissingPackageResourceError(finding.describe()) from finding.read_error
+            raise ResourceDigestMismatchError(finding.describe())
+
+    def audit_resource_digests(
+        self, entries: Iterable[SemanticResource] | None = None
+    ) -> tuple[ResourceIntegrityFinding, ...]:
+        """Report every failing resource instead of raising on the first.
+
+        ``verify_resources`` is the boot gate and must fail closed immediately.
+        This is the diagnostic view behind it: seeing that *all* pinned
+        resources failed at once is what distinguishes one edited file from a
+        whole checkout smudged by ``core.autocrlf``.
+        """
+        if self._resource_reader is None:
+            raise MissingPackageResourceError("semantic registry has no package-resource reader")
+        findings = (
+            self._inspect_resource(resource)
+            for resource in (entries if entries is not None else self.resources)
+        )
+        return tuple(finding for finding in findings if finding is not None)
+
+    def _inspect_resource(self, resource: SemanticResource) -> ResourceIntegrityFinding | None:
+        """Return why one resource fails its pin, or ``None`` when it matches."""
+        assert self._resource_reader is not None  # guarded by both public callers
+        try:
+            content = self._resource_reader(resource.package_resource)
+        except (FileNotFoundError, ModuleNotFoundError) as exc:
+            return ResourceIntegrityFinding(
+                key=resource.key,
+                package_resource=resource.package_resource,
+                issue=ResourceIntegrityIssue.MISSING,
+                expected_sha256=resource.sha256,
+                read_error=exc,
+            )
+        actual = hashlib.sha256(content).hexdigest()
+        if actual == resource.sha256:
+            return None
+        return ResourceIntegrityFinding(
+            key=resource.key,
+            package_resource=resource.package_resource,
+            issue=classify_digest_mismatch(content, resource.sha256),
+            expected_sha256=resource.sha256,
+            actual_sha256=actual,
+        )
 
     def read_verified_resource(self, resource: SemanticResource) -> bytes:
         """Return one registry resource only after checking its immutable pin.
@@ -722,6 +919,43 @@ def _read_packaged_resource(resource_name: str) -> bytes:
     return target.read_bytes()
 
 
+def _decode_manifest(manifest_bytes: bytes, source: str) -> str:
+    """Decode manifest bytes, reporting failure as a registry error."""
+    try:
+        return manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MalformedManifestError(
+            f"semantic registry manifest is not valid UTF-8 ({source}): {exc}"
+        ) from exc
+
+
+def _parse_manifest_toml(text: str, source: str) -> Mapping[str, object]:
+    """Parse a manifest, reporting failure as a registry error.
+
+    Every way a manifest can be unreadable belongs to one error contract, so a
+    caller that already handles ``KnowledgeRegistryError`` — the boot gate, the
+    doctor preflight, the refresh CLI — never has to also catch the TOML
+    decoder's own exception type to stay on its feet.
+    """
+    return tomllib.loads(text)
+
+
+def _load_unverified_registry(manifest_path: Path | None = None) -> SemanticKnowledgeRegistry:
+    """Parse and structurally validate a registry without byte-checking pins."""
+    if manifest_path is None:
+        manifest_bytes = _read_packaged_resource(MANIFEST_RESOURCE)
+        resource_reader = _read_packaged_resource
+        source = MANIFEST_RESOURCE
+    else:
+        package_root = _package_root_for_manifest(manifest_path)
+        manifest_bytes = manifest_path.read_bytes()
+        resource_reader = _source_tree_resource_reader(package_root)
+        source = str(manifest_path)
+
+    manifest = _parse_manifest_toml(_decode_manifest(manifest_bytes, source), source)
+    return SemanticKnowledgeRegistry.from_manifest(manifest, resource_reader=resource_reader)
+
+
 def load_knowledge_registry(manifest_path: Path | None = None) -> SemanticKnowledgeRegistry:
     """Load, validate, and byte-check an immutable package registry.
 
@@ -730,18 +964,21 @@ def load_knowledge_registry(manifest_path: Path | None = None) -> SemanticKnowle
     workflow and its tests; it preserves the same package-resource verification
     instead of treating a checkout manifest as an unverified text file.
     """
-    if manifest_path is None:
-        manifest_bytes = _read_packaged_resource(MANIFEST_RESOURCE)
-        resource_reader = _read_packaged_resource
-    else:
-        package_root = _package_root_for_manifest(manifest_path)
-        manifest_bytes = manifest_path.read_bytes()
-        resource_reader = _source_tree_resource_reader(package_root)
-
-    manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
-    registry = SemanticKnowledgeRegistry.from_manifest(manifest, resource_reader=resource_reader)
+    registry = _load_unverified_registry(manifest_path)
     registry.verify_resources()
     return registry
+
+
+def audit_semantic_resources(
+    manifest_path: Path | None = None,
+) -> tuple[ResourceIntegrityFinding, ...]:
+    """Diagnose every pinned resource, returning one finding per failure.
+
+    This exists so ``kestrel doctor`` can answer the same question the boot
+    gate answers — from the same classifier — before a mismatch presents as an
+    opaque total agent-boot failure.  An empty tuple means every pin verified.
+    """
+    return _load_unverified_registry(manifest_path).audit_resource_digests()
 
 
 @lru_cache(maxsize=1)
@@ -773,7 +1010,7 @@ def refresh_manifest_digest(
     package_root = _package_root_for_manifest(manifest_path)
     requested_version = str(SemanticVersion.parse(version))
     text = manifest_path.read_text(encoding="utf-8")
-    parsed = tomllib.loads(text)
+    parsed = _parse_manifest_toml(text, str(manifest_path))
     registry = SemanticKnowledgeRegistry.from_manifest(parsed)
     resource = registry.resolve(identifier, requested_version)
     snapshot = snapshot_path.read_bytes()
