@@ -52,6 +52,14 @@ def _has_only(properties: Dict[str, Any], allowed: frozenset) -> bool:
 #: The bounded public metadata a shared constitution anchor may carry.
 _SHAREABLE_CONSTITUTION_KEYS = frozenset({"hash", "type", "created_at"})
 
+#: Exactly the per-agent fields the release *before* #2893 wrote onto the
+#: artifact node, and nothing else. Normalisation is licensed by knowing what
+#: these are: they are that release's noise, so dropping them loses nothing.
+#: A key outside this set has unknown provenance — a field a later release
+#: added, or one an operator put there — and trimming it would be one tenant
+#: silently deleting another's data on the way to co-owning the row.
+_LEGACY_ARTIFACT_KEYS = frozenset({"source_path", "anchored_at", "verification"})
+
 #: The bounded, content-derived metadata a shared reanchor artifact may carry.
 _SHAREABLE_ARTIFACT_KEYS = frozenset(
     {
@@ -183,6 +191,11 @@ def _is_normalisable_legacy_artifact(
     installations that never hit it. The second agent's reanchor rolled back
     with "Cannot overwrite a graph node owned by another agent".
 
+    Only the fields that release actually wrote may be dropped
+    (``_LEGACY_ARTIFACT_KEYS``). A row carrying anything else is not the legacy
+    shape — it is a row someone or something else has written to — and joining
+    it must not begin by deleting what is there.
+
     Normalising is safe precisely because the surviving fields are derived from
     the artifact bytes: if the legacy row's content-derived subset is byte-equal
     to what this writer computes from the same file, the extras are the previous
@@ -196,6 +209,8 @@ def _is_normalisable_legacy_artifact(
     trimmed = _canonical_shared_properties(existing, _SHAREABLE_ARTIFACT_KEYS)
     if trimmed == existing:
         return False  # nothing to normalise; the ordinary path handles it
+    if not set(existing) - _SHAREABLE_ARTIFACT_KEYS <= _LEGACY_ARTIFACT_KEYS:
+        return False
     if not _is_shareable_amendment_artifact_properties(trimmed, node_id):
         return False
     return trimmed == _canonical_shared_properties(

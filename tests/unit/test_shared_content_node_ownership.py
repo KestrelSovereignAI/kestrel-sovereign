@@ -34,6 +34,7 @@ layer's and must not differ by backend.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -699,6 +700,86 @@ class TestTheSwapDoorDeclinesSharedRows:
         assert foreign == NodeSwapResult.NOT_FOUND
         assert missing == foreign, (
             "a foreign shared row is distinguishable from an absent one"
+        )
+
+
+class TestLegacyNormalisationIsNarrow:
+    """Joining a row must not begin by deleting what is on it.
+
+    The release before #2893 wrote ``source_path``, ``anchored_at`` and
+    ``verification`` onto the artifact node, and normalising those away is what
+    lets an already-reanchored fleet share the row it is stuck on. That licence
+    comes from *knowing what those fields are* — they are that release's
+    per-agent noise, so dropping them loses nothing.
+
+    Triggering on "carries any unexpected key" instead reads every unknown field
+    as noise. A tenant holding the same blob could then silently delete metadata
+    a later release added, or an operator put there, on its way to co-ownership.
+    """
+
+    async def test_a_row_with_only_known_legacy_fields_is_normalised(
+        self, db, artifact_bytes
+    ):
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _take_possession(db, AGENT_B, artifact_bytes, "a.json")
+        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+        await db.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+            (
+                json.dumps(
+                    dict(
+                        _artifact_node(node_id).properties,
+                        source_path="/home/operator/a.json",
+                        anchored_at="2026-08-01T00:00:00+00:00",
+                        verification="signature verified",
+                    )
+                ),
+                node_id,
+            ),
+        )
+
+        await _graph(db, AGENT_B).add_node(_artifact_node(node_id))
+
+        assert await _owners(db, node_id) == sorted([AGENT_A, AGENT_B])
+        stored = await _graph(db, AGENT_B).get_node(node_id)
+        assert "source_path" not in stored.properties
+
+    @pytest.mark.parametrize(
+        "extra_key",
+        ["retention_policy", "signed_by_operator", "some_future_field"],
+    )
+    async def test_an_unknown_extra_field_is_not_normalised_away(
+        self, db, artifact_bytes, extra_key
+    ):
+        """Parametrized rather than looped: each stands for a different reason a
+        key might be there — a policy field, something signed, a field from a
+        release that does not exist yet — and a loop stops at the first."""
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _take_possession(db, AGENT_B, artifact_bytes, "a.json")
+        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+        await db.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+            (
+                json.dumps(
+                    dict(
+                        _artifact_node(node_id).properties,
+                        source_path="/home/operator/a.json",
+                        **{extra_key: "something nobody here understands"},
+                    )
+                ),
+                node_id,
+            ),
+        )
+
+        with pytest.raises(REFUSAL, match="owned by another agent"):
+            await _graph(db, AGENT_B).add_node(_artifact_node(node_id))
+
+        assert await _owners(db, node_id) == [AGENT_A]
+        row = await db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
+        )
+        assert extra_key in (row[0] or ""), (
+            "another tenant's unknown metadata was deleted on the way to co-ownership"
         )
 
 
