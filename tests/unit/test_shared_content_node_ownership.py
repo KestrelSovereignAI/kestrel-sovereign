@@ -865,5 +865,3 @@ class TestTheShapeIsReadOffTheStoredRow:
         stored = await graph.get_node(node_id)
         assert stored.node_type == "concept"
         assert stored.label == "Tuesdays"
-
-
