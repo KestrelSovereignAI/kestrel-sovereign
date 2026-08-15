@@ -182,6 +182,40 @@ test('places tool cards between prose by position (pre, card, post)', () => {
     );
 });
 
+test('a stale card offset inside a word snaps to the preceding whitespace boundary', () => {
+    const content = 'Before alphaBravo after.';
+    const stalePos = content.indexOf('alphaBravo') + 'alpha'.length;
+    const html = renderAgentContentHtml(content, {
+        toolEvents: [
+            { type: 'start', tool: 'lookup', pos: stalePos },
+            { type: 'complete', tool: 'lookup', ms: 5, pos: stalePos },
+        ],
+    });
+
+    assert.match(html, /<p>alphaBravo after\.<\/p>/);
+    assert.doesNotMatch(html, /<p>Before alpha<\/p>/);
+    assert.doesNotMatch(html, /<p>Bravo after\.<\/p>/);
+    assert.ok(html.indexOf('Before') < html.indexOf('tool-activity-container'));
+    assert.ok(html.indexOf('tool-activity-container') < html.indexOf('alphaBravo'));
+});
+
+test('cards sharing a stale position remain one ordered batch after snapping', () => {
+    const content = 'Before alphaBravo after.';
+    const stalePos = content.indexOf('alphaBravo') + 'alpha'.length;
+    const html = renderAgentContentHtml(content, {
+        toolEvents: [
+            { type: 'start', tool: 'first_tool', pos: stalePos },
+            { type: 'start', tool: 'second_tool', pos: stalePos },
+            { type: 'complete', tool: 'first_tool', ms: 1, pos: stalePos },
+            { type: 'complete', tool: 'second_tool', ms: 2, pos: stalePos },
+        ],
+    });
+
+    assert.equal((html.match(/tool-activity-container/g) || []).length, 1);
+    assert.ok(html.indexOf('Tool call: first_tool') < html.indexOf('Tool call: second_tool'));
+    assert.match(html, /<p>alphaBravo after\.<\/p>/);
+});
+
 test('no toolEvents → plain prose, no card container', () => {
     const html = renderAgentContentHtml('Just an answer.', { toolEvents: [] });
     assert.doesNotMatch(html, /tool-activity-container/);
