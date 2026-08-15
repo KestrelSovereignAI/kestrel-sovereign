@@ -660,6 +660,28 @@ def test_pypi_policy_with_no_version_window_still_rejects_a_direct_url():
     )
 
 
+def test_unknown_provenance_does_not_satisfy_a_pypi_source():
+    """"We could not read it" is not "it came from an index".
+
+    Both states used to reduce to "no direct URL", so a package whose
+    `direct_url.json` was damaged satisfied a declared `pypi` source and the
+    guard skipped repairing it — a safety predicate failing OPEN on the single
+    input it cannot verify. Failing closed costs at most an unnecessary
+    reinstall; failing open is the defect this guard exists to stop.
+    """
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, None)
+
+    readable = fr.CoreInstallShape(version="0.53.0", provenance_known=True)
+    unknown = fr.CoreInstallShape(version="0.53.0", provenance_known=False)
+
+    assert readable.from_index and fr.core_install_matches(readable, policy)
+    assert not unknown.from_index
+    assert not fr.core_install_matches(unknown, policy)
+    assert "unknown source" in unknown.describe()
+
+
 def test_shape_describes_a_direct_url_install_distinctly():
     """An operator reading the failure must be told which wrong source it is."""
     assert "index wheel" in _shape("0.53.0", None).describe()

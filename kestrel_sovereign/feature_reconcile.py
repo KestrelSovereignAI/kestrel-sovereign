@@ -128,6 +128,10 @@ class CoreInstallShape:
     version: Optional[str] = None
     editable_path: Optional[str] = None
     direct_url: Optional[str] = None
+    #: Was the provenance metadata readable? False means the install exists but
+    #: ``direct_url.json`` could not be read or parsed, so where core came from
+    #: is UNKNOWN — which is not the same as "no file", and must not read as one.
+    provenance_known: bool = True
 
     @property
     def is_editable(self) -> bool:
@@ -141,14 +145,21 @@ class CoreInstallShape:
         source directly — VCS, local path, remote archive, editable checkout.
         Index resolutions record nothing. So the absence of a direct URL is the
         positive evidence of an index install; nothing else is.
+
+        Unknown provenance answers False. This is asked to decide whether a
+        declared source is satisfied, and "the metadata would not read" is not a
+        yes — a safety predicate that fails open on the one input it cannot
+        verify is the defect it exists to prevent.
         """
-        return self.direct_url is None
+        return self.provenance_known and self.direct_url is None
 
     def describe(self) -> str:
         if self.editable_path:
             where = f"editable → {self.editable_path}"
         elif self.direct_url:
             where = f"non-editable direct URL → {self.direct_url}"
+        elif not self.provenance_known:
+            where = "unknown source (direct_url.json unreadable)"
         else:
             where = "non-editable (index wheel in site-packages)"
         return f"{where} ({self.version or 'not installed'})"

@@ -104,6 +104,7 @@ class FakeUv:
         feature_install_fails=False,
         feature_install_times_out=False,
         direct_urls=None,
+        unreadable_provenance=None,
     ):
         self.installed = {CORE: core_version}
         self.editable = {CORE: core_checkout} if core_checkout else {}
@@ -131,6 +132,9 @@ class FakeUv:
         # remote archive. Distinct from `editable` (which is also a direct URL,
         # but flagged) and from absent (an index resolution).
         self.direct_urls = dict(direct_urls or {})
+        # Dists whose direct_url.json exists but will not read/parse: provenance
+        # UNKNOWN, which is a third state distinct from both of the above.
+        self.unreadable_provenance = set(unreadable_provenance or ())
         self.commands = []
         self.pins = []  # the core pin seen per install (None = unconstrained)
 
@@ -147,7 +151,12 @@ class FakeUv:
         return self.editable.get(dist)
 
     def direct_url_provenance(self, dist):
-        """PEP 610 provenance for *dist* — ``(url, editable)``.
+        """PEP 610 provenance for *dist* — ``(url, editable, known)``.
+
+        ``unreadable_provenance`` models the third state: metadata that exists
+        but will not parse, so where the package came from is UNKNOWN. Without
+        it the double could only express "index" and "direct URL", and a
+        predicate that fails open on unknown would look correct in every test.
 
         Models what the metadata actually records, which is the distinction the
         guard now depends on: an editable install has a direct URL *and* the
@@ -159,10 +168,12 @@ class FakeUv:
         could not express "non-editable but not from the index", so the case
         that broke the ``pypi`` policy was invisible to every test.
         """
+        if dist in self.unreadable_provenance:
+            return None, False, False
         editable = self.editable.get(dist)
         if editable:
-            return editable, True
-        return self.direct_urls.get(dist), False
+            return editable, True, True
+        return self.direct_urls.get(dist), False, True
 
     # -- the resolver --------------------------------------------------------
 
@@ -392,8 +403,10 @@ class FakeUv:
         )
         self.editable.pop(CORE, None)
         # An index resolution records no PEP 610 provenance — landing one clears
-        # whatever direct URL was there.
+        # whatever direct URL was there, and rewrites the dist-info, so damaged
+        # provenance becomes readable-and-absent rather than staying unknown.
         self.direct_urls.pop(CORE, None)
+        self.unreadable_provenance.discard(CORE)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     def _core_candidates(self, pin):

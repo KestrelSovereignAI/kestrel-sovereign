@@ -477,7 +477,7 @@ def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_
     # modelled package cannot be editable to one helper and index-resolved to
     # the other.
     monkeypatch.setattr(
-        cli, "_direct_url_provenance", lambda dist: ("/src/voice", True),
+        cli, "_direct_url_provenance", lambda dist: ("/src/voice", True, True),
     )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: "/src/voice")
     spy = _InstallSpy()
@@ -554,7 +554,7 @@ def test_sync_unpinned_pypi_core_declaration_never_falls_back_to_git(
     # Stub provenance alongside it, or the shape read falls through to this
     # venv's real metadata and the assertions describe the developer's machine
     # instead of the modelled host.
-    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False))
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False, True))
     spy = _InstallSpy(returncode=1, stderr="no matching distribution")
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
@@ -714,7 +714,7 @@ def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # core: wheel
     # ...and its provenance, or capture reads THIS venv's editable core and
     # writes a real local path ahead of the entry under test.
-    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False))
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False, True))
     manifest = tmp_path / "m.toml"
     cli.cmd_feature_sync(_args(manifest, capture=True))
     # The captured file must parse back to the exact path (no TOML escape break)
@@ -1366,6 +1366,30 @@ def test_sync_succeeds_switching_a_direct_url_core_to_the_declared_index(
     assert "core: ERROR" not in err  # the guard had nothing left to repair
 
 
+def test_unreadable_core_provenance_is_repaired_not_waved_through(
+    monkeypatch, fake_registry, tmp_path,
+):
+    """End to end: damaged provenance must not pass as an index install.
+
+    The version sits inside the declared window, so the only thing between this
+    core and a clean `present` is whether "unknown" reads as "from the index".
+    It does not — sync reinstalls from the declared source rather than trusting
+    metadata it could not read.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n')
+    venv = FakeUv(core_checkout=None, unreadable_provenance={CORE})
+    use_fake_uv(monkeypatch, venv)
+    assert venv.installed[CORE] == "0.52.0"  # version is fine; source is unknown
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    # A scoped reinstall ran, rather than a same-version no-op that would have
+    # left the unverifiable install in place.
+    assert any("--reinstall-package" in cmd for cmd in venv.commands), venv.commands
+
+
 def test_a_pypi_declared_feature_installed_from_git_is_drift_not_present(
     monkeypatch, fake_registry, tmp_path, capsys,
 ):
@@ -1384,7 +1408,7 @@ def test_a_pypi_declared_feature_installed_from_git_is_drift_not_present(
     monkeypatch.setattr(
         cli,
         "_direct_url_provenance",
-        lambda dist: ("git+https://example.invalid/voice@abc", False),
+        lambda dist: ("git+https://example.invalid/voice@abc", False, True),
     )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
     spy = _InstallSpy()

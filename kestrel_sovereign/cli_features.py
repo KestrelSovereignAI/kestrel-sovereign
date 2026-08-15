@@ -268,7 +268,7 @@ def _file_url_to_path(url: str) -> str:
 
 
 def _direct_url_provenance(dist_name: str):
-    """Read *dist_name*'s PEP 610 provenance. Returns ``(url, editable)``.
+    """Read *dist_name*'s PEP 610 provenance. ``(url, editable, known)``.
 
     ``direct_url.json`` is written by every install that named its source
     directly — a VCS ref, a local path, a remote archive, an editable checkout.
@@ -276,28 +276,53 @@ def _direct_url_provenance(dist_name: str):
     None`` is the *only* positive evidence that a distribution came from an
     index, and "not editable" says nothing about it either way (issue #2949).
 
+    ``known`` is the third state, and it exists because there are three:
+
+    * a file that is absent          → came from an index      (None, _, True)
+    * a file that names a source     → came from there    (url, editable, True)
+    * a file we could not read       → **we do not know**     (None, _, False)
+
+    Collapsing the third into the first makes "we could not tell" read as
+    positive evidence of an index install, so a direct-URL package with damaged
+    metadata satisfies a declared ``pypi`` source and the guard skips repairing
+    it — a safety predicate failing *open* on the one input it cannot verify.
+    Callers must decide what unknown means for them; none may assume it is fine.
+
     ``url`` is normalized to a filesystem path for ``file:`` URLs and returned
-    verbatim otherwise. Unreadable or malformed metadata degrades to
-    ``(None, False)`` — absent provenance, never a fabricated one.
+    verbatim otherwise.
     """
     import importlib.metadata as md
     import json
 
     try:
-        raw = md.distribution(dist_name).read_text("direct_url.json")
+        dist = md.distribution(dist_name)
+    except md.PackageNotFoundError:
+        # Not installed, so there is no provenance to have. Absent, and known.
+        return None, False, True
     except Exception:
-        return None, False
-    if not raw:
-        return None, False
+        # The distribution is there but unreadable — that is not "no file".
+        return None, False, False
+    try:
+        raw = dist.read_text("direct_url.json")
+    except Exception:
+        return None, False, False
+    if raw is None:
+        # No direct_url.json: the positive evidence of an index install.
+        return None, False, True
+    if not raw.strip():
+        # Present but empty. Damage, not an index install.
+        return None, False, False
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        return None, False
+        return None, False, False
+    if not isinstance(data, dict):
+        return None, False, False
     editable = bool(data.get("dir_info", {}).get("editable"))
     url = data.get("url", "")
     if url.startswith("file:"):
         url = _file_url_to_path(url) or None
-    return (url or None), editable
+    return (url or None), editable, True
 
 
 def _from_index(dist_name: str) -> bool:
@@ -313,12 +338,18 @@ def _from_index(dist_name: str) -> bool:
     A distribution that is not installed has no direct URL, so it reads as
     "from an index" here; callers check presence separately.
 
+    **Fails closed on unknown.** Unreadable or damaged provenance answers False,
+    because this predicate is asked in order to decide whether a declared source
+    is satisfied, and "we could not tell" is not a yes. The cost of failing
+    closed is a reinstall that was not strictly needed; the cost of failing open
+    is the wrong source silently passing — which is the whole defect.
+
     Read through ``cli.`` so provenance has exactly ONE patchable seam: a test
     that stubs where a package came from must not be able to leave this helper
     answering from the developer's real venv.
     """
-    url, _ = cli._direct_url_provenance(dist_name)
-    return url is None
+    url, _, known = cli._direct_url_provenance(dist_name)
+    return known and url is None
 
 
 def _editable_install_path(dist_name: str) -> Optional[str]:
@@ -334,7 +365,9 @@ def _editable_install_path(dist_name: str) -> Optional[str]:
     one returns None for a non-editable direct URL exactly as it does for an
     index wheel.
     """
-    url, editable = _direct_url_provenance(dist_name)
+    url, editable, _known = _direct_url_provenance(dist_name)
+    # Unknown provenance is not an editable checkout: this answers "is there a
+    # checkout to pull/relink?", and there is no path to hand back.
     return url if editable else None
 
 
@@ -920,11 +953,12 @@ def _core_install_shape():
     """
     from kestrel_sovereign.feature_reconcile import CoreInstallShape
 
-    direct_url, editable = cli._direct_url_provenance(CORE_DISTRIBUTION)
+    direct_url, editable, known = cli._direct_url_provenance(CORE_DISTRIBUTION)
     return CoreInstallShape(
         version=_installed_version(CORE_DISTRIBUTION),
         editable_path=direct_url if editable else None,
         direct_url=direct_url,
+        provenance_known=known,
     )
 
 
