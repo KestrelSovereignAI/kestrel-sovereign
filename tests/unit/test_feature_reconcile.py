@@ -773,6 +773,58 @@ def test_a_same_version_swap_between_two_commits_is_caught():
     assert not fr.core_install_matches(after, policy)
 
 
+def test_relinking_the_same_path_as_editable_is_a_change():
+    """Same url, same version — but a copy and a live checkout are not the same
+    install.
+
+    A non-editable direct install re-linked with `-e` at the same version keeps
+    every other identity field, so an identity that omits editability calls it
+    no change. It is the opposite of no change: core stops being a fixed copy
+    and becomes a checkout whose contents move under the running host.
+    """
+    path = "/src/core"
+    before = _shape("0.53.0", direct_url=path)          # installed, not linked
+    policy = fr.resolve_core_policy({}, before)
+    assert not before.is_editable
+
+    after = _shape("0.53.0", editable_path=path)        # now a live checkout
+    assert after.direct_url == before.direct_url        # url cannot tell them apart
+    assert after.provenance.source_id != before.provenance.source_id
+    assert not fr.core_install_matches(after, policy)
+
+
+def test_source_id_covers_every_provenance_field_by_construction():
+    """A field added to Provenance joins the identity without anyone remembering.
+
+    Both hand-written versions of this tuple shipped incomplete — the revision,
+    hash and subdirectory first, then `editable` — each while its docstring
+    claimed completeness. This test fails if a new field is ever added and
+    silently left out of source comparisons, which is the failure the derivation
+    exists to make impossible.
+    """
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(fr.Provenance)}
+    identity = names - fr._PROVENANCE_NON_IDENTITY
+
+    # Every identity field actually reaches source_id, positionally.
+    assert len(fr.Provenance().source_id) == len(identity)
+
+    # And each one genuinely changes the identity when it changes — a field
+    # present in the tuple but ignored downstream would still be a silent gap.
+    base = fr.Provenance.direct("u", revision="r", subdirectory="s",
+                                archive_hash="h")
+    for name in identity:
+        current = getattr(base, name)
+        changed = (not current) if isinstance(current, bool) else f"{current}-x"
+        other = dataclasses.replace(base, **{name: changed})
+        assert other.source_id != base.source_id, name
+
+    # `known` is excluded on purpose: it says whether we could READ the source,
+    # not which source it is.
+    assert fr._PROVENANCE_NON_IDENTITY == {"known"}
+
+
 def test_a_declared_source_still_wins_over_unreadable_provenance():
     """The hold policy is the *fallback*. Where the operator declared core's
     source, that declaration is still the policy — and still repairable."""

@@ -108,6 +108,16 @@ class ReconcileAction:
     note: str = ""
 
 
+#: Fields of :class:`Provenance` that are NOT part of the source's identity.
+#: Everything else is, automatically — see :attr:`Provenance.source_id`. Adding
+#: a name here removes it from every source comparison in the guard, so it wants
+#: a reason next to it.
+_PROVENANCE_NON_IDENTITY = frozenset({
+    # Whether the metadata could be read, not which source it names.
+    "known",
+})
+
+
 @dataclass(frozen=True)
 class Provenance:
     """Where a distribution came from, per PEP 610 — including "we can't tell".
@@ -178,8 +188,31 @@ class Provenance:
         this, never ``url`` alone — a url match between two different commits is
         exactly the false "no change" a version pin already fails at, one field
         further in.
+
+        ``editable`` belongs here as much as the revision does. The same path
+        installed with and without ``-e`` is the same url at the same version
+        but a materially different install: one is a copy, the other is a live
+        checkout whose contents change under the running host.
+
+        **Derived from the dataclass, never hand-listed.** Every hand-written
+        version of this tuple has been incomplete — first the revision, hash and
+        subdirectory, then ``editable`` — each time while its docstring claimed
+        completeness. A list a human must remember to extend is a list that
+        drifts from the thing it describes, and here the cost of drift is a real
+        replacement reported as no change.
+
+        So a new field on :class:`Provenance` joins the identity automatically.
+        ``known`` is excluded deliberately and explicitly: it records whether we
+        could READ the source, not which source it is. Anything else must opt
+        out here, in the open, rather than be forgotten into invisibility.
         """
-        return (self.url, self.revision, self.subdirectory, self.archive_hash)
+        import dataclasses
+
+        return tuple(
+            getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if f.name not in _PROVENANCE_NON_IDENTITY
+        )
 
     @property
     def is_from_index(self) -> bool:
