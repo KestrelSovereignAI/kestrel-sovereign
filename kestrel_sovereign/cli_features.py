@@ -1064,11 +1064,16 @@ class CoreGuardOutcome:
         a command pasted into the other shell is not the command that ran.
         """
         if not self.command:
-            # No declared source, so no command to offer. Say that, rather than
-            # print an empty backtick pair and let it read as a broken message.
+            # No DECLARED source, so no command to offer — which is not the same
+            # thing as "the source is unknown". A core installed from a known git
+            # ref that no manifest declares reaches here too, and `resolve()`
+            # names that ref in the detail immediately above. Claiming ignorance
+            # over a line that states the source contradicts itself in front of
+            # the operator. The wording has to be true of both cases, and what is
+            # true of both is that nothing declared where core belongs.
             return (
-                "NOT REPAIRED — core's source is unknown, so there is no "
-                "command that could put it back. See the detail above."
+                "NOT REPAIRED — no declared source to restore from, so there is "
+                "no command that could put it back. See the detail above."
             )
         where = f" in {self.shell}" if self.shell else ""
         return f"RESTORE FAILED — run `{self.command}`{where} by hand."
