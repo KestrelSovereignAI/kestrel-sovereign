@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     model TEXT DEFAULT NULL,
     provider TEXT DEFAULT NULL,
     metadata TEXT,
+    session_id TEXT DEFAULT NULL,
     lexical_index_id TEXT DEFAULT NULL,
     lexical_index_version TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -954,6 +955,11 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "conversation_history", "provider", "TEXT DEFAULT NULL"
         )
+        # #2958: session identity becomes an indexable column instead of a
+        # value buried in metadata JSON. Backfilled from metadata in the same
+        # transaction as the ALTER; legacy rows without a canonical session id
+        # stay NULL.
+        await self._migrate_conversation_session_id_column()
         # #1710 follow-up: if a pending A2A question observes a terminal
         # answer but fails to enqueue the local resumption signal, keep the
         # terminal payload on the WAITING row so replay/sweeps can retry the
@@ -1039,10 +1045,17 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "wait_signal_state", "last_surface_status", "TEXT"
         )
+        # Both indexes go through ``ensure_index`` rather than a bare
+        # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
+        # sequence but not safe in parallel, and ``_init_schema`` runs on every
+        # ``from_pool()``. The column probes stay — unlike the session_id
+        # migration, these ALTERs are non-fatal, so the column genuinely may be
+        # absent here (#795).
         if await self._column_exists("conversation_history", "deleted_at"):
-            await self._backend.execute(
-                "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
-                "ON conversation_history(agent_id, deleted_at)"
+            await self.ensure_index(
+                "idx_conversation_deleted_at",
+                "conversation_history",
+                "agent_id, deleted_at",
             )
         else:
             logger.error(
@@ -1051,9 +1064,10 @@ class AsyncDatabase:
                 "preceding logs."
             )
         if await self._column_exists("conversation_history", "archived_at"):
-            await self._backend.execute(
-                "CREATE INDEX IF NOT EXISTS idx_conversation_archived_at "
-                "ON conversation_history(agent_id, archived_at)"
+            await self.ensure_index(
+                "idx_conversation_archived_at",
+                "conversation_history",
+                "agent_id, archived_at",
             )
         else:
             logger.error(
@@ -1715,6 +1729,169 @@ class AsyncDatabase:
                     f"{table} is missing column(s) after migration: "
                     + ", ".join(still_missing)
                 )
+
+    async def ensure_index(
+        self, name: str, table: str, columns: str, *, lock_name: str = "",
+    ) -> None:
+        """Create an index if it is absent, serialized across initializers.
+
+        ``IF NOT EXISTS`` is not the whole answer, which is why this exists.
+        It makes the statement idempotent in SEQUENCE — run twice, the second
+        is a no-op — but it does not make it safe in PARALLEL. Postgres
+        evaluates the existence test before taking the lock that would exclude
+        a peer, so two initializers that pass it together both proceed to build
+        the index and one loses on ``pg_class``' unique index
+        (``duplicate key value ... pg_class_relname_nsp_index``). ``_init_schema``
+        runs on every ``from_pool()`` — frinz calls it per request — so a
+        post-upgrade request burst is exactly the parallel case, and the loser
+        does not merely skip the index: its whole initialization raises and the
+        request fails.
+
+        Same probe → lock → re-probe → verify shape as
+        :meth:`ensure_check_constraint`, for the same reason: the check that
+        decided to enter is stale by the time the lock is held.
+
+        ``columns`` is the index expression as it appears inside the
+        parentheses (``"agent_id, session_id"``). Neither it nor ``name`` may
+        come from untrusted input — both are interpolated, as no backend binds
+        parameters into DDL.
+        """
+        if await self._index_exists(name):
+            return
+        async with self.migration_lock(lock_name or f"index_{name}"):
+            # Re-probed under the lock: a concurrent initializer may have
+            # created it while this one waited.
+            if await self._index_exists(name):
+                return
+            await self._backend.execute(
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+            )
+            logger.info("%s: created index %s(%s)", table, name, columns)
+
+    async def _index_exists(self, name: str) -> bool:
+        """Whether an index of this name is visible to the current connection."""
+        if self.backend_type == "postgres":
+            # ``to_regclass`` resolves through the search path — the same
+            # reasoning as ``_column_exists``: ask about the relation an
+            # unqualified ``CREATE INDEX`` would actually collide with, not one
+            # named by a guessed schema. ``relkind`` distinguishes an index
+            # ('i', or 'I' when partitioned) from a same-named table.
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM pg_class "
+                "WHERE oid = to_regclass(?) AND relkind IN ('i', 'I')",
+                (name,),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'index' AND name = ?",
+                (name,),
+            )
+        return bool(row and row[0])
+
+    def _conversation_session_id_backfill(self) -> tuple:
+        """``(sql, params)`` lifting legacy ``metadata.session_id`` into the column.
+
+        Each backend reads its own JSON with its own accessor — the same split
+        every sibling backfill in this file makes on ``self.backend_type``.
+
+        Both spellings implement one rule, the one
+        :func:`~kestrel_sovereign.storage.session_grouping.is_canonical_session_value`
+        states in Python: take ``metadata.session_id`` when it is a JSON
+        **string** containing at least one character outside ASCII ``0-9``,
+        otherwise leave the column NULL.
+
+        Both halves of that rule are load-bearing here, and each is spelled in
+        SQL because the alternative is a silent three-way disagreement:
+
+        * **The type test** (``json_type``/``jsonb_typeof``) is what the Python
+          rule's ``isinstance(value, str)`` becomes. Without it, a non-string
+          value renders differently in every reader — ``{"session_id": true}``
+          extracts as ``1`` in SQLite, ``'true'`` in Postgres, and ``'True'``
+          under Python's ``str()``, so the same row would be filed under three
+          different identities depending on which upgraded it. A JSON object or
+          array is worse: SQLite hands back its compact JSON text while Python
+          would hand back a ``dict`` repr.
+        * **The digit test** rejects bare integers, which are mis-filed legacy
+          keys (#2012) that session grouping already ignores; backfilling one
+          would put a value in the indexed column that no listed session is
+          actually keyed by. Matching a non-digit rather than testing for
+          all-digits also excludes ``''``. It is deliberately an ASCII range
+          and not each backend's notion of "numeric": Python's ``str.isdigit()``
+          accepts non-ASCII digits that neither SQL dialect does, which is why
+          the shared rule does not use it either.
+
+        Rows with no session id in metadata are legacy and stay NULL by design.
+        """
+        if self.backend_type == "postgres":
+            # ``jsonb_typeof`` on the whole document is the reachable equivalent
+            # of SQLite's ``json_valid`` guard below: it keeps the extraction off
+            # rows whose metadata is not a JSON object. Genuinely malformed
+            # metadata text would still fail the cast — the same assumption every
+            # other ``metadata::jsonb`` path in this codebase makes, and true by
+            # construction because every writer stores ``json.dumps`` output.
+            #
+            # ``-> 'session_id'`` (the jsonb member) is what carries the type;
+            # ``->> 'session_id'`` has already flattened it to text, so the type
+            # test must be asked of the former and the value taken from the
+            # latter.
+            return (
+                "UPDATE conversation_history "
+                "SET session_id = metadata::jsonb ->> 'session_id' "
+                "WHERE jsonb_typeof(metadata::jsonb) = 'object' "
+                "AND jsonb_typeof(metadata::jsonb -> 'session_id') = 'string' "
+                "AND (metadata::jsonb ->> 'session_id') ~ '[^0-9]'",
+                (),
+            )
+        # SQLite's json_extract RAISES on malformed metadata, which inside a
+        # migration transaction would fail the whole boot, so the validity
+        # guard is load-bearing rather than decorative.
+        #
+        # ``json_type(metadata, path)`` returns NULL for an absent path, so the
+        # 'text' comparison also covers "no session_id at all".
+        return (
+            "UPDATE conversation_history "
+            "SET session_id = json_extract(metadata, '$.session_id') "
+            "WHERE json_valid(metadata) = 1 "
+            "AND json_type(metadata) = 'object' "
+            "AND json_type(metadata, '$.session_id') = 'text' "
+            "AND json_extract(metadata, '$.session_id') GLOB '*[^0-9]*'",
+            (),
+        )
+
+    async def _migrate_conversation_session_id_column(self) -> None:
+        """Give ``conversation_history.session_id`` a column and an index (#2958).
+
+        Session identity has only ever lived inside each row's ``metadata``
+        JSON. A value inside a JSON blob cannot be indexed, so
+        ``list_conversations`` could not query by it and had to oversample
+        history and hope the session it wanted was in the window.
+
+        The ALTER and the legacy backfill are declared together so
+        ``migrate_columns_once`` runs them in ONE transaction: a column that
+        exists without its backfill is undetectable afterwards (the schema is
+        the marker), so it must not be reachable.
+
+        Additive for this release — the write path stamps the column but every
+        reader still resolves sessions through metadata, which stays
+        authoritative until the read path moves (#2948).
+        """
+        await self.migrate_columns_once(
+            "conversation_history",
+            (("session_id", "TEXT DEFAULT NULL"),),
+            {"session_id": self._conversation_session_id_backfill()},
+        )
+        # The column is guaranteed here — migrate_columns_once raises unless it
+        # landed — but the INDEX still needs ``ensure_index``: that guarantee is
+        # about the schema, not about how many initializers are building the
+        # index at once. The ALTER is serialized by its own migration lock; a
+        # bare CREATE INDEX after it is not, and two boots racing there is a
+        # failed request rather than a skipped index.
+        await self.ensure_index(
+            "idx_conversation_agent_session",
+            "conversation_history",
+            "agent_id, session_id",
+        )
 
     async def ensure_check_constraint(
         self,

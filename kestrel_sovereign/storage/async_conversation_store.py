@@ -24,10 +24,13 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    canonical_session_id,
     canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    is_canonical_session_value,
+    normalize_session_id,
     summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
@@ -969,8 +972,15 @@ class AsyncConversationStore:
         the time-gap heuristic. Canonicalizing to an inherited UUID would merge
         the new conversation into the old one, so we only canonicalize when no
         earlier row already carries that UUID (#2012).
+
+        Takes an already-normalized value (see
+        ``_normalized_incoming_session_id``); "integer-shaped" is the exact
+        complement of the shared canonical rule, so the two cannot classify the
+        same string differently. That matters for a case ``isdigit()`` gets
+        wrong: ``int()`` accepts non-ASCII digits, so ``"١٢٣"`` would otherwise
+        be looked up as row 123 and re-filed under an unrelated session's UUID.
         """
-        if not session_id or not str(session_id).isdigit():
+        if not session_id or is_canonical_session_value(session_id):
             return session_id
 
         row_id = coerce_persistent_message_id(session_id)
@@ -994,11 +1004,15 @@ class AsyncConversationStore:
         except (json.JSONDecodeError, TypeError):
             return session_id
 
-        marker_uuid = meta.get("session_id")
+        # Read through the shared rule (#2958): this returns the id the
+        # continued turn will be FILED under, so it has to be a value the
+        # indexed column and session grouping would both accept. Asking
+        # ``str(...).isdigit()`` here instead would let a marker whose metadata
+        # holds a non-string session_id hand back a value neither honours.
+        marker_uuid = canonical_session_id(meta)
         if (
             meta.get("new_session")
             and marker_uuid
-            and not str(marker_uuid).isdigit()
             and await self._marker_owns_uuid(row_id, marker_uuid)
         ):
             logger.info(
@@ -1215,10 +1229,42 @@ class AsyncConversationStore:
         echo it back to the client. Without this, the pane's
         ``sessionId`` stays ``null`` forever because the implicit UUID
         derived inside ``add_conversation`` is invisible to the caller.
+
+        ``provided`` comes straight off an unvalidated JSON body, so it is
+        normalized to the one supported type first (#2958). The endpoint echoes
+        this value back as ``X-Session-Id``; returning something the write path
+        would then reject would have the response name a session the transcript
+        never files anything under.
         """
+        provided = self._normalized_incoming_session_id(provided)
         if provided:
             return await self._canonicalize_session_id(provided)
         return await self._derive_implicit_session_id()
+
+    @staticmethod
+    def _normalized_incoming_session_id(provided: Any) -> Optional[str]:
+        """Apply the shared ingress rule, saying so when it drops a value.
+
+        Both doors a caller-supplied session id can come through — the
+        pre-resolution in :meth:`resolve_session_id` and the write itself in
+        :meth:`_prepare_conversation_write` — normalize through here, so
+        neither can develop its own opinion of what a session id is.
+
+        A dropped value is logged rather than raised: the turn is still a
+        perfectly good turn, and it lands in the time-gap session it would have
+        landed in had the field been omitted. Silence is what would be wrong —
+        the client asked for a specific session and did not get it. ``None``
+        and ``""`` are how a caller says "no session", not a wrong type, so
+        they pass quietly.
+        """
+        normalized = normalize_session_id(provided)
+        if normalized is None and provided is not None and not isinstance(provided, str):
+            logger.warning(
+                "Ignoring unsupported session_id %r (%s): a session id must be "
+                "a string. Falling back to the time-gap heuristic.",
+                provided, type(provided).__name__,
+            )
+        return normalized
 
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
@@ -1258,9 +1304,16 @@ class AsyncConversationStore:
         meta = dict(metadata) if metadata else {}
 
         # Resolve session_id: explicit wins; otherwise derive from time gap.
-        # Canonicalize an explicit id first so a row-id echoed back by an older
+        # Normalize the caller's value to the one supported type before anything
+        # else — this is the single funnel every writer (endpoint, A2A, feature,
+        # CLI) reaches, so it is where an unvalidated JSON value stops being one
+        # (#2958). Whatever survives is stamped into metadata AND derived into
+        # the indexed column, and the two can only agree about values the shared
+        # rule can speak about.
+        # Canonicalize an explicit id next so a row-id echoed back by an older
         # UI client is re-linked to its session's UUID rather than splitting the
         # conversation across two keys (#2012).
+        session_id = self._normalized_incoming_session_id(session_id)
         if session_id:
             session_id = await self._canonicalize_session_id(session_id)
         if not session_id:
@@ -1373,6 +1426,11 @@ class AsyncConversationStore:
                 content=prepared.content,
                 rendered_content=prepared.rendered_content,
                 metadata=json.dumps(prepared.metadata) if prepared.metadata else None,
+                # Derived from the metadata that is about to be persisted, by
+                # the same rule session grouping applies when reading it back
+                # — so the column can never claim a session the transcript
+                # does not show (#2958).
+                session_id=canonical_session_id(prepared.metadata),
                 embedding=prepared.embedding,
                 embedding_profile_id=prepared.embedding_profile_id,
                 model=prepared.model,
@@ -1503,6 +1561,7 @@ class AsyncConversationStore:
         embedding_profile_id: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        session_id: Optional[str] = None,
         lexical_index_id: Optional[str] = None,
         lexical_index_version: Optional[str] = None,
     ) -> bool:
@@ -1526,26 +1585,38 @@ class AsyncConversationStore:
         when embeddings are unavailable. ``embedding_profile_id`` is
         always written alongside ``embedding_vec`` — they share the
         same row state (#1477).
+
+        ``session_id`` duplicates the canonical id already inside
+        ``metadata`` into its own indexed column (#2958). It rides in the
+        base AND legacy column lists because its migration raises unless the
+        column exists, so no schema this method can reach is without it —
+        unlike the lexical/embedding columns, whose migrations are non-fatal
+        and whose absence the fallbacks below exist to survive.
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, lexical_index_id, lexical_index_version, created_at"
+            "metadata, session_id, lexical_index_id, lexical_index_version, "
+            "created_at"
         )
         base_vals_suffix = f", {self._now_sql()}"
         base_params = (
             self.agent_id, role, content, rendered_content, model, provider,
-            metadata, lexical_index_id, lexical_index_version,
+            metadata, session_id, lexical_index_id, lexical_index_version,
         )
         legacy_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, created_at"
+            "metadata, session_id, created_at"
         )
-        legacy_params = base_params[:7]
+        legacy_params = base_params[:8]
+        # Generated, not hand-counted: these lists are spelled into six
+        # statements below and a miscount would only surface at runtime.
+        base_binds = ", ".join(["?"] * len(base_params))
+        legacy_binds = ", ".join(["?"] * len(legacy_params))
 
         if embedding is None:
             sql = (
                 f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
+                f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
                 await self.db.execute_commit(sql, base_params)
@@ -1559,7 +1630,7 @@ class AsyncConversationStore:
                 )
                 await self.db.execute_commit(
                     f"INSERT INTO conversation_history ({legacy_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                    f"VALUES ({legacy_binds}{base_vals_suffix})",
                     legacy_params,
                 )
                 return False
@@ -1580,7 +1651,7 @@ class AsyncConversationStore:
             sql = (
                 f"INSERT INTO conversation_history "
                 f"({base_cols}, embedding_vec, embedding_profile_id) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
             await self.db.execute_commit(
@@ -1596,7 +1667,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder}, ?)",
                         legacy_params + (emb_bind, embedding_profile_id),
                     )
@@ -1622,7 +1693,7 @@ class AsyncConversationStore:
                 sql = (
                     f"INSERT INTO conversation_history "
                     f"({base_cols}, embedding_vec) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                    f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
                 await self.db.execute_commit(sql, base_params + (emb_bind,))
@@ -1636,7 +1707,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder})",
                         legacy_params + (emb_bind,),
                     )
@@ -1648,7 +1719,7 @@ class AsyncConversationStore:
                     )
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history ({legacy_cols}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                        f"VALUES ({legacy_binds}{base_vals_suffix})",
                         legacy_params,
                     )
                     return False

@@ -109,9 +109,11 @@ async def test_add_conversation_without_service_uses_legacy_insert():
     assert "embedding_vec" not in sql, (
         f"legacy path must omit embedding_vec column, got: {sql!r}"
     )
-    # 9 bound positional params: the seven legacy fields plus the opaque
-    # lexical-index id and durable completion version.
-    assert len(params) == 9
+    # 10 bound positional params: the seven legacy fields, the indexed
+    # session_id (#2958), and the opaque lexical-index id + durable completion
+    # version.
+    assert len(params) == 10
+    assert "session_id" in sql
     assert params[-2]
     assert params[-1].startswith("v1:")
 

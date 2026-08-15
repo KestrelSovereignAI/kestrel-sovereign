@@ -39,6 +39,7 @@ from ..async_assertion_store import (
     _legacy_erasure_assertion_key,
     _now,
 )
+from ..session_grouping import canonical_session_id
 
 if TYPE_CHECKING:
     from ..async_database import AsyncDatabase
@@ -2334,9 +2335,19 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
                 continue
             new_meta = dict(meta)
             new_meta["session_id"] = canonical
+            # The indexed ``session_id`` column is derived from metadata
+            # (#2958), so a relink that moved metadata must move it too —
+            # otherwise this row keeps the NULL it was backfilled with while
+            # its metadata now names a canonical session. Re-derived through
+            # the shared rule rather than assigning ``canonical`` directly, so
+            # column and metadata can only ever disagree if the rule itself
+            # changed. Safe to reference the column unconditionally: its
+            # migration runs earlier in ``_init_schema`` and raises unless the
+            # column exists.
             await db.execute(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                (json.dumps(new_meta), row_id),
+                "UPDATE conversation_history SET metadata = ?, session_id = ? "
+                "WHERE id = ?",
+                (json.dumps(new_meta), canonical_session_id(new_meta), row_id),
             )
             rewritten_history += 1
 

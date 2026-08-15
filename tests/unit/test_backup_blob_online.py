@@ -104,7 +104,9 @@ async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatc
         await target.close()
 
     assert bound, "no conversation_history INSERT captured"
-    created_at = bound[0][6]  # (agent_id, role, content, model, provider, meta, created_at, deleted_at)
+    # (agent_id, role, content, model, provider, meta, session_id, created_at,
+    # deleted_at) — session_id joined the restore INSERT in #2958.
+    created_at = bound[0][7]
     assert isinstance(created_at, datetime), f"created_at bound as {type(created_at)}"
 
 

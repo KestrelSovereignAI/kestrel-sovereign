@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
+from kestrel_sovereign.storage.session_grouping import canonical_session_id
 
 # Lazy-imported below inside import_agent — identity/__init__ pulls in
 # the exporter chain which transitively loads features.bootstrap, and
@@ -865,27 +866,33 @@ class SovereignStorageAdapter:
                     # to import-time "now" (which broke session grouping +
                     # retention). Falls back to now() only when absent.
                     created_at = self._restored_created_at(msg.get("metadata") or {})
+                    # Restored rows are live history, so they carry the same
+                    # metadata-derived session column every other write path
+                    # stamps (#2958). A backup predating the column still
+                    # yields it, because the source is the metadata.
+                    session_id = canonical_session_id(msg.get("metadata"))
                     if created_at is not None:
                         await self.db.execute(
                             "INSERT INTO conversation_history "
                             "(agent_id, role, content, rendered_content, model, "
-                            "provider, metadata, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            "provider, metadata, session_id, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, msg["role"], msg["content"],
                                 rendered, model, provider, metadata_json,
-                                created_at,
+                                session_id, created_at,
                             ),
                         )
                     else:
                         await self.db.execute(
                             f"INSERT INTO conversation_history "
                             f"(agent_id, role, content, rendered_content, model, "
-                            f"provider, metadata, created_at) "
-                            f"VALUES (?, ?, ?, ?, ?, ?, ?, {self._now_sql()})",
+                            f"provider, metadata, session_id, created_at) "
+                            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, {self._now_sql()})",
                             (
                                 self.agent_id, msg["role"], msg["content"],
                                 rendered, model, provider, metadata_json,
+                                session_id,
                             ),
                         )
 

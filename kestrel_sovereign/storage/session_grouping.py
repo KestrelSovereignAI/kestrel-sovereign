@@ -15,10 +15,89 @@ plain dicts, and hands them here.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+
+
+# The only characters a bare-integer session id can be made of. Spelled as a
+# literal set rather than ``str.isdigit()`` because that method also accepts
+# non-ASCII digits ("١٢٣" is ``isdigit()``), and neither SQL dialect's digit
+# test does. A rule two SQL backfills must reproduce exactly cannot depend on
+# Python's Unicode tables — see ``_conversation_session_id_backfill``.
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def is_canonical_session_value(value: Any) -> bool:
+    """Whether a *stored* ``metadata.session_id`` names a real session (#2958).
+
+    THE rule. Three surfaces implement it — this module's grouping algorithm,
+    the write path that stamps ``conversation_history.session_id``, and the two
+    SQL backfills that populated that column for legacy rows — and they only
+    agree if there is exactly one statement of what they are agreeing to.
+
+    A value qualifies when both hold:
+
+    * **It is a string.** A session id is an opaque textual key; JSON booleans,
+      numbers, objects, and arrays are not session ids, and each backend
+      renders them differently anyway (``true`` in Postgres, ``1`` in SQLite,
+      ``"True"`` under ``str()`` in Python). Nothing may be filed under an
+      identity whose spelling depends on who is reading it.
+    * **It contains at least one character outside ASCII 0-9.** Bare integers
+      are mis-filed legacy keys (#2012): the conversation-list endpoint used to
+      key each session by the row id of its first message and the web UI echoed
+      that integer back on the next turn. Grouping ignores them in favour of the
+      row-id fallback, so promoting one into the indexed column would make the
+      column disagree with the sessions users actually see. Testing for a
+      non-digit rather than for all-digits also excludes ``""``, which is not an
+      identity either.
+    """
+    return isinstance(value, str) and any(ch not in _ASCII_DIGITS for ch in value)
+
+
+def normalize_session_id(value: Any) -> Optional[str]:
+    """Coerce a caller-supplied session id to the one supported type (#2958).
+
+    The ingress half of :func:`is_canonical_session_value`. Session ids arrive
+    from JSON request bodies that nothing validates, so ``session_id`` can be
+    any JSON value; whatever survives here is what gets stamped into metadata
+    and, once canonical, into the indexed column. Enforcing the type on the way
+    IN is what keeps the stored shape inside the set the rule can speak about.
+
+    A string passes through. A JSON *integer* is coerced to its text form
+    because that is a real client shape — the row-id echo of #2012, which
+    ``_canonicalize_session_id`` then relinks to its marker's UUID. Everything
+    else (booleans, floats, objects, arrays) is not a session id in any
+    spelling, and is reported as absent so the caller falls back to the
+    time-gap heuristic rather than stamping a value no reader will honour.
+    ``bool`` is checked before ``int`` because it is a subclass of it.
+    """
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return str(value)
+
+
+def canonical_session_id(metadata: Any) -> Optional[str]:
+    """The session id a row is canonically filed under, or ``None`` (#2958).
+
+    Applies :func:`is_canonical_session_value` to stored metadata. Callers read
+    that metadata at different points in its life, so this takes it either
+    parsed (a dict) or exactly as stored (JSON text); anything else —
+    unparseable, not an object, absent — has no canonical id.
+    """
+    if isinstance(metadata, (str, bytes, bytearray)):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    session_id = metadata.get("session_id")
+    return session_id if is_canonical_session_value(session_id) else None
 
 
 def signal_wake_source(metadata: Dict[str, Any]) -> Optional[str]:
@@ -220,13 +299,11 @@ def group_messages_into_sessions(
         )
 
         is_new_session_marker = bool(meta.get("new_session"))
-        meta_session_id = None
-        sid = meta.get("session_id")
-        # Only treat non-integer values as a canonical UUID. A bare-integer
-        # session_id is a mis-filed legacy key (#2012) where the row-id fallback
-        # groups more stably.
-        if sid and not str(sid).isdigit():
-            meta_session_id = sid
+        # Only non-integer values are a canonical UUID; a bare-integer
+        # session_id is a mis-filed legacy key (#2012) where the row-id
+        # fallback groups more stably. :func:`canonical_session_id` owns that
+        # rule for every surface that has to agree with this one.
+        meta_session_id = canonical_session_id(meta)
 
         if current is None:
             current = _new_session(msg_id, timestamp, meta_session_id)
@@ -250,10 +327,15 @@ def group_messages_into_sessions(
         # merged matches what the delete resolver actually touches. Two distinct
         # UUID sessions DO split — there the resolver matches by metadata
         # membership, so each delete stays scoped to its own id.
+        # "Carries a real id" is asked through the shared rule rather than
+        # ``isdigit()`` because the row-id fallback above is the exact thing the
+        # rule excludes — the two questions are one question, and spelling them
+        # separately let a non-ASCII-digit id ("١٢٣" is ``isdigit()``) read as a
+        # row-id anchor and silently suppress the split.
         session_changed = (
             meta_session_id is not None
             and current["session_id"] != meta_session_id
-            and not str(current["session_id"]).isdigit()
+            and is_canonical_session_value(current["session_id"])
         )
 
         if gap > gap_minutes or is_new_session_marker or session_changed:
