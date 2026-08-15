@@ -1966,3 +1966,91 @@ def test_an_edge_the_agent_does_not_own_is_reported_as_a_ledger_problem(
     assert "safe-modes" in edge[0]
     # Not phrased as drift, which would send them to a plain reanchor.
     assert "anchor drift" not in edge[0]
+
+
+def test_doctor_catches_a_crlf_smudged_semantic_checkout_before_boot(
+    tmp_path, monkeypatch,
+):
+    """The registry mismatch that bricks agent boot must be a doctor failure.
+
+    Redirect only *where* the audit reads; the classifier, the manifest, and
+    the resource bytes are the real ones, so this fails if the diagnosis
+    regresses.
+    """
+    import shutil
+    from importlib import resources
+
+    from kestrel_sovereign.doctor import DoctorReport, _check_semantic_registry
+    from kestrel_sovereign.knowledge import registry as registry_module
+
+    package_root = tmp_path / "kestrel_sovereign"
+    semantic_root = package_root / "data" / "semantic"
+    shutil.copytree(
+        resources.files("kestrel_sovereign").joinpath("data", "semantic"),
+        semantic_root,
+    )
+    audit = registry_module.audit_semantic_resources
+    manifest = semantic_root / "registry.toml"
+    monkeypatch.setattr(
+        registry_module, "audit_semantic_resources", lambda: audit(manifest)
+    )
+
+    clean = DoctorReport()
+    _check_semantic_registry(clean)
+    assert clean.ready, f"fail={clean.fail}"
+    assert any("all pinned resources verified" in m for m in clean.ok)
+
+    pinned = registry_module.load_knowledge_registry(manifest).resources
+    for path in {
+        package_root.joinpath(*Path(resource.package_resource).parts)
+        for resource in pinned
+    }:
+        content = path.read_bytes()
+        path.write_bytes(content.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+
+    report = DoctorReport()
+    _check_semantic_registry(report)
+
+    assert not report.ready, f"ok={report.ok}"
+    assert len(report.fail) == 1, report.fail
+    assert f"{len(pinned)} semantic resource(s) fail their pin" in report.fail[0]
+    assert "line-ending mismatch, not a corrupted resource" in report.fail[0]
+
+    # Every affected path is named, not one example: 29 pins fail together and
+    # a report that shows one leaves the operator repairing a single file while
+    # the fleet stays unbootable.
+    for resource in pinned:
+        assert resource.package_resource in report.fail[0]
+    # And the remedy it carries repairs all of them at once — the whole
+    # directory, executed as commands proven in test_knowledge_registry.py.
+    for command in registry_module.crlf_checkout_repair_commands():
+        assert f"`{command}`" in report.fail[0]
+
+
+def test_doctor_reports_an_unparseable_semantic_manifest_instead_of_crashing(
+    tmp_path, monkeypatch,
+):
+    """A malformed manifest must be a readiness failure, not a traceback.
+
+    ``kestrel doctor`` and ``setup --check`` are what an operator reaches for
+    when the registry is broken; dying inside the TOML decoder is the one
+    outcome that leaves them with nothing.
+    """
+    from kestrel_sovereign.doctor import DoctorReport, _check_semantic_registry
+    from kestrel_sovereign.knowledge import registry as registry_module
+
+    manifest = tmp_path / "kestrel_sovereign" / "data" / "semantic" / "registry.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("version = 1\n[resource.truncated\n", encoding="utf-8")
+    audit = registry_module.audit_semantic_resources
+    monkeypatch.setattr(
+        registry_module, "audit_semantic_resources", lambda: audit(manifest)
+    )
+
+    report = DoctorReport()
+    _check_semantic_registry(report)
+
+    assert not report.ready, f"ok={report.ok}"
+    assert len(report.fail) == 1, report.fail
+    assert "semantic registry is unusable" in report.fail[0]
+    assert "not valid TOML" in report.fail[0]
