@@ -18,9 +18,10 @@ produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
+import re
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional, List, Any
+from typing import Callable, Dict, Optional, List, Any
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
@@ -30,12 +31,64 @@ logger = logging.getLogger(__name__)
 
 _DELETE_ID_BATCH = 500
 
+#: A SHA-256 digest as this codebase writes them: lowercase hex, 64 chars.
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _has_only(properties: Dict[str, Any], allowed: frozenset) -> bool:
+    """Whether ``properties`` carries no key outside ``allowed``.
+
+    Spelled as a subset test on purpose. The obvious-looking
+    ``set(properties) > allowed`` asks whether the keys are a *proper superset*
+    of the allowed set, which is a different — and much weaker — question: swap
+    an optional key for an unlisted one (drop ``created_at``, add
+    ``source_path``) and the key set is no longer a superset at all, so the
+    guard never fires and the unlisted key rides onto a row other tenants
+    co-own. That is the exact leak these predicates exist to prevent.
+    """
+    return set(properties) <= allowed
+
+
+#: The bounded public metadata a shared constitution anchor may carry.
+_SHAREABLE_CONSTITUTION_KEYS = frozenset({"hash", "type", "created_at"})
+
+#: Exactly the per-agent fields the release *before* #2893 wrote onto the
+#: artifact node, and nothing else. Normalisation is licensed by knowing what
+#: these are: they are that release's noise, so dropping them loses nothing.
+#: A key outside this set has unknown provenance — a field a later release
+#: added, or one an operator put there — and trimming it would be one tenant
+#: silently deleting another's data on the way to co-owning the row.
+_LEGACY_ARTIFACT_KEYS = frozenset({"source_path", "anchored_at", "verification"})
+
+#: The bounded, content-derived metadata a shared reanchor artifact may carry.
+_SHAREABLE_ARTIFACT_KEYS = frozenset(
+    {
+        "hash",
+        "type",
+        "artifact_type",
+        "constitution_hash",
+        "signer",
+        "created_at",
+    }
+)
+
+
+def _is_tz_aware_iso(value: Any) -> bool:
+    """A timezone-qualified ISO timestamp, bounded in length."""
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
 
 def _is_shareable_constitution_properties(
     properties: Dict[str, Any], node_id: str
 ) -> bool:
     """Validate the bounded public metadata allowed on a shared anchor."""
-    if set(properties) > {"hash", "type", "created_at"}:
+    if not _has_only(properties, _SHAREABLE_CONSTITUTION_KEYS):
         return False
     if (
         properties.get("hash") != node_id
@@ -45,13 +98,220 @@ def _is_shareable_constitution_properties(
     created_at = properties.get("created_at")
     if created_at is None:
         return True
-    if not isinstance(created_at, str) or len(created_at) > 64:
+    return _is_tz_aware_iso(created_at)
+
+
+def _accepted_amendment_artifact_types() -> frozenset:
+    """The ``artifact_type`` values a signed reanchor artifact may declare.
+
+    A closed set, because this field is admitted onto a row several tenants
+    share — and taken from the verifier's own constant rather than restated
+    here, so the two cannot drift. Imported lazily to keep the storage layer
+    import-light and free of a dependency on the constitution package.
+    """
+    from kestrel_sovereign.constitution.amendment_artifact import ARTIFACT_TYPE
+
+    return frozenset({ARTIFACT_TYPE})
+
+
+def _is_shareable_amendment_artifact_properties(
+    properties: Dict[str, Any], node_id: str
+) -> bool:
+    """Validate the bounded, content-derived metadata on a shared artifact node.
+
+    A Sovereign-signed reanchor artifact is content-addressed, so one file is
+    one node id for a whole PostgreSQL fleet — and every field admitted here is
+    fixed by the bytes that hash to that id: ``artifact_type``, ``signer``,
+    ``constitution_sha256`` and ``created_at`` are all *signed* fields of the
+    artifact (see ``canonical_amendment_bytes``). Two agents anchoring the same
+    file therefore compute the same properties, which is what makes the node
+    genuinely shareable rather than merely coincident.
+
+    What is deliberately **not** here is everything per-agent: ``source_path``
+    (an operator filesystem path), ``anchored_at`` (when *this* agent anchored
+    it) and ``verification`` (the result of checking the signature against
+    *this* agent's resolved trust root). Those live on the agent's own
+    ``constitution_reanchor`` audit property, which already records all three
+    (#2893). Putting them on a fleet-wide node was the defect: it made one
+    tenant's paths reachable from another's row, which is why
+    ``privacy_wrapper`` refused to treat this node type as content-free.
+    """
+    if not _has_only(properties, _SHAREABLE_ARTIFACT_KEYS):
         return False
-    try:
-        parsed = datetime.fromisoformat(created_at)
-    except ValueError:
+    if (
+        properties.get("hash") != node_id
+        or properties.get("type") != "SignedConstitutionAmendment"
+    ):
         return False
-    return parsed.tzinfo is not None
+    if properties.get("artifact_type") not in _accepted_amendment_artifact_types():
+        return False
+    constitution_hash = properties.get("constitution_hash")
+    if not isinstance(constitution_hash, str) or not _HEX64.fullmatch(
+        constitution_hash
+    ):
+        return False
+    signer = properties.get("signer")
+    if not isinstance(signer, str) or len(signer) > 256:
+        return False
+    if not signer.startswith("did:"):
+        return False
+    created_at = properties.get("created_at")
+    if created_at is None:
+        return True
+    # Bounded, but *not* required to be timezone-qualified — unlike the
+    # constitution predicate above, which validates a field this codebase
+    # writes. ``created_at`` here is a **signed** field of the artifact:
+    # ``canonical_amendment_bytes`` covers it and ``verify_reanchor_artifact``
+    # does not constrain its shape. Requiring more of it than the verifier does
+    # would let an artifact govern the first agent and not the second — the
+    # first commits, because a brand-new row is never checked against this
+    # predicate, and the second rolls back. That is the fleet split this issue
+    # exists to remove. The length cap is what keeps a shared row bounded;
+    # anyone who can choose this value already holds the Sovereign key and
+    # could choose ``signer`` too.
+    return isinstance(created_at, str) and len(created_at) <= 64
+
+
+def _canonical_shared_properties(
+    properties: Dict[str, Any], allowed: frozenset
+) -> Dict[str, Any]:
+    """``properties`` with everything outside ``allowed`` dropped."""
+    return {key: value for key, value in properties.items() if key in allowed}
+
+
+def _is_normalisable_legacy_artifact(
+    existing: Dict[str, Any], incoming: Dict[str, Any], node_id: str
+) -> bool:
+    """Whether a pre-#2893 artifact row can be normalised into a shared one.
+
+    The release before this one wrote ``source_path``, ``anchored_at`` and
+    ``verification`` onto the artifact node. A fleet that has already reanchored
+    its first agent therefore *has* such a row — and it is the exact state this
+    issue exists to repair, so refusing to share it would fix the bug only for
+    installations that never hit it. The second agent's reanchor rolled back
+    with "Cannot overwrite a graph node owned by another agent".
+
+    Only the fields that release actually wrote may be dropped
+    (``_LEGACY_ARTIFACT_KEYS``). A row carrying anything else is not the legacy
+    shape — it is a row someone or something else has written to — and joining
+    it must not begin by deleting what is there.
+
+    Normalising is safe precisely because the surviving fields are derived from
+    the artifact bytes: if the legacy row's content-derived subset is byte-equal
+    to what this writer computes from the same file, the extras are the previous
+    release's per-agent noise and dropping them is what #2893 says should happen
+    to them. It is a privacy improvement, not a rewrite of anybody's content —
+    the fields that identify the *content* do not move.
+
+    Everything else still applies: the caller has already established that this
+    writer independently owns the underlying blob.
+    """
+    trimmed = _canonical_shared_properties(existing, _SHAREABLE_ARTIFACT_KEYS)
+    if trimmed == existing:
+        return False  # nothing to normalise; the ordinary path handles it
+    if not set(existing) - _SHAREABLE_ARTIFACT_KEYS <= _LEGACY_ARTIFACT_KEYS:
+        return False
+    if not _is_shareable_amendment_artifact_properties(trimmed, node_id):
+        return False
+    return trimmed == _canonical_shared_properties(
+        incoming, _SHAREABLE_ARTIFACT_KEYS
+    )
+
+
+@dataclass(frozen=True)
+class _SharedContentShape:
+    """One ``(node_type, label)`` a PostgreSQL fleet may hold a single row for.
+
+    Two questions have to be asked of a shared row, and they are not the same
+    question:
+
+    * ``is_shareable`` — *could* a sibling tenant have computed these
+      properties? That is a check on one property set in isolation.
+    * ``identity_keys`` — do the stored row and the incoming node actually
+      *agree*? Two property sets can each be shareable while describing
+      different content. Admitting the second owner then leaves the first row
+      standing and reports success to an agent that believes it stored the
+      second — a record claiming what nobody observed.
+
+    The two sets differ per shape, which is why this is a table rather than one
+    rule: every field of a signed artifact is covered by the signature and must
+    match byte for byte, but a constitution anchor's ``created_at`` is when
+    *that* tenant first stored the document and legitimately differs across the
+    fleet.
+
+    What this layer does **not** promise, so nobody reads more into it: it
+    enforces that a shared row's identity never *changes*, not that it ever
+    matched the bytes. It cannot — deciding whether ``signer`` is really the
+    artifact's signer means verifying a signature, which is
+    ``verify_reanchor_artifact``'s job and the reanchor writers' to call. So a
+    first write of wrong-but-well-formed properties still poisons that node id
+    for the fleet, and a sole owner can reach the same state by deleting its
+    row and recreating it. Both reduce to "the first writer lied", which is
+    bounded upstream by the writers deriving properties from a *verified*
+    artifact — not here.
+    """
+
+    #: Whether a property set is content-derived, and so co-ownable.
+    is_shareable: Callable[[Dict[str, Any], str], bool]
+    #: The subset of properties every co-owner must agree on.
+    identity_keys: frozenset
+    #: Whether a row written by the release *before* #2893 — carrying that
+    #: release's per-agent fields — is normalised into the shared shape rather
+    #: than refused. Only the artifact node has such a deployed state.
+    normalises_legacy_rows: bool = False
+
+
+#: The ``(node_type, label)`` shapes a PostgreSQL fleet may co-own.
+#:
+#: Two node types qualify: the governing constitution document, and a
+#: Sovereign-signed reanchor artifact (#2893). Both are the same argument — the
+#: node id IS the hash of the bytes, so every tenant computes identical
+#: properties — and both are gated the same way: the writer must independently
+#: own the underlying blob, so co-ownership follows possession of the content
+#: rather than knowledge of a hash.
+#:
+#: This table is enforced in :meth:`AsyncGraphStore.add_node`, which is the only
+#: writer of either shape today (inception and both reanchor writers go through
+#: it). A future callsite that creates one of these rows through
+#: :meth:`AsyncGraphStore.compare_and_swap_node` would bypass the table entirely
+#: and has to carry the same guard, or it reopens the split this closes.
+_SHARED_CONTENT_SHAPES = {
+    # The anchor's agreement set is exactly what its predicate already pins, so
+    # the check can never fire on its own here: two rows shareable under the
+    # same node id necessarily agree on ``hash`` and ``type``. It is spelled out
+    # rather than left off because the alternative is a default, and a default
+    # is how the next shape added to this table ends up with no agreement check
+    # without anyone having decided it should have none.
+    ("document", "KESTREL_CONSTITUTION"): _SharedContentShape(
+        is_shareable=_is_shareable_constitution_properties,
+        identity_keys=frozenset({"hash", "type"}),
+    ),
+    (
+        "constitution_amendment_artifact",
+        "Signed Constitution Reanchor Artifact",
+    ): _SharedContentShape(
+        is_shareable=_is_shareable_amendment_artifact_properties,
+        identity_keys=_SHAREABLE_ARTIFACT_KEYS,
+        normalises_legacy_rows=True,
+    ),
+}
+
+
+def _agrees_on_shared_identity(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    shape: _SharedContentShape,
+) -> bool:
+    """Whether two co-owners of a shared row describe the same content.
+
+    Compared over the shape's ``identity_keys`` rather than the whole property
+    dict, because a wholesale comparison would refuse the constitution sharing
+    that already works: each tenant stamps its own ``created_at`` when it first
+    stores the document, and that difference is expected rather than a conflict.
+    """
+    return _canonical_shared_properties(
+        existing, shape.identity_keys
+    ) == _canonical_shared_properties(incoming, shape.identity_keys)
 
 
 def _insert_owner_sql(db: AsyncDatabase, table: str, columns: str) -> str:
@@ -349,6 +609,30 @@ class AsyncGraphStore:
             return "COALESCE(NULLIF(properties, '')::jsonb, '{}'::jsonb) = ?::jsonb"
         return "json(COALESCE(NULLIF(properties, ''), '{}')) = json(?)"
 
+    @staticmethod
+    def _refuse_unshareable_properties(
+        shape_key: tuple, properties: Dict[str, Any], node_id: str
+    ) -> None:
+        """Refuse a property set a fleet could not co-own.
+
+        :meth:`add_node`'s check, and only its — which is the design rather
+        than an oversight. A rule enforced at one of two writers is not a rule,
+        so the *other* writer does not reimplement this one: it refuses
+        fleet-shared rows outright (see :meth:`compare_and_swap_node`). One
+        door knows the rules; the other declines to open.
+
+        A no-op for every node type that is not content-addressed, which is the
+        overwhelming majority.
+        """
+        shape = _SHARED_CONTENT_SHAPES.get(shape_key)
+        if shape is None or shape.is_shareable(properties, node_id):
+            return
+        node_type, label = shape_key
+        raise ValueError(
+            "Cannot store a fleet-shared graph node whose properties fall "
+            f"outside its shared shape: {node_type}/{label}"
+        )
+
     async def add_node(self, node: GraphNode) -> None:
         """Add or update a node and its ownership witness atomically.
 
@@ -359,8 +643,23 @@ class AsyncGraphStore:
         :meth:`compare_and_swap_node` instead — it closes the
         read-modify-write race that a hand-rolled retry loop around
         ``add_node`` can only ever narrow.
+
+        For the handful of content-addressed shapes a fleet co-owns
+        (``_SHARED_CONTENT_SHAPES``) the incoming node is validated *before*
+        anything is read or written, whether or not a row already exists. The
+        checks used to run only against an existing row, which made acceptance
+        depend on insertion order: a property set outside the shared shape was
+        stored happily for whichever agent got there first, and every sibling
+        that presented the same content afterwards rolled back with an ownership
+        error. Validating up front means such a node is refused for everyone or
+        for no one — a loud failure at the first agent, in a command an operator
+        is watching, instead of a silent fleet split discovered at the second.
         """
         owner = self._node_owner(node)
+        shape = _SHARED_CONTENT_SHAPES.get((node.node_type, node.label))
+        self._refuse_unshareable_properties(
+            (node.node_type, node.label), node.properties, node.node_id
+        )
         async with self.db.transaction():
             existing = await self.db.fetchone(
                 "SELECT node_type, label, properties FROM graph_nodes "
@@ -384,8 +683,8 @@ class AsyncGraphStore:
             if (
                 existing
                 and owner
-                and existing[0] == "document"
-                and node.node_type == "document"
+                and shape is not None
+                and existing[0] == node.node_type
                 and existing[1] == node.label
                 and existing_properties.get("hash") == node.node_id
                 and node.properties.get("hash") == node.node_id
@@ -396,17 +695,39 @@ class AsyncGraphStore:
                     (node.node_id, owner),
                 )
                 owns_content_reference = file_owner is not None
-            compatible_content_node = bool(
+            # A row this release would have written, or one the *previous*
+            # release left behind carrying per-agent fields. The second is the
+            # deployed state #2893 repairs, so it is admitted and normalised
+            # rather than refused — see _is_normalisable_legacy_artifact.
+            # ``node.properties`` is not re-checked in either clause below: it
+            # was validated against the shape before this transaction opened, so
+            # reaching here already means the incoming node is shareable.
+            normalisable_legacy = bool(
                 existing
-                and existing[0] == "document"
-                and node.node_type == "document"
-                and existing[1] == "KESTREL_CONSTITUTION"
-                and node.label == "KESTREL_CONSTITUTION"
-                and _is_shareable_constitution_properties(
-                    existing_properties, node.node_id
+                and shape is not None
+                and shape.normalises_legacy_rows
+                and existing[0] == node.node_type
+                and existing[1] == node.label
+                and owns_content_reference
+                and _is_normalisable_legacy_artifact(
+                    existing_properties, node.properties, node.node_id
                 )
-                and _is_shareable_constitution_properties(
-                    node.properties, node.node_id
+            )
+            # Both halves are required. Shareability asks whether each row
+            # *could* have been computed by any tenant; identity agreement asks
+            # whether these two rows describe the same content. Without the
+            # second, a node whose signed metadata disagrees with the stored row
+            # still gains an owner — and because the stored row is deliberately
+            # retained, this agent ends up owning a row that says something
+            # other than what it just anchored, with no error to show for it.
+            compatible_content_node = normalisable_legacy or bool(
+                existing
+                and shape is not None
+                and existing[0] == node.node_type
+                and existing[1] == node.label
+                and shape.is_shareable(existing_properties, node.node_id)
+                and _agrees_on_shared_identity(
+                    existing_properties, node.properties, shape
                 )
                 and owns_content_reference
             )
@@ -416,13 +737,65 @@ class AsyncGraphStore:
                 raise ValueError(
                     "Cannot overwrite a graph node owned by another agent"
                 )
+            # The shape has to be read off the *stored* row as well as off the
+            # incoming node. ``add_node`` is a whole-row upsert — it writes
+            # ``node_type`` and ``label`` too — so deriving the guards only from
+            # what the caller declared let a sole owner walk around every rule
+            # below simply by relabelling: present the artifact's node id as an
+            # ``episode``, ``shape`` comes back ``None``, no check runs, and the
+            # upsert replaces the fleet's governance row wholesale. The next
+            # agent to anchor the genuine artifact then meets a row it cannot
+            # match and rolls back — the same split, through the same door I had
+            # just closed on the swap path and not here.
+            #
+            # Placed after the ownership refusal on purpose: a foreign caller
+            # must keep getting "owned by another agent" and learn nothing more
+            # about a row it cannot see.
+            stored_key = (existing[0], existing[1]) if existing else None
+            if (
+                stored_key is not None
+                and stored_key in _SHARED_CONTENT_SHAPES
+                and stored_key != (node.node_type, node.label)
+            ):
+                raise ValueError(
+                    "Cannot change the node_type or label of a fleet-shared "
+                    f"graph node: {stored_key[0]}/{stored_key[1]}"
+                )
+            # Being the only owner today is not a licence to redefine what the
+            # row says. These node ids ARE the hash of the bytes, so the
+            # identity fields cannot legitimately change while the id stays the
+            # same — a different artifact is a different node. Allowing a sole
+            # owner to swap in another well-formed ``signer`` looked harmless
+            # (nobody else is on the row yet) and is not: every sibling that
+            # later anchors the genuine file now disagrees with the stored row
+            # and rolls back, with no way to repair it. That is this issue's
+            # fleet split, reachable by one agent acting alone.
+            if (
+                existing
+                and shape is not None
+                and not normalisable_legacy
+                and not _agrees_on_shared_identity(
+                    existing_properties, node.properties, shape
+                )
+            ):
+                raise ValueError(
+                    "Cannot change the content-derived identity of a "
+                    f"fleet-shared graph node: {node.node_type}/{node.label}"
+                )
 
             # For an identical shared node, retain the canonical row bytes and
             # add only the second ownership witness.  This avoids one tenant
             # rewriting another tenant's content-addressed row serialization.
+            # ...except when the stored row is a legacy artifact carrying the
+            # previous release's per-agent fields. Then the write is the
+            # normalisation itself: it strips those fields and leaves only what
+            # the artifact bytes fix, which is the whole point of sharing the
+            # row. Nothing content-identifying changes, so this is not one
+            # tenant rewriting another's content — it is the row becoming what
+            # both tenants independently compute.
             current_owner_can_update = bool(
                 not existing or not owner or existing_owners == {owner}
-            )
+            ) or normalisable_legacy
             if current_owner_can_update:
                 await self.db.execute(
                     self._upsert_node_sql(),
@@ -585,6 +958,21 @@ class AsyncGraphStore:
                     and new_node.node_type not in allowed_node_types
                 ):
                     return NodeSwapResult.TYPE_NOT_ALLOWED
+                # A create writes ``new_node``'s shape verbatim, and unlike a
+                # swap there is nothing to conflict with: no stored row, so no
+                # identity to preserve, no co-owner to overrule, and no read
+                # needed to know that. Only shareability applies, which is a
+                # question about the incoming properties alone — the same check
+                # ``add_node`` makes, and the reason a create stays allowed
+                # here while a swap does not. The privacy wrapper admits
+                # ``document``/``KESTREL_CONSTITUTION`` as a content-free
+                # structural type and creates it through this path (#2672).
+                #
+                # Validated against ``node_id`` — the row identity this
+                # primitive writes — not ``new_node.node_id``, which it ignores.
+                self._refuse_unshareable_properties(
+                    (new_node.node_type, new_node.label), new_node.properties, node_id
+                )
                 affected = await self.db.execute(
                     self._insert_if_absent_node_sql(),
                     (node_id, new_node.node_type, new_node.label, new_properties),
@@ -616,6 +1004,36 @@ class AsyncGraphStore:
                     return NodeSwapResult.PREDICATE_FAILED
                 return NodeSwapResult.NOT_FOUND
 
+            # An existing fleet-shared row has exactly ONE writer: ``add_node``.
+            # This primitive refuses them rather than reimplementing that door's
+            # rules — shareability, immutable identity, co-ownership — a second
+            # time against a different write path. A *create* is different and
+            # is allowed above: there is no stored row to preserve, so only
+            # shareability applies.
+            #
+            # Refused by a clause in the conditional UPDATE rather than by
+            # inspecting the row first, which matters for two reasons. A check
+            # before a write is not a check: a concurrent ``add_node`` can retype
+            # the row in between. And reading first would make this method
+            # read-then-write, which it has never been — SQLite opens a deferred
+            # transaction and its write lock is per-connection, so a second
+            # connection committing in between leaves a snapshot that cannot be
+            # upgraded, and a losing swap would raise instead of returning
+            # PREDICATE_FAILED. That contract belongs to every node type here,
+            # not just these two, and must not be spent on them.
+            #
+            # The classification read below reports the refusal as
+            # TYPE_NOT_ALLOWED — already this method's answer for "a type this
+            # operation may not touch", and already what the privacy wrapper
+            # converts into a PrivacyViolationError.
+            shared_clause = "".join(
+                " AND NOT (node_type = ? AND label = ?)"
+                for _ in _SHARED_CONTENT_SHAPES
+            )
+            shared_params = tuple(
+                value for key in _SHARED_CONTENT_SHAPES for value in key
+            )
+
             expected_properties = json.dumps(expected)
             # Properties-only: the SET touches the same single column the
             # predicate gates on, so a concurrent node_type/label change is
@@ -627,13 +1045,14 @@ class AsyncGraphStore:
                 "UPDATE graph_nodes "
                 "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}"
-                f"{type_clause} "
+                f"{type_clause}{shared_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
                     *type_params,
+                    *shared_params,
                     *scope_params,
                 ),
             )
@@ -650,11 +1069,20 @@ class AsyncGraphStore:
             # race) — this is how the wrapper tells "someone else changed it"
             # apart from "this is a user-derived row I must not rewrite".
             existing = await self.db.fetchone(
-                f"SELECT node_type FROM graph_nodes WHERE node_id = ? AND {scope}",
+                "SELECT node_type, label FROM graph_nodes "
+                f"WHERE node_id = ? AND {scope}",
                 (node_id, *scope_params),
             )
             if existing is None:
                 return NodeSwapResult.NOT_FOUND
+            # A fleet-shared row is a type this primitive may not touch, which
+            # is what TYPE_NOT_ALLOWED already means: a policy block rather than
+            # a lost race, and the answer the privacy wrapper knows how to
+            # convert. Reported from the read that was already here, so the
+            # refusal costs no extra query and races nothing — the UPDATE has
+            # already declined to write.
+            if (existing[0], existing[1]) in _SHARED_CONTENT_SHAPES:
+                return NodeSwapResult.TYPE_NOT_ALLOWED
             if (
                 allowed_node_types is not None
                 and existing[0] not in allowed_node_types

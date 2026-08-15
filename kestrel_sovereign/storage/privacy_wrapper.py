@@ -2965,13 +2965,15 @@ class PrivacyEnforcingStorage:
         if result == NodeSwapResult.TYPE_NOT_ALLOWED:
             node_type = getattr(new_node, "node_type", None)
             raise PrivacyViolationError(
-                f"Graph write '{operation}' blocked: the existing node at "
-                f"{node_id!r} is not a {node_type!r} structural node, so a "
-                f"durable properties swap onto it is a user-derived write and is "
-                f"default-denied in the current privacy config "
-                f"(storage={self._privacy_config.storage}). CAS cannot relabel a "
-                f"user-derived node as structural to smuggle content through "
-                f"(#2672)."
+                f"Graph write '{operation}' blocked: the storage layer refuses a "
+                f"durable properties swap onto the existing node at {node_id!r} "
+                f"as a {node_type!r} write. Either that row is not a "
+                f"{node_type!r} structural node — so the swap is a user-derived "
+                f"write, default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage}), and CAS cannot "
+                f"relabel a user-derived node as structural to smuggle content "
+                f"through (#2672) — or it is a fleet-shared content-addressed "
+                f"row, which only add_node may update (#2893)."
             )
         return result
 

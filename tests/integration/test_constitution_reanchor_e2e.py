@@ -668,19 +668,19 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
     )
 
     # Boom: make the last write inside the transaction raise.
-    # `_now_iso` is called three times in `_write_reanchor` — for the
-    # new document node, the signed artifact node, and finally the audit
-    # record's `timestamp` (right before the final agent-node update).
-    # Using a side_effect that succeeds twice and raises on the third
-    # targets the *last* mutation specifically — so all
-    # earlier writes have happened and rollback has real work to do.
+    # `_now_iso` is called twice in `_write_reanchor` — for the new document
+    # node, and finally the audit record's `timestamp` (right before the final
+    # agent-node update). The signed artifact node no longer stamps an
+    # `anchored_at`: that is a per-agent fact and the node is shared across a
+    # fleet (#2893). Succeeding once and raising on the second call targets the
+    # *last* mutation specifically, so every earlier write has happened and
+    # rollback has real work to do.
     real_now = __import__(
         "kestrel_sovereign.setup.constitution_reanchor",
         fromlist=["_now_iso"],
     )._now_iso
     boom = mock.Mock(
         side_effect=[
-            real_now(),
             real_now(),
             RuntimeError("simulated mid-write failure"),
         ]
@@ -712,79 +712,6 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
         "Mid-write failure must roll back the entire reanchor "
         f"transaction. Diff: pre={pre} vs post={post}"
     )
-
-
-@pytest.mark.asyncio
-async def test_artifact_ownership_check_failure_is_an_error_not_a_traceback(
-    tmp_path, monkeypatch
-):
-    """A dropped connection during the #2893 ownership check must surface as a
-    result error, not escape the helper as a traceback.
-
-    That check opens its *own* connection to the runtime database, after the
-    anchor read has already closed one. On a PostgreSQL host the two are
-    separate round trips, so the database can go away in between — which is
-    exactly the round-1 defect (an unreachable host escaping as a traceback),
-    on a path added after round 1 fixed it.
-
-    The setup is a real forced reanchor with a real signed artifact, so the
-    call is genuinely reached: the ``calls`` assertion is the anti-vacuity
-    check. An earlier attempt at this test used a stub artifact and passed for
-    the wrong reason — verification rejected it before the check ever ran.
-    """
-    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
-    constitution_path.write_bytes(CONSTITUTION_V1)
-    import kestrel_sovereign.config as ks_config
-
-    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
-    agent_dir = tmp_path / "agent_data" / "TestAgent"
-    creds = await create_kestrel_identity_async(
-        output_dir=str(agent_dir),
-        constitution_path=str(constitution_path),
-        agent_name="TestAgent",
-    )
-    db_path = agent_dir / "kestrel_prime.db"
-
-    constitution_path.write_bytes(CONSTITUTION_V2)
-    pre = await _snapshot(db_path, creds.agent_did)
-    artifact_path, trust_root_path = _write_authority_files(
-        tmp_path,
-        CONSTITUTION_V2,
-        did_document=_ROOT_DID_DOCUMENT,
-    )
-
-    calls: list[str] = []
-
-    async def _connection_dropped(target, artifact_hash):
-        calls.append(artifact_hash)
-        raise OSError("connection reset by peer")
-
-    monkeypatch.setattr(
-        "kestrel_sovereign.setup.constitution_reanchor._foreign_artifact_owner",
-        _connection_dropped,
-    )
-
-    result = await reanchor_constitution(
-        agent_name="TestAgent",
-        agent_dir=agent_dir,
-        canonical_path=constitution_path,
-        force=True,
-        amendment_artifact_path=artifact_path,
-        sovereign_trust_root_path=trust_root_path,
-    )
-
-    # Reached — verification passed and the check really ran, keyed on the
-    # hash of the artifact bytes rather than of the constitution.
-    assert calls == [hashlib.sha256(artifact_path.read_bytes()).hexdigest()]
-
-    assert result.error is not None
-    assert "connection reset by peer" in result.error
-    assert "Nothing was written." in result.error
-    assert result.reanchored is False
-
-    # And nothing was: the check runs *before* the write, so the claim the
-    # error makes about the database has to hold.
-    assert await _snapshot(db_path, creds.agent_did) == pre
 
 
 @pytest.mark.asyncio
