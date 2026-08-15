@@ -936,8 +936,18 @@ def _parse_manifest_toml(text: str, source: str) -> Mapping[str, object]:
     caller that already handles ``KnowledgeRegistryError`` — the boot gate, the
     doctor preflight, the refresh CLI — never has to also catch the TOML
     decoder's own exception type to stay on its feet.
+
+    ``tomllib.TOMLDecodeError`` is a sibling of ``KnowledgeRegistryError`` under
+    ``ValueError``, not a subclass of it, so letting it escape would end the
+    doctor and ``setup --check`` in a traceback — the same shape of unexplained
+    failure this module is meant to remove.
     """
-    return tomllib.loads(text)
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise MalformedManifestError(
+            f"semantic registry manifest is not valid TOML ({source}): {exc}"
+        ) from exc
 
 
 def _load_unverified_registry(manifest_path: Path | None = None) -> SemanticKnowledgeRegistry:
