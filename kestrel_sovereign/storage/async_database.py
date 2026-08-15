@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
+from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
 
@@ -957,8 +958,9 @@ class AsyncDatabase:
         )
         # #2958: session identity becomes an indexable column instead of a
         # value buried in metadata JSON. Backfilled from metadata in the same
-        # transaction as the ALTER; legacy rows without a canonical session id
-        # stay NULL.
+        # transaction as the ALTER; a row keeps the column's NULL default
+        # wherever metadata holds no session id, or holds one outside the
+        # column's portable contract.
         await self._migrate_conversation_session_id_column()
         # #1710 follow-up: if a pending A2A question observes a terminal
         # answer but fails to enqueue the local resumption signal, keep the
@@ -1747,117 +1749,127 @@ class AsyncDatabase:
         does not merely skip the index: its whole initialization raises and the
         request fails.
 
-        Same probe → lock → re-probe → verify shape as
-        :meth:`ensure_check_constraint`, for the same reason: the check that
-        decided to enter is stale by the time the lock is held.
+        Same probe → lock → re-probe as :meth:`ensure_check_constraint`, for
+        the same reason: the check that decided to enter is stale by the time
+        the lock is held.
+
+        Returns only once ``table`` really carries ``name``, and raises
+        otherwise. That last check is not belt-and-braces: the probe above asks
+        about the (name, table) PAIR, while ``IF NOT EXISTS`` is satisfied by
+        the NAME alone — index names are unique per database on SQLite and per
+        schema on PostgreSQL, both wider than one table. Given a same-named
+        index on a different table the two disagree, and the disagreement is
+        silent in the worst direction: the probe says "absent", the DDL says
+        "already there" and does nothing, and the only symptom is a query plan.
+        Verified against both engines rather than inferred — sqlite 3.50 and
+        PostgreSQL 16.14 each no-op.
 
         ``columns`` is the index expression as it appears inside the
         parentheses (``"agent_id, session_id"``). Neither it nor ``name`` may
         come from untrusted input — both are interpolated, as no backend binds
         parameters into DDL.
         """
-        if await self._index_exists(name):
+        if await self._index_exists(name, table):
             return
+        created = False
         async with self.migration_lock(lock_name or f"index_{name}"):
             # Re-probed under the lock: a concurrent initializer may have
             # created it while this one waited.
-            if await self._index_exists(name):
-                return
-            await self._backend.execute(
-                f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+            if not await self._index_exists(name, table):
+                await self._backend.execute(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+                )
+                created = True
+        # Outside the lock deliberately: the statement has committed, so this
+        # reads what the next boot would read, and a raise here is the caller's
+        # own error rather than a rolled-back transaction's.
+        if not await self._index_exists(name, table):
+            owner = await self._index_name_owner(name, table)
+            raise RuntimeError(
+                f"{table}: index {name}({columns}) was not created. The name "
+                f"is already taken by "
+                + (f"an index on {owner!r}" if owner else "another relation")
+                + " — index names are unique per database on SQLite and per "
+                "schema on PostgreSQL, so CREATE INDEX IF NOT EXISTS treated "
+                "it as already present and did nothing. Rename one of them."
             )
+        if created:
             logger.info("%s: created index %s(%s)", table, name, columns)
 
-    async def _index_exists(self, name: str) -> bool:
-        """Whether an index of this name is visible to the current connection."""
+    async def _index_name_owner(self, name: str, table: str) -> Optional[str]:
+        """Which relation already holds the index name ``name``, if any.
+
+        Only ever consulted to name a collision in the error above, so it
+        answers with a display string and ``None`` rather than raising: a
+        diagnostic that can itself fail would replace the message it exists to
+        improve.
+
+        Scoped to the namespace the ``CREATE INDEX`` would have written into,
+        because that is the scope the collision happened in — on PostgreSQL an
+        index in a *different* schema is not a collision at all (the migration
+        succeeds beside its own table), so reporting one would send the reader
+        after the wrong object.
+        """
         if self.backend_type == "postgres":
-            # ``to_regclass`` resolves through the search path — the same
-            # reasoning as ``_column_exists``: ask about the relation an
-            # unqualified ``CREATE INDEX`` would actually collide with, not one
-            # named by a guessed schema. ``relkind`` distinguishes an index
-            # ('i', or 'I' when partitioned) from a same-named table.
             row = await self._backend.fetch_one(
-                "SELECT COUNT(*) FROM pg_class "
-                "WHERE oid = to_regclass(?) AND relkind IN ('i', 'I')",
-                (name,),
+                "SELECT COALESCE(owner.relname, taken.relname) "
+                "FROM pg_class taken "
+                "LEFT JOIN pg_index i ON i.indexrelid = taken.oid "
+                "LEFT JOIN pg_class owner ON owner.oid = i.indrelid "
+                "WHERE taken.relname = ? AND taken.relnamespace = "
+                "(SELECT relnamespace FROM pg_class WHERE oid = to_regclass(?))",
+                (name, table),
+            )
+        else:
+            # SQLite has one namespace per database file, so no scoping term.
+            row = await self._backend.fetch_one(
+                "SELECT tbl_name FROM sqlite_master WHERE name = ?", (name,)
+            )
+        return row[0] if row and row[0] else None
+
+    async def _index_exists(self, name: str, table: str) -> bool:
+        """Whether ``table`` already carries an index called ``name``.
+
+        Asked of the TABLE, never of the index name alone. An index name is
+        only unique within its schema, so ``to_regclass(name)`` answers about
+        the first index of that name on the search path — which need not be the
+        one beside the table an unqualified ``CREATE INDEX`` would build. With a
+        decoy index in an earlier schema and the target table in a later one,
+        the name-only probe reports "present", the index is never created, and
+        nothing downstream notices: ``CREATE INDEX IF NOT EXISTS`` would have
+        shrugged too, and the only symptom is a query plan.
+
+        ``to_regclass(table)`` resolves the same relation the ``CREATE INDEX``
+        will target — the reasoning ``_column_exists`` spells out — and
+        ``pg_index.indrelid`` then restricts the answer to indexes that actually
+        belong to it. SQLite's ``sqlite_master.tbl_name`` is the same question
+        in that dialect's terms.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
+                (table, name),
             )
         else:
             row = await self._backend.fetch_one(
                 "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type = 'index' AND name = ?",
-                (name,),
+                "WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                (name, table),
             )
         return bool(row and row[0])
 
     def _conversation_session_id_backfill(self) -> tuple:
         """``(sql, params)`` lifting legacy ``metadata.session_id`` into the column.
 
-        Each backend reads its own JSON with its own accessor — the same split
-        every sibling backfill in this file makes on ``self.backend_type``.
-
-        Both spellings implement one rule, the one
-        :func:`~kestrel_sovereign.storage.session_grouping.is_canonical_session_value`
-        states in Python: take ``metadata.session_id`` when it is a JSON
-        **string** containing at least one character outside ASCII ``0-9``,
-        otherwise leave the column NULL.
-
-        Both halves of that rule are load-bearing here, and each is spelled in
-        SQL because the alternative is a silent three-way disagreement:
-
-        * **The type test** (``json_type``/``jsonb_typeof``) is what the Python
-          rule's ``isinstance(value, str)`` becomes. Without it, a non-string
-          value renders differently in every reader — ``{"session_id": true}``
-          extracts as ``1`` in SQLite, ``'true'`` in Postgres, and ``'True'``
-          under Python's ``str()``, so the same row would be filed under three
-          different identities depending on which upgraded it. A JSON object or
-          array is worse: SQLite hands back its compact JSON text while Python
-          would hand back a ``dict`` repr.
-        * **The digit test** rejects bare integers, which are mis-filed legacy
-          keys (#2012) that session grouping already ignores; backfilling one
-          would put a value in the indexed column that no listed session is
-          actually keyed by. Matching a non-digit rather than testing for
-          all-digits also excludes ``''``. It is deliberately an ASCII range
-          and not each backend's notion of "numeric": Python's ``str.isdigit()``
-          accepts non-ASCII digits that neither SQL dialect does, which is why
-          the shared rule does not use it either.
-
-        Rows with no session id in metadata are legacy and stay NULL by design.
+        The statement itself is owned by
+        :mod:`kestrel_sovereign.storage.session_id_column`, next to the Python
+        predicate the write path stamps with and the contract both derive from.
+        Two spellings of one rule is the shape that drifts, so they are not
+        allowed to live in different files.
         """
-        if self.backend_type == "postgres":
-            # ``jsonb_typeof`` on the whole document is the reachable equivalent
-            # of SQLite's ``json_valid`` guard below: it keeps the extraction off
-            # rows whose metadata is not a JSON object. Genuinely malformed
-            # metadata text would still fail the cast — the same assumption every
-            # other ``metadata::jsonb`` path in this codebase makes, and true by
-            # construction because every writer stores ``json.dumps`` output.
-            #
-            # ``-> 'session_id'`` (the jsonb member) is what carries the type;
-            # ``->> 'session_id'`` has already flattened it to text, so the type
-            # test must be asked of the former and the value taken from the
-            # latter.
-            return (
-                "UPDATE conversation_history "
-                "SET session_id = metadata::jsonb ->> 'session_id' "
-                "WHERE jsonb_typeof(metadata::jsonb) = 'object' "
-                "AND jsonb_typeof(metadata::jsonb -> 'session_id') = 'string' "
-                "AND (metadata::jsonb ->> 'session_id') ~ '[^0-9]'",
-                (),
-            )
-        # SQLite's json_extract RAISES on malformed metadata, which inside a
-        # migration transaction would fail the whole boot, so the validity
-        # guard is load-bearing rather than decorative.
-        #
-        # ``json_type(metadata, path)`` returns NULL for an absent path, so the
-        # 'text' comparison also covers "no session_id at all".
-        return (
-            "UPDATE conversation_history "
-            "SET session_id = json_extract(metadata, '$.session_id') "
-            "WHERE json_valid(metadata) = 1 "
-            "AND json_type(metadata) = 'object' "
-            "AND json_type(metadata, '$.session_id') = 'text' "
-            "AND json_extract(metadata, '$.session_id') GLOB '*[^0-9]*'",
-            (),
-        )
+        return backfill_statement(self.backend_type)
 
     async def _migrate_conversation_session_id_column(self) -> None:
         """Give ``conversation_history.session_id`` a column and an index (#2958).
@@ -1874,7 +1886,9 @@ class AsyncDatabase:
 
         Additive for this release — the write path stamps the column but every
         reader still resolves sessions through metadata, which stays
-        authoritative until the read path moves (#2948).
+        authoritative until the read path moves (#2948). The column is
+        therefore allowed to be NULL wherever the backfill could not safely
+        derive a value, and Phase C has to tolerate that anyway.
         """
         await self.migrate_columns_once(
             "conversation_history",

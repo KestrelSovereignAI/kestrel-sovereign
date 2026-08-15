@@ -29,16 +29,27 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 class _RecordingBackend:
     """A backend that reports index existence truthfully and records order.
 
-    Faithful in the one dimension that matters: a statement is a suspension
-    point (``await asyncio.sleep(0)``), so a caller that probes and then creates
-    without holding the writer slot really can be overtaken between the two.
+    Faithful in the two dimensions that matter:
+
+    * A statement is a suspension point (``await asyncio.sleep(0)``), so a
+      caller that probes and then creates without holding the writer slot
+      really can be overtaken between the two.
+    * An index NAME is unique database-wide, so ``CREATE INDEX IF NOT EXISTS``
+      no-ops when the name is taken even by an index on another table. An
+      earlier version of this double let the same name exist on two tables at
+      once — an impossible state, and one that made a silent no-op look like a
+      successful build. Modelling the impossible is how a double starts
+      certifying behaviour no engine has.
     """
 
     backend_type = "sqlite"
 
     def __init__(self) -> None:
         self.events: list[str] = []
-        self.indexes: set[str] = set()
+        # ``index_name -> table`` — the probe is table-aware, because an index
+        # name alone is not unique across schemas (#2958 Finding 3), while the
+        # mapping is single-valued because the name IS unique per database.
+        self.indexes: dict[str, str] = {}
         self._writer = asyncio.Lock()
 
     @asynccontextmanager
@@ -56,13 +67,20 @@ class _RecordingBackend:
         self.events.append(sql)
         if sql.startswith("CREATE INDEX"):
             # CREATE INDEX IF NOT EXISTS <name> ON <table>(<cols>)
-            self.indexes.add(sql.split()[5])
+            name = sql.split()[5]
+            table = sql.split()[7].split("(")[0]
+            self.indexes.setdefault(name, table)  # IF NOT EXISTS, by name
         return 0
 
     async def fetch_one(self, sql: str, params: tuple = ()):
         await asyncio.sleep(0)
-        assert "sqlite_master" in sql and "type = 'index'" in sql, sql
-        return (1 if params[0] in self.indexes else 0,)
+        if "type = 'index'" in sql:
+            assert "sqlite_master" in sql, sql
+            assert "tbl_name = ?" in sql, f"probe must be table-aware: {sql}"
+            return (1 if self.indexes.get(params[0]) == params[1] else 0,)
+        # The collision diagnostic: who holds this name?
+        assert "sqlite_master" in sql and "tbl_name" in sql, sql
+        return (self.indexes.get(params[0]),)
 
     @property
     def creates(self) -> list[str]:
@@ -111,12 +129,65 @@ async def test_the_create_runs_inside_the_lock():
 async def test_an_existing_index_is_not_relocked():
     """The common path — every boot after the first — takes no write lock."""
     backend = _RecordingBackend()
-    backend.indexes.add("idx_probe")
+    backend.indexes["idx_probe"] = "conversation_history"
     db = AsyncDatabase(backend)
 
     await db.ensure_index("idx_probe", "conversation_history", "agent_id")
 
     assert backend.events == []
+
+
+@pytest.mark.asyncio
+async def test_a_name_taken_by_another_table_is_reported_not_shrugged_off():
+    """The probe and ``IF NOT EXISTS`` ask different questions (#2958).
+
+    ``_index_exists`` asks about the (name, table) PAIR — it must, since a name
+    alone is not unique across schemas. ``CREATE INDEX IF NOT EXISTS`` asks
+    only about the NAME. Given a decoy on another table the two disagree: the
+    probe says "absent", the DDL says "present" and does nothing, and the
+    caller is told the index was built. Only a query plan would ever show it.
+
+    The real-engine counterpart is below; this one pins that the failure is
+    raised from ``ensure_index`` itself and names the colliding table.
+    """
+    backend = _RecordingBackend()
+    backend.indexes["idx_probe"] = "some_other_table"
+    db = AsyncDatabase(backend)
+
+    with pytest.raises(RuntimeError, match="some_other_table"):
+        await db.ensure_index("idx_probe", "conversation_history", "agent_id")
+
+    # It did try — the raise is about the outcome, not a refusal to attempt.
+    assert backend.creates == [
+        "CREATE INDEX IF NOT EXISTS idx_probe ON conversation_history(agent_id)"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_name_collision_really_no_ops_on_a_live_sqlite_database(tmp_path):
+    """The engine's own behaviour, not the double's model of it.
+
+    SQLite keeps index names in one database-wide namespace. This asserts both
+    halves of the trap against a real file: the DDL silently does nothing, and
+    ``ensure_index`` refuses to report success for it.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "collision.db"))
+    try:
+        await db.execute("CREATE TABLE decoy (agent_id TEXT)")
+        await db.execute("CREATE TABLE target (agent_id TEXT)")
+        await db.execute("CREATE INDEX idx_collide ON decoy(agent_id)")
+
+        with pytest.raises(Exception) as raised:
+            await db.ensure_index("idx_collide", "target", "agent_id")
+        assert "decoy" in str(raised.value), str(raised.value)
+
+        # The engine really did nothing: the name still belongs to the decoy.
+        assert await db.fetchall(
+            "SELECT name, tbl_name FROM sqlite_master WHERE name = 'idx_collide'",
+            (),
+        ) == [("idx_collide", "decoy")]
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

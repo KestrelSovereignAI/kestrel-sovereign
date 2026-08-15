@@ -444,7 +444,12 @@ jobs:
       && needs.lint-and-imports.outputs.run_expensive != 'false'
     services:
       postgres:
-        image: pgvector/pgvector:pg15
+        # PostgreSQL 16 is the floor, not a preference: the #2958
+        # conversation_history.session_id backfill guards its JSON parse with
+        # `metadata IS JSON OBJECT`, which is 16+. It is the only in-SQL
+        # validity test that returns false for malformed metadata instead of
+        # raising on it, and a raise there aborts the migration and the boot.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: kestrel_user
           POSTGRES_PASSWORD: kestrel_password

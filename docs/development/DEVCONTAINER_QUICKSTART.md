@@ -24,7 +24,7 @@ Get a complete Kestrel + Kestrel development environment running in Docker Deskt
 
 A fully configured development environment with:
 - ✅ Python 3.11 + all dependencies installed
-- ✅ PostgreSQL 15 with pgvector (port 5433)
+- ✅ PostgreSQL 16 with pgvector (port 5433)
 - ✅ Redis 7 (port 6380)
 - ✅ VS Code extensions pre-installed
 - ✅ Git configured with your identity
@@ -245,12 +245,24 @@ Just close VS Code. The container keeps running in the background.
 
 ### Remove Everything
 ```bash
-# Stop and remove containers
-docker-compose -f .devcontainer/docker-compose.devcontainer.yml down
+# Stop and remove containers, keeping the data
+docker compose -f .devcontainer/docker-compose.devcontainer.yml down
 
-# Remove persistent volumes (⚠️ DELETES DATA)
-docker volume rm kestrel-venv kestrel-agent-data kestrel-logs postgres-data redis-data
+# ...or take the volumes with them (⚠️ DELETES DATA)
+docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v
 ```
+
+> Passing `docker volume rm` the names from the compose file does **not** work:
+> Docker prefixes them with the Compose project, so the live cluster is
+> `devcontainer_postgres16-data` — and VS Code derives that prefix from your
+> workspace path, so it differs per machine. `down -v` looks it up for you.
+
+> Upgrading a devcontainer built before the PostgreSQL 16 bump? The database
+> volume is versioned with the server major, so `pg16` starts on a fresh
+> `postgres16-data` instead of refusing to read the `postgres-data` cluster
+> `pg15` left behind. The old volume is not touched — see
+> [.devcontainer/README.md](../../.devcontainer/README.md#upgrading-from-the-postgresql-15-devcontainer)
+> to dump or drop it.
 
 ## 📚 Learn More
 

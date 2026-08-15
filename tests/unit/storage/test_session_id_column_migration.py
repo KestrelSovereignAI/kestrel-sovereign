@@ -2,16 +2,19 @@
 
 Session identity has only ever lived inside each row's ``metadata`` JSON, so it
 could not be indexed and the conversation list had to oversample and hope. This
-covers the additive phase: the column, its index, and the one-time backfill
-that lifts legacy rows out of metadata.
+covers the additive phase: the column, its index, the one-time backfill that
+lifts legacy rows out of metadata, and the write paths that stamp it going
+forward.
 
-The contract under test is stated as an equality, not a list of cases: for
-every row, the column equals
-:func:`~kestrel_sovereign.storage.session_grouping.canonical_session_id` of its
-metadata — the same rule ``group_messages_into_sessions`` applies when it
-decides which id a session is filed under. A bare-integer id is a mis-filed
-legacy key (#2012) that grouping ignores, so it must stay NULL rather than be
-promoted into the indexed column.
+**Additive means additive.** Phase A changes what the database STORES, not what
+any reader does with it and not what any caller may send. Metadata stays
+authoritative; session grouping and ingress are untouched, and there are tests
+below that fail if that stops being true.
+
+The contract is stated as an equality: for every row, the column equals
+:func:`~kestrel_sovereign.storage.session_id_column.column_session_id` of its
+metadata. The rule that function implements — and the reason it is narrower
+than session grouping's — lives in ``test_session_id_contract.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +28,11 @@ import pytest
 
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.session_grouping import canonical_session_id
+from kestrel_sovereign.storage.session_grouping import group_messages_into_sessions
+from kestrel_sovereign.storage.session_id_column import (
+    SESSION_ID_MAX_LENGTH,
+    column_session_id,
+)
 
 
 AGENT = "did:test:session-column"
@@ -52,6 +59,7 @@ CREATE INDEX idx_conversation_agent_id ON conversation_history(agent_id);
 LEGACY_ROWS = [
     ("uuid", json.dumps({"session_id": UUID_A}), UUID_A),
     ("uuid marker", json.dumps({"session_id": UUID_B, "new_session": True}), UUID_B),
+    ("sess key", json.dumps({"session_id": "sess_9fk21xa"}), "sess_9fk21xa"),
     # #2012: the list endpoint keyed sessions by row id and the UI echoed the
     # integer back. Grouping ignores these, so the column must not adopt one.
     ("bare integer", json.dumps({"session_id": "1314"}), None),
@@ -60,26 +68,27 @@ LEGACY_ROWS = [
     ("empty string", json.dumps({"session_id": ""}), None),
     ("json null", json.dumps({"session_id": None}), None),
     ("no metadata", None, None),
-    # Not written by any code path, but a migration that raises here would
-    # fail the whole boot rather than one row.
+    # Written by nothing, but a migration that RAISES here fails the whole
+    # boot rather than one row — the P1 this ticket was rewritten around.
     ("malformed metadata", "{not json", None),
-    # ── Values that render DIFFERENTLY in each reader ────────────────────
-    # A session id must be a JSON string. These are the shapes that made the
-    # three implementations of the rule disagree before it was stated once:
-    # ``true`` extracts as 1 in SQLite, 'true' in Postgres and 'True' under
-    # Python's ``str()``; a JSON object comes back as compact JSON text from
-    # SQLite and as a dict repr from Python. Nothing may be filed under an
-    # identity whose spelling depends on who read it, so all of them are NULL.
+    ("nul escape", '{"session_id": "\\u0000"}', None),
+    ("embedded nul escape", '{"session_id": "a\\u0000b"}', None),
+    ("at the length limit", json.dumps({"session_id": "b" * SESSION_ID_MAX_LENGTH}),
+     "b" * SESSION_ID_MAX_LENGTH),
+    ("over the length limit",
+     json.dumps({"session_id": "b" * (SESSION_ID_MAX_LENGTH + 1)}), None),
+    # Values whose spelling depends on who read them.
     ("json true", json.dumps({"session_id": True}), None),
     ("json false", json.dumps({"session_id": False}), None),
     ("json object", json.dumps({"session_id": {"nested": UUID_A}}), None),
     ("json array", json.dumps({"session_id": [UUID_A]}), None),
     ("json float", json.dumps({"session_id": 1.5}), None),
-    # Not a bare integer by the ASCII rule the SQL implements — and NOT
-    # excludable via ``str.isdigit()``, which calls this digits. It is a string
-    # containing no ASCII 0-9, so it is a (strange but usable) session id and
-    # every backend agrees on its spelling.
-    ("unicode digits", json.dumps({"session_id": "١٢٣"}), "١٢٣"),
+    # Renders as ``-5``: inside the charset, not all digits. Only the JSON
+    # type test keeps it out, which is what makes that clause load-bearing.
+    ("json negative number", json.dumps({"session_id": -5}), None),
+    # str.isdigit() calls this digits and neither SQL dialect does.
+    ("unicode digits", json.dumps({"session_id": "١٢٣"}), None),
+    ("outside the charset", json.dumps({"session_id": "did:x:1"}), None),
     # Metadata that is valid JSON but not an object has no session_id at all.
     ("metadata not an object", json.dumps([{"session_id": UUID_A}]), None),
 ]
@@ -100,6 +109,26 @@ def _seed_pre_migration_db(path: str) -> None:
         conn.close()
 
 
+def _grouped_session_id(metadata):
+    """The session id ``group_messages_into_sessions`` files a lone row under.
+
+    ``keep_empty_markers`` so a ``new_session`` marker — structural, and the
+    only row in these fixtures — is still returned rather than dropped as an
+    empty session.
+    """
+    sessions = group_messages_into_sessions(
+        [{
+            "id": 1,
+            "role": "user",
+            "content": "x",
+            "metadata": metadata,
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }],
+        keep_empty_markers=True,
+    )
+    return sessions[0]["session_id"] if sessions else None
+
+
 async def _rows(db):
     return await db.fetchall(
         "SELECT content, metadata, session_id FROM conversation_history "
@@ -118,7 +147,7 @@ async def _index_names(db):
 
 
 @pytest.mark.asyncio
-async def test_backfill_lifts_only_canonical_session_ids(tmp_path):
+async def test_backfill_lifts_only_stampable_session_ids(tmp_path):
     db_path = tmp_path / "pre-migration.db"
     _seed_pre_migration_db(str(db_path))
 
@@ -133,8 +162,50 @@ async def test_backfill_lifts_only_canonical_session_ids(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfilled_column_agrees_with_session_grouping(tmp_path):
-    """The acceptance statement, asserted row by row against the shared rule."""
+async def test_a_boot_against_only_unparseable_metadata_still_completes(tmp_path):
+    """Malformed and NUL-bearing metadata must not be able to brick startup.
+
+    The migration is mandatory — ``migrate_columns_once`` raises if the column
+    does not land — so a backfill that raised on a poison row would take the
+    whole boot with it, not one row. A table made ENTIRELY of poison is the
+    strongest form of that: nothing else can be carrying the migration.
+    """
+    db_path = tmp_path / "poison.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(PRE_MIGRATION_SCHEMA)
+        for content, metadata in (
+            ("malformed", "{not json"),
+            ("truncated", '{"session_id": "abc'),
+            ("nul", '{"session_id": "\\u0000"}'),
+            ("not an object", "42"),
+            ("empty text", ""),
+        ):
+            conn.execute(
+                "INSERT INTO conversation_history (agent_id, role, content, metadata) "
+                "VALUES (?, ?, ?, ?)",
+                (AGENT, "user", content, metadata),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = await AsyncDatabase.sqlite(str(db_path))
+    try:
+        assert [session_id for _c, _m, session_id in await _rows(db)] == [None] * 5
+        assert "idx_conversation_agent_session" in await _index_names(db)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_backfilled_column_never_disagrees_with_session_grouping(tmp_path):
+    """The acceptance statement, row by row against the real grouper.
+
+    Not "equals" — the contract is deliberately narrower, so the column may be
+    NULL for a row grouping still files under a session id. What it may never
+    do is name a different one.
+    """
     db_path = tmp_path / "pre-migration.db"
     _seed_pre_migration_db(str(db_path))
 
@@ -143,9 +214,10 @@ async def test_backfilled_column_agrees_with_session_grouping(tmp_path):
         rows = await _rows(db)
         assert len(rows) == len(LEGACY_ROWS)
         for content, metadata, session_id in rows:
-            assert session_id == canonical_session_id(metadata), (
-                f"column disagrees with session grouping for {content!r}"
-            )
+            assert session_id == column_session_id(metadata), content
+            if session_id is None:
+                continue
+            assert _grouped_session_id(json.loads(metadata)) == session_id, content
     finally:
         await db.close()
 
@@ -215,7 +287,12 @@ async def test_write_path_stamps_the_column(tmp_path):
 
 @pytest.mark.asyncio
 async def test_write_path_stamps_the_derived_implicit_session(tmp_path):
-    """No explicit id: the column follows whatever derivation put in metadata."""
+    """No explicit id: the column follows whatever derivation put in metadata.
+
+    Also pins that the minted UUIDs are inside the contract's charset — if they
+    were not, every ordinary turn would land with a NULL column and the index
+    would be worthless.
+    """
     db = await AsyncDatabase.sqlite(str(tmp_path / "implicit.db"))
     try:
         store = AsyncConversationStore(db, agent_id=AGENT)
@@ -243,6 +320,48 @@ async def test_write_path_leaves_a_bare_integer_session_id_null(tmp_path):
         _content, metadata, session_id = (await _rows(db))[1]
         assert json.loads(metadata)["session_id"] == "1"
         assert session_id is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unstampable_caller_id_is_stored_but_not_indexed(tmp_path):
+    """Phase A adds a column. It does not add an ingress rule.
+
+    The column contract is narrower than what callers may send, and closing
+    that gap by rejecting or rewriting caller input would change endpoint
+    behaviour under cover of an additive migration (#2958 Finding 5). So an id
+    outside the charset still reaches metadata verbatim, still groups exactly
+    as it did before, and simply leaves the column NULL — the state legacy rows
+    are already in and the one Phase C has to tolerate anyway.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "ingress.db"))
+    try:
+        store = AsyncConversationStore(db, agent_id=AGENT)
+        await store.add_conversation("user", "hello", session_id="did:x:1")
+
+        _content, metadata, session_id = (await _rows(db))[0]
+        assert json.loads(metadata)["session_id"] == "did:x:1"
+        assert session_id is None
+
+        # ...and grouping still files it under the id it always did.
+        assert _grouped_session_id(json.loads(metadata)) == "did:x:1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_id_still_echoes_what_the_caller_sent(tmp_path):
+    """``X-Session-Id`` names the session the row is filed under, as before.
+
+    Filing is metadata's job in Phase A, so an id the column cannot hold is
+    still the correct answer here. A Phase-A patch that started normalizing at
+    this seam would be changing the endpoint contract, not adding a column.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "resolve.db"))
+    try:
+        store = AsyncConversationStore(db, agent_id=AGENT)
+        assert await store.resolve_session_id("did:x:1") == "did:x:1"
     finally:
         await db.close()
 
@@ -287,83 +406,14 @@ async def test_boot_converges_a_relinked_legacy_row_onto_the_column(tmp_path):
         await db.close()
 
 
-@pytest.mark.parametrize(
-    ("backend_type", "expected"),
-    [
-        (
-            "sqlite",
-            (
-                "json_extract(metadata, '$.session_id')",
-                "json_type(metadata, '$.session_id') = 'text'",
-                "GLOB '*[^0-9]*'",
-            ),
-        ),
-        (
-            "postgres",
-            (
-                "metadata::jsonb ->> 'session_id'",
-                "jsonb_typeof(metadata::jsonb -> 'session_id') = 'string'",
-                "~ '[^0-9]'",
-            ),
-        ),
-    ],
-)
-def test_backfill_reads_each_backend_with_its_own_json_dialect(backend_type, expected):
-    """SQLite's json_extract and Postgres' jsonb operator are not interchangeable.
-
-    Postgres cannot run ``json_extract`` at all, and neither the type test nor
-    the digit test has a portable spelling, so the dialect choice is asserted
-    here — the SQLite-only CI run still proves the Postgres branch was written.
-    """
-    db = AsyncDatabase(SimpleNamespace(backend_type=backend_type))
-    sql, params = db._conversation_session_id_backfill()
-
-    assert params == ()
-    for fragment in expected:
-        assert fragment in sql
-    assert sql.startswith("UPDATE conversation_history SET session_id = ")
-
-
 @pytest.mark.asyncio
-async def test_write_path_refuses_a_session_id_that_is_not_a_string(tmp_path):
-    """Ingress owns the type, so no row is ever stored outside the rule's reach.
-
-    A JSON body is unvalidated, so ``session_id`` can arrive as any JSON value.
-    Stamping one into metadata would write a row whose metadata names a session
-    the column (and every reader) refuses — so the write path drops it and the
-    turn joins the time-gap session, exactly as an omitted field would.
-    """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "typed.db"))
-    try:
-        store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "first", session_id=UUID_A)
-        for unsupported in (True, 1.5, {"nested": UUID_A}, [UUID_A]):
-            await store.add_conversation("user", "garbage", session_id=unsupported)
-
-        for content, metadata, session_id in await _rows(db):
-            stored = json.loads(metadata)["session_id"]
-            assert isinstance(stored, str), content
-            assert session_id == canonical_session_id(metadata), content
-    finally:
-        await db.close()
-
-
-@pytest.mark.asyncio
-async def test_write_path_still_relinks_an_integer_session_id_sent_as_a_number(
-    tmp_path,
-):
-    """Normalizing the type must not break the #2012 row-id echo it exists for.
-
-    Older UI clients round-trip the marker's row id. Sending it as a JSON
-    number rather than a string is the same client mistake, so it must reach
-    canonicalization and be relinked — dropping it as "not a string" would
-    regress #2012 in the name of #2958.
+async def test_write_path_still_relinks_an_integer_session_id(tmp_path):
+    """The #2958 column must not disturb the #2012 row-id echo it sits beside.
 
     The marker is deliberately STALE. With a recent one, the time-gap heuristic
-    hands back the same UUID the relink would, so the test passes whether or not
-    the number ever reached canonicalization — it would assert nothing. Beyond
-    the gap, the fallback mints a fresh UUID, so only a genuine relink produces
-    ``UUID_A``.
+    hands back the same UUID the relink would, so the test would pass whether
+    or not canonicalization ran — it would assert nothing. Beyond the gap the
+    fallback mints a fresh UUID, so only a genuine relink produces ``UUID_A``.
     """
     db_path = tmp_path / "echo.db"
     stale = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime(
@@ -386,7 +436,7 @@ async def test_write_path_still_relinks_an_integer_session_id_sent_as_a_number(
     db = await AsyncDatabase.sqlite(str(db_path))
     try:
         store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "continued", session_id=1)
+        await store.add_conversation("user", "continued", session_id="1")
 
         _content, metadata, session_id = (await _rows(db))[1]
         assert json.loads(metadata)["session_id"] == UUID_A
@@ -395,20 +445,39 @@ async def test_write_path_still_relinks_an_integer_session_id_sent_as_a_number(
         await db.close()
 
 
-@pytest.mark.asyncio
-async def test_resolved_session_id_matches_what_the_write_path_will_file(tmp_path):
-    """The echoed ``X-Session-Id`` may not name a session no row can carry."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "resolve.db"))
-    try:
-        store = AsyncConversationStore(db, agent_id=AGENT)
-        resolved = await store.resolve_session_id(True)
+@pytest.mark.parametrize(
+    ("backend_type", "expected"),
+    [
+        (
+            "sqlite",
+            (
+                "json_extract(metadata, '$.session_id')",
+                "json_type(metadata, '$.session_id') = 'text'",
+                "json_valid(metadata) = 1",
+            ),
+        ),
+        (
+            "postgres",
+            (
+                "metadata::jsonb ->> 'session_id'",
+                "jsonb_typeof(metadata::jsonb -> 'session_id') = 'string'",
+                "metadata IS JSON OBJECT",
+            ),
+        ),
+    ],
+)
+def test_backfill_reads_each_backend_with_its_own_json_dialect(backend_type, expected):
+    """SQLite's json_extract and Postgres' jsonb operator are not interchangeable.
 
-        assert resolved is not True
-        assert resolved is None or isinstance(resolved, str)
+    Postgres cannot run ``json_extract`` at all, so the dialect choice is
+    asserted here — the SQLite-only CI leg still proves the Postgres branch was
+    written. What the two statements MEAN is settled against real engines in
+    ``tests/integration/test_session_id_column_backend_parity.py``.
+    """
+    db = AsyncDatabase(SimpleNamespace(backend_type=backend_type))
+    sql, params = db._conversation_session_id_backfill()
 
-        await store.add_conversation("user", "hello", session_id=True)
-        _content, metadata, session_id = (await _rows(db))[0]
-        assert json.loads(metadata)["session_id"] != True  # noqa: E712
-        assert session_id == canonical_session_id(metadata)
-    finally:
-        await db.close()
+    assert params == ("\\u0000",)
+    for fragment in expected:
+        assert fragment in sql
+    assert sql.startswith("UPDATE conversation_history SET session_id = ")

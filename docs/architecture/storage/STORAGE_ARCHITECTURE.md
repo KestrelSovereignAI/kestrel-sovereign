@@ -47,6 +47,15 @@ The default local backend is SQLite. PostgreSQL is supported through the async
 backend layer by setting `KESTREL_DB_BACKEND=postgres` and a PostgreSQL DSN
 through `KESTREL_DATABASE_URL` or explicit configuration.
 
+**PostgreSQL 16 is the floor.** The `conversation_history.session_id` backfill
+(#2958) guards its JSON parse with `metadata IS JSON OBJECT`, which is 16+ and
+is the only in-SQL validity test that returns false for malformed metadata
+instead of raising on it — and a raise inside a startup migration aborts the
+boot rather than skipping a row. On PostgreSQL 15 that statement is a syntax
+error, so an older server fails during schema initialization instead of
+degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16` for the
+same reason.
+
 ## Backend Layer
 
 `AsyncDatabase` wraps a `DatabaseBackend`:
@@ -115,6 +124,7 @@ migrations from `storage/sqla/migrations.py`:
 - `conversation_history.embedding_vec`
 - `conversation_history.rendered_content`
 - `conversation_history.deleted_at`
+- `conversation_history.session_id`
 
 On PostgreSQL, vector migrations create the `vector` extension where needed and
 add HNSW indexes. On SQLite, vector columns are `BLOB`s and use the pure-Python
@@ -122,6 +132,32 @@ backend.
 
 Failures in vector migrations are non-fatal for startup. The affected feature
 falls back to the legacy search path and logs the failure for the next boot.
+
+### The derived `session_id` column
+
+`conversation_history.session_id` is a **derived duplicate** of
+`metadata.session_id`, added so sessions can be indexed (#2958). Metadata stays
+authoritative; the column exists to be queried. Its one invariant is:
+
+> The column may be NULL where session grouping is canonical.
+> It may never disagree.
+
+Which values may be copied into it is decided in exactly one place —
+`storage/session_id_column.py` — and compiled into three renderings that have to
+agree: Python for the write paths, SQLite and PostgreSQL for the two halves of
+the legacy backfill. The rule is deliberately narrower than the grouper's, so
+anything the three readers would spell differently (a non-string JSON value, a
+non-ASCII identifier, a NUL, an id too long for a B-tree entry, or a
+`session_id` key that appears twice in one document) lands as NULL rather than
+as a value one backend agrees with and another does not.
+
+Indexes for these migrations go through `AsyncDatabase.ensure_index`, not a bare
+`CREATE INDEX IF NOT EXISTS`: that spelling is idempotent in sequence but races
+in parallel, and `_init_schema` runs on every `from_pool()`. `ensure_index`
+returns only once the named index really exists on the named table, and raises
+otherwise — `IF NOT EXISTS` is satisfied by the name alone, which is unique per
+database on SQLite and per schema on PostgreSQL, so a same-named index on
+another table would otherwise make the DDL a silent no-op.
 
 ## Retrieval Surfaces
 

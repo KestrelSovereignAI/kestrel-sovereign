@@ -31,7 +31,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
-from kestrel_sovereign.storage.session_grouping import canonical_session_id
+from kestrel_sovereign.storage.session_id_column import column_session_id
 
 # Lazy-imported below inside import_agent — identity/__init__ pulls in
 # the exporter chain which transitively loads features.bootstrap, and
@@ -869,8 +869,10 @@ class SovereignStorageAdapter:
                     # Restored rows are live history, so they carry the same
                     # metadata-derived session column every other write path
                     # stamps (#2958). A backup predating the column still
-                    # yields it, because the source is the metadata.
-                    session_id = canonical_session_id(msg.get("metadata"))
+                    # yields one, because the source is the metadata the
+                    # backup already carries — NULL where that id is outside
+                    # the column's contract.
+                    session_id = column_session_id(msg.get("metadata"))
                     if created_at is not None:
                         await self.db.execute(
                             "INSERT INTO conversation_history "

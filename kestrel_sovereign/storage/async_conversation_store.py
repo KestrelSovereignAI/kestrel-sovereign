@@ -24,16 +24,18 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
-    canonical_session_id,
     canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
-    is_canonical_session_value,
-    normalize_session_id,
     summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
+)
+from .session_id_column import (
+    SESSION_ID_KEY,
+    column_session_id,
+    merged_column_assignment,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
@@ -972,15 +974,8 @@ class AsyncConversationStore:
         the time-gap heuristic. Canonicalizing to an inherited UUID would merge
         the new conversation into the old one, so we only canonicalize when no
         earlier row already carries that UUID (#2012).
-
-        Takes an already-normalized value (see
-        ``_normalized_incoming_session_id``); "integer-shaped" is the exact
-        complement of the shared canonical rule, so the two cannot classify the
-        same string differently. That matters for a case ``isdigit()`` gets
-        wrong: ``int()`` accepts non-ASCII digits, so ``"١٢٣"`` would otherwise
-        be looked up as row 123 and re-filed under an unrelated session's UUID.
         """
-        if not session_id or is_canonical_session_value(session_id):
+        if not session_id or not str(session_id).isdigit():
             return session_id
 
         row_id = coerce_persistent_message_id(session_id)
@@ -1004,15 +999,11 @@ class AsyncConversationStore:
         except (json.JSONDecodeError, TypeError):
             return session_id
 
-        # Read through the shared rule (#2958): this returns the id the
-        # continued turn will be FILED under, so it has to be a value the
-        # indexed column and session grouping would both accept. Asking
-        # ``str(...).isdigit()`` here instead would let a marker whose metadata
-        # holds a non-string session_id hand back a value neither honours.
-        marker_uuid = canonical_session_id(meta)
+        marker_uuid = meta.get("session_id")
         if (
             meta.get("new_session")
             and marker_uuid
+            and not str(marker_uuid).isdigit()
             and await self._marker_owns_uuid(row_id, marker_uuid)
         ):
             logger.info(
@@ -1229,42 +1220,10 @@ class AsyncConversationStore:
         echo it back to the client. Without this, the pane's
         ``sessionId`` stays ``null`` forever because the implicit UUID
         derived inside ``add_conversation`` is invisible to the caller.
-
-        ``provided`` comes straight off an unvalidated JSON body, so it is
-        normalized to the one supported type first (#2958). The endpoint echoes
-        this value back as ``X-Session-Id``; returning something the write path
-        would then reject would have the response name a session the transcript
-        never files anything under.
         """
-        provided = self._normalized_incoming_session_id(provided)
         if provided:
             return await self._canonicalize_session_id(provided)
         return await self._derive_implicit_session_id()
-
-    @staticmethod
-    def _normalized_incoming_session_id(provided: Any) -> Optional[str]:
-        """Apply the shared ingress rule, saying so when it drops a value.
-
-        Both doors a caller-supplied session id can come through — the
-        pre-resolution in :meth:`resolve_session_id` and the write itself in
-        :meth:`_prepare_conversation_write` — normalize through here, so
-        neither can develop its own opinion of what a session id is.
-
-        A dropped value is logged rather than raised: the turn is still a
-        perfectly good turn, and it lands in the time-gap session it would have
-        landed in had the field been omitted. Silence is what would be wrong —
-        the client asked for a specific session and did not get it. ``None``
-        and ``""`` are how a caller says "no session", not a wrong type, so
-        they pass quietly.
-        """
-        normalized = normalize_session_id(provided)
-        if normalized is None and provided is not None and not isinstance(provided, str):
-            logger.warning(
-                "Ignoring unsupported session_id %r (%s): a session id must be "
-                "a string. Falling back to the time-gap heuristic.",
-                provided, type(provided).__name__,
-            )
-        return normalized
 
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
@@ -1304,16 +1263,9 @@ class AsyncConversationStore:
         meta = dict(metadata) if metadata else {}
 
         # Resolve session_id: explicit wins; otherwise derive from time gap.
-        # Normalize the caller's value to the one supported type before anything
-        # else — this is the single funnel every writer (endpoint, A2A, feature,
-        # CLI) reaches, so it is where an unvalidated JSON value stops being one
-        # (#2958). Whatever survives is stamped into metadata AND derived into
-        # the indexed column, and the two can only agree about values the shared
-        # rule can speak about.
-        # Canonicalize an explicit id next so a row-id echoed back by an older
+        # Canonicalize an explicit id first so a row-id echoed back by an older
         # UI client is re-linked to its session's UUID rather than splitting the
         # conversation across two keys (#2012).
-        session_id = self._normalized_incoming_session_id(session_id)
         if session_id:
             session_id = await self._canonicalize_session_id(session_id)
         if not session_id:
@@ -1426,11 +1378,12 @@ class AsyncConversationStore:
                 content=prepared.content,
                 rendered_content=prepared.rendered_content,
                 metadata=json.dumps(prepared.metadata) if prepared.metadata else None,
-                # Derived from the metadata that is about to be persisted, by
-                # the same rule session grouping applies when reading it back
-                # — so the column can never claim a session the transcript
-                # does not show (#2958).
-                session_id=canonical_session_id(prepared.metadata),
+                # Derived from the metadata this same INSERT is about to
+                # store, rather than from a variable that may have moved on
+                # (#2958). The rule is deliberately narrower than session
+                # grouping's, so the column stays NULL for ids grouping still
+                # honours: it may be silent, never wrong.
+                session_id=column_session_id(prepared.metadata),
                 embedding=prepared.embedding,
                 embedding_profile_id=prepared.embedding_profile_id,
                 model=prepared.model,
@@ -1586,12 +1539,13 @@ class AsyncConversationStore:
         always written alongside ``embedding_vec`` — they share the
         same row state (#1477).
 
-        ``session_id`` duplicates the canonical id already inside
-        ``metadata`` into its own indexed column (#2958). It rides in the
-        base AND legacy column lists because its migration raises unless the
-        column exists, so no schema this method can reach is without it —
-        unlike the lexical/embedding columns, whose migrations are non-fatal
-        and whose absence the fallbacks below exist to survive.
+        ``session_id`` duplicates the id already inside ``metadata`` into its
+        own indexed column, or is ``None`` where that id is outside the
+        column's contract (#2958). It rides in the base AND legacy column
+        lists because its migration raises unless the column exists, so no
+        schema this method can reach is without it — unlike the
+        lexical/embedding columns, whose migrations are non-fatal and whose
+        absence the fallbacks below exist to survive.
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
@@ -3452,6 +3406,21 @@ class AsyncConversationStore:
         rehearsal, reflection, tagging, and routing writes cannot be erased by
         a stale Python read-modify-write cycle.
 
+        The key set is the caller's, so this is the one door through which
+        ``metadata.session_id`` can be rewritten after insertion. When it is,
+        the derived column moves in the SAME statement (#2958) — a merge that
+        left the column behind would put the row in the single state the column
+        is not allowed to occupy: naming a session its metadata no longer does.
+        Every other key leaves the column untouched, including the merge that
+        deletes nothing and the empty update.
+
+        The column follows the metadata down to NULL where the merge cannot
+        speak for the whole document: on SQLite a legacy row carrying the key
+        twice stays ambiguous after ``json_set``, and an ambiguous row has no
+        id the column may claim. See
+        :func:`~kestrel_sovereign.storage.session_id_column.merged_column_assignment`
+        for why that is dialect-specific and why the metadata is left as it is.
+
         Args:
             message_id: The message ID to update
             metadata_updates: Dict of metadata fields to update (merged with existing)
@@ -3459,15 +3428,32 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
+        # The value is derived from the update rather than re-read from the
+        # row, because the merge is last-writer-wins on this key and re-reading
+        # would reintroduce the read-modify-write race this method exists to
+        # avoid. Whether that value may be stamped at all is a question about
+        # the DOCUMENT, though, and the two dialects merge documents
+        # differently, so the clause comes from the shared contract rather than
+        # being spelled here (#2958).
+        if SESSION_ID_KEY in metadata_updates:
+            column_assignment = ", " + merged_column_assignment(
+                self.db.backend_type
+            )
+            column_params: tuple = (column_session_id(metadata_updates),)
+        else:
+            column_assignment = ""
+            column_params = ()
+
         if self.db.backend_type == "postgres":
             updates_json = json.dumps(metadata_updates)
             # PostgreSQL: atomic JSON merge via || operator
             # COALESCE handles NULL metadata columns gracefully
             result = await self.db.execute_commit(
                 "UPDATE conversation_history "
-                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb "
+                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb"
+                f"{column_assignment} "
                 "WHERE id = ? AND agent_id = ?",
-                (updates_json, message_id, self.agent_id)
+                (updates_json, *column_params, message_id, self.agent_id)
             )
             updated = result.rowcount > 0 if hasattr(result, 'rowcount') else True
             if not updated:
@@ -3486,11 +3472,15 @@ class AsyncConversationStore:
                     merge_params.extend((f'$."{escaped_key}"', json.dumps(value)))
                 sql = (
                     "UPDATE conversation_history SET metadata = "
-                    f"json_set(COALESCE(metadata, '{{}}'), {assignments}) "
+                    f"json_set(COALESCE(metadata, '{{}}'), {assignments})"
+                    f"{column_assignment} "
                     "WHERE id = ? AND agent_id = ?"
                 )
-                params = (*merge_params, message_id, self.agent_id)
+                params = (*merge_params, *column_params,
+                          message_id, self.agent_id)
             else:
+                # No keys, so no session_id among them — the column cannot be
+                # stale after a merge that changes nothing.
                 sql = (
                     "UPDATE conversation_history SET metadata = "
                     "COALESCE(metadata, '{}') WHERE id = ? AND agent_id = ?"
@@ -3724,7 +3714,24 @@ class AsyncConversationStore:
         Backend-aware: both SQLite (3.38+) and PostgreSQL (jsonb)
         support ``json_set`` + ``json_extract`` natively, so the
         statement is a single atomic UPDATE on either.
+
+        Both field names come from the caller, which makes this the second door
+        onto ``metadata.session_id`` — and unlike
+        :meth:`update_message_metadata` it declines rather than keeping the
+        derived column in step (#2958). Not squeamishness: this writes a
+        counter or a timestamp, and neither is ever a session identity. A
+        caller asking for one has a bug that a silently-synchronized column
+        would hide.
         """
+        if SESSION_ID_KEY in (counter_field, timestamp_field):
+            raise ValueError(
+                f"atomic_increment_metadata_counter cannot write metadata."
+                f"{SESSION_ID_KEY}: it writes counters and timestamps, and "
+                f"neither is a session identity. Session identity is moved "
+                f"through update_message_metadata, which keeps the indexed "
+                f"conversation_history.{SESSION_ID_KEY} column in step (#2958)."
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat() if timestamp_field else None
 
         if self.db.backend_type == "postgres":
@@ -3818,6 +3825,10 @@ class AsyncConversationStore:
         metadata_updates: Dict[str, Any]
     ) -> int:
         """Update metadata for multiple messages.
+
+        One :meth:`update_message_metadata` per id, so the derived
+        ``session_id`` column moves with the metadata here too (#2958) — the
+        per-row statement stays atomic; only the batch is not.
 
         Args:
             message_ids: List of message IDs to update

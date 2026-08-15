@@ -12,7 +12,7 @@ gap this fills: nothing in CI has actually run the PG-specific paths
 (BYTEA → vector(N) backfill, ``CREATE EXTENSION``, HNSW index, ``<=>``
 operator, asyncpg vector return shape) against a real Postgres.
 
-Runs against the local ``pgvector/pgvector:pg15`` container on :5433
+Runs against the local ``pgvector/pgvector:pg16`` container on :5433
 (``frinz-postgres``). Creates a dedicated ``vector_lift_validation``
 database so it never touches the live ``frinz`` or ``kestrel``
 databases. Drops it at the end whether the run succeeds or fails.

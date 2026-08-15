@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from kestrel_sovereign.storage.session_grouping import canonical_session_id
+from kestrel_sovereign.storage.session_id_column import column_session_id
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_conversation_store import (
@@ -276,8 +276,8 @@ async def salvage_messages(
                     json.dumps(marker_metadata),
                     # The marker is a live history row filed in the session it
                     # salvaged, so it stamps the indexed column like any other
-                    # write (#2958).
-                    canonical_session_id(marker_metadata),
+                    # write — or leaves it NULL, by the same rule (#2958).
+                    column_session_id(marker_metadata),
                 ),
             )
             # Find the marker we just inserted by its uuid. This is

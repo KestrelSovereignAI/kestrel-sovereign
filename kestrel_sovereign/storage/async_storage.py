@@ -37,7 +37,7 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
-from .session_grouping import canonical_session_id
+from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import DatabaseBackend, SQLiteBackend, create_backend
 
@@ -2421,7 +2421,9 @@ class AsyncStorage:
                     # messages. session_id rides inside ``metadata`` and is
                     # carried verbatim; the indexed column is re-derived from
                     # it below, so a backup taken before that column existed
-                    # still restores with it populated (#2958).
+                    # restores with it populated wherever the stored id is
+                    # inside the column's contract, and NULL where it is not
+                    # (#2958).
                     cursor = await backup_conn.execute(
                         "SELECT role, content, metadata"
                         + (", model" if has_model else ", NULL AS model")
@@ -2469,7 +2471,7 @@ class AsyncStorage:
                             (
                                 self.agent_id, role, content, model, provider,
                                 metadata_json,
-                                canonical_session_id(metadata_json),
+                                column_session_id(metadata_json),
                                 _ts(created_at), _ts(deleted_at),
                             )
                         )
