@@ -990,34 +990,27 @@ class AsyncGraphStore:
                 return NodeSwapResult.NOT_FOUND
 
             # An existing fleet-shared row has exactly ONE writer: ``add_node``.
-            # (A *create* is different and is allowed above — there is no stored
-            # row to preserve, so only shareability applies.) This
-            # primitive refuses them outright rather than reimplementing that
-            # door's rules — shareability, immutable identity, co-ownership —
-            # a second time against a different write path.
+            # This primitive refuses them rather than reimplementing that door's
+            # rules — shareability, immutable identity, co-ownership — a second
+            # time against a different write path. A *create* is different and
+            # is allowed above: there is no stored row to preserve, so only
+            # shareability applies.
             #
-            # That is a retreat from the previous approach, and deliberate.
-            # Duplicating the rules here meant reading the stored row first,
-            # and six consecutive review rounds found a defect in that read:
-            # gated on the caller's shape instead of the stored one; not a lock
-            # against a concurrent retype; not a lock against a co-owner
-            # arriving; raising where the privacy wrapper documents a result.
-            # Each fix was correct and the next round found the next hole,
-            # which is the signal that the mechanism is the bug rather than any
-            # one of its cases.
+            # Refused by a clause in the conditional UPDATE rather than by
+            # inspecting the row first, which matters for two reasons. A check
+            # before a write is not a check: a concurrent ``add_node`` can retype
+            # the row in between. And reading first would make this method
+            # read-then-write, which it has never been — SQLite opens a deferred
+            # transaction and its write lock is per-connection, so a second
+            # connection committing in between leaves a snapshot that cannot be
+            # upgraded, and a losing swap would raise instead of returning
+            # PREDICATE_FAILED. That contract belongs to every node type here,
+            # not just these two, and must not be spent on them.
             #
-            # The last of those was not even about shared rows: the pre-read
-            # turned this method into read-then-write, and SQLite's deferred
-            # BEGIN cannot upgrade a stale snapshot when a second *connection*
-            # commits in between (the write lock is per-connection —
-            # see the module's write-unit note). A losing CAS would raise
-            # instead of returning PREDICATE_FAILED, for every node type in the
-            # system. A guarantee this primitive exists to provide, spent on a
-            # rule that belongs to another method.
-            #
-            # So: no read. The refusal is a clause in the conditional UPDATE,
-            # which is atomic by construction, and the classification below —
-            # a read that already happened — reports it. Nothing to race.
+            # The classification read below reports the refusal as
+            # TYPE_NOT_ALLOWED — already this method's answer for "a type this
+            # operation may not touch", and already what the privacy wrapper
+            # converts into a PrivacyViolationError.
             shared_clause = "".join(
                 " AND NOT (node_type = ? AND label = ?)"
                 for _ in _SHARED_CONTENT_SHAPES
