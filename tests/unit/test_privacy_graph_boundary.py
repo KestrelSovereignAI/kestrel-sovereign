@@ -1835,8 +1835,9 @@ async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
     hang the stream forever. The real agent lock (``ReentrantTransitionLock``) is
     task-reentrant, so the nested rename completes and still persists (NORMAL) or
     skips (volatile) correctly. Uses the REAL lock type and drives the write under
-    a ``wait_for`` timeout so a regression fails loudly instead of hanging the whole
-    suite (#2672 review P1)."""
+    an ``asyncio.timeout`` deadline so the rename stays on the lock-owning task
+    while a regression still fails loudly instead of hanging the whole suite
+    (#2672 review P1)."""
     from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
@@ -1850,9 +1851,8 @@ async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
         # that deadlocked with a plain asyncio.Lock.
         async with lock:
             assert lock.locked()
-            outcome = await asyncio.wait_for(
-                rename_agent_core(agent, "RenamedInTurn"), timeout=5.0
-            )
+            async with asyncio.timeout(5.0):
+                outcome = await rename_agent_core(agent, "RenamedInTurn")
 
         assert agent._agent_name == "RenamedInTurn"        # live name always updates
         if mode is PrivacyMode.NORMAL:
