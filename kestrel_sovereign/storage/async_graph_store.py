@@ -223,6 +223,17 @@ class _SharedContentShape:
     match byte for byte, but a constitution anchor's ``created_at`` is when
     *that* tenant first stored the document and legitimately differs across the
     fleet.
+
+    What this layer does **not** promise, so nobody reads more into it: it
+    enforces that a shared row's identity never *changes*, not that it ever
+    matched the bytes. It cannot — deciding whether ``signer`` is really the
+    artifact's signer means verifying a signature, which is
+    ``verify_reanchor_artifact``'s job and the reanchor writers' to call. So a
+    first write of wrong-but-well-formed properties still poisons that node id
+    for the fleet, and a sole owner can reach the same state by deleting its
+    row and recreating it. Both reduce to "the first writer lied", which is
+    bounded upstream by the writers deriving properties from a *verified*
+    artifact — not here.
     """
 
     #: Whether a property set is content-derived, and so co-ownable.
