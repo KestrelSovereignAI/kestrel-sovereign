@@ -997,8 +997,23 @@ class AsyncGraphStore:
                 f"WHERE node_id = ? AND {scope}",
                 (node_id, *scope_params),
             )
+            stored_shape = None
             if stored_shape_row is not None:
                 stored_key = (stored_shape_row[0], stored_shape_row[1])
+                # The caller's own type policy is answered first, and as a
+                # *result* rather than an exception. The privacy wrapper passes
+                # ``allowed_node_types`` and converts TYPE_NOT_ALLOWED into a
+                # PrivacyViolationError; raising here instead — because the new
+                # properties do not fit the stored row's shared shape — would
+                # skip that conversion and surface a wrapped TransactionError
+                # for what is a documented policy denial. Same answer the
+                # classification below would give, reached before the shape
+                # rules can disagree with it.
+                if (
+                    allowed_node_types is not None
+                    and stored_key[0] not in allowed_node_types
+                ):
+                    return NodeSwapResult.TYPE_NOT_ALLOWED
                 self._refuse_unshareable_properties(
                     stored_key, new_node.properties, node_id
                 )
@@ -1037,6 +1052,32 @@ class AsyncGraphStore:
                             "Cannot overwrite a graph node owned by another agent"
                         )
 
+            # Carry the shape decision into the UPDATE itself. The read above is
+            # not a lock: on PostgreSQL a concurrent ``add_node`` can retype the
+            # row between that read and this write, so a check alone would let a
+            # row that was ordinary when inspected be fleet-shared by the time
+            # it is written — and unshareable properties land on it.
+            #
+            # Two directions, because the hazard runs both ways. A row that WAS
+            # shared must still be that shape; a row that was not must not have
+            # become one. Deliberately not a blanket "node_type must not change"
+            # predicate: this primitive documents that an ordinary concurrent
+            # type change coexists with a swap rather than failing it, and that
+            # stays true — only the transition into a fleet-shared shape is
+            # refused. A row retyped underneath us matches zero rows and falls
+            # to the classification read, exactly like a lost predicate race.
+            if stored_shape is not None:
+                shape_clause = " AND node_type = ? AND label = ?"
+                shape_params: tuple = stored_key
+            else:
+                shape_clause = "".join(
+                    " AND NOT (node_type = ? AND label = ?)"
+                    for _ in _SHARED_CONTENT_SHAPES
+                )
+                shape_params = tuple(
+                    value for key in _SHARED_CONTENT_SHAPES for value in key
+                )
+
             expected_properties = json.dumps(expected)
             # Properties-only: the SET touches the same single column the
             # predicate gates on, so a concurrent node_type/label change is
@@ -1048,13 +1089,14 @@ class AsyncGraphStore:
                 "UPDATE graph_nodes "
                 "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}"
-                f"{type_clause} "
+                f"{type_clause}{shape_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
                     *type_params,
+                    *shape_params,
                     *scope_params,
                 ),
             )

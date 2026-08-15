@@ -773,3 +773,179 @@ class TestTheShapeIsReadOffTheStoredRow:
         stored = await graph.get_node(node_id)
         assert stored.node_type == "concept"
         assert stored.label == "Tuesdays"
+
+
+class TestTheSwapDecidesAtomically:
+    """A check is not a lock, and a policy denial is not an exception.
+
+    Both found by review after the swap guards went in — the guards were
+    right, the way they reached the write was not.
+    """
+
+    @staticmethod
+    def _retype_mid_flight(monkeypatch, db, node_id, node_type, label):
+        """Land a retype between the stored-shape read and the UPDATE.
+
+        The hazard is a genuine race, and a race is not something a test can
+        pin by running two coroutines and hoping. So the retype is injected at
+        the exact point it would have to land to matter: right after the read
+        that decides the shape, before the write that trusts it. Matching on
+        the statement is blunt, but it names the window precisely, which is the
+        whole point of the test.
+        """
+        original = db.fetchone
+        fired = {"done": False}
+
+        async def hooked(sql, params=None):
+            row = await original(sql, params)
+            if (
+                not fired["done"]
+                and "SELECT node_type, label, properties FROM graph_nodes" in sql
+            ):
+                fired["done"] = True
+                await db.execute(
+                    "UPDATE graph_nodes SET node_type = ?, label = ? "
+                    "WHERE node_id = ?",
+                    (node_type, label, node_id),
+                )
+            return row
+
+        monkeypatch.setattr(db, "fetchone", hooked)
+        return fired
+
+    async def test_a_row_that_becomes_shared_mid_flight_is_not_written(
+        self, db, artifact_bytes, monkeypatch
+    ):
+        """The window the guards had: read, then write.
+
+        The stored-shape read is not a lock. On PostgreSQL a concurrent writer
+        can retype an ordinary row into a fleet-shared one in between — and the
+        swap, having validated against the shape it *saw* rather than the shape
+        it *writes to*, lands unshareable properties on a row the fleet now
+        shares. The decision has to travel into the UPDATE predicate, not just
+        precede it.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+        snapshot = (await graph.get_node(node_id)).properties
+        fired = self._retype_mid_flight(
+            monkeypatch, db, node_id, ARTIFACT_TYPE_LABEL, ARTIFACT_LABEL
+        )
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            GraphNode(
+                node_id,
+                "episode",
+                "A Tuesday",
+                {"source_path": "/home/operator/a.json"},
+            ),
+        )
+
+        assert fired["done"], "the race was never injected; the test proves nothing"
+        assert result != NodeSwapResult.SWAPPED
+        row = await db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
+        )
+        assert "source_path" not in (row[0] or ""), (
+            "an unshareable payload landed on a row that became fleet-shared"
+        )
+
+    async def test_a_shared_row_that_stops_being_shared_mid_flight_is_not_written(
+        self, db, constitution_bytes, monkeypatch
+    ):
+        """The hazard runs both ways: shared when checked, something else when
+        written. The guards passed against a row that is no longer the row.
+
+        On the *anchor* rather than the artifact, and not for convenience: every
+        artifact field is an identity field, so the only swap that survives the
+        pre-write checks there is one that changes nothing, and a test that
+        writes nothing cannot show where the write landed. ``created_at`` is
+        outside the anchor's identity set, so this is a real change that clears
+        every check and must still be stopped by the predicate.
+        """
+        node_id = await _take_possession(
+            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(
+            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
+        )
+        snapshot = (await graph.get_node(node_id)).properties
+        fired = self._retype_mid_flight(
+            monkeypatch, db, node_id, "episode", "A Tuesday"
+        )
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
+        )
+
+        assert fired["done"], "the race was never injected; the test proves nothing"
+        assert result != NodeSwapResult.SWAPPED
+        row = await db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
+        )
+        assert "2026-01-01" in (row[0] or ""), (
+            "the swap landed on a row that had stopped being the shape it checked"
+        )
+
+    async def test_an_ordinary_concurrent_retype_still_coexists(self, db):
+        """The documented behaviour this must not quietly break.
+
+        ``compare_and_swap_node`` promises that a concurrent ``node_type`` /
+        ``label`` change is neither detected nor clobbered — it writes
+        ``properties`` only. A blanket "type must not have changed" predicate
+        would have been the easy fix and would have broken that promise for
+        every node type in the system.
+        """
+        graph = _graph(db, AGENT_A)
+        node_id = f"episode:{uuid.uuid4().hex}"
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        await db.execute(
+            "UPDATE graph_nodes SET node_type = ?, label = ? WHERE node_id = ?",
+            ("concept", "Tuesdays", node_id),
+        )
+
+        result = await graph.compare_and_swap_node(
+            node_id, snapshot, GraphNode(node_id, "episode", "A Tuesday", {"n": 2})
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        stored = await graph.get_node(node_id)
+        assert stored.properties == {"n": 2}
+        assert stored.node_type == "concept"
+
+    async def test_a_disallowed_stored_type_is_a_result_not_an_exception(
+        self, db, constitution_bytes
+    ):
+        """The privacy wrapper's contract.
+
+        It passes ``allowed_node_types`` and converts TYPE_NOT_ALLOWED into a
+        PrivacyViolationError. Validating the new properties against the stored
+        row's shared shape first raised instead — a wrapped TransactionError
+        for what is a documented policy denial, skipping that conversion
+        entirely.
+        """
+        node_id = await _take_possession(
+            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
+        )
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(
+            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
+        )
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            GraphNode(node_id, "audit_anchor", "Audit", {"checked": True}),
+            allowed_node_types=frozenset({"audit_anchor"}),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
