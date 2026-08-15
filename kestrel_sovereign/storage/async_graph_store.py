@@ -600,11 +600,11 @@ class AsyncGraphStore:
     ) -> None:
         """Refuse a property set a fleet could not co-own.
 
-        Both writers of graph rows go through here — :meth:`add_node` and
-        :meth:`compare_and_swap_node` — because a rule enforced at one door is
-        not a rule. A shared row reached through the other door leaks exactly
-        what this issue removed: an operator filesystem path on a row every
-        tenant reads, or an authorization the other co-owners never verified.
+        :meth:`add_node`'s check, and only its — which is the design rather
+        than an oversight. A rule enforced at one of two writers is not a rule,
+        so the *other* writer does not reimplement this one: it refuses
+        fleet-shared rows outright (see :meth:`compare_and_swap_node`). One
+        door knows the rules; the other declines to open.
 
         A no-op for every node type that is not content-addressed, which is the
         overwhelming majority.
@@ -943,10 +943,18 @@ class AsyncGraphStore:
                     and new_node.node_type not in allowed_node_types
                 ):
                     return NodeSwapResult.TYPE_NOT_ALLOWED
-                # A create writes the shape verbatim too, so the fleet-shared
-                # rules apply here exactly as in add_node. Validated against
-                # ``node_id`` — the row identity this primitive writes — not
-                # ``new_node.node_id``, which it ignores.
+                # A create writes ``new_node``'s shape verbatim, and unlike a
+                # swap there is nothing to conflict with: no stored row, so no
+                # identity to preserve, no co-owner to overrule, and no read
+                # needed to know that. Only shareability applies, which is a
+                # question about the incoming properties alone — the same check
+                # ``add_node`` makes, and the reason a create stays allowed
+                # here while a swap does not. The privacy wrapper admits
+                # ``document``/``KESTREL_CONSTITUTION`` as a content-free
+                # structural type and creates it through this path (#2672).
+                #
+                # Validated against ``node_id`` — the row identity this
+                # primitive writes — not ``new_node.node_id``, which it ignores.
                 self._refuse_unshareable_properties(
                     (new_node.node_type, new_node.label), new_node.properties, node_id
                 )
@@ -981,122 +989,42 @@ class AsyncGraphStore:
                     return NodeSwapResult.PREDICATE_FAILED
                 return NodeSwapResult.NOT_FOUND
 
-            # A swap ignores ``new_node.node_type`` / ``label`` and writes onto
-            # whatever row already exists, so the fleet-shared rules have to be
-            # read off the *stored* row. Gating on the caller-supplied shape
-            # instead would be no gate at all: declaring some other node type
-            # would walk straight past it and onto the shared artifact row.
+            # An existing fleet-shared row has exactly ONE writer: ``add_node``.
+            # (A *create* is different and is allowed above — there is no stored
+            # row to preserve, so only shareability applies.) This
+            # primitive refuses them outright rather than reimplementing that
+            # door's rules — shareability, immutable identity, co-ownership —
+            # a second time against a different write path.
             #
-            # Deliberately scoped. An unscoped read here would refuse (rather
-            # than report NOT_FOUND) on a foreign-owned id, telling a bound
-            # tenant that an id it cannot see exists — the existence leak this
-            # primitive's classification is built to avoid. Invisible rows fall
-            # through and the UPDATE matches nothing, exactly as before.
-            stored_shape_row = await self.db.fetchone(
-                "SELECT node_type, label, properties FROM graph_nodes "
-                f"WHERE node_id = ? AND {scope}",
-                (node_id, *scope_params),
+            # That is a retreat from the previous approach, and deliberate.
+            # Duplicating the rules here meant reading the stored row first,
+            # and six consecutive review rounds found a defect in that read:
+            # gated on the caller's shape instead of the stored one; not a lock
+            # against a concurrent retype; not a lock against a co-owner
+            # arriving; raising where the privacy wrapper documents a result.
+            # Each fix was correct and the next round found the next hole,
+            # which is the signal that the mechanism is the bug rather than any
+            # one of its cases.
+            #
+            # The last of those was not even about shared rows: the pre-read
+            # turned this method into read-then-write, and SQLite's deferred
+            # BEGIN cannot upgrade a stale snapshot when a second *connection*
+            # commits in between (the write lock is per-connection —
+            # see the module's write-unit note). A losing CAS would raise
+            # instead of returning PREDICATE_FAILED, for every node type in the
+            # system. A guarantee this primitive exists to provide, spent on a
+            # rule that belongs to another method.
+            #
+            # So: no read. The refusal is a clause in the conditional UPDATE,
+            # which is atomic by construction, and the classification below —
+            # a read that already happened — reports it. Nothing to race.
+            shared_clause = "".join(
+                " AND NOT (node_type = ? AND label = ?)"
+                for _ in _SHARED_CONTENT_SHAPES
             )
-            stored_shape = None
-            if stored_shape_row is not None:
-                stored_key = (stored_shape_row[0], stored_shape_row[1])
-                # The caller's own type policy is answered first, and as a
-                # *result* rather than an exception. The privacy wrapper passes
-                # ``allowed_node_types`` and converts TYPE_NOT_ALLOWED into a
-                # PrivacyViolationError; raising here instead — because the new
-                # properties do not fit the stored row's shared shape — would
-                # skip that conversion and surface a wrapped TransactionError
-                # for what is a documented policy denial. Same answer the
-                # classification below would give, reached before the shape
-                # rules can disagree with it.
-                if (
-                    allowed_node_types is not None
-                    and stored_key[0] not in allowed_node_types
-                ):
-                    return NodeSwapResult.TYPE_NOT_ALLOWED
-                self._refuse_unshareable_properties(
-                    stored_key, new_node.properties, node_id
-                )
-                stored_shape = _SHARED_CONTENT_SHAPES.get(stored_key)
-                if stored_shape is not None:
-                    # Same two rules add_node applies, for the same reasons.
-                    # The identity fields of a content-addressed row cannot
-                    # change while its id stays the same, sole owner or not —
-                    # otherwise one agent alone can leave a row that every
-                    # later co-owner disagrees with and none can repair.
-                    stored_properties = (
-                        json.loads(stored_shape_row[2])
-                        if stored_shape_row[2]
-                        else {}
-                    )
-                    if not _agrees_on_shared_identity(
-                        stored_properties, new_node.properties, stored_shape
-                    ):
-                        raise ValueError(
-                            "Cannot change the content-derived identity of a "
-                            f"fleet-shared graph node: {stored_key[0]}/{stored_key[1]}"
-                        )
-                    # And add_node will not rewrite a row more than one tenant
-                    # owns — it hands out a second ownership witness and leaves
-                    # the canonical bytes alone. A swap must not be the door
-                    # that does what the front door refuses. Still needed after
-                    # the identity check: an anchor's ``created_at`` is outside
-                    # its identity set, so without this a co-owner could
-                    # overwrite the tenant-specific stamp add_node preserves.
-                    owner_rows = await self.db.fetchall(
-                        "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
-                        (node_id,),
-                    )
-                    if len({row[0] for row in owner_rows}) > 1:
-                        raise ValueError(
-                            "Cannot overwrite a graph node owned by another agent"
-                        )
-
-            # Carry the shape decision into the UPDATE itself. The read above is
-            # not a lock: on PostgreSQL a concurrent ``add_node`` can retype the
-            # row between that read and this write, so a check alone would let a
-            # row that was ordinary when inspected be fleet-shared by the time
-            # it is written — and unshareable properties land on it.
-            #
-            # Two directions, because the hazard runs both ways. A row that WAS
-            # shared must still be that shape; a row that was not must not have
-            # become one. Deliberately not a blanket "node_type must not change"
-            # predicate: this primitive documents that an ordinary concurrent
-            # type change coexists with a swap rather than failing it, and that
-            # stays true — only the transition into a fleet-shared shape is
-            # refused. A row retyped underneath us matches zero rows and falls
-            # to the classification read, exactly like a lost predicate race.
-            #
-            # Ownership rides along for the same reason: the owner count above
-            # is a read, not a lock, so a second tenant can commit its witness
-            # between that count and this write and the swap would rewrite a row
-            # that had become co-owned in the interval — exactly what the count
-            # exists to refuse. Spelled as "at most one distinct owner" rather
-            # than "no owner but me" so an unbound maintenance store keeps the
-            # behaviour the pre-write check gives it: it owns nothing, and a
-            # single-owner row stays writable by it.
-            #
-            # That is every pre-write gate on this path now pinned atomically.
-            # The other two were already covered and it is worth saying why, so
-            # nobody adds a third and assumes the same: the stored *properties*
-            # the identity check reads are pinned by the existing
-            # ``properties = expected`` predicate, and the stored ``node_type``
-            # the ``allowed_node_types`` gate reads is pinned by ``type_clause``.
-            if stored_shape is not None:
-                shape_clause = (
-                    " AND node_type = ? AND label = ?"
-                    " AND (SELECT COUNT(DISTINCT agent_id) FROM graph_node_owners"
-                    " WHERE node_id = ?) <= 1"
-                )
-                shape_params: tuple = (*stored_key, node_id)
-            else:
-                shape_clause = "".join(
-                    " AND NOT (node_type = ? AND label = ?)"
-                    for _ in _SHARED_CONTENT_SHAPES
-                )
-                shape_params = tuple(
-                    value for key in _SHARED_CONTENT_SHAPES for value in key
-                )
+            shared_params = tuple(
+                value for key in _SHARED_CONTENT_SHAPES for value in key
+            )
 
             expected_properties = json.dumps(expected)
             # Properties-only: the SET touches the same single column the
@@ -1109,14 +1037,14 @@ class AsyncGraphStore:
                 "UPDATE graph_nodes "
                 "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}"
-                f"{type_clause}{shape_clause} "
+                f"{type_clause}{shared_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
                     *type_params,
-                    *shape_params,
+                    *shared_params,
                     *scope_params,
                 ),
             )
@@ -1133,11 +1061,20 @@ class AsyncGraphStore:
             # race) — this is how the wrapper tells "someone else changed it"
             # apart from "this is a user-derived row I must not rewrite".
             existing = await self.db.fetchone(
-                f"SELECT node_type FROM graph_nodes WHERE node_id = ? AND {scope}",
+                "SELECT node_type, label FROM graph_nodes "
+                f"WHERE node_id = ? AND {scope}",
                 (node_id, *scope_params),
             )
             if existing is None:
                 return NodeSwapResult.NOT_FOUND
+            # A fleet-shared row is a type this primitive may not touch, which
+            # is what TYPE_NOT_ALLOWED already means: a policy block rather than
+            # a lost race, and the answer the privacy wrapper knows how to
+            # convert. Reported from the read that was already here, so the
+            # refusal costs no extra query and races nothing — the UPDATE has
+            # already declined to write.
+            if (existing[0], existing[1]) in _SHARED_CONTENT_SHAPES:
+                return NodeSwapResult.TYPE_NOT_ALLOWED
             if (
                 allowed_node_types is not None
                 and existing[0] not in allowed_node_types

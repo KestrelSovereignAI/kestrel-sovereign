@@ -405,22 +405,88 @@ class TestCoOwnersMustAgree:
 # =====================================================================
 
 
-class TestTheSwapDoorObeysTheSameRules:
-    """``add_node`` is not the only writer of graph rows.
+class TestTheSwapDoorDeclinesSharedRows:
+    """``add_node`` is not the only writer of graph rows — and that is the
+    point of this class.
 
-    A rule enforced at one door is not a rule. ``compare_and_swap_node`` is a
-    public primitive reachable through ``AsyncStorage`` and the privacy
-    wrapper, and it writes ``properties`` onto whatever row already exists —
-    so an agent that legitimately co-owns the fleet's artifact row could have
-    swapped an operator path onto it, or rewritten the signer every co-owner
-    is governed by, and been told ``SWAPPED``.
+    ``compare_and_swap_node`` is a public primitive reachable through
+    ``AsyncStorage`` and the privacy wrapper, and it writes ``properties`` onto
+    whatever row is at ``node_id``. Left alone, an agent that legitimately
+    co-owns the fleet's artifact row could swap an operator path onto it, or
+    rewrite the signer every co-owner is governed by, and be told SWAPPED.
+
+    It does not reimplement ``add_node``'s rules to prevent that; it refuses
+    fleet-shared rows outright. One door knows the rules, the other declines to
+    open. The rules were duplicated here first, and six consecutive review
+    rounds found a hole in the duplicate — including one that degraded the CAS
+    contract for every node type in the system. The refusal is a clause in the
+    conditional UPDATE, so there is no read to race.
     """
 
-    async def test_a_create_cannot_seed_an_unshareable_shared_row(
+    async def test_a_swap_on_a_shared_row_is_refused(self, db, artifact_bytes):
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            _artifact_node(node_id, source_path="/home/operator/a.json"),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+        stored = await graph.get_node(node_id)
+        assert "source_path" not in stored.properties
+
+    async def test_even_a_well_formed_swap_is_refused(self, db, artifact_bytes):
+        """The refusal is about the row, not about the payload. Anything that
+        needs to change one of these rows goes through ``add_node``, which is
+        the writer that knows what may change and what may not."""
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id, snapshot, _artifact_node(node_id)
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+
+    async def test_a_swap_cannot_dodge_the_refusal_by_declaring_another_type(
         self, db, artifact_bytes
     ):
-        """Compare-and-create writes the caller's shape verbatim, so it is the
-        same order-dependence hole as ``add_node`` had, through another door."""
+        """A swap ignores ``new_node.node_type`` and writes onto whatever row
+        is at ``node_id``, so the refusal keys off the stored row — here by
+        construction, since it is a clause in the UPDATE itself rather than a
+        check against something the caller said."""
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            GraphNode(
+                node_id,
+                "episode",
+                "A Tuesday",
+                {"source_path": "/home/operator/a.json"},
+            ),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+        stored = await graph.get_node(node_id)
+        assert stored.node_type == ARTIFACT_TYPE_LABEL
+        assert "source_path" not in stored.properties
+
+    async def test_a_create_of_an_unshareable_shared_row_is_refused(
+        self, db, artifact_bytes
+    ):
+        """Compare-and-create writes the caller's shape verbatim, so the
+        shareability rule applies — and needs no read to apply it."""
         node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
 
         with pytest.raises(REFUSAL, match="fleet-shared"):
@@ -430,199 +496,127 @@ class TestTheSwapDoorObeysTheSameRules:
 
         assert await _owners(db, node_id) == []
 
-    async def test_a_swap_cannot_put_a_per_agent_field_on_a_shared_row(
-        self, db, artifact_bytes
-    ):
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(_artifact_node(node_id))
-        snapshot = (await graph.get_node(node_id)).properties
-
-        with pytest.raises(REFUSAL, match="fleet-shared"):
-            await graph.compare_and_swap_node(
-                node_id,
-                snapshot,
-                _artifact_node(node_id, source_path="/home/operator/a.json"),
-            )
-
-        stored = await graph.get_node(node_id)
-        assert "source_path" not in stored.properties
-
-    async def test_a_swap_cannot_dodge_the_rules_by_declaring_another_type(
-        self, db, artifact_bytes
-    ):
-        """The shape must be read off the *stored* row.
-
-        A swap ignores ``new_node.node_type`` and ``label`` entirely — it
-        writes onto whatever row is at ``node_id``. Gating on the shape the
-        caller declares would therefore be no gate at all: claim to be writing
-        an episode and walk straight onto the fleet's artifact row.
-        """
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(_artifact_node(node_id))
-        snapshot = (await graph.get_node(node_id)).properties
-
-        disguised = GraphNode(
-            node_id=node_id,
-            node_type="episode",
-            label="A Tuesday",
-            properties={"source_path": "/home/operator/a.json"},
-        )
-        with pytest.raises(REFUSAL, match="fleet-shared"):
-            await graph.compare_and_swap_node(node_id, snapshot, disguised)
-
-        stored = await graph.get_node(node_id)
-        assert "source_path" not in stored.properties
-
-    async def test_a_co_owner_cannot_swap_a_row_the_fleet_shares(
+    async def test_a_valid_shared_create_is_still_admitted(
         self, db, constitution_bytes
     ):
-        """The co-owner rule, isolated from the identity rule.
+        """A create is not a swap, and refusing it would have been a brick.
 
-        Deliberately on the *anchor* rather than the artifact. Every artifact
-        field is an identity field, so any swap worth refusing there is already
-        refused for disagreeing on identity, and this test would prove nothing
-        about co-ownership — it would pass with the co-owner check deleted.
-        ``created_at`` is the one field a fleet-shared row legitimately differs
-        on, which makes it the only way to ask this question on its own.
-
-        ``add_node`` hands a second tenant an ownership witness and leaves the
-        first tenant's stamp alone. A swap must not be the door that does what
-        the front door refuses.
+        The privacy wrapper admits ``document``/``KESTREL_CONSTITUTION`` as a
+        content-free structural type and compare-and-creates it through this
+        path (#2672). Blanket-refusing fleet-shared shapes here broke that —
+        which is what a refusal stricter than the runtime looks like from the
+        inside. There is no stored row on a create: no identity to preserve, no
+        co-owner to overrule. Only shareability applies, and it passes.
         """
         node_id = await _take_possession(
             db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
         )
-        await _take_possession(
-            db, AGENT_B, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
-        await _graph(db, AGENT_A).add_node(
-            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
-        )
-        graph_b = _graph(db, AGENT_B)
-        await graph_b.add_node(
-            _constitution_node(node_id, "2026-08-11T00:00:00+00:00")
-        )
-        assert await _owners(db, node_id) == sorted([AGENT_A, AGENT_B])
-
-        snapshot = (await graph_b.get_node(node_id)).properties
-        with pytest.raises(REFUSAL, match="owned by another agent"):
-            await graph_b.compare_and_swap_node(
-                node_id,
-                snapshot,
-                _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
-            )
-
-        stored = await graph_b.get_node(node_id)
-        assert stored.properties["created_at"] == "2026-01-01T00:00:00+00:00"
-
-    async def test_a_lone_owner_cannot_swap_the_identity_either(
-        self, db, artifact_bytes
-    ):
-        """Being first is not a licence to redefine the row.
-
-        An earlier version of this test asserted the opposite — that a sole
-        owner may rewrite its own shared row, on the reasoning that nobody else
-        is on it yet so nobody is harmed. That reasoning is wrong, and the test
-        was pinning the hole open. A node id here IS the hash of the bytes, so
-        identity cannot legitimately change while the id stays: a different
-        artifact is a different node. Swap in another well-formed ``signer``
-        and every sibling that later anchors the genuine file disagrees with
-        the stored row and rolls back — this issue's fleet split, reachable by
-        one agent acting alone, and unrepairable afterwards.
-        """
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
         graph = _graph(db, AGENT_A)
-        await graph.add_node(_artifact_node(node_id))
-        snapshot = (await graph.get_node(node_id)).properties
 
-        with pytest.raises(REFUSAL, match="content-derived identity"):
-            await graph.compare_and_swap_node(
-                node_id,
-                snapshot,
-                _artifact_node(node_id, signer="did:web:someone-else.example"),
-            )
-
-        stored = await graph.get_node(node_id)
-        assert stored.properties["signer"] == SIGNER
-
-    async def test_a_lone_owner_cannot_rewrite_the_identity_through_add_node(
-        self, db, artifact_bytes
-    ):
-        """The same rule at the front door, or the swap check is theatre."""
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(_artifact_node(node_id))
-
-        with pytest.raises(REFUSAL, match="content-derived identity"):
-            await graph.add_node(
-                _artifact_node(node_id, signer="did:web:someone-else.example")
-            )
-
-        stored = await graph.get_node(node_id)
-        assert stored.properties["signer"] == SIGNER
-
-    async def test_the_owner_may_still_restate_the_same_artifact(
-        self, db, artifact_bytes
-    ):
-        """Immutable identity is not a frozen row.
-
-        Re-anchoring the same artifact — an idempotent repeat, which the
-        reanchor writer does — presents identical properties, agrees with
-        itself, and must still land. A rule that refused this would brick the
-        ordinary path.
-        """
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(_artifact_node(node_id))
-
-        await graph.add_node(_artifact_node(node_id))
         result = await graph.compare_and_swap_node(
-            node_id,
-            (await graph.get_node(node_id)).properties,
-            _artifact_node(node_id),
+            node_id, None, _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
         )
 
         assert result == NodeSwapResult.SWAPPED
         assert await _owners(db, node_id) == [AGENT_A]
 
-    async def test_an_anchors_own_timestamp_is_still_the_owners_to_change(
-        self, db, constitution_bytes
+    async def test_a_row_that_becomes_shared_before_the_swap_is_refused(
+        self, db, artifact_bytes
     ):
-        """The guard against over-fixing, on the swap door.
+        """The window the earlier design had, closed by construction.
 
-        ``created_at`` is outside the anchor's identity set — it is when *this*
-        tenant stored the document, not a property of the document — so a lone
-        owner may still update it. Folding it into identity would make the
-        rule wrong in the other direction.
+        The caller reads a snapshot of an ordinary row; the row becomes
+        fleet-shared before the swap fires. A design that decided the shape by
+        reading first and writing second could be overtaken here. A clause in
+        the conditional UPDATE cannot be.
         """
-        node_id = await _take_possession(
-            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
         graph = _graph(db, AGENT_A)
-        await graph.add_node(
-            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
-        )
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
         snapshot = (await graph.get_node(node_id)).properties
+
+        await db.execute(
+            "UPDATE graph_nodes SET node_type = ?, label = ? WHERE node_id = ?",
+            (ARTIFACT_TYPE_LABEL, ARTIFACT_LABEL, node_id),
+        )
 
         result = await graph.compare_and_swap_node(
             node_id,
             snapshot,
-            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
+            GraphNode(
+                node_id,
+                "episode",
+                "A Tuesday",
+                {"source_path": "/home/operator/a.json"},
+            ),
         )
 
-        assert result == NodeSwapResult.SWAPPED
-        stored = await graph.get_node(node_id)
-        assert stored.properties["created_at"] == "2027-01-01T00:00:00+00:00"
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+        row = await db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
+        )
+        assert "source_path" not in (row[0] or "")
+
+    async def test_the_swap_path_reads_nothing_before_it_writes(
+        self, db, artifact_bytes
+    ):
+        """Pins the regression that ended the duplicated-rules design.
+
+        Deciding the shared-row question by reading first turned this method
+        into read-then-write. SQLite opens a deferred transaction, and its
+        write lock is per-connection, so a second *connection* committing in
+        between leaves a snapshot that cannot be upgraded — a losing CAS raises
+        instead of returning PREDICATE_FAILED, for every node type in the
+        system. White-box on purpose: the ordering is the guarantee, and no
+        black-box assertion distinguishes "no read" from "a read that happened
+        to win".
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        calls: list[str] = []
+        original_fetchone, original_fetchall = db.fetchone, db.fetchall
+        original_execute = db.execute
+
+        async def note_fetchone(sql, params=None):
+            calls.append("read")
+            return await original_fetchone(sql, params)
+
+        async def note_fetchall(sql, params=None):
+            calls.append("read")
+            return await original_fetchall(sql, params)
+
+        async def note_execute(sql, params=None):
+            calls.append("write" if sql.strip().upper().startswith("UPDATE") else "other")
+            return await original_execute(sql, params)
+
+        db.fetchone, db.fetchall, db.execute = (
+            note_fetchone, note_fetchall, note_execute
+        )
+        try:
+            await graph.compare_and_swap_node(
+                node_id,
+                snapshot,
+                GraphNode(node_id, "episode", "A Tuesday", {"n": 2}),
+            )
+        finally:
+            db.fetchone, db.fetchall, db.execute = (
+                original_fetchone, original_fetchall, original_execute
+            )
+
+        assert "write" in calls, "the swap never issued its UPDATE"
+        assert "read" not in calls[: calls.index("write")], (
+            f"the swap read before it wrote: {calls}"
+        )
 
     async def test_an_ordinary_node_swaps_freely(self, db):
-        """The new read must not change behaviour for the 99% of node types
-        that are not fleet-shared."""
+        """The refusal must not leak out to the 99% of node types that are not
+        fleet-shared."""
         graph = _graph(db, AGENT_A)
         node_id = f"episode:{uuid.uuid4().hex}"
-        node = GraphNode(node_id, "episode", "A Tuesday", {"n": 1})
-        await graph.add_node(node)
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
 
         result = await graph.compare_and_swap_node(
             node_id, {"n": 1}, GraphNode(node_id, "episode", "A Tuesday", {"n": 2})
@@ -631,63 +625,80 @@ class TestTheSwapDoorObeysTheSameRules:
         assert result == NodeSwapResult.SWAPPED
         assert (await graph.get_node(node_id)).properties == {"n": 2}
 
+    async def test_an_ordinary_concurrent_retype_still_coexists(self, db):
+        """The documented behaviour the new clause must not quietly break.
+
+        ``compare_and_swap_node`` promises that a concurrent ``node_type`` /
+        ``label`` change is neither detected nor clobbered — it writes
+        ``properties`` only. A blanket "type must not have changed" predicate
+        would have been the easy way to refuse shared rows and would have
+        broken that promise for every node type.
+        """
+        graph = _graph(db, AGENT_A)
+        node_id = f"episode:{uuid.uuid4().hex}"
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        await db.execute(
+            "UPDATE graph_nodes SET node_type = ?, label = ? WHERE node_id = ?",
+            ("concept", "Tuesdays", node_id),
+        )
+
+        result = await graph.compare_and_swap_node(
+            node_id, snapshot, GraphNode(node_id, "episode", "A Tuesday", {"n": 2})
+        )
+
+        assert result == NodeSwapResult.SWAPPED
+        stored = await graph.get_node(node_id)
+        assert stored.properties == {"n": 2}
+        assert stored.node_type == "concept"
+
+    async def test_a_disallowed_stored_type_is_still_type_not_allowed(
+        self, db
+    ):
+        """The privacy wrapper's contract, unchanged: it passes
+        ``allowed_node_types`` and converts TYPE_NOT_ALLOWED into a
+        PrivacyViolationError."""
+        graph = _graph(db, AGENT_A)
+        node_id = f"episode:{uuid.uuid4().hex}"
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+        snapshot = (await graph.get_node(node_id)).properties
+
+        result = await graph.compare_and_swap_node(
+            node_id,
+            snapshot,
+            GraphNode(node_id, "audit_anchor", "Audit", {"n": 2}),
+            allowed_node_types=frozenset({"audit_anchor"}),
+        )
+
+        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
+
     async def test_a_foreign_shared_row_still_reports_not_found(
         self, db, artifact_bytes
     ):
         """The refusal must not become an existence oracle.
 
-        ``compare_and_swap_node`` is careful never to let a bound tenant tell
-        "absent" apart from "owned by someone else" — both are NOT_FOUND, the
-        same answer ``get_node`` gives. A shared-shape check that read the
-        stored row *unscoped* would **raise** for a foreign row while an absent
-        one returns NOT_FOUND, handing back that distinction in the shape of an
-        exception. B never stored these bytes, so it is not a co-owner and must
-        learn nothing.
-
-        The probe has to be one the check would actually object to. An earlier
-        version of this test swapped in *well-formed* artifact properties onto
-        a single-owner row: nothing to refuse, so it fell through to the scoped
-        UPDATE and reported NOT_FOUND either way. Removing the scope left it
-        green — a surviving mutant, and the test's fault rather than the code's.
-        Both probes below trip a different refusal.
+        ``compare_and_swap_node`` never lets a bound tenant tell "absent" apart
+        from "owned by someone else" — both are NOT_FOUND, the same answer
+        ``get_node`` gives. A shared-row refusal reported from an *unscoped*
+        read would say TYPE_NOT_ALLOWED for a foreign row and NOT_FOUND for an
+        absent one, which is that distinction handed back in another shape.
         """
         node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        await _take_possession(db, AGENT_C, artifact_bytes, "a.json")
         await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
-        # A and C co-own it. B is the outsider throughout.
-        await _graph(db, AGENT_C).add_node(_artifact_node(node_id))
 
         absent_id = "f" * 64
         graph_b = _graph(db, AGENT_B)
-
-        # Probe 1: properties the shape check refuses outright.
-        unshareable = await graph_b.compare_and_swap_node(
-            node_id,
-            {"anything": True},
-            _artifact_node(node_id, source_path="/home/operator/a.json"),
-        )
-        unshareable_absent = await graph_b.compare_and_swap_node(
-            absent_id,
-            {"anything": True},
-            _artifact_node(absent_id, source_path="/home/operator/a.json"),
-        )
-
-        # Probe 2: well-formed properties onto a row that already has two
-        # owners, which the co-owner rule refuses.
-        multi_owner = await graph_b.compare_and_swap_node(
+        foreign = await graph_b.compare_and_swap_node(
             node_id, {"anything": True}, _artifact_node(node_id)
         )
-        multi_owner_absent = await graph_b.compare_and_swap_node(
+        missing = await graph_b.compare_and_swap_node(
             absent_id, {"anything": True}, _artifact_node(absent_id)
         )
 
-        assert unshareable == NodeSwapResult.NOT_FOUND
-        assert multi_owner == NodeSwapResult.NOT_FOUND
-        assert unshareable == unshareable_absent, (
-            "an unshareable swap distinguishes a foreign row from an absent one"
-        )
-        assert multi_owner == multi_owner_absent, (
-            "a co-owned foreign row is distinguishable from an absent one"
+        assert foreign == NodeSwapResult.NOT_FOUND
+        assert missing == foreign, (
+            "a foreign shared row is distinguishable from an absent one"
         )
 
 
@@ -775,235 +786,3 @@ class TestTheShapeIsReadOffTheStoredRow:
         assert stored.label == "Tuesdays"
 
 
-class TestTheSwapDecidesAtomically:
-    """A check is not a lock, and a policy denial is not an exception.
-
-    Both found by review after the swap guards went in — the guards were
-    right, the way they reached the write was not.
-    """
-
-    @staticmethod
-    def _retype_mid_flight(monkeypatch, db, node_id, node_type, label):
-        """Land a retype between the stored-shape read and the UPDATE.
-
-        The hazard is a genuine race, and a race is not something a test can
-        pin by running two coroutines and hoping. So the retype is injected at
-        the exact point it would have to land to matter: right after the read
-        that decides the shape, before the write that trusts it. Matching on
-        the statement is blunt, but it names the window precisely, which is the
-        whole point of the test.
-        """
-        original = db.fetchone
-        fired = {"done": False}
-
-        async def hooked(sql, params=None):
-            row = await original(sql, params)
-            if (
-                not fired["done"]
-                and "SELECT node_type, label, properties FROM graph_nodes" in sql
-            ):
-                fired["done"] = True
-                await db.execute(
-                    "UPDATE graph_nodes SET node_type = ?, label = ? "
-                    "WHERE node_id = ?",
-                    (node_type, label, node_id),
-                )
-            return row
-
-        monkeypatch.setattr(db, "fetchone", hooked)
-        return fired
-
-    async def test_a_row_that_becomes_shared_mid_flight_is_not_written(
-        self, db, artifact_bytes, monkeypatch
-    ):
-        """The window the guards had: read, then write.
-
-        The stored-shape read is not a lock. On PostgreSQL a concurrent writer
-        can retype an ordinary row into a fleet-shared one in between — and the
-        swap, having validated against the shape it *saw* rather than the shape
-        it *writes to*, lands unshareable properties on a row the fleet now
-        shares. The decision has to travel into the UPDATE predicate, not just
-        precede it.
-        """
-        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
-        snapshot = (await graph.get_node(node_id)).properties
-        fired = self._retype_mid_flight(
-            monkeypatch, db, node_id, ARTIFACT_TYPE_LABEL, ARTIFACT_LABEL
-        )
-
-        result = await graph.compare_and_swap_node(
-            node_id,
-            snapshot,
-            GraphNode(
-                node_id,
-                "episode",
-                "A Tuesday",
-                {"source_path": "/home/operator/a.json"},
-            ),
-        )
-
-        assert fired["done"], "the race was never injected; the test proves nothing"
-        assert result != NodeSwapResult.SWAPPED
-        row = await db.fetchone(
-            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
-        )
-        assert "source_path" not in (row[0] or ""), (
-            "an unshareable payload landed on a row that became fleet-shared"
-        )
-
-    async def test_a_shared_row_that_stops_being_shared_mid_flight_is_not_written(
-        self, db, constitution_bytes, monkeypatch
-    ):
-        """The hazard runs both ways: shared when checked, something else when
-        written. The guards passed against a row that is no longer the row.
-
-        On the *anchor* rather than the artifact, and not for convenience: every
-        artifact field is an identity field, so the only swap that survives the
-        pre-write checks there is one that changes nothing, and a test that
-        writes nothing cannot show where the write landed. ``created_at`` is
-        outside the anchor's identity set, so this is a real change that clears
-        every check and must still be stopped by the predicate.
-        """
-        node_id = await _take_possession(
-            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(
-            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
-        )
-        snapshot = (await graph.get_node(node_id)).properties
-        fired = self._retype_mid_flight(
-            monkeypatch, db, node_id, "episode", "A Tuesday"
-        )
-
-        result = await graph.compare_and_swap_node(
-            node_id,
-            snapshot,
-            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
-        )
-
-        assert fired["done"], "the race was never injected; the test proves nothing"
-        assert result != NodeSwapResult.SWAPPED
-        row = await db.fetchone(
-            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
-        )
-        assert "2026-01-01" in (row[0] or ""), (
-            "the swap landed on a row that had stopped being the shape it checked"
-        )
-
-    async def test_an_owner_joining_mid_flight_does_not_lose_its_stamp(
-        self, db, constitution_bytes, monkeypatch
-    ):
-        """The owner count is a read, not a lock.
-
-        A second tenant can commit its ownership witness between the count and
-        the UPDATE, and the swap would then rewrite a row that had become
-        co-owned in the interval — the exact write the count exists to refuse,
-        landing anyway. Injected after the *owner* read specifically: injecting
-        earlier would just make the count see two owners and raise, which is
-        the case already covered and proves nothing about the window.
-        """
-        node_id = await _take_possession(
-            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
-        await _take_possession(
-            db, AGENT_B, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(
-            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
-        )
-        snapshot = (await graph.get_node(node_id)).properties
-
-        original = db.fetchall
-        fired = {"done": False}
-
-        async def hooked(sql, params=None):
-            rows = await original(sql, params)
-            if (
-                not fired["done"]
-                and "FROM graph_node_owners WHERE node_id" in sql
-            ):
-                fired["done"] = True
-                await db.execute(
-                    "INSERT INTO graph_node_owners (node_id, agent_id) "
-                    "VALUES (?, ?)",
-                    (node_id, AGENT_B),
-                )
-            return rows
-
-        monkeypatch.setattr(db, "fetchall", hooked)
-
-        result = await graph.compare_and_swap_node(
-            node_id,
-            snapshot,
-            _constitution_node(node_id, "2027-01-01T00:00:00+00:00"),
-        )
-
-        assert fired["done"], "the race was never injected; the test proves nothing"
-        assert result != NodeSwapResult.SWAPPED
-        row = await db.fetchone(
-            "SELECT properties FROM graph_nodes WHERE node_id = ?", (node_id,)
-        )
-        assert "2026-01-01" in (row[0] or ""), (
-            "a co-owner's stamp was overwritten by a swap that raced its arrival"
-        )
-
-    async def test_an_ordinary_concurrent_retype_still_coexists(self, db):
-        """The documented behaviour this must not quietly break.
-
-        ``compare_and_swap_node`` promises that a concurrent ``node_type`` /
-        ``label`` change is neither detected nor clobbered — it writes
-        ``properties`` only. A blanket "type must not have changed" predicate
-        would have been the easy fix and would have broken that promise for
-        every node type in the system.
-        """
-        graph = _graph(db, AGENT_A)
-        node_id = f"episode:{uuid.uuid4().hex}"
-        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
-        snapshot = (await graph.get_node(node_id)).properties
-
-        await db.execute(
-            "UPDATE graph_nodes SET node_type = ?, label = ? WHERE node_id = ?",
-            ("concept", "Tuesdays", node_id),
-        )
-
-        result = await graph.compare_and_swap_node(
-            node_id, snapshot, GraphNode(node_id, "episode", "A Tuesday", {"n": 2})
-        )
-
-        assert result == NodeSwapResult.SWAPPED
-        stored = await graph.get_node(node_id)
-        assert stored.properties == {"n": 2}
-        assert stored.node_type == "concept"
-
-    async def test_a_disallowed_stored_type_is_a_result_not_an_exception(
-        self, db, constitution_bytes
-    ):
-        """The privacy wrapper's contract.
-
-        It passes ``allowed_node_types`` and converts TYPE_NOT_ALLOWED into a
-        PrivacyViolationError. Validating the new properties against the stored
-        row's shared shape first raised instead — a wrapped TransactionError
-        for what is a documented policy denial, skipping that conversion
-        entirely.
-        """
-        node_id = await _take_possession(
-            db, AGENT_A, constitution_bytes, "KESTREL_CONSTITUTION.md"
-        )
-        graph = _graph(db, AGENT_A)
-        await graph.add_node(
-            _constitution_node(node_id, "2026-01-01T00:00:00+00:00")
-        )
-        snapshot = (await graph.get_node(node_id)).properties
-
-        result = await graph.compare_and_swap_node(
-            node_id,
-            snapshot,
-            GraphNode(node_id, "audit_anchor", "Audit", {"checked": True}),
-            allowed_node_types=frozenset({"audit_anchor"}),
-        )
-
-        assert result == NodeSwapResult.TYPE_NOT_ALLOWED
