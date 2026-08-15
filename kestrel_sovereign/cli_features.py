@@ -387,7 +387,12 @@ def _direct_url_provenance(dist_name: str):
 
     vcs_info = data.get("vcs_info")
     revision = None
+    vcs_kind = None
     if isinstance(vcs_info, dict):
+        # `vcs` is REQUIRED by PEP 610 and lives outside `url`, which carries
+        # only the transport address. Dropping it made the same address served
+        # by two different VCS at one revision string compare identical.
+        vcs_kind = _text(vcs_info.get("vcs"))
         # commit_id is the resolved pin; requested_revision is what was asked
         # for (a branch or tag, which moves). Prefer the resolved one.
         revision = _text(vcs_info.get("commit_id")) or _text(
@@ -420,6 +425,7 @@ def _direct_url_provenance(dist_name: str):
         revision=revision,
         subdirectory=_text(data.get("subdirectory")),
         archive_hash=archive_hash,
+        vcs=vcs_kind,
     )
 
 
@@ -1789,6 +1795,23 @@ def cmd_feature_sync(args) -> int:
                     "this is a version conflict, move core to a version the "
                     "feature accepts — do not remove the pin."
                 )
+            if is_core:
+                # A failed CORE action stops the batch. `install_core` has
+                # already refreshed the guard from whatever core is NOW — the
+                # old version, or a partial write — so every remaining feature
+                # would resolve and pin against a core the manifest says is
+                # wrong. The final repair may then move core to the declared
+                # version those features were never resolved against, and
+                # `--continue-on-error` would restart the fleet onto that
+                # combination. Verification still runs below; it is installing
+                # everything else that must not proceed.
+                print(
+                    "      note: core did not reach its declared source, so the "
+                    "rest of this batch is skipped — installing features "
+                    "against the wrong core is what produces a venv no single "
+                    "step reports as broken."
+                )
+                break
             continue
 
         installed += 1

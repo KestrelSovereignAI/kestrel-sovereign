@@ -1812,3 +1812,67 @@ def test_provenance_carries_archive_hash_and_subdirectory(monkeypatch):
         {**base, "subdirectory": "pkg_b"}))
     d = cli_features._direct_url_provenance("kestrel-sovereign")
     assert c.url == d.url and c.source_id != d.source_id
+
+
+def test_provenance_keeps_the_vcs_kind(monkeypatch):
+    """PEP 610 requires `vcs_info.vcs` and keeps it OUTSIDE `url`.
+
+    `url` is the bare transport address, so the same address served by two
+    different VCS at one revision string produced identical identities. The
+    derived source_id picks this up automatically once the field exists — which
+    is the point of deriving it.
+    """
+    import importlib.metadata as md
+
+    def _dist(vcs):
+        class _D:
+            def read_text(self, name):
+                return json.dumps({
+                    "url": "https://example.invalid/core",
+                    "vcs_info": {"vcs": vcs, "commit_id": "abc123"},
+                })
+        return _D()
+
+    monkeypatch.setattr(md, "distribution", lambda name: _dist("git"))
+    a = cli_features._direct_url_provenance("kestrel-sovereign")
+    monkeypatch.setattr(md, "distribution", lambda name: _dist("hg"))
+    b = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert a.url == b.url and a.revision == b.revision  # indistinguishable before
+    assert a.vcs == "git" and b.vcs == "hg"
+    assert a.source_id != b.source_id
+    assert "git" in a.describe()
+
+
+def test_a_failed_core_action_stops_the_batch(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Features must not install against a core that failed to reach its source.
+
+    `install_core` refreshes the guard from whatever core is NOW — the old
+    version, or a partial write — so every remaining entry would resolve and pin
+    against a core the manifest says is wrong. A later successful repair can
+    then move core to the declared version those features were never resolved
+    against, and `--continue-on-error` would restart the fleet on exactly that
+    combination: a venv no single step reports as broken.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+    )
+    # Core is editable, the manifest says index — a real transition — and the
+    # core install fails.
+    venv = FakeUv(repair_fails=True)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "rest of this batch is skipped" in out
+    # The feature was never installed against the wrong core. Core is ordered
+    # first (_core_entry_first), so nothing before it ran either.
+    assert not any(
+        "kestrel-feature-voice" in " ".join(cmd) for cmd in venv.commands
+    ), venv.commands

@@ -153,6 +153,10 @@ class Provenance:
     revision: Optional[str] = None
     subdirectory: Optional[str] = None
     archive_hash: Optional[str] = None
+    #: PEP 610 keeps the VCS KIND in ``vcs_info.vcs``, separate from ``url`` —
+    #: the url is the bare transport address. The same address served by two
+    #: different VCS at the same revision string is two different sources.
+    vcs: Optional[str] = None
 
     @classmethod
     def unknown(cls) -> "Provenance":
@@ -173,11 +177,12 @@ class Provenance:
         revision: Optional[str] = None,
         subdirectory: Optional[str] = None,
         archive_hash: Optional[str] = None,
+        vcs: Optional[str] = None,
     ) -> "Provenance":
         """A source named directly — checkout, VCS ref, path, archive."""
         return cls(
             url=url, editable=editable, known=True, revision=revision,
-            subdirectory=subdirectory, archive_hash=archive_hash,
+            subdirectory=subdirectory, archive_hash=archive_hash, vcs=vcs,
         )
 
     @property
@@ -242,6 +247,7 @@ class Provenance:
             extra = "".join(
                 f" ({label} {value})"
                 for label, value in (
+                    ("vcs", self.vcs),
                     ("rev", self.revision),
                     ("subdir", self.subdirectory),
                     ("hash", self.archive_hash),
