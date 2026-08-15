@@ -509,7 +509,7 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
 _DERIVE = object()
 
 
-def _shape(version=None, editable_path=None, direct_url=_DERIVE):
+def _shape(version=None, editable_path=None, direct_url=_DERIVE, known=True):
     """Build a CoreInstallShape the way real metadata would.
 
     An editable install records a PEP 610 direct URL *as well as* the editable
@@ -521,14 +521,18 @@ def _shape(version=None, editable_path=None, direct_url=_DERIVE):
     """
     if direct_url is _DERIVE:
         direct_url = editable_path
-    return fr.CoreInstallShape(
-        version=version, editable_path=editable_path, direct_url=direct_url,
-    )
+    if not known:
+        prov = fr.Provenance.unknown()
+    elif direct_url:
+        prov = fr.Provenance.direct(direct_url, editable=bool(editable_path))
+    else:
+        prov = fr.Provenance.from_index_install()
+    return fr.CoreInstallShape(version=version, provenance=prov)
 
 
 def test_core_policy_defaults_to_the_live_editable_link():
     """No manifest entry: protect the link the venv actually has."""
-    policy = fr.resolve_core_policy({}, "/src/core")
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
     assert policy.editable == "/src/core" and policy.pypi is None
     assert policy.guarded
 
@@ -536,7 +540,7 @@ def test_core_policy_defaults_to_the_live_editable_link():
 def test_core_policy_is_unguarded_for_an_undeclared_wheel():
     """Core already a wheel and nothing declared — there is no link to protect
     and no editable install is invented for the operator."""
-    policy = fr.resolve_core_policy({}, None)
+    policy = fr.resolve_core_policy({}, _shape())
     assert not policy.guarded
     assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
 
@@ -546,7 +550,7 @@ def test_core_policy_prefers_the_manifest_over_the_live_link():
     override their declaration."""
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, editable="/src/next")}
-    policy = fr.resolve_core_policy(idx, "/src/old")
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
     assert policy.editable == "/src/next"
 
 
@@ -555,7 +559,7 @@ def test_core_policy_carries_a_declared_pypi_window():
     declaration the batch must hold, not a waiver of the guard."""
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
-    policy = fr.resolve_core_policy(idx, "/src/old")
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
     assert policy.editable is None and policy.pypi == ">=0.52,<0.53"
     assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == [
         "kestrel-sovereign>=0.52,<0.53"
@@ -574,7 +578,7 @@ def test_core_policy_with_an_empty_pypi_spec_still_holds_the_source():
     """
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi="")}
-    policy = fr.resolve_core_policy(idx, "/src/old")
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
 
     assert policy.guarded
     assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
@@ -589,7 +593,7 @@ def test_core_policy_with_an_empty_pypi_spec_still_holds_the_source():
 def test_editable_constraint_tracks_the_installed_version():
     """The pin is `==<what is installed now>`, so it must be derived from the
     shape at install time — re-snapshot after moving core."""
-    policy = fr.resolve_core_policy({}, "/src/core")
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
     assert fr.core_install_constraints(_shape("0.52.0", "/src/core"), policy) == [
         "kestrel-sovereign==0.52.0"
     ]
@@ -600,7 +604,7 @@ def test_editable_constraint_tracks_the_installed_version():
 
 def test_editable_policy_tolerates_version_drift_but_not_a_lost_link():
     """Reinstalling the checkout is normal; losing the link is the defect."""
-    policy = fr.resolve_core_policy({}, "/src/core")
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
     assert fr.core_install_matches(_shape("0.99.0", "/src/core"), policy)
     assert not fr.core_install_matches(_shape("0.53.0", None), policy)
     assert not fr.core_install_matches(_shape("0.52.0", "/src/other"), policy)
@@ -611,7 +615,7 @@ def test_pypi_policy_is_violated_by_a_version_outside_the_window():
     loudly as one that dropped an editable link."""
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
-    policy = fr.resolve_core_policy(idx, None)
+    policy = fr.resolve_core_policy(idx, _shape())
     assert fr.core_install_matches(_shape("0.52.1", None), policy)
     assert not fr.core_install_matches(_shape("0.53.0", None), policy)
     assert not fr.core_install_matches(_shape("0.52.1", "/src/core"), policy)
@@ -629,7 +633,7 @@ def test_pypi_policy_rejects_a_non_editable_direct_url_install():
     """
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
-    policy = fr.resolve_core_policy(idx, None)
+    policy = fr.resolve_core_policy(idx, _shape())
 
     # An index wheel: no direct URL recorded at all. This is the only shape
     # that actually came from an index.
@@ -652,12 +656,70 @@ def test_pypi_policy_with_no_version_window_still_rejects_a_direct_url():
     anything at all."""
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi="")}
-    policy = fr.resolve_core_policy(idx, None)
+    policy = fr.resolve_core_policy(idx, _shape())
     assert fr.core_install_matches(_shape("0.53.0", None), policy)
     assert not fr.core_install_matches(
         _shape("0.53.0", None, direct_url="git+https://example.invalid/core"),
         policy,
     )
+
+
+def test_unreadable_provenance_is_guarded_not_treated_as_a_plain_wheel():
+    """An undeclared core whose provenance will not read must still be guarded.
+
+    "Core is a known index wheel, nothing to protect" and "we could not tell
+    what core is" both reduce to ``editable_path is None``. Resolving the policy
+    from that narrowed value made the second indistinguishable from the first,
+    so a damaged venv ran with NO constraint and NO verification — the batch
+    free to replace a core that might well have been an editable link.
+    """
+    known_wheel = fr.resolve_core_policy({}, _shape("0.53.0"))
+    assert not known_wheel.guarded  # nothing declared, nothing to protect
+
+    unknown = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert unknown.guarded
+    assert unknown.hold_version == "0.53.0"
+    # It pins the version — the mechanism a feature actually uses to move core.
+    assert fr.core_install_constraints(_shape("0.53.0", known=False), unknown) == [
+        f"{fr.CORE_DISTRIBUTION}==0.53.0",
+    ]
+    # And it judges only that: the source is unknowable, so it is not asserted.
+    assert fr.core_install_matches(_shape("0.53.0", known=False), unknown)
+    assert not fr.core_install_matches(_shape("0.54.0", known=False), unknown)
+    # Which is exactly why it must not claim it can repair one.
+    assert not unknown.source_is_verifiable
+    assert "unverifiable" in unknown.describe_expected()
+
+
+def test_a_declared_source_still_wins_over_unreadable_provenance():
+    """The hold policy is the *fallback*. Where the operator declared core's
+    source, that declaration is still the policy — and still repairable."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, _shape("0.53.0", known=False))
+    assert policy.pypi == ">=0.52,<0.54" and policy.hold_version is None
+    assert policy.source_is_verifiable
+
+
+def test_provenance_answers_one_question_and_accounts_for_unknown():
+    """The type exists so unknown cannot be dropped by a caller.
+
+    Both questions the codebase asks — "from an index?" and "which checkout?" —
+    are answered by the value itself, so there is no `known` flag beside the
+    data for a caller to forget. Two callers forgot it in a single review round
+    when there was one.
+    """
+    index = fr.Provenance.from_index_install()
+    git = fr.Provenance.direct("git+https://example.invalid/c@abc")
+    editable = fr.Provenance.direct("/src/core", editable=True)
+    unknown = fr.Provenance.unknown()
+
+    assert index.is_from_index and index.editable_path is None
+    assert not git.is_from_index and git.editable_path is None
+    assert not editable.is_from_index and editable.editable_path == "/src/core"
+    # Unknown answers no to both, and is never mistaken for an index install.
+    assert not unknown.is_from_index and unknown.editable_path is None
+    assert "unknown source" in unknown.describe()
 
 
 def test_unknown_provenance_does_not_satisfy_a_pypi_source():
@@ -671,10 +733,10 @@ def test_unknown_provenance_does_not_satisfy_a_pypi_source():
     """
     idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
         package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
-    policy = fr.resolve_core_policy(idx, None)
+    policy = fr.resolve_core_policy(idx, _shape())
 
-    readable = fr.CoreInstallShape(version="0.53.0", provenance_known=True)
-    unknown = fr.CoreInstallShape(version="0.53.0", provenance_known=False)
+    readable = _shape("0.53.0")
+    unknown = _shape("0.53.0", known=False)
 
     assert readable.from_index and fr.core_install_matches(readable, policy)
     assert not unknown.from_index
@@ -691,7 +753,7 @@ def test_shape_describes_a_direct_url_install_distinctly():
 
 
 def test_describe_core_change_names_before_after_and_expected():
-    policy = fr.resolve_core_policy({}, "/src/core")
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
     described = fr.describe_core_change(
         _shape("0.52.0", "/src/core"), _shape("0.53.0", None), policy,
     )

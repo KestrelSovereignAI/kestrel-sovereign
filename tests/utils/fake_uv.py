@@ -151,7 +151,7 @@ class FakeUv:
         return self.editable.get(dist)
 
     def direct_url_provenance(self, dist):
-        """PEP 610 provenance for *dist* — ``(url, editable, known)``.
+        """PEP 610 provenance for *dist* — a ``Provenance``.
 
         ``unreadable_provenance`` models the third state: metadata that exists
         but will not parse, so where the package came from is UNKNOWN. Without
@@ -168,12 +168,15 @@ class FakeUv:
         could not express "non-editable but not from the index", so the case
         that broke the ``pypi`` policy was invisible to every test.
         """
+        from kestrel_sovereign.feature_reconcile import Provenance
+
         if dist in self.unreadable_provenance:
-            return None, False, False
+            return Provenance.unknown()
         editable = self.editable.get(dist)
         if editable:
-            return editable, True, True
-        return self.direct_urls.get(dist), False, True
+            return Provenance.direct(editable, editable=True)
+        url = self.direct_urls.get(dist)
+        return Provenance.direct(url) if url else Provenance.from_index_install()
 
     # -- the resolver --------------------------------------------------------
 

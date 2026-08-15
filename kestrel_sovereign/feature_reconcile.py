@@ -108,6 +108,74 @@ class ReconcileAction:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class Provenance:
+    """Where a distribution came from, per PEP 610 — including "we can't tell".
+
+    A distribution has exactly three provenances, and code that models only two
+    keeps getting this wrong:
+
+      * ``from_index``  — no ``direct_url.json``. The only positive evidence of
+        an index resolution.
+      * a direct URL    — VCS ref, local path, remote archive, editable
+        checkout. The file names the source.
+      * **unknown**     — the metadata exists but could not be read, parsed, or
+        made sense of.
+
+    The third is why this is a type rather than a tuple. It was previously a
+    ``known`` flag every caller had to remember to consult, and within one
+    review round two callers didn't: one read unknown as an index install, the
+    other built an *unguarded* policy from it. A flag beside the data is the
+    same shape as the bug this whole change exists to fix — a fact that must be
+    checked at N sites, where any site can forget. Ask :attr:`is_from_index` or
+    :attr:`editable_path` instead; both already account for unknown.
+    """
+
+    url: Optional[str] = None
+    editable: bool = False
+    known: bool = True
+
+    @classmethod
+    def unknown(cls) -> "Provenance":
+        """Metadata that exists but would not read. Nothing may be inferred."""
+        return cls(url=None, editable=False, known=False)
+
+    @classmethod
+    def from_index_install(cls) -> "Provenance":
+        """No ``direct_url.json``: resolved from a package index."""
+        return cls(url=None, editable=False, known=True)
+
+    @classmethod
+    def direct(cls, url: str, *, editable: bool = False) -> "Provenance":
+        """A source named directly — checkout, VCS ref, path, archive."""
+        return cls(url=url, editable=editable, known=True)
+
+    @property
+    def is_from_index(self) -> bool:
+        """Did this come from an index? Unknown answers **no**.
+
+        Asked to decide whether a declared ``pypi`` source is satisfied, and
+        "the metadata would not read" is not a yes. Failing closed costs at most
+        a reinstall nobody needed; failing open lets the wrong source pass,
+        which is the defect.
+        """
+        return self.known and self.url is None
+
+    @property
+    def editable_path(self) -> Optional[str]:
+        """The checkout this is linked to, or None. Unknown is never a path."""
+        return self.url if (self.known and self.editable) else None
+
+    def describe(self) -> str:
+        if self.editable_path:
+            return f"editable → {self.editable_path}"
+        if not self.known:
+            return "unknown source (direct_url.json unreadable)"
+        if self.url:
+            return f"non-editable direct URL → {self.url}"
+        return "non-editable (index wheel in site-packages)"
+
+
 @dataclass
 class CoreInstallShape:
     """How the core distribution is installed in this venv, right now.
@@ -117,21 +185,26 @@ class CoreInstallShape:
     feature installs and compared *after* so a silent editable→wheel swap
     becomes a named failure rather than an invisible divergence (issue #2949).
 
-    ``direct_url`` records core's PEP 610 provenance whenever one exists —
-    editable or not. It is the difference between "where core came from" and a
-    *proxy* for it: ``not is_editable`` used to stand in for "resolved from an
-    index", but a VCS, local-path or any other direct-URL install is equally
-    non-editable, so a ``pypi`` policy silently accepted the wrong source. Only
-    an install with no recorded direct URL actually came from an index.
+    ``provenance`` is the whole of "where core came from", including the case
+    where that cannot be determined. It is a :class:`Provenance` rather than
+    loose fields precisely so no caller can read two thirds of it and miss the
+    third — the mistake that let unknown metadata pass as an index install.
     """
 
     version: Optional[str] = None
-    editable_path: Optional[str] = None
-    direct_url: Optional[str] = None
-    #: Was the provenance metadata readable? False means the install exists but
-    #: ``direct_url.json`` could not be read or parsed, so where core came from
-    #: is UNKNOWN — which is not the same as "no file", and must not read as one.
-    provenance_known: bool = True
+    provenance: Provenance = field(default_factory=Provenance)
+
+    @property
+    def editable_path(self) -> Optional[str]:
+        return self.provenance.editable_path
+
+    @property
+    def direct_url(self) -> Optional[str]:
+        return self.provenance.url
+
+    @property
+    def provenance_known(self) -> bool:
+        return self.provenance.known
 
     @property
     def is_editable(self) -> bool:
@@ -141,46 +214,38 @@ class CoreInstallShape:
     def from_index(self) -> bool:
         """Was core resolved from a package index (rather than a direct URL)?
 
-        PEP 610 writes ``direct_url.json`` for *every* install that named its
-        source directly — VCS, local path, remote archive, editable checkout.
-        Index resolutions record nothing. So the absence of a direct URL is the
-        positive evidence of an index install; nothing else is.
-
-        Unknown provenance answers False. This is asked to decide whether a
-        declared source is satisfied, and "the metadata would not read" is not a
-        yes — a safety predicate that fails open on the one input it cannot
-        verify is the defect it exists to prevent.
+        Delegates, so this cannot answer differently from every other place the
+        same question is asked. Unknown provenance answers False.
         """
-        return self.provenance_known and self.direct_url is None
+        return self.provenance.is_from_index
 
     def describe(self) -> str:
-        if self.editable_path:
-            where = f"editable → {self.editable_path}"
-        elif self.direct_url:
-            where = f"non-editable direct URL → {self.direct_url}"
-        elif not self.provenance_known:
-            where = "unknown source (direct_url.json unreadable)"
-        else:
-            where = "non-editable (index wheel in site-packages)"
-        return f"{where} ({self.version or 'not installed'})"
+        return f"{self.provenance.describe()} ({self.version or 'not installed'})"
 
 
 @dataclass
 class CoreSourcePolicy:
     """Where the core distribution must come from, for a batch of installs.
 
-    At most one of the two is set:
+    At most one of the three is set:
 
       * ``editable`` — the checkout core must stay PEP 660-linked to.
       * ``pypi`` — the operator deliberately declared core comes from the index;
         the value is the declared PEP 440 spec (``""`` means "any version").
+      * ``hold_version`` — nothing was declared and core's provenance could not
+        be read, so where it is *supposed* to come from is unknowable. The batch
+        cannot verify a source, but it can refuse to let a feature move core:
+        the installed version is pinned and any change is reported.
 
-    Neither set means core is an unmanaged wheel: nothing was declared and there
-    is no editable link to protect, so the batch imposes no policy.
+    None set means core is a known, undeclared index wheel: nothing to protect,
+    so the batch imposes no policy. That conclusion requires *knowing* core came
+    from an index — reaching it from unreadable metadata is how a batch ran
+    entirely unguarded over a core that might have been an editable link.
     """
 
     editable: Optional[str] = None
     pypi: Optional[str] = None
+    hold_version: Optional[str] = None
 
     @property
     def guarded(self) -> bool:
@@ -192,19 +257,39 @@ class CoreSourcePolicy:
         to hold. Reading it as unguarded let an editable (or absent) core pass
         a manifest that said the opposite (issue #2949).
         """
-        return bool(self.editable) or self.pypi is not None
+        return (
+            bool(self.editable)
+            or self.pypi is not None
+            or self.hold_version is not None
+        )
+
+    @property
+    def source_is_verifiable(self) -> bool:
+        """Can this policy say where core *should* come from?
+
+        False for ``hold_version``: it exists precisely because that is unknown,
+        so a drift under it can be reported but never automatically repaired —
+        there is no declared source to reinstall from, and guessing one is how
+        an operator's core gets retargeted.
+        """
+        return self.hold_version is None
 
     def describe_expected(self) -> str:
         if self.editable:
             return f"editable → {self.editable}"
         if self.pypi is not None:
             return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
+        if self.hold_version is not None:
+            return (
+                f"unchanged at {self.hold_version} "
+                "(source unverifiable — direct_url.json unreadable)"
+            )
         return "unconstrained"
 
 
 def resolve_core_policy(
     source_index: Dict[str, SourceEntry],
-    detected_editable: Optional[str],
+    shape: "CoreInstallShape",
 ) -> CoreSourcePolicy:
     """Decide the :class:`CoreSourcePolicy` for a batch of feature installs.
 
@@ -220,6 +305,15 @@ def resolve_core_policy(
       2. Otherwise the venv's own live editable link — captured *before* the
          installs run. When core is already an undeclared wheel there is no link
          to protect and no editable install is invented for the operator.
+      3. When nothing is declared and core's provenance is UNREADABLE, there is
+         no safe conclusion available: it may be an editable link, it may be a
+         wheel. Hold the installed version instead of running unguarded.
+
+    Takes the whole *shape* rather than a pre-extracted editable path so rule 3
+    is reachable at all. Passing only ``editable_path`` threw away the one fact
+    that distinguishes "core is a plain wheel, nothing to protect" from "we
+    could not tell what core is" — and both arrived here as ``None``, so a
+    damaged venv got no guard whatsoever.
     """
     src = source_index.get(CORE_DISTRIBUTION)
     if src is not None:
@@ -227,7 +321,11 @@ def resolve_core_policy(
             return CoreSourcePolicy(editable=src.editable)
         if src.pypi is not None:
             return CoreSourcePolicy(pypi=src.pypi)
-    return CoreSourcePolicy(editable=detected_editable or None)
+    if shape.editable_path:
+        return CoreSourcePolicy(editable=shape.editable_path)
+    if not shape.provenance_known and shape.version:
+        return CoreSourcePolicy(hold_version=shape.version)
+    return CoreSourcePolicy()
 
 
 def core_install_constraints(
@@ -263,6 +361,12 @@ def core_install_constraints(
         return [f"{CORE_DISTRIBUTION}=={shape.version}"] if shape.version else []
     if policy.pypi:
         return [f"{CORE_DISTRIBUTION}{policy.pypi}"]
+    if policy.hold_version is not None:
+        # Source unverifiable, so pin the version. That is the mechanism a
+        # feature actually uses to move core — the resolver only reaches for the
+        # index when the installed version fails a pin — so pinning it is real
+        # protection even without knowing the source.
+        return [f"{CORE_DISTRIBUTION}=={policy.hold_version}"]
     # A declared-but-empty spec (``pypi = ""``) has no version to constrain, so
     # there is no line to write — a bare package name would constrain nothing
     # and read as a pin in every message that quotes it. The policy is still
@@ -319,6 +423,12 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             and shape.from_index
             and version_satisfies(shape.version, policy.pypi)
         )
+    if policy.hold_version is not None:
+        # All this policy can assert is that nobody moved core. It deliberately
+        # does not judge the SOURCE: it exists because the source is unknown,
+        # and inventing a verdict about it would be the fabrication the guard
+        # refuses everywhere else.
+        return shape.version == policy.hold_version
     return True
 
 

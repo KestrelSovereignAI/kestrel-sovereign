@@ -18,6 +18,7 @@ import pytest
 
 from kestrel_sovereign import cli
 from kestrel_sovereign import cli_features
+from kestrel_sovereign import feature_reconcile as fr
 from kestrel_sovereign.cli_features import CORE_UNSAFE
 from tests.utils.fake_uv import (
     CHECKOUT,
@@ -477,7 +478,7 @@ def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_
     # modelled package cannot be editable to one helper and index-resolved to
     # the other.
     monkeypatch.setattr(
-        cli, "_direct_url_provenance", lambda dist: ("/src/voice", True, True),
+        cli, "_direct_url_provenance", lambda dist: fr.Provenance.direct("/src/voice", editable=True),
     )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: "/src/voice")
     spy = _InstallSpy()
@@ -554,7 +555,7 @@ def test_sync_unpinned_pypi_core_declaration_never_falls_back_to_git(
     # Stub provenance alongside it, or the shape read falls through to this
     # venv's real metadata and the assertions describe the developer's machine
     # instead of the modelled host.
-    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False, True))
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: fr.Provenance.from_index_install())
     spy = _InstallSpy(returncode=1, stderr="no matching distribution")
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
@@ -714,7 +715,7 @@ def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # core: wheel
     # ...and its provenance, or capture reads THIS venv's editable core and
     # writes a real local path ahead of the entry under test.
-    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: (None, False, True))
+    monkeypatch.setattr(cli, "_direct_url_provenance", lambda dist: fr.Provenance.from_index_install())
     manifest = tmp_path / "m.toml"
     cli.cmd_feature_sync(_args(manifest, capture=True))
     # The captured file must parse back to the exact path (no TOML escape break)
@@ -1408,7 +1409,7 @@ def test_a_pypi_declared_feature_installed_from_git_is_drift_not_present(
     monkeypatch.setattr(
         cli,
         "_direct_url_provenance",
-        lambda dist: ("git+https://example.invalid/voice@abc", False, True),
+        lambda dist: fr.Provenance.direct("git+https://example.invalid/voice@abc"),
     )
     monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
     spy = _InstallSpy()
@@ -1552,3 +1553,139 @@ def test_sync_pip_source_switch_does_not_run_the_second_pass_after_a_failure(
     assert len(venv.commands) == 1  # no second pass
     assert venv.editable[CORE] == CHECKOUT  # and core is still where it was
     assert "FAILED" in capsys.readouterr().out
+
+
+# --- provenance reading, at the metadata boundary (#2949) -------------------
+
+
+@pytest.mark.parametrize("body", [
+    '{}',                                  # parses, but no url
+    '{"url": ""}',                         # present and empty
+    '{"url": "   "}',                      # whitespace only
+    '{"url": 42}',                         # wrong type
+    '{"dir_info": {"editable": true}}',    # editable flag, no url to link to
+    '[]',                                  # valid JSON, wrong shape
+    'not json at all',
+    '',                                    # the file exists and says nothing
+])
+def test_a_damaged_direct_url_file_reads_as_unknown_not_as_an_index_install(
+    monkeypatch, body,
+):
+    """PEP 610 requires ``url``. Anything that parses without a usable one is
+    damage, and damage is UNKNOWN — every one of these shapes previously
+    reported "no direct URL", which is the positive evidence of an index
+    install, so a declared `pypi` source was satisfied by a core nobody could
+    verify.
+    """
+    import importlib.metadata as md
+
+    class _Dist:
+        def read_text(self, name):
+            return body
+
+    monkeypatch.setattr(md, "distribution", lambda name: _Dist())
+
+    prov = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert not prov.is_from_index
+    assert not prov.known
+    assert prov.editable_path is None
+
+
+def test_a_real_direct_url_file_still_reads_as_that_source(monkeypatch):
+    """The counterpart: a well-formed file is read, not rejected — otherwise
+    'fail closed' would just mean 'always fail'."""
+    import importlib.metadata as md
+
+    class _Dist:
+        def read_text(self, name):
+            return '{"url": "git+https://example.invalid/c@abc"}'
+
+    monkeypatch.setattr(md, "distribution", lambda name: _Dist())
+
+    prov = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert prov.known and not prov.is_from_index
+    assert prov.url == "git+https://example.invalid/c@abc"
+
+
+def test_no_direct_url_file_is_a_known_index_install(monkeypatch):
+    """And the absent file remains the one thing that DOES mean 'from an
+    index' — the distinction the whole type exists to preserve."""
+    import importlib.metadata as md
+
+    class _Dist:
+        def read_text(self, name):
+            return None
+
+    monkeypatch.setattr(md, "distribution", lambda name: _Dist())
+
+    prov = cli_features._direct_url_provenance("kestrel-sovereign")
+
+    assert prov.known and prov.is_from_index
+
+
+def test_a_declared_editable_core_is_pulled_before_it_is_linked(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Linking a declared editable core without pulling it restarts on stale code.
+
+    Nothing else covers this checkout: `kestrel update` step 1 pulls the one the
+    *currently installed* core lives in — None when core is a wheel, the wrong
+    one when the manifest declares a different checkout — and reconcile, which
+    does pull every editable entry it installs, excludes core because it is
+    bundled. So the fleet could come back up on whatever happened to be on disk.
+    """
+    checkout = tmp_path / "core-checkout"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "{checkout}"\n'
+    )
+    # core is a wheel; the manifest says otherwise. `checkouts` models what
+    # that checkout builds, the way a real `-e` install takes its version.
+    venv = FakeUv(core_checkout=None, checkouts={str(checkout): "0.52.0"})
+    use_fake_uv(monkeypatch, venv)
+
+    pulled = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+        lambda path, allow_dirty: pulled.append((str(path), allow_dirty)) or (0, "Already up to date."),
+    )
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert pulled == [(str(checkout), False)]  # pulled, and never over a dirty tree
+    assert venv.editable.get(CORE) == str(checkout)  # ...and then linked
+
+
+def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """A refused pull must not fail the sync — but must not be silent either.
+
+    A dirty core checkout is an ordinary dev state, so refusing to link over it
+    would be hostile. Saying nothing would put the operator back where they
+    started: restarted onto code that did not move, with no way to know.
+    """
+    checkout = tmp_path / "core-checkout"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "{checkout}"\n'
+    )
+    venv = FakeUv(core_checkout=None, checkouts={str(checkout): "0.52.0"})
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+        lambda path, allow_dirty: (2, "REFUSED — checkout has modified tracked files"),
+    )
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc == 0  # the link is still correct, so the sync is not failed
+    assert "REFUSED" in out
+    assert "NOT updated" in out  # the staleness is named
+    assert venv.editable.get(CORE) == str(checkout)

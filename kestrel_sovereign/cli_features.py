@@ -268,61 +268,65 @@ def _file_url_to_path(url: str) -> str:
 
 
 def _direct_url_provenance(dist_name: str):
-    """Read *dist_name*'s PEP 610 provenance. ``(url, editable, known)``.
+    """Read *dist_name*'s PEP 610 provenance. Returns a :class:`Provenance`.
 
     ``direct_url.json`` is written by every install that named its source
     directly — a VCS ref, a local path, a remote archive, an editable checkout.
-    An install resolved from a package index writes no such file. So ``url is
-    None`` is the *only* positive evidence that a distribution came from an
-    index, and "not editable" says nothing about it either way (issue #2949).
+    An install resolved from a package index writes no such file, so its absence
+    is the only positive evidence of an index install (issue #2949).
 
-    ``known`` is the third state, and it exists because there are three:
+    Returns the value object rather than a tuple deliberately: the third state
+    (metadata that exists but will not read) has to be impossible to drop, and
+    a caller destructuring three positional values can drop it. Every "did this
+    come from an index?" question goes through :attr:`Provenance.is_from_index`,
+    which already fails closed on unknown.
 
-    * a file that is absent          → came from an index      (None, _, True)
-    * a file that names a source     → came from there    (url, editable, True)
-    * a file we could not read       → **we do not know**     (None, _, False)
-
-    Collapsing the third into the first makes "we could not tell" read as
-    positive evidence of an index install, so a direct-URL package with damaged
-    metadata satisfies a declared ``pypi`` source and the guard skips repairing
-    it — a safety predicate failing *open* on the one input it cannot verify.
-    Callers must decide what unknown means for them; none may assume it is fine.
-
-    ``url`` is normalized to a filesystem path for ``file:`` URLs and returned
+    ``url`` is normalized to a filesystem path for ``file:`` URLs and kept
     verbatim otherwise.
     """
     import importlib.metadata as md
     import json
 
+    from kestrel_sovereign.feature_reconcile import Provenance
+
     try:
         dist = md.distribution(dist_name)
     except md.PackageNotFoundError:
         # Not installed, so there is no provenance to have. Absent, and known.
-        return None, False, True
+        return Provenance.from_index_install()
     except Exception:
         # The distribution is there but unreadable — that is not "no file".
-        return None, False, False
+        return Provenance.unknown()
     try:
         raw = dist.read_text("direct_url.json")
     except Exception:
-        return None, False, False
+        return Provenance.unknown()
     if raw is None:
-        # No direct_url.json: the positive evidence of an index install.
-        return None, False, True
+        # No direct_url.json at all: positive evidence of an index install.
+        return Provenance.from_index_install()
     if not raw.strip():
-        # Present but empty. Damage, not an index install.
-        return None, False, False
+        return Provenance.unknown()  # present but empty is damage, not an index
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        return None, False, False
+        return Provenance.unknown()
     if not isinstance(data, dict):
-        return None, False, False
-    editable = bool(data.get("dir_info", {}).get("editable"))
-    url = data.get("url", "")
+        return Provenance.unknown()
+    # PEP 610 REQUIRES ``url``. A file that parses but omits it, leaves it
+    # empty, or gives a non-string is damaged — and damaged is unknown, not an
+    # index install. Deriving "no url, therefore no direct URL" reproduced the
+    # fail-open one layer down, where the type could no longer help.
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return Provenance.unknown()
+    dir_info = data.get("dir_info")
+    editable = bool(dir_info.get("editable")) if isinstance(dir_info, dict) else False
     if url.startswith("file:"):
-        url = _file_url_to_path(url) or None
-    return (url or None), editable, True
+        path = _file_url_to_path(url)
+        if not path:
+            return Provenance.unknown()  # a file: URL that will not resolve
+        url = path
+    return Provenance.direct(url, editable=editable)
 
 
 def _from_index(dist_name: str) -> bool:
@@ -348,8 +352,7 @@ def _from_index(dist_name: str) -> bool:
     that stubs where a package came from must not be able to leave this helper
     answering from the developer's real venv.
     """
-    url, _, known = cli._direct_url_provenance(dist_name)
-    return known and url is None
+    return cli._direct_url_provenance(dist_name).is_from_index
 
 
 def _editable_install_path(dist_name: str) -> Optional[str]:
@@ -365,10 +368,9 @@ def _editable_install_path(dist_name: str) -> Optional[str]:
     one returns None for a non-editable direct URL exactly as it does for an
     index wheel.
     """
-    url, editable, _known = _direct_url_provenance(dist_name)
     # Unknown provenance is not an editable checkout: this answers "is there a
     # checkout to pull/relink?", and there is no path to hand back.
-    return url if editable else None
+    return _direct_url_provenance(dist_name).editable_path
 
 
 def _installed_extension_distributions() -> list:
@@ -953,12 +955,9 @@ def _core_install_shape():
     """
     from kestrel_sovereign.feature_reconcile import CoreInstallShape
 
-    direct_url, editable, known = cli._direct_url_provenance(CORE_DISTRIBUTION)
     return CoreInstallShape(
         version=_installed_version(CORE_DISTRIBUTION),
-        editable_path=direct_url if editable else None,
-        direct_url=direct_url,
-        provenance_known=known,
+        provenance=cli._direct_url_provenance(CORE_DISTRIBUTION),
     )
 
 
@@ -1010,6 +1009,13 @@ class CoreGuardOutcome:
         the shell when :attr:`shell` says the quoting is specific to one, since
         a command pasted into the other shell is not the command that ran.
         """
+        if not self.command:
+            # No declared source, so no command to offer. Say that, rather than
+            # print an empty backtick pair and let it read as a broken message.
+            return (
+                "NOT REPAIRED — core's source is unknown, so there is no "
+                "command that could put it back. See the detail above."
+            )
         where = f" in {self.shell}" if self.shell else ""
         return f"RESTORE FAILED — run `{self.command}`{where} by hand."
 
@@ -1081,7 +1087,12 @@ class CoreInstallGuard:
         from kestrel_sovereign import feature_reconcile as fr
 
         before = cli._core_install_shape()
-        policy = fr.resolve_core_policy(source_index or {}, before.editable_path)
+        # The whole shape, not just its editable path: "core is a plain index
+        # wheel with nothing to protect" and "core's provenance would not read"
+        # both reduce to editable_path is None, and only the resolver can tell
+        # them apart. Passing the narrowed value let a damaged venv run entirely
+        # unguarded — no constraint, no verification (issue #2949).
+        policy = fr.resolve_core_policy(source_index or {}, before)
         return cls(policy, before)
 
     @classmethod
@@ -1275,6 +1286,27 @@ class CoreInstallGuard:
         # Distinguish "the batch broke it" from "it never got there": both are
         # failures, but only the first is a swap.
         replaced = core_install_matches(self._baseline, self.policy)
+
+        if not self.policy.source_is_verifiable:
+            # A hold policy exists because core's source could not be read. The
+            # drift is real and must be reported, but there is no declared
+            # source to reinstall from — so refuse to guess one. Reinstalling
+            # core from a source nobody declared is the retargeting this guard
+            # exists to prevent, and doing it *as the repair* would be the worst
+            # possible place to commit it.
+            return CoreGuardOutcome(
+                drift=drift,
+                replaced=replaced,
+                repaired=False,
+                command="",
+                shell="",
+                output=(
+                    "core's install source could not be read, so there is no "
+                    "declared source to restore from. Reinstall core yourself, "
+                    "or declare its source in .kestrel-host-features.toml."
+                ),
+            )
+
         repaired, rendered, shell, result = self._repair(timeout=timeout)
         return CoreGuardOutcome(
             drift=drift,
@@ -1553,7 +1585,36 @@ def cmd_feature_sync(args) -> int:
 
         reinstall = None
         if editable_want:
-            pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
+            checkout = Path(editable_want).expanduser()
+            if canonical_package(target) == CORE_DISTRIBUTION:
+                # A declared editable CORE must be pulled before it is linked,
+                # or `kestrel update` restarts the fleet on stale contents.
+                #
+                # Nothing else covers it. Step 1 of `update` pulls the checkout
+                # the *currently installed* core lives in — which is None when
+                # core is an index wheel, and the wrong checkout when the
+                # manifest declares a different one. Reconcile pulls every
+                # editable entry it installs, but core is excluded from
+                # reconcile because it is bundled. So core is the one editable
+                # source on the host that nothing pulls.
+                #
+                # A failed pull does NOT fail the sync: a dirty core checkout is
+                # an ordinary dev state, and refusing to link over it would be
+                # hostile. It is printed instead, so the operator learns the
+                # code did not move rather than being told nothing.
+                from kestrel_sovereign import cli_lifecycle
+
+                rc_pull, out_pull = cli_lifecycle._editable_git_pull(
+                    checkout, allow_dirty=False,
+                )
+                for line in (out_pull or "").strip().splitlines():
+                    print(f"      {line}")
+                if rc_pull != 0:
+                    print(
+                        f"      note: {target} was linked but NOT updated — the "
+                        "checkout above is what will run after a restart."
+                    )
+            pip_args = ["-e", _pip_spec(str(checkout), extras)]
         else:
             pip_args = [install_target]
             if pypi_want is not None and not cli._from_index(target):
