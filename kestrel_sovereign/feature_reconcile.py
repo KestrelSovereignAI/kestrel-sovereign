@@ -232,10 +232,13 @@ class CoreSourcePolicy:
       * ``editable`` — the checkout core must stay PEP 660-linked to.
       * ``pypi`` — the operator deliberately declared core comes from the index;
         the value is the declared PEP 440 spec (``""`` means "any version").
-      * ``hold_version`` — nothing was declared and core's provenance could not
-        be read, so where it is *supposed* to come from is unknowable. The batch
-        cannot verify a source, but it can refuse to let a feature move core:
-        the installed version is pinned and any change is reported.
+      * ``hold_version`` — nothing was declared and core did not come from an
+        index: it is either a known direct URL (VCS, path, archive) or metadata
+        that would not read. Nobody said where core *should* come from, so no
+        source can be asserted — but the batch can refuse to let a feature move
+        it. The installed version is pinned and any change is reported.
+        ``hold_source`` records the direct URL when it is known, so the message
+        an operator reads says which of the two cases they are in.
 
     None set means core is a known, undeclared index wheel: nothing to protect,
     so the batch imposes no policy. That conclusion requires *knowing* core came
@@ -246,6 +249,7 @@ class CoreSourcePolicy:
     editable: Optional[str] = None
     pypi: Optional[str] = None
     hold_version: Optional[str] = None
+    hold_source: Optional[str] = None
 
     @property
     def guarded(self) -> bool:
@@ -280,6 +284,12 @@ class CoreSourcePolicy:
         if self.pypi is not None:
             return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
         if self.hold_version is not None:
+            if self.hold_source:
+                return (
+                    f"unchanged at {self.hold_version} "
+                    f"(installed from {self.hold_source}, not an index — "
+                    "no declared source to restore from)"
+                )
             return (
                 f"unchanged at {self.hold_version} "
                 "(source unverifiable — direct_url.json unreadable)"
@@ -323,8 +333,24 @@ def resolve_core_policy(
             return CoreSourcePolicy(pypi=src.pypi)
     if shape.editable_path:
         return CoreSourcePolicy(editable=shape.editable_path)
-    if not shape.provenance_known and shape.version:
-        return CoreSourcePolicy(hold_version=shape.version)
+    if shape.version and not shape.from_index:
+        # Core did not come from an index, and nothing declared where it should
+        # come from. One rule covers both remaining cases, because the relevant
+        # fact is the same: this core was NOT resolved from an index, so it is
+        # not the "plain wheel with nothing to protect" that ends this function.
+        #
+        #   * a known direct URL (VCS ref, local path, archive) — as deliberate
+        #     an install as an editable link, and just as replaceable by a
+        #     feature's index resolution;
+        #   * unreadable provenance — it might be either, so assume the one that
+        #     needs protecting.
+        #
+        # Splitting these on `provenance_known` guarded the second and let the
+        # first fall through unguarded, which is the same fail-open one branch
+        # further along.
+        return CoreSourcePolicy(
+            hold_version=shape.version, hold_source=shape.direct_url,
+        )
     return CoreSourcePolicy()
 
 

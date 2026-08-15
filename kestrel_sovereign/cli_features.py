@@ -1288,12 +1288,21 @@ class CoreInstallGuard:
         replaced = core_install_matches(self._baseline, self.policy)
 
         if not self.policy.source_is_verifiable:
-            # A hold policy exists because core's source could not be read. The
-            # drift is real and must be reported, but there is no declared
-            # source to reinstall from — so refuse to guess one. Reinstalling
-            # core from a source nobody declared is the retargeting this guard
-            # exists to prevent, and doing it *as the repair* would be the worst
-            # possible place to commit it.
+            # A hold policy means core did not come from an index and NOBODY
+            # declared where it should come from. The drift is real and must be
+            # reported, but there is no declared source to reinstall from — so
+            # refuse to guess one. Reinstalling core from a source nobody
+            # declared is the retargeting this guard exists to prevent, and
+            # committing it *as the repair* would be the worst possible place.
+            #
+            # The two cases say different things to an operator: one can be told
+            # exactly where core came from, the other cannot be told anything.
+            cause = (
+                f"core was installed from {self.policy.hold_source}, which no "
+                "manifest entry declares"
+                if self.policy.hold_source
+                else "core's install source could not be read"
+            )
             return CoreGuardOutcome(
                 drift=drift,
                 replaced=replaced,
@@ -1301,9 +1310,9 @@ class CoreInstallGuard:
                 command="",
                 shell="",
                 output=(
-                    "core's install source could not be read, so there is no "
-                    "declared source to restore from. Reinstall core yourself, "
-                    "or declare its source in .kestrel-host-features.toml."
+                    f"{cause}, so there is no declared source to restore from. "
+                    "Reinstall core yourself, or declare its source in "
+                    ".kestrel-host-features.toml."
                 ),
             )
 

@@ -691,6 +691,36 @@ def test_unreadable_provenance_is_guarded_not_treated_as_a_plain_wheel():
     assert "unverifiable" in unknown.describe_expected()
 
 
+def test_a_known_direct_url_core_is_guarded_too():
+    """A non-editable direct-URL core is not a "plain wheel with nothing to
+    protect" — it is as deliberate an install as an editable link.
+
+    Its provenance is perfectly READABLE, so the unknown-provenance branch did
+    not cover it, and it has no editable_path, so the editable branch did not
+    either. It fell through to an empty policy: no constraint, no verification,
+    and a feature free to replace an explicitly-sourced core with an index wheel
+    while the command reported success. Splitting on `provenance_known` instead
+    of `from_index` is what left that gap.
+    """
+    url = "git+https://example.invalid/core@abc"
+    shape = _shape("0.53.0", direct_url=url)
+    policy = fr.resolve_core_policy({}, shape)
+
+    assert policy.guarded
+    assert policy.hold_version == "0.53.0"
+    assert policy.hold_source == url
+    assert fr.core_install_constraints(shape, policy) == [
+        f"{fr.CORE_DISTRIBUTION}==0.53.0",
+    ]
+    # Held, and a swap to the same-version index wheel is still caught.
+    assert fr.core_install_matches(shape, policy)
+    assert not fr.core_install_matches(_shape("0.54.0"), policy)
+    # No declared source, so it must not pretend it can repair — but it CAN say
+    # where core actually came from, which the unreadable case cannot.
+    assert not policy.source_is_verifiable
+    assert url in policy.describe_expected()
+
+
 def test_a_declared_source_still_wins_over_unreadable_provenance():
     """The hold policy is the *fallback*. Where the operator declared core's
     source, that declaration is still the policy — and still repairable."""
