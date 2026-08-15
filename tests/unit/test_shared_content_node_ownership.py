@@ -689,3 +689,87 @@ class TestTheSwapDoorObeysTheSameRules:
         assert multi_owner == multi_owner_absent, (
             "a co-owned foreign row is distinguishable from an absent one"
         )
+
+
+class TestTheShapeIsReadOffTheStoredRow:
+    """The relabelling escape, found by review after the swap door was fixed.
+
+    ``add_node`` is a whole-row upsert: it writes ``node_type`` and ``label``
+    as well as ``properties``. Every guard above keys off the shared-shape
+    table, so deriving that key from the *incoming* node alone meant a sole
+    owner could skip all of them by declaring a different type — the row's id
+    is what identifies it, not the label the caller puts on it.
+
+    The same mistake, in the same change, at the other door. The swap path
+    already read the shape off the stored row; ``add_node`` did not.
+    """
+
+    async def test_a_sole_owner_cannot_relabel_a_shared_row(
+        self, db, artifact_bytes
+    ):
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        graph = _graph(db, AGENT_A)
+        await graph.add_node(_artifact_node(node_id))
+
+        disguised = GraphNode(
+            node_id=node_id,
+            node_type="episode",
+            label="A Tuesday",
+            properties={"source_path": "/home/operator/a.json"},
+        )
+        with pytest.raises(REFUSAL, match="node_type or label"):
+            await graph.add_node(disguised)
+
+        stored = await graph.get_node(node_id)
+        assert stored.node_type == ARTIFACT_TYPE_LABEL
+        assert stored.properties["signer"] == SIGNER
+
+    async def test_the_next_agent_can_still_anchor_the_genuine_artifact(
+        self, db, artifact_bytes
+    ):
+        """The consequence the refusal exists to prevent, stated as a test.
+
+        Without it, A's relabelling lands and B — holding the same signed
+        artifact — can never join the row.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _take_possession(db, AGENT_B, artifact_bytes, "a.json")
+        graph_a = _graph(db, AGENT_A)
+        await graph_a.add_node(_artifact_node(node_id))
+
+        with pytest.raises(REFUSAL, match="node_type or label"):
+            await graph_a.add_node(
+                GraphNode(node_id, "episode", "A Tuesday", {"n": 1})
+            )
+        await _graph(db, AGENT_B).add_node(_artifact_node(node_id))
+
+        assert await _owners(db, node_id) == sorted([AGENT_A, AGENT_B])
+
+    async def test_a_foreign_caller_learns_nothing_new(
+        self, db, artifact_bytes
+    ):
+        """The refusal must not become a better error for an outsider.
+
+        B does not own the row and must keep getting the ownership answer —
+        anything more specific tells it the shape of a row it cannot read.
+        """
+        node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
+        await _graph(db, AGENT_A).add_node(_artifact_node(node_id))
+
+        with pytest.raises(REFUSAL, match="owned by another agent"):
+            await _graph(db, AGENT_B).add_node(
+                GraphNode(node_id, "episode", "A Tuesday", {"n": 1})
+            )
+
+    async def test_an_ordinary_node_can_still_be_retyped(self, db):
+        """add_node has always been a whole-row upsert for everything else, and
+        this refusal must not quietly become a global rule."""
+        graph = _graph(db, AGENT_A)
+        node_id = f"episode:{uuid.uuid4().hex}"
+        await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
+
+        await graph.add_node(GraphNode(node_id, "concept", "Tuesdays", {"n": 2}))
+
+        stored = await graph.get_node(node_id)
+        assert stored.node_type == "concept"
+        assert stored.label == "Tuesdays"

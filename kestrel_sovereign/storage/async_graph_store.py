@@ -711,6 +711,30 @@ class AsyncGraphStore:
                 raise ValueError(
                     "Cannot overwrite a graph node owned by another agent"
                 )
+            # The shape has to be read off the *stored* row as well as off the
+            # incoming node. ``add_node`` is a whole-row upsert — it writes
+            # ``node_type`` and ``label`` too — so deriving the guards only from
+            # what the caller declared let a sole owner walk around every rule
+            # below simply by relabelling: present the artifact's node id as an
+            # ``episode``, ``shape`` comes back ``None``, no check runs, and the
+            # upsert replaces the fleet's governance row wholesale. The next
+            # agent to anchor the genuine artifact then meets a row it cannot
+            # match and rolls back — the same split, through the same door I had
+            # just closed on the swap path and not here.
+            #
+            # Placed after the ownership refusal on purpose: a foreign caller
+            # must keep getting "owned by another agent" and learn nothing more
+            # about a row it cannot see.
+            stored_key = (existing[0], existing[1]) if existing else None
+            if (
+                stored_key is not None
+                and stored_key in _SHARED_CONTENT_SHAPES
+                and stored_key != (node.node_type, node.label)
+            ):
+                raise ValueError(
+                    "Cannot change the node_type or label of a fleet-shared "
+                    f"graph node: {stored_key[0]}/{stored_key[1]}"
+                )
             # Being the only owner today is not a licence to redefine what the
             # row says. These node ids ARE the hash of the bytes, so the
             # identity fields cannot legitimately change while the id stays the
