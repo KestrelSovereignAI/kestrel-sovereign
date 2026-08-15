@@ -24,8 +24,12 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
+)
+from kestrel_sovereign.features.restart_coordinator.event_store import (
+    list_events_for_request,
 )
 from kestrel_sovereign.features.restart_coordinator.feature import (
     _MAX_NAMED_BUSY_KINDS,
@@ -186,6 +190,13 @@ def _make_agent(backend, did="did:test:agent", name="Test Agent",
         _background_tasks=set(),
         features={"RestartCoordinatorFeature": True},
     )
+
+
+class _TurnAgent(TurnLifecycleMixin):
+    """Restart feature carrier with the production turn-session contract."""
+
+    def __init__(self, backend):
+        self.__dict__.update(vars(_make_agent(backend)))
 
 
 async def _make_feature(tmp_path, **kwargs):
@@ -1074,7 +1085,7 @@ async def test_wake_not_delivered_when_terminalize_write_does_not_land(tmp_path)
 # ---------------------------------------------------------------------------
 
 
-class _RealDispatchAgent:
+class _RealDispatchAgent(TurnLifecycleMixin):
     """Minimal agent wired to a REAL SignalDispatcher so a swept
     ``restart.completed`` signal travels the same pipeline every other
     COGNITION signal uses — registry validation → dispatch → the agent's
@@ -1100,13 +1111,24 @@ class _RealDispatchAgent:
         # When set, process_input raises to model a wake that failed
         # inside the resuming turn (dispatcher records Status.FAILED).
         self.process_input_should_raise = False
+        # Optional one-shot continuation used by the #2928 regression: a
+        # restart.completed cognition turn can file the next restart request.
+        self.restart_request_reason = None
+        self.restart_feature = None
 
     async def process_input(self, prompt: str, session_id=None):
-        if self.process_input_should_raise:
-            raise RuntimeError("simulated cognition failure")
-        self.process_input_calls.append(prompt)
-        self.process_input_sessions.append(session_id)
-        return "resumed"
+        async with self._turn_lifecycle():
+            self._active_session_id = session_id
+            if self.process_input_should_raise:
+                raise RuntimeError("simulated cognition failure")
+            self.process_input_calls.append(prompt)
+            self.process_input_sessions.append(session_id)
+            reason = self.restart_request_reason
+            self.restart_request_reason = None
+            if reason is not None:
+                assert self.restart_feature is not None
+                await self.restart_feature.request_restart(reason=reason)
+            return "resumed"
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -1154,16 +1176,19 @@ async def _real_dispatch_feature(tmp_path, **kwargs):
     store = SignalLogStore(backend)
     await store.initialize()
     registry = SourceRegistry()
+    locks = OrderedLockManager()
+    agent._lock_manager = locks
     dispatcher = SignalDispatcher(
         agent=agent,
         registry=registry,
-        lock_manager=OrderedLockManager(),
+        lock_manager=locks,
         store=store,
     )
     agent.signal_registry = registry
     agent.dispatcher = dispatcher
 
     feat = RestartCoordinatorFeature(agent)
+    agent.restart_feature = feat
     _real_dispatch_lifecycles.append((feat, agent))
     return feat, backend, agent
 
@@ -2151,17 +2176,15 @@ async def test_origin_session_id_roundtrips_in_store(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_request_restart_captures_origin_session(tmp_path):
-    """request_restart records the chat session it was filed from (the
-    session_id_var ContextVar set per HTTP turn)."""
-    from kestrel_sovereign.logging_config import session_id_var
-
-    feat, backend = await _make_feature(tmp_path)
-    token = session_id_var.set("chat-session-42")
-    try:
+async def test_request_restart_captures_turn_session_through_lifecycle(tmp_path):
+    """A normal chat turn captures its effective session at the producer."""
+    backend = await _backend(tmp_path)
+    agent = _TurnAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-session-42"
         result = await feat.request_restart(reason="ship it")
-    finally:
-        session_id_var.reset(token)
 
     req_id = result.data["request"]["id"]
     row = await get_request(backend, req_id)
@@ -2169,14 +2192,30 @@ async def test_request_restart_captures_origin_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_request_restart_captures_active_session(tmp_path):
-    """The authoritative per-turn _active_session_id (set by the turn body from
-    the JSON-body session — the primary chat path) is captured and takes
-    precedence over the logging ContextVar."""
+async def test_request_restart_ignores_agent_global_session_outside_a_turn(
+    tmp_path,
+):
+    """An agent-global session is not routing authority outside its turn."""
+    backend = await _backend(tmp_path)
+    agent = _TurnAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent._active_session_id = "concurrent-chat-3"
+
+    result = await feat.request_restart(reason="cron-filed")
+
+    row = await get_request(backend, result.data["request"]["id"])
+    assert row.origin_session_id == ""
+
+
+@pytest.mark.asyncio
+async def test_request_restart_does_not_infer_origin_from_logging_context(
+    tmp_path,
+):
+    """A logging header outside a live turn is not routing authority."""
     from kestrel_sovereign.logging_config import session_id_var
 
     feat, backend = await _make_feature(tmp_path)
-    feat.agent._active_session_id = "body-session-9"
     token = session_id_var.set("header-session-1")
     try:
         result = await feat.request_restart(reason="ship it")
@@ -2184,7 +2223,7 @@ async def test_request_restart_captures_active_session(tmp_path):
         session_id_var.reset(token)
 
     row = await get_request(backend, result.data["request"]["id"])
-    assert row.origin_session_id == "body-session-9"  # active wins over header
+    assert row.origin_session_id == ""
 
 
 @pytest.mark.asyncio
@@ -2194,6 +2233,58 @@ async def test_request_restart_no_session_is_blank(tmp_path):
     result = await feat.request_restart(reason="system filed")
     row = await get_request(backend, result.data["request"]["id"])
     assert row.origin_session_id == ""
+
+
+@pytest.mark.asyncio
+async def test_origin_session_survives_lifecycle_events_and_completion_wake(
+    tmp_path,
+):
+    """The producer binding is immutable from pending through the wake."""
+    backend = await _backend(tmp_path)
+    agent = _TurnAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-lifecycle-7"
+        result = await feat.request_restart(reason="ship it")
+
+    request_id = result.data["request"]["id"]
+    row = await get_request(backend, request_id)
+    assert await update_status(
+        backend,
+        request_id,
+        status="executing",
+        expected_current_status="pending",
+    )
+    row.status = "executing"
+    await feat._emit_status_event(row, state="executing")
+    assert await feat._terminalize_completed(
+        row, datetime.now(timezone.utc).isoformat()
+    )
+
+    stored = await get_request(backend, request_id)
+    assert stored.origin_session_id == "chat-lifecycle-7"
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events] == [
+        "pending",
+        "executing",
+        "completed",
+    ]
+    assert {
+        event.to_public_dict()["payload"]["origin_session_id"]
+        for event in events
+    } == {"chat-lifecycle-7"}
+
+    from kestrel_sovereign.signals.sources.restart import (
+        build_signal_for_restart_completed,
+    )
+
+    wake = build_signal_for_restart_completed(
+        stored,
+        target_agent=agent.did,
+        completed_at=stored.completed_at,
+    )
+    assert wake.session_id == "chat-lifecycle-7"
 
 
 def test_build_signal_carries_origin_session():
@@ -2260,6 +2351,40 @@ async def test_wake_without_origin_session_is_system_initiated(tmp_path):
 
     assert agent.process_input_calls
     assert agent.process_input_sessions == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin_session_id", "expected_turn_session"),
+    [("chat-chain-9", "chat-chain-9"), ("", None)],
+)
+async def test_restart_wake_followup_preserves_explicit_origin_binding(
+    tmp_path, origin_session_id, expected_turn_session,
+):
+    """A wake chain preserves a bound origin and leaves no-origin unbound."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend,
+        requested_by_agent="did:test:agent",
+        reason="first restart",
+        origin_session_id=origin_session_id,
+    )
+    await update_status(
+        backend,
+        req.id,
+        status="executing",
+        expected_current_status="pending",
+    )
+    agent.restart_request_reason = "follow-up restart"
+
+    await feat.initialize()
+    await feat.on_agent_ready()
+    await agent.drain_background_tasks()
+
+    pending = await list_requests(backend, status="pending")
+    followup = next(row for row in pending if row.reason == "follow-up restart")
+    assert agent.process_input_sessions == [expected_turn_session]
+    assert followup.origin_session_id == origin_session_id
 
 
 @pytest.mark.asyncio
