@@ -740,6 +740,42 @@ async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_backup_without_targets_is_a_successful_skipped_dispatch(
+    dispatcher_components,
+):
+    """A live sync service with no targets is a no-op, not a failed backup."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._sync_service = SimpleNamespace(
+        snapshot_if_changed=AsyncMock(return_value={})
+    )
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("backup_snapshot"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.OK
+    assert json.loads(result.action_result) == {
+        "skipped": True,
+        "reason": "no sync targets configured",
+    }
+
+
+@pytest.mark.asyncio
 async def test_backup_with_failed_targets_is_a_failed_dispatch(
     dispatcher_components,
 ):

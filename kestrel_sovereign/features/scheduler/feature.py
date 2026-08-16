@@ -1235,7 +1235,14 @@ class SchedulerFeature(Feature):
                 }
                 for target, result in results.items()
             }
-            success = bool(targets) and all(
+            if not targets:
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": "no sync targets configured",
+                    }
+                )
+            success = all(
                 target["success"] is True for target in targets.values()
             )
             payload: dict[str, Any] = {

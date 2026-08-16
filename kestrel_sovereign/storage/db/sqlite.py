@@ -8,10 +8,10 @@ import asyncio
 import logging
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Literal, Optional, overload
+from typing import Any, AsyncIterator, Iterator, List, Literal, Optional, overload
 
 import aiosqlite
 
@@ -320,6 +320,11 @@ class SQLiteBackend(DatabaseBackend):
         # Re-entrant for the task that owns an open transaction (its own
         # statements and reads must not deadlock on the lock it already holds).
         self._write_lock = asyncio.Lock()
+        # ``_write_lock`` also serializes shared-connection reads through
+        # cursor cleanup, so lock occupancy alone no longer means that close
+        # should interrupt SQLite. Track the write API explicitly to preserve
+        # clean WAL checkpointing when shutdown merely overlaps a read.
+        self._active_write_operations = 0
         self._txn_owner: Optional["asyncio.Task"] = None
         # aiosqlite cannot cancel work already running in its worker thread.
         # When its caller is cancelled, transfer the queued rollback to a
@@ -477,8 +482,31 @@ class SQLiteBackend(DatabaseBackend):
             # close can both fit inside the advertised shutdown reservation.
             # Do not interrupt an idle connection: SQLite then leaves its WAL
             # uncheckpointed on close even though the worker terminates.
-            if drain is not None or self._write_lock.locked():
-                await conn.interrupt()
+            if (
+                drain is not None
+                or self._in_transaction
+                or self._active_write_operations > 0
+            ):
+                try:
+                    await conn.interrupt()
+                except asyncio.CancelledError as exc:
+                    # Cancellation cannot transfer ownership of the primary
+                    # non-daemon worker. Preserve it for delivery only after
+                    # the connection has completed its bounded retirement.
+                    pending_cancellation = exc
+                except ValueError as exc:
+                    if "no active connection" not in str(exc):
+                        logger.warning(
+                            "Could not interrupt SQLite before close: %s",
+                            exc,
+                        )
+                except Exception:
+                    # Interrupt is an acceleration path. Its failure must not
+                    # skip the lifecycle-owned close that follows.
+                    logger.warning(
+                        "Could not interrupt SQLite before close",
+                        exc_info=True,
+                    )
             if drain is not None and drain is not asyncio.current_task():
                 try:
                     async with asyncio.timeout(
@@ -649,6 +677,15 @@ class SQLiteBackend(DatabaseBackend):
                 yield
                 return
 
+    @contextmanager
+    def _write_operation(self) -> Iterator[None]:
+        """Mark one write API operation independently of lock occupancy."""
+        self._active_write_operations += 1
+        try:
+            yield
+        finally:
+            self._active_write_operations -= 1
+
     def _raise_cancelled_write_drain_error(self) -> None:
         """Fail closed after a detached rollback could not restore safety."""
         error = self._cancelled_write_drain_error
@@ -799,23 +836,24 @@ class SQLiteBackend(DatabaseBackend):
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
-            try:
-                cursor = await conn.execute(query, params)
-                if not self._in_transaction:
-                    await conn.commit()
-                return cursor.rowcount
-            except asyncio.CancelledError:
-                if not self._in_transaction:
-                    self._handoff_cancelled_write(conn)
-                raise
-            except Exception as e:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-            except BaseException:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise
+            with self._write_operation():
+                try:
+                    cursor = await conn.execute(query, params)
+                    if not self._in_transaction:
+                        await conn.commit()
+                    return cursor.rowcount
+                except asyncio.CancelledError:
+                    if not self._in_transaction:
+                        self._handoff_cancelled_write(conn)
+                    raise
+                except Exception as e:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+                except BaseException:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
@@ -824,23 +862,24 @@ class SQLiteBackend(DatabaseBackend):
         record_write_query(query)
         conn = self._ensure_connected()
         async with self._write_guard():
-            try:
-                cursor = await conn.executemany(query, params_list)
-                if not self._in_transaction:
-                    await conn.commit()
-                return cursor.rowcount
-            except asyncio.CancelledError:
-                if not self._in_transaction:
-                    self._handoff_cancelled_write(conn)
-                raise
-            except Exception as e:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-            except BaseException:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise
+            with self._write_operation():
+                try:
+                    cursor = await conn.executemany(query, params_list)
+                    if not self._in_transaction:
+                        await conn.commit()
+                    return cursor.rowcount
+                except asyncio.CancelledError:
+                    if not self._in_transaction:
+                        self._handoff_cancelled_write(conn)
+                    raise
+                except Exception as e:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+                except BaseException:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise
 
     @overload
     async def _fetch_on_connection(
@@ -997,22 +1036,23 @@ class SQLiteBackend(DatabaseBackend):
         record_write_script(script)
         conn = self._ensure_connected()
         async with self._write_guard():
-            try:
-                await conn.executescript(script)
-                if not self._in_transaction:
-                    await conn.commit()
-            except asyncio.CancelledError:
-                if not self._in_transaction:
-                    self._handoff_cancelled_write(conn)
-                raise
-            except Exception as e:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise QueryError(f"Script execution failed: {e}") from e
-            except BaseException:
-                if not self._in_transaction:
-                    await self._rollback_after_failure(conn)
-                raise
+            with self._write_operation():
+                try:
+                    await conn.executescript(script)
+                    if not self._in_transaction:
+                        await conn.commit()
+                except asyncio.CancelledError:
+                    if not self._in_transaction:
+                        self._handoff_cancelled_write(conn)
+                    raise
+                except Exception as e:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise QueryError(f"Script execution failed: {e}") from e
+                except BaseException:
+                    if not self._in_transaction:
+                        await self._rollback_after_failure(conn)
+                    raise
 
     @asynccontextmanager
     async def transaction(self, *, immediate: bool = False) -> AsyncIterator[None]:
@@ -1036,24 +1076,25 @@ class SQLiteBackend(DatabaseBackend):
         # transaction is one atomic write unit against concurrent writers
         # sharing this connection (#1675).
         async with self._write_guard():
-            self._in_transaction = True
-            self._txn_owner = asyncio.current_task()
-            try:
-                await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-                yield
-                await conn.commit()
-            except asyncio.CancelledError:
-                self._handoff_cancelled_write(conn)
-                raise
-            except Exception as e:
-                await self._rollback_after_failure(conn)
-                raise TransactionError(f"Transaction failed: {e}") from e
-            except BaseException:
-                await self._rollback_after_failure(conn)
-                raise
-            finally:
-                self._in_transaction = False
-                self._txn_owner = None
+            with self._write_operation():
+                self._in_transaction = True
+                self._txn_owner = asyncio.current_task()
+                try:
+                    await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                    yield
+                    await conn.commit()
+                except asyncio.CancelledError:
+                    self._handoff_cancelled_write(conn)
+                    raise
+                except Exception as e:
+                    await self._rollback_after_failure(conn)
+                    raise TransactionError(f"Transaction failed: {e}") from e
+                except BaseException:
+                    await self._rollback_after_failure(conn)
+                    raise
+                finally:
+                    self._in_transaction = False
+                    self._txn_owner = None
     
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""

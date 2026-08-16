@@ -981,6 +981,135 @@ class TestSQLiteBackend:
             worker.join(timeout=1.0)
 
     @pytest.mark.asyncio
+    async def test_close_still_retires_worker_when_interrupt_raises(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed interrupt cannot bypass owned connection retirement."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.2,
+        )
+        backend = SQLiteBackend(str(tmp_path / "failed-interrupt-close.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        worker = aiosqlite_worker(conn)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        await conn.create_function("block_in_worker", 0, block_in_worker)
+        blocked_read = asyncio.create_task(
+            backend.fetch_one("SELECT block_in_worker()")
+        )
+        release_handle = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+            drain = backend._cancelled_write_drain
+            assert drain is not None and not drain.done()
+
+            release_handle = asyncio.get_running_loop().call_later(
+                0.02, release_worker.set
+            )
+            interrupt = AsyncMock(
+                side_effect=ValueError("no active connection")
+            )
+            with patch.object(conn, "interrupt", new=interrupt):
+                await backend.close()
+
+            interrupt.assert_awaited_once_with()
+            assert drain.done()
+            assert not backend.is_connected
+            assert not backend.connection_retirement_pending
+            assert not worker.is_alive()
+        finally:
+            watchdog.cancel()
+            if release_handle is not None:
+                release_handle.cancel()
+            release_worker.set()
+            await asyncio.gather(blocked_read, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_close_does_not_interrupt_overlapping_shared_read(
+        self, tmp_path, monkeypatch
+    ):
+        """Read serialization must not masquerade as active write work."""
+        backend = SQLiteBackend(str(tmp_path / "read-overlap-close.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        worker = aiosqlite_worker(conn)
+        read_entered = asyncio.Event()
+        release_read = asyncio.Event()
+        close_entered = asyncio.Event()
+        release_close = asyncio.Event()
+        original_fetch = backend._fetch_on_connection
+        original_close = sqlite_backend_module._close_aiosqlite_connection
+
+        async def held_fetch(*args, **kwargs):
+            read_entered.set()
+            await release_read.wait()
+            return await original_fetch(*args, **kwargs)
+
+        async def held_close(connection, *, retained_closes, deadline=None):
+            close_entered.set()
+            await release_close.wait()
+            await original_close(
+                connection,
+                retained_closes=retained_closes,
+                deadline=deadline,
+            )
+
+        monkeypatch.setattr(backend, "_fetch_on_connection", held_fetch)
+        read_task = asyncio.create_task(backend.fetch_one("SELECT 1"))
+        close_task = None
+        try:
+            await read_entered.wait()
+            assert backend._write_lock.locked()
+            assert backend._active_write_operations == 0
+
+            interrupt = AsyncMock(wraps=conn.interrupt)
+            with patch.object(conn, "interrupt", new=interrupt), patch.object(
+                sqlite_backend_module,
+                "_close_aiosqlite_connection",
+                new=held_close,
+            ):
+                close_task = asyncio.create_task(backend.close())
+                await close_entered.wait()
+                interrupt.assert_not_awaited()
+
+                release_read.set()
+                assert await read_task == (1,)
+                release_close.set()
+                await close_task
+
+            assert not backend.is_connected
+            assert not worker.is_alive()
+        finally:
+            release_read.set()
+            release_close.set()
+            await asyncio.gather(read_task, return_exceptions=True)
+            if close_task is not None:
+                await asyncio.gather(close_task, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_cancelled_drain_becomes_connection_error_not_caller_cancel(
         self, tmp_path
     ):
