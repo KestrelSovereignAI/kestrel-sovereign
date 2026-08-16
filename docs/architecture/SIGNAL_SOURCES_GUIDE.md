@@ -452,9 +452,17 @@ Five rules:
    tasks, so each read lies on its own: out-of-turn work (a cron tick)
    sees whatever chat turn is concurrently in flight, and a task
    detached from a finished turn still reports that turn's id forever.
-   The accessor requires the calling task to own the *live* turn, so
-   background work reads as unattended instead of hijacking a
-   stranger's window.
+   The accessor accepts only one of two authorities: the calling task owns the
+   *live* turn, or the task carries a binding captured on that owning turn with
+   `capture_turn_session_binding()` and re-presented with
+   `bind_turn_session()`. A captured binding remains valid only while that exact
+   turn is live, so unrelated background work still reads as unattended instead
+   of hijacking a stranger's window. If a source callback runs on a task created
+   before the turn (for example, a transport reader or app-server handler), the
+   accessor alone returns `None`: capture while building the callback on the
+   owning turn and bind inside the callback across the task boundary. See
+   `OrchestratorEngineMixin._make_inline_tool_executor` and
+   `Feature._make_feature_inline_tool_executor` for the two in-tree examples.
 
 4. **Don't register session-bound work on a rail that can't wake it.**
    The binding is only as good as the completion path that carries it. Choose

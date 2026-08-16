@@ -21,8 +21,9 @@ import contextvars
 import logging
 import time
 import warnings
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from typing import AsyncIterator, Iterator, Optional
 from uuid import uuid4
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
@@ -51,6 +52,81 @@ _CURRENT_CHAIN: contextvars.ContextVar[list[CausationFrame]] = (
 _CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("kestrel_agent_current_turn_id", default=None)
 )
+
+
+@dataclass(frozen=True)
+class _TurnSessionBinding:
+    """A turn/session pair explicitly carried across a task boundary."""
+
+    agent: object
+    turn_id: Optional[str]
+    session_id: Optional[str]
+
+
+_BOUND_TURN_SESSION: contextvars.ContextVar[Optional[_TurnSessionBinding]] = (
+    contextvars.ContextVar("kestrel_agent_bound_turn_session", default=None)
+)
+
+
+def _normalize_session_id(session_id: object) -> Optional[str]:
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
+    """Capture ``agent``'s authoritative live-turn session for later binding.
+
+    Context variables are copied when a task is created.  Long-lived transport
+    readers therefore cannot see a turn that began after the reader task.  A
+    caller on the owning turn uses this helper while building its callback,
+    then :func:`bind_turn_session` re-presents the captured pair while the
+    callback runs on the reader task.
+
+    The capture never derives authority from an arbitrary transport argument,
+    logging context, or the agent-global session alone.  It either preserves an
+    already-bound live pair (for nested task boundaries) or asks the lifecycle
+    accessor while the calling task owns the live turn.  An out-of-turn or
+    session-less capture is represented explicitly as unbound.
+    """
+    live_turn_id = getattr(agent, "_live_turn_id", None)
+    turn_id = _CURRENT_TURN_ID.get()
+    if turn_id and turn_id == live_turn_id:
+        resolve = getattr(agent, "get_turn_bound_session_id", None)
+        if not callable(resolve):
+            # Compatibility for agent shapes from the 0.53 -> 0.54 migration
+            # window. Keep capture aligned with Feature._turn_session_id's
+            # direct-read resolution until the private alias is removed.
+            resolve = getattr(agent, "_get_turn_bound_session_id", None)
+        try:
+            session_id = resolve() if callable(resolve) else None
+        except Exception:  # noqa: BLE001 - unknown host shapes stay unbound
+            session_id = None
+        return _TurnSessionBinding(
+            agent, turn_id, _normalize_session_id(session_id)
+        )
+
+    propagated = _BOUND_TURN_SESSION.get()
+    if (
+        propagated is not None
+        and propagated.agent is agent
+        and propagated.turn_id
+        and propagated.turn_id == live_turn_id
+    ):
+        return propagated
+    return _TurnSessionBinding(agent, None, None)
+
+
+@contextmanager
+def bind_turn_session(
+    binding: _TurnSessionBinding,
+) -> Iterator[None]:
+    """Temporarily expose a captured lifecycle binding in the current task."""
+    token = _BOUND_TURN_SESSION.set(binding)
+    try:
+        yield
+    finally:
+        _BOUND_TURN_SESSION.reset(token)
 
 
 class TurnLifecycleMixin:
@@ -122,20 +198,31 @@ class TurnLifecycleMixin:
         Pairing them closes both: `_live_turn_id` is the agent-scoped mirror of
         *which turn holds the CONVERSATION lock right now*, so requiring the
         task-local id to equal it means the caller owns the live turn and the
-        session it is reading is that turn's own. The detached task from turn A
-        sees `A != B` while turn B runs, and `None` after A ended — both fall
-        through to None, i.e. "no chat window", which callers treat as
-        system-initiated.
+        session it is reading is that turn's own. A transport callback may also
+        explicitly carry a pair captured through this accessor across a known
+        task boundary; the pair is accepted only while that exact turn remains
+        live. The detached task from turn A sees `A != B` while turn B runs, and
+        `None` after A ended — both resolve to None, i.e. "no chat window",
+        which callers treat as system-initiated.
 
         Returns None outside a turn, for a session-less turn, and for any task
         that merely inherited a finished turn's context.
         """
+        live_turn_id = getattr(self, "_live_turn_id", None)
         turn_id = _CURRENT_TURN_ID.get()
-        if not turn_id or turn_id != getattr(self, "_live_turn_id", None):
-            return None
-        session_id = getattr(self, "_active_session_id", None)
-        if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
+        if turn_id and turn_id == live_turn_id:
+            return _normalize_session_id(
+                getattr(self, "_active_session_id", None)
+            )
+
+        propagated = _BOUND_TURN_SESSION.get()
+        if (
+            propagated is not None
+            and propagated.agent is self
+            and propagated.turn_id
+            and propagated.turn_id == live_turn_id
+        ):
+            return _normalize_session_id(propagated.session_id)
         return None
 
     def _get_turn_bound_session_id(self) -> Optional[str]:

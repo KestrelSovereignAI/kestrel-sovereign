@@ -23,7 +23,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import pytest_asyncio
 
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
@@ -197,6 +199,110 @@ class _TurnAgent(TurnLifecycleMixin):
 
     def __init__(self, backend):
         self.__dict__.update(vars(_make_agent(backend)))
+
+
+class _AllowingHooksManager:
+    """Minimal governed-dispatch hook surface for the inline-path regression."""
+
+    def __init__(self):
+        self.pre_calls: list[HookInput] = []
+
+    async def execute_hooks(
+        self, event: HookEvent, hook_input: HookInput,
+    ) -> HookOutput:
+        self.pre_calls.append(hook_input)
+        return HookOutput.allow()
+
+    async def execute_hooks_parallel(
+        self, event: HookEvent, hook_input: HookInput,
+    ) -> None:
+        return None
+
+
+class _InlineRestartAgent(TurnLifecycleMixin, OrchestratorEngineMixin):
+    """Production lifecycle plus the real inline and named-tool dispatch path."""
+
+    def __init__(self, backend):
+        self.__dict__.update(vars(_make_agent(backend)))
+        self.features = {}
+        self.hooks_manager = _AllowingHooksManager()
+
+    def _visible_features_by_tool_name(self):
+        return {
+            feature.tool_name: feature
+            for feature in self.features.values()
+            if getattr(feature, "enabled", True)
+        }
+
+    async def _get_denied_tools(self, _feature_name):
+        return set()
+
+    def _register_explored_feature_tools(self, _feature):
+        return None
+
+    async def _emit_tool_update_event(self, _session_id):
+        return None
+
+
+class _FrozenReaderHarness:
+    """Model the app-server reader and its per-call handler task."""
+
+    def __init__(self, agent):
+        self._agent = agent
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._reader: asyncio.Task | None = None
+        self.handler_turn_ids: list[str | None] = []
+
+    async def start(self) -> None:
+        assert self._reader is None
+        self._reader = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            executor, name, args, done = item
+            asyncio.create_task(self._handle(executor, name, args, done))
+
+    async def _handle(self, executor, name, args, done) -> None:
+        self.handler_turn_ids.append(self._agent._get_current_turn_id())
+        try:
+            done.set_result(await executor(name, args))
+        except Exception as exc:  # pragma: no cover - defensive harness path
+            done.set_exception(exc)
+
+    async def dispatch(self, executor, name, args):
+        done = asyncio.get_running_loop().create_future()
+        await self._queue.put((executor, name, args, done))
+        return await done
+
+    async def stop(self) -> None:
+        if self._reader is not None:
+            await self._queue.put(None)
+            await self._reader
+            self._reader = None
+
+
+class _NestedRestartLLMService:
+    """Drive a feature's own inline executor on a second frozen reader."""
+
+    def __init__(self, reader):
+        self._reader = reader
+        self.effective_args = None
+        self.result = None
+        self.session_id = None
+
+    async def generate(self, **kwargs):
+        from kestrel_sdk.llm.adapter import LLMResponse
+
+        self.session_id = kwargs.get("session_id")
+        self.effective_args, self.result = await self._reader.dispatch(
+            kwargs["tool_executor"],
+            "request_restart",
+            {"reason": "nested inline tool filed"},
+        )
+        return LLMResponse(content="Complete.", tool_calls=None)
 
 
 async def _make_feature(tmp_path, **kwargs):
@@ -2189,6 +2295,163 @@ async def test_request_restart_captures_turn_session_through_lifecycle(tmp_path)
     req_id = result.data["request"]["id"]
     row = await get_request(backend, req_id)
     assert row.origin_session_id == "chat-session-42"
+
+
+@pytest.mark.asyncio
+async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_path):
+    """The live Codex path carries its owning turn into the pre-turn reader."""
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    reader = _FrozenReaderHarness(agent)
+
+    # Production starts one long-lived reader before later turns. Its child
+    # handlers therefore inherit this pre-turn context, not the active turn's.
+    await reader.start()
+    try:
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "chat-inline-42"
+            executor = agent._make_inline_tool_executor("transport-session-99")
+            effective_args, result = await reader.dispatch(
+                executor,
+                "request_restart",
+                {"reason": "inline tool filed"},
+            )
+    finally:
+        await reader.stop()
+
+    assert reader.handler_turn_ids == [None]
+    assert effective_args == {"reason": "inline tool filed"}
+    row = await get_request(backend, result["data"]["request"]["id"])
+    assert row.origin_session_id == "chat-inline-42"
+    assert agent.hooks_manager.pre_calls[0].tool_name == "request_restart"
+
+
+@pytest.mark.asyncio
+async def test_inline_restart_without_turn_stays_unbound_across_reader_task(
+    tmp_path,
+):
+    """An origin-less inline invocation cannot borrow ambient session hints."""
+    from kestrel_sovereign.logging_config import session_id_var
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    agent._active_session_id = "unrelated-agent-global"
+    reader = _FrozenReaderHarness(agent)
+    executor = agent._make_inline_tool_executor("unowned-transport-session")
+
+    token = session_id_var.set("unrelated-logging-session")
+    await reader.start()
+    try:
+        _effective_args, result = await reader.dispatch(
+            executor,
+            "request_restart",
+            {"reason": "origin-less inline tool"},
+        )
+    finally:
+        await reader.stop()
+        session_id_var.reset(token)
+
+    assert reader.handler_turn_ids == [None]
+    row = await get_request(backend, result["data"]["request"]["id"])
+    assert row.origin_session_id == ""
+
+
+@pytest.mark.asyncio
+async def test_nested_inline_restart_preserves_session_across_two_readers(
+    tmp_path,
+):
+    """The feature-subagent executor carries the turn across its own reader."""
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    parent_reader = _FrozenReaderHarness(agent)
+    feature_reader = _FrozenReaderHarness(agent)
+    llm_service = _NestedRestartLLMService(feature_reader)
+    agent.llm_service = llm_service
+
+    # Both long-lived readers predate the turn. The parent executor restores
+    # the binding once, then execute_as_subagent builds another executor that
+    # must explicitly carry it through the feature reader's separate task.
+    await parent_reader.start()
+    await feature_reader.start()
+    try:
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "chat-nested-42"
+            parent_executor = agent._make_inline_tool_executor(
+                "parent-transport-session"
+            )
+            effective_args, result = await parent_reader.dispatch(
+                parent_executor,
+                feat.tool_name,
+                {"task": "file a restart request"},
+            )
+    finally:
+        await parent_reader.stop()
+        await feature_reader.stop()
+
+    assert parent_reader.handler_turn_ids == [None]
+    assert feature_reader.handler_turn_ids == [None]
+    assert effective_args == {"task": "file a restart request"}
+    assert result["success"] is True
+    assert llm_service.session_id == "chat-nested-42"
+    assert llm_service.effective_args == {
+        "reason": "nested inline tool filed"
+    }
+    row = await get_request(
+        backend, llm_service.result["data"]["request"]["id"]
+    )
+    assert row.origin_session_id == "chat-nested-42"
+
+
+@pytest.mark.asyncio
+async def test_nested_inline_restart_built_off_turn_stays_unbound(tmp_path):
+    """Two inline boundaries cannot turn ambient session hints into authority."""
+    from kestrel_sovereign.logging_config import session_id_var
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    agent._active_session_id = "unrelated-agent-global"
+    parent_reader = _FrozenReaderHarness(agent)
+    feature_reader = _FrozenReaderHarness(agent)
+    llm_service = _NestedRestartLLMService(feature_reader)
+    agent.llm_service = llm_service
+    parent_executor = agent._make_inline_tool_executor(
+        "unowned-parent-transport-session"
+    )
+
+    token = session_id_var.set("unrelated-logging-session")
+    await parent_reader.start()
+    await feature_reader.start()
+    try:
+        _effective_args, result = await parent_reader.dispatch(
+            parent_executor,
+            feat.tool_name,
+            {"task": "file a system restart request"},
+        )
+    finally:
+        await parent_reader.stop()
+        await feature_reader.stop()
+        session_id_var.reset(token)
+
+    assert parent_reader.handler_turn_ids == [None]
+    assert feature_reader.handler_turn_ids == [None]
+    assert result["success"] is True
+    assert llm_service.session_id is None
+    row = await get_request(
+        backend, llm_service.result["data"]["request"]["id"]
+    )
+    assert row.origin_session_id == ""
 
 
 @pytest.mark.asyncio

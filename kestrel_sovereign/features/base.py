@@ -1255,7 +1255,7 @@ class Feature(_SdkFeature):
         — without this, hook-gated policies were bypassed by the
         inline-execution path).
 
-        NESTED cross-task reentry (#2672 review P1 follow-up). This executor is
+        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This executor is
         BUILT while ``execute_as_subagent`` runs on the PARENT inline executor's
         reader task, INSIDE that executor's ``bind_transition_lock_reentry`` scope,
         so the owning turn's transition-lock reentry token is visible in the
@@ -1269,17 +1269,29 @@ class Feature(_SdkFeature):
         bound token here and re-present it around the subagent tool call — the exact
         cross-task seam ``OrchestratorEngineMixin._make_inline_tool_executor``
         installs for the parent turn — so that one write re-enters the owning turn's
-        span. ``None`` (anthropic path, or a subagent not nested under a held turn
-        lock) is a no-op, so an unrelated background task grants no token and the
-        privacy trust boundary is unchanged."""
+        span. The parent executor also carries the lifecycle-authorized turn/session
+        binding; capture and re-present that binding here so a nested lifecycle tool
+        (notably ``request_restart``) can name the originating window after this
+        second reader-task boundary. An executor built outside a live turn captures
+        an explicit unbound value, so neither binding grants authority to unrelated
+        background work.
+        """
+        from kestrel_sovereign.agent.turn_lifecycle import (
+            bind_turn_session,
+            capture_turn_session_binding,
+        )
         from kestrel_sovereign.storage.privacy_wrapper import (
             bind_transition_lock_reentry,
             current_bound_reentry_token,
         )
         transition_reentry_token = current_bound_reentry_token()
+        turn_session_binding = capture_turn_session_binding(self.agent)
 
         async def _exec(name: str, args: Dict[str, Any]):
-            with bind_transition_lock_reentry(transition_reentry_token):
+            with (
+                bind_transition_lock_reentry(transition_reentry_token),
+                bind_turn_session(turn_session_binding),
+            ):
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
