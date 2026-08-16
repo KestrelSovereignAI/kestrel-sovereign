@@ -41,7 +41,8 @@ from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
-from .checks import run_standard_checks
+from . import checks as health_checks
+from .checks import derive_overall_status as _derive_overall_status
 
 logger = logging.getLogger(__name__)
 
@@ -50,25 +51,6 @@ DEFAULT_INTERVAL_SECONDS = 60
 
 # Maximum health results to keep in memory.
 MAX_IN_MEMORY_HISTORY = 100
-
-
-def _derive_overall_status(checks: List[Dict[str, Any]]) -> str:
-    """Derive overall status from individual check results.
-
-    - healthy: all checks pass
-    - degraded: at least one warn, no fails
-    - unhealthy: a critical database, LLM, or resource-lock check fails
-    """
-    statuses = [c.get("status", "pass") for c in checks]
-    critical_names = {"database", "llm_service", "resource_locks"}
-    critical_checks = [c for c in checks if c.get("name") in critical_names]
-    critical_statuses = [c.get("status", "pass") for c in critical_checks]
-
-    if "fail" in critical_statuses:
-        return "unhealthy"
-    if "fail" in statuses or "warn" in statuses:
-        return "degraded"
-    return "healthy"
 
 
 class HealthFeature(Feature):
@@ -437,7 +419,7 @@ class HealthFeature(Feature):
         # Shared with server.py's no-feature fallback so the two lists cannot
         # drift; a check present in one and absent from the other reports
         # `healthy` for a state its sibling calls a warning.
-        checks = await run_standard_checks(self.agent, self._db)
+        checks = await health_checks.run_standard_checks(self.agent, self._db)
 
         overall_status = _derive_overall_status(checks)
         overall_healthy = overall_status == "healthy"
@@ -451,22 +433,34 @@ class HealthFeature(Feature):
             "created_at": now,
         }
 
-        if self._db:
+        database_failed = any(
+            check.get("name") == "database" and check.get("status") == "fail"
+            for check in checks
+        )
+        if self._db and not database_failed:
             try:
-                await self._db.execute(
-                    """
-                    INSERT INTO health_log
-                    (id, agent_id, status, checks_json, overall_healthy, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        check_id,
-                        self._agent_id,
-                        overall_status,
-                        json.dumps(checks),
-                        1 if overall_healthy else 0,
-                        now,
-                    ),
+                async with asyncio.timeout(
+                    health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S
+                ):
+                    await self._db.execute(
+                        """
+                        INSERT INTO health_log
+                        (id, agent_id, status, checks_json, overall_healthy, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            check_id,
+                            self._agent_id,
+                            overall_status,
+                            json.dumps(checks),
+                            1 if overall_healthy else 0,
+                            now,
+                        ),
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "HealthFeature: persistence timed out after %g seconds",
+                    health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S,
                 )
             except Exception as e:
                 logger.warning(f"HealthFeature: failed to persist: {e}")

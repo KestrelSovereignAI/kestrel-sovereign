@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
+from .db.sqlite import _minimum_close_timeout_s
 from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
@@ -2230,18 +2231,18 @@ class AsyncDatabase:
 
         Features may first use vector storage during their own shutdown and
         create the cached factory after the agent has already composed its
-        durable-tail budget.  A file-backed SQLite factory owns the same
-        aiosqlite worker-drain window as this database's primary backend, so
-        expose that *potential* lifecycle requirement even while no factory is
-        cached yet.  Other backends retain their zero-reservation behavior.
+        durable-tail budget.  A file-backed SQLite factory needs one
+        aiosqlite worker-shutdown window, but it has no cancelled-write drain
+        and therefore does not need the primary backend's two-phase budget.
+        Expose that potential lifecycle requirement even while no factory is
+        cached yet. Other backends retain their zero-reservation behavior.
         """
         cached = self.minimum_sqla_factory_close_timeout_s
         if cached > 0.0:
             return cached
         if self.backend_type != "sqlite":
             return 0.0
-        value = getattr(self._backend, "minimum_close_timeout_s", 0.0)
-        return value if isinstance(value, (int, float)) and value > 0 else 0.0
+        return _minimum_close_timeout_s()
 
     async def close(self) -> None:
         """Close the SQLAlchemy factory and primary backend connection.

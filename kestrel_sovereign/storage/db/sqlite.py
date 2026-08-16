@@ -38,7 +38,7 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 
 
 def _minimum_close_timeout_s() -> float:
-    """Return the outer-guard budget required by :meth:`close`.
+    """Return the outer-guard budget for one aiosqlite connection close.
 
     The worker deadline starts only after ``aiosqlite.Connection.close()`` has
     handed its stop sentinel to the worker.  Reserve one poll interval as well
@@ -139,6 +139,13 @@ class SQLiteBackend(DatabaseBackend):
         # statements must not deadlock on the lock it already holds).
         self._write_lock = asyncio.Lock()
         self._txn_owner: Optional["asyncio.Task"] = None
+        # aiosqlite cannot cancel work already running in its worker thread.
+        # When its caller is cancelled, transfer the queued rollback to a
+        # retained task and fence later writers on that drain.  This lets an
+        # outer deadline release task-owned resources promptly without
+        # allowing another writer to commit the abandoned statement (#2907).
+        self._cancelled_write_drain: Optional[asyncio.Task[None]] = None
+        self._cancelled_write_drain_error: Optional[Exception] = None
     
     @property
     def backend_type(self) -> str:
@@ -155,9 +162,16 @@ class SQLiteBackend(DatabaseBackend):
         This is intentionally an optional backend extension rather than a
         change to the SDK's generic backend interface: non-SQLite backends do
         not own an aiosqlite worker and therefore have no equivalent lifecycle
-        requirement.
+        requirement.  A retained cancellation drain and the subsequent
+        connection close can each consume one worker-shutdown window.  Keep
+        this primary-backend reservation separate from
+        :func:`_minimum_close_timeout_s`, which is also used by SQLAlchemy
+        factories that have no cancellation-drain phase.
         """
-        return _minimum_close_timeout_s()
+        return (
+            2 * AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+            + _AIOSQLITE_WORKER_SHUTDOWN_POLL_S
+        )
     
     async def connect(self) -> None:
         """Connect to SQLite database."""
@@ -183,6 +197,12 @@ class SQLiteBackend(DatabaseBackend):
             
             # Row factory to return tuples
             self._connection.row_factory = aiosqlite.Row
+
+            # A newly opened connection cannot contain work abandoned on the
+            # previous connection.  Do not carry a failed cleanup latch across
+            # a successful reconnect.
+            self._cancelled_write_drain = None
+            self._cancelled_write_drain_error = None
             
             logger.debug(f"Connected to SQLite: {self.db_path}")
             
@@ -191,13 +211,42 @@ class SQLiteBackend(DatabaseBackend):
     
     async def close(self) -> None:
         """Close database connection and wait for background thread to stop."""
-        if self._connection is not None:
-            conn = self._connection
-            try:
-                await _close_aiosqlite_connection(conn)
-                logger.debug(f"Closed SQLite connection: {self.db_path}")
-            finally:
-                self._connection = None
+        conn = self._connection
+        if conn is None:
+            self._cancelled_write_drain = None
+            self._cancelled_write_drain_error = None
+            return
+
+        pending_cancellation: Optional[asyncio.CancelledError] = None
+        try:
+            drain = self._cancelled_write_drain
+            if drain is not None and drain is not asyncio.current_task():
+                try:
+                    async with asyncio.timeout(
+                        AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+                    ):
+                        await asyncio.shield(drain)
+                except (TimeoutError, asyncio.CancelledError) as exc:
+                    # The connection close remains responsible for the queued
+                    # SQLite work.  Retire the Python task so loop teardown
+                    # cannot strand a backend-owned cleanup task.
+                    drain.cancel()
+                    try:
+                        await drain
+                    except asyncio.CancelledError:
+                        pass
+                    if isinstance(exc, asyncio.CancelledError):
+                        pending_cancellation = exc
+
+            await _close_aiosqlite_connection(conn)
+            logger.debug(f"Closed SQLite connection: {self.db_path}")
+        finally:
+            self._connection = None
+            self._cancelled_write_drain = None
+            self._cancelled_write_drain_error = None
+
+        if pending_cancellation is not None:
+            raise pending_cancellation
     
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Ensure we have an active connection."""
@@ -247,6 +296,11 @@ class SQLiteBackend(DatabaseBackend):
         uncommitted rows, so it gets a fresh connection and therefore SQLite's
         last committed snapshot.
         """
+        # The drain task is scheduled synchronously but cannot enqueue its
+        # rollback until the cancelled owner yields.  Fence reads too, so a
+        # same-loop caller cannot enqueue a SELECT ahead of that rollback and
+        # observe an abandoned write on the shared connection.
+        await self._wait_for_cancelled_write_drain()
         conn = self._ensure_connected()
         if (
             self.db_path != ":memory:"
@@ -274,8 +328,92 @@ class SQLiteBackend(DatabaseBackend):
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
             yield
             return
-        async with self._write_lock:
-            yield
+
+        # A writer may already be queued on ``_write_lock`` when a cancelled
+        # owner installs the drain fence.  Check both before and after lock
+        # acquisition: the first check avoids occupying the lock for a long
+        # drain, and the second closes the handoff race.  asyncio.Lock is fair,
+        # so releasing and retrying does not starve earlier waiters.
+        while True:
+            await self._wait_for_cancelled_write_drain()
+            async with self._write_lock:
+                if self._cancelled_write_drain is not None:
+                    continue
+                self._raise_cancelled_write_drain_error()
+                yield
+                return
+
+    def _raise_cancelled_write_drain_error(self) -> None:
+        """Fail closed after a detached rollback could not restore safety."""
+        error = self._cancelled_write_drain_error
+        if error is not None:
+            raise ConnectionError(
+                "SQLite write connection is unavailable because cancellation "
+                "cleanup failed"
+            ) from error
+
+    async def _wait_for_cancelled_write_drain(self) -> None:
+        """Wait for an earlier cancelled write's rollback without owning it."""
+        drain = self._cancelled_write_drain
+        if drain is not None and drain is not asyncio.current_task():
+            # A caller cancelled while waiting must not cancel the backend-owned
+            # cleanup task.  The retained task remains the sole drain owner.
+            await asyncio.shield(drain)
+        self._raise_cancelled_write_drain_error()
+
+    def _handoff_cancelled_write(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Transfer rollback to the backend and return without awaiting it.
+
+        The aiosqlite worker serializes its queue.  If the cancelled statement
+        is blocked inside that worker, directly awaiting ``rollback()`` here
+        would put the caller's timeout behind the same statement and defeat the
+        deadline.  The background drain deliberately does not acquire
+        ``_write_lock``; ``_write_guard`` fences all later writers on the
+        retained task instead.
+        """
+        drain = self._cancelled_write_drain
+        if drain is not None and not drain.done():
+            # The write lock permits only one autocommit unit or transaction to
+            # reach this path, so a second live drain signals an invariant bug.
+            self._cancelled_write_drain_error = RuntimeError(
+                "overlapping SQLite cancellation drains"
+            )
+            logger.error("Overlapping SQLite cancellation drains detected")
+            return
+
+        self._cancelled_write_drain_error = None
+        self._cancelled_write_drain = asyncio.create_task(
+            self._drain_cancelled_write(conn),
+            name=f"sqlite-cancelled-write-drain:{self.db_path}",
+        )
+
+    async def _drain_cancelled_write(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Roll back one cancelled worker operation and retire its fence."""
+        this_task = asyncio.current_task()
+        try:
+            await conn.rollback()
+        except Exception as exc:
+            self._cancelled_write_drain_error = exc
+            logger.exception(
+                "SQLite cancellation cleanup failed for %s", self.db_path
+            )
+        finally:
+            if self._cancelled_write_drain is this_task:
+                self._cancelled_write_drain = None
+
+    async def _rollback_after_failure(
+        self, conn: aiosqlite.Connection
+    ) -> None:
+        """Rollback inline, handing off if cancellation reaches cleanup."""
+        try:
+            await conn.rollback()
+        except asyncio.CancelledError:
+            self._handoff_cancelled_write(conn)
+            raise
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
@@ -287,17 +425,17 @@ class SQLiteBackend(DatabaseBackend):
                 if not self._in_transaction:
                     await conn.commit()
                 return cursor.rowcount
+            except asyncio.CancelledError:
+                if not self._in_transaction:
+                    self._handoff_cancelled_write(conn)
+                raise
             except Exception as e:
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
             except BaseException:
-                # Cancellation (CancelledError is BaseException, not Exception):
-                # roll back the partial statement so the next writer to acquire
-                # the lock doesn't inherit — and commit — a canceled write, then
-                # propagate unchanged.
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
@@ -312,14 +450,17 @@ class SQLiteBackend(DatabaseBackend):
                 if not self._in_transaction:
                     await conn.commit()
                 return cursor.rowcount
+            except asyncio.CancelledError:
+                if not self._in_transaction:
+                    self._handoff_cancelled_write(conn)
+                raise
             except Exception as e:
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
             except BaseException:
-                # See execute(): roll back a canceled partial write.
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise
 
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
@@ -368,14 +509,17 @@ class SQLiteBackend(DatabaseBackend):
                 await conn.executescript(script)
                 if not self._in_transaction:
                     await conn.commit()
+            except asyncio.CancelledError:
+                if not self._in_transaction:
+                    self._handoff_cancelled_write(conn)
+                raise
             except Exception as e:
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise QueryError(f"Script execution failed: {e}") from e
             except BaseException:
-                # See execute(): roll back a canceled partial script.
                 if not self._in_transaction:
-                    await conn.rollback()
+                    await self._rollback_after_failure(conn)
                 raise
 
     @asynccontextmanager
@@ -399,21 +543,21 @@ class SQLiteBackend(DatabaseBackend):
         # Hold the write lock for the whole BEGIN..COMMIT/ROLLBACK span so the
         # transaction is one atomic write unit against concurrent writers
         # sharing this connection (#1675).
-        async with self._write_lock:
+        async with self._write_guard():
             self._in_transaction = True
             self._txn_owner = asyncio.current_task()
             try:
                 await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 yield
                 await conn.commit()
+            except asyncio.CancelledError:
+                self._handoff_cancelled_write(conn)
+                raise
             except Exception as e:
-                await conn.rollback()
+                await self._rollback_after_failure(conn)
                 raise TransactionError(f"Transaction failed: {e}") from e
             except BaseException:
-                # Cancellation mid-transaction: roll back so a partial
-                # transaction isn't left open for the next writer (which would
-                # otherwise commit it), then propagate unchanged.
-                await conn.rollback()
+                await self._rollback_after_failure(conn)
                 raise
             finally:
                 self._in_transaction = False

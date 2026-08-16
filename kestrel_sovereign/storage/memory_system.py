@@ -94,15 +94,21 @@ def _answerability_settings() -> tuple[bool, float, Optional[str]]:
     """Load and validate the global retrieval answerability controls."""
     config = load_section("retrieval") or {}
     enabled = config.get("memory_answerability_gate", True)
-    timeout = _positive_timeout_seconds(
-        config, "memory_answerability_timeout_seconds", 12.0
-    )
+    timeout = config.get("memory_answerability_timeout_seconds", 12.0)
     model = config.get("memory_answerability_model")
     if not isinstance(enabled, bool):
         raise ValueError("retrieval.memory_answerability_gate must be boolean")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or float(timeout) <= 0
+    ):
+        raise ValueError(
+            "retrieval.memory_answerability_timeout_seconds must be positive"
+        )
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("retrieval.memory_answerability_model must be a model string")
-    return enabled, timeout, model.strip() if model else None
+    return enabled, float(timeout), model.strip() if model else None
 
 
 def _routing_suppressed(metadata: Optional[Dict[str, Any]]) -> bool:

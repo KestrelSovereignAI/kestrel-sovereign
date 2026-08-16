@@ -15,7 +15,6 @@ import asyncio
 import logging
 
 import pytest
-
 from kestrel_sdk.signals import (
     ResourceLock,
     Signal,
@@ -24,6 +23,7 @@ from kestrel_sdk.signals import (
     Trust,
     Visibility,
 )
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -323,6 +323,30 @@ async def test_handler_exception_becomes_failed_status(dispatcher_components):
     result = await dispatcher.dispatch_signal(signal)
     assert result.status == Status.FAILED
     assert "tool blew up" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_becomes_failed_status(dispatcher_components):
+    """A cron tool's structured failure must not be logged as success."""
+    agent, registry, dispatcher, _ = dispatcher_components
+
+    async def lookup_failed(name, args):
+        return ToolResult.failed("consolidation deadline expired")
+
+    for reg in build_cron_registrations(tool_lookup=lookup_failed):
+        registry.register(reg)
+
+    signal = Signal(
+        source=cron_source_name("memory_consolidate"),
+        kind="run",
+        mode=SignalMode.ARTIFACT,
+        payload={},
+        target_agent=agent.did,
+    )
+    result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.FAILED
+    assert "consolidation deadline expired" in (result.error or "")
 
 
 @pytest.mark.asyncio

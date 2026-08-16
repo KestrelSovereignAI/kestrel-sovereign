@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,14 +12,16 @@ import pytest
 from kestrel_sdk.signals import ResourceLock
 from kestrel_sdk.tools.result import ToolResultStatus
 
+from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.memory.feature import MemoryFeature
+from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.storage.memory_system import (
     DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS,
     MemoryConsolidationTimeoutError,
     MemorySystem,
     _consolidation_timeout_seconds,
 )
-from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 
 
 def _feature(memory_system, locks: OrderedLockManager) -> MemoryFeature:
@@ -198,6 +202,104 @@ async def test_hung_consolidation_times_out_in_owner_task_and_releases_lock(
             {ResourceLock.MEMORY}, label="following acquirer"
         ):
             assert locks.is_held(ResourceLock.MEMORY)
+
+
+async def test_real_blocked_aiosqlite_write_releases_full_sleep_lock_near_deadline(
+    monkeypatch, tmp_path,
+):
+    """Export-enabled sleep cannot re-wedge its lock after DB cancellation."""
+    locks = OrderedLockManager()
+    backend = SQLiteBackend(str(tmp_path / "blocked-consolidation.db"))
+    await backend.connect()
+    entered_worker = threading.Event()
+    release_worker = threading.Event()
+    watchdog = threading.Timer(2.0, release_worker.set)
+
+    def block_in_worker(value):
+        entered_worker.set()
+        release_worker.wait()
+        return value + 1
+
+    try:
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        await backend.execute("CREATE TABLE memories (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO memories (value) VALUES (0)")
+
+        async def run_consolidation():
+            await backend.execute(
+                "UPDATE memories SET value = block_in_worker(value)"
+            )
+            return {"episodes_created": 1}
+
+        timeout_seconds = 0.05
+        monkeypatch.setattr(
+            "kestrel_sovereign.storage.memory_system.load_section",
+            lambda _section: {
+                "memory_consolidation_timeout_seconds": timeout_seconds
+            },
+        )
+        memory_system = MemorySystem(
+            storage=SimpleNamespace(), agent_id="did:test:real-sqlite"
+        )
+        memory_system.consolidator = SimpleNamespace(
+            run_consolidation=run_consolidation
+        )
+
+        class SleepAgent(SleepMixin):
+            pass
+
+        agent = SleepAgent()
+        agent.memory_system = memory_system
+        agent.memory_consolidator = None
+        agent.sleep_hooks = []
+        agent.storage = SimpleNamespace()
+        export_started = asyncio.Event()
+
+        async def export_sovereignty(_storage_tier):
+            export_started.set()
+            await backend.fetch_all("SELECT value FROM memories")
+            return {"cid": "must-not-export"}
+
+        agent._export_sovereignty = export_sovereignty
+
+        # A broken inline rollback would wait for this watchdog and fail the
+        # elapsed-time assertion instead of hanging the suite indefinitely.
+        # A sleep cycle that continues into export would hit the same fence.
+        watchdog.start()
+        started = time.monotonic()
+        async with locks.acquire(
+            {ResourceLock.MEMORY}, label="cron.sleep run"
+        ):
+            report = await agent.sleep(
+                skip_export=False,
+                skip_reflection=True,
+            )
+        elapsed = time.monotonic() - started
+
+        assert entered_worker.is_set()
+        assert elapsed >= timeout_seconds
+        assert elapsed < timeout_seconds + 0.5
+        assert report.success is False
+        assert report.error == "consolidation_failed"
+        assert not export_started.is_set()
+        assert not locks.is_held(ResourceLock.MEMORY)
+
+        async with locks.acquire(
+            {ResourceLock.MEMORY}, label="after blocked SQLite deadline"
+        ):
+            assert locks.is_held(ResourceLock.MEMORY)
+
+        # Let the real worker statement finish.  The next write waits for the
+        # handed-off rollback, proving it cannot commit the abandoned update.
+        release_worker.set()
+        async with asyncio.timeout(1.0):
+            await backend.execute("UPDATE memories SET value = value + 1")
+        assert await backend.fetch_all("SELECT value FROM memories") == [(1,)]
+    finally:
+        watchdog.cancel()
+        release_worker.set()
+        await backend.close()
 
 
 async def test_parent_cancellation_unwinds_and_releases_memory_lock(monkeypatch):

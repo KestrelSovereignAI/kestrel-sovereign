@@ -862,6 +862,27 @@ def _make_health_agent(status, checks=None):
     return agent
 
 
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_uses_shared_noncritical_rollup():
+    """Agents without HealthFeature grade non-critical failures as degraded."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": "resource_locks", "status": "fail"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "degraded", "checks": checks}
+
+
 def test_detailed_health_reports_fleet_when_no_singleton_agent():
     """Multi-agent hosts (app.state.agent is None) must resolve from the fleet.
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
 
 from kestrel_sdk.signals import (
@@ -40,6 +41,7 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -186,11 +188,38 @@ _REDACTION = RedactionPolicy(
 ToolLookup = Callable[[str, dict], Awaitable[Any]]
 
 
+def _require_successful_tool_result(task_name: str, result: Any) -> Any:
+    """Turn a structured tool failure into a failed scheduler dispatch."""
+    failed = (
+        isinstance(result, ToolResult)
+        and result.status is ToolResultStatus.ERROR
+    )
+    if isinstance(result, Mapping):
+        # DynamicTool serializes ToolResult before scheduler lookup returns;
+        # its legacy exception wrapper uses ``success=False``.  Both shapes are
+        # terminal failures, not successful cron artifacts.
+        status = result.get("status")
+        failed = (
+            status in (ToolResultStatus.ERROR, ToolResultStatus.ERROR.value)
+            or result.get("success") is False
+        )
+    if failed:
+        if isinstance(result, ToolResult):
+            detail = result.error or result.confirmation
+        else:
+            detail = result.get("error") or result.get("confirmation")
+        detail = detail or "tool returned an error result"
+        raise RuntimeError(f"scheduled tool {task_name} failed: {detail}")
+    return result
+
+
 def _make_action_handler(lookup: ToolLookup, task_name: str) -> ActionHandler:
     """Return an ACTION handler that runs `lookup(task_name, payload)`."""
 
     async def handler(payload: dict) -> Any:
-        return await lookup(task_name, payload)
+        return _require_successful_tool_result(
+            task_name, await lookup(task_name, payload)
+        )
 
     return handler
 
@@ -202,7 +231,9 @@ def _make_artifact_handler(
     and returns the tool's output as the artifact."""
 
     async def handler(signal: Signal) -> Any:
-        return await lookup(task_name, signal.payload)
+        return _require_successful_tool_result(
+            task_name, await lookup(task_name, signal.payload)
+        )
 
     return handler
 

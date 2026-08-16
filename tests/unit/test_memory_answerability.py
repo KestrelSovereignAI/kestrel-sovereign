@@ -224,3 +224,36 @@ def test_answerability_settings_reject_invalid_values(monkeypatch, config):
 
     with pytest.raises(ValueError):
         memory_system_module._answerability_settings()
+
+
+def test_answerability_settings_validate_gate_before_timeout(monkeypatch):
+    """Consolidation timeout validation must not change legacy error order."""
+    monkeypatch.setattr(
+        memory_system_module,
+        "load_section",
+        lambda _name: {
+            "memory_answerability_gate": "false",
+            "memory_answerability_timeout_seconds": 0,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="retrieval.memory_answerability_gate must be boolean",
+    ):
+        memory_system_module._answerability_settings()
+
+
+def test_answerability_settings_preserve_infinite_timeout(monkeypatch):
+    """The new consolidation bound must not tighten answerability config."""
+    monkeypatch.setattr(
+        memory_system_module,
+        "load_section",
+        lambda _name: {"memory_answerability_timeout_seconds": float("inf")},
+    )
+
+    assert memory_system_module._answerability_settings() == (
+        True,
+        float("inf"),
+        None,
+    )

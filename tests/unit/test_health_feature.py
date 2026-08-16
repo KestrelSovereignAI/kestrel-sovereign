@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.bootstrap.service import BootstrapService, BootstrapState
+from kestrel_sovereign.features.health import checks as health_checks
 from kestrel_sovereign.features.health.checks import (
     check_bootstrap_state,
     check_context_budget,
@@ -31,12 +32,15 @@ from kestrel_sovereign.features.health.checks import (
     check_llm_service,
     check_memory_system,
     check_resource_locks,
+    run_standard_checks,
 )
 from kestrel_sovereign.features.health.feature import (
     DEFAULT_INTERVAL_SECONDS,
     HealthFeature,
     _derive_overall_status,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db import SQLiteBackend
 
 
 # ============================================================================
@@ -276,6 +280,26 @@ class TestCheckResourceLocks:
         assert result["status"] == "pass"
 
     @pytest.mark.asyncio
+    async def test_warns_when_lock_diagnostics_raise(self):
+        def broken_snapshot():
+            raise RuntimeError("snapshot unavailable")
+
+        agent = SimpleNamespace(
+            dispatcher=SimpleNamespace(
+                lock_manager=SimpleNamespace(
+                    active_hold_diagnostics=broken_snapshot
+                )
+            )
+        )
+
+        result = await check_resource_locks(agent)
+
+        assert result["status"] == "warn"
+        assert result["message"] == (
+            "Resource lock diagnostics failed: snapshot unavailable"
+        )
+
+    @pytest.mark.asyncio
     async def test_warns_for_slow_blocked_hold(self):
         result = await check_resource_locks(
             self._agent(
@@ -375,6 +399,130 @@ class TestCheckResourceLocks:
         assert result["status"] == "fail"
         assert "66.7 hours" in result["message"]
         assert result["details"]["held_locks"][0]["resource"] == "memory"
+
+    @pytest.mark.asyncio
+    async def test_standard_checks_return_lock_diagnosis_when_database_wedges(self):
+        """Real bootstrap reads cannot reintroduce a health-suite DB wedge."""
+        never_release = asyncio.Event()
+
+        async def blocked_fetchone(_query):
+            await never_release.wait()
+
+        async def blocked_get_node(_agent_id):
+            await never_release.wait()
+
+        db = SimpleNamespace(fetchone=blocked_fetchone)
+        agent = self._agent(
+            [
+                {
+                    "resource": "memory",
+                    "label": "cron sleep",
+                    "held_seconds": 66.7 * 3600,
+                    "blocked_acquirers": 2,
+                }
+            ]
+        )
+        agent.agent_id = "did:test:blocked-health"
+        agent.storage = SimpleNamespace(get_node=blocked_get_node)
+        agent.bootstrap_service = SimpleNamespace(
+            check_pending_timeout=AsyncMock(
+                side_effect=AssertionError(
+                    "bootstrap timeout evaluation must not run after a blocked read"
+                )
+            )
+        )
+        passing_checks = {
+            name: AsyncMock(
+                return_value={"name": name, "status": "pass", "message": "ok"}
+            )
+            for name in (
+                "llm_service",
+                "memory_system",
+                "disk_space",
+                "context_budget",
+                "signal_audit_log",
+                "birth_record",
+            )
+        }
+
+        with (
+            patch.object(health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.01),
+            patch.object(
+                health_checks,
+                "check_llm_service",
+                passing_checks["llm_service"],
+            ),
+            patch.object(
+                health_checks,
+                "check_memory_system",
+                passing_checks["memory_system"],
+            ),
+            patch.object(
+                health_checks,
+                "check_disk_space",
+                passing_checks["disk_space"],
+            ),
+            patch.object(
+                health_checks,
+                "check_context_budget",
+                passing_checks["context_budget"],
+            ),
+            patch.object(
+                health_checks,
+                "check_signal_audit_log",
+                passing_checks["signal_audit_log"],
+            ),
+            patch.object(
+                health_checks,
+                "check_birth_record",
+                passing_checks["birth_record"],
+            ),
+        ):
+            checks = await asyncio.wait_for(
+                run_standard_checks(agent, db), timeout=0.2
+            )
+
+        assert checks[0]["name"] == "resource_locks"
+        assert checks[0]["status"] == "fail"
+        assert checks[1]["name"] == "database"
+        assert checks[1]["status"] == "fail"
+        assert "timed out" in checks[1]["message"]
+        bootstrap = next(
+            check for check in checks if check["name"] == "bootstrap_state"
+        )
+        assert bootstrap["status"] == "fail"
+        assert "timed out" in bootstrap["message"]
+        agent.bootstrap_service.check_pending_timeout.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_database_checks_each_receive_a_full_timeout_budget(self):
+        async def delayed_llm_check(_agent):
+            await asyncio.sleep(0.075)
+            return {"name": "llm_service", "status": "pass", "message": "ok"}
+
+        agent = SimpleNamespace(
+            bootstrap_service=None,
+            context_manager=None,
+            dispatcher=None,
+            llm_service=None,
+            memory_retriever=None,
+            memory_consolidator=None,
+            storage=None,
+        )
+        db = SimpleNamespace(fetchone=AsyncMock(return_value=(1,)))
+
+        with (
+            patch.object(health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.05),
+            patch.object(
+                health_checks, "check_llm_service", side_effect=delayed_llm_check
+            ),
+        ):
+            checks = await run_standard_checks(agent, db)
+
+        bootstrap = next(
+            check for check in checks if check["name"] == "bootstrap_state"
+        )
+        assert bootstrap["status"] == "pass"
 
 
 class TestCheckDiskSpace:
@@ -542,13 +690,13 @@ class TestDeriveOverallStatus:
         ]
         assert _derive_overall_status(checks) == "unhealthy"
 
-    def test_escalated_resource_lock_is_unhealthy(self):
+    def test_escalated_resource_lock_is_degraded(self):
         checks = [
             {"name": "database", "status": "pass"},
             {"name": "llm_service", "status": "pass"},
             {"name": "resource_locks", "status": "fail"},
         ]
-        assert _derive_overall_status(checks) == "unhealthy"
+        assert _derive_overall_status(checks) == "degraded"
 
     def test_non_critical_fail_is_degraded(self):
         checks = [
@@ -665,6 +813,77 @@ class TestHeartbeatCheck:
         assert len(feature._in_memory_history) == 0
         await feature.health_check()
         assert len(feature._in_memory_history) == 1
+
+    @pytest.mark.asyncio
+    async def test_database_timeout_skips_blocked_persistence(self):
+        """A wedged DB still yields an in-memory unhealthy result."""
+        db = _make_db(table_exists_map={"health_log": True})
+        never_release = asyncio.Event()
+
+        async def blocked_fetchone(*_args, **_kwargs):
+            await never_release.wait()
+
+        db.fetchone = AsyncMock(side_effect=blocked_fetchone)
+        db.execute = AsyncMock(
+            side_effect=AssertionError("must not persist through a failed DB check")
+        )
+        agent = _make_agent(db=db)
+        feat = HealthFeature(agent)
+        feat._db = db
+        feat._agent_id = agent.did
+        feat._in_memory_history = []
+
+        with patch.object(
+            health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.01
+        ):
+            result = await asyncio.wait_for(feat.run_once(), timeout=0.2)
+
+        assert result["status"] == "unhealthy"
+        assert result["checks"][1]["name"] == "database"
+        assert result["checks"][1]["status"] == "fail"
+        assert feat._in_memory_history == [result]
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_write_lock_timeout_keeps_health_tick_live(self, tmp_path):
+        """A healthy read cannot hide a write lock that blocks persistence."""
+        backend = SQLiteBackend(str(tmp_path / "health-write-lock.db"))
+        await backend.connect()
+        db = AsyncDatabase(backend)
+        agent = _make_agent(db=db)
+        agent.bootstrap_service = None
+        agent.dispatcher = None
+        feat = HealthFeature(agent)
+        feat._db = db
+        feat._agent_id = agent.did
+        feat._in_memory_history = []
+        transaction_entered = asyncio.Event()
+        release_transaction = asyncio.Event()
+
+        async def hold_write_lock():
+            async with backend.transaction():
+                transaction_entered.set()
+                await release_transaction.wait()
+
+        holder = asyncio.create_task(hold_write_lock())
+        try:
+            await transaction_entered.wait()
+            with patch.object(
+                health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.05
+            ):
+                result = await asyncio.wait_for(feat.run_once(), timeout=1.0)
+
+            database = next(
+                check for check in result["checks"] if check["name"] == "database"
+            )
+            assert database["status"] == "pass"
+            assert feat._in_memory_history == [result]
+            assert not holder.done()
+            assert backend._cancelled_write_drain is None
+        finally:
+            release_transaction.set()
+            await holder
+            await backend.close()
 
     @pytest.mark.asyncio
     async def test_healthy_when_all_pass(self, feature):

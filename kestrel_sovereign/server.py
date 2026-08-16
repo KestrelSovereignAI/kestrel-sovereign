@@ -3298,20 +3298,17 @@ async def _agent_detailed_health(agent) -> dict:
     # check missing here reports `healthy` for a state the other calls a
     # warning. HealthFeature is not mandatory, so this path is reachable by
     # design.
-    from kestrel_sovereign.features.health.checks import run_standard_checks
+    from kestrel_sovereign.features.health.checks import (
+        derive_overall_status,
+        run_standard_checks,
+    )
 
     db = None
     if hasattr(agent, 'storage') and agent.storage:
         db = getattr(agent.storage, 'db', None)
 
     checks = await run_standard_checks(agent, db)
-    statuses = [c.get("status") for c in checks]
-    if "fail" in statuses:
-        overall = "unhealthy"
-    elif "warn" in statuses:
-        overall = "degraded"
-    else:
-        overall = "healthy"
+    overall = derive_overall_status(checks)
     return {"status": overall, "checks": checks}
 
 

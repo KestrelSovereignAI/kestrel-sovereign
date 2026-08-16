@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
+import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
 from kestrel_sovereign.storage.db import (
     ConnectionError,
+    QueryError,
     SQLiteBackend,
     sqlite_to_postgres,
     postgres_to_sqlite,
@@ -321,6 +323,288 @@ class TestSQLiteBackend:
         # The lock was released, so a fresh writer proceeds.
         await backend.execute("INSERT INTO t (id) VALUES (2)")
         assert await backend.fetch_all("SELECT id FROM t") == [(2,)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "write_method", ["execute", "execute_many", "execute_script"]
+    )
+    async def test_worker_blocked_write_cancellation_hands_off_rollback(
+        self, backend, write_method,
+    ):
+        """Every autocommit write API returns cancellation before worker drain."""
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO t (value) VALUES (0)")
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker(value):
+            entered_worker.set()
+            release_worker.wait()
+            return value + 1
+
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+
+        if write_method == "execute":
+            blocked_write = backend.execute(
+                "UPDATE t SET value = block_in_worker(value)"
+            )
+        elif write_method == "execute_many":
+            blocked_write = backend.execute_many(
+                "UPDATE t SET value = block_in_worker(value) WHERE ?",
+                [(1,)],
+            )
+        else:
+            blocked_write = backend.execute_script(
+                "BEGIN; UPDATE t SET value = block_in_worker(value);"
+            )
+
+        task = asyncio.create_task(blocked_write)
+        following_write = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            task.cancel()
+            async with asyncio.timeout(0.2):
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            # A later writer is fenced on the retained rollback rather than
+            # entering the shared connection while the worker is still stuck.
+            following_write = asyncio.create_task(
+                backend.execute("UPDATE t SET value = value + 1")
+            )
+            await asyncio.sleep(0.02)
+            assert not following_write.done()
+
+            release_worker.set()
+            async with asyncio.timeout(1.0):
+                await following_write
+            assert await backend.fetch_all("SELECT value FROM t") == [(1,)]
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            if not task.done():
+                task.cancel()
+            if following_write is not None and not following_write.done():
+                following_write.cancel()
+            await asyncio.gather(
+                task,
+                *([following_write] if following_write is not None else []),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_worker_blocked_write_fences_following_transaction(self, backend):
+        """A same-continuation transaction cannot overtake retained rollback."""
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO t (value) VALUES (0)")
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker(value):
+            entered_worker.set()
+            release_worker.wait()
+            return value + 1
+
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        blocked = asyncio.create_task(
+            backend.execute("UPDATE t SET value = block_in_worker(value)")
+        )
+        release_handle = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+
+            # Continue in this task immediately after cancellation.  Without
+            # the transaction fence, BEGIN is queued before the retained
+            # rollback and fails with "transaction within a transaction".
+            release_handle = asyncio.get_running_loop().call_later(
+                0.05, release_worker.set
+            )
+            async with asyncio.timeout(1.0):
+                async with backend.transaction():
+                    await backend.execute("UPDATE t SET value = value + 10")
+
+            assert await backend.fetch_all("SELECT value FROM t") == [(10,)]
+        finally:
+            watchdog.cancel()
+            if release_handle is not None:
+                release_handle.cancel()
+            release_worker.set()
+            if not blocked.done():
+                blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_bounded_pending_write_drain(self, tmp_path):
+        """Close retires its retained cleanup task before connection teardown."""
+        backend = SQLiteBackend(str(tmp_path / "pending-drain.db"))
+        await backend.connect()
+        never_release = asyncio.Event()
+        drain = asyncio.create_task(never_release.wait())
+        backend._cancelled_write_drain = drain
+
+        try:
+            with patch(
+                "kestrel_sovereign.storage.db.sqlite."
+                "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                0.01,
+            ):
+                await backend.close()
+
+            assert drain.cancelled()
+            assert backend._cancelled_write_drain is None
+            assert backend._cancelled_write_drain_error is None
+            assert not backend.is_connected
+        finally:
+            if not drain.done():
+                drain.cancel()
+                with suppress(asyncio.CancelledError):
+                    await drain
+            if backend.is_connected:
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_close_pending_real_write_drain_fits_declared_budget(
+        self, tmp_path
+    ):
+        """The shutdown reservation covers drain and connection-close phases."""
+        backend = SQLiteBackend(str(tmp_path / "pending-real-drain.db"))
+        await backend.connect()
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        shutdown_window = (
+            sqlite_backend_module.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+        )
+        watchdog = threading.Timer(3 * shutdown_window, release_worker.set)
+
+        def block_in_worker(value):
+            entered_worker.set()
+            release_worker.wait()
+            return value
+
+        conn = backend._ensure_connected()
+        worker = aiosqlite_worker(conn)
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        blocked = asyncio.create_task(
+            backend.execute("SELECT block_in_worker(1)")
+        )
+        release_handle = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            assert not drain.done()
+
+            # Let the drain consume more than the old one-phase reservation,
+            # then let connection.close() retire the real worker.  No timeout
+            # constants are patched: this verifies the public default budget.
+            loop = asyncio.get_running_loop()
+            release_handle = loop.call_later(
+                1.5 * shutdown_window,
+                release_worker.set,
+            )
+            started = loop.time()
+            await backend.close()
+            elapsed = loop.time() - started
+
+            assert elapsed <= backend.minimum_close_timeout_s
+            assert not worker.is_alive()
+            assert not backend.is_connected
+        finally:
+            watchdog.cancel()
+            if release_handle is not None:
+                release_handle.cancel()
+            release_worker.set()
+            if not blocked.done():
+                blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_retires_pending_drain_and_worker(self, tmp_path):
+        """Shutdown cancellation is delivered after retained cleanup closes."""
+        backend = SQLiteBackend(str(tmp_path / "cancelled-pending-drain.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        worker = aiosqlite_worker(conn)
+        never_release = asyncio.Event()
+        drain_started = asyncio.Event()
+
+        async def pending_drain():
+            drain_started.set()
+            await never_release.wait()
+
+        drain = asyncio.create_task(pending_drain())
+        await drain_started.wait()
+        backend._cancelled_write_drain = drain
+        close_task = asyncio.create_task(backend.close())
+
+        try:
+            await asyncio.sleep(0)
+            assert not close_task.done()
+            close_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+
+            assert drain.cancelled()
+            assert not backend.is_connected
+            assert not worker.is_alive()
+            assert backend._cancelled_write_drain is None
+            assert backend._cancelled_write_drain_error is None
+        finally:
+            if not drain.done():
+                drain.cancel()
+                with suppress(asyncio.CancelledError):
+                    await drain
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_error_does_not_survive_close_or_connect(self, tmp_path):
+        """A fresh connection is not poisoned by an old drain failure."""
+        backend = SQLiteBackend(str(tmp_path / "drain-recovery.db"))
+        await backend.connect()
+        backend._cancelled_write_drain_error = RuntimeError("rollback failed")
+
+        with pytest.raises(QueryError, match="cancellation cleanup failed"):
+            await backend.fetch_one("SELECT 1")
+
+        await backend.close()
+        assert backend._cancelled_write_drain_error is None
+
+        # Exercise connect's reset independently from close's reset.
+        backend._cancelled_write_drain_error = RuntimeError("stale failure")
+        await backend.connect()
+        try:
+            assert backend._cancelled_write_drain_error is None
+            assert await backend.fetch_one("SELECT 1") == (1,)
+        finally:
+            await backend.close()
 
     @pytest.mark.asyncio
     async def test_table_not_exists(self, backend):

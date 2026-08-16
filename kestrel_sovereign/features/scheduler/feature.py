@@ -1016,6 +1016,10 @@ class SchedulerFeature(Feature):
             if blocked is not None:
                 return blocked
         features = getattr(self.agent, "features", {})
+        from kestrel_sovereign.signals.sources.scheduler import (
+            _require_successful_tool_result,
+        )
+
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
                 continue
@@ -1029,6 +1033,7 @@ class SchedulerFeature(Feature):
                     result = await self._run_tool_hook_gated(
                         type(feature).__name__, agent_tool, args,
                     )
+                    result = _require_successful_tool_result(task_name, result)
                     if isinstance(result, ScheduledTaskOutcome):
                         return result
                     # Preserve the legacy JSON-encode contract for
@@ -1045,6 +1050,7 @@ class SchedulerFeature(Feature):
                 result = await self._run_tool_hook_gated(
                     type(self).__name__, agent_tool, args,
                 )
+                result = _require_successful_tool_result(task_name, result)
                 if isinstance(result, ScheduledTaskOutcome):
                     return result
                 if isinstance(result, str):
@@ -1227,7 +1233,7 @@ class SchedulerFeature(Feature):
             )
         return json.dumps({"error": "no sync service configured"})
 
-    async def _handle_sleep(self, args: dict) -> str:
+    async def _handle_sleep(self, args: dict) -> str | ScheduledTaskOutcome:
         """Built-in handler for the nightly ``sleep`` cron (#1674 P3).
 
         Runs the agent's single memory-maintenance cycle: reflection (via the
@@ -1261,11 +1267,22 @@ class SchedulerFeature(Feature):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("[sleep] agent=%s cycle failed: %s", self._agent_id, e)
-            return json.dumps({"error": str(e)})
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=json.dumps({"error": str(e)}),
+                pause_schedule=False,
+            )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
         data["skip_reflection"] = skip_reflection
-        return json.dumps(data, default=str)
+        result_text = json.dumps(data, default=str)
+        if data.get("success") is False or data.get("error"):
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=result_text,
+                pause_schedule=False,
+            )
+        return result_text
 
     async def _sleep_had_activity(self) -> bool:
         """Best-effort: has anything happened since the last episode?

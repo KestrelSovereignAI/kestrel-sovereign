@@ -10,16 +10,66 @@ Each check function returns a dict with:
 Checks are designed to be fast and non-destructive.
 """
 
+import asyncio
 import logging
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Dict, List
 
 from kestrel_sdk.signals import ResourceLock
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 
 logger = logging.getLogger(__name__)
+
+
+# A liveness probe must return while the database operation it diagnoses is
+# wedged.  Keep this below the feature's default 60-second probe cadence.
+DATABASE_HEALTH_CHECK_TIMEOUT_S = 5.0
+
+
+async def _run_database_bound_check(
+    name: str,
+    check: Awaitable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Run one database check within its own I/O deadline."""
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(DATABASE_HEALTH_CHECK_TIMEOUT_S):
+            return await check
+    except TimeoutError:
+        label = name.replace("_", " ").capitalize()
+        return {
+            "name": name,
+            "status": "fail",
+            "message": (
+                f"{label} health check timed out after "
+                f"{DATABASE_HEALTH_CHECK_TIMEOUT_S:g} seconds"
+            ),
+            "duration_ms": _elapsed(started),
+        }
+
+
+def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
+    """Derive the shared three-state status for every detailed-health surface.
+
+    - healthy: all checks pass
+    - degraded: at least one warning or non-critical failure
+    - unhealthy: a critical database or LLM check fails
+    """
+    statuses = [check.get("status", "pass") for check in checks]
+    critical_names = {"database", "llm_service"}
+    critical_statuses = [
+        check.get("status", "pass")
+        for check in checks
+        if check.get("name") in critical_names
+    ]
+
+    if "fail" in critical_statuses:
+        return "unhealthy"
+    if "fail" in statuses or "warn" in statuses:
+        return "degraded"
+    return "healthy"
 
 
 async def check_database(db) -> Dict[str, Any]:
@@ -457,32 +507,10 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
     }
 
 
-async def check_resource_locks(agent) -> Dict[str, Any]:
-    """Surface a MEMORY lock that is both long-held and blocking work.
-
-    MEMORY protects bounded maintenance passes, so prolonged contention is an
-    actionable health signal. Other resources have different healthy hold
-    envelopes: in particular, CONVERSATION spans an entire agentic turn and
-    must not make routine multi-minute work degrade readiness. The snapshot is
-    in-memory and cannot itself block behind the resource being diagnosed.
-    """
-    start = time.monotonic()
-    dispatcher = getattr(agent, "dispatcher", None)
-    lock_manager = (
-        getattr(dispatcher, "lock_manager", None)
-        if dispatcher is not None
-        else None
-    )
-    snapshot = getattr(lock_manager, "active_hold_diagnostics", None)
-    if not callable(snapshot):
-        return {
-            "name": "resource_locks",
-            "status": "pass",
-            "message": "Resource lock diagnostics not available",
-            "duration_ms": _elapsed(start),
-        }
-
-    raw_holds = snapshot()
+def _classify_resource_lock_snapshot(
+    raw_holds: Any, start: float
+) -> Dict[str, Any]:
+    """Validate and grade one duck-typed resource-lock snapshot."""
     if not isinstance(raw_holds, list):
         return {
             "name": "resource_locks",
@@ -562,6 +590,44 @@ async def check_resource_locks(agent) -> Dict[str, Any]:
     }
 
 
+async def check_resource_locks(agent) -> Dict[str, Any]:
+    """Surface a MEMORY lock that is both long-held and blocking work.
+
+    MEMORY protects bounded consolidation passes as well as legitimately
+    long-running work such as training cycles.  Prolonged contention is still
+    an actionable operator signal, but it does not by itself prove the agent
+    is unhealthy.  Other resources have different healthy hold envelopes: in
+    particular, CONVERSATION spans an entire agentic turn and must not make
+    routine multi-minute work degrade readiness. The snapshot is in-memory
+    and cannot itself block behind the resource being diagnosed.
+    """
+    start = time.monotonic()
+    dispatcher = getattr(agent, "dispatcher", None)
+    lock_manager = (
+        getattr(dispatcher, "lock_manager", None)
+        if dispatcher is not None
+        else None
+    )
+    snapshot = getattr(lock_manager, "active_hold_diagnostics", None)
+    if not callable(snapshot):
+        return {
+            "name": "resource_locks",
+            "status": "pass",
+            "message": "Resource lock diagnostics not available",
+            "duration_ms": _elapsed(start),
+        }
+
+    try:
+        return _classify_resource_lock_snapshot(snapshot(), start)
+    except Exception as exc:
+        return {
+            "name": "resource_locks",
+            "status": "warn",
+            "message": f"Resource lock diagnostics failed: {exc}",
+            "duration_ms": _elapsed(start),
+        }
+
+
 async def check_birth_record(agent) -> Dict[str, Any]:
     """Report birth-record capability the runtime database does not have (#2871).
 
@@ -627,15 +693,26 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
     for a state the first calls a warning. Sharing the list is what stops the
     next one drifting.
     """
+    # Snapshot resource ownership before touching the database, then bound each
+    # database-touching check. A cancelled aiosqlite read may keep draining
+    # internally, but it cannot prevent the in-memory diagnosis from returning.
+    resource_locks = await check_resource_locks(agent)
+    database = await _run_database_bound_check(
+        "database", check_database(db)
+    )
+
     return [
-        await check_database(db),
+        resource_locks,
+        database,
         await check_llm_service(agent),
         await check_memory_system(agent),
         await check_disk_space(),
         await check_context_budget(agent),
-        await check_bootstrap_state(agent),
+        await _run_database_bound_check(
+            "bootstrap_state",
+            check_bootstrap_state(agent),
+        ),
         await check_signal_audit_log(agent),
-        await check_resource_locks(agent),
         await check_birth_record(agent),
     ]
 
