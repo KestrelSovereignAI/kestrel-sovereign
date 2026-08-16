@@ -2167,10 +2167,28 @@ class AsyncDatabase:
     async def fetchone(self, sql: str, params: tuple = ()) -> Optional[Tuple[Any, ...]]:
         """Fetch a single row."""
         return await self._backend.fetch_one(sql, params)
+
+    async def fetchone_diagnostic(
+        self, sql: str, params: tuple = ()
+    ) -> Optional[Tuple[Any, ...]]:
+        """Fetch committed state without waiting on SQLite cleanup."""
+        fetch = getattr(self._backend, "fetch_one_diagnostic", None)
+        if fetch is None:
+            fetch = self._backend.fetch_one
+        return await fetch(sql, params)
     
     async def fetchall(self, sql: str, params: tuple = ()) -> List[Tuple[Any, ...]]:
         """Fetch all rows."""
         return await self._backend.fetch_all(sql, params)
+
+    async def fetchall_diagnostic(
+        self, sql: str, params: tuple = ()
+    ) -> List[Tuple[Any, ...]]:
+        """Fetch committed rows without waiting on SQLite cleanup."""
+        fetch = getattr(self._backend, "fetch_all_diagnostic", None)
+        if fetch is None:
+            fetch = self._backend.fetch_all
+        return await fetch(sql, params)
     
     async def fetchval(self, sql: str, params: tuple = ()) -> Optional[Any]:
         """Fetch a single value."""
@@ -2185,6 +2203,13 @@ class AsyncDatabase:
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""
         return await self._backend.table_exists(table_name)
+
+    async def table_exists_diagnostic(self, table_name: str) -> bool:
+        """Check schema state without waiting on SQLite cleanup."""
+        check = getattr(self._backend, "table_exists_diagnostic", None)
+        if check is None:
+            check = self._backend.table_exists
+        return await check(table_name)
     
     async def commit(self) -> None:
         """Commit transaction (no-op, commits are automatic in new backend)."""

@@ -770,10 +770,14 @@ class TestSQLiteBackend:
         await backend.execute("INSERT INTO durable (value) VALUES (7)")
         backend._cancelled_write_drain_error = RuntimeError("rollback failed")
 
-        # A fresh query-only connection can still expose the committed state,
-        # which keeps health/diagnostic reads alive without trusting the shared
+        # A fresh query-only connection can still expose the committed state to
+        # an explicitly diagnostic caller without trusting the shared
         # connection's possibly-abandoned transaction.
-        assert await backend.fetch_one("SELECT value FROM durable") == (7,)
+        assert await backend.fetch_one_diagnostic(
+            "SELECT value FROM durable"
+        ) == (7,)
+        with pytest.raises(QueryError, match="cancellation cleanup failed"):
+            await backend.fetch_one("SELECT value FROM durable")
         with pytest.raises(ConnectionError, match="cancellation cleanup failed"):
             await backend.execute("UPDATE durable SET value = 8")
 
@@ -826,13 +830,154 @@ class TestSQLiteBackend:
             assert drain is not None and not drain.done()
 
             async with asyncio.timeout(0.2):
-                assert await backend.fetch_one(
+                assert await backend.fetch_one_diagnostic(
                     "SELECT value FROM durable"
                 ) == (7,)
         finally:
             release_worker.set()
             await asyncio.gather(blocked, return_exceptions=True)
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_application_read_waits_for_cancelled_commit_drain(
+        self, tmp_path
+    ):
+        """A stale diagnostic snapshot cannot drive a later application write."""
+        backend = SQLiteBackend(str(tmp_path / "cancelled-commit-read.db"))
+        await backend.connect()
+        await backend.execute(
+            "CREATE TABLE episodes (source TEXT NOT NULL)"
+        )
+        conn = backend._ensure_connected()
+        commit_entered = threading.Event()
+        release_commit = threading.Event()
+        real_worker_commit = conn._conn.commit
+
+        async def blocked_commit():
+            def commit_in_worker():
+                commit_entered.set()
+                release_commit.wait()
+                real_worker_commit()
+
+            await conn._execute(commit_in_worker)
+
+        timed_out_write = None
+        application_read = None
+        with patch.object(conn, "commit", new=blocked_commit):
+            try:
+                timed_out_write = asyncio.create_task(
+                    backend.execute(
+                        "INSERT INTO episodes (source) VALUES ('messages-1-2')"
+                    )
+                )
+                async with asyncio.timeout(0.5):
+                    while not commit_entered.is_set():
+                        await asyncio.sleep(0.005)
+
+                timed_out_write.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await timed_out_write
+                drain = backend._cancelled_write_drain
+                assert drain is not None and not drain.done()
+
+                # Diagnostics remain available and, correctly, expose only the
+                # pre-commit snapshot while the worker is blocked.
+                assert await backend.fetch_all_diagnostic(
+                    "SELECT source FROM episodes"
+                ) == []
+
+                # Application reads must not make the same stale decision. The
+                # queued commit can still succeed before retained rollback.
+                application_read = asyncio.create_task(
+                    backend.fetch_all("SELECT source FROM episodes")
+                )
+                await asyncio.sleep(0.02)
+                assert not application_read.done()
+
+                release_commit.set()
+                async with asyncio.timeout(1.0):
+                    rows = await application_read
+                assert rows == [("messages-1-2",)]
+                assert backend.write_connection_unavailable is False
+
+                # A consolidation-style read/decide/write continuation now
+                # observes coverage and therefore cannot create a duplicate.
+                if not rows:
+                    await backend.execute(
+                        "INSERT INTO episodes (source) VALUES ('messages-1-2')"
+                    )
+                assert await backend.fetch_val(
+                    "SELECT COUNT(*) FROM episodes"
+                ) == 1
+            finally:
+                release_commit.set()
+                await asyncio.gather(
+                    *(
+                        task
+                        for task in (timed_out_write, application_read)
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_close_interrupts_real_blocked_worker_within_budget(
+        self, tmp_path, monkeypatch
+    ):
+        """Close interrupts a retained real SQLite VM before awaiting close."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.2,
+        )
+        backend = SQLiteBackend(str(tmp_path / "interrupt-close.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        worker = aiosqlite_worker(conn)
+        entered_worker = threading.Event()
+        await conn.set_progress_handler(entered_worker.set, 100)
+        blocked = asyncio.create_task(
+            backend.fetch_all(
+                """
+                WITH RECURSIVE count(value) AS (
+                    SELECT 1
+                    UNION ALL
+                    SELECT value + 1 FROM count WHERE value < 100000000
+                )
+                SELECT sum(value) FROM count
+                """
+            )
+        )
+        watchdog = threading.Timer(2.0, conn._conn.interrupt)
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            drain = backend._cancelled_write_drain
+            assert drain is not None and not drain.done()
+
+            started = asyncio.get_running_loop().time()
+            await backend.close()
+            elapsed = asyncio.get_running_loop().time() - started
+
+            assert elapsed <= backend.minimum_close_timeout_s
+            assert not backend.is_connected
+            assert not worker.is_alive()
+            assert drain.done()
+        finally:
+            watchdog.cancel()
+            if not blocked.done():
+                blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
 
     @pytest.mark.asyncio
     async def test_cancelled_drain_becomes_connection_error_not_caller_cancel(

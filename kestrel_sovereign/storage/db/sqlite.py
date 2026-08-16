@@ -44,15 +44,17 @@ class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
 def _minimum_close_timeout_s() -> float:
     """Return the outer-guard budget for one aiosqlite connection close.
 
-    The worker deadline starts only after ``aiosqlite.Connection.close()`` has
-    handed its stop sentinel to the worker.  Reserve one poll interval as well
-    so an outer guard cannot win a scheduling tie with that internal deadline.
+    The budget covers both ``aiosqlite.Connection.close()`` and final worker
+    termination. Reserve one poll interval so an outer guard cannot win a
+    scheduling tie with the internal lifecycle deadline.
     """
     return AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S + _AIOSQLITE_WORKER_SHUTDOWN_POLL_S
 
 
 async def _wait_for_aiosqlite_worker_shutdown(
     connection: aiosqlite.Connection,
+    *,
+    timeout_s: float = AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
 ) -> None:
     """Wait until ``connection``'s worker has actually terminated.
 
@@ -68,7 +70,7 @@ async def _wait_for_aiosqlite_worker_shutdown(
         return
 
     try:
-        async with asyncio.timeout(AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S):
+        async with asyncio.timeout(timeout_s):
             while is_alive():
                 await asyncio.sleep(_AIOSQLITE_WORKER_SHUTDOWN_POLL_S)
     except TimeoutError as exc:
@@ -77,7 +79,7 @@ async def _wait_for_aiosqlite_worker_shutdown(
             return
         raise ConnectionError(
             "SQLite worker did not terminate within "
-            f"{AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S:.2f}s after close"
+            f"{timeout_s:.2f}s after close"
         ) from exc
 
 
@@ -88,28 +90,59 @@ async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
     close and worker-termination wait together prevents a short-lived backup
     or snapshot connection from bypassing the shutdown contract.
     """
-    try:
-        await connection.close()
-    except asyncio.CancelledError:
-        # ``Connection.close`` queues its stop sentinel from a ``finally``
-        # block.  Once that happens, cancellation must not let the caller
-        # tear down its event loop while the worker is still returning.
-        try:
-            await _wait_for_aiosqlite_worker_shutdown(connection)
-        finally:
-            raise
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _minimum_close_timeout_s()
+    close_task = loop.create_task(connection.close())
+    pending_cancellation: Optional[asyncio.CancelledError] = None
 
     try:
-        await _wait_for_aiosqlite_worker_shutdown(connection)
-    except asyncio.CancelledError:
-        # The caller still receives its cancellation, but only after the
-        # owned worker has exited (or the bounded worker deadline has failed
-        # explicitly).  This same helper covers primary, backup, and snapshot
-        # connections.
+        remaining = max(0.0, deadline - loop.time())
+        done, _ = await asyncio.wait({close_task}, timeout=remaining)
+    except asyncio.CancelledError as exc:
+        # Keep the close in its own task: cancelling aiosqlite's public close
+        # awaitable can move it into a ``finally`` wait behind the same blocked
+        # worker.  Preserve caller cancellation and finish retiring the owned
+        # connection inside the original lifecycle budget.
+        pending_cancellation = exc
+        remaining = max(0.0, deadline - loop.time())
+        done, _ = await asyncio.wait({close_task}, timeout=remaining)
+
+    if not done:
         try:
-            await _wait_for_aiosqlite_worker_shutdown(connection)
-        finally:
-            raise
+            await connection.interrupt()
+        except ValueError as exc:
+            if "no active connection" not in str(exc):
+                raise
+        close_task.cancel()
+        raise ConnectionError(
+            "SQLite connection close did not complete within "
+            f"{_minimum_close_timeout_s():.2f}s"
+        )
+
+    close_error: Optional[BaseException] = None
+    try:
+        close_task.result()
+    except BaseException as exc:
+        close_error = exc
+
+    remaining = max(0.0, deadline - loop.time())
+    try:
+        await _wait_for_aiosqlite_worker_shutdown(
+            connection,
+            timeout_s=remaining,
+        )
+    except asyncio.CancelledError as exc:
+        pending_cancellation = pending_cancellation or exc
+        remaining = max(0.0, deadline - loop.time())
+        await _wait_for_aiosqlite_worker_shutdown(
+            connection,
+            timeout_s=remaining,
+        )
+
+    if pending_cancellation is not None:
+        raise pending_cancellation
+    if close_error is not None:
+        raise close_error
 
 
 class SQLiteBackend(DatabaseBackend):
@@ -254,6 +287,14 @@ class SQLiteBackend(DatabaseBackend):
         self._closing = True
         try:
             drain = self._cancelled_write_drain
+            # Cancelling the Python rollback task does not stop a SQLite VM
+            # already executing in aiosqlite's worker.  Interrupt the actual
+            # connection before waiting for the retained drain so rollback and
+            # close can both fit inside the advertised shutdown reservation.
+            # Do not interrupt an idle connection: SQLite then leaves its WAL
+            # uncheckpointed on close even though the worker terminates.
+            if drain is not None or self._write_lock.locked():
+                await conn.interrupt()
             if drain is not None and drain is not asyncio.current_task():
                 try:
                     async with asyncio.timeout(
@@ -330,7 +371,11 @@ class SQLiteBackend(DatabaseBackend):
             raise
 
     @asynccontextmanager
-    async def _read_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+    async def _read_connection(
+        self,
+        *,
+        diagnostic: bool = False,
+    ) -> AsyncIterator[aiosqlite.Connection]:
         """Return a connection with read-committed semantics for this task.
 
         The shared aiosqlite connection must be used for normal reads and for
@@ -342,23 +387,21 @@ class SQLiteBackend(DatabaseBackend):
         conn = self._ensure_connected()
         drain = self._cancelled_write_drain
         cleanup_failed = self._cancelled_write_drain_error is not None
-        if (
-            self.db_path != ":memory:"
-            and (
-                drain is not None
-                or cleanup_failed
-                or (
-                    self._txn_owner is not None
-                    and self._txn_owner is not asyncio.current_task()
-                )
-            )
+        sibling_transaction = (
+            self._txn_owner is not None
+            and self._txn_owner is not asyncio.current_task()
+        )
+        diagnostic_bypass = diagnostic and (
+            drain is not None or cleanup_failed
+        )
+        if self.db_path != ":memory:" and (
+            sibling_transaction or diagnostic_bypass
         ):
-            # A cancelled aiosqlite statement may remain wedged inside the
-            # shared worker indefinitely, with its queued rollback stuck behind
-            # it. Waiting for that drain before choosing the snapshot path
-            # defeats the fallback. An independent query-only connection sees
-            # only committed state, so it can serve diagnostics immediately
-            # while the shared write path remains fenced.
+            # A different task must not see another task's uncommitted
+            # transaction.  Separately, explicitly diagnostic reads may inspect
+            # committed state while cancellation cleanup keeps the application
+            # path fenced.  Ordinary reads never take that second bypass:
+            # decisions that feed later writes must observe the post-drain state.
             read_conn = await self._open_snapshot_read_connection()
             try:
                 yield read_conn
@@ -366,15 +409,12 @@ class SQLiteBackend(DatabaseBackend):
                 await _close_aiosqlite_connection(read_conn)
             return
 
-        # In-memory databases have no independent committed snapshot. They must
-        # wait for the shared worker's rollback before that connection is safe
-        # to read. File-backed reads reach this wait only when no drain/failure
-        # was visible above.
+        # In-memory databases have no independent committed snapshot. Ordinary
+        # file-backed reads also wait here when cleanup is retained so their
+        # application decisions cannot be made from a stale snapshot.
         await self._wait_for_cancelled_write_drain()
         cleanup_failed = self._cancelled_write_drain_error is not None
         if cleanup_failed:
-            # Only the in-memory path can reach this state: file-backed reads
-            # selected their independent snapshot before waiting.
             self._raise_cancelled_write_drain_error()
 
         yield conn
@@ -670,11 +710,16 @@ class SQLiteBackend(DatabaseBackend):
             if cursor is not None and not cancelled:
                 await cursor.close()
 
-    async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
-        """Fetch a single row."""
+    async def _fetch_one(
+        self,
+        query: str,
+        params: Params,
+        *,
+        diagnostic: bool,
+    ) -> Optional[Row]:
         record_write_query(query)
         try:
-            async with self._read_connection() as conn:
+            async with self._read_connection(diagnostic=diagnostic) as conn:
                 if conn is self._connection:
                     # Serialize the complete shared-connection read unit. This
                     # prevents a writer from queueing between cancellation and
@@ -692,12 +737,27 @@ class SQLiteBackend(DatabaseBackend):
             return row
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-    
-    async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
-        """Fetch all rows."""
+
+    async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
+        """Fetch a single row after retained cancellation cleanup drains."""
+        return await self._fetch_one(query, params, diagnostic=False)
+
+    async def fetch_one_diagnostic(
+        self, query: str, params: Params = ()
+    ) -> Optional[Row]:
+        """Fetch committed state without waiting for retained write cleanup."""
+        return await self._fetch_one(query, params, diagnostic=True)
+
+    async def _fetch_all(
+        self,
+        query: str,
+        params: Params,
+        *,
+        diagnostic: bool,
+    ) -> List[Row]:
         record_write_query(query)
         try:
-            async with self._read_connection() as conn:
+            async with self._read_connection(diagnostic=diagnostic) as conn:
                 if conn is self._connection:
                     async with self._write_guard():
                         rows = await self._fetch_on_connection(
@@ -710,6 +770,16 @@ class SQLiteBackend(DatabaseBackend):
             return rows
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+
+    async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
+        """Fetch all rows after retained cancellation cleanup drains."""
+        return await self._fetch_all(query, params, diagnostic=False)
+
+    async def fetch_all_diagnostic(
+        self, query: str, params: Params = ()
+    ) -> List[Row]:
+        """Fetch committed rows without waiting for retained write cleanup."""
+        return await self._fetch_all(query, params, diagnostic=True)
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
@@ -786,5 +856,13 @@ class SQLiteBackend(DatabaseBackend):
         row = await self.fetch_one(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
             (table_name,)
+        )
+        return row is not None
+
+    async def table_exists_diagnostic(self, table_name: str) -> bool:
+        """Check schema state through the committed diagnostic read path."""
+        row = await self.fetch_one_diagnostic(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
         )
         return row is not None

@@ -1103,6 +1103,81 @@ class TestHeartbeatInterval:
         assert feature._interval_seconds == 120
 
     @pytest.mark.asyncio
+    async def test_interval_restart_does_not_cancel_pending_persistence(
+        self, tmp_path
+    ):
+        """Changing cadence restarts only the loop, not a finite DB write."""
+        backend = SQLiteBackend(str(tmp_path / "health-interval-persist.db"))
+        await backend.connect()
+        db = AsyncDatabase(backend)
+        await db.execute(
+            """
+            CREATE TABLE health_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                overall_healthy INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        agent = _make_agent(db=db)
+        agent.bootstrap_service = None
+        agent.dispatcher = None
+        feat = HealthFeature(agent)
+        feat._db = db
+        feat._agent_id = agent.did
+        feat._interval_seconds = DEFAULT_INTERVAL_SECONDS
+        feat._in_memory_history = []
+        feat._health_persist_tasks = set()
+        feat._running = True
+        old_background = asyncio.create_task(asyncio.Event().wait())
+        feat._background_task = old_background
+        transaction_entered = asyncio.Event()
+        release_transaction = asyncio.Event()
+
+        async def hold_write_lock():
+            async with backend.transaction():
+                transaction_entered.set()
+                await release_transaction.wait()
+
+        holder = asyncio.create_task(hold_write_lock())
+        pending_persist = None
+        try:
+            await transaction_entered.wait()
+            with patch.object(
+                health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.05
+            ):
+                await feat.run_once()
+
+            assert len(feat._health_persist_tasks) == 1
+            pending_persist = next(iter(feat._health_persist_tasks))
+            assert not pending_persist.done()
+
+            result = await feat._apply_interval(120)
+
+            assert result["new_interval_seconds"] == 120
+            assert old_background.cancelled()
+            assert feat._background_task is not old_background
+            assert not pending_persist.cancelled()
+            assert pending_persist in feat._health_persist_tasks
+            assert backend._cancelled_write_drain is None
+
+            release_transaction.set()
+            await holder
+            await pending_persist
+            assert backend._cancelled_write_drain is None
+            assert await db.fetchval("SELECT COUNT(*) FROM health_log") == 1
+        finally:
+            release_transaction.set()
+            await asyncio.gather(holder, return_exceptions=True)
+            if pending_persist is not None:
+                await asyncio.gather(pending_persist, return_exceptions=True)
+            await feat.shutdown()
+            await backend.close()
+
+    @pytest.mark.asyncio
     async def test_clamps_minimum(self, feature):
         """Round 1 honesty: requesting an out-of-range interval is
         silently clamped — surface as PARTIAL with the actual applied

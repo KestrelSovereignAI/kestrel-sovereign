@@ -116,14 +116,7 @@ class HealthFeature(Feature):
 
     async def shutdown(self):
         """Stop the background loop gracefully."""
-        self._running = False
-        if self._background_task and not self._background_task.done():
-            self._background_task.cancel()
-            try:
-                await self._background_task
-            except asyncio.CancelledError:
-                pass
-        self._background_task = None
+        await self._stop_background_loop()
 
         # A timed-out health persistence wait remains live so it cannot install
         # a global SQLite cancellation fence. Teardown still owns that work:
@@ -140,6 +133,17 @@ class HealthFeature(Feature):
         self._health_persist_tasks = set()
         await super().shutdown()
         logger.info("HealthFeature: background loop stopped")
+
+    async def _stop_background_loop(self) -> None:
+        """Stop only the periodic loop, leaving finite persistence owned."""
+        self._running = False
+        if self._background_task and not self._background_task.done():
+            self._background_task.cancel()
+            try:
+                await self._background_task
+            except asyncio.CancelledError:
+                pass
+        self._background_task = None
 
     # =========================================================================
     # Tool commands (canonical !health* form)
@@ -354,9 +358,19 @@ class HealthFeature(Feature):
         history: List[Dict[str, Any]] = []
         if self._db:
             try:
-                exists = await self._db.table_exists("health_log")
+                table_exists = self._db.table_exists
+                if callable(
+                    getattr(type(self._db), "table_exists_diagnostic", None)
+                ):
+                    table_exists = self._db.table_exists_diagnostic
+                exists = await table_exists("health_log")
                 if exists:
-                    rows = await self._db.fetchall(
+                    fetchall = self._db.fetchall
+                    if callable(
+                        getattr(type(self._db), "fetchall_diagnostic", None)
+                    ):
+                        fetchall = self._db.fetchall_diagnostic
+                    rows = await fetchall(
                         """
                         SELECT id, status, checks_json, overall_healthy, created_at
                         FROM health_log
@@ -414,7 +428,7 @@ class HealthFeature(Feature):
         self._interval_seconds = seconds
 
         if self._running:
-            await self.shutdown()
+            await self._stop_background_loop()
             self._start_background_loop()
 
         return {
