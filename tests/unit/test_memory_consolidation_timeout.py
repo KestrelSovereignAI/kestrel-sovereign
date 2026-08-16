@@ -302,6 +302,80 @@ async def test_real_blocked_aiosqlite_write_releases_full_sleep_lock_near_deadli
         await backend.close()
 
 
+async def test_real_blocked_aiosqlite_read_releases_memory_lock_near_deadline(
+    monkeypatch, tmp_path,
+):
+    """A cancelled fetch must not inline-wait on its queued cursor close."""
+    locks = OrderedLockManager()
+    backend = SQLiteBackend(str(tmp_path / "blocked-read-consolidation.db"))
+    await backend.connect()
+    entered_worker = threading.Event()
+    release_worker = threading.Event()
+    watchdog = threading.Timer(2.0, release_worker.set)
+    calls = 0
+
+    def block_on_second_row(value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered_worker.set()
+            release_worker.wait()
+        return value
+
+    try:
+        conn = backend._ensure_connected()
+        await conn.create_function("block_on_second_row", 1, block_on_second_row)
+        await backend.execute("CREATE TABLE memories (value INTEGER NOT NULL)")
+        await backend.execute_many(
+            "INSERT INTO memories (value) VALUES (?)", [(1,), (2,)]
+        )
+
+        async def run_consolidation():
+            await backend.fetch_all(
+                "SELECT block_on_second_row(value) FROM memories"
+            )
+            return {"episodes_created": 1}
+
+        timeout_seconds = 0.05
+        monkeypatch.setattr(
+            "kestrel_sovereign.storage.memory_system.load_section",
+            lambda _section: {
+                "memory_consolidation_timeout_seconds": timeout_seconds
+            },
+        )
+        memory_system = MemorySystem(
+            storage=SimpleNamespace(), agent_id="did:test:real-sqlite-read"
+        )
+        memory_system.consolidator = SimpleNamespace(
+            run_consolidation=run_consolidation
+        )
+        feature = _feature(memory_system, locks)
+
+        watchdog.start()
+        started = time.monotonic()
+        result = await feature.memory_consolidate()
+        elapsed = time.monotonic() - started
+
+        assert entered_worker.is_set()
+        assert elapsed >= timeout_seconds
+        assert elapsed < timeout_seconds + 0.5
+        assert result.status is ToolResultStatus.ERROR
+        assert "configured 0.05-second deadline" in result.error
+        assert not locks.is_held(ResourceLock.MEMORY)
+        assert backend.write_connection_unavailable
+
+        release_worker.set()
+        async with asyncio.timeout(1.0):
+            await backend.execute("UPDATE memories SET value = value + 10")
+        assert await backend.fetch_all(
+            "SELECT value FROM memories ORDER BY value"
+        ) == [(11,), (12,)]
+    finally:
+        watchdog.cancel()
+        release_worker.set()
+        await backend.close()
+
+
 async def test_parent_cancellation_unwinds_and_releases_memory_lock(monkeypatch):
     locks = OrderedLockManager()
     entered = asyncio.Event()

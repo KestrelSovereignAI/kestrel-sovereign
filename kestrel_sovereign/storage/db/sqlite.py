@@ -9,7 +9,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Literal, Optional, overload
 
 import aiosqlite
 
@@ -133,14 +133,16 @@ class SQLiteBackend(DatabaseBackend):
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
-        # Serializes write *units* on the single shared connection. aiosqlite
+        # Serializes operation *units* on the single shared connection. aiosqlite
         # serializes individual operations, but NOT the execute->commit/rollback
         # pair: without this, two concurrent autocommit writers share one
         # connection-scoped transaction, so one writer's failed rollback() can
         # discard the other's uncommitted write (#1675). The lock makes each
         # autocommit statement and each explicit transaction an atomic write
-        # unit. Re-entrant for the task that owns an open transaction (its own
-        # statements must not deadlock on the lock it already holds).
+        # unit. Shared-connection reads also hold it through cursor cleanup so a
+        # cancellation drain is queued before another operation can overtake it.
+        # Re-entrant for the task that owns an open transaction (its own
+        # statements and reads must not deadlock on the lock it already holds).
         self._write_lock = asyncio.Lock()
         self._txn_owner: Optional["asyncio.Task"] = None
         # aiosqlite cannot cancel work already running in its worker thread.
@@ -379,12 +381,13 @@ class SQLiteBackend(DatabaseBackend):
     
     @asynccontextmanager
     async def _write_guard(self) -> AsyncIterator[None]:
-        """Hold the connection write lock for one atomic write unit.
+        """Hold the shared-connection lock for one atomic operation unit.
 
         Re-entrant only for the task that owns an open transaction: that task's
         own statements run under the lock it already holds (no deadlock), while
-        every other writer — autocommit or a different task — must acquire the
-        lock and therefore waits until the in-flight write unit completes.
+        every other shared-connection operation must acquire the lock and wait
+        until the in-flight unit completes. File-backed sibling reads may use
+        the independent snapshot path instead.
         """
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
             yield
@@ -496,8 +499,9 @@ class SQLiteBackend(DatabaseBackend):
 
         drain = self._cancelled_write_drain
         if drain is not None and not drain.done():
-            # The write lock permits only one autocommit unit or transaction to
-            # reach this path, so a second live drain signals an invariant bug.
+            # The shared-connection lock permits only one operation unit or
+            # transaction to reach this path, so a second live drain signals an
+            # invariant bug.
             self._cancelled_write_drain_error = RuntimeError(
                 "overlapping SQLite cancellation drains"
             )
@@ -594,19 +598,98 @@ class SQLiteBackend(DatabaseBackend):
                     await self._rollback_after_failure(conn)
                 raise
 
+    @overload
+    async def _fetch_on_connection(
+        self,
+        conn: aiosqlite.Connection,
+        query: str,
+        params: Params,
+        *,
+        one: Literal[True],
+    ) -> Optional[Row]: ...
+
+    @overload
+    async def _fetch_on_connection(
+        self,
+        conn: aiosqlite.Connection,
+        query: str,
+        params: Params,
+        *,
+        one: Literal[False],
+    ) -> List[Row]: ...
+
+    async def _fetch_on_connection(
+        self,
+        conn: aiosqlite.Connection,
+        query: str,
+        params: Params,
+        *,
+        one: bool,
+    ) -> Optional[Row] | List[Row]:
+        """Run a read without making cancelled cursor cleanup an inline drain.
+
+        ``Cursor.close()`` is queued on the aiosqlite worker. If cancellation
+        lands while ``execute``/``fetch*`` is stuck in that worker, awaiting
+        cursor close from ``finally`` waits behind the same stuck statement and
+        defeats the caller's deadline. On the shared connection, hand the queue
+        drain to the retained rollback fence used by cancelled writes; snapshot
+        connections remain owned by :meth:`_read_connection` and close there.
+        """
+        cursor: Optional[aiosqlite.Cursor] = None
+        cancelled = False
+        try:
+            cursor = await conn.execute(query, params)
+            result = await (cursor.fetchone() if one else cursor.fetchall())
+            cursor_to_close = cursor
+            cursor = None
+            await cursor_to_close.close()
+            if one:
+                return None if result is None else tuple(result)
+            return [tuple(row) for row in result]
+        except asyncio.CancelledError:
+            cancelled = True
+            if conn is self._connection and not self._in_transaction:
+                self._handoff_cancelled_write(conn)
+            elif conn is not self._connection:
+                # A snapshot is private to this read, so it needs no shared
+                # transaction fence. Interrupt its current SQLite operation so
+                # _read_connection can close the owned worker without waiting
+                # for the abandoned query to finish naturally.
+                try:
+                    await conn.interrupt()
+                except Exception:
+                    logger.exception(
+                        "Failed to interrupt cancelled SQLite snapshot read"
+                    )
+            raise
+        finally:
+            # Ordinary failures still close synchronously. Cancellation skips
+            # this queue operation: the retained rollback (or enclosing
+            # transaction) is the terminal worker marker for the abandoned
+            # cursor operation.
+            if cursor is not None and not cancelled:
+                await cursor.close()
+
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
         record_write_query(query)
         try:
             async with self._read_connection() as conn:
-                cursor = await conn.execute(query, params)
-                try:
-                    row = await cursor.fetchone()
-                finally:
-                    await cursor.close()
-            if row is None:
-                return None
-            return tuple(row)
+                if conn is self._connection:
+                    # Serialize the complete shared-connection read unit. This
+                    # prevents a writer from queueing between cancellation and
+                    # the retained rollback marker. Transaction-owner reads are
+                    # re-entrant; sibling transaction reads already selected a
+                    # committed snapshot in ``_read_connection``.
+                    async with self._write_guard():
+                        row = await self._fetch_on_connection(
+                            conn, query, params, one=True
+                        )
+                else:
+                    row = await self._fetch_on_connection(
+                        conn, query, params, one=True
+                    )
+            return row
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
     
@@ -615,12 +698,16 @@ class SQLiteBackend(DatabaseBackend):
         record_write_query(query)
         try:
             async with self._read_connection() as conn:
-                cursor = await conn.execute(query, params)
-                try:
-                    rows = await cursor.fetchall()
-                finally:
-                    await cursor.close()
-            return [tuple(row) for row in rows]
+                if conn is self._connection:
+                    async with self._write_guard():
+                        rows = await self._fetch_on_connection(
+                            conn, query, params, one=False
+                        )
+                else:
+                    rows = await self._fetch_on_connection(
+                        conn, query, params, one=False
+                    )
+            return rows
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
     

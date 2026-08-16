@@ -399,6 +399,136 @@ class TestSQLiteBackend:
             )
 
     @pytest.mark.asyncio
+    async def test_worker_blocked_read_cancellation_hands_off_drain(self, backend):
+        """A cancelled fetch returns before its queued cursor close can drain."""
+        await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
+        await backend.execute_many(
+            "INSERT INTO t (value) VALUES (?)", [(1,), (2,)]
+        )
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+        calls = 0
+
+        def block_on_second_row(value):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered_worker.set()
+                release_worker.wait()
+            return value
+
+        conn = backend._ensure_connected()
+        await conn.create_function("block_on_second_row", 1, block_on_second_row)
+        blocked_read = asyncio.create_task(
+            backend.fetch_all("SELECT block_on_second_row(value) FROM t")
+        )
+        following_write = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked_read.cancel()
+            # Do not add an outer timeout here: its second cancellation would
+            # make the old inline cursor-close path look bounded. The first
+            # cancellation must reach the caller on its own.
+            await asyncio.sleep(0.05)
+            assert blocked_read.done()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+            assert backend.write_connection_unavailable
+
+            following_write = asyncio.create_task(
+                backend.execute("UPDATE t SET value = value + 10")
+            )
+            await asyncio.sleep(0.02)
+            assert not following_write.done()
+
+            release_worker.set()
+            async with asyncio.timeout(1.0):
+                await following_write
+            assert await backend.fetch_all(
+                "SELECT value FROM t ORDER BY value"
+            ) == [(11,), (12,)]
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            if not blocked_read.done():
+                blocked_read.cancel()
+            if following_write is not None and not following_write.done():
+                following_write.cancel()
+            await asyncio.gather(
+                blocked_read,
+                *([following_write] if following_write is not None else []),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_snapshot_read_interrupts_before_owned_close(
+        self, backend, monkeypatch
+    ):
+        """A long snapshot query cannot trap cancellation in connection close."""
+        if backend.db_path == ":memory:":
+            pytest.skip("in-memory SQLite has no independent snapshot connection")
+
+        transaction_entered = asyncio.Event()
+        release_transaction = asyncio.Event()
+
+        async def hold_transaction():
+            async with backend.transaction():
+                transaction_entered.set()
+                await release_transaction.wait()
+
+        original_open_snapshot = backend._open_snapshot_read_connection
+        entered_snapshot_worker = threading.Event()
+
+        async def open_observed_snapshot():
+            conn = await original_open_snapshot()
+            await conn.set_progress_handler(entered_snapshot_worker.set, 100)
+            return conn
+
+        monkeypatch.setattr(
+            backend, "_open_snapshot_read_connection", open_observed_snapshot
+        )
+        transaction = asyncio.create_task(hold_transaction())
+        snapshot_read = None
+        try:
+            await transaction_entered.wait()
+            snapshot_read = asyncio.create_task(
+                backend.fetch_all(
+                    """
+                    WITH RECURSIVE count(value) AS (
+                        SELECT 1
+                        UNION ALL
+                        SELECT value + 1 FROM count WHERE value < 100000000
+                    )
+                    SELECT sum(value) FROM count
+                    """
+                )
+            )
+            async with asyncio.timeout(0.5):
+                while not entered_snapshot_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            snapshot_read.cancel()
+            # A second cancellation would hide an inline-close regression.
+            await asyncio.sleep(0.05)
+            assert snapshot_read.done()
+            with pytest.raises(asyncio.CancelledError):
+                await snapshot_read
+        finally:
+            release_transaction.set()
+            if snapshot_read is not None and not snapshot_read.done():
+                snapshot_read.cancel()
+            await asyncio.gather(
+                transaction,
+                *([snapshot_read] if snapshot_read is not None else []),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_worker_blocked_write_fences_following_transaction(self, backend):
         """A same-continuation transaction cannot overtake retained rollback."""
         await backend.execute("CREATE TABLE t (value INTEGER NOT NULL)")
