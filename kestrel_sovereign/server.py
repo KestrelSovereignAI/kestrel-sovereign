@@ -1726,7 +1726,6 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
-            owner_id=f"host-scheduler-preflight:{os.getpid()}",
         )
         # This is intentionally ``_ensure_tables`` rather than ``start``.  It
         # establishes the durable schema/provenance/rollout state but never
@@ -1856,7 +1855,6 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
-            owner_id=f"host-scheduler:{os.getpid()}",
         )
         # ``runner.start`` runs schema migration / rollout fencing and can fail.
         # Publish it first so cleanup also reaches a partially-started runner.
@@ -1886,7 +1884,6 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     SchedulerFeature._load_max_concurrent_tasks()
                 ),
                 lease_seconds=SchedulerFeature._load_lease_seconds(),
-                owner_id=f"host-scheduler-register:{os.getpid()}:{agent_id}",
             )
             registration = await tenant_runner.prepare_tenant_registration()
 

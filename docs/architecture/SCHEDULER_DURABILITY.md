@@ -112,8 +112,11 @@ and freshness use database statement time, so skew between PostgreSQL replica
 process clocks cannot make a current worker stale or preserve an old one. The
 reader selects only the current freshness window (plus at most one prior-owner
 diagnostic row), and publication reaps reports older than 24 hours, so random
-per-process owner IDs cannot grow health-query work without bound. Fleet
-inventory is loaded once per heartbeat and owner reports are batch-upserted.
+per-runner owner IDs cannot grow health-query work without bound. Each owner ID
+is an opaque UUID created once for a runner lifetime: it neither depends on a
+container PID that peer replicas may share nor contains an agent identifier.
+Fleet inventory is loaded once per heartbeat and owner reports are
+batch-upserted.
 The normal PostgreSQL bootstrap only inspects the existing composite key; an
 exclusive table lock is taken only for the legacy single-key migration and has
 a five-second lock timeout. The report contains worker state, tick timestamps,
