@@ -69,17 +69,39 @@ def test_every_channel_excludes_every_dump_shape(channel, pattern):
     )
 
 
+def _is_dump_shaped(pattern: str) -> bool:
+    """Whether an ignore rule looks like it is about a database dump.
+
+    Deliberately decided by SHAPE, not by membership of :data:`DUMP_PATTERNS`.
+    An earlier version of the test below filtered to the known list first,
+    which made it vacuous: the parameterized test above already requires every
+    known pattern in every channel, so comparing only known patterns could
+    never fail. A new suffix added to one channel — the actual drift this
+    guards — was invisible.
+
+    ``*.sqlite``/``*.sqlite3``/``*.sqlite-wal`` are live database files rather
+    than dumps and are excluded on their own terms elsewhere; ``endswith``
+    rather than a substring test keeps them out of this set.
+    """
+    p = pattern.lower()
+    return "dump" in p or p.endswith(".sql") or p.endswith(".sql.gz")
+
+
 def test_the_channels_agree_exactly():
-    """No channel may carry a dump pattern the others lack.
+    """No channel may carry a dump rule the others lack.
 
     Drift in this direction is the quiet failure: a reviewer sees the pattern
     present in the file they are reading and concludes the class is handled.
+    Whoever adds a new dump suffix must add it everywhere, and this fails until
+    they do — including for suffixes nobody has thought of yet.
     """
     per_channel = {
-        channel: {p for p in _patterns(channel) if p in DUMP_PATTERNS}
+        channel: {p for p in _patterns(channel) if _is_dump_shaped(p)}
         for channel in EXCLUSION_CHANNELS
     }
-    assert len(set(map(frozenset, per_channel.values()))) == 1, (
-        "dump patterns have drifted between exclusion channels: "
+    distinct = set(map(frozenset, per_channel.values()))
+    assert len(distinct) == 1, (
+        "dump rules have drifted between exclusion channels — a dump matching "
+        "the extra rule leaves the machine through the channels that lack it: "
         + "; ".join(f"{c} has {sorted(p)}" for c, p in per_channel.items())
     )
