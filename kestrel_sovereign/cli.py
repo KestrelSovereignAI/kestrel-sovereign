@@ -1347,20 +1347,47 @@ def cmd_migrate_encryption(args) -> int:
 
 
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
-    """Best-effort check that the agent process isn't holding the DB."""
-    try:
-        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+    """Whether anything might currently hold this agent's database open.
 
+    A per-agent PID file only exists in MULTI-PROCESS mode. The default
+    deployment runs every agent in-process under one uvicorn host, which writes
+    a single ``logs/.host.pid`` — so the absence of a per-agent PID file is the
+    NORMAL shape, not evidence the agent is stopped. Reading it as "not running"
+    reported four live agents as stopped and let a CLI open a second connection
+    to a database a running agent was using (#2920).
+    """
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    try:
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        pid_file = ProcessManager.agent_pid_file(resolved_dir)
-        pid = ProcessManager.read_pid(pid_file)
-        if pid is None:
-            return False
-        return ProcessManager.is_process_running(pid)
+        pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
+        if pid is not None:
+            return ProcessManager.is_process_running(pid)
+
+        # No per-agent PID file: fall through to the in-process host. The host
+        # owns every agent in ``multi_agent.toml``, so a live host means this
+        # agent's database may be open even though nothing names the agent.
+        from kestrel_sovereign.cli_lifecycle import _host_pid_path
+
+        host_pid = ProcessManager.read_pid(_host_pid_path(project_dir))
+        return host_pid is not None and ProcessManager.is_process_running(host_pid)
     except Exception:
-        # If we can't tell, err on the side of letting the user proceed
-        # — they get a clear error from the storage layer if it's locked.
-        return False
+        # Previously this returned False — "err on the side of letting the user
+        # proceed, they get a clear error from the storage layer if it's
+        # locked". That assumption is what failed in #2920: the caller got no
+        # error at all and the LIVE agent absorbed the contention, falling into
+        # Safe Mode. The cost of a false "running" is a recoverable refusal the
+        # operator clears with `kestrel stop`; the cost of a false "stopped" is
+        # paid by a third party that never sees the command. Fail closed.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not determine whether agent '%s' is running; assuming it is. "
+            "Stop the agent (or the host) and retry.",
+            agent_name,
+            exc_info=True,
+        )
+        return True
 
 
 def cmd_setup(args) -> int:

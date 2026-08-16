@@ -875,3 +875,66 @@ def test_anchor_overlay_targets_the_database_doctor_reads(
     assert seen["runtime_dsn"] == doctors_view["KESTREL_DATABASE_URL"]
     assert seen["runtime_backend"] == doctors_view["KESTREL_DB_BACKEND"]
     assert seen["runtime_dsn"] == "postgresql://from-file/db"
+
+
+# ---------------------------------------------------------------------------
+# The running-agent guard itself (#2920). Every test above PATCHES
+# ``_agent_appears_running``; these drive the real thing, because what it
+# reports is what stands between a CLI and a live agent's database.
+# ---------------------------------------------------------------------------
+
+class _Cfg:
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+
+
+def test_guard_sees_an_agent_running_in_process_under_the_host(reanchor_env):
+    """A per-agent PID file only exists in MULTI-PROCESS mode.
+
+    The default deployment runs every agent in one uvicorn host, so no agent
+    has its own PID file — and reading that absence as "stopped" reported four
+    live agents as stopped, which is how #2920's inspection reached a database
+    a running agent was using. ``os.getpid()`` is a PID that is certainly
+    alive, which is the whole claim under test.
+    """
+    from kestrel_sovereign.cli import _agent_appears_running
+
+    logs = reanchor_env / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / ".host.pid").write_text(str(os.getpid()))
+
+    assert _agent_appears_running(reanchor_env, "Test", _Cfg("agent_data/Test")) is True
+
+
+def test_guard_reports_stopped_only_when_no_pid_file_is_live(reanchor_env):
+    """With neither a per-agent nor a host PID, nothing holds the database."""
+    from kestrel_sovereign.cli import _agent_appears_running
+
+    assert not (reanchor_env / "logs" / ".host.pid").exists()
+    assert _agent_appears_running(reanchor_env, "Test", _Cfg("agent_data/Test")) is False
+
+
+def test_guard_fails_closed_when_it_cannot_tell(reanchor_env):
+    """An undecidable probe must refuse, not wave the caller through.
+
+    The old fallback returned False — "they get a clear error from the storage
+    layer if it's locked". In #2920 the caller got no error at all; the LIVE
+    agent absorbed the contention and fell into Safe Mode. A false "running"
+    costs a refusal the operator clears with `kestrel stop`; a false "stopped"
+    is paid by a third party that never sees the command.
+    """
+    from kestrel_sovereign.cli import _agent_appears_running
+
+    broken = _Cfg("agent_data/Test")
+    del broken.data_dir  # any probe failure, not a specific one
+
+    assert _agent_appears_running(reanchor_env, "Test", broken) is True
+
+
+def test_host_pid_path_does_not_create_the_directory_it_reports(tmp_path):
+    """Asking "is a host running?" must not touch the tree being inspected."""
+    from kestrel_sovereign.cli_lifecycle import _host_pid_path
+
+    path = _host_pid_path(tmp_path)
+    assert path == tmp_path / "logs" / ".host.pid"
+    assert not path.parent.exists()

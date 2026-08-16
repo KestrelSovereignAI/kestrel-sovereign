@@ -196,13 +196,23 @@ def _format_uptime(pid: int) -> str:
 # Host PID / log file paths
 # ---------------------------------------------------------------------------
 
-def _host_pid_file(project_dir: Optional[Path] = None) -> Path:
-    """PID file for the host process."""
+def _host_pid_path(project_dir: Optional[Path] = None) -> Path:
+    """Where the host process's PID file lives, without creating anything.
+
+    Readers asking "is a host running?" must not have a side effect on the
+    filesystem they are inspecting; ``_host_pid_file`` keeps the ``mkdir`` for
+    the writers that are about to put a PID there (#2920).
+    """
     if project_dir is None:
         project_dir = cli._get_project_dir()
-    logs_dir = project_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir / ".host.pid"
+    return project_dir / "logs" / ".host.pid"
+
+
+def _host_pid_file(project_dir: Optional[Path] = None) -> Path:
+    """PID file for the host process, ensuring ``logs/`` exists."""
+    path = _host_pid_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _host_log_file(project_dir: Optional[Path] = None) -> Path:
