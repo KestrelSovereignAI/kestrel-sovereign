@@ -897,3 +897,30 @@ def test_describe_core_change_names_before_after_and_expected():
     assert fr.describe_core_change(
         _shape("0.52.0", "/src/core"), _shape("0.53.0", "/src/core"), policy,
     ) is None
+
+
+def test_a_malformed_pypi_spec_fails_closed_rather_than_satisfying_everything():
+    """An unevaluable rule is not a rule that is met.
+
+    `version_satisfies` answers True when a spec will not parse — safe for the
+    reporting caller it was written for, catastrophic for the guard: every
+    installed version "satisfies" a garbage window. And the constraint rendered
+    from it is `<pkg><spec>`, which for `banana` is the package NAME
+    `kestrel-sovereignbanana` — pinning something that does not exist and
+    leaving core entirely free while verification reports conformity. A guard
+    that pins an unrelated package and then claims success is worse than none.
+    """
+    policy = fr.CoreSourcePolicy(pypi="banana")
+    shape = _shape("0.53.0")
+
+    assert not fr.spec_is_valid("banana")
+    assert fr.spec_is_valid(">=0.52,<0.54") and fr.spec_is_valid("")
+    # Fails closed, and emits no constraint rather than a fake one.
+    assert not fr.core_install_matches(shape, policy)
+    assert fr.core_install_constraints(shape, policy) == []
+    # A valid spec is unaffected.
+    good = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert fr.core_install_matches(shape, good)
+    assert fr.core_install_constraints(shape, good) == [
+        f"{fr.CORE_DISTRIBUTION}>=0.52,<0.54",
+    ]

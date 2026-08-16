@@ -1876,3 +1876,26 @@ def test_a_failed_core_action_stops_the_batch(
     assert not any(
         "kestrel-feature-voice" in " ".join(cmd) for cmd in venv.commands
     ), venv.commands
+
+
+def test_the_manifest_rejects_a_malformed_pypi_spec(tmp_path):
+    """Caught where the operator can see which line is wrong.
+
+    Downstream it fails silently: the spec renders into a constraint naming a
+    different package, and every version satisfies the window. Failing at load
+    keeps a typo from becoming a guard that reports success over an unprotected
+    core.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = "banana"\n')
+
+    with pytest.raises(ValueError) as exc:
+        cli_features._load_host_manifest(manifest)
+
+    msg = str(exc.value)
+    assert "not a valid PEP 440" in msg and "banana" in msg
+
+    # The valid forms still load, including "" (any version from the index).
+    for spec in (">=0.3,<0.4", "", "==1.2.3"):
+        manifest.write_text(f'[[feature]]\nname = "voice"\npypi = "{spec}"\n')
+        assert cli_features._load_host_manifest(manifest)[0]["pypi"] == spec

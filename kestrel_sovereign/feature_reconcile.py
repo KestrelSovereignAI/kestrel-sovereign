@@ -472,6 +472,12 @@ def core_install_constraints(
     if policy.editable:
         return [f"{CORE_DISTRIBUTION}=={shape.version}"] if shape.version else []
     if policy.pypi:
+        if not spec_is_valid(policy.pypi):
+            # `<pkg><garbage>` is not a constraint on <pkg> — for `banana` it
+            # renders the package NAME `kestrel-sovereignbanana`, pinning
+            # something that does not exist and leaving core free. Emit nothing
+            # rather than a line that looks like protection and is not.
+            return []
         return [f"{CORE_DISTRIBUTION}{policy.pypi}"]
     if policy.hold_version is not None:
         # Source unverifiable, so pin the version. That is the mechanism a
@@ -487,12 +493,32 @@ def core_install_constraints(
     return []
 
 
+def spec_is_valid(spec: Optional[str]) -> bool:
+    """Is *spec* an evaluable PEP 440 specifier? Empty counts as valid ("any")."""
+    if not spec:
+        return True
+    try:
+        from packaging.specifiers import SpecifierSet
+
+        SpecifierSet(spec)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def version_satisfies(version: Optional[str], spec: Optional[str]) -> bool:
     """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
 
     An empty spec means "any version". A missing version never satisfies a
     non-empty spec. When the spec can't be evaluated (malformed value) we
-    conservatively return True rather than manufacture a violation.
+    conservatively return True rather than manufacture a violation — safe for a
+    *reporting* caller, which is what this was written for.
+
+    It is NOT safe for the core guard, and that caller must not use it alone:
+    "I could not evaluate the rule" reading as "the rule is met" is the
+    fail-open this whole change exists to remove. :func:`core_install_matches`
+    checks :func:`spec_is_valid` first for exactly that reason, and the manifest
+    loader rejects a malformed spec before it ever gets here.
     """
     if not spec:
         return True
@@ -529,6 +555,12 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
     if policy.editable:
         return _same_path(shape.editable_path, policy.editable)
     if policy.pypi is not None:
+        if not spec_is_valid(policy.pypi):
+            # A rule we cannot evaluate is not a rule that is met. The loader
+            # rejects this shape, so reaching here means the policy came from
+            # somewhere that skipped validation — fail closed rather than let
+            # `version_satisfies`'s reporting-safe True stand in for a verdict.
+            return False
         return (
             shape.version is not None
             and not shape.is_editable

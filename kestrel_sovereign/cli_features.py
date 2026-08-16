@@ -716,6 +716,26 @@ def _load_host_manifest(path: Path) -> list:
                 f"manifest '{label}': 'pypi' must be a string version spec "
                 "(e.g. \">=0.3,<0.4\" or \"\" for any)"
             )
+        if pypi:
+            # Reject a malformed specifier HERE, where the operator can see
+            # which line is wrong. Downstream it fails silently and expensively:
+            # `version_satisfies` conservatively answers True when a spec will
+            # not evaluate, so every installed version "satisfies" a garbage
+            # window — and the constraint rendered from it is `<pkg><spec>`,
+            # which for `banana` is the package NAME `kestrel-sovereignbanana`
+            # and so constrains nothing at all. A guard that pins an unrelated
+            # package and then reports conformity is worse than no guard,
+            # because it reports success (issue #2949).
+            from packaging.specifiers import InvalidSpecifier, SpecifierSet
+
+            try:
+                SpecifierSet(pypi)
+            except (InvalidSpecifier, ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"manifest '{label}': 'pypi' is not a valid PEP 440 version "
+                    f"spec: {pypi!r} ({exc}). Use e.g. \">=0.3,<0.4\", or \"\" "
+                    "for any version from the index."
+                ) from exc
         if editable is not None and pypi is not None:
             raise ValueError(
                 f"manifest '{label}': 'editable' and 'pypi' are mutually "
