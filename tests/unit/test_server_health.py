@@ -292,6 +292,54 @@ def test_health_fails_for_enabled_standalone_scheduler_without_runner():
     }
 
 
+def test_detailed_health_fails_for_enabled_scheduler_without_live_worker():
+    """Cached subsystem health cannot mask a missing scheduler worker."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
+        return_value={"status": "healthy", "checks": []}
+    )
+    health_feature.__class__.__name__ = "HealthFeature"
+    agent = SimpleNamespace(
+        features={
+            "HealthFeature": health_feature,
+            "SchedulerFeature": SimpleNamespace(
+                enabled=True,
+                _runner=None,
+                _polling_managed_by_host=False,
+            ),
+        }
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "Scheduler unavailable"
+    assert response.json()["scheduler_readiness_failures"] == []
+    health_feature.get_latest.assert_not_awaited()
+
+
 def test_host_managed_scheduler_without_scoped_runner_uses_host_worker():
     """A shared host runner backs features that intentionally omit local pollers."""
     from kestrel_sovereign.server import _active_scheduler_workers_available

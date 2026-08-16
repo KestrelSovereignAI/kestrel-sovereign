@@ -3463,10 +3463,13 @@ async def health_detailed(request: Request):
                 "tracing": tracing,
             },
         )
+    scheduler_workers_available = _active_scheduler_workers_available(
+        request.app, agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state, "scheduler_readiness_failures", []
     )
-    if scheduler_failures:
+    if scheduler_failures or not scheduler_workers_available:
         return JSONResponse(
             status_code=503,
             content={
