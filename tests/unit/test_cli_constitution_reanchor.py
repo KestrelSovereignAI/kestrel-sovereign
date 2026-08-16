@@ -148,7 +148,7 @@ def test_reanchor_refuses_when_agent_appears_running(reanchor_env, capsys):
     with patch(
         "kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env,
     ), patch(
-        "kestrel_sovereign.cli._agent_appears_running", return_value=True,
+        "kestrel_sovereign.cli._agent_db_holder", return_value="agent",
     ), patch(
         "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution"
     ) as mock_reanchor:
@@ -208,7 +208,7 @@ def test_reanchor_targets_the_database_doctor_reads(reanchor_env, monkeypatch):
         )
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_capture,
@@ -233,7 +233,7 @@ def test_reanchor_unchanged_returns_zero(reanchor_env, capsys):
         unchanged=True,
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -266,7 +266,7 @@ def test_reanchor_same_hash_edge_repair_reports_removed(
         stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -295,7 +295,7 @@ def test_reanchor_stale_edge_drift_unforced_returns_one(reanchor_env, capsys):
         stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -327,7 +327,7 @@ def test_reanchor_success_with_stale_edges_reports_reanchored(
         stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -353,7 +353,7 @@ def test_reanchor_drift_unforced_returns_one(reanchor_env, capsys):
         drift_unforced=True,
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -379,7 +379,7 @@ def test_reanchor_success_prints_old_new_and_backup(reanchor_env, capsys):
         reanchored=True,
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -405,7 +405,7 @@ def test_reanchor_helper_error_propagates(reanchor_env, capsys):
         error="Cannot read canonical constitution at /fake/canonical.md: [Errno 2]",
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -438,7 +438,7 @@ def test_reanchor_passes_authority_paths_to_shared_helper(reanchor_env):
         return result
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_capture,
@@ -481,7 +481,7 @@ def test_reanchor_reads_the_agent_homes_env_not_the_operators_shell(
     ])
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None):
         rc = cmd_constitution(args)
 
     assert rc == 1
@@ -520,7 +520,7 @@ def test_reanchor_env_does_not_override_an_exported_value(
     )
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -546,7 +546,7 @@ def test_reanchor_output_names_the_database_it_wrote(reanchor_env, capsys):
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -577,7 +577,7 @@ def test_unforced_drift_on_postgres_does_not_promise_a_file_backup(
     args = _parse(["constitution", "reanchor", "--agent-name", "Test"])
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_stubbed_helper(result),
@@ -606,7 +606,7 @@ def test_anchor_overlay_reads_the_agent_homes_env_too(
     args = _parse(["constitution", "anchor-overlay", "--agent-name", "Test"])
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None):
         rc = cmd_constitution(args)
 
     assert rc == 1
@@ -662,7 +662,7 @@ def test_reanchor_refuses_a_data_key_that_will_not_open_the_target(
         called = True
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_must_not_run,
@@ -701,7 +701,7 @@ def test_reanchor_proceeds_when_the_keys_agree(reanchor_env, monkeypatch):
         )
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_capture,
@@ -728,7 +728,7 @@ def test_reanchor_refuses_a_blank_project_key_against_an_exported_one(
 
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None):
         rc = cmd_constitution(args)
 
     assert rc == 2
@@ -763,7 +763,7 @@ def test_a_key_only_in_the_environment_is_not_a_conflict(
         )
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_capture,
@@ -805,7 +805,7 @@ def test_a_per_agent_key_outranks_a_mismatched_fleet_key(
         )
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
              side_effect=_capture,
@@ -826,7 +826,7 @@ def test_a_mismatched_per_agent_key_is_still_refused(
 
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False):
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None):
         assert cmd_constitution(args) == 2
 
     assert "KESTREL_DATA_KEY" in capsys.readouterr().err
@@ -864,7 +864,7 @@ def test_anchor_overlay_targets_the_database_doctor_reads(
         return OverlayAnchorResult(agent_name="Test", unchanged=True, new_hash="a" * 64)
 
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
-         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch("kestrel_sovereign.cli._agent_db_holder", return_value=None), \
          patch(
              "kestrel_sovereign.setup.overlay_anchor.anchor_overlay",
              side_effect=_capture,
@@ -938,3 +938,69 @@ def test_host_pid_path_does_not_create_the_directory_it_reports(tmp_path):
     path = _host_pid_path(tmp_path)
     assert path == tmp_path / "logs" / ".host.pid"
     assert not path.parent.exists()
+
+
+def test_refusal_for_an_in_process_host_names_a_command_that_can_clear_it(
+    reanchor_env, capsys,
+):
+    """A refusal must name a command that actually clears what it detected.
+
+    `kestrel stop <agent>` stops a per-agent process or reaps its port; against
+    the in-process host it reports "not running" and leaves `logs/.host.pid`
+    alive. Telling the operator to run it would refuse every retry with advice
+    that cannot work — the same defect shape as an error message prescribing a
+    no-op repair (#2924).
+    """
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch(
+        "kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env,
+    ), patch(
+        "kestrel_sovereign.cli._agent_db_holder", return_value="host",
+    ), patch(
+        "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution"
+    ) as mock_reanchor:
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "in-process" in err
+    assert "`kestrel stop`" in err
+    # The per-agent form must not be the instruction: it cannot stop the host.
+    assert "Run `kestrel stop Test` first" not in err
+    mock_reanchor.assert_not_called()
+
+
+def test_refusal_when_the_probe_itself_failed_says_so(reanchor_env, capsys):
+    """Fail-closed must explain itself, not impersonate a positive detection."""
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+    with patch(
+        "kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env,
+    ), patch(
+        "kestrel_sovereign.cli._agent_db_holder", return_value="unknown",
+    ), patch(
+        "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution"
+    ) as mock_reanchor:
+        rc = cmd_constitution(args)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "could not determine" in err.lower()
+    assert "kestrel status" in err
+    mock_reanchor.assert_not_called()
+
+
+def test_guard_reports_which_source_holds_the_database(reanchor_env):
+    """The source is the load-bearing part — it selects the remedy."""
+    from kestrel_sovereign.cli import _agent_db_holder
+
+    cfg = _Cfg("agent_data/Test")
+    assert _agent_db_holder(reanchor_env, "Test", cfg) is None
+
+    logs = reanchor_env / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / ".host.pid").write_text(str(os.getpid()))
+    assert _agent_db_holder(reanchor_env, "Test", cfg) == "host"
+
+    agent_pid = reanchor_env / "agent_data" / "Test" / "agent.pid"
+    agent_pid.write_text(str(os.getpid()))
+    assert _agent_db_holder(reanchor_env, "Test", cfg) == "agent"

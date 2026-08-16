@@ -1001,12 +1001,9 @@ def cmd_constitution_reanchor(args) -> int:
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
     # than probing the network — same source-of-truth as `kestrel stop`.
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
-        print(
-            f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
-            file=sys.stderr,
-        )
+    holder = _agent_db_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder is not None:
+        print(_running_agent_refusal(args.agent_name, holder), file=sys.stderr)
         return 2
 
     result = asyncio.run(
@@ -1147,12 +1144,9 @@ def cmd_constitution_anchor_overlay(args) -> int:
         )
         return 2
 
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
-        print(
-            f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
-            file=sys.stderr,
-        )
+    holder = _agent_db_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder is not None:
+        print(_running_agent_refusal(args.agent_name, holder), file=sys.stderr)
         return 2
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
@@ -1346,15 +1340,21 @@ def cmd_migrate_encryption(args) -> int:
     return cli_run(args)
 
 
-def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
-    """Whether anything might currently hold this agent's database open.
+def _agent_db_holder(project_dir, agent_name, agent_cfg):
+    """What currently holds this agent's database open, or ``None``.
+
+    Returns ``"agent"`` (a per-agent process), ``"host"`` (the in-process
+    uvicorn host that owns every agent), or ``"unknown"`` when the probe itself
+    failed. Callers need the SOURCE, not just a boolean: the two are cleared by
+    different commands, and a refusal that names the wrong one cannot be acted
+    on (#2920).
 
     A per-agent PID file only exists in MULTI-PROCESS mode. The default
     deployment runs every agent in-process under one uvicorn host, which writes
     a single ``logs/.host.pid`` — so the absence of a per-agent PID file is the
     NORMAL shape, not evidence the agent is stopped. Reading it as "not running"
     reported four live agents as stopped and let a CLI open a second connection
-    to a database a running agent was using (#2920).
+    to a database a running agent was using.
     """
     from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
@@ -1362,7 +1362,7 @@ def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
         pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
         if pid is not None:
-            return ProcessManager.is_process_running(pid)
+            return "agent" if ProcessManager.is_process_running(pid) else None
 
         # No per-agent PID file: fall through to the in-process host. The host
         # owns every agent in ``multi_agent.toml``, so a live host means this
@@ -1370,7 +1370,9 @@ def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
         from kestrel_sovereign.cli_lifecycle import _host_pid_path
 
         host_pid = ProcessManager.read_pid(_host_pid_path(project_dir))
-        return host_pid is not None and ProcessManager.is_process_running(host_pid)
+        if host_pid is not None and ProcessManager.is_process_running(host_pid):
+            return "host"
+        return None
     except Exception:
         # Previously this returned False — "err on the side of letting the user
         # proceed, they get a clear error from the storage layer if it's
@@ -1387,7 +1389,40 @@ def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
             agent_name,
             exc_info=True,
         )
-        return True
+        return "unknown"
+
+
+def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
+    """Boolean form of :func:`_agent_db_holder`, kept for callers that only ask."""
+    return _agent_db_holder(project_dir, agent_name, agent_cfg) is not None
+
+
+def _running_agent_refusal(agent_name: str, holder: str) -> str:
+    """The refusal text, naming a command that can actually clear the holder.
+
+    ``kestrel stop <agent>`` only stops a per-agent process (or reaps its port);
+    against the in-process host it reports "not running" and leaves
+    ``logs/.host.pid`` alive, so every retry is refused by advice that cannot
+    work. The host case must say so (#2920).
+    """
+    if holder == "host":
+        return (
+            f"error: agent '{agent_name}' is running in-process under the "
+            f"Kestrel host. Run `kestrel stop` (no agent name) to stop the "
+            f"host first — `kestrel stop {agent_name}` only stops a per-agent "
+            f"process and would leave the host holding the database."
+        )
+    if holder == "unknown":
+        return (
+            f"error: could not determine whether agent '{agent_name}' is "
+            f"running, so this refuses rather than risk a second connection to "
+            f"a live database. Run `kestrel status`, stop whatever holds it, "
+            f"and retry."
+        )
+    return (
+        f"error: agent '{agent_name}' appears to be running. "
+        f"Run `kestrel stop {agent_name}` first to avoid DB corruption."
+    )
 
 
 def cmd_setup(args) -> int:
