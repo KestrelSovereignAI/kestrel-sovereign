@@ -344,7 +344,6 @@ Size: 89949 bytes
 |---------|----------|
 | Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8900` — wait 8 seconds |
 | Agent returns 401 | Check API key: `grep KESTREL_API_KEY .env` |
-| `!status` returns LLM response instead of DID | Run `!bootstrap-status` — if in discovery state, run `!skip-discovery` first |
 | EPHEMERAL invoke returns 500 | Ollama not running. Start: `ollama serve`. If unavailable, skip invoke — explain: "EPHEMERAL forces all LLM calls to a local model — zero network traffic. The code path literally doesn't call cloud APIs." |
 | Sovereignty export fails | Show previous exports: `GET /api/sovereignty/exports` — say "Here's one from earlier" |
 | Agent hallucinating instead of using tools | Model quality issue — switch to a stronger model via `/api/model/set` |

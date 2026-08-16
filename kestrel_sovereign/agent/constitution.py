@@ -2152,17 +2152,16 @@ class ConstitutionMixin:
         commands and ``!continue`` can fall through to an LLM turn, so they must
         complete genesis just like ordinary text.
         """
-        recovery_commands = {
-            "!status",
-            "!help",
-            "!verify-constitution",
-            "!reanchor-constitution",
-            "!safe-mode",
-            "!get-privacy-mode",
-            "!privacy-status",
-            "!bootstrap-status",
-        }
-        command = user_input.split(maxsplit=1)[0] if user_input else ""
+        # Import locally to keep this mixin's low-level storage import path
+        # clear of the command handler's privacy/storage dependencies.
+        from kestrel_sovereign.command_handler import get_recovery_commands
+
+        recovery_commands = get_recovery_commands(
+            getattr(self, "command_handler", None)
+        )
+        command = (
+            user_input.split(maxsplit=1)[0].lower() if user_input else ""
+        )
         if command in recovery_commands:
             return None
 
