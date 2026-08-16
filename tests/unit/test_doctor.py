@@ -1672,16 +1672,26 @@ def test_queryless_uri_uses_the_guarded_asyncpg_parse_path(tmp_path):
     assert parsed["dbname"] == "db"
 
 
+@pytest.mark.parametrize(
+    ("runtime_environment", "expected_user"),
+    [
+        ({"PGUSER": "postgres_runtime_user"}, "postgres_runtime_user"),
+        ({"USER": "login_runtime_user"}, "login_runtime_user"),
+    ],
+    ids=("pguser", "login-name"),
+)
 def test_empty_query_user_falls_back_exactly_like_asyncpg(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, runtime_environment, expected_user
 ):
     from asyncpg.connect_utils import _parse_connect_dsn_and_args
     from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    for name in ("LOGNAME", "USER", "LNAME", "USERNAME"):
-        monkeypatch.setenv(name, "runtime_user")
+    for name in ("PGUSER", "LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in runtime_environment.items():
+        monkeypatch.setenv(name, value)
     _, asyncpg_params = _parse_connect_dsn_and_args(
         dsn="postgresql://h/db?user=",
         host=None,
@@ -1699,12 +1709,37 @@ def test_empty_query_user_falls_back_exactly_like_asyncpg(
     )
     translated = parse_dsn(
         _doctor_postgres_dsn(
-            "postgresql://h/db?user=", {"USER": "runtime_user"}, tmp_path
+            "postgresql://h/db?user=", runtime_environment, tmp_path
         )
     )
 
-    assert asyncpg_params.user == "runtime_user"
+    assert asyncpg_params.user == expected_user
     assert translated["user"] == asyncpg_params.user
+
+
+def test_blanked_spawned_login_names_do_not_reuse_the_parent_login(
+    tmp_path, monkeypatch
+):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    for name in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.setenv(name, "doctor_parent_user")
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor._system_account_user",
+        lambda: "spawned_os_user",
+    )
+    spawned_env = {
+        name: "" for name in ("LOGNAME", "USER", "LNAME", "USERNAME")
+    }
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn("postgresql://h", spawned_env, tmp_path)
+    )
+
+    assert parsed["user"] == "spawned_os_user"
+    assert parsed["dbname"] == "spawned_os_user"
 
 
 def test_windows_asyncpg_tls_defaults_are_frozen_from_userprofile(
@@ -1817,6 +1852,49 @@ def test_pghost_uses_asyncpg_host_list_rules(
 
     assert parsed["host"] == expected_host
     assert parsed["port"] == expected_port
+
+
+@pytest.mark.parametrize(
+    ("dsn", "environment"),
+    [
+        ("postgresql://u@%40abstract/db", {}),
+        ("postgresql:///db?user=u&host=@abstract", {}),
+        ("postgresql:///db?user=u", {"PGHOST": "@abstract"}),
+        ("postgresql:///db?user=u&host=h1,@abstract", {}),
+    ],
+    ids=("authority", "query", "environment", "host-list"),
+)
+def test_libpq_reserved_abstract_socket_hosts_fail_closed(
+    tmp_path, dsn, environment
+):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match="reserves for Unix sockets") as exc:
+        _doctor_postgres_dsn(dsn, environment, tmp_path)
+
+    assert "@abstract" not in str(exc.value)
+
+
+def test_asyncpg_treats_at_prefixed_hosts_as_tcp():
+    from asyncpg.connect_utils import _parse_connect_dsn_and_args
+
+    addresses, _ = _parse_connect_dsn_and_args(
+        dsn="postgresql://u@%40abstract/db",
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        passfile=None,
+        database=None,
+        ssl="disable",
+        direct_tls=None,
+        server_settings=None,
+        target_session_attrs=None,
+        krbsrvname=None,
+        gsslib=None,
+    )
+
+    assert addresses == [("@abstract", 5432)]
 
 
 def test_empty_pghost_uses_asyncpg_defaults(tmp_path):
@@ -2276,6 +2354,49 @@ def test_multi_host_default_pgpass_uses_the_spawned_home(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("asyncpg compat unavailable"),
+        OSError("Windows known-folder lookup failed"),
+        AttributeError("ctypes Windows API unavailable"),
+    ],
+    ids=("import", "known-folder", "ctypes-api"),
+)
+def test_windows_passfile_discovery_failure_is_an_unreadable_finding(
+    tmp_path, monkeypatch, error
+):
+    from asyncpg import compat as asyncpg_compat
+
+    from kestrel_sovereign.doctor import _resolve_governance_source
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", "{}")],
+        node_owners=[("did:x", "did:x")],
+    )
+    monkeypatch.setattr("kestrel_sovereign.doctor.sys.platform", "win32")
+
+    def fail_to_find_pg_home():
+        raise error
+
+    monkeypatch.setattr(
+        asyncpg_compat, "get_pg_home_directory", fail_to_find_pg_home
+    )
+
+    result = _resolve_governance_source(
+        db,
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://u@h/db",
+        },
+        tmp_path,
+    )
+
+    assert isinstance(result, _UnreadableDB)
+    assert "default passfile location could not be determined" in result.reason
+
+
+@pytest.mark.parametrize(
     "dsn",
     (
         "postgresql://u@h1:5432/db",
@@ -2654,6 +2775,156 @@ def test_empty_enum_environment_option_is_rejected_like_asyncpg(
             {env_name: ""},
             tmp_path,
         )
+
+
+@pytest.mark.parametrize(
+    ("asyncpg_spelling", "libpq_spelling", "source"),
+    [
+        ("verify_ca", "verify-ca", "query"),
+        ("verify_full", "verify-full", "query"),
+        ("verify_ca", "verify-ca", "environment"),
+        ("verify_full", "verify-full", "environment"),
+    ],
+)
+def test_asyncpg_sslmode_aliases_are_normalized_for_libpq(
+    tmp_path, asyncpg_spelling, libpq_spelling, source
+):
+    from asyncpg.connect_utils import SSLMode
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    root_certificate = tmp_path / "root.crt"
+    root_certificate.write_text("test root certificate")
+    if source == "query":
+        runtime_dsn = (
+            "postgresql://u@h/db?sslmode="
+            f"{asyncpg_spelling}&sslrootcert=root.crt"
+        )
+        environment = {}
+    else:
+        runtime_dsn = "postgresql://u@h/db"
+        environment = {
+            "PGSSLMODE": asyncpg_spelling,
+            "PGSSLROOTCERT": str(root_certificate),
+        }
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
+    )
+
+    assert SSLMode.parse(asyncpg_spelling).name == asyncpg_spelling
+    assert parsed["sslmode"] == libpq_spelling
+
+
+@pytest.mark.parametrize(
+    ("asyncpg_minimum", "asyncpg_maximum", "libpq_minimum", "libpq_maximum"),
+    [
+        ("TLSv1_2", "TLSv1_3", "TLSv1.2", "TLSv1.3"),
+        (
+            "MINIMUM_SUPPORTED",
+            "MAXIMUM_SUPPORTED",
+            "TLSv1",
+            "TLSv1.3",
+        ),
+    ],
+    ids=("version-members", "symbolic-bounds"),
+)
+@pytest.mark.parametrize("source", ["query", "environment"])
+def test_asyncpg_tls_protocol_aliases_are_normalized_for_libpq(
+    tmp_path,
+    source,
+    asyncpg_minimum,
+    asyncpg_maximum,
+    libpq_minimum,
+    libpq_maximum,
+):
+    import ssl
+
+    from asyncpg.connect_utils import _parse_tls_version
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    if source == "query":
+        runtime_dsn = (
+            "postgresql://u@h/db?sslmode=require"
+            f"&ssl_min_protocol_version={asyncpg_minimum}"
+            f"&ssl_max_protocol_version={asyncpg_maximum}"
+        )
+        environment = {}
+    else:
+        runtime_dsn = "postgresql://u@h/db?sslmode=require"
+        environment = {
+            "PGSSLMINPROTOCOLVERSION": asyncpg_minimum,
+            "PGSSLMAXPROTOCOLVERSION": asyncpg_maximum,
+        }
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
+    )
+
+    assert _parse_tls_version(asyncpg_minimum) is ssl.TLSVersion[
+        asyncpg_minimum
+    ]
+    assert _parse_tls_version(asyncpg_maximum) is ssl.TLSVersion[
+        asyncpg_maximum
+    ]
+    assert parsed["ssl_min_protocol_version"] == libpq_minimum
+    assert parsed["ssl_max_protocol_version"] == libpq_maximum
+
+
+@pytest.mark.parametrize("source", ["query", "environment"])
+def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
+    tmp_path, monkeypatch, source
+):
+    from asyncpg.connect_utils import _parse_connect_dsn_and_args
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    tls_environment = {
+        "PGSSLMODE": "disable",
+        "PGSSLMINPROTOCOLVERSION": "not-a-tls-version",
+        "PGSSLMAXPROTOCOLVERSION": "also-not-a-tls-version",
+    }
+    for name in tls_environment:
+        monkeypatch.delenv(name, raising=False)
+    if source == "query":
+        runtime_dsn = (
+            "postgresql://u@h/db?sslmode=disable"
+            "&ssl_min_protocol_version=not-a-tls-version"
+            "&ssl_max_protocol_version=also-not-a-tls-version"
+        )
+        environment = {}
+    else:
+        runtime_dsn = "postgresql://u@h/db"
+        environment = tls_environment
+        for name, value in tls_environment.items():
+            monkeypatch.setenv(name, value)
+
+    _, asyncpg_params = _parse_connect_dsn_and_args(
+        dsn=runtime_dsn,
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        passfile=None,
+        database=None,
+        ssl=None,
+        direct_tls=None,
+        server_settings=None,
+        target_session_attrs=None,
+        krbsrvname=None,
+        gsslib=None,
+    )
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
+    )
+
+    assert asyncpg_params.ssl is False
+    assert "ssl_min_protocol_version" not in parsed
+    assert "ssl_max_protocol_version" not in parsed
 
 
 @pytest.mark.parametrize(
@@ -3523,16 +3794,8 @@ def test_project_env_pg_settings_reach_the_driver_without_being_exported(
     assert "PGPASSWORD" not in os.environ
 
 
-@pytest.mark.parametrize(
-    ("error_type", "message"),
-    [
-        (OSError, "uid has no passwd entry"),
-        (KeyError, "getpwuid(): uid not found: 1000"),
-    ],
-    ids=("normalized-os-error", "legacy-key-error"),
-)
 def test_missing_login_name_is_an_unreadable_database_finding(
-    tmp_path, monkeypatch, error_type, message
+    tmp_path, monkeypatch
 ):
     _seed_matching_anchor(tmp_path, monkeypatch)
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -3543,9 +3806,11 @@ def test_missing_login_name_is_an_unreadable_database_finding(
         monkeypatch.delenv(name, raising=False)
 
     def no_login_name():
-        raise error_type(message)
+        raise OSError("uid has no passwd entry")
 
-    monkeypatch.setattr("getpass.getuser", no_login_name)
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor._system_account_user", no_login_name
+    )
 
     report = diagnose(tmp_path)
 

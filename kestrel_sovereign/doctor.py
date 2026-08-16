@@ -36,7 +36,6 @@ This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import os
@@ -647,6 +646,19 @@ _LIBPQ_COMPILED_DSN_DEFAULTS = (
 
 _ABSENT_PASSFILE_SENTINEL = "__kestrel_doctor_absent_passfile__"
 
+_ASYNCPG_SSLMODE_ALIASES = {
+    "verify_ca": "verify-ca",
+    "verify_full": "verify-full",
+}
+
+_ASYNCPG_TLS_PROTOCOL_ALIASES = {
+    "MINIMUM_SUPPORTED": "TLSv1",
+    "MAXIMUM_SUPPORTED": "TLSv1.3",
+    "TLSv1_1": "TLSv1.1",
+    "TLSv1_2": "TLSv1.2",
+    "TLSv1_3": "TLSv1.3",
+}
+
 
 def _require_postgres_driver() -> None:
     """Raise a useful diagnostic when psycopg2 itself is unavailable."""
@@ -898,6 +910,72 @@ def _libpq_option_fragment(name: str, value: str) -> str:
     return f"-c {setting}"
 
 
+def _system_account_user() -> str:
+    """Return the OS-account fallback used by ``getpass.getuser``.
+
+    The environment-dependent half is handled separately against the exact
+    spawned-agent environment. Calling ``getpass.getuser()`` here would
+    inspect doctor's unchanged parent environment and could resurrect a login
+    name that the child environment explicitly blanked.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid())[0]
+    except (ImportError, KeyError) as exc:
+        raise OSError("No username set in the environment") from exc
+
+
+def _asyncpg_default_user(env: dict) -> str:
+    """Resolve the login name asyncpg sees in the spawned agent."""
+    for name in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        value = env.get(name)
+        if value:
+            return value
+    try:
+        return _system_account_user()
+    except OSError as exc:
+        raise ValueError(
+            "runtime PostgreSQL user could not be determined"
+        ) from exc
+
+
+def _normalize_asyncpg_connection_options(query: dict[str, str]) -> None:
+    """Translate asyncpg spellings and ignored TLS settings for libpq."""
+    sslmode = query.get("sslmode")
+    if sslmode in _ASYNCPG_SSLMODE_ALIASES:
+        sslmode = _ASYNCPG_SSLMODE_ALIASES[sslmode]
+        query["sslmode"] = sslmode
+
+    if sslmode == "disable":
+        # Asyncpg never creates an SSLContext in this mode, so it never parses
+        # these values. Libpq does parse them even though SSL is disabled.
+        query.pop("ssl_min_protocol_version", None)
+        query.pop("ssl_max_protocol_version", None)
+        return
+
+    for name in (
+        "ssl_min_protocol_version",
+        "ssl_max_protocol_version",
+    ):
+        value = query.get(name)
+        if value in _ASYNCPG_TLS_PROTOCOL_ALIASES:
+            query[name] = _ASYNCPG_TLS_PROTOCOL_ALIASES[value]
+
+
+def _reject_libpq_reserved_tcp_hosts(hosts: list[str]) -> None:
+    """Fail closed when libpq would reinterpret an asyncpg TCP host."""
+    if any(host.startswith("@") for host in hosts):
+        # Asyncpg treats this as an ordinary TCP name. On platforms supporting
+        # abstract Unix-domain sockets, libpq reserves the same spelling for a
+        # socket address. Resolving it eagerly to ``hostaddr`` would add DNS
+        # and address-selection semantics the spawned runtime does not have.
+        raise ValueError(
+            "runtime PostgreSQL TCP host uses a spelling the diagnostic "
+            "driver reserves for Unix sockets"
+        )
+
+
 def _state_asyncpg_connection_defaults(
     parts,
     query: dict[str, str],
@@ -915,21 +993,7 @@ def _state_asyncpg_connection_defaults(
     """
     effective_user = unquote(user) if user else query.get("user")
     if not effective_user:
-        effective_user = next(
-            (
-                env[name]
-                for name in ("LOGNAME", "USER", "LNAME", "USERNAME")
-                if env.get(name)
-            ),
-            None,
-        )
-        if not effective_user:
-            try:
-                effective_user = getpass.getuser()
-            except (OSError, KeyError, ImportError) as exc:
-                raise ValueError(
-                    "runtime PostgreSQL user could not be determined"
-                ) from exc
+        effective_user = _asyncpg_default_user(env)
         query["user"] = effective_user
 
     if parts.path == "/":
@@ -1224,9 +1288,15 @@ def _fold_asyncpg_passfile(
         passfile = Path(query["passfile"]) if query["passfile"] else None
     elif sys.platform == "win32":
         # Asyncpg uses Windows' roaming AppData known folder rather than HOME.
-        from asyncpg import compat as _asyncpg_compat
+        try:
+            from asyncpg import compat as _asyncpg_compat
 
-        home = _asyncpg_compat.get_pg_home_directory()
+            home = _asyncpg_compat.get_pg_home_directory()
+        except (AttributeError, ImportError, OSError) as exc:
+            raise ValueError(
+                "runtime PostgreSQL default passfile location could not be "
+                "determined"
+            ) from exc
         passfile = home / "pgpass.conf" if home is not None else None
     else:
         resolved_home = _asyncpg_home(env, project_dir)
@@ -1305,6 +1375,7 @@ def _doctor_postgres_dsn(
     hosts, ports, auth_hosts = _resolve_asyncpg_hosts(
         hostspec, raw_query, env
     )
+    _reject_libpq_reserved_tcp_hosts(hosts)
     query["host"] = ",".join(hosts)
     query["port"] = ",".join(str(port) for port in ports)
     if user:
@@ -1325,6 +1396,7 @@ def _doctor_postgres_dsn(
     # below removes an ambient service recipe rather than attempting to
     # enumerate every authentication and TLS option a service could inject.
     _state_asyncpg_connection_defaults(parts, query, hosts, user, env)
+    _normalize_asyncpg_connection_options(query)
     _normalize_asyncpg_direct_tls(query)
     _validate_asyncpg_connection_options(query)
 

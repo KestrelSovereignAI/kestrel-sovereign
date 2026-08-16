@@ -1024,6 +1024,68 @@ def test_asyncpg_recognized_and_startup_options_remain_connectable(
 
 
 @pytest.mark.parametrize(
+    ("minimum", "maximum"),
+    [
+        ("TLSv1_2", "TLSv1_3"),
+        ("MINIMUM_SUPPORTED", "MAXIMUM_SUPPORTED"),
+    ],
+    ids=("version-members", "symbolic-bounds"),
+)
+async def test_tls_protocol_aliases_reach_asyncpg_and_libpq_live(
+    tmp_path, monkeypatch, canonical, runtime_db, minimum, maximum
+):
+    """Both real drivers accept asyncpg's underscore spellings after folding."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    runtime_dsn = (
+        runtime_db.dsn
+        + f"?sslmode=prefer&ssl_min_protocol_version={minimum}"
+        + f"&ssl_max_protocol_version={maximum}"
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    connection = await asyncpg.connect(runtime_dsn)
+    await connection.close()
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+async def test_disabled_ssl_ignores_invalid_tls_versions_live(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Libpq must not validate settings the real asyncpg path never reads."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?sslmode=disable&ssl_min_protocol_version=not-a-version"
+        + "&ssl_max_protocol_version=also-not-a-version"
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    connection = await asyncpg.connect(runtime_dsn)
+    await connection.close()
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+@pytest.mark.parametrize(
     ("query", "tls_env", "doctor_ready"),
     [
         ("?sslmode=disable&sslnegotiation=direct", {}, True),
