@@ -1779,6 +1779,10 @@ class _PostgresProbeQueryError(_PostgresProbeError):
 class _PostgresProbeTimeoutError(_PostgresProbeError):
     """The bounded worker was terminated with its result still unknown."""
 
+    def __init__(self, message: str, *, partial_diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.partial_diagnostic = partial_diagnostic
+
 
 def _postgres_probe_failure_kind(exc: BaseException) -> str:
     """Classify runtime impact without inferring it from rendered text."""
@@ -1800,6 +1804,9 @@ def _postgres_unreadable(
     return _UnreadableDB(
         reason=reason,
         postgres_failure=_postgres_probe_failure_kind(exc),
+        postgres_partial_diagnostic=bool(
+            isinstance(exc, _PostgresProbeTimeoutError) and exc.partial_diagnostic
+        ),
     )
 
 
@@ -2014,7 +2021,8 @@ def _fetch_postgres_rows_isolated(
             "timeout and was terminated"
         )
         raise _PostgresProbeTimeoutError(
-            f"{message}; partial diagnostic: {detail}" if detail else message
+            f"{message}; partial diagnostic: {detail}" if detail else message,
+            partial_diagnostic=detail,
         ) from exc
     except OSError as exc:
         try:
@@ -2711,11 +2719,16 @@ def _report_unexamined(
             f"connection and re-run before treating this host as ready."
         )
     elif postgres_failure == "diagnostic_timeout":
+        partial_advice = (
+            "inspect the preserved partial diagnostic, then fix "
+            if source.postgres_partial_diagnostic
+            else "fix "
+        )
         report.fail.append(
             f"{name}: governance NOT verified — {reason}. Runtime database "
             f"reachability was not established before the finite diagnostic "
-            f"deadline; inspect the preserved partial diagnostic, then fix "
-            f"connectivity or adjust the doctor timeout and re-run before "
+            f"deadline; {partial_advice}connectivity or adjust the doctor "
+            f"timeout and re-run before "
             f"treating this host as ready."
         )
     elif postgres_failure == "diagnostic_tooling":
@@ -2858,6 +2871,8 @@ class _UnreadableDB:
 
     reason: str
     postgres_failure: str | None = None
+    #: True only when a timed-out isolated worker yielded redacted output.
+    postgres_partial_diagnostic: bool = False
 
 
 @dataclass(frozen=True)

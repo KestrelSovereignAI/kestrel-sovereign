@@ -29,12 +29,21 @@ class ProbeQueryError(ProbeError):
     """The connection opened, but the governance query failed."""
 
 
+def _emit_phase(*, connected: bool) -> None:
+    """Flush one bounded, non-secret breadcrumb outside the JSON channel."""
+    phase = "connected; querying" if connected else "connecting"
+    sys.stderr.write(f"PostgreSQL diagnostic phase: {phase}\n")
+    sys.stderr.flush()
+
+
 def _query_postgres_driver(driver, dsn: str, sql: str, params) -> list:
     """Run one query through a psycopg2-compatible driver."""
+    _emit_phase(connected=False)
     try:
         connection = driver.connect(dsn)
     except Exception as exc:
         raise ProbeConnectionError(str(exc)) from exc
+    _emit_phase(connected=True)
     try:
         try:
             with connection.cursor() as cursor:

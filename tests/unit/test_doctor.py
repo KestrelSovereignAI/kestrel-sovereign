@@ -3600,6 +3600,42 @@ def test_isolated_postgres_probe_uses_stdin_and_sanitized_environment(
     assert os.environ["PGSERVICE"] == "private-service-name"
 
 
+def test_postgres_probe_worker_keeps_breadcrumbs_out_of_success_json(
+    monkeypatch, capsys
+):
+    import io
+    import json
+    import sys
+
+    from kestrel_sovereign import _doctor_postgres_probe as worker
+
+    fake = _FakePostgres({"SELECT 1": [(1,)]})
+    monkeypatch.setitem(sys.modules, "psycopg2", fake)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "dsn": "postgresql://u@h/db",
+                    "sql": "SELECT 1",
+                    "params": [],
+                    "absent_passfile_sentinel": "unused",
+                }
+            )
+        ),
+    )
+
+    worker.main()
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"ok": True, "rows": [[1]]}
+    assert captured.err.splitlines() == [
+        "PostgreSQL diagnostic phase: connecting",
+        "PostgreSQL diagnostic phase: connected; querying",
+    ]
+
+
 def test_isolated_probe_tolerates_non_utf8_stderr_with_valid_stdout(
     monkeypatch,
 ):
@@ -3697,6 +3733,40 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
     assert second_host not in diagnostic
     assert password not in diagnostic
     assert "<host>" in diagnostic
+    assert len(diagnostic) < 1200
+
+
+def test_real_isolated_postgres_probe_preserves_phase_when_killed(monkeypatch):
+    import socket
+
+    from kestrel_sovereign.doctor import (
+        _fetch_postgres_rows_isolated,
+        _PostgresProbeTimeoutError,
+    )
+
+    password = "real-subprocess-timeout-secret"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(
+            "kestrel_sovereign.doctor._postgres_probe_timeout_seconds",
+            lambda _dsn: 2,
+        )
+
+        with pytest.raises(_PostgresProbeTimeoutError) as raised:
+            _fetch_postgres_rows_isolated(
+                f"postgresql://probe_user:{password}@127.0.0.1:{port}/probe_db"
+                "?connect_timeout=5&sslmode=disable",
+                "SELECT 1",
+            )
+
+    diagnostic = str(raised.value)
+    assert raised.value.partial_diagnostic
+    assert "partial diagnostic" in diagnostic
+    assert "PostgreSQL diagnostic phase: connecting" in diagnostic
+    assert "connected; querying" not in diagnostic
+    assert password not in diagnostic
     assert len(diagnostic) < 1200
 
 
@@ -4421,6 +4491,36 @@ def test_postgres_failure_provenance_does_not_depend_on_reason_text():
 
     assert not unknown.fail
     assert unknown.warn
+
+
+def test_timeout_remediation_mentions_partial_diagnostic_only_when_present():
+    from kestrel_sovereign.doctor import (
+        DoctorReport,
+        _postgres_unreadable,
+        _PostgresProbeTimeoutError,
+        _report_unexamined,
+    )
+
+    without_partial = _postgres_unreadable(
+        _PostgresProbeTimeoutError("diagnostic timed out"),
+        reason="diagnostic timed out",
+    )
+    without_report = DoctorReport()
+    _report_unexamined("Test", without_partial.reason, without_partial, without_report)
+
+    with_partial = _postgres_unreadable(
+        _PostgresProbeTimeoutError(
+            "diagnostic timed out; partial diagnostic: phase",
+            partial_diagnostic="stderr: phase",
+        ),
+        reason="diagnostic timed out; partial diagnostic: phase",
+    )
+    with_report = DoctorReport()
+    _report_unexamined("Test", with_partial.reason, with_partial, with_report)
+
+    assert "inspect the preserved partial diagnostic" not in without_report.fail[0]
+    assert "fix connectivity or adjust the doctor timeout" in without_report.fail[0]
+    assert "inspect the preserved partial diagnostic" in with_report.fail[0]
 
 
 def test_an_edge_the_agent_does_not_own_is_reported_as_a_ledger_problem(
