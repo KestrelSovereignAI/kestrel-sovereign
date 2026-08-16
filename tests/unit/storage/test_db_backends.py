@@ -585,26 +585,231 @@ class TestSQLiteBackend:
             worker.join(timeout=1.0)
 
     @pytest.mark.asyncio
+    async def test_close_preserves_cancellation_while_reaping_timed_out_drain(
+        self, tmp_path, monkeypatch
+    ):
+        """Caller cancellation during drain reaping is delivered after close."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.02,
+        )
+        backend = SQLiteBackend(str(tmp_path / "cancel-during-drain-reap.db"))
+        await backend.connect()
+        worker = aiosqlite_worker(backend._ensure_connected())
+        first_drain_cancel = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def stubborn_drain():
+            try:
+                await never_release.wait()
+            except asyncio.CancelledError:
+                first_drain_cancel.set()
+                await never_release.wait()
+
+        drain = asyncio.create_task(stubborn_drain())
+        backend._cancelled_write_drain = drain
+        close_task = asyncio.create_task(backend.close())
+        try:
+            async with asyncio.timeout(0.2):
+                await first_drain_cancel.wait()
+            await asyncio.sleep(0)
+            close_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+
+            assert not backend.is_connected
+            assert drain.done()
+            assert not worker.is_alive()
+        finally:
+            never_release.set()
+            if not drain.done():
+                drain.cancel()
+            await asyncio.gather(drain, close_task, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_cleanup_error_does_not_survive_close_or_connect(self, tmp_path):
-        """A fresh connection is not poisoned by an old drain failure."""
+        """A failed drain fences writes but leaves committed reads available."""
         backend = SQLiteBackend(str(tmp_path / "drain-recovery.db"))
         await backend.connect()
+        await backend.execute("CREATE TABLE durable (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO durable (value) VALUES (7)")
         backend._cancelled_write_drain_error = RuntimeError("rollback failed")
 
-        with pytest.raises(QueryError, match="cancellation cleanup failed"):
-            await backend.fetch_one("SELECT 1")
+        # A fresh query-only connection can still expose the committed state,
+        # which keeps health/diagnostic reads alive without trusting the shared
+        # connection's possibly-abandoned transaction.
+        assert await backend.fetch_one("SELECT value FROM durable") == (7,)
+        with pytest.raises(ConnectionError, match="cancellation cleanup failed"):
+            await backend.execute("UPDATE durable SET value = 8")
 
         await backend.close()
         assert backend._cancelled_write_drain_error is None
 
-        # Exercise connect's reset independently from close's reset.
+        # Exercise connect's recovery while a failed shared connection is
+        # still open; an idempotent early return would leave the latch set.
+        await backend.connect()
+        stale_conn = backend._ensure_connected()
         backend._cancelled_write_drain_error = RuntimeError("stale failure")
         await backend.connect()
         try:
+            assert backend._ensure_connected() is not stale_conn
             assert backend._cancelled_write_drain_error is None
             assert await backend.fetch_one("SELECT 1") == (1,)
         finally:
             await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_pending_write_drain_does_not_block_file_snapshot_reads(
+        self, tmp_path
+    ):
+        """A wedged shared worker cannot wedge committed diagnostic reads."""
+        backend = SQLiteBackend(str(tmp_path / "pending-drain-read.db"))
+        await backend.connect()
+        await backend.execute("CREATE TABLE durable (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO durable (value) VALUES (7)")
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+
+        def block_in_worker(value):
+            entered_worker.set()
+            release_worker.wait()
+            return value
+
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        blocked = asyncio.create_task(
+            backend.execute("SELECT block_in_worker(value) FROM durable")
+        )
+        try:
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            drain = backend._cancelled_write_drain
+            assert drain is not None and not drain.done()
+
+            async with asyncio.timeout(0.2):
+                assert await backend.fetch_one(
+                    "SELECT value FROM durable"
+                ) == (7,)
+        finally:
+            release_worker.set()
+            await asyncio.gather(blocked, return_exceptions=True)
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_drain_becomes_connection_error_not_caller_cancel(
+        self, tmp_path
+    ):
+        """Lifecycle cancellation of cleanup must not cancel unrelated work."""
+        backend = SQLiteBackend(str(tmp_path / "cancelled-drain-waiter.db"))
+        await backend.connect()
+        rollback_started = asyncio.Event()
+        conn = backend._ensure_connected()
+
+        async def pending_rollback():
+            rollback_started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(conn, "rollback", new=pending_rollback):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            await rollback_started.wait()
+            waiter = asyncio.create_task(
+                backend.execute("CREATE TABLE later (id INTEGER)")
+            )
+            try:
+                await asyncio.sleep(0)
+                drain.cancel()
+                with pytest.raises(
+                    ConnectionError, match="cancellation cleanup failed"
+                ):
+                    await waiter
+                assert not waiter.cancelled()
+            finally:
+                if not drain.done():
+                    drain.cancel()
+                await asyncio.gather(drain, waiter, return_exceptions=True)
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_writer_wait_for_cancelled_drain_has_a_deadline(
+        self, tmp_path, monkeypatch
+    ):
+        """A wedged rollback cannot block every later writer indefinitely."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.02,
+        )
+        backend = SQLiteBackend(str(tmp_path / "bounded-drain-wait.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        rollback_started = asyncio.Event()
+        release_rollback = asyncio.Event()
+
+        async def pending_rollback():
+            rollback_started.set()
+            await release_rollback.wait()
+
+        with patch.object(conn, "rollback", new=pending_rollback):
+            backend._handoff_cancelled_write(conn)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            await rollback_started.wait()
+            try:
+                async with asyncio.timeout(0.2):
+                    with pytest.raises(
+                        ConnectionError, match="cleanup is still pending"
+                    ):
+                        await backend.execute("CREATE TABLE later (id INTEGER)")
+                assert backend.write_connection_requires_reconnect is False
+                assert not drain.done()
+            finally:
+                release_rollback.set()
+                await asyncio.gather(drain, return_exceptions=True)
+                assert backend.write_connection_unavailable is False
+                await backend.execute("CREATE TABLE later (id INTEGER)")
+                await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_close_fences_late_cancellation_handoff(self, tmp_path):
+        """Close cannot orphan a rollback task installed after drain sampling."""
+        backend = SQLiteBackend(str(tmp_path / "late-close-handoff.db"))
+        await backend.connect()
+        conn = backend._ensure_connected()
+        close_entered = asyncio.Event()
+        release_close = asyncio.Event()
+        real_close = sqlite_backend_module._close_aiosqlite_connection
+
+        async def delayed_close(connection):
+            close_entered.set()
+            await release_close.wait()
+            await real_close(connection)
+
+        with patch.object(
+            sqlite_backend_module,
+            "_close_aiosqlite_connection",
+            new=delayed_close,
+        ):
+            close_task = asyncio.create_task(backend.close())
+            await close_entered.wait()
+            backend._handoff_cancelled_write(conn)
+            assert backend._cancelled_write_drain is None
+            release_close.set()
+            await close_task
+
+        assert backend._cancelled_write_drain is None
+        assert backend._cancelled_write_drain_error is None
+        assert not backend.is_connected
 
     @pytest.mark.asyncio
     async def test_table_not_exists(self, backend):

@@ -34,10 +34,18 @@ async def _run_database_bound_check(
 ) -> Dict[str, Any]:
     """Run one database check within its own I/O deadline."""
     started = time.monotonic()
+    deadline: asyncio.Timeout | None = None
     try:
-        async with asyncio.timeout(DATABASE_HEALTH_CHECK_TIMEOUT_S):
+        async with asyncio.timeout(
+            DATABASE_HEALTH_CHECK_TIMEOUT_S
+        ) as deadline:
             return await check
     except TimeoutError:
+        # Do not relabel a TimeoutError raised by the check/provider itself as
+        # this wrapper's deadline. This mirrors every other deadline boundary
+        # on the consolidation and health paths.
+        if deadline is None or not deadline.expired():
+            raise
         label = name.replace("_", " ").capitalize()
         return {
             "name": name,
@@ -50,12 +58,22 @@ async def _run_database_bound_check(
         }
 
 
-def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
+def derive_overall_status(
+    checks: List[Dict[str, Any]],
+    *,
+    fail_on_any_failure: bool = False,
+) -> str:
     """Derive the shared three-state status for every detailed-health surface.
 
     - healthy: all checks pass
     - degraded: at least one warning or non-critical failure
-    - unhealthy: a critical database or LLM check fails
+    - unhealthy: a critical database/LLM failure, or any failure on a caller
+      that explicitly requests the historical strict fallback policy
+
+    HealthFeature has always treated only database and LLM failures as
+    critical. The no-feature ``/health/detailed`` fallback historically treated
+    every failure as unhealthy. One parameterized implementation preserves both
+    public contracts without letting their check lists drift again.
     """
     statuses = [check.get("status", "pass") for check in checks]
     critical_names = {"database", "llm_service"}
@@ -65,7 +83,9 @@ def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
         if check.get("name") in critical_names
     ]
 
-    if "fail" in critical_statuses:
+    if "fail" in critical_statuses or (
+        fail_on_any_failure and "fail" in statuses
+    ):
         return "unhealthy"
     if "fail" in statuses or "warn" in statuses:
         return "degraded"
@@ -88,6 +108,30 @@ async def check_database(db) -> Dict[str, Any]:
             "name": "database",
             "status": "fail",
             "message": "No database connection available",
+            "duration_ms": _elapsed(start),
+        }
+
+    backend = getattr(db, "backend", db)
+    if getattr(backend, "write_connection_unavailable", False) is True:
+        reconnect_required = (
+            getattr(backend, "write_connection_requires_reconnect", False)
+            is True
+        )
+        return {
+            "name": "database",
+            # A live rollback handoff is transient and self-healing. It fences
+            # writes for correctness but does not make a successful committed
+            # read probe impossible. Failed cleanup is the terminal condition
+            # that requires reconnect and makes database health critical.
+            "status": "fail" if reconnect_required else "warn",
+            "message": (
+                "Database write connection is unavailable because cancellation "
+                + (
+                    "cleanup failed; reconnect is required"
+                    if reconnect_required
+                    else "cleanup is still pending"
+                )
+            ),
             "duration_ms": _elapsed(start),
         }
 
@@ -574,7 +618,14 @@ def _classify_resource_lock_snapshot(
     )
     return {
         "name": "resource_locks",
-        "status": "fail" if escalated else "warn",
+        # Sub-hour contention is observable in details/logs but remains within
+        # the normal envelope of bounded sleep/training work. Readiness changes
+        # only at the explicit escalation threshold.
+        # A long-held MEMORY lock is actionable, but training and other
+        # deliberately non-cancellable work can legitimately exceed the
+        # escalation threshold. Keep it degraded (rather than database/LLM
+        # unhealthy) consistently on both detailed-health surfaces.
+        "status": "warn" if escalated else "pass",
         "message": (
             f"{longest.get('resource', 'unknown')} lock has been held for "
             f"{held_for} by {longest.get('label', 'unknown')} with "

@@ -1463,12 +1463,12 @@ class MemoryFeature(Feature):
 
         try:
             timeout_seconds = _consolidation_timeout_seconds()
-            # Start the tool guard slightly after MemorySystem's canonical
-            # deadline. That leaves the chokepoint time to raise its precise,
-            # drain-aware exception while still bounding nonstandard
-            # MemorySystem stand-ins. Lock waiting gets a separate full budget
-            # below, so contention cannot silently consume consolidation time.
-            tool_timeout_seconds = timeout_seconds + min(timeout_seconds, 1.0)
+            # One end-to-end deadline covers both manual lock acquisition and
+            # consolidation. Separate full budgets let a contended invocation
+            # run for almost twice the configured limit while advertising one
+            # deadline to the operator.
+            tool_deadline: asyncio.Timeout | None = None
+            lock_acquired = lock_manager is None
             async with AsyncExitStack() as stack:
                 owns_memory = getattr(
                     lock_manager, "is_owned_by_current_task", None
@@ -1478,57 +1478,45 @@ class MemoryFeature(Feature):
                     and callable(owns_memory)
                     and owns_memory(ResourceLock.MEMORY) is True
                 )
-                if lock_manager is not None and not already_owned:
-                    lock_deadline: asyncio.Timeout | None = None
-                    try:
-                        async with asyncio.timeout(
-                            tool_timeout_seconds
-                        ) as lock_deadline:
+                lock_acquired = lock_acquired or already_owned
+                try:
+                    async with asyncio.timeout(
+                        timeout_seconds
+                    ) as tool_deadline:
+                        if lock_manager is not None and not already_owned:
                             await stack.enter_async_context(
                                 lock_manager.acquire(
                                     [ResourceLock.MEMORY], label=lock_label
                                 )
                             )
-                    except TimeoutError:
-                        if lock_deadline is None or not lock_deadline.expired():
-                            raise
-                        logger.error(
-                            "memory_consolidate could not acquire the MEMORY "
-                            "lock within %gs; consolidation did not start",
-                            tool_timeout_seconds,
-                        )
-                        return ToolResult.failed(
-                            "Memory consolidation could not acquire the memory "
-                            f"lock within {tool_timeout_seconds:g} seconds; "
-                            "consolidation did not start"
-                        )
+                            lock_acquired = True
 
-                # consolidate() is the single chokepoint — it runs
-                # consolidation AND the forgetting deletion tier (#1674), so
-                # the tool and nightly sleep cycle forget identically. A
-                # scheduled memory_consolidate dispatch already owns MEMORY in
-                # this same task; skip only that task-owned nested acquisition
-                # to avoid self-deadlocking a non-reentrant lock.
-                #
-                # This timeout begins only after lock acquisition. It cancels
-                # THIS task at the deadline, so the surrounding lock context
-                # unwinds in its owner task before TimeoutError is surfaced.
-                # asyncio.wait_for would move the coroutine into a child task
-                # and break that contract.
-                tool_deadline: asyncio.Timeout | None = None
-                try:
-                    async with asyncio.timeout(
-                        tool_timeout_seconds
-                    ) as tool_deadline:
+                        # consolidate() is the single chokepoint — it runs
+                        # consolidation AND the forgetting deletion tier
+                        # (#1674), so the tool and nightly sleep cycle forget
+                        # identically. A scheduled dispatch already owns MEMORY
+                        # in this same task; skip only that nested acquisition.
                         result = await memory_system.consolidate()
                 except TimeoutError:
                     if tool_deadline is None or not tool_deadline.expired():
                         raise
+                    if not lock_acquired:
+                        logger.error(
+                            "memory_consolidate could not acquire the MEMORY "
+                            "lock within %gs; consolidation did not start",
+                            timeout_seconds,
+                        )
+                        return ToolResult.failed(
+                            "Memory consolidation could not acquire the memory "
+                            f"lock within the configured {timeout_seconds:g}-second "
+                            "deadline; "
+                            "consolidation did not start"
+                        )
                     logger.error(
                         "memory_consolidate exceeded its %gs tool deadline; the "
                         "pass was abandoned and in-flight database work may "
                         "still be draining",
-                        tool_timeout_seconds,
+                        timeout_seconds,
                     )
                     return ToolResult.failed(
                         "Memory consolidation did not complete within the "

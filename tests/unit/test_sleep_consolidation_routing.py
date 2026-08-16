@@ -78,6 +78,33 @@ async def test_nightly_sleep_inherits_memory_system_consolidation_timeout(monkey
 
 
 @pytest.mark.asyncio
+async def test_nightly_sleep_timeout_preserves_prior_retention_failure():
+    """A consolidation deadline cannot hide an earlier retention failure."""
+    from kestrel_sovereign.storage.memory_system import (
+        MemoryConsolidationTimeoutError,
+    )
+
+    class _FailingSweepStorage:
+        async def sweep_expired_governed_semantic_artifacts(self):
+            raise RuntimeError("private retention detail")
+
+    agent = _Agent()
+    agent.storage = _FailingSweepStorage()
+    agent.sleep_hooks = []
+    agent._consolidate_memories = AsyncMock(
+        side_effect=MemoryConsolidationTimeoutError(0.02)
+    )
+
+    report = await agent.sleep(skip_export=True, skip_reflection=True)
+
+    assert report.success is False
+    assert report.error == (
+        "semantic_artifact_expiry_sweep_failed; consolidation_failed"
+    )
+    assert "private retention detail" not in report.error
+
+
+@pytest.mark.asyncio
 async def test_nightly_sleep_logs_invalid_timeout_cause(monkeypatch, caplog):
     """A bad operator value must remain visible after sleep records failure."""
     from kestrel_sovereign.storage.memory_system import MemorySystem

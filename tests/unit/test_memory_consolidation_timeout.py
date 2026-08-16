@@ -193,7 +193,7 @@ async def test_hung_consolidation_times_out_in_owner_task_and_releases_lock(
     assert observed_tasks == [owner_task, owner_task]
     assert holder_labels == ["Claw MemoryFeature.memory_consolidate"]
     assert result.status is ToolResultStatus.ERROR
-    assert "configured deadline of 0.02 seconds" in result.error
+    assert "configured 0.02-second deadline" in result.error
     assert not locks.is_held(ResourceLock.MEMORY)
     assert locks.holder(ResourceLock.MEMORY) is None
 
@@ -375,7 +375,7 @@ async def test_tool_skips_same_task_dispatch_lock_reacquisition(monkeypatch):
     assert result.status is ToolResultStatus.OK
 
 
-async def test_lock_wait_does_not_consume_consolidation_budget(monkeypatch):
+async def test_lock_wait_and_consolidation_share_one_deadline(monkeypatch):
     locks = OrderedLockManager()
     held = asyncio.Event()
     consolidation_started = asyncio.Event()
@@ -401,9 +401,10 @@ async def test_lock_wait_does_not_consume_consolidation_budget(monkeypatch):
     result = await feature.memory_consolidate()
     await holder_task
 
-    assert consolidation_started.is_set()
-    assert result.status is ToolResultStatus.OK
-    assert result.data["episodes_created"] == 1
+    assert not consolidation_started.is_set()
+    assert result.status is ToolResultStatus.ERROR
+    assert "configured 0.1-second deadline" in result.error
+    assert "consolidation did not start" in result.error
     assert not locks.is_held(ResourceLock.MEMORY)
 
 
@@ -431,7 +432,7 @@ async def test_blocked_lock_acquisition_has_its_own_failure(monkeypatch):
     assert result.status is ToolResultStatus.ERROR
     assert "could not acquire the memory lock" in result.error
     assert "consolidation did not start" in result.error
-    assert "configured 0.02-second deadline" not in result.error
+    assert "configured 0.02-second deadline" in result.error
     memory_system.consolidate.assert_not_awaited()
     assert locks.holder(ResourceLock.MEMORY).label == "other task"
 

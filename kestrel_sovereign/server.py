@@ -3308,7 +3308,7 @@ async def _agent_detailed_health(agent) -> dict:
         db = getattr(agent.storage, 'db', None)
 
     checks = await run_standard_checks(agent, db)
-    overall = derive_overall_status(checks)
+    overall = derive_overall_status(checks, fail_on_any_failure=True)
     return {"status": overall, "checks": checks}
 
 

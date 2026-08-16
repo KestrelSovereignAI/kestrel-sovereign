@@ -623,6 +623,82 @@ class TestRetiredCronCleanup:
 
 class TestSleepCronHandler:
     @pytest.mark.asyncio
+    async def test_handle_sleep_runs_maintenance_when_core_work_is_disabled(self):
+        class _Report:
+            def to_dict(self):
+                return {"success": False, "error": None}
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        f = SchedulerFeature(agent)
+
+        out = await f._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": False,
+        })
+
+        assert json.loads(out) == {
+            "success": False,
+            "error": None,
+            "skipped": True,
+            "reason": "consolidation and export were both skipped",
+            "skip_reflection": False,
+        }
+        agent.sleep.assert_awaited_once_with(
+            skip_export=True,
+            skip_consolidation=True,
+            skip_reflection=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_fails_incomplete_maintenance_only_cycle(self):
+        class _Report:
+            def to_dict(self):
+                return {
+                    "success": False,
+                    "error": None,
+                    "semantic_maintenance": {"status": "partial"},
+                }
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        feature = SchedulerFeature(agent)
+
+        outcome = await feature._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": True,
+        })
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert json.loads(outcome.result_text)["semantic_maintenance"] == {
+            "status": "partial"
+        }
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_logs_raised_cycle_locally_with_traceback(
+        self, caplog
+    ):
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(side_effect=RuntimeError("sleep exploded"))
+        feature = SchedulerFeature(agent)
+        feature._agent_id = "did:test:sleep-diagnostics"
+
+        with caplog.at_level(logging.ERROR):
+            outcome = await feature._handle_sleep({"skip_reflection": True})
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
+        record = next(
+            record
+            for record in caplog.records
+            if record.message
+            == "[sleep] agent=did:test:sleep-diagnostics cycle failed"
+        )
+        assert record.exc_info is not None
+        assert "sleep exploded" in str(record.exc_info[1])
+
+    @pytest.mark.asyncio
     async def test_handle_sleep_calls_agent_sleep_skip_export(self):
         """The sleep cron handler runs the agent's sleep cycle with
         skip_export=True (backups own DR) and surfaces the report."""
@@ -660,6 +736,7 @@ class TestSleepCronHandler:
         agent.did = agent.agent_id
         agent.features = {}
         agent.storage = MagicMock()
+        agent.storage.sweep_expired_governed_semantic_artifacts = None
         agent.storage.db = _make_mock_db()
         agent.sleep_hooks = []
         agent._consolidate_memories = AsyncMock(
@@ -695,7 +772,7 @@ class TestSleepCronHandler:
         assert isinstance(outcome, ScheduledTaskOutcome)
         assert outcome.status == "failed"
         assert outcome.pause_schedule is False
-        assert json.loads(outcome.result_text) == {"error": "sleep exploded"}
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
 
     @pytest.mark.asyncio
     async def test_handle_sleep_reflects_when_active(self):
@@ -1566,41 +1643,14 @@ class TestSchedulerRunner:
         )
         assert outcome_call[0][1][0] == "failed"
 
-    @pytest.mark.asyncio
-    async def test_tick_records_failed_outcome_without_pausing_recurring_task(self):
-        """A failed built-in sleep report is not normalized to success."""
-        db = _make_mock_db()
-        now_iso = datetime.now(timezone.utc).isoformat()
-        db.fetchall = AsyncMock(return_value=[
-            ("sleep-task", "test-agent", "sleep", "@daily", "{}",
-             1, None, now_iso, "2026-03-04T00:00:00"),
-        ])
-        executor = AsyncMock(
-            return_value=ScheduledTaskOutcome(
+    def test_failed_outcome_cannot_silently_request_pause(self):
+        """Failed dispatcher results have no structured pause channel."""
+        with pytest.raises(ValueError, match="only valid for blocked"):
+            ScheduledTaskOutcome(
                 status="failed",
-                result_text='{"success": false, "error": "consolidation_failed"}',
-                pause_schedule=False,
+                result_text="failed",
+                pause_schedule=True,
             )
-        )
-        runner = SchedulerRunner(db, "test-agent", executor)
-
-        await runner._tick()
-
-        outcome_call = next(
-            call for call in db.execute.call_args_list
-            if "UPDATE task_execution_log" in call[0][0]
-        )
-        assert outcome_call[0][1][0] == "failed"
-        assert "consolidation_failed" in outcome_call[0][1][1]
-
-        schedule_call = next(
-            call for call in db.execute.call_args_list
-            if "UPDATE scheduled_tasks" in call[0][0]
-            and "terminal_status" in call[0][0]
-        )
-        # Non-database-clock unit doubles include last_run_at first, followed
-        # by next_run_at and enabled.  A recurring failure remains enabled.
-        assert schedule_call[0][1][2] == 1
 
     @pytest.mark.asyncio
     async def test_tick_records_blocked_reason_and_pauses_schedule(self):
@@ -2133,7 +2183,9 @@ class TestTaskExecutor:
         feature.agent.features = {"MemoryFeature": memory_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        with pytest.raises(RuntimeError, match="consolidation deadline expired"):
+        with pytest.raises(
+            RuntimeError, match="scheduled tool memory_consolidate failed"
+        ):
             await feature._lookup_and_run_tool("memory_consolidate", {})
 
     @pytest.mark.asyncio
@@ -2152,7 +2204,7 @@ class TestTaskExecutor:
         feature.agent.features = {"JobFeature": job_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        with pytest.raises(RuntimeError, match="job exploded"):
+        with pytest.raises(RuntimeError, match="scheduled tool job failed"):
             await feature._lookup_and_run_tool("job", {})
 
     @pytest.mark.asyncio

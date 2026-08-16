@@ -943,10 +943,16 @@ class SleepMixin:
                     # zero-valued counters masquerade as a completed sleep
                     # cycle, and do not surface provider or memory content in
                     # this operator-facing report.
-                    report.error = unavailability_reason
+                    if report.error:
+                        report.error += f"; {unavailability_reason}"
+                    else:
+                        report.error = unavailability_reason
             except MemoryConsolidationTimeoutError:
                 logger.error("Consolidation timed out", exc_info=True)
-                report.error = "consolidation_failed"
+                if report.error:
+                    report.error += "; consolidation_failed"
+                else:
+                    report.error = "consolidation_failed"
                 report.consolidation_ms = int((time.time() - start) * 1000)
                 report.reflection_ms = (
                     int((time.time() - reflection_start) * 1000)
@@ -959,7 +965,10 @@ class SleepMixin:
                 return report
             except Exception:
                 logger.error("Consolidation failed", exc_info=True)
-                report.error = "consolidation_failed"
+                if report.error:
+                    report.error += "; consolidation_failed"
+                else:
+                    report.error = "consolidation_failed"
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)
 

@@ -80,6 +80,7 @@ class HealthFeature(Feature):
         self._agent_id = ""
         self._interval_seconds = DEFAULT_INTERVAL_SECONDS
         self._background_task: Optional[asyncio.Task] = None
+        self._health_persist_tasks: set[asyncio.Task] = set()
         self._running = False
         self._in_memory_history: List[Dict[str, Any]] = []
         self._start_time = time.monotonic()
@@ -123,6 +124,21 @@ class HealthFeature(Feature):
             except asyncio.CancelledError:
                 pass
         self._background_task = None
+
+        # A timed-out health persistence wait remains live so it cannot install
+        # a global SQLite cancellation fence. Teardown still owns that work:
+        # cancel and reap it before the feature/database lifecycle continues.
+        pending_persists = [
+            task
+            for task in getattr(self, "_health_persist_tasks", set())
+            if not task.done()
+        ]
+        for task in pending_persists:
+            task.cancel()
+        if pending_persists:
+            await asyncio.gather(*pending_persists, return_exceptions=True)
+        self._health_persist_tasks = set()
+        await super().shutdown()
         logger.info("HealthFeature: background loop stopped")
 
     # =========================================================================
@@ -437,33 +453,65 @@ class HealthFeature(Feature):
             check.get("name") == "database" and check.get("status") == "fail"
             for check in checks
         )
-        if self._db and not database_failed:
-            try:
-                async with asyncio.timeout(
-                    health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S
-                ):
-                    await self._db.execute(
-                        """
-                        INSERT INTO health_log
-                        (id, agent_id, status, checks_json, overall_healthy, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            check_id,
-                            self._agent_id,
-                            overall_status,
-                            json.dumps(checks),
-                            1 if overall_healthy else 0,
-                            now,
-                        ),
-                    )
-            except TimeoutError:
+        pending_persists = getattr(self, "_health_persist_tasks", None)
+        if pending_persists is None:
+            pending_persists = set()
+            self._health_persist_tasks = pending_persists
+        pending_persists.difference_update(
+            {task for task in pending_persists if task.done()}
+        )
+        if self._db and not database_failed and not pending_persists:
+            # Use the running loop directly: tests and embedders may replace
+            # ``asyncio.create_task`` specifically to suppress the long-lived
+            # health loop, but this finite persistence task must remain real.
+            persist_task = asyncio.get_running_loop().create_task(
+                self._db.execute(
+                    """
+                    INSERT INTO health_log
+                    (id, agent_id, status, checks_json, overall_healthy, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        check_id,
+                        self._agent_id,
+                        overall_status,
+                        json.dumps(checks),
+                        1 if overall_healthy else 0,
+                        now,
+                    ),
+                ),
+                name=f"health-log-persist:{self._agent_id}",
+            )
+            pending_persists.add(persist_task)
+
+            def _persist_done(task: asyncio.Task) -> None:
+                pending_persists.discard(task)
+                if task.cancelled():
+                    return
+                error = task.exception()
+                if error is not None:
+                    logger.warning("HealthFeature: failed to persist: %s", error)
+
+            persist_task.add_done_callback(_persist_done)
+            # The liveness call has a bounded wait, but expiry must not cancel a
+            # shared-connection write. A cancelled aiosqlite operation installs
+            # a backend-wide rollback fence. ``asyncio.wait`` returns with the
+            # task still owned here and avoids creating a discarded shield
+            # future that could report a late exception as unhandled.
+            done, _ = await asyncio.wait(
+                {persist_task},
+                timeout=health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S,
+            )
+            if not done:
                 logger.warning(
-                    "HealthFeature: persistence timed out after %g seconds",
+                    "HealthFeature: persistence still pending after %g seconds",
                     health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S,
                 )
-            except Exception as e:
-                logger.warning(f"HealthFeature: failed to persist: {e}")
+        elif self._db and not database_failed:
+            logger.warning(
+                "HealthFeature: skipping persistence while a prior health-log "
+                "write is still pending"
+            )
 
         self._in_memory_history.append(result)
         if len(self._in_memory_history) > MAX_IN_MEMORY_HISTORY:

@@ -161,6 +161,43 @@ class TestCheckDatabase:
         assert "connection lost" in result["message"]
 
     @pytest.mark.asyncio
+    async def test_fail_when_sqlite_write_path_is_fenced(self):
+        db = SimpleNamespace(
+            backend=SimpleNamespace(
+                write_connection_unavailable=True,
+                write_connection_requires_reconnect=True,
+            ),
+            fetchone=AsyncMock(
+                side_effect=AssertionError("read probe must not mask write failure")
+            ),
+        )
+
+        result = await check_database(db)
+
+        assert result["status"] == "fail"
+        assert "write connection is unavailable" in result["message"]
+        assert "reconnect is required" in result["message"]
+        db.fetchone.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_warn_when_sqlite_cancellation_cleanup_is_pending(self):
+        db = SimpleNamespace(
+            backend=SimpleNamespace(
+                write_connection_unavailable=True,
+                write_connection_requires_reconnect=False,
+            ),
+            fetchone=AsyncMock(
+                side_effect=AssertionError("fenced state is diagnosed directly")
+            ),
+        )
+
+        result = await check_database(db)
+
+        assert result["status"] == "warn"
+        assert "cleanup is still pending" in result["message"]
+        db.fetchone.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_warn_when_unexpected_result(self):
         db = _make_db(fetchone_data=(42,))
         result = await check_database(db)
@@ -300,7 +337,7 @@ class TestCheckResourceLocks:
         )
 
     @pytest.mark.asyncio
-    async def test_warns_for_slow_blocked_hold(self):
+    async def test_subthreshold_slow_blocked_hold_remains_ready(self):
         result = await check_resource_locks(
             self._agent(
                 [
@@ -314,7 +351,7 @@ class TestCheckResourceLocks:
             )
         )
 
-        assert result["status"] == "warn"
+        assert result["status"] == "pass"
         assert "memory lock has been held for 120 seconds" in result["message"]
         assert "cron sleep" in result["message"]
 
@@ -378,11 +415,11 @@ class TestCheckResourceLocks:
             )
         )
 
-        assert result["status"] == "fail"
+        assert result["status"] == "warn"
         assert result["details"]["escalation_threshold_seconds"] == 110.0
 
     @pytest.mark.asyncio
-    async def test_fails_and_reports_hours_after_escalation_threshold(self):
+    async def test_warns_and_reports_hours_after_escalation_threshold(self):
         result = await check_resource_locks(
             self._agent(
                 [
@@ -396,7 +433,7 @@ class TestCheckResourceLocks:
             )
         )
 
-        assert result["status"] == "fail"
+        assert result["status"] == "warn"
         assert "66.7 hours" in result["message"]
         assert result["details"]["held_locks"][0]["resource"] == "memory"
 
@@ -483,7 +520,7 @@ class TestCheckResourceLocks:
             )
 
         assert checks[0]["name"] == "resource_locks"
-        assert checks[0]["status"] == "fail"
+        assert checks[0]["status"] == "warn"
         assert checks[1]["name"] == "database"
         assert checks[1]["status"] == "fail"
         assert "timed out" in checks[1]["message"]
@@ -523,6 +560,18 @@ class TestCheckResourceLocks:
             check for check in checks if check["name"] == "bootstrap_state"
         )
         assert bootstrap["status"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_database_check_does_not_relabel_nested_timeout(self):
+        """Only the wrapper's own expired deadline becomes a health result."""
+        async def nested_timeout():
+            raise TimeoutError("database driver timed out")
+
+        with pytest.raises(TimeoutError, match="database driver timed out"):
+            await health_checks._run_database_bound_check(
+                "database",
+                nested_timeout(),
+            )
 
 
 class TestCheckDiskSpace:
@@ -694,17 +743,27 @@ class TestDeriveOverallStatus:
         checks = [
             {"name": "database", "status": "pass"},
             {"name": "llm_service", "status": "pass"},
-            {"name": "resource_locks", "status": "fail"},
+            {"name": "resource_locks", "status": "warn"},
         ]
         assert _derive_overall_status(checks) == "degraded"
 
-    def test_non_critical_fail_is_degraded(self):
+    def test_noncritical_subsystem_fail_is_degraded(self):
         checks = [
             {"name": "database", "status": "pass"},
             {"name": "llm_service", "status": "pass"},
             {"name": "disk_space", "status": "fail"},
         ]
         assert _derive_overall_status(checks) == "degraded"
+
+    def test_strict_fallback_policy_marks_any_failure_unhealthy(self):
+        checks = [
+            {"name": "database", "status": "pass"},
+            {"name": "llm_service", "status": "pass"},
+            {"name": "context_budget", "status": "fail"},
+        ]
+        assert _derive_overall_status(
+            checks, fail_on_any_failure=True
+        ) == "unhealthy"
 
     def test_empty_checks(self):
         assert _derive_overall_status([]) == "healthy"
@@ -850,6 +909,18 @@ class TestHeartbeatCheck:
         backend = SQLiteBackend(str(tmp_path / "health-write-lock.db"))
         await backend.connect()
         db = AsyncDatabase(backend)
+        await db.execute(
+            """
+            CREATE TABLE health_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                overall_healthy INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         agent = _make_agent(db=db)
         agent.bootstrap_service = None
         agent.dispatcher = None
@@ -880,9 +951,14 @@ class TestHeartbeatCheck:
             assert feat._in_memory_history == [result]
             assert not holder.done()
             assert backend._cancelled_write_drain is None
+
+            pending_persists = list(feat._health_persist_tasks)
+            assert len(pending_persists) == 1
         finally:
             release_transaction.set()
             await holder
+            if "pending_persists" in locals():
+                await asyncio.gather(*pending_persists)
             await backend.close()
 
     @pytest.mark.asyncio

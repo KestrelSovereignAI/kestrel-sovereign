@@ -863,14 +863,14 @@ def _make_health_agent(status, checks=None):
 
 
 @pytest.mark.asyncio
-async def test_detailed_health_fallback_uses_shared_noncritical_rollup():
-    """Agents without HealthFeature grade non-critical failures as degraded."""
+async def test_detailed_health_fallback_matches_lock_warning_rollup():
+    """The lock diagnosis has one severity with or without HealthFeature."""
     from kestrel_sovereign.server import _agent_detailed_health
 
     checks = [
         {"name": "database", "status": "pass"},
         {"name": "llm_service", "status": "pass"},
-        {"name": "resource_locks", "status": "fail"},
+        {"name": "resource_locks", "status": "warn"},
     ]
     agent = SimpleNamespace(features={}, storage=None)
 
@@ -881,6 +881,30 @@ async def test_detailed_health_fallback_uses_shared_noncritical_rollup():
         result = await _agent_detailed_health(agent)
 
     assert result == {"status": "degraded", "checks": checks}
+
+
+@pytest.mark.parametrize("failed_check", ["disk_space", "memory_system"])
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_keeps_subsystem_failures_unhealthy(
+    failed_check,
+):
+    """Installing no HealthFeature cannot relax the established fallback."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": failed_check, "status": "fail"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "unhealthy", "checks": checks}
 
 
 def test_detailed_health_reports_fleet_when_no_singleton_agent():
