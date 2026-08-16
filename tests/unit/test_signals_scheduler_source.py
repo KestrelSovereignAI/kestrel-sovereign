@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from kestrel_sdk.signals import (
@@ -24,18 +25,21 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
     SourceRegistry,
 )
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.signals.sources.scheduler import (
     CRON_TASKS,
     build_cron_registrations,
     cron_source_name,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
@@ -380,6 +384,122 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
     assert result.status == Status.OK
     assert result.action_result is blocked
     assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    ("case", "task_name", "signal_status", "execution_status", "enabled"),
+    [
+        ("failed", "sleep", Status.FAILED, "failed", 1),
+        ("exception", "sleep", Status.FAILED, "failed", 1),
+        ("successful", "sleep", Status.OK, "success", 1),
+        ("blocked", "restart_coordinator", Status.OK, "blocked", 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
+    dispatcher_components,
+    case,
+    task_name,
+    signal_status,
+    execution_status,
+    enabled,
+):
+    """A cron result has one status meaning across dispatch and scheduling."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    agent.dispatcher = dispatcher
+
+    if case == "failed":
+        sleep_report = {
+            "success": False,
+            "error": "consolidation deadline expired",
+        }
+    else:
+        sleep_report = {"success": True}
+
+    class _SleepReport:
+        def to_dict(self):
+            return sleep_report
+
+    async def sleep(**kwargs):
+        if case == "exception":
+            raise RuntimeError("sleep exploded")
+        return _SleepReport()
+
+    blocked = ScheduledTaskOutcome.blocked(
+        task_name="restart_coordinator",
+        decision="ask",
+        reason="operator approval required",
+    )
+
+    async def lookup(name, args):
+        if name == "restart_coordinator":
+            return blocked
+        raise AssertionError(f"unexpected lookup for {name}")
+
+    agent.sleep = sleep
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+    for registration in build_cron_registrations(
+        tool_lookup=lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner._ensure_tables()
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    schedule_id = f"{case}-task"
+    await db.execute(
+        """
+        INSERT INTO scheduled_tasks
+            (id, agent_id, task_name, cron_expression, args_json,
+             enabled, next_run_at, created_at, scheduler_protocol_version)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+        """,
+        (
+            schedule_id,
+            agent.did,
+            task_name,
+            "@daily",
+            '{"skip_reflection": true}',
+            due_at,
+            due_at,
+        ),
+    )
+
+    await runner._tick()
+    pending = [task for task in agent.background_tasks if not task.done()]
+    if pending:
+        await asyncio.gather(*pending)
+
+    signal_row = await backend.fetch_one(
+        "SELECT status, error FROM signal_log WHERE source = ?",
+        (cron_source_name(task_name),),
+    )
+    execution_row = await db.fetchone(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+        (schedule_id,),
+    )
+    schedule_row = await db.fetchone(
+        "SELECT enabled FROM scheduled_tasks WHERE id = ?",
+        (schedule_id,),
+    )
+
+    assert signal_row is not None
+    assert signal_row[0] == signal_status.value
+    assert execution_row is not None
+    assert execution_row[0] == execution_status
+    assert schedule_row == (enabled,)
+    if case == "failed":
+        assert "consolidation deadline expired" in (signal_row[1] or "")
+        assert "consolidation deadline expired" in (execution_row[1] or "")
+    elif case == "exception":
+        assert "sleep exploded" in (signal_row[1] or "")
+        assert "sleep exploded" in (execution_row[1] or "")
+    elif case == "blocked":
+        assert signal_row[1] is None
+        assert "operator approval required" in (execution_row[1] or "")
 
 
 @pytest.mark.asyncio

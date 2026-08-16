@@ -1017,7 +1017,7 @@ class SchedulerFeature(Feature):
                 return blocked
         features = getattr(self.agent, "features", {})
         from kestrel_sovereign.signals.sources.scheduler import (
-            _require_successful_tool_result,
+            _require_successful_task_result,
         )
 
         for feature in features.values():
@@ -1033,7 +1033,7 @@ class SchedulerFeature(Feature):
                     result = await self._run_tool_hook_gated(
                         type(feature).__name__, agent_tool, args,
                     )
-                    result = _require_successful_tool_result(task_name, result)
+                    result = _require_successful_task_result(task_name, result)
                     if isinstance(result, ScheduledTaskOutcome):
                         return result
                     # Preserve the legacy JSON-encode contract for
@@ -1050,7 +1050,7 @@ class SchedulerFeature(Feature):
                 result = await self._run_tool_hook_gated(
                     type(self).__name__, agent_tool, args,
                 )
-                result = _require_successful_tool_result(task_name, result)
+                result = _require_successful_task_result(task_name, result)
                 if isinstance(result, ScheduledTaskOutcome):
                     return result
                 if isinstance(result, str):

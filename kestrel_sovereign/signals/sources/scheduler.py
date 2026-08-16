@@ -42,6 +42,7 @@ from kestrel_sdk.signals import (
     Trust,
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +189,22 @@ _REDACTION = RedactionPolicy(
 ToolLookup = Callable[[str, dict], Awaitable[Any]]
 
 
-def _require_successful_tool_result(task_name: str, result: Any) -> Any:
-    """Turn a structured tool failure into a failed scheduler dispatch."""
+def _require_successful_task_result(task_name: str, result: Any) -> Any:
+    """Turn a structured task failure into a failed scheduler dispatch.
+
+    Permission blocks remain normal handler results: the scheduler runner needs
+    their structured outcome to pause the schedule and persist operator-facing
+    recovery guidance without making an expected policy decision look like a
+    dispatcher error.
+    """
+    if isinstance(result, ScheduledTaskOutcome):
+        if result.status == "blocked":
+            return result
+        detail = result.result_text or "task returned a non-success outcome"
+        raise RuntimeError(
+            f"scheduled task {task_name} returned {result.status}: {detail}"
+        )
+
     failed = (
         isinstance(result, ToolResult)
         and result.status is ToolResultStatus.ERROR
@@ -213,11 +228,25 @@ def _require_successful_tool_result(task_name: str, result: Any) -> Any:
     return result
 
 
+def _wrap_builtin_action_handler(
+    handler: ActionHandler,
+    task_name: str,
+) -> ActionHandler:
+    """Apply the scheduled-result contract to a bespoke ACTION handler."""
+
+    async def checked_handler(payload: dict) -> Any:
+        return _require_successful_task_result(
+            task_name, await handler(payload)
+        )
+
+    return checked_handler
+
+
 def _make_action_handler(lookup: ToolLookup, task_name: str) -> ActionHandler:
     """Return an ACTION handler that runs `lookup(task_name, payload)`."""
 
     async def handler(payload: dict) -> Any:
-        return _require_successful_tool_result(
+        return _require_successful_task_result(
             task_name, await lookup(task_name, payload)
         )
 
@@ -231,7 +260,7 @@ def _make_artifact_handler(
     and returns the tool's output as the artifact."""
 
     async def handler(signal: Signal) -> Any:
-        return _require_successful_tool_result(
+        return _require_successful_task_result(
             task_name, await lookup(task_name, signal.payload)
         )
 
@@ -270,8 +299,11 @@ def build_cron_registrations(
     for task_name, mode, resources in CRON_TASKS:
         # Pick the handler. Builtins win over tool lookup.
         if mode == SignalMode.ACTION:
-            handler: ActionHandler | None = builtin_handlers.get(
-                task_name, _make_action_handler(tool_lookup, task_name)
+            builtin_handler = builtin_handlers.get(task_name)
+            handler: ActionHandler | None = (
+                _make_action_handler(tool_lookup, task_name)
+                if builtin_handler is None
+                else _wrap_builtin_action_handler(builtin_handler, task_name)
             )
             artifact_handler = None
         else:  # ARTIFACT
