@@ -58,22 +58,15 @@ async def _run_database_bound_check(
         }
 
 
-def derive_overall_status(
-    checks: List[Dict[str, Any]],
-    *,
-    fail_on_any_failure: bool = False,
-) -> str:
+def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
     """Derive the shared three-state status for every detailed-health surface.
 
     - healthy: all checks pass
     - degraded: at least one warning or non-critical failure
-    - unhealthy: a critical database/LLM failure, or any failure on a caller
-      that explicitly requests the historical strict fallback policy
+    - unhealthy: a critical database or LLM check fails
 
-    HealthFeature has always treated only database and LLM failures as
-    critical. The no-feature ``/health/detailed`` fallback historically treated
-    every failure as unhealthy. One parameterized implementation preserves both
-    public contracts without letting their check lists drift again.
+    Both HealthFeature and the no-feature ``/health/detailed`` fallback use
+    this function so installing the feature cannot change a check's severity.
     """
     statuses = [check.get("status", "pass") for check in checks]
     critical_names = {"database", "llm_service"}
@@ -83,9 +76,7 @@ def derive_overall_status(
         if check.get("name") in critical_names
     ]
 
-    if "fail" in critical_statuses or (
-        fail_on_any_failure and "fail" in statuses
-    ):
+    if "fail" in critical_statuses:
         return "unhealthy"
     if "fail" in statuses or "warn" in statuses:
         return "degraded"

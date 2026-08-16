@@ -755,16 +755,6 @@ class TestDeriveOverallStatus:
         ]
         assert _derive_overall_status(checks) == "degraded"
 
-    def test_strict_fallback_policy_marks_any_failure_unhealthy(self):
-        checks = [
-            {"name": "database", "status": "pass"},
-            {"name": "llm_service", "status": "pass"},
-            {"name": "context_budget", "status": "fail"},
-        ]
-        assert _derive_overall_status(
-            checks, fail_on_any_failure=True
-        ) == "unhealthy"
-
     def test_empty_checks(self):
         assert _derive_overall_status([]) == "healthy"
 

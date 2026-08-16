@@ -883,12 +883,14 @@ async def test_detailed_health_fallback_matches_lock_warning_rollup():
     assert result == {"status": "degraded", "checks": checks}
 
 
-@pytest.mark.parametrize("failed_check", ["disk_space", "memory_system"])
+@pytest.mark.parametrize(
+    "failed_check", ["bootstrap_state", "disk_space", "memory_system"]
+)
 @pytest.mark.asyncio
-async def test_detailed_health_fallback_keeps_subsystem_failures_unhealthy(
+async def test_detailed_health_fallback_matches_noncritical_failure_rollup(
     failed_check,
 ):
-    """Installing no HealthFeature cannot relax the established fallback."""
+    """Installing HealthFeature cannot change a non-critical severity."""
     from kestrel_sovereign.server import _agent_detailed_health
 
     checks = [
@@ -904,7 +906,7 @@ async def test_detailed_health_fallback_keeps_subsystem_failures_unhealthy(
     ):
         result = await _agent_detailed_health(agent)
 
-    assert result == {"status": "unhealthy", "checks": checks}
+    assert result == {"status": "degraded", "checks": checks}
 
 
 def test_detailed_health_reports_fleet_when_no_singleton_agent():
