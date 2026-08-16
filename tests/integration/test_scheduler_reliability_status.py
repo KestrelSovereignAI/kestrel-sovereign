@@ -32,7 +32,10 @@ from kestrel_sovereign.features.scheduler.status import (
     scheduler_status_parameters,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.database_clock import database_clock
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+scheduler_database_clock = database_clock
 
 
 async def _database(path) -> AsyncDatabase:
@@ -199,6 +202,438 @@ async def test_runtime_report_distinguishes_missing_zero_and_system_disabled(tmp
 
 
 @pytest.mark.asyncio
+async def test_multi_owner_health_uses_fresh_healthy_worker_without_peer_flap(
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-multi-owner.db")
+    runner = SchedulerRunner(db, "agent-1", lambda *_: None, owner_id="healthy")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await runner._ensure_tables()
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id="healthy",
+            worker_state="running",
+            last_tick_started_at=now,
+            last_tick_completed_at=now,
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id="peer",
+            worker_state="restarting",
+            last_tick_started_at=now,
+            last_tick_completed_at=now,
+            restart_count=3,
+            consecutive_failures=2,
+            last_error_type="RuntimeError",
+        )
+
+        degraded_peer = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert degraded_peer["status"] == "pass"
+        assert degraded_peer["owner_id"] == "healthy"
+        assert degraded_peer["fresh_worker_count"] == 2
+        assert degraded_peer["running_worker_count"] == 1
+
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id="peer",
+            worker_state="stopped",
+            last_tick_started_at=now,
+            last_tick_completed_at=now,
+            restart_count=3,
+            consecutive_failures=2,
+            last_error_type="RuntimeError",
+        )
+        stopping_peer = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert stopping_peer["status"] == "pass"
+        assert stopping_peer["owner_id"] == "healthy"
+
+        await db.execute(
+            "UPDATE scheduler_runtime_status SET reported_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(),
+                "agent-1",
+                "healthy",
+            ),
+        )
+        only_stopped_is_fresh = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert only_stopped_is_fresh["status"] == "fail"
+        assert only_stopped_is_fresh["state"] == "stopped"
+        assert only_stopped_is_fresh["fresh_worker_count"] == 1
+        assert only_stopped_is_fresh["running_worker_count"] == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_bounds_historical_owners_and_reaps_expired_rows(
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-owner-retention.db")
+    runner = SchedulerRunner(db, "agent-1", lambda *_: None, owner_id="healthy")
+    try:
+        await runner._ensure_tables()
+        now = datetime.now(timezone.utc)
+        for index in range(20):
+            await db.execute(
+                """INSERT INTO scheduler_runtime_status
+                       (agent_id, owner_id, worker_state, reported_at)
+                   VALUES (?, ?, 'stopped', ?)""",
+                (
+                    "agent-1",
+                    f"historical-{index}",
+                    (now - timedelta(minutes=10, seconds=index)).isoformat(),
+                ),
+            )
+        await db.execute(
+            """INSERT INTO scheduler_runtime_status
+                   (agent_id, owner_id, worker_state, reported_at)
+               VALUES (?, ?, 'stopped', ?)""",
+            ("agent-1", "expired", (now - timedelta(days=2)).isoformat()),
+        )
+
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id="healthy",
+            worker_state="running",
+            last_tick_started_at=now.isoformat(),
+            last_tick_completed_at=now.isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM scheduler_runtime_status "
+            "WHERE owner_id = 'expired'"
+        ) == (0,)
+        status = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert status["status"] == "pass"
+        assert status["owner_id"] == "healthy"
+        assert status["worker_reports_received"] == 1
+        assert status["stale_worker_count"] == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_migrates_agent_primary_key_without_losing_report(
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-runtime-owner-migration.db")
+    try:
+        await db.execute(
+            """
+            CREATE TABLE scheduler_runtime_status (
+                agent_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                worker_state TEXT NOT NULL,
+                reported_at TEXT NOT NULL,
+                last_tick_started_at TEXT,
+                last_tick_completed_at TEXT,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_error_type TEXT,
+                configured_enabled_count INTEGER NOT NULL DEFAULT 0,
+                enabled_count INTEGER NOT NULL DEFAULT 0,
+                executing_count INTEGER NOT NULL DEFAULT 0,
+                disabled_count INTEGER NOT NULL DEFAULT 0,
+                fenced_count INTEGER NOT NULL DEFAULT 0,
+                system_disabled_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """INSERT INTO scheduler_runtime_status
+                   (agent_id, owner_id, worker_state, reported_at)
+               VALUES ('agent-1', 'legacy-owner', 'running', ?)""",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+        await ensure_runtime_status_table(db)
+        await ensure_runtime_status_table(db)
+
+        key_columns = [
+            row[1]
+            for row in sorted(
+                await db.fetchall("PRAGMA table_info(scheduler_runtime_status)"),
+                key=lambda row: int(row[5]),
+            )
+            if row[5]
+        ]
+        assert key_columns == ["agent_id", "owner_id"]
+        assert await db.fetchone(
+            "SELECT owner_id, worker_state FROM scheduler_runtime_status "
+            "WHERE agent_id = ?",
+            ("agent-1",),
+        ) == ("legacy-owner", "running")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_one_shot_is_history_not_recoverable_disablement(tmp_path):
+    db = await _database(tmp_path / "scheduler-terminal-history.db")
+    agent = SimpleNamespace(
+        did="agent-1",
+        agent_id="agent-1",
+        storage=SimpleNamespace(db=db),
+        signal_registry=None,
+        wait_registry=None,
+        features={},
+    )
+    feature = SchedulerFeature(agent)
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await feature.initialize()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, schedule_kind, run_at,
+                 terminal_status, terminal_at, scheduler_protocol_version)
+            VALUES ('completed-deadline', 'agent-1', 'wait_reconcile',
+                    '* * * * *', '{}', 0, NULL, ?, 'one_shot', ?,
+                    'success', ?, ?)
+            """,
+            (now, now, now, SCHEDULER_PROTOCOL_VERSION),
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=feature._runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=now,
+            last_tick_completed_at=now,
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert status["status"] == "pass"
+        assert status["state"] == "running_only_terminal_schedules"
+        assert status["terminal_count"] == 1
+        assert status["disabled_count"] == 0
+        assert status["system_disabled_count"] == 0
+        assert status["disabled_reasons"] == {}
+
+        listed = await feature.schedule_list()
+        task = listed.data["tasks"][0]
+        assert task["disablement"] == {
+            "state": "terminal",
+            "source": "scheduler_history",
+            "reason": "success",
+            "recoverable": False,
+            "recovery_action": None,
+        }
+        resume = await feature.schedule_resume("completed-deadline")
+        assert resume.status.value == "error"
+        assert "one-shot" in resume.error.lower()
+    finally:
+        await feature.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "execution_log_inconsistent",
+        "invalid_idempotency_key",
+        ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
+    ],
+)
+async def test_one_shot_safety_disablement_is_not_terminal_history(
+    tmp_path, terminal_status,
+):
+    db = await _database(
+        tmp_path / f"scheduler-one-shot-safety-{terminal_status}.db"
+    )
+    agent = SimpleNamespace(
+        did="agent-1",
+        agent_id="agent-1",
+        storage=SimpleNamespace(db=db),
+        signal_registry=None,
+        wait_registry=None,
+        features={},
+    )
+    feature = SchedulerFeature(agent)
+    now = datetime.now(timezone.utc)
+    run_at = (now + timedelta(hours=1)).isoformat()
+    try:
+        await feature.initialize()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, schedule_kind, run_at,
+                 terminal_status, terminal_at, scheduler_protocol_version)
+            VALUES ('safety-disabled-deadline', 'agent-1', 'wait_reconcile',
+                    '* * * * *', '{}', 0, NULL, ?, 'one_shot', ?, ?, ?, ?)
+            """,
+            (
+                now.isoformat(),
+                run_at,
+                terminal_status,
+                now.isoformat(),
+                SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=feature._runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=now.isoformat(),
+            last_tick_completed_at=now.isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=30
+        )
+        assert status["status"] == "warn"
+        assert status["state"] == "system_disabled_schedules"
+        assert status["terminal_count"] == 0
+        assert status["system_disabled_count"] == 1
+        assert status["disabled_reasons"] == {terminal_status: 1}
+
+        listed = await feature.schedule_list()
+        disablement = listed.data["tasks"][0]["disablement"]
+        assert disablement["state"] == "disabled"
+        assert disablement["source"] == "scheduler"
+        assert disablement["reason"] == terminal_status
+
+        if terminal_status == "invalid_idempotency_key":
+            refused = await feature.schedule_resume("safety-disabled-deadline")
+            assert refused.status.value == "error"
+            assert "repair or recreate" in refused.error
+        elif terminal_status == ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE:
+            refused = await feature.schedule_resume("safety-disabled-deadline")
+            assert refused.status.value == "error"
+            assert "acknowledge_ambiguous_effect=true" in refused.error
+            resumed = await feature.schedule_resume(
+                "safety-disabled-deadline",
+                acknowledge_ambiguous_effect=True,
+            )
+            assert resumed.status.value == "ok"
+        else:
+            assert disablement["recoverable"] is False
+            assert "recreate the one-shot" in disablement["recovery_action"]
+            refused = await feature.schedule_resume("safety-disabled-deadline")
+            assert refused.status.value == "error"
+            assert "recreate the deadline" in refused.error
+            persisted = await db.fetchone(
+                "SELECT enabled, terminal_status, terminal_at FROM scheduled_tasks "
+                "WHERE id = ?",
+                ("safety-disabled-deadline",),
+            )
+            assert persisted[0] == 0
+            assert persisted[1] == "execution_log_inconsistent"
+            assert persisted[2]
+    finally:
+        await feature.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_skew_hours", [-12, 12])
+async def test_runtime_freshness_uses_database_time_despite_producer_clock_skew(
+    monkeypatch, tmp_path, producer_skew_hours,
+):
+    from kestrel_sovereign.storage import database_clock as scheduler_clock
+
+    real_datetime = datetime
+
+    class SkewedDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = real_datetime.now(tz or timezone.utc)
+            return current + timedelta(hours=producer_skew_hours)
+
+    monkeypatch.setattr(scheduler_clock, "datetime", SkewedDateTime)
+    db = await _database(
+        tmp_path / f"scheduler-clock-skew-{producer_skew_hours}.db"
+    )
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="skewed",
+        poll_interval=0.01,
+    )
+    try:
+        await runner._ensure_tables()
+
+        async def one_tick():
+            runner._running = False
+
+        monkeypatch.setattr(runner, "_tick", one_tick)
+        runner._running = True
+        await runner._loop()
+
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id="skewed",
+            worker_state="running",
+            last_tick_started_at=runner._last_tick_started_at,
+            last_tick_completed_at=runner._last_tick_completed_at,
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+        status = await scheduler_status(
+            db, agent_id="agent-1", poll_interval=1, stale_after_ticks=1
+        )
+        assert status["status"] == "pass"
+        assert status["report_age_seconds"] < 1
+        assert abs(
+            (_parse_reported_at(status["reported_at"]) - real_datetime.now(timezone.utc))
+            .total_seconds()
+        ) < 5
+        assert abs(
+            (
+                _parse_reported_at(runner._last_tick_started_at)
+                - real_datetime.now(timezone.utc)
+            ).total_seconds()
+        ) < 5
+        assert abs(
+            (
+                _parse_reported_at(runner._last_tick_completed_at)
+                - real_datetime.now(timezone.utc)
+            ).total_seconds()
+        ) < 5
+    finally:
+        await db.close()
+
+
+def _parse_reported_at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+@pytest.mark.asyncio
 async def test_supervisor_restarts_failed_worker_and_keeps_polling(monkeypatch, tmp_path):
     db = await _database(tmp_path / "scheduler-supervision.db")
     runner = SchedulerRunner(
@@ -234,6 +669,85 @@ async def test_supervisor_restarts_failed_worker_and_keeps_polling(monkeypatch, 
     finally:
         await runner.stop()
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_propagates_its_own_cancellation_without_resurrection(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-supervisor-cancel.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="supervisor-cancel",
+        poll_interval=0.01,
+    )
+    tick_started = asyncio.Event()
+
+    async def blocked_tick():
+        tick_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_tick", blocked_tick)
+    try:
+        await runner.start()
+        await asyncio.wait_for(tick_started.wait(), timeout=2)
+        supervisor = runner._task
+        supervisor.cancel("external lifecycle cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor
+        await asyncio.sleep(0)
+
+        assert supervisor.done()
+        assert runner._running is False
+        assert runner._worker_task is None
+        assert runner._worker_restart_count == 0
+        assert runner.readiness_failure is None
+    finally:
+        await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_storage_terminates_supervisor_without_restart_loop(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-closed-storage.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="closed-storage",
+        poll_interval=0.01,
+    )
+    tick_started = asyncio.Event()
+    release_tick = asyncio.Event()
+
+    async def fail_after_close():
+        tick_started.set()
+        await release_tick.wait()
+        await db.fetchval("SELECT 1")
+
+    monkeypatch.setattr(runner, "_tick", fail_after_close)
+    await runner.start()
+    supervisor = runner._task
+    sqlite_connection = db.backend._connection
+    sqlite_worker = getattr(sqlite_connection, "_thread", sqlite_connection)
+    await asyncio.wait_for(tick_started.wait(), timeout=2)
+    await db.close()
+    release_tick.set()
+    await asyncio.wait_for(asyncio.shield(supervisor), timeout=2)
+
+    assert runner._running is False
+    assert runner._runtime_worker_state == "storage_unavailable"
+    assert runner._worker_restart_count == 0
+    await runner.stop()
+    assert runner._task is None
+    assert runner._worker_task is None
+    assert runner._telemetry_task is None
+    is_alive = getattr(sqlite_worker, "is_alive", None)
+    assert not callable(is_alive) or not is_alive()
 
 
 @pytest.mark.asyncio
@@ -459,7 +973,7 @@ async def test_prior_boot_report_uses_startup_grace_for_current_owner(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_startup_grace_begins_when_standalone_runner_is_armed(tmp_path):
+async def test_pre_arm_startup_grace_expires_from_feature_initialization(tmp_path):
     db = await _database(tmp_path / "scheduler-arm-grace.db")
     agent = SimpleNamespace(
         did="agent-1",
@@ -474,9 +988,8 @@ async def test_startup_grace_begins_when_standalone_runner_is_armed(tmp_path):
         await feature.initialize()
         feature._initialized_monotonic = 0.0
 
-        # Feature-heavy boot can spend longer than three poll intervals before
-        # Phase 6 calls on_agent_ready. Polling is not expected before then, so
-        # construction age must not turn this into a liveness failure.
+        # A swallowed on_agent_ready failure cannot leave this pre-arm state
+        # warned forever after its finite initialization grace expires.
         before_ready = await check_scheduler_liveness(
             SimpleNamespace(
                 did="agent-1",
@@ -484,10 +997,10 @@ async def test_startup_grace_begins_when_standalone_runner_is_armed(tmp_path):
             ),
             db,
         )
-        assert before_ready["status"] == "warn"
-        assert before_ready["details"]["state"] == "awaiting_telemetry"
+        assert before_ready["status"] == "fail"
+        assert before_ready["details"]["state"] == "no_telemetry"
         parameters = scheduler_status_parameters(feature)
-        assert parameters["startup_grace_remaining"] == 90.0
+        assert parameters["startup_grace_remaining"] == 0.0
 
         # Once arm is requested, its own timestamp is the finite grace anchor.
         feature._runner._arm_requested = True
@@ -604,7 +1117,7 @@ async def test_overdue_health_respects_misfire_grace_and_active_tick(tmp_path):
             "misfire_grace_seconds = 0 WHERE id = 'queued'",
             (very_late,),
         )
-        tick_started = datetime.now(timezone.utc).isoformat()
+        tick_started = (await scheduler_database_clock(db)).isoformat()
         await emit_runtime_status(
             db,
             agent_ids=("agent-1",),
@@ -651,6 +1164,125 @@ async def test_overdue_health_respects_misfire_grace_and_active_tick(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_wedged_tick_cannot_hide_overdue_queue_forever(tmp_path):
+    db = await _database(tmp_path / "scheduler-wedged-tick.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="wedged-tick",
+        lease_seconds=120,
+    )
+    now = datetime.now(timezone.utc)
+    try:
+        await runner._ensure_tables()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, misfire_grace_seconds,
+                 scheduler_protocol_version)
+            VALUES ('overdue', 'agent-1', 'wait_reconcile', '* * * * *',
+                    '{}', 1, ?, ?, 0, ?)
+            """,
+            (
+                (now - timedelta(minutes=10)).isoformat(),
+                now.isoformat(),
+                SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=(now - timedelta(minutes=5)).isoformat(),
+            last_tick_completed_at=(now - timedelta(minutes=6)).isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=30,
+            lease_seconds=120,
+            expected_owner_id=runner._owner_id,
+        )
+        assert status["telemetry_received"] is True
+        assert status["report_age_seconds"] < 1
+        assert status["tick_in_progress"] is False
+        assert status["tick_in_progress_limit_seconds"] == 210
+        assert status["state"] == "overdue"
+        assert status["status"] == "fail"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_overdue_age_uses_row_with_earliest_misfire_deadline(tmp_path):
+    db = await _database(tmp_path / "scheduler-mixed-grace-overdue.db")
+    runner = SchedulerRunner(
+        db, "agent-1", lambda *_: None, owner_id="mixed-grace"
+    )
+    try:
+        await runner._ensure_tables()
+        now = await scheduler_database_clock(db)
+        await db.execute_many(
+            """INSERT INTO scheduled_tasks
+                   (id, agent_id, task_name, cron_expression, args_json,
+                    enabled, next_run_at, created_at, misfire_grace_seconds,
+                    scheduler_protocol_version)
+               VALUES (?, 'agent-1', 'wait_reconcile', '* * * * *', '{}',
+                       1, ?, ?, ?, ?)""",
+            [
+                (
+                    "older-inside-long-grace",
+                    (now - timedelta(minutes=35)).isoformat(),
+                    now.isoformat(),
+                    3600,
+                    SCHEDULER_PROTOCOL_VERSION,
+                ),
+                (
+                    "newer-past-short-grace",
+                    (now - timedelta(minutes=5)).isoformat(),
+                    now.isoformat(),
+                    0,
+                    SCHEDULER_PROTOCOL_VERSION,
+                ),
+            ],
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=now.isoformat(),
+            last_tick_completed_at=now.isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=30,
+            expected_owner_id=runner._owner_id,
+        )
+
+        assert status["state"] == "overdue"
+        assert 240 <= status["overdue_seconds"] <= 360
+        overdue_run = _parse_reported_at(
+            status["oldest_unclaimed_overdue_run_at"]
+        )
+        assert abs((overdue_run - (now - timedelta(minutes=5))).total_seconds()) < 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_schedule_list_survives_unavailable_runtime_telemetry(tmp_path):
     db = await _database(tmp_path / "scheduler-list-telemetry.db")
     agent = SimpleNamespace(
@@ -668,8 +1300,9 @@ async def test_schedule_list_survives_unavailable_runtime_telemetry(tmp_path):
         listed = await feature.schedule_list()
         assert listed.status.value == "ok"
         assert listed.data["tasks"] == []
-        assert listed.data["scheduler_status"]["state"] == "unavailable"
-        assert listed.data["scheduler_status"]["status"] == "warn"
+        assert listed.data["scheduler_status"]["state"] == "inspection_failed"
+        assert listed.data["scheduler_status"]["status"] == "fail"
+        assert listed.data["scheduler_status"]["enabled_count"] is None
     finally:
         await ensure_runtime_status_table(db)
         await feature.shutdown()
@@ -707,6 +1340,9 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
         fresh, decision = await feature._evaluate_and_track_safety(fresh)
         assert decision["safe"] is False
         assert decision["blocker"]["scope"] == "cohosted_agent"
+        assert decision["blocker"]["count"] is None
+        assert decision["blocker"]["oldest_age_seconds"] is None
+        assert "1 active request" not in decision["reason"]
         assert fresh.first_blocked_at
         assert decision["request_age_seconds"] < 5
         assert decision["deferral_age_seconds"] < 5
@@ -720,7 +1356,9 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
             (aged, fresh.id),
         )
         fresh.first_blocked_at = aged
-        escalated = feature._evaluate_safety(fresh)
+        escalated = feature._evaluate_safety(
+            fresh, database_now=await scheduler_database_clock(db)
+        )
         assert escalated["safe"] is True
         assert escalated["escalated"] is True
         assert escalated["blocker"]["scope"] == "cohosted_agent"
@@ -784,13 +1422,93 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
             (aged, legacy.id),
         )
         legacy = await get_request(db, legacy.id)
-        needs_ack = feature._evaluate_safety(legacy)
+        needs_ack = feature._evaluate_safety(
+            legacy, database_now=await scheduler_database_clock(db)
+        )
         assert needs_ack["safe"] is False
         assert "acknowledgement required" in needs_ack["reason"]
         acknowledged = await feature.acknowledge_restart_escalation(legacy.id)
         assert acknowledged.data["acknowledged"] is True
         legacy = await get_request(db, legacy.id)
-        assert feature._evaluate_safety(legacy)["safe"] is True
+        assert feature._evaluate_safety(
+            legacy, database_now=await scheduler_database_clock(db)
+        )["safe"] is True
+    finally:
+        await feature.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
+    monkeypatch, tmp_path,
+):
+    from kestrel_sovereign.features.restart_coordinator import (
+        feature as restart_feature_module,
+    )
+    from kestrel_sovereign.features.restart_coordinator import (
+        store as restart_store_module,
+    )
+
+    db = await _database(tmp_path / "restart-deferral-clock.db")
+    agent = SimpleNamespace(
+        did="agent-1",
+        agent_id="agent-1",
+        storage=SimpleNamespace(db=db),
+        dispatcher=SimpleNamespace(),
+        signal_registry=None,
+        features={},
+        _active_request_ids={"busy"},
+        _background_tasks=set(),
+        emit_event=AsyncMock(),
+    )
+    feature = RestartCoordinatorFeature(agent)
+    real_datetime = datetime
+
+    class FastHostDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz or timezone.utc) + timedelta(hours=12)
+
+    class SlowHostDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz or timezone.utc) - timedelta(hours=12)
+
+    try:
+        await feature.initialize()
+        request = await insert_request(
+            db, requested_by_agent="agent-1", reason="clock skew"
+        )
+        monkeypatch.setattr(restart_feature_module, "datetime", FastHostDateTime)
+        monkeypatch.setattr(restart_store_module, "datetime", FastHostDateTime)
+
+        request, initial = await feature._evaluate_and_track_safety(request)
+        assert initial["safe"] is False
+        assert initial["escalated"] is False
+        assert initial["deferral_age_seconds"] < 5
+        database_now = await scheduler_database_clock(db)
+        blocked_at = datetime.fromisoformat(request.first_blocked_at)
+        assert abs((database_now - blocked_at).total_seconds()) < 5
+
+        aged = (
+            database_now
+            - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
+        ).isoformat()
+        await db.execute(
+            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
+            (aged, request.id),
+        )
+        request = await get_request(db, request.id)
+        monkeypatch.setattr(restart_feature_module, "datetime", SlowHostDateTime)
+        monkeypatch.setattr(restart_store_module, "datetime", SlowHostDateTime)
+
+        request, escalated = await feature._evaluate_and_track_safety(request)
+        assert escalated["safe"] is True
+        assert escalated["escalated"] is True
+        assert (
+            escalated["deferral_age_seconds"]
+            >= MAX_IDLE_ONLY_DEFERRAL_SECONDS
+        )
     finally:
         await feature.shutdown()
         await db.close()

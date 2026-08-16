@@ -699,10 +699,13 @@ class SchedulerFeature(Feature):
 
     async def shutdown(self):
         """Stop the background runner."""
-        if self._runner:
-            await self._runner.stop()
-        # Unregister the cron / pr-watch / discovery sources (base #2522 P2).
-        await super().shutdown()
+        try:
+            if self._runner:
+                await self._runner.stop()
+        finally:
+            # Source ownership must unwind even when runner cancellation is
+            # propagated through the feature's bounded shutdown slice.
+            await super().shutdown()
 
     # ------------------------------------------------------------------
     # Task executor — dispatches via SignalDispatcher (Phase 4 of #889)
@@ -2106,6 +2109,7 @@ class SchedulerFeature(Feature):
             return ToolResult.failed("Database not available")
 
         try:
+            schedule_now = await scheduler_database_clock(self._db)
             rows = await self._db.fetchall(
                 """
                 SELECT id, task_name, cron_expression, args_json,
@@ -2171,7 +2175,11 @@ class SchedulerFeature(Feature):
                 "terminal_at": row[18] if len(row) > 18 else None,
                 "disablement": self._schedule_disablement(
                     enabled=bool(row[4]),
+                    schedule_kind=(
+                        row[8] if len(row) > 8 and row[8] else "cron"
+                    ),
                     terminal_status=row[17] if len(row) > 17 else None,
+                    database_now=schedule_now,
                     rollout_fenced=bool(row[19]) if len(row) > 19 else False,
                     claim_fenced=bool(row[20]) if len(row) > 20 else False,
                     lease_owner=row[14] if len(row) > 14 else None,
@@ -2195,12 +2203,9 @@ class SchedulerFeature(Feature):
                 type(error).__name__,
             )
             liveness = {
-                "state": "unavailable",
-                "status": "warn",
-                "enabled_count": sum(
-                    task["disablement"]["state"] in {"enabled", "executing"}
-                    for task in tasks
-                ),
+                "state": "inspection_failed",
+                "status": "fail",
+                "enabled_count": None,
                 "telemetry_received": False,
                 "error_type": type(error).__name__,
             }
@@ -2230,7 +2235,8 @@ class SchedulerFeature(Feature):
 
     @staticmethod
     def _schedule_disablement(
-        *, enabled: bool, terminal_status: Optional[str],
+        *, enabled: bool, schedule_kind: str,
+        terminal_status: Optional[str], database_now: datetime,
         rollout_fenced: bool, claim_fenced: bool,
         lease_owner: Optional[str] = None,
         lease_expires_at: Optional[str] = None,
@@ -2241,7 +2247,9 @@ class SchedulerFeature(Feature):
 
         return classify_disablement(
             enabled=enabled,
+            schedule_kind=schedule_kind,
             terminal_status=terminal_status,
+            database_now=database_now,
             rollout_fenced=rollout_fenced,
             claim_fenced=claim_fenced,
             lease_owner=lease_owner,
@@ -2685,10 +2693,6 @@ class SchedulerFeature(Feature):
                 run_at = row[4] if len(row) > 4 else None
                 timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
                 terminal_status = row[6] if len(row) > 6 else None
-                if schedule_kind == "one_shot" and terminal_status:
-                    return ToolResult.failed(
-                        f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
-                    )
                 if terminal_status == "invalid_idempotency_key":
                     return ToolResult.failed(
                         f"Task {task_id} has an invalid persisted idempotency key; "
@@ -2699,6 +2703,24 @@ class SchedulerFeature(Feature):
                             "recovery_action": (
                                 "repair or recreate the schedule with a valid "
                                 "idempotency key"
+                            ),
+                        },
+                    )
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status == "execution_log_inconsistent"
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} has inconsistent execution history for "
+                        "its one-shot occurrence; reconcile the execution log "
+                        "and recreate the deadline instead of replaying it",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recoverable": False,
+                            "recovery_action": (
+                                "reconcile the execution log and recreate the "
+                                "one-shot schedule"
                             ),
                         },
                     )
@@ -2720,6 +2742,19 @@ class SchedulerFeature(Feature):
                                 "acknowledge_ambiguous_effect=true"
                             ),
                         },
+                    )
+                from kestrel_sovereign.features.scheduler.status import (
+                    SCHEDULER_SAFETY_DISABLEMENT_REASONS,
+                )
+
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status
+                    and terminal_status not in SCHEDULER_SAFETY_DISABLEMENT_REASONS
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} is a terminal one-shot deadline "
+                        f"({terminal_status}) and cannot be resumed"
                     )
                 cron_now_invalid = False
                 if schedule_kind == "one_shot":

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from kestrel_sovereign.storage.database_clock import database_now_sql
+
 
 # Terminal states — a request in any of these is locked. The
 # coordinator must not re-execute, the agent must not re-modify.
@@ -377,9 +379,9 @@ async def insert_request(
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
-    now = datetime.now(timezone.utc).isoformat()
+    now_sql = database_now_sql(db)
     await db.execute(
-        """
+        f"""
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
@@ -387,34 +389,18 @@ async def insert_request(
             update_profile, update_allow_migrations, update_log,
             requester_request_id, origin_session_id, escalation_acknowledged
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?, ?, 1)
+        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
+                ?, ?, ?, ?, ?, '', ?, ?, 1)
         """,
-        (req_id, requested_by_agent, reason, now, desired_window,
+        (req_id, requested_by_agent, reason, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
          requester_request_id, origin_session_id),
     )
-    return RestartRequest(
-        id=req_id,
-        requested_by_agent=requested_by_agent,
-        reason=reason,
-        requested_at=now,
-        desired_window=desired_window,
-        urgency=urgency,
-        policy=policy,
-        status="pending",
-        status_reason="",
-        completed_at=None,
-        operation=operation,
-        update_repo_path=update_repo_path,
-        update_target_ref=update_target_ref,
-        update_profile=update_profile,
-        update_allow_migrations=update_allow_migrations,
-        update_log="",
-        requester_request_id=requester_request_id,
-        origin_session_id=origin_session_id,
-        escalation_acknowledged=True,
-    )
+    inserted = await get_request(db, req_id)
+    if inserted is None:
+        raise RuntimeError("restart request insert did not become visible")
+    return inserted
 
 
 async def list_requests(
@@ -547,31 +533,45 @@ async def get_request(db, request_id: str) -> Optional[RestartRequest]:
 
 
 async def mark_deferral_started(
-    db, request_id: str, *, blocked_at: Optional[str] = None,
+    db,
+    request_id: str,
+    *,
+    expected_current_status: str,
+    blocked_at: Optional[str] = None,
 ) -> Optional[RestartRequest]:
     """Persist the beginning of one uninterrupted busy deferral.
 
     The conditional write preserves the first timestamp when multiple host
-    coordinators observe the same row. Returning the authoritative row keeps
-    the caller's escalation calculation tied to durable state.
+    coordinators observe the same row. The status compare-and-set prevents a
+    stale coordinator from annotating a canceled or executing row. Returning
+    the authoritative row lets the caller distinguish an existing timestamp
+    from a lost lifecycle race.
     """
 
-    stamp = blocked_at or datetime.now(timezone.utc).isoformat()
+    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
+    params = (
+        (blocked_at, request_id, expected_current_status)
+        if blocked_at is not None
+        else (request_id, expected_current_status)
+    )
     await db.execute(
-        "UPDATE restart_requests SET first_blocked_at = ? "
-        "WHERE id = ? AND status IN ('pending', 'approved', 'updating') "
+        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "WHERE id = ? AND status = ? "
         "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
-        (stamp, request_id),
+        params,
     )
     return await get_request(db, request_id)
 
 
-async def clear_deferral_started(db, request_id: str) -> bool:
+async def clear_deferral_started(
+    db, request_id: str, *, expected_current_status: str,
+) -> bool:
     """Clear a busy interval after fleet quiescence is observed."""
 
     result = await db.execute(
-        "UPDATE restart_requests SET first_blocked_at = '' WHERE id = ?",
-        (request_id,),
+        "UPDATE restart_requests SET first_blocked_at = '' "
+        "WHERE id = ? AND status = ?",
+        (request_id, expected_current_status),
     )
     return await _write_landed(
         db, result, request_id, lambda row: row.first_blocked_at == "",

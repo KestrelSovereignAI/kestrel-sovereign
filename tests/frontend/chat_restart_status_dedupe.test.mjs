@@ -250,7 +250,7 @@ test('escalated restart status renders structured blocker and age evidence', () 
         request_age_seconds: 1804.4,
         deferral_age_seconds: 1801.2,
         blocker: {
-            scope: 'cohosted_agent',
+            scope: 'requesting_agent',
             kind: 'active_requests',
             count: 2,
             oldest_age_seconds: 91.6,
@@ -270,6 +270,29 @@ test('escalated restart status renders structured blocker and age evidence', () 
     assert.match(bubble._innerHTML, />2</);
     assert.match(bubble._innerHTML, /Blocker oldest/);
     assert.match(bubble._innerHTML, /92s/);
+});
+
+
+test('cohosted blocker omits privacy-redacted count and age rows', () => {
+    resetPane();
+    chatModule.handleRestartStatus(basePayload({
+        status: 'escalated',
+        dedupe_signature: '7f9ee2dab18b4f079ce2e03ba7122b9:cohosted-redacted',
+        escalated: true,
+        blocker: {
+            scope: 'cohosted_agent',
+            kind: 'background_tasks',
+            count: null,
+            oldest_age_seconds: null,
+            summary: null,
+        },
+    }));
+
+    const bubble = pane.element.querySelectorAll('.restart-status-message')[0];
+    assert.match(bubble._innerHTML, /Blocker kind/);
+    assert.match(bubble._innerHTML, /background_tasks/);
+    assert.doesNotMatch(bubble._innerHTML, /Blocker count/);
+    assert.doesNotMatch(bubble._innerHTML, /Blocker oldest/);
 });
 
 

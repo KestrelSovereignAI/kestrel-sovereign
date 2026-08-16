@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
@@ -287,6 +288,19 @@ class TestSchedulerTools:
     async def test_tool_description(self, feature):
         desc = feature.tool_description
         assert "scheduled" in desc.lower() or "schedule" in desc.lower()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_unregisters_sources_when_runner_propagates_cancellation(
+        self, feature,
+    ):
+        feature._runner.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        base_shutdown = AsyncMock()
+
+        with patch.object(Feature, "shutdown", base_shutdown):
+            with pytest.raises(asyncio.CancelledError):
+                await feature.shutdown()
+
+        base_shutdown.assert_awaited_once()
 
 
 # =========================================================================
@@ -1441,15 +1455,57 @@ class TestSchedulerRunner:
         """
         db = _make_mock_db()
         db.backend_type = "postgres"
+        base_fetchone = db.fetchone.side_effect
+
+        async def _fetchone(sql, *args):
+            if "FROM pg_constraint con" in sql:
+                return ("scheduler_runtime_status_pkey",)
+            return await base_fetchone(sql, *args)
+
+        async def _fetchall(sql, *args):
+            if "JOIN pg_attribute attribute" in sql:
+                return [("agent_id",), ("owner_id",)]
+            return []
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
                 assert "ADD COLUMN IF NOT EXISTS" in sql
 
+        db.fetchone = AsyncMock(side_effect=_fetchone)
+        db.fetchall = AsyncMock(side_effect=_fetchall)
         db.execute = AsyncMock(side_effect=_exec)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._ensure_tables()
+        assert not any(
+            "LOCK TABLE scheduler_runtime_status" in call.args[0]
+            for call in db.execute.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_arm_rejects_unprepared_protocol_before_database_clock(self):
+        db = _make_mock_db()
+        db.fetchval = AsyncMock(
+            side_effect=AssertionError("database clock must not be queried")
+        )
+        runner = SchedulerRunner(db, "test-agent", AsyncMock(return_value="ok"))
+
+        with pytest.raises(RuntimeError, match="protocol preparation"):
+            await runner.arm()
+
+        db.fetchval.assert_not_awaited()
+        assert runner._arm_requested is False
+
+    def test_database_connectivity_probe_tolerates_protected_backend_wrapper(self):
+        class ProtectedDatabase:
+            @property
+            def backend(self):
+                raise RuntimeError("backend access denied")
+
+        runner = SchedulerRunner(
+            ProtectedDatabase(), "test-agent", AsyncMock(return_value="ok")
+        )
+        assert runner._database_is_connected() is True
 
     @pytest.mark.asyncio
     async def test_ensure_tables_skips_existing_sqlite_columns_before_alter(self):

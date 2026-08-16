@@ -500,6 +500,11 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             )
         elif state == "running_zero_schedules":
             message = "Scheduler worker is current and reports zero schedules"
+        elif state == "running_only_terminal_schedules":
+            message = (
+                "Scheduler worker is current; all "
+                f"{status['terminal_count']} schedule(s) are terminal history"
+            )
         elif state == "running_only_operator_paused_schedules":
             message = (
                 "Scheduler worker is current; all "

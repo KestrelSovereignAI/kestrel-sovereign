@@ -291,6 +291,45 @@ def test_health_fails_when_scheduler_arm_was_requested_but_never_started():
     }
 
 
+def test_health_fails_when_scheduler_ready_hook_never_armed_runner():
+    """A swallowed ready-hook failure cannot hide behind a private flag."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _arm_requested=False,
+        _running=False,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
 def test_health_ignores_unrelated_feature_private_runner_attribute():
     """Only runners exposing the scheduler readiness contract are inspected."""
     from kestrel_sovereign.server import _active_scheduler_workers_available

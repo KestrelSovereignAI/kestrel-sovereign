@@ -106,10 +106,19 @@ Occurrence-level failures remain isolated inside a tick and are
 finalized independently, so one failed scheduled task neither cancels its
 siblings nor kills the polling worker.
 
-Every poller emits one row per authorized agent to
-`scheduler_runtime_status`, including agents with zero schedules. The report
-contains worker state, tick timestamps, restart/failure counts, and exact
-runnable, executing, configured-enabled, paused, protocol-fenced, and
+Every poller emits one row per `(authorized agent, worker owner)` pair to
+`scheduler_runtime_status`, including agents with zero schedules. Publication
+and freshness use database statement time, so skew between PostgreSQL replica
+process clocks cannot make a current worker stale or preserve an old one. The
+reader selects only the current freshness window (plus at most one prior-owner
+diagnostic row), and publication reaps reports older than 24 hours, so random
+per-process owner IDs cannot grow health-query work without bound. Fleet
+inventory is loaded once per heartbeat and owner reports are batch-upserted.
+The normal PostgreSQL bootstrap only inspects the existing composite key; an
+exclusive table lock is taken only for the legacy single-key migration and has
+a five-second lock timeout. The report contains worker state, tick timestamps,
+restart/failure counts, and
+exact runnable, executing, configured-enabled, paused, protocol-fenced, and
 scheduler-disabled counts. Consequently, these states remain distinct:
 
 - no runtime report was received;
@@ -119,19 +128,31 @@ scheduler-disabled counts. Consequently, these states remain distinct:
 - schedules are temporarily fenced by scheduler protocol; and
 - scheduler safety policy disabled one or more schedules.
 
-The Health feature reads this report through the same scheduler-status helper
-used by `schedule_list`. Missing or stale telemetry, a stopped/restarting
-worker, or unclaimed work older than both the telemetry threshold and its
-misfire grace fails the critical `scheduler_liveness` check. A due batch owned
-by the current tick remains healthy while rows wait behind the bounded
-concurrency semaphore. A current worker with zero schedules passes. A live
-claim is reported as executing and remains configured-enabled; only an absent
-or expired claim lease is classified as protocol recovery. Scheduler-disabled
-rows warn with their reason; operator pauses do not impersonate a worker
-outage. Durable reports carry a per-runner owner ID, and standalone startup
-grace begins when final readiness actually arms that runner. The arm timestamp
-keeps a prior `stopped`, stale, or same-owner row from masking missing telemetry
-for the current lifecycle.
+The Health feature reads these reports through the same scheduler-status helper
+used by `schedule_list`. It aggregates only fresh workers and remains healthy
+when any current replica is running, so a failing or stopping peer cannot
+overwrite or flap a healthy peer. Missing or stale telemetry, no running worker,
+or unclaimed work older than both the telemetry threshold and its misfire grace
+fails the critical `scheduler_liveness` check. A due batch owned by a current
+tick remains healthy while rows wait behind the bounded concurrency semaphore,
+but that exemption expires after the telemetry threshold plus one claim lease
+so a wedged tick cannot hide an overdue queue forever. With heterogeneous
+misfire grace, the reported overdue age belongs to the row with the earliest
+expired deadline rather than an unrelated older row still inside its grace.
+Tick boundaries are stamped from database time as well.
+A current worker with zero schedules passes. A live claim is reported as
+executing and remains configured-enabled; only an absent or expired claim lease
+is classified as protocol recovery. Scheduler-disabled rows warn with their
+reason; operator pauses and completed one-shot history do not impersonate a
+worker outage. Scheduler safety reasons remain disablements even on one-shot
+rows and retain their explicit recovery contract. In particular, an
+`execution_log_inconsistent` one-shot cannot be replayed at its old deadline or
+have its marker cleared by `schedule_resume`; the execution log must be
+reconciled and a new one-shot created. Durable reports carry a per-runner owner
+ID. Standalone startup grace is bounded from feature initialization, while a
+successful arm replaces that anchor with its database-time arm timestamp. A
+ready hook that never arms therefore fails health after the finite grace, and a
+prior `stopped`, stale, or same-owner row cannot mask missing current telemetry.
 
 ## Protocol-v2 rollout fence
 

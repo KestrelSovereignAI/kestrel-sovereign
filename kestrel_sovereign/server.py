@@ -373,10 +373,6 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
                 if (
                     runner is not None
                     and hasattr(runner, "worker_available")
-                    and (
-                        getattr(runner, "_arm_requested", False)
-                        or getattr(runner, "_running", False)
-                    )
                 ):
                     runners.append(runner)
             except Exception:  # pragma: no cover - public health must not crash
@@ -390,10 +386,6 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
         if (
             host_runner is not None
             and hasattr(host_runner, "worker_available")
-            and (
-                getattr(host_runner, "_arm_requested", False)
-                or getattr(host_runner, "_running", False)
-            )
         ):
             runners.append(host_runner)
         return all(
