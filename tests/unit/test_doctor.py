@@ -676,6 +676,82 @@ def test_governed_by_check_fails_without_edges_table(tmp_path, monkeypatch):
     assert not report.ready
 
 
+@pytest.mark.parametrize("phase", ["scoped", "physical"])
+@pytest.mark.parametrize(
+    "failure",
+    ["diagnostic_timeout", "diagnostic_tooling", "connection"],
+)
+def test_edge_probe_failures_report_unexamined_governance_without_reanchor(
+    tmp_path, monkeypatch, phase, failure
+):
+    from kestrel_sovereign.doctor import (
+        DoctorReport,
+        _check_governance_edge,
+        _GovernanceSource,
+        _UnreadableDB,
+    )
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:test:Test",
+        dsn="postgresql://u@h/db?connect_timeout=2",
+    )
+    unreadable = _UnreadableDB(
+        reason="edge diagnostic stopped before returning a result",
+        postgres_failure=failure,
+    )
+    results = iter([unreadable] if phase == "scoped" else [(), unreadable])
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor._read_governed_by_targets",
+        lambda *_args, **_kwargs: next(results),
+    )
+    report = DoctorReport()
+
+    _check_governance_edge(
+        "Test", source, "did:test:Test", {"constitution_hash": "a" * 64}, report
+    )
+
+    assert len(report.fail) == 1
+    assert "governance NOT verified" in report.fail[0]
+    assert (
+        "database connection succeeded while reading the agent node" in report.fail[0]
+    )
+    assert "reachability was not established" not in report.fail[0]
+    assert "reanchor" not in report.fail[0]
+    assert "safe-mode" not in report.fail[0]
+
+
+def test_edge_query_failure_retains_integrity_remediation(tmp_path, monkeypatch):
+    from kestrel_sovereign.doctor import (
+        DoctorReport,
+        _check_governance_edge,
+        _GovernanceSource,
+        _UnreadableDB,
+    )
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:test:Test",
+        dsn="postgresql://u@h/db?connect_timeout=2",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor._read_governed_by_targets",
+        lambda *_args, **_kwargs: _UnreadableDB(
+            reason="the graph_edges query failed",
+            postgres_failure="runtime_database",
+        ),
+    )
+    report = DoctorReport()
+
+    _check_governance_edge(
+        "Test", source, "did:test:Test", {"constitution_hash": "a" * 64}, report
+    )
+
+    assert len(report.fail) == 1
+    assert "cannot verify the governed_by governance edge" in report.fail[0]
+    assert "reanchor --agent-name Test --force" in report.fail[0]
+
+
 def test_governed_by_stale_extra_edge_warns_but_passes(tmp_path, monkeypatch):
     """Correct edge present + a stale extra target: proof 2 passes (it only
     requires one edge at the anchor), so boot succeeds — ok + warn, not fail."""
@@ -1382,6 +1458,28 @@ def test_the_password_is_redacted_even_if_the_dsn_is_not_quoted_whole(tmp_path):
     assert "hunter2" not in _safe(truncated, source)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        'FATAL: role "app-s3cr3t-role" does not exist',
+        'could not open file "/etc/keys/prefix-s3cr3t-suffix.pem"',
+    ],
+)
+def test_password_is_redacted_inside_larger_diagnostic_tokens(tmp_path, message):
+    from kestrel_sovereign.doctor import _GovernanceSource, _safe
+
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db",
+        agent_did="did:x",
+        dsn="postgresql://kestrel:s3cr3t@db.internal/kestrel",
+    )
+
+    redacted = _safe(message, source)
+
+    assert "s3cr3t" not in redacted
+    assert "<redacted>" in redacted
+
+
 def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     """#2245: a management-key-only OpenRouter route (api_key_env unset in .env,
     but management_api_key_env present) must NOT be flagged — doctor must agree
@@ -1837,6 +1935,53 @@ def test_libpq_reserved_abstract_socket_hosts_fail_closed(tmp_path, dsn, environ
         _doctor_postgres_dsn(dsn, environment, tmp_path)
 
     assert "@abstract" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("dsn", "asyncpg_address"),
+    [
+        (
+            "postgresql://u@%2Ftmp%2Cprivate/db",
+            "/tmp,private/.s.PGSQL.5432",
+        ),
+        (
+            "postgresql://u@%2Ftmp%2F.s.PGSQL.5432/db",
+            "/tmp/.s.PGSQL.5432",
+        ),
+    ],
+    ids=("encoded-comma", "complete-socket-filename"),
+)
+def test_asyncpg_socket_endpoints_libpq_cannot_preserve_fail_closed(
+    tmp_path, dsn, asyncpg_address
+):
+    from asyncpg.connect_utils import _parse_connect_dsn_and_args
+
+    from kestrel_sovereign.doctor import (
+        _doctor_postgres_dsn,
+        _PostgresDiagnosticCapabilityError,
+    )
+
+    addresses, _ = _parse_connect_dsn_and_args(
+        dsn=dsn,
+        host=None,
+        port=None,
+        user=None,
+        password=None,
+        passfile=None,
+        database=None,
+        ssl="disable",
+        direct_tls=None,
+        server_settings=None,
+        target_session_attrs=None,
+        krbsrvname=None,
+        gsslib=None,
+    )
+    assert addresses == [asyncpg_address]
+
+    with pytest.raises(
+        _PostgresDiagnosticCapabilityError, match="cannot be represented"
+    ):
+        _doctor_postgres_dsn(dsn, {}, tmp_path)
 
 
 def test_asyncpg_treats_at_prefixed_hosts_as_tcp():
@@ -3167,10 +3312,9 @@ def test_a_one_character_environment_password_does_not_shred_diagnostics(tmp_pat
     assert "credential=<redacted>" in redacted
 
 
-def test_bounded_dsn_redacts_password_and_sslpassword(tmp_path):
-    """Libpq can echo decoded secrets from its reserialized bounded DSN."""
+def test_translated_dsn_redacts_password_and_sslpassword(tmp_path):
+    """Libpq can echo decoded secrets separately from the translated URI."""
     from kestrel_sovereign.doctor import (
-        _bounded_dsn,
         _doctor_postgres_dsn,
         _GovernanceSource,
         _safe,
@@ -3185,11 +3329,10 @@ def test_bounded_dsn_redacts_password_and_sslpassword(tmp_path):
     source = _GovernanceSource(
         anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
     )
-    bounded = _bounded_dsn(effective)
 
     redacted = _safe(
         "connection rejected sslpassword=private-key-secret "
-        f"password=database-secret dsn={bounded}",
+        f"password=database-secret dsn={effective}",
         source,
     )
 
@@ -3198,11 +3341,12 @@ def test_bounded_dsn_redacts_password_and_sslpassword(tmp_path):
     assert "sslpassword=<redacted>" in redacted
 
 
-def test_bounded_conninfo_escaped_secret_forms_are_redacted(tmp_path):
+def test_worker_conninfo_escaped_secret_forms_are_redacted(tmp_path):
     from urllib.parse import quote
 
+    from psycopg2.extensions import make_dsn
+
     from kestrel_sovereign.doctor import (
-        _bounded_dsn,
         _doctor_postgres_dsn,
         _GovernanceSource,
         _safe,
@@ -3221,8 +3365,9 @@ def test_bounded_conninfo_escaped_secret_forms_are_redacted(tmp_path):
     source = _GovernanceSource(
         anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
     )
+    worker_dsn = make_dsn(effective, passfile="/private/absent/pgpass")
 
-    redacted = _safe(f"connection failed: {_bounded_dsn(effective)}", source)
+    redacted = _safe(f"connection failed: {worker_dsn}", source)
 
     assert "database-leak" not in redacted
     assert "private-key-leak" not in redacted
@@ -3678,6 +3823,7 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
     first_host = "first.private.example"
     second_host = "second.private.example"
     password = "partial-output-secret"
+    governance_row = "serialized-governance-row-must-stay-private"
 
     class Process:
         returncode = None
@@ -3689,20 +3835,27 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
                     "probe",
                     timeout,
                     output=(
-                        '{"progress": "trying '
+                        '{"ok": true, "rows": [["'
+                        + governance_row
+                        + " \\n"
                         + second_host
-                        + " with "
+                        + " "
                         + password
-                        + '"}'
+                        + '"]]}'
                     ),
                     stderr=(
+                        "PostgreSQL diagnostic phase: connecting\n"
                         'could not translate host name "'
                         + first_host
                         + '" to address: deterministic failure'
                     ),
                 )
             self.returncode = -9
-            return "", "libpq retained its earlier address failure"
+            return (
+                '{"ok": true, "rows": [["' + governance_row + '"]]}',
+                "PostgreSQL diagnostic phase: connected; querying\n"
+                "libpq retained its earlier address failure",
+            )
 
         def kill(self):
             state["killed"] = True
@@ -3726,14 +3879,39 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
 
     assert state == {"communicate_calls": 2, "killed": True}
     diagnostic = str(raised.value)
-    assert "could not translate host name" in diagnostic
-    assert "deterministic failure" in diagnostic
-    assert "libpq retained its earlier address failure" in diagnostic
+    assert "PostgreSQL diagnostic phase: connecting" in diagnostic
+    assert "PostgreSQL diagnostic phase: connected; querying" in diagnostic
+    assert "could not translate host name" not in diagnostic
+    assert "deterministic failure" not in diagnostic
+    assert "libpq retained its earlier address failure" not in diagnostic
     assert first_host not in diagnostic
     assert second_host not in diagnostic
     assert password not in diagnostic
-    assert "<host>" in diagnostic
+    assert governance_row not in diagnostic
+    assert "stdout" not in diagnostic
     assert len(diagnostic) < 1200
+
+
+def test_probe_output_is_redacted_before_whitespace_is_normalized():
+    from kestrel_sovereign.doctor import _redacted_probe_output_tail
+
+    secret = "secret  phrase"
+    postgres_home = "/private/runtime  home"
+    dsn = "postgresql://u:secret%20%20phrase@h/db?connect_timeout=2"
+
+    diagnostic = _redacted_probe_output_tail(
+        f"password={secret}\nTLS path={postgres_home}\tfailed",
+        dsn,
+        postgres_home,
+        (),
+    )
+
+    assert secret not in diagnostic
+    assert "secret phrase" not in diagnostic
+    assert postgres_home not in diagnostic
+    assert "/private/runtime home" not in diagnostic
+    assert "<redacted>" in diagnostic
+    assert "<home> failed" in diagnostic
 
 
 def test_real_isolated_postgres_probe_preserves_phase_when_killed(monkeypatch):
@@ -4335,6 +4513,20 @@ def test_worker_timeout_covers_every_floored_libpq_host():
     assert _postgres_probe_timeout_seconds(dsn) == 17
 
 
+def test_worker_timeout_uses_default_budget_for_an_unparseable_dsn():
+    from kestrel_sovereign.doctor import (
+        _CONNECT_TIMEOUT_SECONDS,
+        _POSTGRES_PROBE_GRACE_SECONDS,
+        _postgres_probe_timeout_seconds,
+    )
+
+    dsn = "postgresql://u@h/db?connect_timeout"
+
+    assert _postgres_probe_timeout_seconds(dsn) == (
+        _CONNECT_TIMEOUT_SECONDS + _POSTGRES_PROBE_GRACE_SECONDS
+    )
+
+
 @pytest.mark.parametrize("value", ["", " ", "\t \n"])
 def test_blank_doctor_postgres_timeout_uses_the_default(tmp_path, value):
     from psycopg2.extensions import parse_dsn
@@ -4367,7 +4559,7 @@ def test_blank_project_timeout_reaches_diagnose_as_the_default(tmp_path, monkeyp
     assert parse_dsn(fake.dsn)["connect_timeout"] == "5"
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer", "2147483647"])
 def test_invalid_doctor_postgres_timeout_fails_as_configuration(tmp_path, value):
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
@@ -4379,16 +4571,16 @@ def test_invalid_doctor_postgres_timeout_fails_as_configuration(tmp_path, value)
         )
 
 
+@pytest.mark.parametrize("value", ["not-an-integer", "2147483647"])
 def test_invalid_project_timeout_is_not_reported_as_a_database_outage(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, value
 ):
     _seed_matching_anchor(tmp_path, monkeypatch)
     fake = _FakePostgres({})
     _postgres_host(monkeypatch, fake)
     env_path = tmp_path / ".env"
     env_path.write_text(
-        env_path.read_text()
-        + "\nKESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS=not-an-integer\n"
+        env_path.read_text() + f"\nKESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS={value}\n"
     )
 
     report = diagnose(tmp_path)

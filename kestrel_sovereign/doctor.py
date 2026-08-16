@@ -612,6 +612,7 @@ _CONNECT_TIMEOUT_SECONDS = 5
 _MIN_LIBPQ_CONNECT_TIMEOUT_SECONDS = 2
 _POSTGRES_PROBE_GRACE_SECONDS = 5
 _POSTGRES_TIMEOUT_ENV = "KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS"
+_MAX_POSTGRES_TIMEOUT_SECONDS = 3600
 
 
 class _PostgresTranslationError(ValueError):
@@ -745,9 +746,10 @@ def _doctor_postgres_timeout_seconds(env: dict) -> int:
         raise _DoctorPostgresConfigurationError(
             f"{_POSTGRES_TIMEOUT_ENV} must be a positive integer"
         ) from exc
-    if timeout <= 0:
+    if not 1 <= timeout <= _MAX_POSTGRES_TIMEOUT_SECONDS:
         raise _DoctorPostgresConfigurationError(
-            f"{_POSTGRES_TIMEOUT_ENV} must be a positive integer"
+            f"{_POSTGRES_TIMEOUT_ENV} must be between 1 and "
+            f"{_MAX_POSTGRES_TIMEOUT_SECONDS} seconds"
         )
     return timeout
 
@@ -1026,8 +1028,26 @@ def _normalize_asyncpg_connection_options(query: dict[str, str]) -> None:
             query[name] = _ASYNCPG_TLS_PROTOCOL_ALIASES[value]
 
 
-def _reject_libpq_reserved_tcp_hosts(hosts: list[str]) -> None:
-    """Fail closed when libpq would reinterpret an asyncpg TCP host."""
+def _validate_libpq_hosts(hosts: list[str]) -> None:
+    """Fail closed when libpq would reinterpret an asyncpg endpoint."""
+    if any("," in host for host in hosts):
+        # Authority hosts are split before percent-decoding in asyncpg. Thus
+        # ``%2C`` belongs to one host there, while libpq splits the decoded
+        # ``host`` parameter into multiple endpoints. Libpq has no escaping
+        # that can preserve this single-host shape.
+        raise _PostgresDiagnosticCapabilityError(
+            "a single runtime PostgreSQL host containing a comma cannot be "
+            "represented by the diagnostic driver"
+        )
+    if any(host.startswith("/") and ".s.PGSQL." in host for host in hosts):
+        # Asyncpg treats a socket path already containing ``.s.PGSQL.`` as the
+        # complete socket filename. Libpq's host parameter accepts a socket
+        # directory and appends that filename itself, so passing this through
+        # would probe a different, doubled path.
+        raise _PostgresDiagnosticCapabilityError(
+            "a runtime PostgreSQL Unix-socket filename cannot be represented "
+            "by the diagnostic driver"
+        )
     if any(host.startswith("@") for host in hosts):
         # Asyncpg treats this as an ordinary TCP name. On platforms supporting
         # abstract Unix-domain sockets, libpq reserves the same spelling for a
@@ -1449,7 +1469,7 @@ def _doctor_postgres_dsn(runtime_dsn: str, env: dict, project_dir: Path) -> str:
         raise _PostgresRuntimeConfigurationError(
             "runtime PostgreSQL host/port configuration is not valid for asyncpg"
         ) from exc
-    _reject_libpq_reserved_tcp_hosts(hosts)
+    _validate_libpq_hosts(hosts)
     query["host"] = ",".join(hosts)
     query["port"] = ",".join(str(port) for port in ports)
     if user:
@@ -1567,16 +1587,23 @@ def _safe(exc: object, source: _GovernanceSource) -> str:
     # redacting longest-first stops a shorter token reappearing inside a
     # replacement.
     for secret in _dsn_secrets(source.dsn):
-        # Passwords can be as short as one character or coincide with common
-        # diagnostic words. Replacing arbitrary substrings turns ``port`` and
-        # ``password`` into gibberish for a password of ``p``. Match only a
-        # complete token while retaining the whole-DSN redaction above for
-        # byte-identical echoes.
-        text = re.sub(
-            rf"(?<![\w-]){re.escape(secret)}(?![\w-])",
-            "<redacted>",
-            text,
-        )
+        if len(secret) > 2:
+            # Real credentials can appear beside arbitrary punctuation or
+            # inside a larger driver token (for example a role or file name).
+            # Redact every occurrence; a token boundary here would disclose
+            # the credential in those routine error shapes.
+            text = text.replace(secret, "<redacted>")
+        else:
+            # One- and two-character passwords can coincide with common
+            # diagnostic fragments. Replacing arbitrary substrings turns
+            # ``port`` and ``password`` into gibberish for a password of
+            # ``p``. The token-bounded form still covers explicit renderings
+            # such as ``credential=p`` without destroying the report.
+            text = re.sub(
+                rf"(?<![\w-]){re.escape(secret)}(?![\w-])",
+                "<redacted>",
+                text,
+            )
     for field_name, value in _dsn_connection_files(source.dsn):
         text = text.replace(value, f"<{field_name}>")
     identities = (
@@ -1609,9 +1636,10 @@ def _dsn_secrets(dsn: str) -> tuple:
     except Exception:  # noqa: BLE001, S110 — malformed DSN; URI fallback follows
         pass
 
-    # A bounded DSN is reserialized by libpq and is no longer byte-identical to
-    # ``source.dsn``. Collect query credentials independently so their decoded
-    # forms remain redacted even when libpq echoes only ``field=value``.
+    # The isolated worker can reserialize the translated URI as libpq conninfo,
+    # which is no longer byte-identical to ``source.dsn``. Collect query
+    # credentials independently so their decoded forms remain redacted even
+    # when libpq echoes only ``field=value``.
     try:
         for field, value in parse_qsl(urlsplit(dsn).query, strict_parsing=True):
             if field in {"password", "sslpassword"} and value:
@@ -1627,10 +1655,11 @@ def _dsn_secrets(dsn: str) -> tuple:
         secrets.add(encoded_password)
         secrets.add(unquote(encoded_password))
 
-    # ``_bounded_dsn`` reserializes a URI as libpq conninfo. In that spelling
+    # The isolated worker's ``make_dsn`` call reserializes a URI as libpq
+    # conninfo when it installs the absent-passfile sentinel. In that spelling
     # apostrophes and backslashes gain a backslash, and whitespace-bearing
     # values are quoted. Redact both the logical value and the exact escaped
-    # token a bounded-driver diagnostic can echo.
+    # token a worker diagnostic can echo.
     for secret in tuple(secrets):
         conninfo_secret = re.sub(r"([\\'])", r"\\\1", secret)
         if any(character.isspace() for character in conninfo_secret):
@@ -1863,23 +1892,27 @@ def _postgres_fetch_rows_in_process(
 def _postgres_probe_timeout_seconds(dsn: str) -> int:
     """Bound worker startup, every per-host connect, and one read query."""
     try:
+        from psycopg2 import ProgrammingError
         from psycopg2.extensions import parse_dsn
-
-        parsed = parse_dsn(dsn)
-        per_host = int(parsed.get("connect_timeout", _CONNECT_TIMEOUT_SECONDS))
-        connection_budget = per_host * _dsn_host_count(parsed)
-    except (ImportError, TypeError, ValueError):
+    except (ImportError, AttributeError):
         connection_budget = _CONNECT_TIMEOUT_SECONDS
+    else:
+        try:
+            parsed = parse_dsn(dsn)
+            per_host = int(parsed.get("connect_timeout", _CONNECT_TIMEOUT_SECONDS))
+            connection_budget = per_host * _dsn_host_count(parsed)
+        except (ProgrammingError, TypeError, ValueError):
+            connection_budget = _CONNECT_TIMEOUT_SECONDS
     return connection_budget + _POSTGRES_PROBE_GRACE_SECONDS
 
 
 def _probe_output_text(output: object) -> str:
-    """Return one single-line worker diagnostic from text or bytes."""
+    """Decode worker output without changing redaction-sensitive bytes."""
     if isinstance(output, bytes):
         output = output.decode("utf-8", errors="replace")
     if not isinstance(output, str):
         return ""
-    return " ".join(output.strip().split())
+    return output
 
 
 def _redact_probe_output(
@@ -1909,50 +1942,38 @@ def _redacted_probe_output_tail(
     *,
     limit: int = 1000,
 ) -> str:
-    """Redact a complete worker fragment before applying its output bound."""
-    redacted = _redact_probe_output(
-        _probe_output_text(output), dsn, postgres_home, dsn_identity
-    )
-    return redacted[-limit:]
+    """Redact raw worker output before normalizing and bounding it."""
+    decoded = _probe_output_text(output)
+    redacted = _redact_probe_output(decoded, dsn, postgres_home, dsn_identity)
+    normalized = " ".join(redacted.strip().split())
+    return normalized[-limit:]
 
 
 def _partial_probe_diagnostic(
     exc: subprocess.TimeoutExpired,
-    stdout: object,
     stderr: object,
     *,
-    dsn: str,
-    postgres_home: str | None,
-    dsn_identity: tuple | None,
     limit: int = 2000,
 ) -> str:
-    """Preserve, bound, and redact output captured around worker termination."""
-    fragments: list[str] = []
-    per_fragment_limit = max(1, (limit - 80) // 4)
-    for label, value in (
-        ("stderr", exc.stderr),
-        ("stdout", exc.output),
-        ("stderr", stderr),
-        ("stdout", stdout),
-    ):
-        fragment = _redacted_probe_output_tail(
-            value,
-            dsn,
-            postgres_home,
-            dsn_identity,
-            limit=per_fragment_limit,
-        )
-        if not fragment:
-            continue
-        rendered = f"{label}: {fragment}"
-        if rendered not in fragments:
-            fragments.append(rendered)
-    combined = "; ".join(fragments)
-    # The equal per-stream shares preserve both TimeoutExpired streams and
-    # both post-kill streams while this aggregate guard keeps the total report
-    # finite. Prefer the beginning only as a final defense; each constituent
-    # already retains its diagnostic tail.
-    return combined[:limit]
+    """Preserve privacy-safe stderr breadcrumbs around worker termination.
+
+    Stdout is the worker's JSON result channel and may already contain
+    governance rows when the parent deadline expires. It is deliberately not
+    accepted here, so a timeout can never copy those rows into diagnostics.
+    Stderr is also allowlisted to the worker's two constant phase messages;
+    arbitrary driver or interpreter output has no timeout-reporting contract.
+    """
+    allowed = {
+        "PostgreSQL diagnostic phase: connecting",
+        "PostgreSQL diagnostic phase: connected; querying",
+    }
+    breadcrumbs: list[str] = []
+    for value in (exc.stderr, stderr):
+        for line in _probe_output_text(value).splitlines():
+            phase = line.strip()
+            if phase in allowed and phase not in breadcrumbs:
+                breadcrumbs.append(phase)
+    return "; ".join(f"stderr: {phase}" for phase in breadcrumbs)[:limit]
 
 
 def _fetch_postgres_rows_isolated(
@@ -2007,14 +2028,10 @@ def _fetch_postgres_rows_isolated(
         )
     except subprocess.TimeoutExpired as exc:
         process.kill()
-        stdout, stderr = process.communicate()
+        _stdout, stderr = process.communicate()
         detail = _partial_probe_diagnostic(
             exc,
-            stdout,
             stderr,
-            dsn=dsn,
-            postgres_home=postgres_home,
-            dsn_identity=dsn_identity,
         )
         message = (
             "isolated PostgreSQL diagnostic process exceeded its bounded "
@@ -2489,6 +2506,15 @@ def _check_governance_edge(
 
     targets = _read_governed_by_targets(source, node_id)
     if isinstance(targets, _UnreadableDB):
+        if _edge_probe_left_governance_unexamined(targets):
+            _report_unexamined(
+                name,
+                targets.reason,
+                targets,
+                report,
+                database_was_reached=True,
+            )
+            return
         # FAIL, not warn: we could read the agent node moments ago, so the
         # DB is not sqlcipher-encrypted — the edges specifically cannot be
         # read (missing graph_edges table / corruption). The runtime fails
@@ -2514,6 +2540,17 @@ def _check_governance_edge(
     # operator to a command that cannot clear the finding it was given for.
     if stored_hash not in targets:
         physical = _read_governed_by_targets(source, node_id, any_owner=True)
+        if isinstance(physical, _UnreadableDB) and (
+            _edge_probe_left_governance_unexamined(physical)
+        ):
+            _report_unexamined(
+                name,
+                physical.reason,
+                physical,
+                report,
+                database_was_reached=True,
+            )
+            return
         if not isinstance(physical, _UnreadableDB) and stored_hash in physical:
             report.fail.append(
                 f"{name}: the governed_by edge to {stored_hash[:12]}… exists "
@@ -2560,6 +2597,21 @@ def _check_governance_edge(
             f"`kestrel constitution reanchor --agent-name {name} --force` "
             f"with a signed artifact to repair ({_rollback_advice(source)})."
         )
+
+
+def _edge_probe_left_governance_unexamined(result: _UnreadableDB) -> bool:
+    """Whether an edge read failed without establishing integrity damage.
+
+    ``runtime_database`` means the equivalent connection opened and the edge
+    query itself failed, which is evidence the runtime cannot perform proof 2.
+    Every other classified PostgreSQL failure stopped before that conclusion:
+    it may block readiness, but it cannot justify a force-reanchor repair.
+    Unclassified SQLite failures retain the established integrity finding.
+    """
+    return (
+        result.postgres_failure is not None
+        and result.postgres_failure != "runtime_database"
+    )
 
 
 def _describe_overlay_anchor(anchor: object) -> str:
@@ -2655,7 +2707,12 @@ def _check_overlay_anchor(
 
 
 def _report_unexamined(
-    name: str, reason: str, source: object, report: DoctorReport
+    name: str,
+    reason: str,
+    source: object,
+    report: DoctorReport,
+    *,
+    database_was_reached: bool = False,
 ) -> None:
     """Record that this agent's governance could not be read.
 
@@ -2665,6 +2722,10 @@ def _report_unexamined(
     equivalent connection failure does. All leave governance unverified and
     therefore fail readiness, but the report must not turn diagnostic blindness
     into a database outage by guessing from words in ``reason``.
+
+    An edge probe runs only after the agent-node read established the
+    runtime-equivalent connection. ``database_was_reached`` preserves that
+    evidence while still failing readiness for the incomplete governance read.
 
     On the local anchor it usually can. ``KESTREL_DB_KEY`` at inception gives a
     whole-DB sqlcipher file that stock ``sqlite3`` cannot open and the agent
@@ -2682,6 +2743,23 @@ def _report_unexamined(
     postgres_failure = (
         source.postgres_failure if isinstance(source, _UnreadableDB) else None
     )
+    if (
+        isinstance(source, _UnreadableDB)
+        and postgres_failure is not None
+        and database_was_reached
+    ):
+        partial_advice = (
+            " Inspect the preserved partial diagnostic, then fix its cause"
+            if source.postgres_partial_diagnostic
+            else " Fix the reported failure"
+        )
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. A runtime-equivalent "
+            f"database connection succeeded while reading the agent node, but "
+            f"the governance edge read did not complete.{partial_advice} and "
+            f"re-run before treating this host as ready."
+        )
+        return
     if postgres_failure == "connection":
         report.fail.append(
             f"{name}: governance NOT verified — {reason}. Doctor cannot say "
