@@ -179,7 +179,21 @@ removing it, then load the dump into the running devcontainer:
 docker run --rm -v <project>_postgres-data:/var/lib/postgresql/data \
   -e POSTGRES_PASSWORD=kestrel_password -e PGDATA=/var/lib/postgresql/data/pgdata \
   -d --name kestrel-pg15-dump pgvector/pgvector:pg15
+
+# WAIT. `docker run -d` returns as soon as the container is created, not when
+# the server accepts connections — and an old cluster may still be replaying
+# WAL. Dumping into that gap does not error loudly; it writes an EMPTY
+# pg15-dump.sql, and the `docker rm -f` below then throws away the only
+# server that could have read the volume.
+until docker exec kestrel-pg15-dump pg_isready -U kestrel_user -q; do sleep 1; done
+
 docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql
+
+# Check before discarding the source. pg_dumpall exits 0 on an empty database,
+# so a non-empty file is the only evidence the dump actually carries data.
+[ -s pg15-dump.sql ] && grep -q "PostgreSQL database cluster dump" pg15-dump.sql \
+  && echo "dump looks good" || echo "DUMP IS EMPTY — do not remove the volume"
+
 docker rm -f kestrel-pg15-dump
 docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
 ```
