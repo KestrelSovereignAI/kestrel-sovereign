@@ -45,6 +45,11 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.command_policy import (
+    BOOTSTRAP_ALLOWED_COMMANDS,
+    SAFE_MODE_COMMANDS,
+    prefixed_command_token,
+)
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.a2a.stores import (
     SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
@@ -5055,14 +5060,13 @@ Expected Duration: {expected_duration}
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if safe_mode or audit_pending:
-            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
-            if user_input.startswith("!"):
-                cmd = user_input.split()[0]
-                if cmd not in safe_mode_commands:
+            command = prefixed_command_token(user_input)
+            if command is not None:
+                if command not in SAFE_MODE_COMMANDS:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
                         "The agent has detected an integrity issue and is operating in restricted mode.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status\\n\\n"
+                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
@@ -5097,20 +5101,8 @@ Expected Duration: {expected_duration}
 
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-                bootstrap_commands = {
-                    "!skip-discovery",
-                    "!restart-discovery",
-                    "!bootstrap-status",
-                }
-                command = (
-                    user_input.split(maxsplit=1)[0].lower()
-                    if user_input.startswith("!")
-                    else None
-                )
-                if (
-                    command in bootstrap_commands
-                    or command in self.command_handler.SOVEREIGN_COMMANDS
-                ):
+                command = prefixed_command_token(user_input)
+                if command in BOOTSTRAP_ALLOWED_COMMANDS:
                     pass  # Let command handler process these
                 elif command is not None:
                     # Never feed command text into discovery. Bootstrap may
