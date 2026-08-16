@@ -330,19 +330,50 @@ def test_health_fails_when_scheduler_ready_hook_never_armed_runner():
     }
 
 
-def test_health_ignores_unrelated_feature_private_runner_attribute():
-    """Only runners exposing the scheduler readiness contract are inspected."""
-    from kestrel_sovereign.server import _active_scheduler_workers_available
+@pytest.mark.parametrize(
+    "feature_name, feature",
+    [
+        (
+            "ThirdPartyFeature",
+            SimpleNamespace(
+                _runner=SimpleNamespace(
+                    worker_available=False,
+                    readiness_failure=RuntimeError("unrelated failure"),
+                ),
+            ),
+        ),
+        (
+            "SchedulerFeature",
+            SimpleNamespace(
+                enabled=False,
+                _runner=SimpleNamespace(
+                    worker_available=False,
+                    readiness_failure=RuntimeError("disabled failure"),
+                ),
+            ),
+        ),
+    ],
+    ids=("unrelated-runner-contract", "disabled-scheduler"),
+)
+def test_health_ignores_non_active_scheduler_runners(feature_name, feature):
+    """Only an enabled SchedulerFeature participates in scheduler readiness."""
+    from kestrel_sovereign.server import (
+        _active_scheduler_workers_available,
+        _latch_active_scheduler_runner_failures,
+    )
 
-    unrelated = SimpleNamespace(_running=True)
-    agent = SimpleNamespace(
-        features={"ThirdPartyFeature": SimpleNamespace(_runner=unrelated)}
-    )
+    agent = SimpleNamespace(features={feature_name: feature})
     fake_app = SimpleNamespace(
-        state=SimpleNamespace(host_scheduler_runner=None)
+        state=SimpleNamespace(
+            host_scheduler_runner=None,
+            scheduler_readiness_failures=[],
+        )
     )
+
+    _latch_active_scheduler_runner_failures(fake_app, agent, None)
 
     assert _active_scheduler_workers_available(fake_app, agent, None) is True
+    assert fake_app.state.scheduler_readiness_failures == []
 
 
 def test_health_probe_fails_closed_when_agent_features_cannot_be_inspected():

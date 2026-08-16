@@ -277,6 +277,15 @@ def _latch_scheduler_readiness_failure(
         )
 
 
+def _is_enabled_scheduler_feature(name: object, feature: object) -> bool:
+    """Return whether a feature-map entry is an active scheduler feature."""
+
+    return (
+        name == "SchedulerFeature"
+        or type(feature).__name__ == "SchedulerFeature"
+    ) and bool(getattr(feature, "enabled", True))
+
+
 def _latch_active_scheduler_runner_failures(
     app: FastAPI,
     agent,
@@ -321,8 +330,10 @@ def _latch_active_scheduler_runner_failures(
             continue
         if not isinstance(features, dict):
             continue
-        for feature in features.values():
+        for name, feature in features.items():
             try:
+                if not _is_enabled_scheduler_feature(name, feature):
+                    continue
                 runner = getattr(feature, "_runner", None)
                 failure = getattr(runner, "readiness_failure", None)
             except Exception:  # pragma: no cover - health must not crash
@@ -367,8 +378,10 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
             return False
         if not isinstance(features, dict):
             continue
-        for feature in features.values():
+        for name, feature in features.items():
             try:
+                if not _is_enabled_scheduler_feature(name, feature):
+                    continue
                 runner = getattr(feature, "_runner", None)
                 if (
                     runner is not None
