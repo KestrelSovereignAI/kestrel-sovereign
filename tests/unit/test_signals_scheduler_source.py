@@ -370,7 +370,9 @@ async def test_handler_exception_becomes_failed_status(
 
 
 @pytest.mark.asyncio
-async def test_failed_tool_result_becomes_failed_status(dispatcher_components):
+async def test_failed_tool_result_becomes_failed_status(
+    dispatcher_components, caplog,
+):
     """The production lookup rejects failure before its JSON boundary."""
     agent, registry, dispatcher, backend = dispatcher_components
     private_marker = "private-consolidation-detail-2907"
@@ -397,7 +399,11 @@ async def test_failed_tool_result_becomes_failed_status(dispatcher_components):
         payload={},
         target_agent=agent.did,
     )
-    result = await dispatcher.dispatch_signal(signal)
+    with caplog.at_level(
+        logging.ERROR,
+        logger="kestrel_sovereign.signals.sources.scheduler",
+    ):
+        result = await dispatcher.dispatch_signal(signal)
 
     assert result.status == Status.FAILED
     assert "scheduled tool memory_consolidate failed" in (result.error or "")
@@ -408,6 +414,12 @@ async def test_failed_tool_result_becomes_failed_status(dispatcher_components):
     )
     assert row is not None
     assert private_marker not in (row[0] or "")
+    assert any(
+        private_marker in record.getMessage()
+        and "returned a failed result" in record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.signals.sources.scheduler"
+    )
 
 
 @pytest.mark.asyncio
@@ -765,7 +777,7 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
 
 @pytest.mark.asyncio
 async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
-    dispatcher_components,
+    dispatcher_components, caplog,
 ):
     """Failure routing cannot copy governed/hook result maps into audit error."""
     agent, registry, dispatcher, backend = dispatcher_components
@@ -803,7 +815,11 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
         payload={"skip_consolidation": True, "skip_reflection": True},
         target_agent=agent.did,
     )
-    result = await dispatcher.dispatch_signal(signal)
+    with caplog.at_level(
+        logging.ERROR,
+        logger="kestrel_sovereign.signals.sources.scheduler",
+    ):
+        result = await dispatcher.dispatch_signal(signal)
 
     assert result.status == Status.FAILED
     assert (result.error or "").endswith(
@@ -817,6 +833,12 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     assert row is not None
     assert row[0].endswith("scheduled task sleep returned failed")
     assert private_marker not in row[0]
+    assert any(
+        private_marker in record.getMessage()
+        and "returned failed" in record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.signals.sources.scheduler"
+    )
 
 
 @pytest.mark.parametrize(

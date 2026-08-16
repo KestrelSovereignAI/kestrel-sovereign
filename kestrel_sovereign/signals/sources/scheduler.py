@@ -213,6 +213,12 @@ def _require_successful_task_result(
         # semantic-maintenance maps. Never splice it into an exception: the
         # dispatcher persists exception text in ``signal_log.error`` and emits
         # it to ERROR logs without the result-summary redaction/cap boundary.
+        logger.error(
+            "Scheduled task %s returned %s: %s",
+            task_name,
+            result.status,
+            result.result_text,
+        )
         raise RuntimeError(
             f"scheduled task {task_name} returned {result.status}"
         )
@@ -262,6 +268,17 @@ def _require_successful_task_result(
         # result bodies: they may contain provider/memory detail or a QueryError
         # with SQL. The dispatcher persists exception text outside the bounded
         # result-summary channel, so expose only the task identity and verdict.
+        if isinstance(evaluated_result, ToolResult):
+            detail = evaluated_result.error or evaluated_result.confirmation
+        else:
+            detail = evaluated_result.get("error") or evaluated_result.get(
+                "confirmation"
+            )
+        logger.error(
+            "Scheduled tool %s returned a failed result: %s",
+            task_name,
+            detail or "tool returned an error result",
+        )
         raise RuntimeError(f"scheduled tool {task_name} failed")
     return result
 
