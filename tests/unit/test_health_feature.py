@@ -15,6 +15,7 @@ Tests:
 
 import asyncio
 import json
+import threading
 import pytest
 import pytest_asyncio
 from dataclasses import dataclass
@@ -40,7 +41,8 @@ from kestrel_sovereign.features.health.feature import (
     _derive_overall_status,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db import QueryError, SQLiteBackend
+from kestrel_sovereign.storage.db import sqlite as sqlite_backend_module
 
 
 # ============================================================================
@@ -196,6 +198,61 @@ class TestCheckDatabase:
         assert result["status"] == "warn"
         assert "cleanup is still pending" in result["message"]
         db.fetchone.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fail_when_real_sqlite_cleanup_exceeds_deadline(
+        self, tmp_path, monkeypatch
+    ):
+        """An expired real worker drain is a critical database failure."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.02,
+        )
+        backend = SQLiteBackend(str(tmp_path / "expired-cleanup.db"))
+        await backend.connect()
+        db = AsyncDatabase(backend)
+        conn = backend._ensure_connected()
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        await conn.create_function("block_in_worker", 0, block_in_worker)
+        blocked_read = asyncio.create_task(
+            backend.fetch_one("SELECT block_in_worker()")
+        )
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+
+            with pytest.raises(QueryError, match="cleanup is still pending"):
+                await backend.fetch_one("SELECT 1")
+
+            assert backend.write_connection_cleanup_deadline_exceeded is True
+            result = await check_database(db)
+
+            assert result["status"] == "fail"
+            assert "cleanup exceeded its deadline" in result["message"]
+            assert health_checks.derive_overall_status([result]) == "unhealthy"
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            await asyncio.gather(blocked_read, return_exceptions=True)
+            drain = backend._cancelled_write_drain
+            if drain is not None:
+                await asyncio.gather(drain, return_exceptions=True)
+            await backend.close()
 
     @pytest.mark.asyncio
     async def test_warn_when_unexpected_result(self):

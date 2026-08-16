@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, List, Literal, Optional, overload
 
@@ -39,6 +40,19 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 
 class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
     """A retained rollback is still running after a later writer's budget."""
+
+
+@dataclass
+class _RetainedAiosqliteClose:
+    """Strong ownership of one close until its worker terminates."""
+
+    close_task: asyncio.Task[None]
+    retirement_task: Optional[asyncio.Task[None]] = None
+
+
+_RetainedAiosqliteCloses = dict[
+    aiosqlite.Connection, _RetainedAiosqliteClose
+]
 
 
 def _minimum_close_timeout_s() -> float:
@@ -83,7 +97,85 @@ async def _wait_for_aiosqlite_worker_shutdown(
         ) from exc
 
 
-async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
+def _retain_aiosqlite_close(
+    connection: aiosqlite.Connection,
+    close_task: asyncio.Task[None],
+    retained_closes: _RetainedAiosqliteCloses,
+) -> None:
+    """Own a timed-out close until its non-daemon worker really exits."""
+    existing = retained_closes.get(connection)
+    if existing is not None and _aiosqlite_worker_is_alive(connection):
+        return
+    retained_closes.pop(connection, None)
+
+    retained = _RetainedAiosqliteClose(close_task=close_task)
+
+    async def reap() -> None:
+        pending_cancellation: Optional[asyncio.CancelledError] = None
+        try:
+            await asyncio.shield(retained.close_task)
+        except asyncio.CancelledError as exc:
+            # The public close task is normally cancelled by the bounded
+            # caller below. A cancellation of this reaper must not discard
+            # lifecycle ownership while a non-daemon worker is still alive.
+            pending_cancellation = exc
+        except Exception:
+            # The bounded caller already surfaces the close failure. Reaping
+            # owns the remaining worker lifetime, not a second error channel.
+            pass
+
+        while _aiosqlite_worker_is_alive(connection):
+            try:
+                await asyncio.sleep(_AIOSQLITE_WORKER_SHUTDOWN_POLL_S)
+            except asyncio.CancelledError as exc:
+                pending_cancellation = pending_cancellation or exc
+
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
+    loop = asyncio.get_running_loop()
+    retirement_task = loop.create_task(
+        reap(),
+        name=f"aiosqlite-close-retirement:{id(connection)}",
+    )
+    retained.retirement_task = retirement_task
+    retained_closes[connection] = retained
+
+    def release_ownership(_task: asyncio.Task[None]) -> None:
+        # Cancellation before the reaper's first event-loop turn cannot run
+        # its cancellation-resistant body. Keep the connection and close task
+        # strongly owned in that case; the next lifecycle probe prunes them
+        # only after the worker itself has exited.
+        if (
+            retained_closes.get(connection) is retained
+            and not _aiosqlite_worker_is_alive(connection)
+        ):
+            retained_closes.pop(connection)
+
+    retirement_task.add_done_callback(release_ownership)
+
+
+def _aiosqlite_worker_is_alive(connection: aiosqlite.Connection) -> bool:
+    """Return whether either supported aiosqlite worker shape is alive."""
+    worker = getattr(connection, "_thread", connection)
+    is_alive = getattr(worker, "is_alive", None)
+    return bool(callable(is_alive) and is_alive())
+
+
+def _prune_retained_aiosqlite_closes(
+    retained_closes: _RetainedAiosqliteCloses,
+) -> None:
+    """Release lifecycle records only after their workers have exited."""
+    for connection in list(retained_closes):
+        if not _aiosqlite_worker_is_alive(connection):
+            retained_closes.pop(connection)
+
+
+async def _close_aiosqlite_connection(
+    connection: aiosqlite.Connection,
+    *,
+    retained_closes: _RetainedAiosqliteCloses,
+) -> None:
     """Close an owned aiosqlite connection through its full lifecycle.
 
     Every connection this backend opens owns an aiosqlite worker.  Keeping the
@@ -108,16 +200,25 @@ async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
         done, _ = await asyncio.wait({close_task}, timeout=remaining)
 
     if not done:
+        interrupt_error: Optional[Exception] = None
         try:
             await connection.interrupt()
         except ValueError as exc:
             if "no active connection" not in str(exc):
-                raise
+                interrupt_error = exc
+        except Exception as exc:
+            interrupt_error = exc
         close_task.cancel()
-        raise ConnectionError(
+        _retain_aiosqlite_close(
+            connection, close_task, retained_closes
+        )
+        error = ConnectionError(
             "SQLite connection close did not complete within "
             f"{_minimum_close_timeout_s():.2f}s"
         )
+        if interrupt_error is not None:
+            raise error from interrupt_error
+        raise error
 
     close_error: Optional[BaseException] = None
     try:
@@ -127,17 +228,29 @@ async def _close_aiosqlite_connection(connection: aiosqlite.Connection) -> None:
 
     remaining = max(0.0, deadline - loop.time())
     try:
-        await _wait_for_aiosqlite_worker_shutdown(
-            connection,
-            timeout_s=remaining,
-        )
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(
+                connection,
+                timeout_s=remaining,
+            )
+        except ConnectionError:
+            _retain_aiosqlite_close(
+                connection, close_task, retained_closes
+            )
+            raise
     except asyncio.CancelledError as exc:
         pending_cancellation = pending_cancellation or exc
         remaining = max(0.0, deadline - loop.time())
-        await _wait_for_aiosqlite_worker_shutdown(
-            connection,
-            timeout_s=remaining,
-        )
+        try:
+            await _wait_for_aiosqlite_worker_shutdown(
+                connection,
+                timeout_s=remaining,
+            )
+        except ConnectionError:
+            _retain_aiosqlite_close(
+                connection, close_task, retained_closes
+            )
+            raise
 
     if pending_cancellation is not None:
         raise pending_cancellation
@@ -185,6 +298,7 @@ class SQLiteBackend(DatabaseBackend):
         # allowing another writer to commit the abandoned statement (#2907).
         self._cancelled_write_drain: Optional[asyncio.Task[None]] = None
         self._cancelled_write_drain_error: Optional[Exception] = None
+        self._retired_connection_closes: _RetainedAiosqliteCloses = {}
         self._closing = False
     
     @property
@@ -212,6 +326,20 @@ class SQLiteBackend(DatabaseBackend):
         )
 
     @property
+    def write_connection_cleanup_deadline_exceeded(self) -> bool:
+        """Whether retained cleanup passed the bounded availability window."""
+        return isinstance(
+            self._cancelled_write_drain_error,
+            _CancelledWriteDrainDeadlineExceeded,
+        )
+
+    @property
+    def connection_retirement_pending(self) -> bool:
+        """Whether a timed-out close still owns a live aiosqlite worker."""
+        _prune_retained_aiosqlite_closes(self._retired_connection_closes)
+        return bool(self._retired_connection_closes)
+
+    @property
     def minimum_close_timeout_s(self) -> float:
         """Minimum budget an outer shutdown guard must reserve for ``close``.
 
@@ -231,6 +359,11 @@ class SQLiteBackend(DatabaseBackend):
     
     async def connect(self) -> None:
         """Connect to SQLite database."""
+        if self.connection_retirement_pending:
+            raise ConnectionError(
+                "Cannot reconnect SQLite while a previous connection worker "
+                "is still retiring after its close deadline"
+            )
         if self._connection is not None:
             if self._cancelled_write_drain_error is None:
                 return
@@ -275,6 +408,11 @@ class SQLiteBackend(DatabaseBackend):
         """Close database connection and wait for background thread to stop."""
         conn = self._connection
         if conn is None:
+            if self.connection_retirement_pending:
+                raise ConnectionError(
+                    "SQLite connection worker is still retiring after its "
+                    "close deadline"
+                )
             self._cancelled_write_drain = None
             self._cancelled_write_drain_error = None
             return
@@ -321,7 +459,10 @@ class SQLiteBackend(DatabaseBackend):
                                 pending_cancellation or drain_cancelled
                             )
 
-            await _close_aiosqlite_connection(conn)
+            await _close_aiosqlite_connection(
+                conn,
+                retained_closes=self._retired_connection_closes,
+            )
             logger.debug(f"Closed SQLite connection: {self.db_path}")
         finally:
             self._connection = None
@@ -355,7 +496,10 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 await conn.backup(dest)
             finally:
-                await _close_aiosqlite_connection(dest)
+                await _close_aiosqlite_connection(
+                    dest,
+                    retained_closes=self._retired_connection_closes,
+                )
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
@@ -367,7 +511,10 @@ class SQLiteBackend(DatabaseBackend):
             conn.row_factory = aiosqlite.Row
             return conn
         except BaseException:
-            await _close_aiosqlite_connection(conn)
+            await _close_aiosqlite_connection(
+                conn,
+                retained_closes=self._retired_connection_closes,
+            )
             raise
 
     @asynccontextmanager
@@ -406,7 +553,10 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 yield read_conn
             finally:
-                await _close_aiosqlite_connection(read_conn)
+                await _close_aiosqlite_connection(
+                    read_conn,
+                    retained_closes=self._retired_connection_closes,
+                )
             return
 
         # In-memory databases have no independent committed snapshot. Ordinary

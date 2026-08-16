@@ -31,8 +31,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from kestrel_sovereign.storage.db.sqlite import (
+    _RetainedAiosqliteCloses,
     _close_aiosqlite_connection,
     _minimum_close_timeout_s,
+    _prune_retained_aiosqlite_closes,
 )
 
 
@@ -69,6 +71,7 @@ class SovereignSqlaSessionFactory:
         # raw driver connections at the engine boundary so this factory owns
         # their complete lifecycle too.
         self._sqlite_connections: list[Any] = []
+        self._retired_sqlite_closes: _RetainedAiosqliteCloses = {}
         if getattr(engine.dialect, "name", None) == "sqlite":
             event.listen(
                 engine.sync_engine, "connect", self._track_sqlite_connection
@@ -84,6 +87,12 @@ class SovereignSqlaSessionFactory:
         if getattr(self._engine.dialect, "name", None) != "sqlite":
             return 0.0
         return _minimum_close_timeout_s()
+
+    @property
+    def sqlite_connection_retirement_pending(self) -> bool:
+        """Whether a timed-out driver close still owns a live worker."""
+        _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
+        return bool(self._retired_sqlite_closes)
 
     def _track_sqlite_connection(self, dbapi_connection: Any, _record: Any) -> None:
         """Remember one raw aiosqlite connection opened by this engine."""
@@ -147,7 +156,10 @@ class SovereignSqlaSessionFactory:
         cleanup_errors: list[BaseException] = []
         for connection in self._sqlite_connections:
             try:
-                await _close_aiosqlite_connection(connection)
+                await _close_aiosqlite_connection(
+                    connection,
+                    retained_closes=self._retired_sqlite_closes,
+                )
             except (Exception, asyncio.CancelledError) as exc:
                 # One timed-out worker must not prevent another tracked driver
                 # from receiving its own close sentinel.

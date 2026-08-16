@@ -108,19 +108,35 @@ async def check_database(db) -> Dict[str, Any]:
             getattr(backend, "write_connection_requires_reconnect", False)
             is True
         )
+        cleanup_deadline_exceeded = (
+            getattr(
+                backend,
+                "write_connection_cleanup_deadline_exceeded",
+                False,
+            )
+            is True
+        )
+        cleanup_failed = reconnect_required or cleanup_deadline_exceeded
         return {
             "name": "database",
             # A live rollback handoff is transient and self-healing. It fences
-            # writes for correctness but does not make a successful committed
-            # read probe impossible. Failed cleanup is the terminal condition
-            # that requires reconnect and makes database health critical.
-            "status": "fail" if reconnect_required else "warn",
+            # reads and writes for correctness, but remains a warning only
+            # inside its bounded cleanup window. Once that deadline expires,
+            # normal database operations are unavailable indefinitely and the
+            # critical database check must fail even if cleanup may eventually
+            # self-heal without reconnecting.
+            "status": "fail" if cleanup_failed else "warn",
             "message": (
                 "Database write connection is unavailable because cancellation "
                 + (
                     "cleanup failed; reconnect is required"
                     if reconnect_required
-                    else "cleanup is still pending"
+                    else (
+                        "cleanup exceeded its deadline; normal reads and writes "
+                        "are unavailable"
+                        if cleanup_deadline_exceeded
+                        else "cleanup is still pending"
+                    )
                 )
             ),
             "duration_ms": _elapsed(start),

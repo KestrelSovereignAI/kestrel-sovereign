@@ -2223,9 +2223,9 @@ class AsyncDatabase:
         :class:`DatabaseBackend` connection.  Keep this phase separately
         callable so shutdown orchestration can bound engine disposal without
         stealing the primary SQLite connection's worker-drain reservation.
-        Clearing the cache *before* the await makes a timed-out disposal a
-        one-shot attempt: a later backend close must not repeat the same
-        unbounded pre-close work and starve the primary connection.
+        Keep the cache while a timed-out aiosqlite close retains a live worker
+        on the factory; clearing it then would discard the explicit lifecycle
+        owner. Other bounded failures preserve the existing one-shot behavior.
         """
         # If the SQLA helper ever cached a session factory on us
         # (``kestrel_sovereign.storage.sqla.make_session_factory``),
@@ -2234,14 +2234,24 @@ class AsyncDatabase:
         # shuts down. The cache is best-effort and may be absent in
         # tests / fresh DBs — guard with ``getattr``.
         sqla_factory = getattr(self, "_sovereign_sqla_factory", None)
-        self._sovereign_sqla_factory = None
         if sqla_factory is not None:
             # The caller owns the ordering between this independent engine and
             # the primary backend.  Do not turn a failed engine close into a
             # false success here: ``close()`` still gives the primary backend
             # its close chance before reporting this failure, and whole-agent
             # shutdown records it as degraded after that same primary close.
-            await sqla_factory.close()
+            try:
+                await sqla_factory.close()
+            except (Exception, asyncio.CancelledError):
+                if getattr(
+                    sqla_factory,
+                    "sqlite_connection_retirement_pending",
+                    False,
+                ) is not True:
+                    self._sovereign_sqla_factory = None
+                raise
+            if getattr(self, "_sovereign_sqla_factory", None) is sqla_factory:
+                self._sovereign_sqla_factory = None
 
     @property
     def minimum_sqla_factory_close_timeout_s(self) -> float:
