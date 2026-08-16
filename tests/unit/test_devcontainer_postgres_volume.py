@@ -146,17 +146,29 @@ DOCS = [
     Path("docs/development/DEVCONTAINER_QUICKSTART.md"),
 ]
 
-#: How the reset has to be spelled. Compose does NOT rediscover the project
-#: name — invoked by hand it derives one from the compose file's own directory
-#: (``devcontainer``), while VS Code launches the stack under a
-#: workspace-derived name. So the reset must pass ``-p`` with the project read
-#: off the running container's ``com.docker.compose.project`` label; a bare
-#: ``down -v`` targets ``devcontainer_*`` and removes nothing, or removes some
-#: other project's volumes.
-RESET_COMMAND = (
-    'docker compose -p "$project" '
-    "-f .devcontainer/docker-compose.devcontainer.yml down -v"
-)
+#: The container name the compose file fixes globally. Because it is fixed, it
+#: is NOT a safe way to discover which project to operate on: in a second clone
+#: or git worktree it resolves to whatever checkout happens to be running.
+GLOBAL_CONTAINER_NAME = "kestrel-dev-postgres"
+
+
+def _fenced_command_lines(text: str) -> list:
+    """Lines inside ``` fences — i.e. what a reader can copy and run.
+
+    The distinction matters: these documents *should* discuss ``down -v`` at
+    length, because explaining why every short spelling of it is wrong is the
+    whole point. What they must not do is put one where it can be pasted. A
+    naive substring search over the whole file cannot tell those apart and
+    fails on the explanation itself.
+    """
+    lines, inside = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            lines.append(line)
+    return lines
 
 
 def _unprefixable_volumes() -> set:
@@ -181,24 +193,59 @@ def _unprefixable_volumes() -> set:
 
 
 @pytest.mark.parametrize("doc", DOCS)
-def test_the_documented_reset_goes_through_compose(doc: Path):
-    """The reset has to be run by the party that knows the project prefix.
+def test_no_document_ships_a_destructive_project_wide_command(doc: Path):
+    """These docs must not hand over a copy-pasteable ``down -v``.
 
-    Both documents hand the reader a command that wipes the devcontainer's
-    state, and the failure mode of getting it wrong is silent in the worst
-    direction: ``docker volume rm`` on a name that does not exist removes
-    nothing, so the reader believes the database was reset while the cluster it
-    is actually running on is untouched — which then gets blamed on the
-    application.
+    Three spellings were tried and every one destroyed the wrong thing:
 
-    ``down -v`` removes the volumes this compose file declares, whatever the
-    project prefix turns out to be on that machine.
+    * bare ``docker compose -f .devcontainer/… down -v`` — Compose derives the
+      project from the compose file's own directory, so it targets
+      ``devcontainer_*``: nothing under VS Code, or another project entirely.
+    * ``-p`` with the project read from ``docker inspect kestrel-dev-postgres``
+      — that container name is fixed globally, so in a second clone or git
+      worktree it resolves to whatever checkout is running. The lookup succeeds
+      while *this* checkout is stopped, and the ``down -v`` then deletes the
+      other checkout's database.
+    * naming the volumes directly — the prefix is not knowable from here.
+
+    The failure is silent in the worst direction each time: either nothing is
+    removed and the reader believes it was, or data that belongs to something
+    else is destroyed. A reader who has to look up their own project cannot
+    make that mistake by copy-paste, so the docs describe and do not prescribe.
     """
-    text = (REPO_ROOT / doc).read_text()
-    assert RESET_COMMAND in text, (
-        f"{doc} no longer documents the volume reset as {RESET_COMMAND!r}. "
-        "Any spelling that names volumes directly cannot work: the reader's "
-        "project prefix is not knowable from this repository."
+    offenders = [
+        line.strip()
+        for line in _fenced_command_lines((REPO_ROOT / doc).read_text())
+        if "down -v" in line
+    ]
+    assert not offenders, (
+        f"{doc} ships a destructive project-wide command: {offenders}. "
+        "Every short spelling of this targets the wrong Compose project in "
+        "some real setup — see this test's docstring. Describe how to find "
+        "the volumes instead of handing over a command that deletes them. "
+        "Discussing `down -v` in prose is fine and expected; putting one in a "
+        "code fence is not."
+    )
+
+
+@pytest.mark.parametrize("doc", DOCS)
+def test_no_document_derives_a_project_from_the_global_container_name(doc: Path):
+    """``docker inspect kestrel-dev-postgres`` must not feed a destructive command.
+
+    The compose file fixes ``container_name`` globally, so this lookup is not
+    scoped to a checkout. With several clones or git worktrees on one machine —
+    the normal case here — it returns whichever one is running, and using that
+    project in ``down -v`` deletes that checkout's persistent volumes.
+    """
+    offenders = [
+        line.strip()
+        for line in _fenced_command_lines((REPO_ROOT / doc).read_text())
+        if f"docker inspect {GLOBAL_CONTAINER_NAME}" in line
+    ]
+    assert not offenders, (
+        f"{doc} derives a Compose project from the globally-fixed container "
+        f"name: {offenders}. That resolves to whatever checkout is running, "
+        "not necessarily this one."
     )
 
 

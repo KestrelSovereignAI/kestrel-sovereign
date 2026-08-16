@@ -134,22 +134,30 @@ with the Compose project, so what `docker volume ls` shows is
 `<project>_postgres16-data` — and under VS Code the prefix is derived from your
 workspace path, so it is not the same string on two machines.
 
-Compose does **not** rediscover that name for you. Invoked by hand it derives
-the project from this file's own directory (`devcontainer`), so a bare
-`docker compose … down -v` targets `devcontainer_*` — which under VS Code
-removes nothing, or removes some *other* project's volumes if one happens to be
-named `devcontainer`. Read the real project off the running container instead:
+This README deliberately gives you no copy-pasteable command for deleting
+them, because every short spelling of it destroys the wrong thing somewhere:
+
+- A bare `docker compose -f .devcontainer/… down -v` does **not** rediscover
+  VS Code's project name. Invoked by hand, Compose derives the project from
+  this file's own directory (`devcontainer`), so it targets `devcontainer_*` —
+  removing nothing under VS Code, or removing some *other* project's volumes.
+- Passing `-p` with a project read from `docker inspect kestrel-dev-postgres`
+  is worse. That container name is fixed globally in the compose file, so with
+  a second clone or git worktree it resolves to **whatever checkout is running**
+  — which may not be this one. The lookup still succeeds while this checkout is
+  stopped, and the teardown then deletes the other checkout's database.
+
+Identify the volumes first, decide what each belongs to, and remove them by
+their full names:
 
 ```bash
-# ⚠️ DELETES DATA — removes the containers and every volume declared above
-project=$(docker inspect kestrel-dev-postgres \
-  --format '{{index .Config.Labels "com.docker.compose.project"}}')
-docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down -v
+docker volume ls | grep postgres16-data
 ```
 
-If the stack is not running there is no label to read, and no prefix to
-recover: find the volumes with `docker volume ls | grep postgres16-data` and
-remove them by their full names.
+For a scripted reset, derive the project from the checkout you are in —
+`docker compose ls` lists each project with its `config_files` path — rather
+than from a globally-named container. Under VS Code, the extension's own
+teardown is the reliable route, because it knows which project it launched.
 
 ### Upgrading from the PostgreSQL 15 devcontainer
 

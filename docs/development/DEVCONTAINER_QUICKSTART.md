@@ -244,30 +244,25 @@ Just close VS Code. The container keeps running in the background.
 2. This reopens the folder on your host machine
 
 ### Remove Everything
-```bash
-# The project name VS Code launched the stack under. Compose does NOT
-# rediscover it — by hand it derives one from the compose file's directory.
-project=$(docker inspect kestrel-dev-postgres \
-  --format '{{index .Config.Labels "com.docker.compose.project"}}')
 
-# Stop and remove containers, keeping the data
-docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down
+Use the VS Code command palette — **Dev Containers: Rebuild Container** for a
+clean rebuild that keeps the database, and the extension's own teardown when
+you want the volumes gone. It knows which project it launched; nothing you type
+by hand does.
 
-# ...or take the volumes with them (⚠️ DELETES DATA)
-docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down -v
-```
-
-> Passing `docker volume rm` the names from the compose file does **not** work:
-> Docker prefixes them with the Compose project, so the live cluster is
-> `<project>_postgres16-data` — and VS Code derives that prefix from your
-> workspace path, so it differs per machine.
+> There is deliberately no copy-pasteable `down -v` here. Docker prefixes each
+> volume with the Compose project, so the live cluster is
+> `<project>_postgres16-data`, and VS Code derives that prefix from your
+> workspace path. A bare `docker compose -f .devcontainer/… down -v` does not
+> rediscover it — invoked by hand Compose uses the compose file's own directory
+> (`devcontainer`), so it removes nothing, or another project's volumes.
 >
-> Nor does a bare `down -v` look it up for you. Invoked by hand, Compose uses
-> the compose file's own directory (`devcontainer`) as the project, so without
-> `-p` it targets `devcontainer_*`: nothing is removed, or another project's
-> volumes are. Read the real name off the running container, as above. If the
-> stack is not running there is no label to read — find the volumes with
-> `docker volume ls | grep postgres16-data` and remove them by full name.
+> Recovering the project from `docker inspect kestrel-dev-postgres` is worse:
+> that container name is fixed globally, so in a second clone or git worktree
+> it resolves to whatever checkout is running — possibly not yours — and a
+> `down -v` on that project deletes **that** checkout's database. See
+> `.devcontainer/README.md`. To remove volumes by hand, list them first with
+> `docker volume ls | grep postgres16-data` and decide what each belongs to.
 
 > Upgrading a devcontainer built before the PostgreSQL 16 bump? The database
 > volume is versioned with the server major, so `pg16` starts on a fresh
