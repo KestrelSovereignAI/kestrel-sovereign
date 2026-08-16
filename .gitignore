@@ -216,3 +216,10 @@ tests/e2e/simpletuner/playwright.config.cjs
 serve_models.toml
 site/
 site.staging/
+
+# Database dumps — never commit or ship these; the repo root is a Docker build
+# context and several Dockerfiles COPY . .  A cluster dump carries conversation
+# data and role password hashes.
+*-dump.sql
+*.dump
+*.sql.gz
