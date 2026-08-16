@@ -514,11 +514,12 @@ def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
     parsed = parse_dsn(runtime_db.dsn)
     if not parsed.get("password"):
         pytest.skip("live PostgreSQL URL has no password to exercise pgpass")
+    if any(character in parsed["password"] for character in (":", "\\", "\n")):
+        pytest.skip("asyncpg pgpass fixture requires an unescaped password")
 
     passfile = tmp_path / "secrets" / "runtime.pgpass"
     passfile.parent.mkdir()
-    password = parsed["password"].replace("\\", "\\\\").replace(":", "\\:")
-    passfile.write_text(f"*:*:*:*:{password}\n")
+    passfile.write_text(f'*:*:*:*:{parsed["password"]}\n')
     passfile.chmod(0o600)
 
     for name in (
@@ -552,6 +553,96 @@ def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
     monkeypatch.chdir(invocation_dir)
 
     report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+async def test_multi_host_pgpass_password_is_frozen_before_fallback(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor and asyncpg reuse the first host's credential on host two.
+
+    Raw libpq would read the deliberately-wrong second row after the refused
+    first connection. The translated diagnostic must instead fold the single
+    password asyncpg selected before it began trying hosts.
+    """
+    import asyncpg
+    from psycopg2.extensions import parse_dsn
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    parsed = parse_dsn(runtime_db.dsn)
+    required = ("host", "port", "user", "password", "dbname")
+    if any(not parsed.get(field) for field in required):
+        pytest.skip("live PostgreSQL URL needs TCP host, user, and password")
+    if any(
+        character in parsed[field]
+        for field in ("host", "user", "password", "dbname")
+        for character in (":", "\\", "\n")
+    ):
+        pytest.skip("adversarial pgpass fixture requires unescaped fields")
+
+    bad_port = "1" if parsed["port"] != "1" else "2"
+    passfile_host = (
+        "localhost" if parsed["host"].startswith("/") else parsed["host"]
+    )
+    passfile = tmp_path / "fallback.pgpass"
+    passfile.write_text(
+        f'{passfile_host}:{bad_port}:{parsed["dbname"]}:'
+        f'{parsed["user"]}:{parsed["password"]}\n'
+        f'{passfile_host}:{parsed["port"]}:{parsed["dbname"]}:'
+        f'{parsed["user"]}:deliberately-wrong-password\n'
+    )
+    passfile.chmod(0o600)
+    query = {
+        "host": f'{parsed["host"]},{parsed["host"]}',
+        "port": f'{bad_port},{parsed["port"]}',
+        "user": parsed["user"],
+        "passfile": str(passfile),
+    }
+    if parsed.get("sslmode"):
+        query["sslmode"] = parsed["sslmode"]
+    def build_dsn(values):
+        return (
+            "postgresql:///"
+            + quote(parsed["dbname"], safe="")
+            + "?"
+            + "&".join(
+                f"{name}={quote(value, safe='')}"
+                for name, value in values.items()
+            )
+        )
+
+    runtime_dsn = build_dsn(query)
+    wrong_password_query = {
+        **query,
+        "host": parsed["host"],
+        "port": parsed["port"],
+        "password": "deliberately-wrong-password",
+    }
+    wrong_password_query.pop("passfile")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+    with pytest.MonkeyPatch.context() as connection_env:
+        for name in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE"):
+            connection_env.delenv(name, raising=False)
+        try:
+            wrong_connection = await asyncpg.connect(
+                build_dsn(wrong_password_query)
+            )
+        except asyncpg.InvalidPasswordError:
+            pass
+        else:
+            await wrong_connection.close()
+            pytest.skip("live PostgreSQL server does not require a password")
+        connection = await asyncpg.connect(runtime_dsn)
+        await connection.close()
+        report = diagnose(tmp_path)
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 

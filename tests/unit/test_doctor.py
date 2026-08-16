@@ -1574,7 +1574,11 @@ def test_explicit_dsn_connection_parameters_outrank_the_environment(tmp_path):
     """Only absent settings may be filled from the spawned-agent env."""
     from psycopg2.extensions import parse_dsn
 
-    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+    from kestrel_sovereign.doctor import (
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
 
     effective = _doctor_postgres_dsn(
         "postgresql://dsn_user:dsn-password@dsn.example:6543/dsn_db"
@@ -1763,8 +1767,8 @@ def test_connection_files_are_resolved_from_the_agent_working_directory(
         )
     )
 
+    _assert_absent_doctor_passfile(parsed["passfile"], project_dir)
     for option, relative in {
-        "passfile": "dsn/.pgpass",
         "sslrootcert": "dsn/root.crt",
         "sslcrl": "dsn/root.crl",
         "sslkey": "dsn/client.key",
@@ -1794,14 +1798,314 @@ def test_environment_connection_files_use_the_same_project_directory(tmp_path):
         )
     )
 
+    _assert_absent_doctor_passfile(parsed["passfile"], project_dir)
     for option, relative in {
-        "passfile": "env/.pgpass",
         "sslrootcert": "env/root.crt",
         "sslcrl": "env/root.crl",
         "sslkey": "env/client.key",
         "sslcert": "env/client.crt",
     }.items():
         assert parsed[option] == str((project_dir / relative).resolve())
+
+
+def _assert_absent_doctor_passfile(value: str, project_dir: Path) -> None:
+    path = Path(value)
+    assert not path.exists()
+    assert path.name == "pgpass"
+    assert path.parent.parent == project_dir.resolve()
+    assert path.parent.name.startswith(".kestrel-doctor-no-passfile")
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "*:*:*:*:probe:x",
+        r"*:*:*:*:pa\:ss",
+    ],
+    ids=("unescaped-password-colon", "escaped-password-colon"),
+)
+def test_single_host_passfile_uses_asyncpg_password_dialect(tmp_path, row):
+    from urllib.parse import quote
+
+    from asyncpg.connect_utils import _read_password_from_pgpass
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text(row + "\n")
+    passfile.chmod(0o600)
+    expected = _read_password_from_pgpass(
+        passfile=passfile,
+        hosts=["h1"],
+        ports=[5432],
+        database="db",
+        user="u",
+    )
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h1:5432/db?passfile="
+            + quote(str(passfile), safe=""),
+            {},
+            tmp_path,
+        )
+    )
+
+    assert parsed["password"] == expected
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("passfile_rows", "expected"),
+    [
+        (
+            [
+                "h1:5432:db:u:first-host-secret",
+                "h2:5433:db:u:second-host-secret",
+            ],
+            "first-host-secret",
+        ),
+        (
+            [
+                "other:5432:db:u:not-a-match",
+                "h2:5433:db:u:first-matching-secret",
+            ],
+            "first-matching-secret",
+        ),
+    ],
+    ids=("first-host", "first-matching-host"),
+)
+def test_multi_host_passfile_uses_asyncpg_selection_once(
+    tmp_path, passfile_rows, expected
+):
+    """Libpq must not select a new credential after host fallback."""
+    from urllib.parse import quote
+
+    from asyncpg.connect_utils import _read_password_from_pgpass
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import (
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
+
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text("\n".join(passfile_rows) + "\n")
+    passfile.chmod(0o600)
+    asyncpg_password = _read_password_from_pgpass(
+        passfile=passfile,
+        hosts=["h1", "h2"],
+        ports=[5432, 5433],
+        database="db",
+        user="u",
+    )
+
+    effective = _doctor_postgres_dsn(
+        "postgresql://u@h1:5432,h2:5433/db?passfile="
+        + quote(str(passfile), safe=""),
+        {},
+        tmp_path,
+    )
+    parsed = parse_dsn(effective)
+
+    assert asyncpg_password == expected
+    assert parsed["password"] == asyncpg_password
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
+    )
+    assert expected not in _safe(f"password={expected}", source)
+
+
+def test_multi_host_passfile_with_no_match_cannot_fall_through_to_libpq(
+    tmp_path,
+):
+    from urllib.parse import quote
+
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text("somewhere-else:5432:db:u:wrong-secret\n")
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h1:5432,h2:5433/db?passfile="
+            + quote(str(passfile), safe=""),
+            {},
+            tmp_path,
+        )
+    )
+
+    assert "password" not in parsed
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+def test_multi_host_pgpassfile_environment_is_selected_once(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text(
+        "h1:5432:db:u:environment-first-secret\n"
+        "h2:5433:db:u:environment-second-secret\n"
+    )
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h1:5432,h2:5433/db",
+            {"PGPASSFILE": str(passfile)},
+            tmp_path,
+        )
+    )
+
+    assert parsed["password"] == "environment-first-secret"
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+def test_multi_host_default_pgpass_uses_the_spawned_home(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    runtime_home = tmp_path / "spawned-home"
+    runtime_home.mkdir()
+    passfile = runtime_home / ".pgpass"
+    passfile.write_text(
+        "h1:5432:db:u:default-first-secret\n"
+        "h2:5433:db:u:default-second-secret\n"
+    )
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h1:5432,h2:5433/db",
+            {"HOME": str(runtime_home)},
+            tmp_path,
+        )
+    )
+
+    assert parsed["password"] == "default-first-secret"
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    (
+        "postgresql://u@h1:5432/db",
+        "postgresql://u@h1:5432,h2:5433/db",
+    ),
+    ids=("single-host", "multi-host"),
+)
+def test_empty_pgpassfile_does_not_fall_through_to_default(tmp_path, dsn):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    runtime_home = tmp_path / "spawned-home"
+    runtime_home.mkdir()
+    passfile = runtime_home / ".pgpass"
+    passfile.write_text("h1:5432:db:u:must-not-be-selected\n")
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            dsn,
+            {"HOME": str(runtime_home), "PGPASSFILE": ""},
+            tmp_path,
+        )
+    )
+
+    assert "password" not in parsed
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+def test_empty_pgpassword_suppresses_passfile_on_single_host(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    runtime_home = tmp_path / "spawned-home"
+    runtime_home.mkdir()
+    passfile = runtime_home / ".pgpass"
+    passfile.write_text("h1:5432:db:u:must-not-be-selected\n")
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h1:5432/db",
+            {"HOME": str(runtime_home), "PGPASSWORD": ""},
+            tmp_path,
+        )
+    )
+
+    assert parsed["password"] == ""
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX socket fallback")
+def test_default_host_pgpass_uses_asyncpg_auth_host_and_first_port(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    runtime_home = tmp_path / "spawned-home"
+    runtime_home.mkdir()
+    passfile = runtime_home / ".pgpass"
+    passfile.write_text("localhost:5433:db:u:wrong-second-port-secret\n")
+    passfile.chmod(0o600)
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql:///db?user=u",
+            {
+                "HOME": str(runtime_home),
+                "PGPORT": "5432,5433,5434,5435,5436",
+            },
+            tmp_path,
+        )
+    )
+
+    assert "password" not in parsed
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("row", "user"),
+    [
+        (r"h1:5432:db:u:pa\\ss", "u"),
+        (r"h1:5432:db:u\\x:only-secret", r"u\x"),
+        ("h1:5432:db:u:pa\vss", "u"),
+    ],
+    ids=("password-backslash", "user-backslash", "vertical-tab"),
+)
+def test_pgpass_file_parsing_matches_asyncpg_exactly(tmp_path, row, user):
+    from asyncpg.connect_utils import _read_password_from_pgpass
+
+    from kestrel_sovereign.doctor import _read_asyncpg_passfile_password
+
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text(row + "\n")
+    passfile.chmod(0o600)
+
+    expected = _read_password_from_pgpass(
+        passfile=passfile,
+        hosts=["h1", "h2"],
+        ports=[5432, 5433],
+        database="db",
+        user=user,
+    )
+    actual = _read_asyncpg_passfile_password(
+        passfile, ["h1", "h2"], [5432, 5433], "db", user
+    )
+
+    assert actual == expected
 
 
 def test_empty_options_neutralizes_libpq_only_pgoptions(tmp_path):
@@ -1935,13 +2239,12 @@ def test_neutralizer_unknown_to_linked_libpq_is_not_emitted(monkeypatch, tmp_pat
     assert "sslcertmode" not in parse_dsn(effective)
 
 
-def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
+def test_asyncpg_environment_option_unknown_to_linked_libpq_fails_closed(
     monkeypatch,
     tmp_path,
 ):
     import psycopg2
     from psycopg2.extensions import make_dsn as real_make_dsn
-    from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
@@ -1951,23 +2254,21 @@ def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
         return real_make_dsn(dsn, **kwargs)
 
     monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_newer_option)
-    effective = _doctor_postgres_dsn(
-        "postgresql://u@h/db",
-        {"PGSSLNEGOTIATION": "direct"},
-        tmp_path,
-    )
+    with pytest.raises(ValueError, match="sslnegotiation"):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db",
+            {"PGSSLNEGOTIATION": "direct"},
+            tmp_path,
+        )
 
-    assert "sslnegotiation" not in parse_dsn(effective)
 
-
-def test_asyncpg_query_option_unknown_to_linked_libpq_is_not_emitted(
+def test_asyncpg_query_option_unknown_to_linked_libpq_fails_closed(
     monkeypatch,
     tmp_path,
 ):
-    """A newer URI option is capability-checked before TLS normalization."""
+    """A stated runtime constraint must never disappear on older libpq."""
     import psycopg2
     from psycopg2.extensions import make_dsn as real_make_dsn
-    from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
@@ -1977,15 +2278,58 @@ def test_asyncpg_query_option_unknown_to_linked_libpq_is_not_emitted(
         return real_make_dsn(dsn, **kwargs)
 
     monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_newer_option)
-    effective = _doctor_postgres_dsn(
-        "postgresql://u@h/db?sslnegotiation=direct",
-        {},
-        tmp_path,
-    )
-    parsed = parse_dsn(effective)
+    with pytest.raises(ValueError, match="sslnegotiation"):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslnegotiation=direct",
+            {},
+            tmp_path,
+        )
 
-    assert parsed["sslmode"] == "prefer"
-    assert "sslnegotiation" not in parsed
+
+def test_unsupported_secret_connection_option_fails_without_leaking(
+    monkeypatch, tmp_path
+):
+    import psycopg2
+    from psycopg2.extensions import make_dsn as real_make_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    def reject_sslpassword(dsn=None, **kwargs):
+        if "sslpassword" in kwargs:
+            raise psycopg2.ProgrammingError("unsupported by this libpq")
+        return real_make_dsn(dsn, **kwargs)
+
+    monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_sslpassword)
+    with pytest.raises(ValueError, match="sslpassword") as exc_info:
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslpassword=super-secret",
+            {},
+            tmp_path,
+        )
+
+    assert "super-secret" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "option_name"),
+    [
+        ("PGSSLMODE", "sslmode"),
+        ("PGSSLNEGOTIATION", "sslnegotiation"),
+        ("PGTARGETSESSIONATTRS", "target_session_attrs"),
+        ("PGGSSLIB", "gsslib"),
+    ],
+)
+def test_empty_enum_environment_option_is_rejected_like_asyncpg(
+    tmp_path, env_name, option_name
+):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match=option_name):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db",
+            {env_name: ""},
+            tmp_path,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2132,6 +2476,49 @@ def test_libpq_only_query_names_remain_asyncpg_server_settings(
 @pytest.mark.parametrize(
     "query",
     [
+        "bad%3Dname=translated-secret",
+        "%00name=translated-secret",
+        "=translated-secret",
+    ],
+    ids=("equals", "nul", "empty"),
+)
+def test_unrepresentable_startup_setting_names_fail_closed(query, tmp_path):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match="startup setting name") as exc_info:
+        _doctor_postgres_dsn(f"postgresql://u@h/db?{query}", {}, tmp_path)
+
+    assert "translated-secret" not in str(exc_info.value)
+
+
+def test_equals_in_startup_setting_value_is_preserved(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    effective = _doctor_postgres_dsn(
+        "postgresql://u@h/db?search_path=tenant%3Dblue",
+        {},
+        tmp_path,
+    )
+
+    assert parse_dsn(effective)["options"] == "-c search_path=tenant=blue"
+
+
+def test_nul_in_startup_setting_value_fails_closed(tmp_path):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match="startup setting value"):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?search_path=tenant%00hidden",
+            {},
+            tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
         "options=-c%20statement_timeout%3D1000&search_path=tenant",
         "search_path=tenant&options=-c%20statement_timeout%3D1000",
     ],
@@ -2152,6 +2539,18 @@ def test_asyncpg_options_precede_direct_startup_settings(query, tmp_path):
     assert parse_dsn(effective)["options"] == (
         "-c statement_timeout=1000 -c search_path=tenant"
     )
+
+
+def test_odd_trailing_options_backslash_cannot_consume_direct_setting(tmp_path):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match="cannot be combined losslessly"):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?options=-c%20work_mem%3D4MB%5C"
+            "&search_path=tenant",
+            {},
+            tmp_path,
+        )
 
 
 def test_a_folded_environment_password_stays_inside_error_redaction(tmp_path):
@@ -2177,6 +2576,108 @@ def test_a_folded_environment_password_stays_inside_error_redaction(tmp_path):
     )
     assert "project-password" not in redacted
     assert effective not in redacted
+
+
+def test_bounded_dsn_redacts_password_and_sslpassword(tmp_path):
+    """Libpq can echo decoded secrets from its reserialized bounded DSN."""
+    from kestrel_sovereign.doctor import (
+        _bounded_dsn,
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
+
+    effective = _doctor_postgres_dsn(
+        "postgresql://project_user@db.internal/kestrel"
+        "?password=database-secret&sslpassword=private-key-secret",
+        {},
+        tmp_path,
+    )
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
+    )
+    bounded = _bounded_dsn(effective)
+
+    redacted = _safe(
+        "connection rejected sslpassword=private-key-secret "
+        f"password=database-secret dsn={bounded}",
+        source,
+    )
+
+    assert "database-secret" not in redacted
+    assert "private-key-secret" not in redacted
+    assert "sslpassword=<redacted>" in redacted
+
+
+def test_bounded_conninfo_escaped_secret_forms_are_redacted(tmp_path):
+    from urllib.parse import quote
+
+    from kestrel_sovereign.doctor import (
+        _bounded_dsn,
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
+
+    password = "database-leak'with\\escapes"
+    sslpassword = "private-key-leak'with\\escapes"
+    effective = _doctor_postgres_dsn(
+        "postgresql://project_user@db.internal/kestrel?password="
+        + quote(password, safe="")
+        + "&sslpassword="
+        + quote(sslpassword, safe=""),
+        {},
+        tmp_path,
+    )
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
+    )
+
+    redacted = _safe(f"connection failed: {_bounded_dsn(effective)}", source)
+
+    assert "database-leak" not in redacted
+    assert "private-key-leak" not in redacted
+
+
+def test_malformed_uri_redacts_encoded_and_decoded_password(tmp_path):
+    from kestrel_sovereign.doctor import _GovernanceSource, _safe
+
+    dsn = "postgresql://user:encoded%20secret@[bad/db"
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=dsn
+    )
+
+    redacted = _safe(
+        "invalid URI password=encoded%20secret decoded=encoded secret",
+        source,
+    )
+
+    assert "encoded%20secret" not in redacted
+    assert "encoded secret" not in redacted
+
+
+def test_multi_host_failure_redacts_the_individual_failed_host(tmp_path):
+    from kestrel_sovereign.doctor import (
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
+
+    effective = _doctor_postgres_dsn(
+        "postgresql://runtime_user@first.internal,second.internal/db",
+        {"PGPASSWORD": "secret"},
+        tmp_path,
+    )
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
+    )
+
+    redacted = _safe(
+        'could not translate host name "second.internal" to address', source
+    )
+
+    assert "second.internal" not in redacted
+    assert "<host>" in redacted
 
 
 def test_resolved_connection_file_paths_stay_inside_error_redaction(tmp_path):
@@ -2423,15 +2924,19 @@ def test_diagnose_resolves_connection_files_from_project_not_invocation_cwd(
         + "KESTREL_DATABASE_URL=postgresql://u@db.internal/kestrel\n"
         + "PGPASSFILE=secrets/runtime.pgpass\n"
     )
+    passfile = tmp_path / "secrets" / "runtime.pgpass"
+    passfile.parent.mkdir()
+    passfile.write_text("db.internal:5432:kestrel:u:relative-secret\n")
+    passfile.chmod(0o600)
     invocation_dir = tmp_path / "nested" / "invocation"
     invocation_dir.mkdir(parents=True)
     monkeypatch.chdir(invocation_dir)
 
     diagnose(tmp_path)
 
-    assert parse_dsn(fake.dsn)["passfile"] == str(
-        (tmp_path / "secrets/runtime.pgpass").resolve()
-    )
+    parsed = parse_dsn(fake.dsn)
+    assert parsed["password"] == "relative-secret"
+    _assert_absent_doctor_passfile(parsed["passfile"], tmp_path)
 
 
 def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(

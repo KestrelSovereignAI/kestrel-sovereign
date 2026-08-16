@@ -39,6 +39,7 @@ from __future__ import annotations
 import getpass
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -641,11 +642,10 @@ def _libpq_accepts_dsn_option(name: str, value: str) -> bool:
     """Whether the psycopg2-linked libpq can express one DSN option.
 
     The project can run against a system libpq older than the environment
-    variable being neutralised. Such a libpq neither reads that variable nor
-    accepts its newer connection parameter, so omitting the parameter is the
-    faithful and connectable result. An unavailable or incomplete psycopg2 is
-    also a negative capability result; a diagnostic helper must not turn that
-    into an uncaught import error before the normal connection path reports it.
+    variable or runtime option being translated. Callers distinguish a safe
+    omission (a libpq-only variable that this older libpq also cannot read)
+    from an asyncpg runtime constraint, which must fail closed. An unavailable
+    or incomplete psycopg2 is likewise a negative capability result.
     """
     try:
         from psycopg2 import extensions as _pg_ext
@@ -654,6 +654,17 @@ def _libpq_accepts_dsn_option(name: str, value: str) -> bool:
     except Exception:  # noqa: BLE001 — an unusable libpq cannot express it
         return False
     return True
+
+
+def _require_libpq_dsn_option(name: str, value: str) -> None:
+    """Fail when doctor cannot preserve one effective runtime constraint."""
+    if not _libpq_accepts_dsn_option(name, value):
+        # Values can be credentials (``password`` / ``sslpassword``), so the
+        # diagnostic deliberately identifies only the unsupported field.
+        raise ValueError(
+            "installed PostgreSQL diagnostic driver cannot represent "
+            f"runtime connection option {name!r}"
+        )
 
 
 def _authority_fields(netloc: str) -> tuple[str, str, str]:
@@ -742,10 +753,11 @@ def _parse_asyncpg_hostlist(
 
 def _resolve_asyncpg_hosts(
     authority_hostspec: str, query: dict[str, str], env: dict
-) -> tuple[list[str], list[int]]:
+) -> tuple[list[str], list[int], list[str]]:
     """Resolve asyncpg's effective ordered hosts and per-host ports."""
     hosts: list[str] | None = None
     ports: list[int] | None = None
+    auth_hosts: list[str] | None = None
 
     if authority_hostspec:
         hosts, ports = _parse_asyncpg_hostlist(
@@ -771,6 +783,10 @@ def _resolve_asyncpg_hosts(
             )
 
     if not hosts:
+        # asyncpg uses only ``localhost`` to select a default passfile entry,
+        # even though it subsequently attempts every platform socket before
+        # localhost. Keep that distinct authentication host list intact.
+        auth_hosts = ["localhost"]
         hosts = (
             ["localhost"]
             if sys.platform == "win32"
@@ -787,7 +803,7 @@ def _resolve_asyncpg_hosts(
         ports = _asyncpg_default_ports(hosts, env)
     else:
         ports = _validate_asyncpg_ports(hosts, [int(port) for port in ports])
-    return hosts, ports
+    return hosts, ports, auth_hosts or hosts
 
 
 def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
@@ -809,6 +825,20 @@ def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
 
 def _libpq_option_fragment(name: str, value: str) -> str:
     """Encode one startup setting for libpq's command-line-style options."""
+    # ``-c name=value`` has no escaping for its first equals delimiter. A NUL
+    # cannot cross libpq's C-string boundary either. Reject these shapes
+    # instead of probing a different setting from the one asyncpg will send in
+    # its startup packet.
+    if not name or "=" in name or "\x00" in name:
+        raise ValueError(
+            "runtime PostgreSQL startup setting name cannot be represented "
+            "by the diagnostic driver"
+        )
+    if "\x00" in value:
+        raise ValueError(
+            "runtime PostgreSQL startup setting value cannot be represented "
+            "by the diagnostic driver"
+        )
     # libpq passes ``options`` through PostgreSQL's command-line splitter.
     # Backslash is its escape character. PostgreSQL splits on every whitespace
     # character, so escape tabs and newlines as well as ordinary spaces.
@@ -889,6 +919,36 @@ def _normalize_asyncpg_direct_tls(query: dict[str, str]) -> None:
         query["sslmode"] = "require"
 
 
+def _validate_asyncpg_connection_options(query: dict[str, str]) -> None:
+    """Reject enum spellings asyncpg refuses before opening a socket."""
+    allowed_values = {
+        "sslmode": {
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        },
+        "sslnegotiation": {"postgres", "direct"},
+        "target_session_attrs": {
+            "any",
+            "primary",
+            "standby",
+            "prefer-standby",
+            "read-write",
+            "read-only",
+        },
+        "gsslib": {"gssapi", "sspi"},
+    }
+    for name, allowed in allowed_values.items():
+        if name in query and query[name] not in allowed:
+            raise ValueError(
+                f"runtime PostgreSQL {name} connection option is not valid "
+                "for asyncpg"
+            )
+
+
 _ASYNCPG_CONNECTION_FILE_OPTIONS = frozenset(
     {"passfile", "sslrootcert", "sslcrl", "sslkey", "sslcert"}
 )
@@ -904,6 +964,150 @@ def _resolve_connection_file_paths(query: dict[str, str], project_dir: Path) -> 
             if not path.is_absolute():
                 path = (working_dir / path).resolve()
             query[name] = str(path)
+
+
+def _read_asyncpg_passfile_password(
+    passfile: Path,
+    hosts: list[str],
+    ports: list[int],
+    database: str,
+    user: str,
+) -> str | None:
+    """Select a passfile password with asyncpg 0.30's ordered-host rules."""
+    try:
+        if not passfile.is_file():
+            return None
+        if os.name != "nt" and passfile.stat().st_mode & 0o077:
+            return None
+        # Text-mode universal-newline handling matches asyncpg's file iterator;
+        # splitting only on the translated newline avoids treating vertical
+        # tabs and other Unicode line separators as record boundaries.
+        lines = passfile.read_text().split("\n")
+    except OSError:
+        return None
+
+    entries: list[tuple[str, ...]] = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Match asyncpg's parser exactly: protect escaped backslashes while
+        # splitting on unescaped colons, then restore them afterward.
+        protected = line.replace(r"\\", "\n")
+        entries.append(
+            tuple(
+                field.replace("\n", r"\\")
+                for field in re.split(r"(?<!\\):", protected, maxsplit=4)
+            )
+        )
+
+    for host, port in zip(hosts, ports):
+        auth_host = "localhost" if host.startswith("/") else host
+        for entry in entries:
+            if len(entry) != 5:
+                raise ValueError("runtime PostgreSQL passfile is malformed")
+            phost, pport, pdatabase, puser, password = entry
+            if phost not in {"*", auth_host}:
+                continue
+            if pport not in {"*", str(port)}:
+                continue
+            if pdatabase not in {"*", database}:
+                continue
+            if puser not in {"*", user}:
+                continue
+            return password
+    return None
+
+
+def _fold_asyncpg_passfile(
+    parts,
+    query: dict[str, str],
+    hosts: list[str],
+    ports: list[int],
+    auth_hosts: list[str],
+    env: dict,
+    project_dir: Path,
+) -> None:
+    """Freeze asyncpg's passfile behavior into explicit libpq parameters.
+
+    Asyncpg scans the ordered hosts once, selects the first matching passfile
+    password, and reuses it for every connection attempt. Libpq consults the
+    passfile again for each attempted host. Folding asyncpg's selection into
+    an explicit password prevents doctor from authenticating as a different
+    effective client after the first host fails.
+    """
+    authority_user, authority_password, _ = _authority_fields(parts.netloc)
+    if authority_password:
+        return
+    if "password" in query:
+        if query["password"] == "":
+            query["passfile"] = _absent_passfile_path(project_dir)
+        return
+    if query.get("passfile") == "":
+        query["passfile"] = _absent_passfile_path(project_dir)
+        return
+
+    user = unquote(authority_user) if authority_user else query["user"]
+    if parts.path:
+        database_path = (
+            parts.path[1:] if parts.path.startswith("/") else parts.path
+        )
+        database = unquote(database_path)
+    else:
+        database = query["dbname"]
+
+    if "passfile" in query:
+        # An explicitly empty PGPASSFILE becomes ``Path('')`` in asyncpg and
+        # therefore does not fall through to the default file.
+        passfile = Path(query["passfile"]) if query["passfile"] else None
+    elif sys.platform == "win32":
+        # Asyncpg uses Windows' roaming AppData known folder rather than HOME.
+        from asyncpg import compat as _asyncpg_compat
+
+        home = _asyncpg_compat.get_pg_home_directory()
+        passfile = home / "pgpass.conf" if home is not None else None
+    else:
+        try:
+            # The agent process receives ``env`` wholesale. Path.home() reads
+            # its HOME, including a project-.env override, before consulting
+            # the OS account database.
+            home = Path(env["HOME"] or "/") if "HOME" in env else Path.home()
+        except (RuntimeError, KeyError):
+            home = None
+        if home is not None and not home.is_absolute():
+            home = project_dir.resolve() / home
+        passfile = home / ".pgpass" if home is not None else None
+
+    password = (
+        _read_asyncpg_passfile_password(
+            passfile, auth_hosts, ports, database, user
+        )
+        if passfile is not None
+        else None
+    )
+    if password is not None:
+        query["password"] = password
+
+    # With no match asyncpg attempts passwordless authentication; it does not
+    # fall through to another passfile. A path beneath a directory verified
+    # absent suppresses libpq's lookup silently. ``os.devnull`` is not a
+    # regular file, so libpq warns once per attempted host when used as a
+    # passfile sentinel.
+    query["passfile"] = _absent_passfile_path(project_dir)
+
+
+def _absent_passfile_path(project_dir: Path) -> str:
+    """Return a stable path libpq can stat as absent without warning."""
+    root = project_dir.resolve()
+    suffix = 0
+    while True:
+        name = ".kestrel-doctor-no-passfile"
+        if suffix:
+            name = f"{name}-{suffix}"
+        absent_directory = root / name
+        if not absent_directory.exists():
+            return str(absent_directory / "pgpass")
+        suffix += 1
 
 
 def _doctor_postgres_dsn(
@@ -931,17 +1135,14 @@ def _doctor_postgres_dsn(
         ) from exc
 
     stated = _dsn_stated_options(parts, raw_query)
-    # asyncpg can understand connection options newer than the libpq linked
-    # into psycopg2. Keep only options this diagnostic driver can express,
-    # before any cross-driver normalization depends on their presence.
+    # Keep asyncpg's classification intact through precedence resolution and
+    # cross-driver normalization. Capability validation happens only after the
+    # final effective option set exists; an explicit constraint must never be
+    # silently deleted merely because the linked libpq predates it.
     query = {
         name: value
         for name, value in raw_query.items()
         if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS
-        and _libpq_accepts_dsn_option(
-            "dbname" if name == "database" else name,
-            value,
-        )
     }
 
     # asyncpg accepts ``database`` as an alias; libpq accepts ``dbname``.
@@ -956,7 +1157,9 @@ def _doctor_postgres_dsn(
         query["dbname"] = query.pop("database")
 
     user, password, hostspec = _authority_fields(parts.netloc)
-    hosts, ports = _resolve_asyncpg_hosts(hostspec, raw_query, env)
+    hosts, ports, auth_hosts = _resolve_asyncpg_hosts(
+        hostspec, raw_query, env
+    )
     query["host"] = ",".join(hosts)
     query["port"] = ",".join(str(port) for port in ports)
     if user:
@@ -969,7 +1172,6 @@ def _doctor_postgres_dsn(
         if (
             value is not None
             and dsn_name not in stated
-            and _libpq_accepts_dsn_option(dsn_name, value)
         ):
             query[dsn_name] = value
 
@@ -980,6 +1182,7 @@ def _doctor_postgres_dsn(
     has_libpq_service = "PGSERVICE" in env
     _state_asyncpg_connection_defaults(parts, query, hosts, user, env)
     _normalize_asyncpg_direct_tls(query)
+    _validate_asyncpg_connection_options(query)
 
     for env_name, dsn_name, asyncpg_default in _LIBPQ_ONLY_ENV_DSN_DEFAULTS:
         should_neutralize = env_name in env or has_libpq_service
@@ -989,15 +1192,33 @@ def _doctor_postgres_dsn(
             query[dsn_name] = asyncpg_default
 
     _resolve_connection_file_paths(query, project_dir)
+    _fold_asyncpg_passfile(
+        parts, query, hosts, ports, auth_hosts, env, project_dir
+    )
+
+    for name, value in query.items():
+        _require_libpq_dsn_option(name, value)
 
     # These are server settings under asyncpg even when libpq happens to have
     # a connection parameter with the same name. PostgreSQL processes the raw
     # ``options`` field before direct startup settings regardless of URI order,
     # so put it first and append every other setting through ``-c name=value``.
     option_fragments = [raw_query["options"]] if "options" in raw_query else []
-    for name, value in raw_query.items():
-        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS or name == "options":
-            continue
+    direct_settings = [
+        (name, value)
+        for name, value in raw_query.items()
+        if name not in _ASYNCPG_CONNECTION_QUERY_OPTIONS and name != "options"
+    ]
+    if option_fragments and direct_settings:
+        trailing_backslashes = len(option_fragments[0]) - len(
+            option_fragments[0].rstrip("\\")
+        )
+        if trailing_backslashes % 2:
+            raise ValueError(
+                "runtime PostgreSQL options value cannot be combined "
+                "losslessly with direct startup settings"
+            )
+    for name, value in direct_settings:
         option_fragments.append(_libpq_option_fragment(name, value))
     # State this unconditionally. ``options=`` is a valid explicit empty value
     # and prevents ambient PGOPTIONS from changing doctor's schema or startup
@@ -1081,17 +1302,43 @@ def _dsn_secrets(dsn: str) -> tuple:
     try:
         from psycopg2.extensions import parse_dsn
 
-        password = parse_dsn(dsn).get("password")
-        if password:
-            secrets.add(password)
+        parsed = parse_dsn(dsn)
+        for field in ("password", "sslpassword"):
+            value = parsed.get(field)
+            if value:
+                secrets.add(value)
     except Exception:  # noqa: BLE001 — an unparseable DSN is why we are here
+        pass
+
+    # A bounded DSN is reserialized by libpq and is no longer byte-identical to
+    # ``source.dsn``. Collect query credentials independently so their decoded
+    # forms remain redacted even when libpq echoes only ``field=value``.
+    try:
+        for field, value in parse_qsl(
+            urlsplit(dsn).query, strict_parsing=True
+        ):
+            if field in {"password", "sslpassword"} and value:
+                secrets.add(value)
+    except (TypeError, ValueError):
         pass
 
     # ``parse_dsn`` raises on exactly the malformed URIs that leak, so fall
     # back to the URI's own shape: everything between "://user:" and the "@".
     match = re.search(r"://[^:/?#]*:([^@/?#]+)@", dsn)
     if match:
-        secrets.add(match.group(1))
+        encoded_password = match.group(1)
+        secrets.add(encoded_password)
+        secrets.add(unquote(encoded_password))
+
+    # ``_bounded_dsn`` reserializes a URI as libpq conninfo. In that spelling
+    # apostrophes and backslashes gain a backslash, and whitespace-bearing
+    # values are quoted. Redact both the logical value and the exact escaped
+    # token a bounded-driver diagnostic can echo.
+    for secret in tuple(secrets):
+        conninfo_secret = re.sub(r"([\\'])", r"\\\1", secret)
+        if any(character.isspace() for character in conninfo_secret):
+            conninfo_secret = f"'{conninfo_secret}'"
+        secrets.add(conninfo_secret)
 
     return tuple(sorted(secrets, key=len, reverse=True))
 
@@ -1134,11 +1381,15 @@ def _dsn_identity(dsn: str) -> tuple:
     except Exception:  # noqa: BLE001 — unparseable; the whole-DSN replace stands
         return ()
 
-    found = [
-        (field, parsed[field])
-        for field in _DSN_IDENTITY_FIELDS
-        if isinstance(parsed.get(field), str) and len(parsed[field]) > 2
-    ]
+    found = []
+    for field in _DSN_IDENTITY_FIELDS:
+        value = parsed.get(field)
+        if not isinstance(value, str):
+            continue
+        values = value.split(",") if field == "host" else [value]
+        found.extend(
+            (field, member) for member in values if len(member) > 2
+        )
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
