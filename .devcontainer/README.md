@@ -8,7 +8,7 @@ The dev container provides a complete development environment with:
 
 ### Services
 - **Python 3.11** development environment
-- **PostgreSQL 15** with pgvector extension (port 5433)
+- **PostgreSQL 16** with pgvector extension (port 5433)
 - **Redis 7** for caching and sessions (port 6380)
 - **Ollama** (optional - for local LLM, requires GPU)
 
@@ -126,12 +126,51 @@ These volumes persist across container rebuilds:
 - `kestrel-venv`: Python virtual environment
 - `kestrel-agent-data`: Agent databases and files
 - `kestrel-logs`: Application logs
-- `postgres-data`: PostgreSQL database
+- `postgres16-data`: PostgreSQL database
 - `redis-data`: Redis cache
 
-To reset everything:
+Those are the names *inside* the compose file. Docker prefixes a named volume
+with the Compose project, so what `docker volume ls` shows is
+`devcontainer_postgres16-data` — and under VS Code the prefix is derived from
+your workspace path, so it is not the same string on two machines. Reset
+through Compose, which knows its own prefix, rather than by typing the names:
+
 ```bash
-docker volume rm kestrel-venv kestrel-agent-data kestrel-logs postgres-data redis-data
+# ⚠️ DELETES DATA — removes the containers and every volume declared above
+docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v
+```
+
+### Upgrading from the PostgreSQL 15 devcontainer
+
+The database volume is versioned with the server major (`postgres16-data`),
+because a PostgreSQL data directory cannot be read by a different major — the
+server refuses to start with *"database files are incompatible with server"*.
+A container rebuild does not remove a named volume, so if `pg16` were pointed
+at the old `postgres-data` it would fail its healthcheck forever and `app`,
+which waits on that health, would never come up.
+
+Nothing is deleted for you. On the first rebuild after the bump, `pg16`
+initializes an empty `postgres16-data` and the old `postgres-data` volume stays
+on disk. `down -v` will not collect it either — Compose only removes volumes the
+*current* file declares, and nothing declares `postgres-data` any more. That is
+the point: the cluster survives the bump. Devcontainer databases are normally
+disposable, so most people can just drop it by its full name:
+
+```bash
+docker volume ls | grep postgres-data       # find your project's prefix
+docker volume rm <project>_postgres-data
+```
+
+If you do need something out of it, dump it with a **15** server before
+removing it, then load the dump into the running devcontainer:
+
+```bash
+docker run --rm -v <project>_postgres-data:/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=kestrel_password -e PGDATA=/var/lib/postgresql/data/pgdata \
+  -d --name kestrel-pg15-dump pgvector/pgvector:pg15
+docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql
+docker rm -f kestrel-pg15-dump
+docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
 ```
 
 ## Port Forwarding
