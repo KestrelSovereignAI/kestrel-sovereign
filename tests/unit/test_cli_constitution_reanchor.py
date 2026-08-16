@@ -1004,3 +1004,25 @@ def test_guard_reports_which_source_holds_the_database(reanchor_env):
     agent_pid = reanchor_env / "agent_data" / "Test" / "agent.pid"
     agent_pid.write_text(str(os.getpid()))
     assert _agent_db_holder(reanchor_env, "Test", cfg) == "agent"
+
+
+def test_a_stale_agent_pid_does_not_mask_a_live_host(reanchor_env):
+    """A crashed standalone agent's corpse must not vouch for an empty database.
+
+    Absent and stale per-agent PIDs mean the same thing — no per-agent process
+    holds this database — so both must fall through to the host probe. Reading
+    a stale file as proof of "nothing holds it" reintroduces #2920 exactly: the
+    agent crashed, the fleet is now run in-process, and the dead agent.pid
+    masks the live host that really does hold the file.
+    """
+    from kestrel_sovereign.cli import _agent_db_holder
+
+    cfg = _Cfg("agent_data/Test")
+    # A PID that is certainly not running: claim one, then let it be reaped.
+    dead_pid = 2**22  # far above any live pid on a normal host
+    (reanchor_env / "agent_data" / "Test" / "agent.pid").write_text(str(dead_pid))
+    logs = reanchor_env / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / ".host.pid").write_text(str(os.getpid()))
+
+    assert _agent_db_holder(reanchor_env, "Test", cfg) == "host"

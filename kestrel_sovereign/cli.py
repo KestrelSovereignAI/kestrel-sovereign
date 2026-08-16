@@ -1361,12 +1361,17 @@ def _agent_db_holder(project_dir, agent_name, agent_cfg):
     try:
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
         pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
-        if pid is not None:
-            return "agent" if ProcessManager.is_process_running(pid) else None
+        if pid is not None and ProcessManager.is_process_running(pid):
+            return "agent"
 
-        # No per-agent PID file: fall through to the in-process host. The host
-        # owns every agent in ``multi_agent.toml``, so a live host means this
-        # agent's database may be open even though nothing names the agent.
+        # An ABSENT per-agent PID and a STALE one mean the same thing here — no
+        # per-agent process holds this database — so both fall through to the
+        # host probe. Short-circuiting on a stale file would reintroduce the
+        # whole bug: a standalone agent that crashed leaves a dead agent.pid,
+        # and if the fleet is later run in-process that corpse would mask the
+        # live host. The host owns every agent in ``multi_agent.toml``, so a
+        # live host means this database may be open even though nothing names
+        # the agent.
         from kestrel_sovereign.cli_lifecycle import _host_pid_path
 
         host_pid = ProcessManager.read_pid(_host_pid_path(project_dir))
