@@ -172,34 +172,24 @@ docker volume ls | grep postgres-data       # find your project's prefix
 docker volume rm <project>_postgres-data
 ```
 
-If you do need something out of it, dump it with a **15** server before
-removing it, then load the dump into the running devcontainer:
+If you do need something out of it, that is a manual database task and this
+README deliberately does not hand you a one-shot recipe for it. Two facts are
+what you actually need:
 
-```bash
-docker run --rm -v <project>_postgres-data:/var/lib/postgresql/data \
-  -e POSTGRES_PASSWORD=kestrel_password -e PGDATA=/var/lib/postgresql/data/pgdata \
-  -d --name kestrel-pg15-dump pgvector/pgvector:pg15
+- **A data directory is only readable by the major that wrote it.** Mount
+  `<project>_postgres-data` into a **PostgreSQL 15** server to read it at all.
+- **A `pg_dumpall` cluster dump is the wrong shape for this target.** The
+  devcontainer's `pg16` is already initialized with the `kestrel_user` role and
+  the `kestrel` database, so a cluster dump necessarily replays
+  role/database creation on top of them. `psql` does not stop on those errors
+  and still exits 0, so a restore can report success having applied only part
+  of the dump. Dump the specific databases you want with `pg_dump` and restore
+  them deliberately, with `ON_ERROR_STOP=1`.
 
-# WAIT. `docker run -d` returns as soon as the container is created, not when
-# the server accepts connections — and an old cluster may still be replaying
-# WAL. Dumping into that gap does not error loudly; it writes an EMPTY
-# pg15-dump.sql, and the `docker rm -f` below then throws away the only
-# server that could have read the volume.
-until docker exec kestrel-pg15-dump pg_isready -U kestrel_user -q; do sleep 1; done
-
-# Gate everything downstream on pg_dumpall's EXIT STATUS, not on what landed
-# in the file. pg_dumpall writes its "PostgreSQL database cluster dump" header
-# before it streams any data, so a run that dies partway — corrupt relation,
-# read error, full disk — leaves a file that looks well-formed and is
-# truncated. Only the exit status separates "started" from "finished".
-if docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql; then
-  docker rm -f kestrel-pg15-dump
-  docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
-else
-  echo "pg_dumpall FAILED — pg15-dump.sql is incomplete."
-  echo "Keep <project>_postgres-data and the kestrel-pg15-dump container."
-fi
-```
+Write any dump **outside this repository**. The repo root is a Docker build
+context and several deployment Dockerfiles use `COPY . .`, so a cluster dump
+left here can be committed or baked into a published image — it contains
+conversation data and role password hashes.
 
 ## Port Forwarding
 
