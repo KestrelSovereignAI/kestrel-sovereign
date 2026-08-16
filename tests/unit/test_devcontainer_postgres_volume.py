@@ -146,10 +146,16 @@ DOCS = [
     Path("docs/development/DEVCONTAINER_QUICKSTART.md"),
 ]
 
-#: How the reset has to be spelled. Compose is the only party that knows the
-#: project prefix, so the command has to go through it AND name this file.
+#: How the reset has to be spelled. Compose does NOT rediscover the project
+#: name — invoked by hand it derives one from the compose file's own directory
+#: (``devcontainer``), while VS Code launches the stack under a
+#: workspace-derived name. So the reset must pass ``-p`` with the project read
+#: off the running container's ``com.docker.compose.project`` label; a bare
+#: ``down -v`` targets ``devcontainer_*`` and removes nothing, or removes some
+#: other project's volumes.
 RESET_COMMAND = (
-    "docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v"
+    'docker compose -p "$project" '
+    "-f .devcontainer/docker-compose.devcontainer.yml down -v"
 )
 
 

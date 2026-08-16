@@ -51,7 +51,7 @@ services:
       # across one. PostgreSQL refuses to start on a cluster initialized by a
       # different major ("database files are incompatible with server"), and a
       # container rebuild does not remove a named volume — so pointing pg16 at
-      # the pg15 `postgres16-data` would wedge every existing devcontainer:
+      # the pg15 `postgres-data` would wedge every existing devcontainer:
       # postgres never becomes healthy, and `app` waits on that health forever.
       # A new name lets pg16 initdb fresh while the pg15 volume stays on disk,
       # so nothing is destroyed and the old data can still be dumped. Bump this

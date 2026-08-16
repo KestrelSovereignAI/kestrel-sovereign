@@ -245,17 +245,29 @@ Just close VS Code. The container keeps running in the background.
 
 ### Remove Everything
 ```bash
+# The project name VS Code launched the stack under. Compose does NOT
+# rediscover it — by hand it derives one from the compose file's directory.
+project=$(docker inspect kestrel-dev-postgres \
+  --format '{{index .Config.Labels "com.docker.compose.project"}}')
+
 # Stop and remove containers, keeping the data
-docker compose -f .devcontainer/docker-compose.devcontainer.yml down
+docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down
 
 # ...or take the volumes with them (⚠️ DELETES DATA)
-docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v
+docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down -v
 ```
 
 > Passing `docker volume rm` the names from the compose file does **not** work:
 > Docker prefixes them with the Compose project, so the live cluster is
-> `devcontainer_postgres16-data` — and VS Code derives that prefix from your
-> workspace path, so it differs per machine. `down -v` looks it up for you.
+> `<project>_postgres16-data` — and VS Code derives that prefix from your
+> workspace path, so it differs per machine.
+>
+> Nor does a bare `down -v` look it up for you. Invoked by hand, Compose uses
+> the compose file's own directory (`devcontainer`) as the project, so without
+> `-p` it targets `devcontainer_*`: nothing is removed, or another project's
+> volumes are. Read the real name off the running container, as above. If the
+> stack is not running there is no label to read — find the volumes with
+> `docker volume ls | grep postgres16-data` and remove them by full name.
 
 > Upgrading a devcontainer built before the PostgreSQL 16 bump? The database
 > volume is versioned with the server major, so `pg16` starts on a fresh

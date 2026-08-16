@@ -131,14 +131,25 @@ These volumes persist across container rebuilds:
 
 Those are the names *inside* the compose file. Docker prefixes a named volume
 with the Compose project, so what `docker volume ls` shows is
-`devcontainer_postgres16-data` — and under VS Code the prefix is derived from
-your workspace path, so it is not the same string on two machines. Reset
-through Compose, which knows its own prefix, rather than by typing the names:
+`<project>_postgres16-data` — and under VS Code the prefix is derived from your
+workspace path, so it is not the same string on two machines.
+
+Compose does **not** rediscover that name for you. Invoked by hand it derives
+the project from this file's own directory (`devcontainer`), so a bare
+`docker compose … down -v` targets `devcontainer_*` — which under VS Code
+removes nothing, or removes some *other* project's volumes if one happens to be
+named `devcontainer`. Read the real project off the running container instead:
 
 ```bash
 # ⚠️ DELETES DATA — removes the containers and every volume declared above
-docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v
+project=$(docker inspect kestrel-dev-postgres \
+  --format '{{index .Config.Labels "com.docker.compose.project"}}')
+docker compose -p "$project" -f .devcontainer/docker-compose.devcontainer.yml down -v
 ```
+
+If the stack is not running there is no label to read, and no prefix to
+recover: find the volumes with `docker volume ls | grep postgres16-data` and
+remove them by their full names.
 
 ### Upgrading from the PostgreSQL 15 devcontainer
 
