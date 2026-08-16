@@ -1219,6 +1219,77 @@ async def test_volatile_reanchor_superseded_receipt_refused_by_wrapper(tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", VOLATILE_MODES)
+async def test_volatile_agent_write_carries_reanchor_history_along(tmp_path, mode):
+    """``constitution_reanchor_history`` is carried along, never freshly written.
+
+    #2963 archives each superseded reanchor receipt here. The key has to be a
+    canonical governance field for one reason that is easy to miss: the allowed
+    key set IS the validator map's keys, so an agent that accumulated history in
+    a persistent stint would fail closed on its NEXT ordinary volatile
+    agent-node write — one that changes nothing about the history at all.
+
+    The other half is the boundary itself: appending to that history is a fresh
+    free-text change and stays refused, exactly as the superseded genesis
+    receipt above. Admitting the key must not admit new content through it.
+    """
+    prior_receipt = {
+        "timestamp": "2026-04-05T00:00:00Z",
+        "old_hash": VALID_HASH,
+        "new_hash": VALID_HASH2,
+        "path": "/prior/KESTREL_CONSTITUTION.md",
+        "authorization": "prior_admin",
+    }
+    history = [{
+        "receipt": prior_receipt,
+        "superseded_at": "2026-04-06T00:00:00Z",
+        "superseded_by_constitution_hash": VALID_HASH2,
+        "provenance": "runtime:constitution_reanchor",
+    }]
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
+        await raw.add_node(GraphNode(
+            node_id=AGENT_ID, node_type="agent", label="Kestrel",
+            properties={
+                "constitution_hash": VALID_HASH, "created_at": _now_iso(),
+                "name": "Kestrel",
+                "constitution_reanchor_history": history,
+            },
+        ))
+        wrapper = PrivacyEnforcingStorage(raw, mode)
+
+        # Unchanged carry-along: admitted, so a prior stint's history does not
+        # brick ordinary volatile writes.
+        stored = await raw.get_node(AGENT_ID)
+        carried = dict(stored.properties)
+        carried["bootstrap_state"] = "complete"
+        await wrapper.add_node(
+            GraphNode(node_id=AGENT_ID, node_type="agent", label="Kestrel",
+                      properties=carried),
+            capability=CAP,
+        )
+        after = await raw.get_node(AGENT_ID)
+        assert after.properties["constitution_reanchor_history"] == history
+
+        # Appending a new entry is fresh free-text: refused, and nothing lands.
+        appended = dict(after.properties)
+        appended["constitution_reanchor_history"] = history + [{
+            "receipt": {"new_hash": VALID_HASH, "path": "/next.md"},
+            "superseded_at": "2026-04-07T00:00:00Z",
+            "superseded_by_constitution_hash": VALID_HASH,
+            "provenance": "runtime:constitution_reanchor",
+        }]
+        with pytest.raises(PrivacyViolationError):
+            await wrapper.add_node(
+                GraphNode(node_id=AGENT_ID, node_type="agent", label="Kestrel",
+                          properties=appended),
+                capability=CAP,
+            )
+        unchanged = await raw.get_node(AGENT_ID)
+        assert unchanged.properties["constitution_reanchor_history"] == history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", VOLATILE_MODES)
 async def test_governed_by_edge_allowed_end_to_end(tmp_path, mode):
     """The structural `governed_by` binding still writes in a volatile mode — what
     lets the startup constitution audit bind a born-volatile agent."""

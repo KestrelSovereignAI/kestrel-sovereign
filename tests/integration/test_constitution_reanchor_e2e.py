@@ -168,6 +168,24 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
         did_document=_ROOT_DID_DOCUMENT,
     )
 
+    # Give the agent a prior anchoring's receipt, so the reanchor below is a
+    # SUPERSEDING one. #2963's regression — the writer assigning where it
+    # documented appending — is invisible on a first reanchor, because there is
+    # nothing yet to destroy. The runtime writer has its own coverage in
+    # tests/unit/test_reanchor_constitution.py; this pins the setup writer.
+    prior_receipt = {
+        "timestamp": "2026-04-05T00:00:00Z",
+        "old_hash": "0" * 64,
+        "new_hash": v1_hash,
+        "source_path": str(constitution_path),
+        "authorization": "prior-integration-test",
+        "signed_artifact_hash": "1" * 64,
+    }
+    async with AsyncStorage(str(db_path)) as seed_storage:
+        seed_agent = await seed_storage.graph.get_node(agent_did)
+        seed_agent.properties["constitution_reanchor"] = prior_receipt
+        await seed_storage.graph.add_node(seed_agent)
+
     # ---- 4. Reanchor with force ----
     result = await reanchor_constitution(
         agent_name="TestAgent",
@@ -213,6 +231,12 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     assert post["genesis_audit_history"][-1]["receipt"][
         "constitution_hash"
     ] == v1_hash
+    # The receipt this reanchor replaced is retained verbatim (#2963).
+    reanchor_history = post["agent_properties"]["constitution_reanchor_history"]
+    assert len(reanchor_history) == 1
+    assert reanchor_history[0]["receipt"] == prior_receipt
+    assert reanchor_history[0]["superseded_by_constitution_hash"] == v2_hash
+    assert reanchor_history[0]["provenance"] == "setup:constitution_reanchor"
 
     # 2. governed_by edge: now points at v2 only.
     assert v2_hash in post["governed_by_targets"]

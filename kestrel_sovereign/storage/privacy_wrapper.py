@@ -1078,6 +1078,17 @@ _STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
             "genesis_audit_history": _is_governance_receipt,
             "emancipation_contract": _is_governance_receipt,
             "constitution_reanchor": _is_governance_receipt,
+            # ``supersede_constitution_reanchor`` archives the receipt each
+            # reanchor replaces here (#2963), exactly as ``supersede_genesis_audit``
+            # archives to ``genesis_audit_history`` above. The reanchor write
+            # itself does not ride this wrapper in a volatile mode — a CHANGED
+            # receipt is refused there and the ceremony uses the raw store (see
+            # ``test_volatile_reanchor_superseded_receipt_refused_by_wrapper``).
+            # It must still be a canonical key: the allowed key set IS this map's
+            # keys, so an agent that accumulated history during a persistent
+            # stint would otherwise fail closed on its next ordinary volatile
+            # agent-node write, carrying the property along unchanged.
+            "constitution_reanchor_history": _is_governance_receipt,
             "doctrine_bundle_hash": _is_hex_hash_or_none,
             "doctrine_bundle_files": _is_path_list_or_none,
             "doctrine_bundle_anchored_at": _is_iso_timestamp_or_none,
@@ -1121,6 +1132,7 @@ _STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
             "genesis_audit_history",
             "emancipation_contract",
             "constitution_reanchor",
+            "constitution_reanchor_history",
             "doctrine_bundle_reanchor",
         }),
         # label = the agent's own name, or ``f"Agent {did}"`` — identity.
