@@ -204,6 +204,91 @@ async def test_runtime_report_distinguishes_missing_zero_and_system_disabled(tmp
 
 
 @pytest.mark.asyncio
+async def test_enabled_schedules_without_valid_next_run_are_not_runnable(tmp_path):
+    db = await _database(tmp_path / "scheduler-non-runnable.db")
+    agent = SimpleNamespace(
+        did="agent-1",
+        agent_id="agent-1",
+        storage=SimpleNamespace(db=db),
+        signal_registry=None,
+        wait_registry=None,
+        features={},
+    )
+    feature = SchedulerFeature(agent)
+    try:
+        await feature.initialize()
+        agent.features["SchedulerFeature"] = feature
+        now = await scheduler_database_clock(db)
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version)
+            VALUES ('invalid-cron-resume', 'agent-1', 'wait_reconcile',
+                    'not a cron', '{}', 0, NULL, ?, ?)
+            """,
+            (now.isoformat(), SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        resumed = await feature.schedule_resume("invalid-cron-resume")
+        assert resumed.status.value == "partial"
+        assert resumed.data["next_run_at"] is None
+        assert await db.fetchone(
+            "SELECT enabled, next_run_at FROM scheduled_tasks WHERE id = ?",
+            ("invalid-cron-resume",),
+        ) == (1, None)
+
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version)
+            VALUES ('malformed-legacy-time', 'agent-1', 'wait_reconcile',
+                    '* * * * *', '{}', 1, 'not-a-timestamp', ?, ?)
+            """,
+            (now.isoformat(), SCHEDULER_PROTOCOL_VERSION),
+        )
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=feature._runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=now.isoformat(),
+            last_tick_completed_at=now.isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=30,
+            expected_owner_id=feature._runner._owner_id,
+        )
+        assert status["configured_enabled_count"] == 2
+        assert status["enabled_count"] == 0
+        assert status["non_runnable_count"] == 2
+        assert status["non_runnable_reasons"] == {
+            "missing_next_run_at": 1,
+            "invalid_next_run_at": 1,
+        }
+        assert status["reported_configured_enabled_count"] == 2
+        assert status["reported_enabled_count"] == 0
+        assert status["next_run_at"] is None
+        assert status["state"] == "non_runnable_schedules"
+        assert status["status"] == "fail"
+
+        health = await check_scheduler_liveness(agent, db)
+        assert health["status"] == "fail"
+        assert health["details"]["state"] == "non_runnable_schedules"
+        assert "without a valid next_run_at" in health["message"]
+    finally:
+        await feature.shutdown()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_multi_owner_health_uses_fresh_healthy_worker_without_peer_flap(
     tmp_path,
 ):
@@ -1101,6 +1186,77 @@ async def test_blocked_tick_fails_closed_and_recovers_after_completion(
         assert runner.worker_available is True
     finally:
         release_tick.set()
+        await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_database_clock_stall_is_covered_by_tick_watchdog(
+    monkeypatch,
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-clock-stall.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="clock-stall",
+        poll_interval=0.01,
+    )
+    runner._tick_in_progress_limit_seconds = 0.05
+    clock_read_started = asyncio.Event()
+    release_clock = asyncio.Event()
+    clock_reads = 0
+
+    async def block_first_tick_clock(clock_db):
+        nonlocal clock_reads
+        clock_reads += 1
+        if clock_reads == 1:
+            return await scheduler_database_clock(clock_db)
+        clock_read_started.set()
+        await release_clock.wait()
+        return await scheduler_database_clock(clock_db)
+
+    async def wait_for_worker_state(expected):
+        while True:
+            row = await db.fetchone(
+                "SELECT worker_state FROM scheduler_runtime_status "
+                "WHERE agent_id = ? AND owner_id = ?",
+                ("agent-1", runner._owner_id),
+            )
+            if row == (expected,):
+                return
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner.scheduler_database_clock",
+        block_first_tick_clock,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    try:
+        await runner.start()
+        await asyncio.wait_for(clock_read_started.wait(), timeout=2)
+        await asyncio.wait_for(wait_for_worker_state("stalled"), timeout=2)
+
+        assert runner._last_tick_started_at is None
+        assert runner._tick_started_monotonic is not None
+        assert runner.tick_stalled is True
+        assert runner.worker_available is False
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=1,
+            expected_owner_id=runner._owner_id,
+        )
+        assert status["worker_state"] == "stalled"
+        assert status["state"] == "tick_stalled"
+        assert status["status"] == "fail"
+    finally:
+        release_clock.set()
         await runner.stop()
         await db.close()
 

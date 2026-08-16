@@ -1351,9 +1351,10 @@ class SchedulerRunner:
 
     async def _loop(self):
         while self._running:
-            self._last_tick_started_at = (
-                await scheduler_database_clock(self._db)
-            ).isoformat()
+            # Arm the local watchdog before any tick I/O. In particular, the
+            # PostgreSQL clock read can block independently of telemetry; if it
+            # does, the heartbeat must report a stalled tick rather than keep
+            # publishing the prior healthy running state indefinitely.
             self._tick_started_monotonic = time.monotonic()
             self._runtime_worker_state = "running"
             self._runtime_status_wake.set()
@@ -1361,6 +1362,9 @@ class SchedulerRunner:
             # Infrastructure failures escape to the supervisor, which reports
             # and replaces this worker instead of letting it vanish.
             try:
+                self._last_tick_started_at = (
+                    await scheduler_database_clock(self._db)
+                ).isoformat()
                 await self._tick()
                 self._last_tick_completed_at = (
                     await scheduler_database_clock(self._db)

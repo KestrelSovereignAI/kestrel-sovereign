@@ -125,11 +125,14 @@ exclusive table lock is taken only for the legacy single-key migration and has
 a five-second lock timeout. The report contains worker state, tick timestamps,
 restart/failure counts, and
 exact runnable, executing, configured-enabled, paused, protocol-fenced, and
-scheduler-disabled counts. Consequently, these states remain distinct:
+scheduler-disabled counts. Enabled rows whose `next_run_at` is missing or
+unparseable remain in the configured inventory but are counted as non-runnable
+and fail health. Consequently, these states remain distinct:
 
 - no runtime report was received;
 - a current worker explicitly reports zero schedule rows;
 - schedules exist but were deliberately paused by an operator;
+- schedules are enabled but cannot run because `next_run_at` is invalid;
 - an occurrence is executing under a current claim lease;
 - schedules are temporarily fenced by scheduler protocol; and
 - scheduler safety policy disabled one or more schedules.
@@ -145,7 +148,9 @@ but that exemption expires after the telemetry threshold plus one claim lease.
 An unfinished tick past that same bound is explicitly `tick_stalled` and fails
 both public worker availability and detailed scheduler health even when the
 queue contains zero schedules; a tick that later completes recovers those live
-signals. A tick with a live claimed execution reports `executing` instead: its
+signals. The monotonic watchdog is armed before the tick's first database-clock
+read, so that read cannot hang while independent telemetry stays healthy. A
+tick with a live claimed execution reports `executing` instead: its
 lease-renewal contract remains the liveness evidence for intentionally long
 target work, while unrelated overdue rows still fail once the bounded
 in-progress exemption expires. With heterogeneous

@@ -538,6 +538,11 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             "Scheduler has unclaimed work overdue by "
             f"{status['overdue_seconds']}s"
         )
+    elif state == "non_runnable_schedules":
+        message = (
+            f"Scheduler has {status['non_runnable_count']} enabled schedule(s) "
+            "without a valid next_run_at"
+        )
     elif state == "system_disabled_schedules":
         message = (
             f"Scheduler worker is current; {status['system_disabled_count']} "

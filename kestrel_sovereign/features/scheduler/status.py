@@ -342,11 +342,13 @@ def _inventory_from_rows(
     configured_enabled_count = 0
     enabled_count = 0
     executing_count = 0
+    non_runnable_count = 0
     disabled_count = 0
     fenced_count = 0
     system_disabled_count = 0
     terminal_count = 0
     disabled_reasons: Dict[str, int] = {}
+    non_runnable_reasons: Dict[str, int] = {}
     next_runs: list[datetime] = []
     overdue_candidates: list[datetime] = []
     overdue_entries: list[tuple[datetime, datetime]] = []
@@ -365,7 +367,18 @@ def _inventory_from_rows(
         state = disablement["state"]
         if state in {"enabled", "executing"}:
             configured_enabled_count += 1
-        if state == "enabled":
+        next_at = _parse_utc(row[1])
+        if state == "enabled" and next_at is None:
+            non_runnable_count += 1
+            reason = (
+                "missing_next_run_at"
+                if row[1] is None or not str(row[1]).strip()
+                else "invalid_next_run_at"
+            )
+            non_runnable_reasons[reason] = (
+                non_runnable_reasons.get(reason, 0) + 1
+            )
+        elif state == "enabled":
             enabled_count += 1
         elif state == "executing":
             executing_count += 1
@@ -380,7 +393,6 @@ def _inventory_from_rows(
             if disablement["source"] != "operator":
                 system_disabled_count += 1
 
-        next_at = _parse_utc(row[1])
         if disablement["state"] == "enabled" and next_at is not None:
             next_runs.append(next_at)
             overdue_candidates.append(next_at)
@@ -410,11 +422,13 @@ def _inventory_from_rows(
         "configured_enabled_count": configured_enabled_count,
         "enabled_count": enabled_count,
         "executing_count": executing_count,
+        "non_runnable_count": non_runnable_count,
         "disabled_count": disabled_count,
         "fenced_count": fenced_count,
         "system_disabled_count": system_disabled_count,
         "terminal_count": terminal_count,
         "disabled_reasons": disabled_reasons,
+        "non_runnable_reasons": non_runnable_reasons,
         "next_run_at": min(next_runs).isoformat() if next_runs else None,
         "oldest_unclaimed_run_at": (
             min(overdue_candidates).isoformat() if overdue_candidates else None
@@ -940,6 +954,10 @@ async def scheduler_status(
         details["overdue_seconds"] = round(
             (database_now - oldest).total_seconds(), 3
         )
+        details["status"] = "fail"
+        return details
+    if inventory["non_runnable_count"]:
+        details["state"] = "non_runnable_schedules"
         details["status"] = "fail"
         return details
     if inventory["system_disabled_count"]:
