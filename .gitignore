@@ -222,3 +222,4 @@ site.staging/
 # data and role password hashes.
 *-dump.sql
 *.dump
+*.sql.gz
