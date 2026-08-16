@@ -29,16 +29,16 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
-import toml
 from cryptography.fernet import Fernet
 
-from kestrel_sovereign.doctor import diagnose
+from kestrel_sovereign.doctor import _LIBPQ_ONLY_ENV_DSN_DEFAULTS, diagnose
 from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
     LocalAgentConfig,
-    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import write_env
@@ -381,13 +381,38 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     runtime_db(
         AGENT_DID, {"name": "Test", "constitution_hash": stale}, governed_by=stale
     )
-    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
-    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    from psycopg2.extensions import parse_dsn
+
+    parsed = parse_dsn(runtime_db.dsn)
+    pg_env_names = {
+        "host": "PGHOST",
+        "port": "PGPORT",
+        "user": "PGUSER",
+        "password": "PGPASSWORD",
+        "sslmode": "PGSSLMODE",
+        "sslrootcert": "PGSSLROOTCERT",
+    }
+    connection_env = {
+        env_name: parsed[dsn_name]
+        for dsn_name, env_name in pg_env_names.items()
+        if parsed.get(dsn_name) is not None
+    }
+    for name in (
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+        *connection_env,
+    ):
+        monkeypatch.delenv(name, raising=False)
     write_env(
         tmp_path / ".env",
         {
             "KESTREL_DB_BACKEND": "postgres",
-            "KESTREL_DATABASE_URL": runtime_db.dsn,
+            # Only the database remains in the URI. Host, account, password,
+            # and TLS data live exclusively in the project .env's PG* keys.
+            "KESTREL_DATABASE_URL": (
+                "postgresql:///" + quote(parsed["dbname"], safe="")
+            ),
+            **connection_env,
         },
     )
 
@@ -399,6 +424,264 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     assert "KESTREL_DB_BACKEND" not in os.environ, (
         "a diagnostic must not export the project's environment"
     )
+    assert all(name not in os.environ for name in connection_env)
+
+
+def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """A valid runtime server setting must be applied, never stripped.
+
+    "Connectable" here means the raw asyncpg pool; the SQLAlchemy seam's DSN
+    query handling requires a separate runtime fix outside #2932.
+
+    The governance tables exist only in the tenant schema, so reading public
+    would produce a different verdict rather than merely exercising URI
+    parsing.
+    """
+    import psycopg2
+    from psycopg2 import sql
+
+    stale = hashlib.sha256(b"tenant schema was not read").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    schema = f"doctor_{uuid.uuid4().hex[:12]}"
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
+            )
+            for table in (
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
+                "schema_backfills",
+            ):
+                cursor.execute(
+                    sql.SQL("ALTER TABLE {} SET SCHEMA {}").format(
+                        sql.Identifier(table), sql.Identifier(schema)
+                    )
+                )
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        runtime_db.dsn + "?search_path=" + quote(schema, safe=""),
+    )
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any(
+        "constitution anchored to current file" in message
+        for message in report.ok
+    ), report.ok
+
+
+def test_libpq_only_pgoptions_cannot_change_doctors_schema(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor ignores the same ambient PGOPTIONS that asyncpg ignores.
+
+    The leaked schema deliberately carries stale governance. If the translated
+    DSN stops stating ``options=``, libpq inherits PGOPTIONS, reads that stale
+    tenant, and this test reports drift instead of passing vacuously.
+    """
+    import psycopg2
+    from psycopg2 import sql
+
+    stale = hashlib.sha256(b"ambient PGOPTIONS changed the schema").hexdigest()
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    schema = f"leaked_{uuid.uuid4().hex[:12]}"
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
+            )
+            for table in (
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
+                "schema_backfills",
+            ):
+                cursor.execute(
+                    sql.SQL("CREATE TABLE {}.{} (LIKE {} INCLUDING ALL)").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table),
+                        sql.Identifier(table),
+                    )
+                )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_nodes "
+                    "(node_id, node_type, label, properties) "
+                    "VALUES (%s, 'agent', 'Test', %s)"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, json.dumps({"constitution_hash": stale})),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_node_owners (node_id, agent_id) "
+                    "VALUES (%s, %s)"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, AGENT_DID),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_edges "
+                    "(source_id, target_id, label) "
+                    "VALUES (%s, %s, 'governed_by')"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, stale),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_edge_owners "
+                    "(source_id, target_id, label, agent_id) "
+                    "VALUES (%s, %s, 'governed_by', %s)"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, stale, AGENT_DID),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.schema_backfills (name) "
+                    "VALUES ('ownership_2649')"
+                ).format(sql.Identifier(schema))
+            )
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+    monkeypatch.setenv("PGOPTIONS", f"-c search_path={schema}")
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any(
+        "constitution anchored to current file" in message
+        for message in report.ok
+    ), report.ok
+
+
+def test_libpq_service_recipe_cannot_redirect_doctor(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """A libpq recipe must not redirect doctor away from asyncpg's database."""
+    stale = hashlib.sha256(b"libpq service selected the anchor").hexdigest()
+    _seed_project(tmp_path, anchored_hash=stale)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+    service_file = tmp_path / "pg_service.conf"
+    service_file.write_text(
+        "[libpq_only_recipe]\n"
+        "host=127.0.0.1\n"
+        "port=1\n"
+        "dbname=not_the_runtime_database\n"
+    )
+    # This context must close before ``runtime_db`` tears down: its finalizer
+    # also connects through libpq and must not inherit the deliberately
+    # divergent recipe used only for this diagnostic.
+    with pytest.MonkeyPatch.context() as service_env:
+        service_env.setenv("PGSERVICE", "libpq_only_recipe")
+        service_env.setenv("PGSERVICEFILE", str(service_file))
+        report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any(
+        "constitution anchored to current file" in message
+        for message in report.ok
+    ), report.ok
+
+
+def test_all_libpq_only_environment_defaults_remain_connectable(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Every neutralizer in the production table works with real libpq."""
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+
+    # Keep variables that can alter libpq authentication and connection state
+    # out of the runtime database fixture's own teardown connection.
+    with pytest.MonkeyPatch.context() as libpq_only_env:
+        for env_name, _, _ in _LIBPQ_ONLY_ENV_DSN_DEFAULTS:
+            libpq_only_env.setenv(env_name, "libpq-only-value")
+        report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+@pytest.mark.parametrize("query", ["connect_timeout=30", "keepalives=1"])
+def test_libpq_connection_names_rejected_by_runtime_are_not_reported_healthy(
+    tmp_path, monkeypatch, canonical, runtime_db, query
+):
+    """asyncpg sends both names as GUCs, which PostgreSQL rejects."""
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn + "?" + query)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    assert any("governance NOT verified" in message for message in report.fail)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "sslmode=prefer",
+        "options=-c%20statement_timeout%3D5000",
+    ],
+)
+def test_asyncpg_recognized_and_startup_options_remain_connectable(
+    tmp_path, monkeypatch, canonical, runtime_db, query
+):
+    """The two non-GUC query shapes retain their distinct semantics."""
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn + "?" + query)
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
@@ -799,4 +1082,3 @@ async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
 
     assert not result.unchanged, "reported nothing to do for a failing proof 2"
     assert result.drift_unforced, result
-

@@ -36,20 +36,25 @@ This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
-import os
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
-from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
     effective_identity_export_roots,
 )
-from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
+from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
+from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
+    MultiAgentConfig,
+)
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -496,10 +501,23 @@ def _resolve_governance_source(
     if _anchor_is_the_runtime_database(env):
         source = _GovernanceSource(anchor_path=anchor_path, agent_did=agent_did)
     else:
+        runtime_dsn = env["KESTREL_DATABASE_URL"]
+        try:
+            dsn = _doctor_postgres_dsn(runtime_dsn, env)
+        except ValueError as exc:
+            # Bind the raw URI to the same redactor used for driver failures.
+            # The translation error is intentionally generic, but this also
+            # protects future parser messages from echoing URI credentials.
+            unsafe_source = _GovernanceSource(
+                anchor_path=anchor_path,
+                agent_did=agent_did,
+                dsn=runtime_dsn,
+            )
+            return _UnreadableDB(
+                reason=f"cannot read PostgreSQL ({_safe(exc, unsafe_source)})"
+            )
         source = _GovernanceSource(
-            anchor_path=anchor_path,
-            agent_did=agent_did,
-            dsn=env["KESTREL_DATABASE_URL"],
+            anchor_path=anchor_path, agent_did=agent_did, dsn=dsn
         )
     # Keyed on the DSN, or on the anchor path for a SQLite host where each
     # agent genuinely has its own file and its own answer.
@@ -527,6 +545,328 @@ def _resolve_governance_source(
 #: out the OS TCP timeout, minutes of an apparently hung diagnostic. Failing
 #: fast turns that into the ``_UnreadableDB`` finding callers already report.
 _CONNECT_TIMEOUT_SECONDS = 5
+
+
+# Query parameters consumed by asyncpg 0.30's connection parser. Every other
+# parameter is put in ``server_settings`` and sent in PostgreSQL's startup
+# packet. This is intentionally asyncpg's vocabulary, not libpq's: libpq knows
+# names such as ``connect_timeout`` and ``keepalives`` that the runtime sends
+# to PostgreSQL as settings (where PostgreSQL rejects them). Letting libpq
+# consume those names would make doctor report Ready for an agent that cannot
+# connect.
+_ASYNCPG_CONNECTION_QUERY_OPTIONS = frozenset(
+    {
+        "port",
+        "host",
+        "dbname",
+        "database",
+        "user",
+        "password",
+        "passfile",
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslnegotiation",
+        "sslcrl",
+        "sslpassword",
+        "ssl_min_protocol_version",
+        "ssl_max_protocol_version",
+        "target_session_attrs",
+        "krbsrvname",
+        "gsslib",
+    }
+)
+
+
+# Environment variables asyncpg 0.30 actually reads, and the equivalent DSN
+# parameter libpq accepts. Deliberately absent are libpq-only variables such as
+# PGCONNECT_TIMEOUT: inheriting one would give doctor connection semantics the
+# spawned asyncpg process does not have. The diagnostic timeout below also
+# states connect_timeout explicitly, preventing libpq from consulting that
+# process-global default. Libpq-only variables are neutralised separately below
+# so they cannot leak back in from doctor's own process environment.
+_ASYNCPG_ENV_DSN_OPTIONS = (
+    ("PGHOST", "host"),
+    ("PGPORT", "port"),
+    ("PGUSER", "user"),
+    ("PGPASSWORD", "password"),
+    ("PGDATABASE", "dbname"),
+    ("PGPASSFILE", "passfile"),
+    ("PGSSLMODE", "sslmode"),
+    ("PGSSLNEGOTIATION", "sslnegotiation"),
+    ("PGSSLROOTCERT", "sslrootcert"),
+    ("PGSSLCRL", "sslcrl"),
+    ("PGSSLKEY", "sslkey"),
+    ("PGSSLCERT", "sslcert"),
+    ("PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"),
+    ("PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"),
+    ("PGTARGETSESSIONATTRS", "target_session_attrs"),
+    ("PGKRBSRVNAME", "krbsrvname"),
+    ("PGGSSLIB", "gsslib"),
+)
+
+
+# Libpq reads these variables but asyncpg does not. When one is present in the
+# effective spawned-agent environment, explicitly state asyncpg's corresponding
+# behaviour in the translated DSN so libpq cannot inherit a different value
+# from doctor's process environment. Each row is capability-probed against the
+# psycopg2-linked libpq before use: a newer process environment can contain
+# variables that an older linked libpq neither reads nor accepts as parameters.
+_LIBPQ_ONLY_ENV_DSN_DEFAULTS = (
+    ("PGHOSTADDR", "hostaddr", ""),
+    ("PGGSSENCMODE", "gssencmode", "disable"),
+    ("PGCHANNELBINDING", "channel_binding", "disable"),
+    ("PGCLIENTENCODING", "client_encoding", ""),
+    ("PGAPPNAME", "application_name", ""),
+    ("PGSSLCOMPRESSION", "sslcompression", "0"),
+    ("PGSSLCERTMODE", "sslcertmode", "allow"),
+    ("PGSSLCRLDIR", "sslcrldir", ""),
+    ("PGSSLSNI", "sslsni", "1"),
+    ("PGREQUIREPEER", "requirepeer", ""),
+    (
+        "PGREQUIREAUTH",
+        "require_auth",
+        "none,password,md5,scram-sha-256,gss,sspi",
+    ),
+    ("PGGSSDELEGATION", "gssdelegation", "0"),
+    ("PGLOADBALANCEHOSTS", "load_balance_hosts", "disable"),
+)
+
+
+def _libpq_accepts_dsn_option(name: str, value: str) -> bool:
+    """Whether the psycopg2-linked libpq can express one DSN option.
+
+    The project can run against a system libpq older than the environment
+    variable being neutralised. Such a libpq neither reads that variable nor
+    accepts its newer connection parameter, so omitting the parameter is the
+    faithful and connectable result. An unavailable or incomplete psycopg2 is
+    also a negative capability result; a diagnostic helper must not turn that
+    into an uncaught import error before the normal connection path reports it.
+    """
+    try:
+        from psycopg2 import extensions as _pg_ext
+
+        _pg_ext.make_dsn(**{name: value})
+    except Exception:  # noqa: BLE001 — an unusable libpq cannot express it
+        return False
+    return True
+
+
+def _authority_fields(netloc: str) -> tuple[str, str, str]:
+    """Return asyncpg's raw ``(user, password, hostspec)`` URI fields."""
+    if "@" in netloc:
+        auth, _, hostspec = netloc.partition("@")
+        user, _, password = auth.partition(":")
+        return user, password, hostspec
+    return "", "", netloc
+
+
+def _authority_states_port(hostspec: str) -> bool:
+    """Whether an asyncpg URI authority explicitly supplies any port."""
+    for host in hostspec.split(","):
+        if host.startswith("["):
+            close = host.find("]")
+            if close >= 0 and host[close + 1 :].startswith(":"):
+                return True
+        elif ":" in host:
+            return True
+    return False
+
+
+def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
+    """Connection options the runtime URI states before env resolution."""
+    user, password, hostspec = _authority_fields(parts.netloc)
+    stated = set(query).intersection(_ASYNCPG_CONNECTION_QUERY_OPTIONS)
+    if hostspec:
+        stated.add("host")
+        # asyncpg resolves a port while parsing the authority host list (from
+        # an explicit authority port, PGPORT, or 5432). Its later query-port
+        # branch therefore cannot replace that value.
+        stated.discard("port")
+    if _authority_states_port(hostspec):
+        stated.add("port")
+    if user:
+        stated.add("user")
+    if password:
+        stated.add("password")
+    if parts.path:
+        stated.add("dbname")
+    if "database" in stated:
+        stated.add("dbname")
+    return stated
+
+
+def _libpq_option_fragment(name: str, value: str) -> str:
+    """Encode one startup setting for libpq's command-line-style options."""
+    # libpq passes ``options`` through PostgreSQL's command-line splitter.
+    # Backslash is its escape character. PostgreSQL splits on every whitespace
+    # character, so escape tabs and newlines as well as ordinary spaces.
+    setting = f"{name}={value}".replace("\\", "\\\\")
+    setting = "".join(f"\\{char}" if char.isspace() else char for char in setting)
+    return f"-c {setting}"
+
+
+def _state_asyncpg_connection_defaults(
+    parts,
+    query: dict[str, str],
+    hostspec: str,
+    user: str,
+    env: dict,
+) -> None:
+    """State asyncpg's basic defaults for libpq's connection.
+
+    The drivers have different implicit host resolution: asyncpg tries its
+    platform socket list and then localhost, while libpq uses one compiled-in
+    socket directory. Making every database-selecting default explicit keeps
+    doctor on asyncpg's endpoint and also prevents an ambient ``PGSERVICE``
+    recipe from filling a value that asyncpg never reads.
+    """
+    if not hostspec and "host" not in query:
+        query["host"] = (
+            "localhost"
+            if sys.platform == "win32"
+            else "/run/postgresql,/var/run/postgresql,/tmp,/private/tmp,localhost"
+        )
+
+    if "port" not in query and not _authority_states_port(hostspec):
+        query["port"] = "5432"
+
+    effective_user = unquote(user) if user else query.get("user")
+    if not effective_user:
+        effective_user = next(
+            (
+                env[name]
+                for name in ("LOGNAME", "USER", "LNAME", "USERNAME")
+                if env.get(name)
+            ),
+            None,
+        ) or getpass.getuser()
+        query["user"] = effective_user
+
+    if not parts.path and "dbname" not in query:
+        query["dbname"] = effective_user
+
+    if "sslmode" not in query:
+        effective_hosts = unquote(hostspec) if hostspec else query["host"]
+        have_tcp_host = any(
+            not host.startswith("/") for host in effective_hosts.split(",")
+        )
+        query["sslmode"] = "prefer" if have_tcp_host else "disable"
+
+    if _libpq_accepts_dsn_option("target_session_attrs", "any"):
+        query.setdefault("target_session_attrs", "any")
+
+
+def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
+    """Translate asyncpg's effective connection data into a libpq URI.
+
+    ``runtime_dsn`` remains authoritative. Only fields it does not state are
+    filled from the launcher environment, and query options asyncpg treats as
+    server settings are carried through libpq's ``options`` parameter rather
+    than stripped or accidentally reclassified as libpq connection options.
+
+    The return value is the string stored on :class:`_GovernanceSource`, so a
+    password folded in from ``env`` remains inside the redaction boundary used
+    by every driver-error path.
+    """
+    try:
+        parts = urlsplit(runtime_dsn)
+        if parts.scheme not in {"postgres", "postgresql"}:
+            raise ValueError("not an asyncpg PostgreSQL URI")
+        raw_query = dict(parse_qsl(parts.query, strict_parsing=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "runtime PostgreSQL DSN is not valid for asyncpg"
+        ) from exc
+
+    stated = _dsn_stated_options(parts, raw_query)
+    query = {
+        name: value
+        for name, value in raw_query.items()
+        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS
+    }
+
+    # asyncpg accepts ``database`` as an alias; libpq accepts ``dbname``.
+    # A URI path wins over either query spelling in asyncpg, so ignored query
+    # copies are removed instead of being allowed to override the path here.
+    if parts.path:
+        query.pop("dbname", None)
+        query.pop("database", None)
+    elif "dbname" in query:
+        query.pop("database", None)
+    elif "database" in query:
+        query["dbname"] = query.pop("database")
+
+    user, password, hostspec = _authority_fields(parts.netloc)
+    if hostspec:
+        query.pop("host", None)
+        # Like query ``host``, query ``port`` is already too late to replace
+        # an authority host in asyncpg, even when that authority states no
+        # explicit port.
+        query.pop("port", None)
+    if user:
+        query.pop("user", None)
+    if password:
+        query.pop("password", None)
+
+    for env_name, dsn_name in _ASYNCPG_ENV_DSN_OPTIONS:
+        value = env.get(env_name)
+        if (
+            value is not None
+            and dsn_name not in stated
+            and _libpq_accepts_dsn_option(dsn_name, value)
+        ):
+            query[dsn_name] = value
+
+    # State the defaults even without PGSERVICE: asyncpg's host fallback list
+    # differs from libpq's compiled-in socket default. A service-file path
+    # alone remains inert, while an actual service recipe has no unstated
+    # database-selecting value left to fill. This never mutates os.environ.
+    has_libpq_service = "PGSERVICE" in env
+    _state_asyncpg_connection_defaults(parts, query, hostspec, user, env)
+
+    # PGREQUIRESSL is libpq's legacy fallback for an otherwise absent
+    # ``sslmode``. Asyncpg ignores it and defaults TCP connections to
+    # ``prefer``, so explicitly state that default only when the legacy
+    # variable could otherwise steer libpq. An asyncpg-recognised query or
+    # PGSSLMODE value already in ``query`` remains authoritative.
+    if "PGREQUIRESSL" in env:
+        query.setdefault("sslmode", "prefer")
+
+    for env_name, dsn_name, asyncpg_default in _LIBPQ_ONLY_ENV_DSN_DEFAULTS:
+        should_neutralize = env_name in env or has_libpq_service
+        if should_neutralize and _libpq_accepts_dsn_option(
+            dsn_name, asyncpg_default
+        ):
+            query[dsn_name] = asyncpg_default
+
+    # These are server settings under asyncpg even when libpq happens to have
+    # a connection parameter with the same name. ``options`` itself is already
+    # PostgreSQL's startup-options field, so keep its value directly and add
+    # every other setting through ``-c name=value``.
+    option_fragments = []
+    for name, value in raw_query.items():
+        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS:
+            continue
+        if name == "options":
+            option_fragments.append(value)
+        else:
+            option_fragments.append(_libpq_option_fragment(name, value))
+    # State this unconditionally. ``options=`` is a valid explicit empty value
+    # and prevents ambient PGOPTIONS from changing doctor's schema or startup
+    # settings when the spawned asyncpg process would ignore it.
+    query["options"] = " ".join(option_fragments)
+
+    # ``urlencode`` defaults to quote_plus. libpq percent-decodes according to
+    # RFC 3986 and keeps '+' literal, which would turn ``-c search_path=...``
+    # into ``-c+search_path=...``. Use percent-encoded spaces explicitly.
+    encoded_query = urlencode(query, quote_via=quote)
+    # Building this directly preserves the URI's ``//`` marker when it has no
+    # authority (``postgresql:///db``). ``urlunsplit`` normalizes that valid
+    # asyncpg/libpq form to the invalid ``postgresql:/db``.
+    effective = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    return f"{effective}?{encoded_query}" if encoded_query else effective
 
 
 def _safe(exc: object, source: "_GovernanceSource") -> str:
@@ -626,20 +966,18 @@ def _dsn_identity(dsn: str) -> tuple:
 
 
 def _bounded_dsn(dsn: str) -> str:
-    """``dsn`` with a connection timeout, unless it already states one.
+    """Apply doctor's unconditional outage bound to a translated DSN.
 
-    ``psycopg2.connect(dsn, connect_timeout=...)`` merges through
-    ``make_dsn``, where the **keyword wins** over the DSN. Passing the default
-    that way would silently overrule an operator who tuned a slow or distant
-    link, and doctor would then report a reachable database as unreadable —
-    the cry-wolf failure this whole change is about. So the default is applied
-    only where the DSN is silent.
+    PostgreSQL sources reach this function only after asyncpg-style query
+    parameters have been translated. A runtime ``connect_timeout`` query is
+    therefore a server setting in ``options``, never libpq's connection
+    timeout. Stating five seconds here also prevents process-global
+    ``PGCONNECT_TIMEOUT`` from changing the diagnostic independently of the
+    spawned runtime.
     """
     try:
-        from psycopg2.extensions import make_dsn, parse_dsn
+        from psycopg2.extensions import make_dsn
 
-        if "connect_timeout" in parse_dsn(dsn):
-            return dsn
         return make_dsn(dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS)
     except Exception:  # noqa: BLE001 — psycopg2.ProgrammingError on a bad DSN
         # The import is inside the ``try`` on purpose. An unparseable DSN is
