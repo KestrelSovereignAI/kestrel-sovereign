@@ -17,6 +17,16 @@ node_modules/
 *.capsule
 agent_data/
 
+# Database dumps. This list gates what `gcloud builds submit .` UPLOADS to
+# Cloud Build source storage, and it is consulted before Docker ever reads
+# .dockerignore — so excluding a dump from the image is not enough on this
+# path, the bytes are already in GCS. Kept identical to the dump patterns in
+# .gitignore and .dockerignore; tests/unit/test_dump_exclusion_parity.py fails
+# if the three drift apart.
+*.dump
+*-dump.sql
+*.sql.gz
+
 # Archive (historical docs, not needed for builds)
 archive/
 
