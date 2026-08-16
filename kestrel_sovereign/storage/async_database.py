@@ -2223,9 +2223,11 @@ class AsyncDatabase:
         :class:`DatabaseBackend` connection.  Keep this phase separately
         callable so shutdown orchestration can bound engine disposal without
         stealing the primary SQLite connection's worker-drain reservation.
-        Keep the cache while a timed-out aiosqlite close retains a live worker
-        on the factory; clearing it then would discard the explicit lifecycle
-        owner. Other bounded failures preserve the existing one-shot behavior.
+        Clearing the cache *before* the await makes a timed-out or abandoned
+        disposal a one-shot attempt: a later backend close must not repeat the
+        same unbounded pre-close work and starve the primary connection.  A
+        factory that explicitly retains a live SQLite worker is re-cached so
+        its lifecycle owner remains reachable for a later close attempt.
         """
         # If the SQLA helper ever cached a session factory on us
         # (``kestrel_sovereign.storage.sqla.make_session_factory``),
@@ -2234,6 +2236,7 @@ class AsyncDatabase:
         # shuts down. The cache is best-effort and may be absent in
         # tests / fresh DBs — guard with ``getattr``.
         sqla_factory = getattr(self, "_sovereign_sqla_factory", None)
+        self._sovereign_sqla_factory = None
         if sqla_factory is not None:
             # The caller owns the ordering between this independent engine and
             # the primary backend.  Do not turn a failed engine close into a
@@ -2247,11 +2250,9 @@ class AsyncDatabase:
                     sqla_factory,
                     "sqlite_connection_retirement_pending",
                     False,
-                ) is not True:
-                    self._sovereign_sqla_factory = None
+                ) is True:
+                    self._sovereign_sqla_factory = sqla_factory
                 raise
-            if getattr(self, "_sovereign_sqla_factory", None) is sqla_factory:
-                self._sovereign_sqla_factory = None
 
     @property
     def minimum_sqla_factory_close_timeout_s(self) -> float:

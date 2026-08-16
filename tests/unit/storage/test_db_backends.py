@@ -646,12 +646,13 @@ class TestSQLiteBackend:
             assert drain is not None
             assert not drain.done()
 
-            # Let the drain consume more than the old one-phase reservation,
-            # then let connection.close() retire the real worker.  No timeout
-            # constants are patched: this verifies the public default budget.
+            # Let the drain consume most of the shared worker window, then let
+            # connection.close() retire the real worker inside the same
+            # absolute deadline. No timeout constants are patched: this
+            # verifies the public default budget.
             loop = asyncio.get_running_loop()
             release_handle = loop.call_later(
-                1.5 * shutdown_window,
+                0.75 * shutdown_window,
                 release_worker.set,
             )
             started = loop.time()
@@ -1065,11 +1066,13 @@ class TestSQLiteBackend:
         release_close = asyncio.Event()
         real_close = sqlite_backend_module._close_aiosqlite_connection
 
-        async def delayed_close(connection, *, retained_closes):
+        async def delayed_close(connection, *, retained_closes, deadline=None):
             close_entered.set()
             await release_close.wait()
             await real_close(
-                connection, retained_closes=retained_closes
+                connection,
+                retained_closes=retained_closes,
+                deadline=deadline,
             )
 
         with patch.object(
@@ -1314,6 +1317,182 @@ class TestSQLiteBackend:
             )
             if backend.is_connected:
                 await backend.close()
+            worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_primary_close_reports_retained_snapshot_worker(
+        self, tmp_path, monkeypatch
+    ):
+        """Primary close cannot report success while an auxiliary worker lives."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.02,
+        )
+        backend = SQLiteBackend(str(tmp_path / "retained-snapshot.db"))
+        await backend.connect()
+        primary = backend._ensure_connected()
+        primary_worker = aiosqlite_worker(primary)
+        snapshot = await backend._open_snapshot_read_connection()
+        snapshot_worker = aiosqlite_worker(snapshot)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        await snapshot.create_function("block_in_worker", 0, block_in_worker)
+        blocked_read = asyncio.create_task(
+            snapshot.execute("SELECT block_in_worker()")
+        )
+        retirement_tasks = []
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+
+            with pytest.raises(
+                ConnectionError, match="connection close did not complete"
+            ):
+                await sqlite_backend_module._close_aiosqlite_connection(
+                    snapshot,
+                    retained_closes=backend._retired_connection_closes,
+                )
+            assert snapshot_worker.is_alive()
+            assert backend.connection_retirement_pending
+            retirement_tasks = [
+                retained.retirement_task
+                for retained in backend._retired_connection_closes.values()
+                if retained.retirement_task is not None
+            ]
+
+            with pytest.raises(
+                ConnectionError, match="worker is still retiring"
+            ):
+                await backend.close()
+            assert not backend.is_connected
+            assert not primary_worker.is_alive()
+            assert snapshot_worker.is_alive()
+            assert backend.connection_retirement_pending
+
+            with pytest.raises(
+                ConnectionError, match="previous connection worker"
+            ):
+                await backend.connect()
+
+            release_worker.set()
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            assert not backend.connection_retirement_pending
+            assert not snapshot_worker.is_alive()
+
+            await backend.connect()
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            await asyncio.gather(blocked_read, return_exceptions=True)
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            if backend.is_connected:
+                await backend.close()
+            primary_worker.join(timeout=1.0)
+            snapshot_worker.join(timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_repeated_close_cancellation_retains_live_worker(
+        self, tmp_path, monkeypatch
+    ):
+        """A second caller cancellation cannot orphan a blocked worker."""
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            0.2,
+        )
+        connection = await aiosqlite.connect(
+            str(tmp_path / "repeated-close-cancellation.db")
+        )
+        worker = aiosqlite_worker(connection)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+        first_wait_started = asyncio.Event()
+        retry_wait_started = asyncio.Event()
+        retained_closes = {}
+        real_wait = asyncio.wait
+        wait_count = 0
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        async def tracked_wait(*args, **kwargs):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                first_wait_started.set()
+            elif wait_count == 2:
+                retry_wait_started.set()
+            return await real_wait(*args, **kwargs)
+
+        await connection.create_function(
+            "block_in_worker", 0, block_in_worker
+        )
+        blocked_read = asyncio.create_task(
+            connection.execute("SELECT block_in_worker()")
+        )
+        retirement_tasks = []
+        close_call = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+
+            with patch.object(
+                sqlite_backend_module.asyncio, "wait", new=tracked_wait
+            ):
+                close_call = asyncio.create_task(
+                    sqlite_backend_module._close_aiosqlite_connection(
+                        connection,
+                        retained_closes=retained_closes,
+                    )
+                )
+                await first_wait_started.wait()
+                close_call.cancel()
+                await retry_wait_started.wait()
+                close_call.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await close_call
+
+            assert worker.is_alive()
+            retained = retained_closes[connection]
+            assert retained.close_task is not None
+            assert retained.retirement_task is not None
+            retirement_tasks = [retained.retirement_task]
+
+            release_worker.set()
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            assert not worker.is_alive()
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            await asyncio.gather(blocked_read, return_exceptions=True)
+            if close_call is not None:
+                await asyncio.gather(close_call, return_exceptions=True)
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            if worker.is_alive():
+                await connection.close()
             worker.join(timeout=1.0)
 
     @pytest.mark.asyncio

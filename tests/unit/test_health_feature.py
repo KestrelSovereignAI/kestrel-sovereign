@@ -41,7 +41,7 @@ from kestrel_sovereign.features.health.feature import (
     _derive_overall_status,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.db import QueryError, SQLiteBackend
+from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db import sqlite as sqlite_backend_module
 
 
@@ -203,11 +203,11 @@ class TestCheckDatabase:
     async def test_fail_when_real_sqlite_cleanup_exceeds_deadline(
         self, tmp_path, monkeypatch
     ):
-        """An expired real worker drain is a critical database failure."""
+        """Health ages a real worker drain without requiring another query."""
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
-            0.02,
+            0.1,
         )
         backend = SQLiteBackend(str(tmp_path / "expired-cleanup.db"))
         await backend.connect()
@@ -236,10 +236,16 @@ class TestCheckDatabase:
             with pytest.raises(asyncio.CancelledError):
                 await blocked_read
 
-            with pytest.raises(QueryError, match="cleanup is still pending"):
-                await backend.fetch_one("SELECT 1")
+            initial = await check_database(db)
+            assert initial["status"] == "warn"
+            assert "cleanup is still pending" in initial["message"]
+
+            async with asyncio.timeout(0.5):
+                while not backend.write_connection_cleanup_deadline_exceeded:
+                    await asyncio.sleep(0.005)
 
             assert backend.write_connection_cleanup_deadline_exceeded is True
+            assert backend._cancelled_write_drain_error is None
             result = await check_database(db)
 
             assert result["status"] == "fail"

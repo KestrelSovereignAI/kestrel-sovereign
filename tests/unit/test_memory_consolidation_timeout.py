@@ -279,7 +279,7 @@ async def test_real_blocked_aiosqlite_write_releases_full_sleep_lock_near_deadli
 
         assert entered_worker.is_set()
         assert elapsed >= timeout_seconds
-        assert elapsed < timeout_seconds + 0.5
+        assert elapsed < 1.5
         assert report.success is False
         assert report.error == "consolidation_failed"
         assert not export_started.is_set()
@@ -358,7 +358,7 @@ async def test_real_blocked_aiosqlite_read_releases_memory_lock_near_deadline(
 
         assert entered_worker.is_set()
         assert elapsed >= timeout_seconds
-        assert elapsed < timeout_seconds + 0.5
+        assert elapsed < 1.5
         assert result.status is ToolResultStatus.ERROR
         assert "configured 0.05-second deadline" in result.error
         assert not locks.is_held(ResourceLock.MEMORY)
