@@ -47,14 +47,23 @@ The default local backend is SQLite. PostgreSQL is supported through the async
 backend layer by setting `KESTREL_DB_BACKEND=postgres` and a PostgreSQL DSN
 through `KESTREL_DATABASE_URL` or explicit configuration.
 
-**PostgreSQL 16 is the floor.** The `conversation_history.session_id` backfill
-(#2958) guards its JSON parse with `metadata IS JSON OBJECT`, which is 16+ and
-is the only in-SQL validity test that returns false for malformed metadata
-instead of raising on it — and a raise inside a startup migration aborts the
-boot rather than skipping a row. On PostgreSQL 15 that statement is a syntax
-error, so an older server fails during schema initialization instead of
-degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16` for the
-same reason.
+**PostgreSQL 16 is the floor** (#2988). The `conversation_history.session_id`
+backfill (#2958) has to *skip* metadata it cannot cast rather than raise on it:
+a raise inside a startup migration rolls back the whole migration, and because
+the schema is the marker, the next boot retries from the same row and fails
+identically. The guard that makes skipping possible is
+`pg_input_is_valid(metadata, 'jsonb')` — 16+, and it answers "would this cast
+succeed?" without performing the cast.
+
+Nothing weaker works, because the documents `jsonb` rejects cannot be
+enumerated from outside the parser. `IS JSON OBJECT` (also 16+) returns *true*
+for both a NUL escape and a lone surrogate, and `::jsonb` then raises on each —
+measured on 16.14. `IS JSON OBJECT` is still in the statement, for the
+different job of proving the document is an object before `json_object_keys` is
+asked about it.
+
+On PostgreSQL 15 the backfill fails during schema initialization rather than
+degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16`.
 
 ## Backend Layer
 
@@ -150,6 +159,19 @@ anything the three readers would spell differently (a non-string JSON value, a
 non-ASCII identifier, a NUL, an id too long for a B-tree entry, or a
 `session_id` key that appears twice in one document) lands as NULL rather than
 as a value one backend agrees with and another does not.
+
+After insertion, `update_message_metadata` is the one door that can rewrite
+`metadata.session_id`, so it moves the column in the same statement. The column
+follows the metadata down to NULL wherever the JSON merge cannot speak for the
+whole document — and both engines have a shape where they decline to merge
+while still reporting success. A metadata root that is not an object (`42`,
+`[]`, `"text"`, JSON `null`) comes back from SQLite's `json_set` with nothing
+added to it, and is *concatenated into an array* rather than merged by
+PostgreSQL's `jsonb ||`; on SQLite a document carrying `session_id` twice keeps
+the second occurrence, which is the one session grouping reads. None of those
+rows ends up carrying the incoming id, so none of them may have it stamped. A
+SQL `NULL` metadata column is not one of these cases — it is an absence, the
+merge's `COALESCE` makes it `{}`, and it stamps normally.
 
 Indexes for these migrations go through `AsyncDatabase.ensure_index`, not a bare
 `CREATE INDEX IF NOT EXISTS`: that spelling is idempotent in sequence but races

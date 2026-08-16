@@ -3415,11 +3415,16 @@ class AsyncConversationStore:
         deletes nothing and the empty update.
 
         The column follows the metadata down to NULL where the merge cannot
-        speak for the whole document: on SQLite a legacy row carrying the key
-        twice stays ambiguous after ``json_set``, and an ambiguous row has no
-        id the column may claim. See
+        speak for the whole document, and "cannot" is wider than it looks. On
+        BOTH backends a metadata root that is not an object — ``42``, ``[]``,
+        ``"text"``, JSON ``null``, all shapes free-text legacy metadata holds —
+        declines the merge while reporting success: SQLite's ``json_set``
+        returns the document unchanged and PostgreSQL's ``||`` concatenates
+        into an array instead of merging. On SQLite a legacy row carrying the
+        key twice additionally stays ambiguous after ``json_set``. None of
+        those rows has an id the column may claim. See
         :func:`~kestrel_sovereign.storage.session_id_column.merged_column_assignment`
-        for why that is dialect-specific and why the metadata is left as it is.
+        for the measurements and why the metadata is left as it is.
 
         Args:
             message_id: The message ID to update

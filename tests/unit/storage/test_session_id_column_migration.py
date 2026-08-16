@@ -446,7 +446,7 @@ async def test_write_path_still_relinks_an_integer_session_id(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("backend_type", "expected"),
+    ("backend_type", "expected", "expected_params"),
     [
         (
             "sqlite",
@@ -454,30 +454,49 @@ async def test_write_path_still_relinks_an_integer_session_id(tmp_path):
                 "json_extract(metadata, '$.session_id')",
                 "json_type(metadata, '$.session_id') = 'text'",
                 "json_valid(metadata) = 1",
+                # SQLite has no cast to fail, so the NUL is excluded by hand:
+                # its length() and GLOB stop at the first one and would measure
+                # a NUL-bearing id as short and in-charset.
+                "instr(metadata, ?) = 0",
             ),
+            ("\\u0000",),
         ),
         (
             "postgres",
             (
                 "metadata::jsonb ->> 'session_id'",
                 "jsonb_typeof(metadata::jsonb -> 'session_id') = 'string'",
+                # Cast safety, and it must be pg_input_is_valid rather than an
+                # enumeration of the documents jsonb rejects: `IS JSON OBJECT`
+                # plus a NUL search passes a lone surrogate, which then raises
+                # on the cast and rolls back the migration.
+                "pg_input_is_valid(metadata, 'jsonb')",
                 "metadata IS JSON OBJECT",
             ),
+            (),
         ),
     ],
 )
-def test_backfill_reads_each_backend_with_its_own_json_dialect(backend_type, expected):
+def test_backfill_reads_each_backend_with_its_own_json_dialect(
+    backend_type, expected, expected_params
+):
     """SQLite's json_extract and Postgres' jsonb operator are not interchangeable.
 
     Postgres cannot run ``json_extract`` at all, so the dialect choice is
     asserted here — the SQLite-only CI leg still proves the Postgres branch was
     written. What the two statements MEAN is settled against real engines in
     ``tests/integration/test_session_id_column_backend_parity.py``.
+
+    The two dialects no longer take the same parameters, and that asymmetry is
+    the point rather than an accident: PostgreSQL asks the parser whether the
+    cast will succeed, so it needs no literal to search for, while SQLite has
+    no cast to ask about and must exclude the NUL escape by hand.
     """
     db = AsyncDatabase(SimpleNamespace(backend_type=backend_type))
     sql, params = db._conversation_session_id_backfill()
 
-    assert params == ("\\u0000",)
+    assert params == expected_params
+    assert sql.count("?") == len(params)
     for fragment in expected:
         assert fragment in sql
     assert sql.startswith("UPDATE conversation_history SET session_id = ")

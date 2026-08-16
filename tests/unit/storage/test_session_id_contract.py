@@ -252,6 +252,11 @@ def test_each_backfill_carries_the_compiled_rule_not_a_hand_copy(backend_type):
     in SQL?"  This answers it mechanically: the character classes, the length
     cap and the NUL escape in the emitted statement are the objects from the
     contract, so editing the contract necessarily edits the SQL.
+
+    The NUL escape is bound on SQLite alone. PostgreSQL does not need it —
+    ``pg_input_is_valid`` declines every document whose cast would raise, that
+    one included — and carrying it anyway would be a conjunct no input can
+    exercise, which reads as protection while defending nothing.
     """
     contract = describe_contract()
     sql, params = backfill_statement(backend_type)
@@ -261,7 +266,12 @@ def test_each_backfill_carries_the_compiled_rule_not_a_hand_copy(backend_type):
         # '*[^...]*'``) where PostgreSQL anchors it (``~ '^[...]+$'``).
         assert f"[{authored}]" in sql or f"[^{authored}]" in sql
     assert str(contract["max_length"]) in sql
-    assert params == (contract["nul_escape"],)
+    if backend_type == "sqlite":
+        assert params == (contract["nul_escape"],)
+    else:
+        assert params == ()
+        assert contract["nul_escape"] not in sql
+    assert sql.count("?") == len(params)
     assert sql.startswith("UPDATE conversation_history SET session_id = CASE WHEN ")
 
 
@@ -280,6 +290,11 @@ def test_the_where_clause_holds_no_expression_that_can_raise(backend_type):
     subquery and brings a ``WHERE`` of its own, so "first" started meaning the
     wrong clause the moment it was added. A test that reads the wrong region
     reports on nothing.
+
+    ``pg_input_is_valid`` is deliberately absent from the list below and is the
+    one JSON-aware function the ``WHERE`` may hold. Its entire purpose is to
+    answer "would this parse?" *without* parsing, so it is the exception that
+    makes the rest of the rule enforceable rather than a hole in it.
     """
     sql, _params = backfill_statement(backend_type)
     assert sql.count(" END WHERE ") == 1, sql
@@ -315,39 +330,75 @@ def test_the_merge_clause_binds_exactly_one_value(backend_type):
     assert clause.count("?") == 1, clause
 
 
-def test_the_sqlite_merge_clause_asks_about_the_column_it_was_given():
+@pytest.mark.parametrize("backend_type", ["sqlite", "postgres"])
+def test_the_merge_clause_asks_about_the_column_it_was_given(backend_type):
     """The guard reads the document being merged, not one named by accident.
 
-    SQLite needs the old document to decide whether the merge can speak for it
-    (``json_set`` cannot collapse a duplicated key), so the clause carries a
-    subquery over the metadata column. Pinned because a hard-coded ``metadata``
-    would keep working for today's only caller and silently read the wrong
-    column for the next one.
+    Both dialects have to inspect the old document to decide whether the merge
+    can speak for it, so both clauses carry the metadata column's name. Pinned
+    because a hard-coded ``metadata`` would keep working for today's only
+    caller and silently read the wrong column for the next one.
     """
-    clause = merged_column_assignment("sqlite", metadata_column="legacy_meta")
-    assert "json_each(COALESCE(legacy_meta, '{}'))" in clause
+    clause = merged_column_assignment(backend_type, metadata_column="legacy_meta")
+    assert "legacy_meta" in clause
     assert "metadata" not in clause
 
 
-def test_the_postgres_merge_clause_is_unconditional_because_jsonb_dedupes():
-    """Not an oversight: the guarded shape would be dead code on this engine.
+@pytest.mark.parametrize("backend_type", ["sqlite", "postgres"])
+def test_both_merge_clauses_refuse_a_root_that_is_not_an_object(backend_type):
+    """Neither engine merges into a scalar, an array or a JSON null.
 
-    ``jsonb`` deduplicates on parse, so the merged value can only carry the key
-    once and it is the incoming one. Asserting the asymmetry keeps a future
-    "make both branches look the same" edit from adding a clause no input can
-    exercise — and from making the SQLite guard look equally optional.
+    SQLite's ``json_set`` returns such a document unchanged and PostgreSQL's
+    ``||`` concatenates it into an array — both report success, neither
+    produces a top-level ``session_id``. An assignment that did not ask would
+    stamp an id no reader of the row can see, which is the one state this
+    column may not occupy. Asserted per dialect here and executed against both
+    engines in the parity suite.
     """
-    assert merged_column_assignment("postgres") == "session_id = ?"
-    assert "CASE" in merged_column_assignment("sqlite")
+    clause = merged_column_assignment(backend_type)
+    type_test = "jsonb_typeof" if backend_type == "postgres" else "json_type"
+    assert f"{type_test}(COALESCE(" in clause
+    assert "= 'object'" in clause
+    assert clause.startswith("session_id = CASE WHEN ")
 
 
-def test_the_postgres_backfill_uses_the_pg16_validity_test():
-    """``IS JSON OBJECT`` is why the Postgres floor is 16.
+def test_only_sqlite_carries_the_duplicate_key_guard():
+    """The asymmetry is real and belongs where it is.
 
-    It is the only in-SQL validity guard that returns false for malformed
-    metadata rather than raising on it. Pinned here so a future edit that drops
-    it has to acknowledge it is also dropping the floor requirement recorded in
-    ``.github/workflows/ci.yml``.
+    ``jsonb`` deduplicates on parse, so a PostgreSQL object merge can only ever
+    leave one ``session_id`` and it is the incoming one; the duplicate guard
+    would be dead code there. ``json_set`` replaces the first occurrence only,
+    so on SQLite it is the difference between NULL and a wrong answer. Pinned
+    so a future "make both branches look the same" edit has to justify moving
+    a guard rather than doing it for symmetry — in either direction.
+    """
+    assert "json_each" in merged_column_assignment("sqlite")
+    assert "< 2" in merged_column_assignment("sqlite")
+    assert "json_object_keys" not in merged_column_assignment("postgres")
+    assert "< 2" not in merged_column_assignment("postgres")
+
+
+def test_the_postgres_backfill_asks_the_parser_rather_than_listing_bad_inputs():
+    """``pg_input_is_valid`` is why the Postgres floor is 16 (#2988).
+
+    Cast safety cannot be enumerated. ``IS JSON OBJECT`` plus a search for the
+    NUL escape was the first attempt, and it let a lone surrogate through —
+    valid JSON text that ``jsonb`` refuses, so the ``SET`` expression raised and
+    rolled back a mandatory migration. Any list of bad inputs is complete only
+    up to the last bug report; ``pg_input_is_valid(metadata, 'jsonb')`` asks the
+    parser the actual question and cannot be behind.
+
+    Both clauses are pinned because they are not the same claim and neither
+    implies the other:
+
+    * ``pg_input_is_valid`` — the cast will not raise.
+    * ``IS JSON OBJECT`` — the document is an object, which ``json_object_keys``
+      in the SET clause requires and which validity does NOT give: ``'"x"'`` and
+      ``'[1]'`` are both valid jsonb and both make it raise.
+
+    Dropping either has to be a deliberate act, including the floor requirement
+    in ``.github/workflows/ci.yml`` that the first clause depends on.
     """
     sql, _params = backfill_statement("postgres")
+    assert "pg_input_is_valid(metadata, 'jsonb')" in sql
     assert "metadata IS JSON OBJECT" in sql

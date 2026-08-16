@@ -37,9 +37,13 @@ languages. Two of the three cannot be asked Python's questions:
   ``{"session_id": true}`` extracts as ``1`` in SQLite, ``'true'`` in Postgres
   and ``'True'`` under Python's ``str()``. Nothing may be filed under an
   identity whose spelling depends on who read it, so only JSON strings qualify.
-* PostgreSQL cannot hold a NUL in ``TEXT`` at all, and ``metadata::jsonb``
-  raises outright on the ``\\u0000`` escape that would produce one — during a
-  migration that is a failed boot, not a bad row.
+* PostgreSQL cannot hold a NUL in ``TEXT`` at all, and its ``jsonb`` rejects a
+  wider set of documents than JSON syntax does: the NUL escape, and any
+  ill-formed UTF-16 escape such as a lone surrogate. ``metadata::jsonb`` raises
+  on those rather than returning a bad value, and inside a mandatory migration
+  a raise is a failed boot, not a skipped row. The backfill therefore asks
+  ``pg_input_is_valid`` whether the cast will succeed instead of listing the
+  documents on which it would not.
 * An oversized id would be accepted by every writer and then fail when the
   composite ``(agent_id, session_id)`` B-tree entry exceeds PostgreSQL's
   ~2704-byte page limit — at index build time, which is again boot.
@@ -85,11 +89,13 @@ SESSION_ID_KEY = "session_id"
 #: function below without the two meaning different things.
 SESSION_ID_MAX_LENGTH = 512
 
-#: The JSON escape a NUL is stored as. Both dialects exclude metadata
-#: containing it by searching the raw text, BEFORE any JSON parse: on Postgres
-#: the parse is the thing that raises, so a guard phrased against the parsed
-#: value would never run. Searching the text also sidesteps SQLite's GLOB and
-#: ``length()``, which are NUL-terminated and cannot see past one.
+#: The JSON escape a NUL is stored as. **SQLite only.** PostgreSQL needs no
+#: such term — ``pg_input_is_valid(metadata, 'jsonb')`` already declines every
+#: document whose cast would raise, this one included — but SQLite parses a NUL
+#: escape happily and then hands the result to ``length()`` and ``GLOB``, which
+#: are NUL-terminated C string functions and cannot see past the first one.
+#: ``"a\\u0000b"`` would measure 1 character and match the charset, so without a
+#: raw-text search SQLite would stamp a value PostgreSQL cannot even store.
 _NUL_ESCAPE = "\\u0000"
 
 
@@ -234,50 +240,78 @@ def merged_column_assignment(
 
     Returned with exactly one ``?`` placeholder, which the caller binds to
     :func:`column_session_id` of the *update* — the merge is last-writer-wins
-    on this key, so on a document that can hold the key only once, what
+    on this key, so on a document the merge can speak for, what
     ``metadata.session_id`` says afterwards is exactly what arrived. Deriving
     from the update rather than re-reading the row is what keeps this a single
     statement, and single is what keeps it safe from the read-modify-write race
     :meth:`AsyncConversationStore.update_message_metadata` exists to avoid.
 
-    "Can hold the key only once" is the part that is not free, and it is the
-    whole reason this is a function rather than a constant string:
+    "A document the merge can speak for" is the part that is not free, and it
+    is the whole reason this is a function rather than a constant string. The
+    stamp is allowed only where the merged row is an OBJECT carrying the key
+    exactly once; anywhere else the column takes NULL, which is the answer
+    :func:`column_session_id` gives the same document and one Phase C already
+    tolerates.
 
-    * **PostgreSQL merges in ``jsonb``**, which deduplicates on parse. Whatever
-      the stored text said, the merged value carries one ``session_id`` and it
-      is the incoming one. The bare assignment is therefore already true, and
-      the merge additionally *repairs* a duplicated legacy document on its way
-      past. Nothing to guard.
-    * **SQLite merges the text as written** with ``json_set``, which replaces
-      only the FIRST occurrence of a duplicated key. Measured on 3.50.4:
-      setting ``session_id`` on ``{"session_id":"a","session_id":"b"}`` yields
+    Both dialects fail that in a shape that is easy to miss, because both keep
+    reporting success while quietly declining to merge:
+
+    * **A non-object root.** ``metadata`` is free text, and legacy rows hold
+      ``42``, ``[]``, ``"text"`` and ``null`` as well as objects. Measured on
+      sqlite 3.50.4, ``json_set('42', '$."session_id"', json('"x"'))`` returns
+      ``42`` — the document's value unchanged (it is reserialized compactly,
+      but nothing is added to it) and no error. Measured on PostgreSQL 16.14,
+      ``'42'::jsonb || '{"session_id":"x"}'::jsonb`` returns
+      ``[42, {"session_id": "x"}]`` — ``||`` promotes a non-object operand to a
+      one-element array and CONCATENATES rather than merging. Neither result
+      carries a top-level ``session_id``, so an unguarded assignment left the
+      column naming a session no reader of that row can see. That is the exact
+      state the column may never occupy, and it was reachable on both engines.
+    * **A duplicated key, on SQLite only.** ``json_set`` replaces only the
+      FIRST occurrence. Measured on 3.50.4: setting ``session_id`` on
+      ``{"session_id":"a","session_id":"b"}`` yields
       ``{"session_id":"<new>","session_id":"b"}`` — ``json_extract`` then reads
       the new value while ``json.loads``, and so session grouping, still reads
-      ``b``. Stamping the incoming value there would put the column in exactly
-      the state it may never occupy: disagreeing with the metadata its reader
-      is grouping by.
+      ``b``. PostgreSQL needs no counterpart: ``jsonb`` deduplicates on parse,
+      so an object merge *repairs* a duplicated legacy document on its way
+      past, leaving one key holding the incoming value.
 
-    So the SQLite clause is conditional, and the condition is asked of the OLD
-    document (every ``SET`` expression sees the pre-update row): a document
-    holding the key at most once can only hold it once after the merge, so the
-    incoming value is what every reader will see. Two or more occurrences and
-    ``json_set`` cannot collapse them, so the row stays ambiguous and the
-    column takes NULL — the same answer :func:`column_session_id` gives that
-    document, and one Phase C already tolerates.
+    Both conditions are asked of the OLD document, because every ``SET``
+    expression sees the pre-update row — and that is not an approximation of
+    the question:
 
-    Collapsing the duplicate instead was the alternative, and it was declined:
-    it would mean rewriting the whole document on every metadata update of any
-    key, changing merge semantics well outside this column's remit for the sake
-    of a legacy shape the reader has to tolerate anyway.
+    * Objectness cannot be created or destroyed by this merge. The single
+      placeholder is bound to ``column_session_id(update)``, which returns
+      non-``NULL`` only for a mapping (or JSON object text) — so whenever there
+      is anything to stamp, the patch is itself an object, and on both dialects
+      merging an object patch leaves an object root an object and a non-object
+      root a non-object. Old-is-object and merged-is-object are the same claim.
+    * A document holding the key at most once can only hold it once after the
+      merge; two or more and ``json_set`` cannot collapse them.
 
-    ``json_each`` raises on malformed metadata — but so does the ``json_set``
-    it rides beside, so this adds no failure mode the statement did not already
-    have.
+    ``COALESCE`` is inside both tests for the same reason it is inside the
+    merge: a SQL ``NULL`` metadata column becomes ``{}``, a genuine object, and
+    such a row must keep stamping normally. A JSON ``null`` is a different
+    thing — it is a value, not an absence, ``COALESCE`` leaves it alone, and it
+    is not an object.
+
+    Collapsing the SQLite duplicate instead was the alternative, and it was
+    declined: it would mean rewriting the whole document on every metadata
+    update of any key, changing merge semantics well outside this column's
+    remit for the sake of a legacy shape the reader has to tolerate anyway.
+
+    ``json_type``/``jsonb_typeof`` and ``json_each`` all raise on malformed
+    metadata — but so do the ``json_set`` and ``::jsonb`` they ride beside, so
+    this adds no failure mode the statement did not already have.
     """
     if backend_type == "postgres":
-        return "session_id = ?"
+        return (
+            "session_id = CASE WHEN jsonb_typeof(COALESCE("
+            f"{metadata_column}::jsonb, '{{}}'::jsonb)) = 'object' THEN ? END"
+        )
     return (
-        "session_id = CASE WHEN (SELECT count(*) FROM "
+        f"session_id = CASE WHEN json_type(COALESCE({metadata_column}, '{{}}')) "
+        "= 'object' AND (SELECT count(*) FROM "
         f"json_each(COALESCE({metadata_column}, '{{}}')) "
         f"WHERE key = '{SESSION_ID_KEY}') < 2 THEN ? END"
     )
@@ -318,26 +352,37 @@ def backfill_statement(backend_type: str) -> Tuple[str, tuple]:
     in both corpora as ``json negative number``.
     """
     if backend_type == "postgres":
-        # ``IS JSON OBJECT`` (PG16+) parses without raising and returns false
-        # for malformed text — the only in-SQL validity guard that does not
-        # itself fail on the input it is meant to reject. It is NOT sufficient
-        # alone: a NUL escape is valid JSON that ``jsonb`` cannot represent,
-        # so it passes IS JSON OBJECT and then raises on the cast. Hence the
-        # second text-level guard.
+        # ``pg_input_is_valid(metadata, 'jsonb')`` (PG16+) answers the only
+        # question the ``SET`` clause below actually needs — *will this text
+        # cast to jsonb?* — and answers it without performing the cast, so it
+        # cannot raise on the input it exists to reject.
         #
-        # ``OBJECT`` tightens that predicate further than extraction strictly
-        # needs — ``jsonb -> 'session_id'`` already yields SQL NULL on a scalar
-        # or array rather than raising — and is kept because it states the
-        # rule's first clause where a reader looks for it, in the conservative
-        # direction. It is a qualifier on a load-bearing test, not a guard of
-        # its own; the SQLite branch below drops the equivalent CASE conjunct
-        # for exactly the opposite reason.
+        # It replaced an ``IS JSON OBJECT`` paired with a text search for
+        # the NUL escape, and that is a change of KIND, not of degree: the
+        # pair ENUMERATED the ways a document can be valid JSON that jsonb
+        # cannot represent, and an enumeration is only ever as complete as
+        # the last bug report. It knew the NUL escape and not the lone
+        # surrogate — ``{"session_id": "\\ud800"}`` passes ``IS JSON OBJECT``
+        # and carries no NUL, and the cast then fails with "Unicode low
+        # surrogate must follow a high surrogate". Inside a mandatory
+        # migration that is a rolled-back boot, forever, because the schema is
+        # the marker and the next boot starts from the same row. Measured on
+        # PostgreSQL 16.14: the old predicate raises on that document, this one
+        # skips it. ``pg_input_is_valid`` covers both, and covers whatever the
+        # next one turns out to be, because it asks the parser instead of
+        # describing it.
+        #
+        # ``IS JSON OBJECT`` stays, and is NOT redundant beside it: validity is
+        # not objectness. ``'"hello"'`` and ``'[1]'`` are both valid jsonb, and
+        # ``json_object_keys`` in the SET clause raises on either. Verified —
+        # ``pg_input_is_valid`` returns true for both.
         #
         # ``json_object_keys`` is asked of ``::json``, not ``::jsonb``: the
         # binary form deduplicates on the way in, so a duplicate key is already
         # gone by the time it could be counted. ``::json`` keeps the document
         # as written. Both casts are safe here — the row reached the SET clause
-        # only by passing the text-level ``WHERE`` above.
+        # only by passing the text-level ``WHERE`` above, and jsonb validity
+        # implies json validity (jsonb is the stricter of the two).
         return (
             "UPDATE conversation_history SET session_id = CASE WHEN "
             f"jsonb_typeof(metadata::jsonb -> '{SESSION_ID_KEY}') = 'string' "
@@ -350,10 +395,10 @@ def backfill_statement(backend_type: str) -> Tuple[str, tuple]:
             f"AND (metadata::jsonb ->> '{SESSION_ID_KEY}') "
             f"!~ '^[{_DIGIT_CLASS}]+$' "
             f"THEN metadata::jsonb ->> '{SESSION_ID_KEY}' END "
-            "WHERE metadata IS JSON OBJECT "
-            "AND position(? in metadata) = 0 "
+            "WHERE pg_input_is_valid(metadata, 'jsonb') "
+            "AND metadata IS JSON OBJECT "
             f"AND position('{SESSION_ID_KEY}' in metadata) > 0",
-            (_NUL_ESCAPE,),
+            (),
         )
     # SQLite's json_extract RAISES on malformed metadata, which inside a
     # migration transaction is a failed boot rather than a skipped row, so
