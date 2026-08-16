@@ -86,10 +86,20 @@ def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
     The capture never derives authority from an arbitrary transport argument,
     logging context, or the agent-global session alone.  It either preserves an
     already-bound live pair (for nested task boundaries) or asks the lifecycle
-    accessor while the calling task owns the live turn.  An out-of-turn or
-    session-less capture is represented explicitly as unbound.
+    accessor while the calling task owns the live turn.  An explicit binding
+    for this agent takes precedence even when it is unbound or stale: callback
+    code must not replace its captured authority with an ambient turn copied
+    into the task that happens to invoke it.  Entering a new turn clears any
+    inherited binding, because the task then owns that turn outright.  An
+    out-of-turn or session-less capture is represented explicitly as unbound.
     """
     live_turn_id = getattr(agent, "_live_turn_id", None)
+    propagated = _BOUND_TURN_SESSION.get()
+    if propagated is not None and propagated.agent is agent:
+        if propagated.turn_id and propagated.turn_id == live_turn_id:
+            return propagated
+        return _TurnSessionBinding(agent, None, None)
+
     turn_id = _CURRENT_TURN_ID.get()
     if turn_id and turn_id == live_turn_id:
         resolve = getattr(agent, "get_turn_bound_session_id", None)
@@ -106,14 +116,6 @@ def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
             agent, turn_id, _normalize_session_id(session_id)
         )
 
-    propagated = _BOUND_TURN_SESSION.get()
-    if (
-        propagated is not None
-        and propagated.agent is agent
-        and propagated.turn_id
-        and propagated.turn_id == live_turn_id
-    ):
-        return propagated
     return _TurnSessionBinding(agent, None, None)
 
 
@@ -201,28 +203,30 @@ class TurnLifecycleMixin:
         session it is reading is that turn's own. A transport callback may also
         explicitly carry a pair captured through this accessor across a known
         task boundary; the pair is accepted only while that exact turn remains
-        live. The detached task from turn A sees `A != B` while turn B runs, and
-        `None` after A ended — both resolve to None, i.e. "no chat window",
-        which callers treat as system-initiated.
+        live. When present, that explicit binding is authoritative even if it
+        is unbound or stale; an executor captured off-turn cannot borrow an
+        unrelated ambient turn merely because its reader task copied that
+        turn's ContextVar. A task that enters `_turn_lifecycle` clears any
+        inherited binding and owns the new turn outright. The detached task
+        from turn A sees `A != B` while turn B runs, and `None` after A ended —
+        both resolve to None, i.e. "no chat window", which callers treat as
+        system-initiated.
 
         Returns None outside a turn, for a session-less turn, and for any task
         that merely inherited a finished turn's context.
         """
         live_turn_id = getattr(self, "_live_turn_id", None)
+        propagated = _BOUND_TURN_SESSION.get()
+        if propagated is not None and propagated.agent is self:
+            if propagated.turn_id and propagated.turn_id == live_turn_id:
+                return _normalize_session_id(propagated.session_id)
+            return None
+
         turn_id = _CURRENT_TURN_ID.get()
         if turn_id and turn_id == live_turn_id:
             return _normalize_session_id(
                 getattr(self, "_active_session_id", None)
             )
-
-        propagated = _BOUND_TURN_SESSION.get()
-        if (
-            propagated is not None
-            and propagated.agent is self
-            and propagated.turn_id
-            and propagated.turn_id == live_turn_id
-        ):
-            return _normalize_session_id(propagated.session_id)
         return None
 
     def _get_turn_bound_session_id(self) -> Optional[str]:
@@ -307,9 +311,18 @@ class TurnLifecycleMixin:
             # against the task-local id to tell a caller that owns the turn
             # from one that merely inherited its ContextVar (#2877).
             self._live_turn_id = turn_id
+            # A background task created inside an explicitly-bound callback
+            # inherits that binding. If it later enters its own cognition turn
+            # (the signal-dispatch wake path), turn entry is the unambiguous
+            # ownership boundary: the new turn's lifecycle/session authority
+            # supersedes the callback binding it inherited. Passive callbacks
+            # never enter this boundary, so their explicit stale/unbound veto
+            # remains intact (#2928 review P1).
+            bound_token = _BOUND_TURN_SESSION.set(None)
             try:
                 yield turn_id
             finally:
+                _BOUND_TURN_SESSION.reset(bound_token)
                 _CURRENT_TURN_ID.reset(token)
                 self._live_turn_id = None
                 # Clear the per-turn active session on exit so an out-of-turn

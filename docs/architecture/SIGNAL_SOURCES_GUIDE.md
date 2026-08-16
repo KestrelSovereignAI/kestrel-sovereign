@@ -457,10 +457,15 @@ Five rules:
    `capture_turn_session_binding()` and re-presented with
    `bind_turn_session()`. A captured binding remains valid only while that exact
    turn is live, so unrelated background work still reads as unattended instead
-   of hijacking a stranger's window. If a source callback runs on a task created
-   before the turn (for example, a transport reader or app-server handler), the
-   accessor alone returns `None`: capture while building the callback on the
-   owning turn and bind inside the callback across the task boundary. See
+   of hijacking a stranger's window. A present explicit binding is authoritative
+   even when unbound or stale; callback code never replaces captured authority
+   with an ambient turn copied into the invoking task. The carve-out is turn
+   entry itself: a task that enters `_turn_lifecycle` owns that new turn outright,
+   so the lifecycle clears any binding inherited from the callback or tool that
+   spawned it. If a source callback runs on a task created before the turn (for
+   example, a transport reader or app-server handler), the accessor alone returns
+   `None`: capture while building the callback on the owning turn and bind inside
+   the callback across the task boundary. See
    `OrchestratorEngineMixin._make_inline_tool_executor` and
    `Feature._make_feature_inline_tool_executor` for the two in-tree examples.
 

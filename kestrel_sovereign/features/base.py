@@ -1255,14 +1255,15 @@ class Feature(_SdkFeature):
         — without this, hook-gated policies were bypassed by the
         inline-execution path).
 
-        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This executor is
-        BUILT while ``execute_as_subagent`` runs on the PARENT inline executor's
-        reader task, INSIDE that executor's ``bind_transition_lock_reentry`` scope,
-        so the owning turn's transition-lock reentry token is visible in the
-        ContextVar here. But the codex app-server dispatches THIS subagent's OWN
-        inline tools on a SEPARATE, freshly-spawned reader task that does NOT inherit
-        that binding — so a nested durable-identity write (rename / description /
-        discovery history / user name / SOUL) invoked by the subagent would
+        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This
+        executor is BUILT while ``execute_as_subagent`` runs on the PARENT inline
+        executor's reader task, INSIDE that executor's
+        ``bind_transition_lock_reentry`` scope, so the owning turn's
+        transition-lock reentry token is visible in the ContextVar here. But the
+        codex app-server dispatches THIS subagent's OWN inline tools on a
+        SEPARATE, freshly-spawned reader task that does NOT inherit that binding
+        — so a nested durable-identity write (rename / description / discovery
+        history / user name / SOUL) invoked by the subagent would
         re-acquire the transition lock from a token-less foreign task and DEADLOCK
         against the turn that holds it (the turn is blocked awaiting the app-server
         result; the write is blocked acquiring the lock the turn holds). Capture the
