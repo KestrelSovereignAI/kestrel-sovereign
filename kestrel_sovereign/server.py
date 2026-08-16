@@ -358,9 +358,10 @@ def _latch_active_scheduler_runner_failures(
 
 
 def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
-    """Return false while any requested scheduler arm lacks a live worker."""
+    """Return false when an enabled scheduler lacks its topology's live worker."""
 
     runners = []
+    host_worker_required = False
     candidates = [agent] if agent is not None else []
     if manager is not None:
         try:
@@ -383,11 +384,14 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
                 if not _is_enabled_scheduler_feature(name, feature):
                     continue
                 runner = getattr(feature, "_runner", None)
-                if (
-                    runner is not None
-                    and hasattr(runner, "worker_available")
-                ):
-                    runners.append(runner)
+                if runner is None:
+                    if getattr(feature, "_polling_managed_by_host", False) is True:
+                        host_worker_required = True
+                        continue
+                    return False
+                if not hasattr(runner, "worker_available"):
+                    return False
+                runners.append(runner)
             except Exception:  # pragma: no cover - public health must not crash
                 logger.warning(
                     "Unable to inspect scheduler worker availability",
@@ -396,10 +400,12 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
                 return False
     try:
         host_runner = getattr(app.state, "host_scheduler_runner", None)
-        if (
-            host_runner is not None
-            and hasattr(host_runner, "worker_available")
-        ):
+        if host_runner is None:
+            if host_worker_required:
+                return False
+        else:
+            if not hasattr(host_runner, "worker_available"):
+                return False
             runners.append(host_runner)
         return all(
             getattr(runner, "worker_available", False) for runner in runners

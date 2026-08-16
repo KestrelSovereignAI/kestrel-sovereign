@@ -253,6 +253,63 @@ def test_health_fails_while_scheduler_supervisor_has_no_worker():
     }
 
 
+def test_health_fails_for_enabled_standalone_scheduler_without_runner():
+    """No-database scheduler mode cannot make an unpolled host look ready."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    agent = SimpleNamespace(
+        features={
+            "SchedulerFeature": SimpleNamespace(
+                enabled=True,
+                _runner=None,
+                _polling_managed_by_host=False,
+            )
+        }
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_host_managed_scheduler_without_scoped_runner_uses_host_worker():
+    """A shared host runner backs features that intentionally omit local pollers."""
+    from kestrel_sovereign.server import _active_scheduler_workers_available
+
+    feature = SimpleNamespace(
+        enabled=True,
+        _runner=None,
+        _polling_managed_by_host=True,
+    )
+    agent = SimpleNamespace(features={"SchedulerFeature": feature})
+    host_runner = SimpleNamespace(worker_available=True)
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(host_scheduler_runner=host_runner)
+    )
+
+    assert _active_scheduler_workers_available(fake_app, agent, None) is True
+
+
 def test_public_health_fails_while_scheduler_tick_is_stalled():
     """A fresh heartbeat cannot hide a polling tick beyond its hard bound."""
     from server import app
