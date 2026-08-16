@@ -1026,3 +1026,60 @@ def test_a_stale_agent_pid_does_not_mask_a_live_host(reanchor_env):
     (logs / ".host.pid").write_text(str(os.getpid()))
 
     assert _agent_db_holder(reanchor_env, "Test", cfg) == "host"
+
+
+def test_a_live_process_owned_by_another_user_is_not_read_as_stopped(reanchor_env):
+    """EPERM is proof of life, not evidence of death.
+
+    ``os.kill(pid, 0)`` raises ``PermissionError`` when the process EXISTS but
+    belongs to another user, and ``ProcessManager.is_process_running`` maps
+    every ``OSError`` to False — so ``is_process_running(1)`` is False for
+    launchd. A host run as a service or as root would therefore have been
+    reported stopped by the very guard meant to protect its database (#2920).
+    """
+    import sys as _sys
+
+    from kestrel_sovereign.cli import _agent_db_holder, _pid_file_state
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    if _sys.platform == "win32":  # pragma: no cover - POSIX semantics under test
+        pytest.skip("EPERM liveness semantics are POSIX-specific")
+
+    # PID 1 is alive on every POSIX host and is not ours to signal.
+    assert ProcessManager.is_process_running(1) is False, "premise moved"
+
+    logs = reanchor_env / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / ".host.pid").write_text("1")
+
+    assert _pid_file_state(logs / ".host.pid") == "alive"
+    assert _agent_db_holder(reanchor_env, "Test", _Cfg("agent_data/Test")) == "host"
+
+
+def test_an_unreadable_pid_file_is_undecidable_not_absent(reanchor_env):
+    """A malformed PID must reach the fail-closed path, not look like "stopped".
+
+    ``read_pid`` returns None for a corrupt file exactly as for a missing one,
+    so the outer ``except`` never fired and the guard answered "nothing holds
+    this database" on the strength of a failed probe.
+    """
+    from kestrel_sovereign.cli import _agent_db_holder, _pid_file_state
+
+    logs = reanchor_env / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / ".host.pid").write_text("not-a-pid")
+
+    assert _pid_file_state(logs / ".host.pid") == "unreadable"
+    assert _agent_db_holder(reanchor_env, "Test", _Cfg("agent_data/Test")) == "unknown"
+
+
+def test_pid_file_states_cover_absent_and_dead(reanchor_env):
+    """The two states that genuinely mean "nothing holds this"."""
+    from kestrel_sovereign.cli import _pid_file_state
+
+    missing = reanchor_env / "logs" / ".host.pid"
+    assert _pid_file_state(missing) == "absent"
+
+    missing.parent.mkdir(parents=True, exist_ok=True)
+    missing.write_text(str(2**22))
+    assert _pid_file_state(missing) == "dead"

@@ -1340,6 +1340,52 @@ def cmd_migrate_encryption(args) -> int:
     return cli_run(args)
 
 
+def _pid_file_state(pid_file) -> str:
+    """What a PID file actually tells us: ``absent`` / ``dead`` / ``alive`` / ``unreadable``.
+
+    The shared helpers are two-state and collapse failures into "no":
+    ``ProcessManager.read_pid`` returns ``None`` for a malformed or unreadable
+    file exactly as it does for a missing one, and ``is_process_running`` maps
+    every ``OSError`` to ``False`` — including the ``PermissionError`` that
+    ``os.kill(pid, 0)`` raises when the process EXISTS but belongs to another
+    user. Measured on this host: ``is_process_running(1)`` is ``False`` for
+    launchd, which is unambiguously alive.
+
+    A guard that must fail closed cannot rest on a probe that reports live
+    processes as stopped, so this keeps the third state. It is local rather
+    than a change to ``ProcessManager``, whose two-state contract other callers
+    already depend on (#2920).
+    """
+    try:
+        if not pid_file.exists():
+            return "absent"
+        raw = pid_file.read_text().strip()
+    except OSError:
+        return "unreadable"
+
+    try:
+        pid = int(raw)
+    except ValueError:
+        return "unreadable"
+
+    if sys.platform == "win32":  # pragma: no cover - Windows-only branch
+        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+        return "alive" if ProcessManager.is_process_running(pid) else "dead"
+
+    try:
+        os.kill(pid, 0)
+        return "alive"
+    except PermissionError:
+        # EPERM: the process exists, we simply may not signal it. Proof of
+        # life — the case a root- or service-owned host produces.
+        return "alive"
+    except ProcessLookupError:
+        return "dead"
+    except OSError:
+        return "unreadable"
+
+
 def _agent_db_holder(project_dir, agent_name, agent_cfg):
     """What currently holds this agent's database open, or ``None``.
 
@@ -1360,9 +1406,11 @@ def _agent_db_holder(project_dir, agent_name, agent_cfg):
 
     try:
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
-        if pid is not None and ProcessManager.is_process_running(pid):
+        agent_state = _pid_file_state(ProcessManager.agent_pid_file(resolved_dir))
+        if agent_state == "alive":
             return "agent"
+        if agent_state == "unreadable":
+            return "unknown"
 
         # An ABSENT per-agent PID and a STALE one mean the same thing here — no
         # per-agent process holds this database — so both fall through to the
@@ -1374,9 +1422,11 @@ def _agent_db_holder(project_dir, agent_name, agent_cfg):
         # the agent.
         from kestrel_sovereign.cli_lifecycle import _host_pid_path
 
-        host_pid = ProcessManager.read_pid(_host_pid_path(project_dir))
-        if host_pid is not None and ProcessManager.is_process_running(host_pid):
+        host_state = _pid_file_state(_host_pid_path(project_dir))
+        if host_state == "alive":
             return "host"
+        if host_state == "unreadable":
+            return "unknown"
         return None
     except Exception:
         # Previously this returned False — "err on the side of letting the user
