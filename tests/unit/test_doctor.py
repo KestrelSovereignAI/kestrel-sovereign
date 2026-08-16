@@ -8,14 +8,13 @@ import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import (
-    _LIBPQ_COMPILED_DSN_DEFAULTS,
     diagnose,
     format_report,
 )
 from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
     LocalAgentConfig,
-    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import write_env
@@ -97,9 +96,12 @@ def test_doctor_blocks_on_missing_api_key_env(tmp_path):
     # Remove OPENAI_API_KEY but keep route
     p = tmp_path / ".env"
     text = p.read_text()
-    p.write_text("\n".join(
-        line for line in text.splitlines() if not line.startswith("OPENAI_API_KEY=")
-    ) + "\n")
+    p.write_text(
+        "\n".join(
+            line for line in text.splitlines() if not line.startswith("OPENAI_API_KEY=")
+        )
+        + "\n"
+    )
     report = diagnose(tmp_path)
     assert not report.ready
     assert any("OPENAI_API_KEY" in m for m in report.fail)
@@ -219,21 +221,20 @@ def test_doctor_accepts_private_identity_export_metadata(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-import hashlib  # noqa: E402
-import json  # noqa: E402
-import os  # noqa: E402
-import sqlite3  # noqa: E402
+import hashlib
+import json
+import os
+import sqlite3
 
-import pytest  # noqa: E402
-from unittest.mock import patch  # noqa: E402
+import pytest
 
-from kestrel_sovereign.doctor import (  # noqa: E402
+from kestrel_sovereign.doctor import (
+    _anchored_constitution_hash,
+    _anchored_emancipation_contract,
+    _GovernanceSource,
     _NoAgentNode,
     _NoHashProperty,
     _UnreadableDB,
-    _GovernanceSource,
-    _anchored_constitution_hash,
-    _anchored_emancipation_contract,
 )
 
 _TEST_DID = "did:test:Test"
@@ -364,9 +365,7 @@ def _seed_with_anchored_constitution(
         # (``AsyncGraphStore.add_node`` -> ``record_graph_node_owner``). It is
         # what the bound runtime store actually matches on, so a seed without
         # it is not a healthy agent — it is the invisible-row case.
-        conn.execute(
-            "INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)"
-        )
+        conn.execute("INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)")
         if witness_node:
             conn.execute(
                 "INSERT INTO graph_node_owners(node_id, agent_id) VALUES (?, ?)",
@@ -402,18 +401,14 @@ def _patch_canonical(tmp_path: Path, content: bytes) -> Path:
 def test_constitution_drift_passes_when_hashes_match(tmp_path, monkeypatch):
     text = b"# Kestrel Constitution\nv1\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_with_anchored_constitution(
         tmp_path,
         constitution_text=text,
         stored_hash=hashlib.sha256(text).hexdigest(),
     )
     report = diagnose(tmp_path)
-    assert any(
-        "constitution anchored to current file" in m for m in report.ok
-    )
+    assert any("constitution anchored to current file" in m for m in report.ok)
     # No drift fails generated.
     assert not any("constitution drift" in m for m in report.fail)
 
@@ -424,9 +419,7 @@ def test_constitution_drift_fails_when_file_changed(tmp_path, monkeypatch):
     edited = b"# Kestrel Constitution\nv2 - amended\n"
 
     canonical = _patch_canonical(tmp_path, edited)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_with_anchored_constitution(
         tmp_path,
         constitution_text=original,
@@ -451,16 +444,14 @@ def test_constitution_drift_warns_on_missing_hash_property(tmp_path, monkeypatch
     blocking would prevent users from upgrading to a hash-anchored agent."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_with_anchored_constitution(
-        tmp_path, constitution_text=text, stored_hash=None,
+        tmp_path,
+        constitution_text=text,
+        stored_hash=None,
     )
     report = diagnose(tmp_path)
-    assert any(
-        "missing constitution_hash property" in m for m in report.warn
-    )
+    assert any("missing constitution_hash property" in m for m in report.warn)
     assert not any("constitution drift" in m for m in report.fail)
 
 
@@ -469,9 +460,7 @@ def test_constitution_drift_warns_on_unreadable_db(tmp_path, monkeypatch):
     sqlite3 — must skip, not crash, not fail the whole doctor run."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_ready(tmp_path)
     # Replace the empty-bytes DB with garbage that will fail to parse.
     db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
@@ -485,9 +474,7 @@ def test_constitution_drift_warns_on_unreadable_db(tmp_path, monkeypatch):
     assert not any("constitution drift" in m for m in report.fail)
 
 
-def test_constitution_drift_warns_when_canonical_file_missing(
-    tmp_path, monkeypatch
-):
+def test_constitution_drift_warns_when_canonical_file_missing(tmp_path, monkeypatch):
     """Cannot drift-check if we can't read the canonical file."""
     monkeypatch.setattr(
         "kestrel_sovereign.config.CONSTITUTION_PATH",
@@ -507,9 +494,7 @@ def test_constitution_drift_silent_when_no_agents(tmp_path, monkeypatch):
     should not pile on additional drift noise."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     # No multi_agent written → no agents.
     report = diagnose(tmp_path)
     # Match only the exact phrases the drift check itself emits, NOT
@@ -527,8 +512,7 @@ def test_constitution_drift_silent_when_no_agents(tmp_path, monkeypatch):
         return any(p in m for p in drift_phrases)
 
     drift_msgs = [
-        m for m in (*report.warn, *report.fail, *report.ok)
-        if _is_drift_msg(m)
+        m for m in (*report.warn, *report.fail, *report.ok) if _is_drift_msg(m)
     ]
     assert drift_msgs == []
 
@@ -538,9 +522,7 @@ def test_constitution_drift_skips_when_db_missing(tmp_path, monkeypatch):
     not pile on a duplicate message."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_ready(tmp_path)
     (tmp_path / "agent_data" / "test" / "kestrel_prime.db").unlink()
     report = diagnose(tmp_path)
@@ -551,7 +533,8 @@ def test_constitution_drift_skips_when_db_missing(tmp_path, monkeypatch):
         "Constitution drift check skipped",
     )
     drift_msgs = [
-        m for m in (*report.warn, *report.fail, *report.ok)
+        m
+        for m in (*report.warn, *report.fail, *report.ok)
         if any(p in m for p in drift_phrases)
     ]
     # Only the no-db fail remains; nothing added by drift check itself.
@@ -570,11 +553,11 @@ def test_reads_the_hash_off_the_properties_it_was_given():
 @pytest.mark.parametrize(
     "properties",
     [
-        None,                                  # corrupt/absent properties column
-        {},                                     # older agent, never anchored
-        {"constitution_hash": ""},              # present but empty
-        {"constitution_hash": 12345},           # present but not a string
-        "not a dict",                           # properties parsed to a scalar
+        None,  # corrupt/absent properties column
+        {},  # older agent, never anchored
+        {"constitution_hash": ""},  # present but empty
+        {"constitution_hash": 12345},  # present but not a string
+        "not a dict",  # properties parsed to a scalar
     ],
 )
 def test_no_usable_hash_is_its_own_verdict(properties):
@@ -617,7 +600,7 @@ def test_an_agent_without_a_contract_reads_as_dormant(properties):
 # ---------------------------------------------------------------------------
 
 
-from kestrel_sovereign.doctor import (  # noqa: E402
+from kestrel_sovereign.doctor import (
     _read_agent_node,
     _read_governed_by_targets,
 )
@@ -631,9 +614,7 @@ def _seed_matching_anchor(tmp_path, monkeypatch, **kwargs) -> str:
     """
     text = b"# Kestrel Constitution\nv1\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     stored = hashlib.sha256(text).hexdigest()
     _seed_with_anchored_constitution(
         tmp_path, constitution_text=text, stored_hash=stored, **kwargs
@@ -645,8 +626,7 @@ def test_governed_by_edge_match_passes(tmp_path, monkeypatch):
     stored = _seed_matching_anchor(tmp_path, monkeypatch)
     report = diagnose(tmp_path)
     assert any(
-        "governed_by edge targets the anchored constitution" in m
-        and stored[:12] in m
+        "governed_by edge targets the anchored constitution" in m and stored[:12] in m
         for m in report.ok
     )
     assert not any("anchor drift" in m for m in report.fail)
@@ -656,9 +636,7 @@ def test_governed_by_edge_mistargeted_fails(tmp_path, monkeypatch):
     """The 2026-07-18 incident: property + blob reanchored, edge still on
     the ancient anchor → proof 2 fails closed at boot."""
     ancient = hashlib.sha256(b"ancient constitution").hexdigest()
-    stored = _seed_matching_anchor(
-        tmp_path, monkeypatch, governed_by_target=ancient
-    )
+    stored = _seed_matching_anchor(tmp_path, monkeypatch, governed_by_target=ancient)
     report = diagnose(tmp_path)
     drift = [m for m in report.fail if "anchor drift" in m]
     assert len(drift) == 1
@@ -672,9 +650,7 @@ def test_governed_by_edge_mistargeted_fails(tmp_path, monkeypatch):
 
 
 def test_governed_by_edge_missing_fails(tmp_path, monkeypatch):
-    stored = _seed_matching_anchor(
-        tmp_path, monkeypatch, governed_by_target=None
-    )
+    stored = _seed_matching_anchor(tmp_path, monkeypatch, governed_by_target=None)
     report = diagnose(tmp_path)
     drift = [m for m in report.fail if "anchor drift" in m]
     assert len(drift) == 1
@@ -692,15 +668,11 @@ def test_governed_by_check_fails_without_edges_table(tmp_path, monkeypatch):
     _seed_matching_anchor(tmp_path, monkeypatch, create_edges_table=False)
     report = diagnose(tmp_path)
     unverifiable = [
-        m for m in report.fail
-        if "cannot verify the governed_by governance edge" in m
+        m for m in report.fail if "cannot verify the governed_by governance edge" in m
     ]
     assert len(unverifiable) == 1
     assert "safe-mode" in unverifiable[0]
-    assert (
-        "kestrel constitution reanchor --agent-name Test --force"
-        in unverifiable[0]
-    )
+    assert "kestrel constitution reanchor --agent-name Test --force" in unverifiable[0]
     assert not report.ready
 
 
@@ -729,8 +701,7 @@ def test_governed_by_stale_extra_edge_warns_but_passes(tmp_path, monkeypatch):
         conn.commit()
     report = diagnose(tmp_path)
     assert any(
-        "governed_by edge targets the anchored constitution" in m
-        and stored[:12] in m
+        "governed_by edge targets the anchored constitution" in m and stored[:12] in m
         for m in report.ok
     )
     stale = [m for m in report.warn if "stale extra governed_by edge" in m]
@@ -745,11 +716,11 @@ def test_governed_by_check_silent_without_base_anchor(tmp_path, monkeypatch):
     The base check already warns; the edge check must stay silent."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_with_anchored_constitution(
-        tmp_path, constitution_text=text, stored_hash=None,
+        tmp_path,
+        constitution_text=text,
+        stored_hash=None,
     )
     report = diagnose(tmp_path)
     assert not any(
@@ -806,16 +777,15 @@ def test_overlay_anchor_missing_file_fails(tmp_path, monkeypatch):
     # No overlay file written.
     report = diagnose(tmp_path)
     missing = [
-        m for m in report.fail
+        m
+        for m in report.fail
         if "anchored constitution overlay is missing from disk" in m
     ]
     assert len(missing) == 1
     assert anchored_hash[:12] in missing[0]
 
 
-def test_overlay_malformed_anchor_with_overlay_present_fails(
-    tmp_path, monkeypatch
-):
+def test_overlay_malformed_anchor_with_overlay_present_fails(tmp_path, monkeypatch):
     """A truthy non-string anchor counts as anchored at runtime (truthiness,
     not isinstance) and can never equal the overlay sha → drift fail, not
     'present but NOT anchored', and definitely not silence."""
@@ -841,7 +811,8 @@ def test_overlay_malformed_anchor_without_overlay_fails(tmp_path, monkeypatch):
     )
     report = diagnose(tmp_path)
     missing = [
-        m for m in report.fail
+        m
+        for m in report.fail
         if "anchored constitution overlay is missing from disk" in m
     ]
     assert len(missing) == 1
@@ -872,9 +843,7 @@ def test_overlay_unreadable_without_anchor_warns(tmp_path, monkeypatch):
     _seed_matching_anchor(tmp_path, monkeypatch)
     (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").mkdir()
     report = diagnose(tmp_path)
-    incomplete = [
-        m for m in report.warn if "overlay anchor check incomplete" in m
-    ]
+    incomplete = [m for m in report.warn if "overlay anchor check incomplete" in m]
     assert len(incomplete) == 1
     assert not any("overlay" in m.lower() for m in report.fail)
     assert report.ready, f"fail={report.fail}"
@@ -884,22 +853,16 @@ def test_overlay_silent_when_absent_and_unanchored(tmp_path, monkeypatch):
     """Normal agent: no overlay file, no anchor → zero overlay messages."""
     _seed_matching_anchor(tmp_path, monkeypatch)
     report = diagnose(tmp_path)
-    assert not any(
-        "overlay" in m for m in (*report.ok, *report.warn, *report.fail)
-    )
+    assert not any("overlay" in m for m in (*report.ok, *report.warn, *report.fail))
 
 
-def test_overlay_checked_for_legacy_agent_without_base_anchor(
-    tmp_path, monkeypatch
-):
+def test_overlay_checked_for_legacy_agent_without_base_anchor(tmp_path, monkeypatch):
     """#1722 legacy shape: anchored overlay but NO base constitution_hash.
     The overlay check must still run (the runtime audits it first and
     unconditionally)."""
     text = b"# constitution\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     overlay_text = b"# Overlay\n"
     overlay_hash = hashlib.sha256(overlay_text).hexdigest()
     _seed_with_anchored_constitution(
@@ -908,9 +871,7 @@ def test_overlay_checked_for_legacy_agent_without_base_anchor(
         stored_hash=None,
         overlay_anchor=overlay_hash,
     )
-    (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").write_bytes(
-        overlay_text
-    )
+    (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").write_bytes(overlay_text)
     report = diagnose(tmp_path)
     assert any("constitution overlay anchored" in m for m in report.ok)
 
@@ -935,7 +896,12 @@ CREATE TABLE schema_backfills (
 
 
 def _graph_db(
-    path, *, nodes=(), edges=(), node_owners=(), edge_owners=(),
+    path,
+    *,
+    nodes=(),
+    edges=(),
+    node_owners=(),
+    edge_owners=(),
     ownership_settled=True,
 ):
     """A Kestrel graph with the ownership ledgers a real write maintains.
@@ -949,9 +915,7 @@ def _graph_db(
         conn.executescript(_GRAPH_SCHEMA)
         conn.executemany("INSERT INTO graph_nodes VALUES (?, ?, ?, ?)", nodes)
         conn.executemany("INSERT INTO graph_edges VALUES (?, ?, ?, NULL)", edges)
-        conn.executemany(
-            "INSERT INTO graph_node_owners VALUES (?, ?)", node_owners
-        )
+        conn.executemany("INSERT INTO graph_node_owners VALUES (?, ?)", node_owners)
         conn.executemany(
             "INSERT INTO graph_edge_owners VALUES (?, ?, ?, ?)", edge_owners
         )
@@ -959,9 +923,7 @@ def _graph_db(
             # A database the runtime has opened has #2649 recorded. Without the
             # marker a missing witness is *pending*, not permanent — boot
             # backfills it — so tests about permanence must say which they mean.
-            conn.execute(
-                "INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)"
-            )
+            conn.execute("INSERT INTO schema_backfills VALUES ('ownership_2649', NULL)")
         conn.commit()
     return path
 
@@ -1132,7 +1094,7 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
 
 
 def test_an_unreachable_postgres_is_not_ready(tmp_path, monkeypatch):
-    """"I did not check" must not print as "Ready".
+    """ "I did not check" must not print as "Ready".
 
     ``ready`` is ``not report.fail``, so warning here made ``kestrel doctor``
     exit 0 and print Ready having inspected no governance at all — on a host
@@ -1159,9 +1121,12 @@ def test_an_unreachable_postgres_is_not_ready(tmp_path, monkeypatch):
     assert not report.ready, f"ok={report.ok} warn={report.warn}"
     assert any("governance NOT verified" in m for m in report.fail), report.fail
     assert any("connection timed out" in m for m in report.fail), report.fail
+    assert any("equivalent libpq connection failed" in m for m in report.fail)
     assert not any(
-        "cannot represent runtime connection option" in m
-        for m in report.fail
+        "Runtime database reachability was not established" in m for m in report.fail
+    )
+    assert not any(
+        "cannot represent runtime connection option" in m for m in report.fail
     ), report.fail
     # Not phrased as drift: the remedy is access, not a reanchor.
     assert not any("reanchor" in m for m in report.fail)
@@ -1314,9 +1279,7 @@ def test_sqlite_repairs_still_promise_the_backup(tmp_path, monkeypatch):
     """It is true there: the reanchor copies the anchor aside before writing."""
     text = b"# Kestrel Constitution\nv1\n"
     canonical = _patch_canonical(tmp_path, text)
-    monkeypatch.setattr(
-        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
-    )
+    monkeypatch.setattr("kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical))
     _seed_with_anchored_constitution(
         tmp_path, constitution_text=text, stored_hash="f" * 64
     )
@@ -1349,13 +1312,17 @@ def test_a_driver_error_never_carries_the_dsn(tmp_path):
     "message, leaked",
     [
         ('could not translate host name "db.internal" to address', "db.internal"),
-        ('FATAL:  password authentication failed for user "kestrel_prod"',
-         "kestrel_prod"),
+        (
+            'FATAL:  password authentication failed for user "kestrel_prod"',
+            "kestrel_prod",
+        ),
         ('FATAL:  database "governance_prod" does not exist', "governance_prod"),
     ],
 )
 def test_routine_failures_do_not_leak_the_database_estate(
-    tmp_path, message, leaked,
+    tmp_path,
+    message,
+    leaked,
 ):
     """The common case, and the one a whole-DSN replace never catches.
 
@@ -1370,9 +1337,7 @@ def test_routine_failures_do_not_leak_the_database_estate(
     source = _GovernanceSource(
         anchor_path=tmp_path / "k.db",
         agent_did="did:x",
-        dsn=(
-            "postgresql://kestrel_prod:hunter2@db.internal:5432/governance_prod"
-        ),
+        dsn=("postgresql://kestrel_prod:hunter2@db.internal:5432/governance_prod"),
     )
 
     redacted = _safe(message, source)
@@ -1422,15 +1387,27 @@ def test_doctor_accepts_openrouter_management_key_only(tmp_path):
     but management_api_key_env present) must NOT be flagged — doctor must agree
     with `kestrel setup --check`, which now accepts this shape."""
     _seed_ready(tmp_path)
-    write_toml(tmp_path / "kestrel.toml", {"llm": {
-        "route_priority": ["openrouter:api"],
-        "vendors": {"openrouter": {"routes": {"api": {
-            "adapter": "OpenRouterAdapter",
-            "api_key_env": "OPENROUTER_API_KEY",
-            "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
-            "model": "auto",
-        }}}},
-    }}, deep_merge=False)
+    write_toml(
+        tmp_path / "kestrel.toml",
+        {
+            "llm": {
+                "route_priority": ["openrouter:api"],
+                "vendors": {
+                    "openrouter": {
+                        "routes": {
+                            "api": {
+                                "adapter": "OpenRouterAdapter",
+                                "api_key_env": "OPENROUTER_API_KEY",
+                                "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
+                                "model": "auto",
+                            }
+                        }
+                    }
+                },
+            }
+        },
+        deep_merge=False,
+    )
     # Only the management key is present in .env (no OPENROUTER_API_KEY).
     p = tmp_path / ".env"
     p.write_text(p.read_text() + "\nOPENROUTER_MANAGEMENT_API_KEY=sk-or-mgmt-xyz\n")
@@ -1452,12 +1429,15 @@ def test_the_backend_rule_is_the_runtimes_rule():
     assert (
         _anchor_is_the_runtime_database({"KESTREL_DB_BACKEND": "postgres"}) is True
     ), "no DSN -> the runtime is SQLite"
-    assert _anchor_is_the_runtime_database(
-        {
-            "KESTREL_DB_BACKEND": "postgres",
-            "KESTREL_DATABASE_URL": "postgresql://h/db",
-        }
-    ) is False
+    assert (
+        _anchor_is_the_runtime_database(
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://h/db",
+            }
+        )
+        is False
+    )
 
 
 def test_the_database_settings_are_read_from_the_project_env(tmp_path, monkeypatch):
@@ -1514,8 +1494,7 @@ def test_doctor_and_the_launcher_resolve_identically(tmp_path, monkeypatch):
     from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
     (tmp_path / ".env").write_text(
-        "KESTREL_DB_BACKEND=postgres\n"
-        "KESTREL_DATABASE_URL=postgresql://from-file/db\n"
+        "KESTREL_DB_BACKEND=postgres\nKESTREL_DATABASE_URL=postgresql://from-file/db\n"
     )
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://exported/db")
 
@@ -1586,22 +1565,19 @@ def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn(tmp_path):
 
 def test_explicit_dsn_connection_parameters_outrank_the_environment(tmp_path):
     """Only absent settings may be filled from the spawned-agent env."""
+    from urllib.parse import quote
+
     from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import (
         _doctor_postgres_dsn,
-        _GovernanceSource,
-        _safe,
     )
-
-    from urllib.parse import quote
 
     dsn_root_certificate = tmp_path / "dsn-ca.pem"
     dsn_root_certificate.write_text("test DSN root certificate")
     effective = _doctor_postgres_dsn(
         "postgresql://dsn_user:dsn-password@dsn.example:6543/dsn_db"
-        "?sslmode=require&sslrootcert="
-        + quote(str(dsn_root_certificate), safe=""),
+        "?sslmode=require&sslrootcert=" + quote(str(dsn_root_certificate), safe=""),
         {
             "PGHOST": "env.example",
             "PGPORT": "7777",
@@ -1664,9 +1640,7 @@ def test_queryless_uri_uses_the_guarded_asyncpg_parse_path(tmp_path):
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn("postgresql://u@h/db", {}, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn("postgresql://u@h/db", {}, tmp_path))
 
     assert parsed["user"] == "u"
     assert parsed["dbname"] == "db"
@@ -1708,9 +1682,7 @@ def test_empty_query_user_falls_back_exactly_like_asyncpg(
         gsslib=None,
     )
     translated = parse_dsn(
-        _doctor_postgres_dsn(
-            "postgresql://h/db?user=", runtime_environment, tmp_path
-        )
+        _doctor_postgres_dsn("postgresql://h/db?user=", runtime_environment, tmp_path)
     )
 
     assert asyncpg_params.user == expected_user
@@ -1730,13 +1702,9 @@ def test_blanked_spawned_login_names_do_not_reuse_the_parent_login(
         "kestrel_sovereign.doctor._system_account_user",
         lambda: "spawned_os_user",
     )
-    spawned_env = {
-        name: "" for name in ("LOGNAME", "USER", "LNAME", "USERNAME")
-    }
+    spawned_env = {name: "" for name in ("LOGNAME", "USER", "LNAME", "USERNAME")}
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn("postgresql://h", spawned_env, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn("postgresql://h", spawned_env, tmp_path))
 
     assert parsed["user"] == "spawned_os_user"
     assert parsed["dbname"] == "spawned_os_user"
@@ -1749,7 +1717,7 @@ def test_windows_asyncpg_tls_defaults_are_frozen_from_userprofile(
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    monkeypatch.setattr("kestrel_sovereign.doctor.sys.platform", "win32")
+    monkeypatch.setattr("kestrel_sovereign.doctor._IS_WINDOWS", True)
     runtime_home = tmp_path / "runtime-home"
     tls_dir = runtime_home / ".postgresql"
     tls_dir.mkdir(parents=True)
@@ -1789,7 +1757,7 @@ def test_windows_missing_asyncpg_root_remains_explicit_for_verification(
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    monkeypatch.setattr("kestrel_sovereign.doctor.sys.platform", "win32")
+    monkeypatch.setattr("kestrel_sovereign.doctor._IS_WINDOWS", True)
     runtime_home = tmp_path / "runtime-home"
     runtime_home.mkdir()
 
@@ -1846,9 +1814,7 @@ def test_pghost_uses_asyncpg_host_list_rules(
     if pg_port is not None:
         env["PGPORT"] = pg_port
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn("postgresql:///db", env, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn("postgresql:///db", env, tmp_path))
 
     assert parsed["host"] == expected_host
     assert parsed["port"] == expected_port
@@ -1864,9 +1830,7 @@ def test_pghost_uses_asyncpg_host_list_rules(
     ],
     ids=("authority", "query", "environment", "host-list"),
 )
-def test_libpq_reserved_abstract_socket_hosts_fail_closed(
-    tmp_path, dsn, environment
-):
+def test_libpq_reserved_abstract_socket_hosts_fail_closed(tmp_path, dsn, environment):
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
     with pytest.raises(ValueError, match="reserves for Unix sockets") as exc:
@@ -1957,9 +1921,7 @@ def test_pgport_fills_each_authority_host_without_a_port(
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn(dsn, {"PGPORT": pg_port}, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn(dsn, {"PGPORT": pg_port}, tmp_path))
 
     assert parsed["host"] == expected_host
     assert parsed["port"] == expected_port
@@ -2158,9 +2120,7 @@ def test_lone_environment_missing_sslkey_is_tolerated_like_asyncpg(
     )
 
     assert asyncpg_params.ssl is not None
-    assert translated["sslkey"] == str(
-        (tmp_path / "private" / "missing.key").resolve()
-    )
+    assert translated["sslkey"] == str((tmp_path / "private" / "missing.key").resolve())
 
 
 def _assert_absent_doctor_passfile(value: str, project_dir: Path) -> None:
@@ -2203,8 +2163,7 @@ def test_single_host_passfile_uses_asyncpg_password_dialect(tmp_path, row):
 
     parsed = parse_dsn(
         _doctor_postgres_dsn(
-            "postgresql://u@h1:5432/db?passfile="
-            + quote(str(passfile), safe=""),
+            "postgresql://u@h1:5432/db?passfile=" + quote(str(passfile), safe=""),
             {},
             tmp_path,
         )
@@ -2261,8 +2220,7 @@ def test_multi_host_passfile_uses_asyncpg_selection_once(
     )
 
     effective = _doctor_postgres_dsn(
-        "postgresql://u@h1:5432,h2:5433/db?passfile="
-        + quote(str(passfile), safe=""),
+        "postgresql://u@h1:5432,h2:5433/db?passfile=" + quote(str(passfile), safe=""),
         {},
         tmp_path,
     )
@@ -2336,8 +2294,7 @@ def test_multi_host_default_pgpass_uses_the_spawned_home(tmp_path):
     runtime_home.mkdir()
     passfile = runtime_home / ".pgpass"
     passfile.write_text(
-        "h1:5432:db:u:default-first-secret\n"
-        "h2:5433:db:u:default-second-secret\n"
+        "h1:5432:db:u:default-first-secret\nh2:5433:db:u:default-second-secret\n"
     )
     passfile.chmod(0o600)
 
@@ -2374,14 +2331,12 @@ def test_windows_passfile_discovery_failure_is_an_unreadable_finding(
         nodes=[("did:x", "agent", "x", "{}")],
         node_owners=[("did:x", "did:x")],
     )
-    monkeypatch.setattr("kestrel_sovereign.doctor.sys.platform", "win32")
+    monkeypatch.setattr("kestrel_sovereign.doctor._IS_WINDOWS", True)
 
     def fail_to_find_pg_home():
         raise error
 
-    monkeypatch.setattr(
-        asyncpg_compat, "get_pg_home_directory", fail_to_find_pg_home
-    )
+    monkeypatch.setattr(asyncpg_compat, "get_pg_home_directory", fail_to_find_pg_home)
 
     result = _resolve_governance_source(
         db,
@@ -2394,6 +2349,36 @@ def test_windows_passfile_discovery_failure_is_an_unreadable_finding(
 
     assert isinstance(result, _UnreadableDB)
     assert "default passfile location could not be determined" in result.reason
+
+
+def test_future_classified_translation_failure_is_contained(tmp_path, monkeypatch):
+    from kestrel_sovereign import doctor as doctor_module
+
+    db = _graph_db(
+        tmp_path / "k.db",
+        nodes=[("did:x", "agent", "x", "{}")],
+        node_owners=[("did:x", "did:x")],
+    )
+
+    def fail_translation(*_args, **_kwargs):
+        raise doctor_module._PostgresTranslationError(
+            "future classified translation failure"
+        )
+
+    monkeypatch.setattr(doctor_module, "_doctor_postgres_dsn", fail_translation)
+
+    result = doctor_module._resolve_governance_source(
+        db,
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://u@h/db",
+        },
+        tmp_path,
+    )
+
+    assert isinstance(result, _UnreadableDB)
+    assert result.postgres_failure == "diagnostic_capability"
+    assert "cannot construct an equivalent libpq diagnostic connection" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -2545,7 +2530,10 @@ def test_empty_options_neutralizes_libpq_only_pgoptions(tmp_path):
     assert parse_dsn(effective)["options"] == ""
 
 
-@pytest.mark.parametrize(("dsn_name", "expected"), _LIBPQ_COMPILED_DSN_DEFAULTS)
+@pytest.mark.parametrize(
+    ("dsn_name", "expected"),
+    (("gssencmode", "disable"), ("channel_binding", "disable")),
+)
 def test_libpq_compiled_defaults_are_always_asyncpg_equivalent(
     dsn_name,
     expected,
@@ -2558,9 +2546,7 @@ def test_libpq_compiled_defaults_are_always_asyncpg_equivalent(
         _libpq_accepts_dsn_option,
     )
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn("postgresql://u@h/db", {}, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn("postgresql://u@h/db", {}, tmp_path))
 
     if _libpq_accepts_dsn_option(dsn_name, expected):
         assert parsed[dsn_name] == expected
@@ -2568,9 +2554,7 @@ def test_libpq_compiled_defaults_are_always_asyncpg_equivalent(
         assert dsn_name not in parsed
 
 
-def test_missing_postgres_driver_has_a_driver_diagnostic(
-    tmp_path, monkeypatch
-):
+def test_missing_postgres_driver_has_a_driver_diagnostic(tmp_path, monkeypatch):
     import sys
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
@@ -2633,9 +2617,7 @@ def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch, tmp_path):
     assert parsed["sslmode"] == "prefer"
     assert parsed["target_session_attrs"] == "any"
     assert parsed["options"] == ""
-    assert parsed["connect_timeout"] == (
-        "5" if sys.platform == "win32" else "2"
-    )
+    assert parsed["connect_timeout"] == ("5" if sys.platform == "win32" else "2")
 
 
 def test_libpq_service_file_without_a_service_name_is_inert(tmp_path):
@@ -2798,8 +2780,7 @@ def test_asyncpg_sslmode_aliases_are_normalized_for_libpq(
     root_certificate.write_text("test root certificate")
     if source == "query":
         runtime_dsn = (
-            "postgresql://u@h/db?sslmode="
-            f"{asyncpg_spelling}&sslrootcert=root.crt"
+            f"postgresql://u@h/db?sslmode={asyncpg_spelling}&sslrootcert=root.crt"
         )
         environment = {}
     else:
@@ -2809,9 +2790,7 @@ def test_asyncpg_sslmode_aliases_are_normalized_for_libpq(
             "PGSSLROOTCERT": str(root_certificate),
         }
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn(runtime_dsn, environment, tmp_path))
 
     assert SSLMode.parse(asyncpg_spelling).name == asyncpg_spelling
     assert parsed["sslmode"] == libpq_spelling
@@ -2860,16 +2839,10 @@ def test_asyncpg_tls_protocol_aliases_are_normalized_for_libpq(
             "PGSSLMAXPROTOCOLVERSION": asyncpg_maximum,
         }
 
-    parsed = parse_dsn(
-        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn(runtime_dsn, environment, tmp_path))
 
-    assert _parse_tls_version(asyncpg_minimum) is ssl.TLSVersion[
-        asyncpg_minimum
-    ]
-    assert _parse_tls_version(asyncpg_maximum) is ssl.TLSVersion[
-        asyncpg_maximum
-    ]
+    assert _parse_tls_version(asyncpg_minimum) is ssl.TLSVersion[asyncpg_minimum]
+    assert _parse_tls_version(asyncpg_maximum) is ssl.TLSVersion[asyncpg_maximum]
     assert parsed["ssl_min_protocol_version"] == libpq_minimum
     assert parsed["ssl_max_protocol_version"] == libpq_maximum
 
@@ -2918,9 +2891,7 @@ def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
         krbsrvname=None,
         gsslib=None,
     )
-    parsed = parse_dsn(
-        _doctor_postgres_dsn(runtime_dsn, environment, tmp_path)
-    )
+    parsed = parse_dsn(_doctor_postgres_dsn(runtime_dsn, environment, tmp_path))
 
     assert asyncpg_params.ssl is False
     assert "ssl_min_protocol_version" not in parsed
@@ -3139,8 +3110,7 @@ def test_odd_trailing_options_backslash_cannot_consume_direct_setting(tmp_path):
 
     with pytest.raises(ValueError, match="cannot be combined losslessly"):
         _doctor_postgres_dsn(
-            "postgresql://u@h/db?options=-c%20work_mem%3D4MB%5C"
-            "&search_path=tenant",
+            "postgresql://u@h/db?options=-c%20work_mem%3D4MB%5C&search_path=tenant",
             {},
             tmp_path,
         )
@@ -3188,8 +3158,7 @@ def test_a_one_character_environment_password_does_not_shred_diagnostics(tmp_pat
     )
 
     redacted = _safe(
-        "connection failed on port 55432: password authentication failed; "
-        "credential=p",
+        "connection failed on port 55432: password authentication failed; credential=p",
         source,
     )
 
@@ -3300,26 +3269,38 @@ def test_multi_host_failure_redacts_the_individual_failed_host(tmp_path):
     assert "<host>" in redacted
 
 
-def test_synthetic_fallback_hosts_do_not_mangle_driver_messages(tmp_path):
+def test_synthetic_fallback_hosts_do_not_mangle_driver_messages(tmp_path, monkeypatch):
     from kestrel_sovereign.doctor import (
         _doctor_postgres_dsn,
-        _GovernanceSource,
-        _safe,
+        _fetch_postgres_rows_isolated,
+        _PostgresProbeConnectionError,
         _translated_dsn_identity,
     )
 
     runtime_dsn = "postgresql:///db"
     env = {"USER": "runtime_user"}
     effective = _doctor_postgres_dsn(runtime_dsn, env, tmp_path)
-    source = _GovernanceSource(
-        anchor_path=tmp_path / "k.db",
-        agent_did="did:x",
-        dsn=effective,
-        dsn_identity=_translated_dsn_identity(runtime_dsn, effective, env),
-    )
     message = "localhost could not read unrelated file /tmp/root.crt"
 
-    assert _safe(message, source) == message
+    class Process:
+        returncode = 0
+
+        def communicate(self, payload=None, timeout=None):
+            return json.dumps({"ok": False, "kind": "connection", "error": message}), ""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor.subprocess.Popen",
+        lambda *_args, **_kwargs: Process(),
+    )
+
+    with pytest.raises(_PostgresProbeConnectionError) as raised:
+        _fetch_postgres_rows_isolated(
+            effective,
+            "SELECT 1",
+            dsn_identity=_translated_dsn_identity(runtime_dsn, effective, env),
+        )
+
+    assert str(raised.value) == message
 
 
 def test_explicit_socket_host_remains_inside_error_redaction(tmp_path):
@@ -3362,9 +3343,7 @@ def test_resolved_connection_file_paths_stay_inside_error_redaction(tmp_path):
     )
     resolved_path = str(root_certificate.resolve())
 
-    redacted = _safe(
-        f'root certificate file "{resolved_path}" does not exist', source
-    )
+    redacted = _safe(f'root certificate file "{resolved_path}" does not exist', source)
 
     assert resolved_path not in redacted
     assert "<sslrootcert>" in redacted
@@ -3469,9 +3448,7 @@ def _postgres_host(monkeypatch, fake):
         doctor_module,
         "_fetch_postgres_rows_isolated",
         lambda dsn, sql, params=(), **_kwargs: (
-            doctor_module._postgres_fetch_rows_in_process(
-                dsn, sql, params, driver=fake
-            )
+            doctor_module._postgres_fetch_rows_in_process(dsn, sql, params, driver=fake)
         ),
     )
 
@@ -3495,17 +3472,13 @@ def test_libpq_service_environment_does_not_block_the_runtime_dsn(
     assert service_name not in " ".join(report.ok + report.warn + report.fail)
 
 
-def test_missing_tls_file_becomes_a_path_safe_postgres_finding(
-    tmp_path, monkeypatch
-):
+def test_missing_tls_file_becomes_a_path_safe_postgres_finding(tmp_path, monkeypatch):
     from urllib.parse import quote
 
     _seed_matching_anchor(tmp_path, monkeypatch)
     missing_certificate = tmp_path / "private" / "missing-client.crt"
-    runtime_dsn = (
-        "postgresql://runtime_user@db.internal/kestrel"
-        "?sslcert="
-        + quote(str(missing_certificate), safe="")
+    runtime_dsn = "postgresql://runtime_user@db.internal/kestrel?sslcert=" + quote(
+        str(missing_certificate), safe=""
     )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
@@ -3514,9 +3487,49 @@ def test_missing_tls_file_becomes_a_path_safe_postgres_finding(
 
     findings = " ".join(report.fail)
     assert not report.ready
-    assert "cannot read PostgreSQL" in findings
+    assert "runtime PostgreSQL configuration is invalid" in findings
+    assert "shared with the spawned asyncpg runtime" in findings
     assert "sslcert" in findings
     assert str(missing_certificate) not in findings
+
+
+def test_non_utf8_passfile_becomes_a_path_safe_postgres_finding(tmp_path, monkeypatch):
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    passfile = tmp_path / "private-runtime-passfile"
+    passfile.write_bytes(b"host:5432:db:user:\xff\n")
+    passfile.chmod(0o600)
+    monkeypatch.setenv("PGPASSFILE", str(passfile))
+
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert not fake.executed
+    assert "runtime PostgreSQL configuration is invalid" in findings
+    assert "passfile cannot be read by asyncpg" in findings
+    assert str(passfile) not in findings
+
+
+def test_nul_connection_file_path_becomes_a_path_safe_postgres_finding(
+    tmp_path, monkeypatch
+):
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    unsafe_path = "private\x00root-ca.pem"
+    env_path = tmp_path / ".env"
+    env_path.write_text(env_path.read_text() + f"\nPGSSLROOTCERT={unsafe_path}\n")
+
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert not fake.executed
+    assert "runtime PostgreSQL configuration is invalid" in findings
+    assert "sslrootcert file path cannot be resolved by asyncpg" in findings
+    assert unsafe_path not in findings
 
 
 def test_postgres_probe_child_strips_the_complete_libpq_namespace(monkeypatch):
@@ -3538,6 +3551,7 @@ def test_postgres_probe_child_strips_the_complete_libpq_namespace(monkeypatch):
     assert "PYTHONPATH" not in child_env
     assert "PYTHONHOME" not in child_env
     assert child_env["HOME"] == "/spawned/agent/home"
+    assert child_env["PYTHONIOENCODING"] == "utf-8"
     assert os.environ["HOME"] == "/doctor/home"
     assert os.environ["PGSERVICE"] == "private_failed_recipe"
     assert os.environ["PGDATESTYLE"] == "invalid-runtime-divergence"
@@ -3577,6 +3591,7 @@ def test_isolated_postgres_probe_uses_stdin_and_sanitized_environment(
     assert not any(name.upper().startswith("PG") for name in captured["env"])
     assert captured["env"]["HOME"] == "/runtime/home"
     assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
     assert captured["timeout"] == 10
     assert captured["command"][0] == __import__("sys").executable
     assert captured["command"][1] == "-P"
@@ -3585,17 +3600,48 @@ def test_isolated_postgres_probe_uses_stdin_and_sanitized_environment(
     assert os.environ["PGSERVICE"] == "private-service-name"
 
 
+def test_isolated_probe_tolerates_non_utf8_stderr_with_valid_stdout(
+    monkeypatch,
+):
+    from kestrel_sovereign.doctor import _fetch_postgres_rows_isolated
+
+    def popen(_command, **kwargs):
+        class Process:
+            returncode = 0
+
+            def communicate(self, payload=None, timeout=None):
+                encoding = kwargs["encoding"]
+                errors = kwargs.get("errors", "strict")
+                return (
+                    b'{"ok": true, "rows": [[1]]}'.decode(encoding, errors=errors),
+                    b"libpq noise: \xff\xfe".decode(encoding, errors=errors),
+                )
+
+        return Process()
+
+    monkeypatch.setattr("kestrel_sovereign.doctor.subprocess.Popen", popen)
+
+    rows = _fetch_postgres_rows_isolated(
+        "postgresql://u@h/db?connect_timeout=2", "SELECT 1"
+    )
+
+    assert rows == [(1,)]
+
+
 def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
     monkeypatch,
 ):
     import subprocess
 
     from kestrel_sovereign.doctor import (
-        _PostgresProbeError,
         _fetch_postgres_rows_isolated,
+        _PostgresProbeError,
     )
 
     state = {"communicate_calls": 0, "killed": False}
+    first_host = "first.private.example"
+    second_host = "second.private.example"
+    password = "partial-output-secret"
 
     class Process:
         returncode = None
@@ -3603,9 +3649,24 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
         def communicate(self, payload=None, timeout=None):
             state["communicate_calls"] += 1
             if timeout is not None:
-                raise subprocess.TimeoutExpired("probe", timeout)
+                raise subprocess.TimeoutExpired(
+                    "probe",
+                    timeout,
+                    output=(
+                        '{"progress": "trying '
+                        + second_host
+                        + " with "
+                        + password
+                        + '"}'
+                    ),
+                    stderr=(
+                        'could not translate host name "'
+                        + first_host
+                        + '" to address: deterministic failure'
+                    ),
+                )
             self.returncode = -9
-            return "", ""
+            return "", "libpq retained its earlier address failure"
 
         def kill(self):
             state["killed"] = True
@@ -3615,16 +3676,35 @@ def test_isolated_postgres_probe_kills_and_reaps_a_timed_out_child(
         lambda *_args, **_kwargs: Process(),
     )
 
-    with pytest.raises(_PostgresProbeError, match="terminated"):
+    with pytest.raises(_PostgresProbeError, match="terminated") as raised:
         _fetch_postgres_rows_isolated(
-            "postgresql://u@h/db?connect_timeout=2", "SELECT 1"
+            "postgresql://runtime_user:"
+            + password
+            + "@"
+            + first_host
+            + ","
+            + second_host
+            + "/db?connect_timeout=2",
+            "SELECT 1",
         )
 
     assert state == {"communicate_calls": 2, "killed": True}
+    diagnostic = str(raised.value)
+    assert "could not translate host name" in diagnostic
+    assert "deterministic failure" in diagnostic
+    assert "libpq retained its earlier address failure" in diagnostic
+    assert first_host not in diagnostic
+    assert second_host not in diagnostic
+    assert password not in diagnostic
+    assert "<host>" in diagnostic
+    assert len(diagnostic) < 1200
 
 
 def test_isolated_postgres_probe_kills_and_reaps_on_pipe_failure(monkeypatch):
-    from kestrel_sovereign.doctor import _fetch_postgres_rows_isolated
+    from kestrel_sovereign.doctor import (
+        _fetch_postgres_rows_isolated,
+        _PostgresProbeError,
+    )
 
     state = {"killed": False, "waited": False}
 
@@ -3645,7 +3725,9 @@ def test_isolated_postgres_probe_kills_and_reaps_on_pipe_failure(monkeypatch):
         lambda *_args, **_kwargs: Process(),
     )
 
-    with pytest.raises(OSError, match="broken diagnostic pipe"):
+    with pytest.raises(
+        _PostgresProbeError, match="diagnostic process communication failed"
+    ):
         _fetch_postgres_rows_isolated("postgresql://u@h/db", "SELECT 1")
 
     assert state == {"killed": True, "waited": True}
@@ -3653,22 +3735,20 @@ def test_isolated_postgres_probe_kills_and_reaps_on_pipe_failure(monkeypatch):
 
 def test_isolated_postgres_probe_rejects_non_json_parameters():
     from kestrel_sovereign.doctor import (
-        _PostgresProbeError,
         _fetch_postgres_rows_isolated,
+        _PostgresProbeError,
     )
 
     with pytest.raises(_PostgresProbeError, match="not transportable"):
-        _fetch_postgres_rows_isolated(
-            "postgresql://u@h/db", "SELECT %s", (object(),)
-        )
+        _fetch_postgres_rows_isolated("postgresql://u@h/db", "SELECT %s", (object(),))
 
 
 def test_real_isolated_postgres_probe_reports_an_unreachable_server(
     monkeypatch,
 ):
     from kestrel_sovereign.doctor import (
-        _PostgresProbeError,
         _fetch_postgres_rows_isolated,
+        _PostgresProbeError,
     )
 
     service_name = "private_service_must_not_reach_worker"
@@ -3686,9 +3766,7 @@ def test_real_isolated_postgres_probe_reports_an_unreachable_server(
     assert "isolated PostgreSQL diagnostic process" not in str(raised.value)
     assert service_name not in str(raised.value)
     assert "service" not in str(raised.value).lower()
-    assert "127.0.0.1" in str(raised.value) or "connection" in str(
-        raised.value
-    ).lower()
+    assert "127.0.0.1" in str(raised.value) or "connection" in str(raised.value).lower()
 
 
 def test_absent_passfile_is_materialized_under_private_probe_custody(
@@ -3708,9 +3786,7 @@ def test_absent_passfile_is_materialized_under_private_probe_custody(
         "postgresql://runtime_user@host.example/db", {}, tmp_path
     )
 
-    assert _postgres_fetch_rows_in_process(translated, "SELECT 1", ()) == [
-        (1,)
-    ]
+    assert _postgres_fetch_rows_in_process(translated, "SELECT 1", ()) == [(1,)]
     materialized = Path(parse_dsn(fake.dsn)["passfile"])
     assert str(materialized) != _ABSENT_PASSFILE_SENTINEL
     assert tmp_path.resolve() not in materialized.parents
@@ -3730,7 +3806,7 @@ def test_windows_probe_hides_and_restores_libpq_appdata(monkeypatch):
         return original_connect(dsn)
 
     fake.connect = connect
-    monkeypatch.setattr(worker.sys, "platform", "win32")
+    monkeypatch.setattr(worker, "_IS_WINDOWS", True)
     monkeypatch.setenv("APPDATA", "/operator/appdata")
 
     assert worker.fetch_rows_in_process(
@@ -3794,23 +3870,17 @@ def test_project_env_pg_settings_reach_the_driver_without_being_exported(
     assert "PGPASSWORD" not in os.environ
 
 
-def test_missing_login_name_is_an_unreadable_database_finding(
-    tmp_path, monkeypatch
-):
+def test_missing_login_name_is_an_unreadable_database_finding(tmp_path, monkeypatch):
     _seed_matching_anchor(tmp_path, monkeypatch)
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv(
-        "KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel"
-    )
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel")
     for name in ("PGUSER", "LOGNAME", "USER", "LNAME", "USERNAME"):
         monkeypatch.delenv(name, raising=False)
 
     def no_login_name():
         raise OSError("uid has no passwd entry")
 
-    monkeypatch.setattr(
-        "kestrel_sovereign.doctor._system_account_user", no_login_name
-    )
+    monkeypatch.setattr("kestrel_sovereign.doctor._system_account_user", no_login_name)
 
     report = diagnose(tmp_path)
 
@@ -3894,9 +3964,9 @@ def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
 
     report = diagnose(tmp_path)
 
-    assert any(
-        "constitution drift" in m and drifted[:12] in m for m in report.fail
-    ), f"expected drift against the PostgreSQL hash; got {report.fail} / {report.ok}"
+    assert any("constitution drift" in m and drifted[:12] in m for m in report.fail), (
+        f"expected drift against the PostgreSQL hash; got {report.fail} / {report.ok}"
+    )
     assert not any(stored[:12] in m for m in report.ok)
 
 
@@ -3918,9 +3988,7 @@ def test_the_runtime_read_is_scoped_to_this_agent(tmp_path, monkeypatch):
     diagnose(tmp_path)
 
     node_reads = [
-        (sql, params)
-        for sql, params in fake.executed
-        if "FROM graph_nodes" in sql
+        (sql, params) for sql, params in fake.executed if "FROM graph_nodes" in sql
     ]
     assert node_reads, "doctor never asked PostgreSQL anything"
     for sql, params in node_reads:
@@ -4081,7 +4149,8 @@ def test_a_pre_migration_anchor_still_only_warns(tmp_path, monkeypatch):
 
 
 def test_a_missing_witness_before_the_backfill_is_pending_not_broken(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """Table existence is not the same fact as backfill completion.
 
@@ -4127,7 +4196,7 @@ def test_a_missing_witness_after_the_backfill_is_permanent(tmp_path):
 
 
 def test_a_failed_existence_probe_never_claims_the_runtime_is_empty(tmp_path):
-    """"Something is there, do not call this empty" is the safe direction.
+    """ "Something is there, do not call this empty" is the safe direction.
 
     ``_row_physically_exists`` decides whether a bound read that found nothing
     means *absent* (replication repairs it) or *unowned* (it cannot). A probe
@@ -4191,28 +4260,127 @@ def test_doctor_timeout_is_divided_across_libpq_hosts(tmp_path):
 def test_worker_timeout_covers_every_floored_libpq_host():
     from kestrel_sovereign.doctor import _postgres_probe_timeout_seconds
 
-    dsn = (
-        "postgresql://u@h1,h2,h3,h4,h5,h6/db"
-        "?connect_timeout=2"
-    )
+    dsn = "postgresql://u@h1,h2,h3,h4,h5,h6/db?connect_timeout=2"
 
     assert _postgres_probe_timeout_seconds(dsn) == 17
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
-def test_invalid_doctor_postgres_timeout_fails_as_configuration(
-    tmp_path, value
-):
+@pytest.mark.parametrize("value", ["", " ", "\t \n"])
+def test_blank_doctor_postgres_timeout_uses_the_default(tmp_path, value):
+    from psycopg2.extensions import parse_dsn
+
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
-    with pytest.raises(
-        ValueError, match="KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS"
-    ):
+    translated = _doctor_postgres_dsn(
+        "postgresql://u@h/db",
+        {"KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS": value},
+        tmp_path,
+    )
+
+    assert parse_dsn(translated)["connect_timeout"] == "5"
+
+
+def test_blank_project_timeout_reaches_diagnose_as_the_default(tmp_path, monkeypatch):
+    from psycopg2.extensions import parse_dsn
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        env_path.read_text() + "\nKESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS=   \n"
+    )
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert parse_dsn(fake.dsn)["connect_timeout"] == "5"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_invalid_doctor_postgres_timeout_fails_as_configuration(tmp_path, value):
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    with pytest.raises(ValueError, match="KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS"):
         _doctor_postgres_dsn(
             "postgresql://u@h/db",
             {"KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS": value},
             tmp_path,
         )
+
+
+def test_invalid_project_timeout_is_not_reported_as_a_database_outage(
+    tmp_path, monkeypatch
+):
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        env_path.read_text()
+        + "\nKESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS=not-an-integer\n"
+    )
+
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert not fake.executed
+    assert "PostgreSQL doctor configuration is invalid" in findings
+    assert "Runtime database reachability was not established" in findings
+    assert "runtime database access with those settings will fail" not in findings
+
+
+def test_libpq_direct_tls_limit_is_diagnostic_blindness_not_runtime_outage(
+    tmp_path, monkeypatch
+):
+    from kestrel_sovereign import doctor as doctor_module
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://durable.example/kestrel?sslmode=require&sslnegotiation=direct",
+    )
+    accepts = doctor_module._libpq_accepts_dsn_option
+    monkeypatch.setattr(
+        doctor_module,
+        "_libpq_accepts_dsn_option",
+        lambda name, value: False if name == "sslnegotiation" else accepts(name, value),
+    )
+
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert not fake.executed
+    assert "cannot construct an equivalent libpq diagnostic connection" in findings
+    assert "runtime connection option 'sslnegotiation'" in findings
+    assert "Runtime database reachability was not established" in findings
+    assert "runtime database access with those settings will fail" not in findings
+
+
+def test_shared_invalid_sslmode_is_reported_as_runtime_configuration(
+    tmp_path, monkeypatch
+):
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    fake = _FakePostgres({})
+    _postgres_host(monkeypatch, fake)
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://durable.example/kestrel?sslmode=invalid-mode",
+    )
+
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert not fake.executed
+    assert "runtime PostgreSQL configuration is invalid" in findings
+    assert "shared with the spawned asyncpg runtime" in findings
+    assert "cannot open the configured database until it is fixed" in findings
+    assert "Runtime database reachability was not established" not in findings
 
 
 def test_the_emancipation_contract_survives_a_falsy_but_real_value():
@@ -4227,30 +4395,39 @@ def test_the_emancipation_contract_survives_a_falsy_but_real_value():
     assert _anchored_emancipation_contract({}) is None
 
 
-def test_an_unreadable_source_on_postgres_fails_even_before_a_source_exists(
-    tmp_path,
-):
+def test_postgres_failure_provenance_does_not_depend_on_reason_text():
     """Resolution can fail before a ``_GovernanceSource`` is built at all.
 
-    ``_report_unexamined`` still has to decide fail-vs-warn, and it reads the
-    backend out of the reason text in that case. If that ever stops matching,
-    an unreachable PostgreSQL silently becomes a warning again — and warnings
-    leave ``ready`` true.
+    The structured connection kind, not the word ``PostgreSQL``, makes this a
+    runtime-impacting failure. Conversely, PostgreSQL-looking prose without
+    provenance must not manufacture a reachability claim.
     """
-    from kestrel_sovereign.doctor import DoctorReport, _UnreadableDB, _report_unexamined
+    from kestrel_sovereign.doctor import DoctorReport, _report_unexamined, _UnreadableDB
 
     report = DoctorReport()
-    sentinel = _UnreadableDB(reason="cannot read PostgreSQL (connection refused)")
+    sentinel = _UnreadableDB(
+        reason="connection refused",
+        postgres_failure="connection",
+    )
     _report_unexamined("Test", sentinel.reason, sentinel, report)
 
     assert report.fail and not report.warn, (report.fail, report.warn)
     assert not report.ready
+    assert "equivalent libpq connection failed" in report.fail[0]
+
+    unknown = DoctorReport()
+    unclassified = _UnreadableDB(reason="cannot read PostgreSQL")
+    _report_unexamined("Test", unclassified.reason, unclassified, unknown)
+
+    assert not unknown.fail
+    assert unknown.warn
 
 
 def test_an_edge_the_agent_does_not_own_is_reported_as_a_ledger_problem(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
-    """"No edge" and "an edge I cannot use" are different findings.
+    """ "No edge" and "an edge I cannot use" are different findings.
 
     The writer deletes an *ownerless* correct edge and re-creates it, so a
     forced reanchor really does repair that one. An edge witnessed by another
@@ -4271,7 +4448,8 @@ def test_an_edge_the_agent_does_not_own_is_reported_as_a_ledger_problem(
 
 
 def test_doctor_catches_a_crlf_smudged_semantic_checkout_before_boot(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """The registry mismatch that bricks agent boot must be a doctor failure.
 
@@ -4330,7 +4508,8 @@ def test_doctor_catches_a_crlf_smudged_semantic_checkout_before_boot(
 
 
 def test_doctor_reports_an_unparseable_semantic_manifest_instead_of_crashing(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """A malformed manifest must be a readiness failure, not a traceback.
 

@@ -39,10 +39,7 @@ from urllib.parse import quote, urlsplit
 import pytest
 from cryptography.fernet import Fernet
 
-from kestrel_sovereign.doctor import (
-    _LIBPQ_COMPILED_DSN_DEFAULTS,
-    diagnose,
-)
+from kestrel_sovereign.doctor import diagnose
 from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
@@ -113,9 +110,7 @@ def runtime_db():
             " label TEXT NOT NULL, properties TEXT,"
             " PRIMARY KEY (source_id, target_id, label))"
         )
-        cursor.execute(
-            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
-        )
+        cursor.execute("CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)")
         cursor.execute(
             "CREATE TABLE graph_edge_owners ("
             " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
@@ -128,9 +123,7 @@ def runtime_db():
             " name TEXT PRIMARY KEY,"
             " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
-        cursor.execute(
-            "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
-        )
+        cursor.execute("INSERT INTO schema_backfills (name) VALUES ('ownership_2649')")
 
     def seed(
         did: str,
@@ -149,8 +142,7 @@ def runtime_db():
             )
             if witness_node:
                 cursor.execute(
-                    "INSERT INTO graph_node_owners (node_id, agent_id) "
-                    "VALUES (%s, %s)",
+                    "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (%s, %s)",
                     (did, did),
                 )
             if governed_by is not None:
@@ -195,9 +187,7 @@ def _seed_governance_schema(dsn: str, schema: str, constitution_hash: str) -> No
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
-            )
+            cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
             for table in (
                 "graph_nodes",
                 "graph_edges",
@@ -250,8 +240,7 @@ def _seed_governance_schema(dsn: str, schema: str, constitution_hash: str) -> No
             )
             cursor.execute(
                 sql.SQL(
-                    "INSERT INTO {}.schema_backfills (name) "
-                    "VALUES ('ownership_2649')"
+                    "INSERT INTO {}.schema_backfills (name) VALUES ('ownership_2649')"
                 ).format(sql.Identifier(schema))
             )
     finally:
@@ -381,9 +370,9 @@ def test_doctor_reads_the_database_the_agent_is_governed_by(
 
     report = diagnose(tmp_path)
 
-    assert any(
-        "constitution drift" in m and stale[:12] in m for m in report.fail
-    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
+        f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    )
 
 
 def test_doctor_agrees_with_the_runtime_after_a_reanchor(
@@ -406,9 +395,9 @@ def test_doctor_agrees_with_the_runtime_after_a_reanchor(
     report = diagnose(tmp_path)
 
     assert not any("constitution drift" in m for m in report.fail), report.fail
-    assert any(
-        "constitution anchored to current file" in m for m in report.ok
-    ), report.ok
+    assert any("constitution anchored to current file" in m for m in report.ok), (
+        report.ok
+    )
 
 
 def test_doctor_does_not_answer_about_a_neighbouring_agent(
@@ -498,9 +487,9 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
 
     report = diagnose(tmp_path)
 
-    assert any(
-        "constitution drift" in m and stale[:12] in m for m in report.fail
-    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
+        f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    )
     assert "KESTREL_DB_BACKEND" not in os.environ, (
         "a diagnostic must not export the project's environment"
     )
@@ -527,7 +516,7 @@ def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
 
     passfile = tmp_path / "secrets" / "runtime.pgpass"
     passfile.parent.mkdir()
-    passfile.write_text(f'*:*:*:*:{parsed["password"]}\n')
+    passfile.write_text(f"*:*:*:*:{parsed['password']}\n")
     passfile.chmod(0o600)
 
     for name in (
@@ -545,9 +534,7 @@ def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
         "KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii"),
         "OPENAI_API_KEY": "sk-x",
         "KESTREL_DB_BACKEND": "postgres",
-        "KESTREL_DATABASE_URL": (
-            "postgresql:///" + quote(parsed["dbname"], safe="")
-        ),
+        "KESTREL_DATABASE_URL": ("postgresql:///" + quote(parsed["dbname"], safe="")),
         "PGHOST": parsed["host"],
         "PGPORT": parsed["port"],
         "PGUSER": parsed["user"],
@@ -595,33 +582,31 @@ async def test_multi_host_pgpass_password_is_frozen_before_fallback(
         pytest.skip("adversarial pgpass fixture requires unescaped fields")
 
     bad_port = "1" if parsed["port"] != "1" else "2"
-    passfile_host = (
-        "localhost" if parsed["host"].startswith("/") else parsed["host"]
-    )
+    passfile_host = "localhost" if parsed["host"].startswith("/") else parsed["host"]
     passfile = tmp_path / "fallback.pgpass"
     passfile.write_text(
-        f'{passfile_host}:{bad_port}:{parsed["dbname"]}:'
-        f'{parsed["user"]}:{parsed["password"]}\n'
-        f'{passfile_host}:{parsed["port"]}:{parsed["dbname"]}:'
-        f'{parsed["user"]}:deliberately-wrong-password\n'
+        f"{passfile_host}:{bad_port}:{parsed['dbname']}:"
+        f"{parsed['user']}:{parsed['password']}\n"
+        f"{passfile_host}:{parsed['port']}:{parsed['dbname']}:"
+        f"{parsed['user']}:deliberately-wrong-password\n"
     )
     passfile.chmod(0o600)
     query = {
-        "host": f'{parsed["host"]},{parsed["host"]}',
-        "port": f'{bad_port},{parsed["port"]}',
+        "host": f"{parsed['host']},{parsed['host']}",
+        "port": f"{bad_port},{parsed['port']}",
         "user": parsed["user"],
         "passfile": str(passfile),
     }
     if parsed.get("sslmode"):
         query["sslmode"] = parsed["sslmode"]
+
     def build_dsn(values):
         return (
             "postgresql:///"
             + quote(parsed["dbname"], safe="")
             + "?"
             + "&".join(
-                f"{name}={quote(value, safe='')}"
-                for name, value in values.items()
+                f"{name}={quote(value, safe='')}" for name, value in values.items()
             )
         )
 
@@ -640,9 +625,7 @@ async def test_multi_host_pgpass_password_is_frozen_before_fallback(
         for name in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE"):
             connection_env.delenv(name, raising=False)
         try:
-            wrong_connection = await asyncpg.connect(
-                build_dsn(wrong_password_query)
-            )
+            wrong_connection = await asyncpg.connect(build_dsn(wrong_password_query))
         except asyncpg.InvalidPasswordError:
             pass
         else:
@@ -685,9 +668,7 @@ def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
-            )
+            cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
             for table in (
                 "graph_nodes",
                 "graph_edges",
@@ -713,8 +694,7 @@ def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
     assert any(
-        "constitution anchored to current file" in message
-        for message in report.ok
+        "constitution anchored to current file" in message for message in report.ok
     ), report.ok
 
 
@@ -752,8 +732,7 @@ async def test_direct_startup_setting_outranks_options_for_doctor_and_asyncpg(
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
     assert any(
-        "constitution anchored to current file" in message
-        for message in report.ok
+        "constitution anchored to current file" in message for message in report.ok
     ), report.ok
 
 
@@ -784,8 +763,7 @@ def test_libpq_only_pgoptions_cannot_change_doctors_schema(
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
     assert any(
-        "constitution anchored to current file" in message
-        for message in report.ok
+        "constitution anchored to current file" in message for message in report.ok
     ), report.ok
 
 
@@ -824,8 +802,7 @@ def test_libpq_service_recipe_cannot_redirect_doctor(
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
     assert any(
-        "constitution anchored to current file" in message
-        for message in report.ok
+        "constitution anchored to current file" in message for message in report.ok
     ), report.ok
     assert "private_service_identity" not in " ".join(
         report.ok + report.warn + report.fail
@@ -874,9 +851,7 @@ async def test_bare_slash_database_cannot_fall_through_to_pgdatabase(
     bare_database_dsn = runtime_db.dsn.rsplit("/", 1)[0] + "/"
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", bare_database_dsn)
-    monkeypatch.setenv(
-        "PGDATABASE", urlsplit(runtime_db.dsn).path.removeprefix("/")
-    )
+    monkeypatch.setenv("PGDATABASE", urlsplit(runtime_db.dsn).path.removeprefix("/"))
 
     translated = parse_dsn(
         _doctor_postgres_dsn(
@@ -894,14 +869,10 @@ async def test_bare_slash_database_cannot_fall_through_to_pgdatabase(
     else:
         asyncpg_connected = True
         try:
-            selected_database = await connection.fetchval(
-                "SELECT current_database()"
-            )
+            selected_database = await connection.fetchval("SELECT current_database()")
         finally:
             await connection.close()
-        assert selected_database != urlsplit(runtime_db.dsn).path.removeprefix(
-            "/"
-        )
+        assert selected_database != urlsplit(runtime_db.dsn).path.removeprefix("/")
 
     report = diagnose(tmp_path)
 
@@ -971,10 +942,6 @@ def test_compiled_libpq_defaults_remain_connectable_without_environment(
 
     report = diagnose(tmp_path)
 
-    assert _LIBPQ_COMPILED_DSN_DEFAULTS == (
-        ("gssencmode", "disable"),
-        ("channel_binding", "disable"),
-    )
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
@@ -1187,7 +1154,14 @@ async def test_direct_negotiation_matches_runtime_or_fails_closed(
         f"ok={report.ok} warn={report.warn} fail={report.fail}"
     )
     if not doctor_ready:
-        assert any("cannot read PostgreSQL" in message for message in report.fail)
+        assert any(
+            "cannot construct an equivalent libpq diagnostic connection" in message
+            for message in report.fail
+        )
+        assert any(
+            "Runtime database reachability was not established" in message
+            for message in report.fail
+        )
 
 
 async def test_explicit_missing_tls_file_fails_like_the_asyncpg_runtime(
@@ -1219,7 +1193,13 @@ async def test_explicit_missing_tls_file_fails_like_the_asyncpg_runtime(
     report = diagnose(tmp_path)
 
     assert not report.ready
-    assert any("cannot read PostgreSQL" in message for message in report.fail)
+    assert any(
+        "runtime PostgreSQL configuration is invalid" in message
+        for message in report.fail
+    )
+    assert any(
+        "shared with the spawned asyncpg runtime" in message for message in report.fail
+    )
     assert all(str(missing_certificate) not in message for message in report.fail)
 
 
@@ -1285,12 +1265,12 @@ async def test_a_stale_anchor_awaiting_replication_is_not_ready(
 
     report = diagnose(tmp_path)
 
-    assert any(
-        "holds no record for this agent yet" in m for m in report.warn
-    ), f"warn={report.warn}"
-    assert any(
-        "constitution drift" in m and stale[:12] in m for m in report.fail
-    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any("holds no record for this agent yet" in m for m in report.warn), (
+        f"warn={report.warn}"
+    )
+    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
+        f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    )
 
 
 async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
@@ -1307,6 +1287,7 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
     _seed_project(tmp_path, anchored_hash=canonical)
     # Drop the schema the fixture created: this database has never been booted.
     import psycopg2
+
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1315,8 +1296,10 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
             # opened has *nothing*, and leaving the marker table behind made
             # this test pass against a probe that cannot survive its absence.
             for table in (
-                "graph_nodes", "graph_edges",
-                "graph_node_owners", "graph_edge_owners",
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
                 "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -1329,9 +1312,9 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
     report = diagnose(tmp_path)
 
     assert report.ready, f"fail={report.fail}"
-    assert any(
-        "holds no record for this agent yet" in m for m in report.warn
-    ), f"warn={report.warn}"
+    assert any("holds no record for this agent yet" in m for m in report.warn), (
+        f"warn={report.warn}"
+    )
     assert any("constitution anchored to current file" in m for m in report.ok)
 
 
@@ -1342,6 +1325,7 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     stale = hashlib.sha256(b"an older constitution").hexdigest()
     _seed_project(tmp_path, anchored_hash=stale)
     import psycopg2
+
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1350,8 +1334,10 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
             # opened has *nothing*, and leaving the marker table behind made
             # this test pass against a probe that cannot survive its absence.
             for table in (
-                "graph_nodes", "graph_edges",
-                "graph_node_owners", "graph_edge_owners",
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
                 "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -1364,9 +1350,9 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     report = diagnose(tmp_path)
 
     assert not report.ready
-    assert any(
-        "constitution drift" in m and stale[:12] in m for m in report.fail
-    ), f"fail={report.fail}"
+    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
+        f"fail={report.fail}"
+    )
 
 
 async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
@@ -1386,6 +1372,7 @@ async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
     runtime_db(AGENT_DID, {"initialBalance": "100.0"}, governed_by=None)
     # The label half of the predicate, as _ensure_agent_node_present writes it.
     import psycopg2
+
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1403,12 +1390,12 @@ async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
     report = diagnose(tmp_path)
 
     assert not report.ready, f"ok={report.ok} warn={report.warn}"
-    assert any(
-        "holds no record for this agent yet" in m for m in report.warn
-    ), f"warn={report.warn}"
-    assert any(
-        "constitution drift" in m and stale[:12] in m for m in report.fail
-    ), f"fail={report.fail}"
+    assert any("holds no record for this agent yet" in m for m in report.warn), (
+        f"warn={report.warn}"
+    )
+    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
+        f"fail={report.fail}"
+    )
 
 
 async def test_a_real_agent_row_is_not_mistaken_for_a_placeholder(
@@ -1605,7 +1592,7 @@ async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
-        witness_edge=False,   # the node is owned; the edge is not
+        witness_edge=False,  # the node is owned; the edge is not
     )
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION)

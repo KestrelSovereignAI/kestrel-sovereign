@@ -14,18 +14,34 @@ import sys
 import tempfile
 from pathlib import Path
 
+_IS_WINDOWS = sys.platform == "win32"
+
 
 class ProbeError(RuntimeError):
     """A driver failure safe to return over the worker protocol."""
 
 
+class ProbeConnectionError(ProbeError):
+    """The equivalent libpq connection itself failed."""
+
+
+class ProbeQueryError(ProbeError):
+    """The connection opened, but the governance query failed."""
+
+
 def _query_postgres_driver(driver, dsn: str, sql: str, params) -> list:
     """Run one query through a psycopg2-compatible driver."""
-    connection = driver.connect(dsn)
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(sql, params)
-            return cursor.fetchall()
+        connection = driver.connect(dsn)
+    except Exception as exc:
+        raise ProbeConnectionError(str(exc)) from exc
+    try:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchall()
+        except Exception as exc:
+            raise ProbeQueryError(str(exc)) from exc
     finally:
         connection.close()
 
@@ -50,30 +66,26 @@ def fetch_rows_in_process(
         # unrelated defaults for the duration of this one child-local query.
         old_appdata = os.environ.get("APPDATA")
         had_appdata = "APPDATA" in os.environ
-        if sys.platform == "win32":
+        if _IS_WINDOWS:
             os.environ["APPDATA"] = str(Path(temp_dir) / "absent-appdata")
-        if (
-            driver.extensions.parse_dsn(dsn).get("passfile")
-            == absent_passfile_sentinel
-        ):
+        if driver.extensions.parse_dsn(dsn).get("passfile") == absent_passfile_sentinel:
             # The worker directory has private mkdtemp custody.  Its ``absent``
             # child is never created, so no process can race a passfile into
             # place between translation and libpq's open.
             passfile = Path(temp_dir) / "absent" / "pgpass"
-            effective_dsn = driver.extensions.make_dsn(
-                dsn, passfile=str(passfile)
-            )
+            effective_dsn = driver.extensions.make_dsn(dsn, passfile=str(passfile))
 
         try:
             try:
-                return _query_postgres_driver(
-                    driver, effective_dsn, sql, params
-                )
-            except Exception as exc:  # noqa: BLE001 - driver diagnostics
+                return _query_postgres_driver(driver, effective_dsn, sql, params)
+            except ProbeError as exc:
+                message = str(exc).replace(temp_dir, "<probe-temp>")
+                raise type(exc)(message) from exc
+            except Exception as exc:
                 message = str(exc).replace(temp_dir, "<probe-temp>")
                 raise ProbeError(message) from exc
         finally:
-            if sys.platform == "win32":
+            if _IS_WINDOWS:
                 if had_appdata:
                     os.environ["APPDATA"] = old_appdata or ""
                 else:
@@ -94,8 +106,12 @@ def main() -> None:
         # returns JSON-native scalars.  A future query that does not must fail
         # closed rather than silently changing bytes/datetime/Decimal values.
         output = json.dumps({"ok": True, "rows": rows})
+    except ProbeConnectionError as exc:
+        output = json.dumps({"ok": False, "kind": "connection", "error": str(exc)})
+    except ProbeQueryError as exc:
+        output = json.dumps({"ok": False, "kind": "query", "error": str(exc)})
     except Exception as exc:  # noqa: BLE001 - protocol carries safe text only
-        output = json.dumps({"ok": False, "error": str(exc)})
+        output = json.dumps({"ok": False, "kind": "diagnostic", "error": str(exc)})
     sys.stdout.write(output)
 
 
