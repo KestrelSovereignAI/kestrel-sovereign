@@ -187,15 +187,18 @@ docker run --rm -v <project>_postgres-data:/var/lib/postgresql/data \
 # server that could have read the volume.
 until docker exec kestrel-pg15-dump pg_isready -U kestrel_user -q; do sleep 1; done
 
-docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql
-
-# Check before discarding the source. pg_dumpall exits 0 on an empty database,
-# so a non-empty file is the only evidence the dump actually carries data.
-[ -s pg15-dump.sql ] && grep -q "PostgreSQL database cluster dump" pg15-dump.sql \
-  && echo "dump looks good" || echo "DUMP IS EMPTY — do not remove the volume"
-
-docker rm -f kestrel-pg15-dump
-docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
+# Gate everything downstream on pg_dumpall's EXIT STATUS, not on what landed
+# in the file. pg_dumpall writes its "PostgreSQL database cluster dump" header
+# before it streams any data, so a run that dies partway — corrupt relation,
+# read error, full disk — leaves a file that looks well-formed and is
+# truncated. Only the exit status separates "started" from "finished".
+if docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql; then
+  docker rm -f kestrel-pg15-dump
+  docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
+else
+  echo "pg_dumpall FAILED — pg15-dump.sql is incomplete."
+  echo "Keep <project>_postgres-data and the kestrel-pg15-dump container."
+fi
 ```
 
 ## Port Forwarding
