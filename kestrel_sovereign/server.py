@@ -310,12 +310,28 @@ def _latch_active_scheduler_runner_failures(
             )
 
     for agent_name, candidate in candidates:
-        features = getattr(candidate, "features", None)
+        try:
+            features = getattr(candidate, "features", None)
+        except Exception:  # pragma: no cover - health must not crash
+            logger.warning(
+                "Unable to inspect scheduler features for %s",
+                agent_name,
+                exc_info=True,
+            )
+            continue
         if not isinstance(features, dict):
             continue
         for feature in features.values():
-            runner = getattr(feature, "_runner", None)
-            failure = getattr(runner, "readiness_failure", None)
+            try:
+                runner = getattr(feature, "_runner", None)
+                failure = getattr(runner, "readiness_failure", None)
+            except Exception:  # pragma: no cover - health must not crash
+                logger.warning(
+                    "Unable to inspect scheduler runner for %s",
+                    agent_name,
+                    exc_info=True,
+                )
+                continue
             if isinstance(failure, BaseException):
                 _latch_scheduler_readiness_failure(
                     app,
@@ -328,6 +344,67 @@ def _latch_active_scheduler_runner_failures(
     host_failure = getattr(host_runner, "readiness_failure", None)
     if isinstance(host_failure, BaseException):
         _latch_scheduler_readiness_failure(app, "protocol", host_failure)
+
+
+def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
+    """Return false while any requested scheduler arm lacks a live worker."""
+
+    runners = []
+    candidates = [agent] if agent is not None else []
+    if manager is not None:
+        try:
+            candidates.extend(manager.list_agents().values())
+        except Exception:  # pragma: no cover - public health must not crash
+            return False
+    for candidate in candidates:
+        try:
+            features = getattr(candidate, "features", None)
+        except Exception:  # pragma: no cover - public health must not crash
+            logger.warning(
+                "Unable to inspect scheduler worker availability",
+                exc_info=True,
+            )
+            return False
+        if not isinstance(features, dict):
+            continue
+        for feature in features.values():
+            try:
+                runner = getattr(feature, "_runner", None)
+                if (
+                    runner is not None
+                    and hasattr(runner, "worker_available")
+                    and (
+                        getattr(runner, "_arm_requested", False)
+                        or getattr(runner, "_running", False)
+                    )
+                ):
+                    runners.append(runner)
+            except Exception:  # pragma: no cover - public health must not crash
+                logger.warning(
+                    "Unable to inspect scheduler worker availability",
+                    exc_info=True,
+                )
+                return False
+    try:
+        host_runner = getattr(app.state, "host_scheduler_runner", None)
+        if (
+            host_runner is not None
+            and hasattr(host_runner, "worker_available")
+            and (
+                getattr(host_runner, "_arm_requested", False)
+                or getattr(host_runner, "_running", False)
+            )
+        ):
+            runners.append(host_runner)
+        return all(
+            getattr(runner, "worker_available", False) for runner in runners
+        )
+    except Exception:  # pragma: no cover - public health must not crash
+        logger.warning(
+            "Unable to inspect scheduler worker availability",
+            exc_info=True,
+        )
+        return False
 
 
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
@@ -3201,6 +3278,9 @@ def health_check(request: Request):
             content={"status": "unhealthy", "agent_initialized": False},
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
+    scheduler_workers_available = _active_scheduler_workers_available(
+        request.app, agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state,
         "scheduler_readiness_failures",
@@ -3213,6 +3293,7 @@ def health_check(request: Request):
         or identity_failures
         or constitution_safe_mode
         or scheduler_failures
+        or not scheduler_workers_available
     ):
         return JSONResponse(
             status_code=503,

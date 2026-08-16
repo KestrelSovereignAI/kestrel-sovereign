@@ -91,6 +91,48 @@ next occurrence; recovery of an uncompleted occurrence retains the execution
 identity and increments that occurrence's attempt. Renewal remains alive until
 the terminal CAS finishes, including when the caller is being cancelled.
 
+## Worker supervision and liveness
+
+The polling loop is a replaceable worker owned by a scheduler supervisor. An
+infrastructure exception escapes that worker, is reported as `restarting`, and
+causes a restart with exponential backoff bounded between one and thirty
+seconds. The escaped failure also latches host readiness fail-closed even if a
+replacement worker later completes a tick; recovery does not erase the durable
+evidence that scheduler infrastructure failed during this process. Runtime
+telemetry runs on an independently-owned heartbeat, so a long cognition task
+does not make a live worker look stale. Those writes are bounded, best-effort
+observers and cannot kill or indefinitely delay the polling loop.
+Occurrence-level failures remain isolated inside a tick and are
+finalized independently, so one failed scheduled task neither cancels its
+siblings nor kills the polling worker.
+
+Every poller emits one row per authorized agent to
+`scheduler_runtime_status`, including agents with zero schedules. The report
+contains worker state, tick timestamps, restart/failure counts, and exact
+runnable, executing, configured-enabled, paused, protocol-fenced, and
+scheduler-disabled counts. Consequently, these states remain distinct:
+
+- no runtime report was received;
+- a current worker explicitly reports zero schedule rows;
+- schedules exist but were deliberately paused by an operator;
+- an occurrence is executing under a current claim lease;
+- schedules are temporarily fenced by scheduler protocol; and
+- scheduler safety policy disabled one or more schedules.
+
+The Health feature reads this report through the same scheduler-status helper
+used by `schedule_list`. Missing or stale telemetry, a stopped/restarting
+worker, or unclaimed work older than both the telemetry threshold and its
+misfire grace fails the critical `scheduler_liveness` check. A due batch owned
+by the current tick remains healthy while rows wait behind the bounded
+concurrency semaphore. A current worker with zero schedules passes. A live
+claim is reported as executing and remains configured-enabled; only an absent
+or expired claim lease is classified as protocol recovery. Scheduler-disabled
+rows warn with their reason; operator pauses do not impersonate a worker
+outage. Durable reports carry a per-runner owner ID, and standalone startup
+grace begins when final readiness actually arms that runner. The arm timestamp
+keeps a prior `stopped`, stale, or same-owner row from masking missing telemetry
+for the current lifecycle.
+
 ## Protocol-v2 rollout fence
 
 The old scheduler only selected `agent_id`, `enabled`, and `next_run_at`. It
@@ -168,6 +210,13 @@ cannot prove whether that external effect happened, so a fenced non-claim row
 that was already due at activation remains disabled with terminal status
 `rollout_ambiguous_legacy_occurrence`. An operator must reconcile the effect
 and explicitly resume that schedule; activation never guesses or replays it.
+`schedule_list` identifies this as a scheduler-originated, recoverable
+disablement and names `schedule_resume` as the recovery action. Resume is
+serialized against the active rollout control row, recomputes the next cron
+occurrence from the database clock, and clears the terminal reason only when
+the caller passes `acknowledge_ambiguous_effect=true`. Invalid
+persisted idempotency keys are not blindly re-enabled; they must be repaired or
+the schedule recreated first.
 
 Pausing remains permitted during quiescence and is serialized with the control
 row, so a fence is not mistaken for an already-paused user request and later

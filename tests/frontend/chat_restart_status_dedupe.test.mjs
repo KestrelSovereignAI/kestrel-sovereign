@@ -241,6 +241,38 @@ test('restart status falls back to requester DID for older or unresolved payload
 });
 
 
+test('escalated restart status renders structured blocker and age evidence', () => {
+    resetPane();
+    chatModule.handleRestartStatus(basePayload({
+        status: 'escalated',
+        dedupe_signature: '7f9ee2dab18b4f079ce2e03ba7122b9d:escalated',
+        escalated: true,
+        request_age_seconds: 1804.4,
+        deferral_age_seconds: 1801.2,
+        blocker: {
+            scope: 'cohosted_agent',
+            kind: 'active_requests',
+            count: 2,
+            oldest_age_seconds: 91.6,
+        },
+    }));
+
+    const bubble = pane.element.querySelectorAll('.restart-status-message')[0];
+    assert.equal(bubble.style.borderLeftColor, 'rgba(239, 68, 68, 0.95)');
+    assert.match(bubble._innerHTML, /restart-status-state-escalated/);
+    assert.match(bubble._innerHTML, /Request age/);
+    assert.match(bubble._innerHTML, /1804s/);
+    assert.match(bubble._innerHTML, /Continuous deferral/);
+    assert.match(bubble._innerHTML, /1801s/);
+    assert.match(bubble._innerHTML, /Blocker kind/);
+    assert.match(bubble._innerHTML, /active_requests/);
+    assert.match(bubble._innerHTML, /Blocker count/);
+    assert.match(bubble._innerHTML, />2</);
+    assert.match(bubble._innerHTML, /Blocker oldest/);
+    assert.match(bubble._innerHTML, /92s/);
+});
+
+
 test('stream-boundary: status mid-stream finalizes current bubble and arms a fresh one below', () => {
     resetPane();
     const streamingBubble = makeNode();

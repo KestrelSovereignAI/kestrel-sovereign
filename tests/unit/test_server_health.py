@@ -214,6 +214,137 @@ def test_health_latches_loaded_scheduler_runner_safety_failure():
     assert "secret" not in detailed.text
 
 
+def test_health_fails_while_scheduler_supervisor_has_no_worker():
+    """A dead polling task cannot be hidden by otherwise healthy process state."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _running=True,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_health_fails_when_scheduler_arm_was_requested_but_never_started():
+    """A swallowed on_agent_ready failure remains visible to the LB probe."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _arm_requested=True,
+        _running=False,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_health_ignores_unrelated_feature_private_runner_attribute():
+    """Only runners exposing the scheduler readiness contract are inspected."""
+    from kestrel_sovereign.server import _active_scheduler_workers_available
+
+    unrelated = SimpleNamespace(_running=True)
+    agent = SimpleNamespace(
+        features={"ThirdPartyFeature": SimpleNamespace(_runner=unrelated)}
+    )
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(host_scheduler_runner=None)
+    )
+
+    assert _active_scheduler_workers_available(fake_app, agent, None) is True
+
+
+def test_health_probe_fails_closed_when_agent_features_cannot_be_inspected():
+    """A broken feature accessor returns controlled 503 instead of HTTP 500."""
+    from server import app
+
+    class BrokenFeatureInventory:
+        @property
+        def features(self):
+            raise RuntimeError("synthetic feature inventory failure")
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = BrokenFeatureInventory()
+        app.state.agent_manager = None
+        app.state.scheduler_readiness_failures = []
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.scheduler_readiness_failures = original_scheduler_failures
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
 def test_load_balancer_probe_reports_minimal_degraded_state():
     """A remote probe needs readiness, not deployment diagnostics."""
     from server import app

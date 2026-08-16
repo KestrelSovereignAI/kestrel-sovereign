@@ -432,6 +432,32 @@ async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path):
     assert "did:test:sibling" in state["reason"]
 
 
+@pytest.mark.asyncio
+async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    sibling = _idle_sibling("did:test:sibling", busy=False)
+    blocked = asyncio.Event()
+
+    async def private_counterparty_sync():
+        await blocked.wait()
+
+    task = asyncio.create_task(
+        private_counterparty_sync(), name="private-counterparty-sync"
+    )
+    sibling._background_tasks = {task}
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+    try:
+        state = feat._fleet_idle(ignore_request_id="")
+        assert state["idle"] is False
+        assert state["blocker"]["summary"] is None
+        assert "private-counterparty-sync" not in state["reason"]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 # ---------------------------------------------------------------------------
 # Store layer
 # ---------------------------------------------------------------------------
@@ -519,6 +545,8 @@ async def test_request_restart_creates_pending_row(tmp_path):
     req = result.data["request"]
     assert req["status"] == "pending"
     assert req["requested_by_agent"] == "did:test:agent"
+    assert req["first_blocked_at"] == ""
+    assert req["escalation_acknowledged"] is True
     # Persisted to the table.
     rows = await list_requests(backend)
     assert any(r.id == req["id"] for r in rows)
@@ -962,6 +990,12 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
 
     assert mock_spawn.call_count == 1
     assert result.data["executed"][0]["request_id"] == req.id
+    events = await feat.list_restart_status_events()
+    request_events = [
+        event for event in events.data["events"]
+        if event["request_id"] == req.id
+    ]
+    assert all(event["state"] != "escalated" for event in request_events)
 
 
 @pytest.mark.asyncio
@@ -4057,6 +4091,22 @@ async def _insert_raw(db, request_id, **cols):
         f"INSERT INTO restart_requests ({names}) VALUES ({marks})",
         tuple(fields.values()),
     )
+
+
+@pytest.mark.asyncio
+async def test_migrated_pending_request_requires_escalation_acknowledgement(
+    tmp_path,
+):
+    db = await _db_at_schema(
+        tmp_path, "legacy-escalation.db", through_column="wake_dispatch_count",
+    )
+    await _insert_raw(db, "legacy-pending", status="pending")
+
+    await ensure_restart_requests_table(db)
+
+    row = await get_request(db, "legacy-pending")
+    assert row.first_blocked_at == ""
+    assert row.escalation_acknowledged is False
 
 
 @pytest.mark.asyncio

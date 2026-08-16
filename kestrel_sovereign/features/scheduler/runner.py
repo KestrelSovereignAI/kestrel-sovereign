@@ -28,6 +28,11 @@ from kestrel_sovereign._async_ownership import await_owned_task, run_blocking_op
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.status import (
+    DEFAULT_MISFIRE_GRACE_SECONDS,
+    emit_runtime_status,
+    ensure_runtime_status_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +97,12 @@ async def scheduler_database_clock(db: Any) -> datetime:
 
 
 POLL_INTERVAL = 30
-DEFAULT_MISFIRE_GRACE_SECONDS = 600
 DEFAULT_MAX_CONCURRENT_TASKS = 4
 DEFAULT_LEASE_SECONDS = 120
+SUPERVISOR_MIN_BACKOFF_SECONDS = 1.0
+SUPERVISOR_MAX_BACKOFF_SECONDS = 30.0
+RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS = 1.0
+RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS = 5.0
 
 MISFIRE_SKIP = "skip"
 MISFIRE_FIRE_ONCE = "fire_once"
@@ -1011,8 +1019,27 @@ class SchedulerRunner:
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
         self._schema_provenance: Optional[str] = None
+        # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
+        # polling loop it watches.  A dead worker must never become an
+        # unobserved completed asyncio task while the process stays healthy.
         self._task: Optional[asyncio.Task] = None
+        self._worker_task: Optional[asyncio.Task] = None
+        self._telemetry_task: Optional[asyncio.Task] = None
+        self._runtime_status_publish_lock = asyncio.Lock()
+        self._runtime_status_wake = asyncio.Event()
+        # Set as soon as arm() is requested and cleared only by stop(). Health
+        # uses this separately from _running so a failed arm cannot disappear
+        # from the public readiness inventory.
+        self._arm_requested = False
+        self._arm_requested_monotonic: Optional[float] = None
+        self._arm_requested_at: Optional[str] = None
         self._running = False
+        self._last_tick_started_at: Optional[str] = None
+        self._last_tick_completed_at: Optional[str] = None
+        self._worker_restart_count = 0
+        self._consecutive_worker_failures = 0
+        self._last_worker_error_type: Optional[str] = None
+        self._runtime_worker_state = "stopped"
         # Set only after the schema and durable rollout state have both been
         # established. Production starts always go through ``start``; retaining
         # a false default keeps legacy private-tick test doubles from inventing
@@ -1034,6 +1061,22 @@ class SchedulerRunner:
         """
 
         return self._readiness_failure
+
+    @property
+    def worker_available(self) -> bool:
+        """Whether supervision currently owns a non-failing polling worker."""
+
+        return bool(
+            self._arm_requested
+            and self._running
+            and self._task is not None
+            and not self._task.done()
+            and self._consecutive_worker_failures == 0
+            and (
+                self._worker_task is None
+                or not self._worker_task.done()
+            )
+        )
 
     def _latch_protocol_failure(self, error: BaseException) -> None:
         """Persist the first safety failure in process state and notify host."""
@@ -1101,15 +1144,33 @@ class SchedulerRunner:
 
         if self._running:
             return
+        self._arm_requested = True
+        self._arm_requested_monotonic = time.monotonic()
+        self._arm_requested_at = datetime.now(timezone.utc).isoformat()
         if not self._protocol_ready:
             raise RuntimeError(
                 "SchedulerRunner cannot poll before protocol preparation"
             )
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="scheduler-runner")
-        logger.info("SchedulerRunner %s started (poll every %ds)", self._owner_id, self._poll_interval)
+        self._runtime_worker_state = "starting"
+        self._task = asyncio.create_task(
+            self._supervise_loop(), name="scheduler-supervisor"
+        )
+        self._telemetry_task = asyncio.create_task(
+            self._telemetry_loop(), name="scheduler-runtime-telemetry"
+        )
+        # Polling ownership exists before the best-effort telemetry task. A
+        # reporting failure cannot delay or prevent the worker from starting.
+        logger.info(
+            "SchedulerRunner %s started (poll every %ds)",
+            self._owner_id,
+            self._poll_interval,
+        )
 
     async def stop(self):
+        self._arm_requested = False
+        self._arm_requested_monotonic = None
+        self._arm_requested_at = None
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -1117,21 +1178,134 @@ class SchedulerRunner:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._telemetry_task and not self._telemetry_task.done():
+            self._telemetry_task.cancel()
+            try:
+                await self._telemetry_task
+            except asyncio.CancelledError:
+                pass
+        self._worker_task = None
+        self._telemetry_task = None
+        self._runtime_worker_state = "stopped"
+        await self._publish_runtime_status_best_effort("stopped")
         logger.info("SchedulerRunner %s stopped", self._owner_id)
+
+    async def _publish_runtime_status(self, worker_state: str) -> None:
+        await emit_runtime_status(
+            self._db,
+            agent_ids=await self._current_authorized_agent_ids(),
+            owner_id=self._owner_id,
+            worker_state=worker_state,
+            last_tick_started_at=self._last_tick_started_at,
+            last_tick_completed_at=self._last_tick_completed_at,
+            restart_count=self._worker_restart_count,
+            consecutive_failures=self._consecutive_worker_failures,
+            last_error_type=self._last_worker_error_type,
+        )
+
+    async def _publish_runtime_status_best_effort(
+        self, worker_state: Optional[str] = None,
+    ) -> None:
+        """Publish telemetry without allowing the observer to kill its worker."""
+
+        try:
+            async with self._runtime_status_publish_lock:
+                state = worker_state or self._runtime_worker_state
+                await asyncio.wait_for(
+                    self._publish_runtime_status(state),
+                    timeout=RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS,
+                )
+        except Exception:
+            logger.warning(
+                "SchedulerRunner %s could not publish %s state",
+                self._owner_id,
+                worker_state or self._runtime_worker_state,
+                exc_info=True,
+            )
+
+    async def _telemetry_loop(self) -> None:
+        """Publish worker liveness independently of tick execution time."""
+
+        interval = max(
+            RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS,
+            float(self._poll_interval),
+        )
+        while self._running:
+            self._runtime_status_wake.clear()
+            await self._publish_runtime_status_best_effort()
+            try:
+                await asyncio.wait_for(
+                    self._runtime_status_wake.wait(), timeout=interval
+                )
+            except TimeoutError:
+                pass
+
+    async def _supervise_loop(self) -> None:
+        """Restart a polling worker that exits unexpectedly with bounded backoff."""
+
+        while self._running:
+            self._runtime_worker_state = "running"
+            self._runtime_status_wake.set()
+            self._worker_task = asyncio.create_task(
+                self._loop(), name="scheduler-runner"
+            )
+            failure: Optional[BaseException] = None
+            try:
+                await self._worker_task
+                if self._running:
+                    failure = RuntimeError("scheduler worker exited unexpectedly")
+            except asyncio.CancelledError as error:
+                if not self._running:
+                    raise
+                failure = RuntimeError("scheduler worker was cancelled unexpectedly")
+                failure.__cause__ = error
+            except Exception as error:
+                failure = error
+            finally:
+                self._worker_task = None
+
+            if not self._running:
+                break
+            if failure is None:
+                failure = RuntimeError("scheduler worker stopped unexpectedly")
+            # Executor failures are normalized and finalized within _tick.
+            # Anything that escapes the tick is scheduler infrastructure or
+            # protocol failure: retain the original fail-closed readiness
+            # contract even though the supervisor also attempts recovery.
+            self._latch_protocol_failure(failure)
+            self._worker_restart_count += 1
+            self._consecutive_worker_failures += 1
+            self._last_worker_error_type = type(failure).__name__
+            self._runtime_worker_state = "restarting"
+            self._runtime_status_wake.set()
+            backoff = min(
+                SUPERVISOR_MIN_BACKOFF_SECONDS
+                * (2 ** min(self._consecutive_worker_failures - 1, 16)),
+                SUPERVISOR_MAX_BACKOFF_SECONDS,
+            )
+            logger.error(
+                "SchedulerRunner %s worker died; restart %d in %.1fs",
+                self._owner_id,
+                self._worker_restart_count,
+                backoff,
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+            await self._publish_runtime_status_best_effort("restarting")
+            await asyncio.sleep(backoff)
 
     async def _loop(self):
         while self._running:
-            try:
-                await self._tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                # Executor failures are normalized into durable task outcomes
-                # inside ``_execute_claim``. Anything escaping a tick is
-                # scheduler infrastructure/protocol failure and must make host
-                # readiness fail rather than merely emit a log line.
-                self._latch_protocol_failure(error)
-                logger.exception("SchedulerRunner tick error")
+            self._last_tick_started_at = datetime.now(timezone.utc).isoformat()
+            self._runtime_worker_state = "running"
+            self._runtime_status_wake.set()
+            # Per-occurrence failures are isolated and finalized by ``_tick``.
+            # Infrastructure failures escape to the supervisor, which reports
+            # and replaces this worker instead of letting it vanish.
+            await self._tick()
+            self._last_tick_completed_at = datetime.now(timezone.utc).isoformat()
+            self._consecutive_worker_failures = 0
+            self._last_worker_error_type = None
+            self._runtime_status_wake.set()
             try:
                 await asyncio.sleep(self._poll_interval)
             except asyncio.CancelledError:
@@ -3716,6 +3890,7 @@ class SchedulerRunner:
         )
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_task ON task_execution_log(task_id, executed_at DESC)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_idempotency ON task_execution_log(agent_id, idempotency_key)")
+        await ensure_runtime_status_table(self._db)
         return await self._ensure_protocol_rollout(
             preexisting_schedule_table=preexisting_schedule_table,
             rollout_gates_held=True,
