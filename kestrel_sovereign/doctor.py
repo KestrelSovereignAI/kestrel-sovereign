@@ -475,7 +475,10 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
 
 
 def _resolve_governance_source(
-    anchor_path: Path, env: dict, ledger_by_dsn: dict | None = None
+    anchor_path: Path,
+    env: dict,
+    project_dir: Path,
+    ledger_by_dsn: dict | None = None,
 ):
     """Resolve where to read this agent's governance from, and as whom.
 
@@ -503,7 +506,7 @@ def _resolve_governance_source(
     else:
         runtime_dsn = env["KESTREL_DATABASE_URL"]
         try:
-            dsn = _doctor_postgres_dsn(runtime_dsn, env)
+            dsn = _doctor_postgres_dsn(runtime_dsn, env, project_dir)
         except ValueError as exc:
             # Bind the raw URI to the same redactor used for driver failures.
             # The translation error is intentionally generic, but this also
@@ -579,16 +582,16 @@ _ASYNCPG_CONNECTION_QUERY_OPTIONS = frozenset(
 )
 
 
-# Environment variables asyncpg 0.30 actually reads, and the equivalent DSN
-# parameter libpq accepts. Deliberately absent are libpq-only variables such as
-# PGCONNECT_TIMEOUT: inheriting one would give doctor connection semantics the
-# spawned asyncpg process does not have. The diagnostic timeout below also
-# states connect_timeout explicitly, preventing libpq from consulting that
+# Scalar environment variables asyncpg 0.30 reads, and the equivalent DSN
+# parameter libpq accepts. PGHOST and PGPORT are resolved together below because
+# asyncpg's host-list grammar assigns a possibly different port to every host.
+# Deliberately absent are libpq-only variables such as PGCONNECT_TIMEOUT:
+# inheriting one would give doctor connection semantics the spawned asyncpg
+# process does not have. The diagnostic timeout below also states
+# connect_timeout explicitly, preventing libpq from consulting that
 # process-global default. Libpq-only variables are neutralised separately below
 # so they cannot leak back in from doctor's own process environment.
 _ASYNCPG_ENV_DSN_OPTIONS = (
-    ("PGHOST", "host"),
-    ("PGPORT", "port"),
     ("PGUSER", "user"),
     ("PGPASSWORD", "password"),
     ("PGDATABASE", "dbname"),
@@ -662,16 +665,129 @@ def _authority_fields(netloc: str) -> tuple[str, str, str]:
     return "", "", netloc
 
 
-def _authority_states_port(hostspec: str) -> bool:
-    """Whether an asyncpg URI authority explicitly supplies any port."""
-    for host in hostspec.split(","):
-        if host.startswith("["):
-            close = host.find("]")
-            if close >= 0 and host[close + 1 :].startswith(":"):
-                return True
-        elif ":" in host:
-            return True
-    return False
+def _validate_asyncpg_ports(
+    hosts: list[str], ports: int | list[int]
+) -> list[int]:
+    """Apply asyncpg 0.30's one-port-per-host validation."""
+    if isinstance(ports, list):
+        if len(ports) != len(hosts):
+            raise ValueError(
+                f"could not match {len(ports)} port numbers to "
+                f"{len(hosts)} hosts"
+            )
+        return ports
+    return [ports for _ in hosts]
+
+
+def _asyncpg_default_ports(hostspecs: list[str], env: dict) -> list[int]:
+    """Return the PGPORT/default ports asyncpg applies to a host list."""
+    portspec = env.get("PGPORT")
+    if portspec:
+        ports = (
+            [int(port) for port in portspec.split(",")]
+            if "," in portspec
+            else int(portspec)
+        )
+    else:
+        ports = 5432
+    return _validate_asyncpg_ports(hostspecs, ports)
+
+
+def _parse_asyncpg_hostlist(
+    hostlist: str,
+    ports: list[int] | None,
+    env: dict,
+    *,
+    unquote_hosts: bool = False,
+) -> tuple[list[str], list[int]]:
+    """Parse one host list with asyncpg 0.30's host/port rules."""
+    hostspecs = hostlist.split(",")
+    defaults = (
+        _asyncpg_default_ports(hostspecs, env)
+        if not ports
+        else _validate_asyncpg_ports(hostspecs, ports)
+    )
+    hosts: list[str] = []
+    resolved_ports: list[int] = []
+
+    for index, hostspec in enumerate(hostspecs):
+        if not hostspec:
+            # asyncpg indexes the first character while parsing and rejects
+            # empty members rather than treating them as libpq socket defaults.
+            raise ValueError("empty host in PostgreSQL host list")
+        if hostspec[0] == "/":
+            host = hostspec
+            host_port = ""
+        elif hostspec[0] == "[":
+            match = re.match(r"(?:\[([^\]]+)\])(?::([0-9]+))?", hostspec)
+            if not match:
+                raise ValueError("invalid IPv6 address in PostgreSQL host list")
+            host = match.group(1)
+            host_port = match.group(2) or ""
+        else:
+            host, _, host_port = hostspec.partition(":")
+
+        if unquote_hosts:
+            host = unquote(host)
+        hosts.append(host)
+        if not ports:
+            if host_port and unquote_hosts:
+                host_port = unquote(host_port)
+            resolved_ports.append(
+                int(host_port) if host_port else defaults[index]
+            )
+
+    return hosts, ports or resolved_ports
+
+
+def _resolve_asyncpg_hosts(
+    authority_hostspec: str, query: dict[str, str], env: dict
+) -> tuple[list[str], list[int]]:
+    """Resolve asyncpg's effective ordered hosts and per-host ports."""
+    hosts: list[str] | None = None
+    ports: list[int] | None = None
+
+    if authority_hostspec:
+        hosts, ports = _parse_asyncpg_hostlist(
+            authority_hostspec, None, env, unquote_hosts=True
+        )
+    else:
+        query_port = query.get("port")
+        if query_port:
+            ports = [int(port) for port in query_port.split(",")]
+
+        query_host = query.get("host")
+        if query_host:
+            hosts, ports = _parse_asyncpg_hostlist(query_host, ports, env)
+
+    if not hosts:
+        environment_host = env.get("PGHOST")
+        # asyncpg deliberately ignores an empty PGHOST. Libpq does not: it
+        # interprets it as its compiled socket directory, so it must never be
+        # copied verbatim into the translated DSN.
+        if environment_host:
+            hosts, ports = _parse_asyncpg_hostlist(
+                environment_host, ports, env
+            )
+
+    if not hosts:
+        hosts = (
+            ["localhost"]
+            if sys.platform == "win32"
+            else [
+                "/run/postgresql",
+                "/var/run/postgresql",
+                "/tmp",
+                "/private/tmp",
+                "localhost",
+            ]
+        )
+
+    if not ports:
+        ports = _asyncpg_default_ports(hosts, env)
+    else:
+        ports = _validate_asyncpg_ports(hosts, [int(port) for port in ports])
+    return hosts, ports
 
 
 def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
@@ -680,12 +796,6 @@ def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
     stated = set(query).intersection(_ASYNCPG_CONNECTION_QUERY_OPTIONS)
     if hostspec:
         stated.add("host")
-        # asyncpg resolves a port while parsing the authority host list (from
-        # an explicit authority port, PGPORT, or 5432). Its later query-port
-        # branch therefore cannot replace that value.
-        stated.discard("port")
-    if _authority_states_port(hostspec):
-        stated.add("port")
     if user:
         stated.add("user")
     if password:
@@ -710,7 +820,7 @@ def _libpq_option_fragment(name: str, value: str) -> str:
 def _state_asyncpg_connection_defaults(
     parts,
     query: dict[str, str],
-    hostspec: str,
+    hosts: list[str],
     user: str,
     env: dict,
 ) -> None:
@@ -722,16 +832,6 @@ def _state_asyncpg_connection_defaults(
     doctor on asyncpg's endpoint and also prevents an ambient ``PGSERVICE``
     recipe from filling a value that asyncpg never reads.
     """
-    if not hostspec and "host" not in query:
-        query["host"] = (
-            "localhost"
-            if sys.platform == "win32"
-            else "/run/postgresql,/var/run/postgresql,/tmp,/private/tmp,localhost"
-        )
-
-    if "port" not in query and not _authority_states_port(hostspec):
-        query["port"] = "5432"
-
     effective_user = unquote(user) if user else query.get("user")
     if not effective_user:
         effective_user = next(
@@ -741,24 +841,50 @@ def _state_asyncpg_connection_defaults(
                 if env.get(name)
             ),
             None,
-        ) or getpass.getuser()
+        )
+        if not effective_user:
+            try:
+                effective_user = getpass.getuser()
+            except (OSError, KeyError, ImportError) as exc:
+                raise ValueError(
+                    "runtime PostgreSQL user could not be determined"
+                ) from exc
         query["user"] = effective_user
 
     if not parts.path and "dbname" not in query:
         query["dbname"] = effective_user
 
     if "sslmode" not in query:
-        effective_hosts = unquote(hostspec) if hostspec else query["host"]
-        have_tcp_host = any(
-            not host.startswith("/") for host in effective_hosts.split(",")
-        )
+        # State asyncpg's host-derived default unconditionally. Besides making
+        # libpq match asyncpg, this prevents libpq-only PGREQUIRESSL from
+        # changing TCP ``prefer`` or Unix-socket ``disable`` semantics.
+        have_tcp_host = any(not host.startswith("/") for host in hosts)
         query["sslmode"] = "prefer" if have_tcp_host else "disable"
 
     if _libpq_accepts_dsn_option("target_session_attrs", "any"):
         query.setdefault("target_session_attrs", "any")
 
 
-def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
+_ASYNCPG_CONNECTION_FILE_OPTIONS = frozenset(
+    {"passfile", "sslrootcert", "sslcrl", "sslkey", "sslcert"}
+)
+
+
+def _resolve_connection_file_paths(query: dict[str, str], project_dir: Path) -> None:
+    """Resolve files from the spawned agent's working directory."""
+    working_dir = project_dir.resolve()
+    for name in _ASYNCPG_CONNECTION_FILE_OPTIONS:
+        value = query.get(name)
+        if value:
+            path = Path(value)
+            if not path.is_absolute():
+                path = (working_dir / path).resolve()
+            query[name] = str(path)
+
+
+def _doctor_postgres_dsn(
+    runtime_dsn: str, env: dict, project_dir: Path
+) -> str:
     """Translate asyncpg's effective connection data into a libpq URI.
 
     ``runtime_dsn`` remains authoritative. Only fields it does not state are
@@ -799,12 +925,9 @@ def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
         query["dbname"] = query.pop("database")
 
     user, password, hostspec = _authority_fields(parts.netloc)
-    if hostspec:
-        query.pop("host", None)
-        # Like query ``host``, query ``port`` is already too late to replace
-        # an authority host in asyncpg, even when that authority states no
-        # explicit port.
-        query.pop("port", None)
+    hosts, ports = _resolve_asyncpg_hosts(hostspec, raw_query, env)
+    query["host"] = ",".join(hosts)
+    query["port"] = ",".join(str(port) for port in ports)
     if user:
         query.pop("user", None)
     if password:
@@ -824,15 +947,7 @@ def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
     # alone remains inert, while an actual service recipe has no unstated
     # database-selecting value left to fill. This never mutates os.environ.
     has_libpq_service = "PGSERVICE" in env
-    _state_asyncpg_connection_defaults(parts, query, hostspec, user, env)
-
-    # PGREQUIRESSL is libpq's legacy fallback for an otherwise absent
-    # ``sslmode``. Asyncpg ignores it and defaults TCP connections to
-    # ``prefer``, so explicitly state that default only when the legacy
-    # variable could otherwise steer libpq. An asyncpg-recognised query or
-    # PGSSLMODE value already in ``query`` remains authoritative.
-    if "PGREQUIRESSL" in env:
-        query.setdefault("sslmode", "prefer")
+    _state_asyncpg_connection_defaults(parts, query, hosts, user, env)
 
     for env_name, dsn_name, asyncpg_default in _LIBPQ_ONLY_ENV_DSN_DEFAULTS:
         should_neutralize = env_name in env or has_libpq_service
@@ -840,6 +955,8 @@ def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
             dsn_name, asyncpg_default
         ):
             query[dsn_name] = asyncpg_default
+
+    _resolve_connection_file_paths(query, project_dir)
 
     # These are server settings under asyncpg even when libpq happens to have
     # a connection parameter with the same name. ``options`` itself is already
@@ -865,7 +982,19 @@ def _doctor_postgres_dsn(runtime_dsn: str, env: dict) -> str:
     # Building this directly preserves the URI's ``//`` marker when it has no
     # authority (``postgresql:///db``). ``urlunsplit`` normalizes that valid
     # asyncpg/libpq form to the invalid ``postgresql:/db``.
-    effective = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    # The normalized host list lives in query parameters so every host can
+    # carry the exact per-host port asyncpg resolved. Retain only URI userinfo;
+    # leaving the original authority hosts in place would let libpq reinterpret
+    # an embedded port or an IPv6/socket spelling a second time.
+    auth_netloc = (
+        f"{parts.netloc.partition('@')[0]}@" if "@" in parts.netloc else ""
+    )
+    path = (
+        parts.path
+        if not parts.path or parts.path.startswith("/")
+        else f"/{parts.path}"
+    )
+    effective = f"{parts.scheme}://{auth_netloc}{path}"
     return f"{effective}?{encoded_query}" if encoded_query else effective
 
 
@@ -906,6 +1035,8 @@ def _safe(exc: object, source: "_GovernanceSource") -> str:
     # replacement.
     for secret in _dsn_secrets(source.dsn):
         text = text.replace(secret, "<redacted>")
+    for field_name, value in _dsn_connection_files(source.dsn):
+        text = text.replace(value, f"<{field_name}>")
     for field_name, value in _dsn_identity(source.dsn):
         text = text.replace(value, f"<{field_name}>")
     return text
@@ -934,6 +1065,23 @@ def _dsn_secrets(dsn: str) -> tuple:
         secrets.add(match.group(1))
 
     return tuple(sorted(secrets, key=len, reverse=True))
+
+
+def _dsn_connection_files(dsn: str) -> tuple:
+    """Resolved connection-file paths that driver errors must not disclose."""
+    try:
+        from psycopg2.extensions import parse_dsn
+
+        parsed = parse_dsn(dsn)
+    except Exception:  # noqa: BLE001 — unparseable; whole-DSN redaction remains
+        return ()
+
+    found = [
+        (field, parsed[field])
+        for field in _ASYNCPG_CONNECTION_FILE_OPTIONS
+        if isinstance(parsed.get(field), str) and parsed[field]
+    ]
+    return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
 #: Identity-bearing DSN fields, and the placeholder each becomes. Not secrets,
@@ -1138,7 +1286,9 @@ def _read_agent_governance(
         if not db_path.exists():
             continue
 
-        source = _resolve_governance_source(db_path, env, ledger_by_dsn)
+        source = _resolve_governance_source(
+            db_path, env, project_dir, ledger_by_dsn
+        )
         node = (
             source
             if isinstance(source, (_UnreadableDB, _SchemaAbsent))
@@ -1179,7 +1329,9 @@ def _read_agent_governance(
             or _is_placeholder_node(node)
         )
         if runtime_is_empty:
-            anchor_source = _resolve_governance_source(db_path, {}, ledger_by_dsn)
+            anchor_source = _resolve_governance_source(
+                db_path, {}, project_dir, ledger_by_dsn
+            )
             if isinstance(anchor_source, _GovernanceSource):
                 source, node, pending = (
                     anchor_source,

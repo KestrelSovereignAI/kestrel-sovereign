@@ -1101,7 +1101,7 @@ def test_a_pre_migration_database_is_still_read(tmp_path, monkeypatch):
         nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
         edges=[("did:x", "abc", "governed_by")],
     )
-    source = _resolve_governance_source(db, {})
+    source = _resolve_governance_source(db, {}, tmp_path)
 
     assert source.ownership_ledger is False
     node_id, _label, properties = _read_agent_node(source)
@@ -1118,7 +1118,7 @@ def test_a_migrated_database_is_detected_as_such(tmp_path):
         nodes=[("did:x", "agent", "x", "{}")],
         node_owners=[("did:x", "did:x")],
     )
-    assert _resolve_governance_source(db, {}).ownership_ledger is True
+    assert _resolve_governance_source(db, {}, tmp_path).ownership_ledger is True
 
 
 # ---------------------------------------------------------------------------
@@ -1226,7 +1226,7 @@ def test_an_anchor_with_two_agent_roots_is_refused(tmp_path):
         node_owners=[("did:one", "did:one"), ("did:two", "did:two")],
     )
 
-    result = _resolve_governance_source(db, {})
+    result = _resolve_governance_source(db, {}, tmp_path)
 
     assert isinstance(result, _UnreadableDB)
     assert "more than one agent root" in result.reason
@@ -1260,6 +1260,7 @@ def test_an_unreachable_database_is_probed_once(tmp_path, monkeypatch):
             "KESTREL_DB_BACKEND": "postgres",
             "KESTREL_DATABASE_URL": "postgresql://durable.example/kestrel",
         },
+        tmp_path,
     )
 
     assert isinstance(result, _UnreadableDB)
@@ -1533,7 +1534,7 @@ def test_diagnose_does_not_export_the_project_env(tmp_path, monkeypatch):
     assert "KESTREL_DB_BACKEND" not in os.environ
 
 
-def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn():
+def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn(tmp_path):
     """libpq cannot be pointed at a copy of the launcher's environment.
 
     The effective values therefore have to become explicit connection-string
@@ -1553,6 +1554,7 @@ def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn():
             "PGSSLMODE": "verify-full",
             "PGSSLROOTCERT": "/etc/kestrel/ca.pem",
         },
+        tmp_path,
     )
 
     assert parse_dsn(effective) == {
@@ -1568,7 +1570,7 @@ def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn():
     }
 
 
-def test_explicit_dsn_connection_parameters_outrank_the_environment():
+def test_explicit_dsn_connection_parameters_outrank_the_environment(tmp_path):
     """Only absent settings may be filled from the spawned-agent env."""
     from psycopg2.extensions import parse_dsn
 
@@ -1586,6 +1588,7 @@ def test_explicit_dsn_connection_parameters_outrank_the_environment():
             "PGSSLMODE": "verify-full",
             "PGSSLROOTCERT": "/env/ca.pem",
         },
+        tmp_path,
     )
     parsed = parse_dsn(effective)
 
@@ -1598,7 +1601,7 @@ def test_explicit_dsn_connection_parameters_outrank_the_environment():
     assert parsed["sslrootcert"] == "/dsn/ca.pem"
 
 
-def test_query_port_is_ignored_when_the_authority_names_a_host():
+def test_query_port_is_ignored_when_the_authority_names_a_host(tmp_path):
     """asyncpg resolves PGPORT while parsing an authority host.
 
     Its later query-port branch cannot replace that already-truthy value, so
@@ -1611,6 +1614,7 @@ def test_query_port_is_ignored_when_the_authority_names_a_host():
     effective = _doctor_postgres_dsn(
         "postgresql://h/db?port=6543",
         {"PGPORT": "5433"},
+        tmp_path,
     )
 
     parsed = parse_dsn(effective)
@@ -1618,7 +1622,189 @@ def test_query_port_is_ignored_when_the_authority_names_a_host():
     assert parsed["port"] == "5433"
 
 
-def test_empty_options_neutralizes_libpq_only_pgoptions():
+def test_scheme_relative_dsn_preserves_the_database_name(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    effective = _doctor_postgres_dsn(
+        "postgresql:db",
+        {"USER": "runtime_user"},
+        tmp_path,
+    )
+
+    assert parse_dsn(effective)["dbname"] == "db"
+
+
+@pytest.mark.parametrize(
+    ("pg_host", "pg_port", "expected_host", "expected_port"),
+    [
+        ("db.internal:6543", None, "db.internal", "6543"),
+        (
+            "db1:5433,db2,[::1]:5435,/tmp",
+            "6543",
+            "db1,db2,::1,/tmp",
+            "5433,6543,5435,6543",
+        ),
+    ],
+)
+def test_pghost_uses_asyncpg_host_list_rules(
+    tmp_path, pg_host, pg_port, expected_host, expected_port
+):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    env = {"PGHOST": pg_host, "USER": "runtime_user"}
+    if pg_port is not None:
+        env["PGPORT"] = pg_port
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn("postgresql:///db", env, tmp_path)
+    )
+
+    assert parsed["host"] == expected_host
+    assert parsed["port"] == expected_port
+
+
+def test_empty_pghost_uses_asyncpg_defaults(tmp_path):
+    import sys
+
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql:///db",
+            {"PGHOST": "", "USER": "runtime_user"},
+            tmp_path,
+        )
+    )
+
+    expected_hosts = (
+        ["localhost"]
+        if sys.platform == "win32"
+        else [
+            "/run/postgresql",
+            "/var/run/postgresql",
+            "/tmp",
+            "/private/tmp",
+            "localhost",
+        ]
+    )
+    assert parsed["host"] == ",".join(expected_hosts)
+    assert parsed["port"] == ",".join("5432" for _ in expected_hosts)
+
+
+@pytest.mark.parametrize(
+    ("dsn", "pg_port", "expected_host", "expected_port"),
+    [
+        (
+            "postgresql://u@h1:5433,h2/db",
+            "6543",
+            "h1,h2",
+            "5433,6543",
+        ),
+        (
+            "postgresql://u@[::1]:5433,%2Ftmp,h3/db",
+            "6543",
+            "::1,/tmp,h3",
+            "5433,6543,6543",
+        ),
+        (
+            "postgresql://u@h1:5433,h2/db",
+            "6001,6002",
+            "h1,h2",
+            "5433,6002",
+        ),
+    ],
+)
+def test_pgport_fills_each_authority_host_without_a_port(
+    tmp_path, dsn, pg_port, expected_host, expected_port
+):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(dsn, {"PGPORT": pg_port}, tmp_path)
+    )
+
+    assert parsed["host"] == expected_host
+    assert parsed["port"] == expected_port
+
+
+def test_connection_files_are_resolved_from_the_agent_working_directory(
+    tmp_path,
+):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslmode=require"
+            "&passfile=dsn%2F.pgpass"
+            "&sslrootcert=dsn%2Froot.crt"
+            "&sslcrl=dsn%2Froot.crl"
+            "&sslkey=dsn%2Fclient.key"
+            "&sslcert=dsn%2Fclient.crt",
+            {
+                "PGPASSFILE": "env/.pgpass",
+                "PGSSLROOTCERT": "env/root.crt",
+                "PGSSLCRL": "env/root.crl",
+                "PGSSLKEY": "env/client.key",
+                "PGSSLCERT": "env/client.crt",
+            },
+            project_dir,
+        )
+    )
+
+    for option, relative in {
+        "passfile": "dsn/.pgpass",
+        "sslrootcert": "dsn/root.crt",
+        "sslcrl": "dsn/root.crl",
+        "sslkey": "dsn/client.key",
+        "sslcert": "dsn/client.crt",
+    }.items():
+        assert parsed[option] == str((project_dir / relative).resolve())
+
+
+def test_environment_connection_files_use_the_same_project_directory(tmp_path):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslmode=require",
+            {
+                "PGPASSFILE": "env/.pgpass",
+                "PGSSLROOTCERT": "env/root.crt",
+                "PGSSLCRL": "env/root.crl",
+                "PGSSLKEY": "env/client.key",
+                "PGSSLCERT": "env/client.crt",
+            },
+            project_dir,
+        )
+    )
+
+    for option, relative in {
+        "passfile": "env/.pgpass",
+        "sslrootcert": "env/root.crt",
+        "sslcrl": "env/root.crl",
+        "sslkey": "env/client.key",
+        "sslcert": "env/client.crt",
+    }.items():
+        assert parsed[option] == str((project_dir / relative).resolve())
+
+
+def test_empty_options_neutralizes_libpq_only_pgoptions(tmp_path):
     from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
@@ -1626,6 +1812,7 @@ def test_empty_options_neutralizes_libpq_only_pgoptions():
     effective = _doctor_postgres_dsn(
         "postgresql://u@h/db",
         {"PGOPTIONS": "-c search_path=leaked_schema"},
+        tmp_path,
     )
 
     assert parse_dsn(effective)["options"] == ""
@@ -1642,6 +1829,7 @@ def test_other_libpq_only_environment_cannot_steer_doctor(
     env_name,
     dsn_name,
     expected,
+    tmp_path,
 ):
     from psycopg2.extensions import parse_dsn
 
@@ -1653,6 +1841,7 @@ def test_other_libpq_only_environment_cannot_steer_doctor(
     effective = _doctor_postgres_dsn(
         "postgresql://u@h/db",
         {env_name: "host-specific-value"},
+        tmp_path,
     )
 
     parsed = parse_dsn(effective)
@@ -1661,8 +1850,18 @@ def test_other_libpq_only_environment_cannot_steer_doctor(
     else:
         assert dsn_name not in parsed
 
+    if env_name == "PGREQUIRESSL":
+        unix_socket = parse_dsn(
+            _doctor_postgres_dsn(
+                "postgresql://u@%2Ftmp/db",
+                {env_name: "1"},
+                tmp_path,
+            )
+        )
+        assert unix_socket["sslmode"] == "disable"
 
-def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch):
+
+def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch, tmp_path):
     import sys
 
     from psycopg2.extensions import parse_dsn
@@ -1676,6 +1875,7 @@ def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch):
     effective = _doctor_postgres_dsn(
         "postgresql://",
         {"USER": "runtime_user"},
+        tmp_path,
     )
     parsed = parse_dsn(effective)
 
@@ -1685,7 +1885,7 @@ def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch):
         else "/run/postgresql,/var/run/postgresql,/tmp,/private/tmp,localhost"
     )
     assert parsed["host"] == expected_host
-    assert parsed["port"] == "5432"
+    assert parsed["port"] == ",".join("5432" for _ in expected_host.split(","))
     assert parsed["user"] == "runtime_user"
     assert parsed["dbname"] == "runtime_user"
     assert parsed["sslmode"] == "prefer"
@@ -1693,12 +1893,13 @@ def test_hostless_dsn_states_asyncpg_connection_defaults(monkeypatch):
     assert parsed["options"] == ""
 
 
-def test_libpq_service_file_without_a_service_name_is_inert():
+def test_libpq_service_file_without_a_service_name_is_inert(tmp_path):
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
     baseline = _doctor_postgres_dsn(
         "postgresql:///kestrel",
         {"USER": "runtime_user"},
+        tmp_path,
     )
     with_service_file = _doctor_postgres_dsn(
         "postgresql:///kestrel",
@@ -1706,12 +1907,13 @@ def test_libpq_service_file_without_a_service_name_is_inert():
             "PGSERVICEFILE": "/libpq/only/service.conf",
             "USER": "runtime_user",
         },
+        tmp_path,
     )
 
     assert with_service_file == baseline
 
 
-def test_neutralizer_unknown_to_linked_libpq_is_not_emitted(monkeypatch):
+def test_neutralizer_unknown_to_linked_libpq_is_not_emitted(monkeypatch, tmp_path):
     import psycopg2
     from psycopg2.extensions import make_dsn as real_make_dsn
     from psycopg2.extensions import parse_dsn
@@ -1727,6 +1929,7 @@ def test_neutralizer_unknown_to_linked_libpq_is_not_emitted(monkeypatch):
     effective = _doctor_postgres_dsn(
         "postgresql://u@h/db",
         {"PGSSLCERTMODE": "verify-full"},
+        tmp_path,
     )
 
     assert "sslcertmode" not in parse_dsn(effective)
@@ -1734,6 +1937,7 @@ def test_neutralizer_unknown_to_linked_libpq_is_not_emitted(monkeypatch):
 
 def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
     monkeypatch,
+    tmp_path,
 ):
     import psycopg2
     from psycopg2.extensions import make_dsn as real_make_dsn
@@ -1750,6 +1954,7 @@ def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
     effective = _doctor_postgres_dsn(
         "postgresql://u@h/db",
         {"PGSSLNEGOTIATION": "direct"},
+        tmp_path,
     )
 
     assert "sslnegotiation" not in parse_dsn(effective)
@@ -1767,6 +1972,7 @@ def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
 def test_libpq_only_query_names_remain_asyncpg_server_settings(
     query,
     server_option,
+    tmp_path,
 ):
     """Classification follows asyncpg, even when libpq knows the name."""
     from psycopg2.extensions import parse_dsn
@@ -1776,6 +1982,7 @@ def test_libpq_only_query_names_remain_asyncpg_server_settings(
     effective = _doctor_postgres_dsn(
         f"postgresql://u@h/db?{query}",
         {},
+        tmp_path,
     )
     parsed = parse_dsn(effective)
 
@@ -1785,7 +1992,7 @@ def test_libpq_only_query_names_remain_asyncpg_server_settings(
     assert "+" not in effective
 
 
-def test_asyncpg_options_and_other_server_settings_share_libpq_options():
+def test_asyncpg_options_and_other_server_settings_share_libpq_options(tmp_path):
     """The startup ``options`` field is already the channel libpq needs."""
     from psycopg2.extensions import parse_dsn
 
@@ -1795,6 +2002,7 @@ def test_asyncpg_options_and_other_server_settings_share_libpq_options():
         "postgresql://u@h/db?options=-c%20statement_timeout%3D1000"
         "&search_path=tenant",
         {},
+        tmp_path,
     )
 
     assert parse_dsn(effective)["options"] == (
@@ -1813,6 +2021,7 @@ def test_a_folded_environment_password_stays_inside_error_redaction(tmp_path):
     effective = _doctor_postgres_dsn(
         "postgresql://project_user@db.internal/kestrel",
         {"PGPASSWORD": "project-password"},
+        tmp_path,
     )
     source = _GovernanceSource(
         anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
@@ -1824,6 +2033,31 @@ def test_a_folded_environment_password_stays_inside_error_redaction(tmp_path):
     )
     assert "project-password" not in redacted
     assert effective not in redacted
+
+
+def test_resolved_connection_file_paths_stay_inside_error_redaction(tmp_path):
+    from kestrel_sovereign.doctor import (
+        _doctor_postgres_dsn,
+        _GovernanceSource,
+        _safe,
+    )
+
+    effective = _doctor_postgres_dsn(
+        "postgresql://project_user@db.internal/kestrel?sslmode=verify-full",
+        {"PGSSLROOTCERT": "private/root.crt"},
+        tmp_path,
+    )
+    source = _GovernanceSource(
+        anchor_path=tmp_path / "k.db", agent_did="did:x", dsn=effective
+    )
+    resolved_path = str((tmp_path / "private/root.crt").resolve())
+
+    redacted = _safe(
+        f'root certificate file "{resolved_path}" does not exist', source
+    )
+
+    assert resolved_path not in redacted
+    assert "<sslrootcert>" in redacted
 
 
 # ---------------------------------------------------------------------------
@@ -1980,6 +2214,80 @@ def test_project_env_pg_settings_reach_the_driver_without_being_exported(
     assert parsed["password"] == "project-password"
     assert parsed["sslmode"] == "disable"
     assert "PGPASSWORD" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (OSError, "uid has no passwd entry"),
+        (KeyError, "getpwuid(): uid not found: 1000"),
+    ],
+    ids=("normalized-os-error", "legacy-key-error"),
+)
+def test_missing_login_name_is_an_unreadable_database_finding(
+    tmp_path, monkeypatch, error_type, message
+):
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel"
+    )
+    for name in ("PGUSER", "LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.delenv(name, raising=False)
+
+    def no_login_name():
+        raise error_type(message)
+
+    monkeypatch.setattr("getpass.getuser", no_login_name)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "governance NOT verified" in message
+        and "runtime PostgreSQL user could not be determined" in message
+        for message in report.fail
+    ), report.fail
+
+
+def test_diagnose_resolves_connection_files_from_project_not_invocation_cwd(
+    tmp_path, monkeypatch
+):
+    from psycopg2.extensions import parse_dsn
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    properties = json.dumps({"name": "Test", "constitution_hash": "a" * 64})
+    fake = _FakePostgres(
+        {
+            "SELECT node_id, label, properties FROM graph_nodes": [
+                ("did:test:Test", "Test", properties)
+            ],
+            "FROM graph_edges": [("a" * 64,)],
+        }
+    )
+    monkeypatch.setitem(__import__("sys").modules, "psycopg2", fake)
+    for name in (
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+        "PGPASSFILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        env_path.read_text()
+        + "\nKESTREL_DB_BACKEND=postgres\n"
+        + "KESTREL_DATABASE_URL=postgresql://u@db.internal/kestrel\n"
+        + "PGPASSFILE=secrets/runtime.pgpass\n"
+    )
+    invocation_dir = tmp_path / "nested" / "invocation"
+    invocation_dir.mkdir(parents=True)
+    monkeypatch.chdir(invocation_dir)
+
+    diagnose(tmp_path)
+
+    assert parse_dsn(fake.dsn)["passfile"] == str(
+        (tmp_path / "secrets/runtime.pgpass").resolve()
+    )
 
 
 def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
@@ -2187,7 +2495,7 @@ def test_a_pre_migration_anchor_still_only_warns(tmp_path, monkeypatch):
         tmp_path / "k.db",
         nodes=[("did:x", "agent", "x", json.dumps({"constitution_hash": "abc"}))],
     )
-    source = _resolve_governance_source(db, {})
+    source = _resolve_governance_source(db, {}, tmp_path)
 
     assert source.ownership_ledger is False
     assert not isinstance(_read_agent_node(source), _NoAgentNode)
@@ -2212,7 +2520,7 @@ def test_a_missing_witness_before_the_backfill_is_pending_not_broken(
         node_owners=[],
         ownership_settled=False,
     )
-    source = _resolve_governance_source(db, {})
+    source = _resolve_governance_source(db, {}, tmp_path)
 
     assert source.ownership_ledger is True
     assert source.ownership_settled is False
@@ -2227,7 +2535,7 @@ def test_a_missing_witness_after_the_backfill_is_permanent(tmp_path):
         node_owners=[],
         ownership_settled=True,
     )
-    source = _resolve_governance_source(db, {})
+    source = _resolve_governance_source(db, {}, tmp_path)
 
     assert source.ownership_settled is True
 

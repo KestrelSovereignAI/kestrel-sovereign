@@ -427,6 +427,63 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     assert all(name not in os.environ for name in connection_env)
 
 
+def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Doctor can be invoked elsewhere, but the spawned agent runs here."""
+    from psycopg2.extensions import parse_dsn
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    parsed = parse_dsn(runtime_db.dsn)
+    if not parsed.get("password"):
+        pytest.skip("live PostgreSQL URL has no password to exercise pgpass")
+
+    passfile = tmp_path / "secrets" / "runtime.pgpass"
+    passfile.parent.mkdir()
+    password = parsed["password"].replace("\\", "\\\\").replace(":", "\\:")
+    passfile.write_text(f"*:*:*:*:{password}\n")
+    passfile.chmod(0o600)
+
+    for name in (
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGPASSFILE",
+        "PGSSLMODE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    project_env = {
+        "KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii"),
+        "OPENAI_API_KEY": "sk-x",
+        "KESTREL_DB_BACKEND": "postgres",
+        "KESTREL_DATABASE_URL": (
+            "postgresql:///" + quote(parsed["dbname"], safe="")
+        ),
+        "PGHOST": parsed["host"],
+        "PGPORT": parsed["port"],
+        "PGUSER": parsed["user"],
+        "PGPASSFILE": "secrets/runtime.pgpass",
+    }
+    if parsed.get("sslmode"):
+        project_env["PGSSLMODE"] = parsed["sslmode"]
+    write_env(tmp_path / ".env", project_env)
+    invocation_dir = tmp_path / "nested" / "invocation"
+    invocation_dir.mkdir(parents=True)
+    monkeypatch.chdir(invocation_dir)
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
 def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
