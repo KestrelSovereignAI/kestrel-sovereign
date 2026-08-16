@@ -273,6 +273,62 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     assert agent.storage.store_file.call_count == 2
     agent.storage.store_file.assert_any_call(FAKE_CONSTITUTION, "KESTREL_CONSTITUTION.md")
     agent.privacy_agent.add_conversation.assert_called_once()
+    # First reanchor: nothing to supersede, so no empty history is written.
+    assert "constitution_reanchor_history" not in node.properties
+
+
+@pytest.mark.asyncio
+async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
+    """The superseded anchoring's per-agent facts must survive the next one.
+
+    Until #2963 both writers ASSIGNED ``constitution_reanchor``, so a v2→v3
+    reanchor destroyed the v2 receipt: under what authority, from what source,
+    and verified how this agent came to be governed by v2. Those facts used to
+    survive incidentally on v2's own ``constitution_amendment_artifact`` node —
+    its id is the artifact's content hash, so a different artifact meant a
+    different node — until #2893 made that node fleet-shareable and moved the
+    per-agent fields off it.
+    """
+    agent, node = _make_agent(stored_hash="oldhash", safe_mode=False)
+    prior = {
+        "timestamp": "2026-04-05T00:00:00Z",
+        "old_hash": "ancienthash",
+        "new_hash": "oldhash",
+        "path": "/prior/KESTREL_CONSTITUTION.md",
+        "signed_artifact_hash": "priorartifacthash",
+        "signed_artifact_path": "/prior/amendment.json",
+        "signed_artifact_signer": ROOT_DID,
+        "signed_artifact_verification": "signed by the pinned sovereign root",
+        "authorization": "prior_admin",
+        "expected_hash_prefix": "oldhash",
+    }
+    node.properties["constitution_reanchor"] = prior
+    agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
+    artifact_path = _write_artifact(tmp_path)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
+
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            authorization="admin_command",
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower()
+    # The pointer moved to the new anchoring...
+    assert node.properties["constitution_reanchor"]["new_hash"] == FAKE_HASH
+    assert node.properties["constitution_reanchor"]["authorization"] == "admin_command"
+    # ...and the receipt it replaced is retained verbatim, not merged or
+    # summarised. The two writers disagree on field names for the same fact
+    # (``path`` here, ``source_path`` in setup/), so a reader has to see
+    # exactly what the writer of that anchoring actually claimed.
+    history = node.properties["constitution_reanchor_history"]
+    assert len(history) == 1
+    assert history[0]["receipt"] == prior
+    assert history[0]["superseded_by_constitution_hash"] == FAKE_HASH
+    assert history[0]["superseded_by_artifact_hash"] == FAKE_HASH
+    assert history[0]["provenance"] == "runtime:constitution_reanchor"
 
 
 # --- #2465: the Iron Rule for agents with no structured receipt ---

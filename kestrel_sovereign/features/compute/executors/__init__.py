@@ -2,7 +2,7 @@
 Kestrel Compute Feature - Executors Package.
 
 This package provides execution environments for running scripts safely:
-- UvExecutor: Python scripts via `uv run --isolated`
+- UvExecutor: Python scripts via `uv run --isolated --no-project`
 - DockerExecutor: Sandboxed execution in Docker containers
 - LocalExecutor: Direct execution (development only)
 """

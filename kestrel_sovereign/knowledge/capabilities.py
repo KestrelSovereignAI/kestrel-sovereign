@@ -192,8 +192,10 @@ class SemanticRuntimeCapabilities:
                     (*profile.import_closure, *shapes.import_closure)
                 )
             except KnowledgeRegistryError as exc:
+                # Carry the registry's own sentence forward. The traceback is
+                # not what an operator reads in a boot log; this message is.
                 raise SemanticCapabilityConfigurationError(
-                    "stable semantic capability resources are unavailable"
+                    f"stable semantic capability resources are unavailable: {exc}"
                 ) from exc
             return
         assert (
@@ -251,7 +253,8 @@ class SemanticRuntimeCapabilities:
             self.create_rdf_codec(registry=registry)
         except (KnowledgeRegistryError, UnsupportedRdfCapabilityError) as exc:
             raise SemanticCapabilityConfigurationError(
-                "experimental semantic capability is unavailable or has an invalid pin"
+                "experimental semantic capability is unavailable or has an "
+                f"invalid pin: {exc}"
             ) from exc
 
     def create_rdf_codec(

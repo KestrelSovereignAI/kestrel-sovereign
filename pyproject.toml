@@ -224,7 +224,12 @@ dependencies = [
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
-    "pqcrypto>=0.4.0",
+    # Capped below 1.0: pqcrypto 1.0.0 (2026-08-15) renamed
+    # ml_dsa_65.generate_keypair -> keygen and changed verify() from
+    # returning True/False to returning None and raising
+    # InvalidSignatureError. The second is silent — our bool(verify(...))
+    # would read a *valid* signature as unverified. See #2966 before lifting.
+    "pqcrypto>=0.4.0,<1.0",
     "kestrel-llms[all]==0.1.8",
 ]
 

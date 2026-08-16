@@ -361,6 +361,17 @@ def test_ensure_image_builds_when_missing(monkeypatch):
     assert "docker/Dockerfile.sovereign" in " ".join(calls[1])
 
 
+def test_sovereign_image_runs_kestrel_from_dedicated_virtualenv():
+    """The shipped local image must satisfy UvExecutor's runtime boundary."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dockerfile = (repo_root / "docker" / "Dockerfile.sovereign").read_text()
+
+    assert "uv venv /app/.venv" in dockerfile
+    assert "uv pip install --python /app/.venv/bin/python" in dockerfile
+    assert 'ENTRYPOINT ["/app/.venv/bin/python"]' in dockerfile
+    assert "uv pip install --system" not in dockerfile
+
+
 def test_kestrel_agent_docker_run_argparse_via_real_parser(tmp_path):
     """Codex review v9 on PR #1079: the bare ``"command"`` positional
     on the run subverb collided with the top-level subparser's

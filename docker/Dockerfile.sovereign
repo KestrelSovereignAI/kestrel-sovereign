@@ -67,17 +67,21 @@ COPY --from=uv /uv /usr/local/bin/uv
 # tests, kestrel.toml, *.db, agent_data, etc. — see /.dockerignore).
 COPY . .
 
-# Install the package and its declared dependencies via pyproject.toml.
-# Replaces the hand-curated dependency list this Dockerfile carried since
-# the pre-extraction monolith era — that list had drifted (missing multi_agent,
-# signals, kestrel_config, and the post-#688 LLM modules).
-RUN --mount=type=secret,id=github_token \
-    GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)" && \
-    if [ -n "$GIT_AUTH" ]; then \
-        git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
-    fi && \
-    uv pip install --system --no-cache . && \
-    git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+# Install the package and its declared dependencies in a dedicated runtime
+# virtual environment. UvExecutor fails closed outside a virtual environment
+# so agent-authored scripts cannot inherit Kestrel's own site-packages.
+# Heredoc + set -e also keeps an install failure from being swallowed by the
+# best-effort credential cleanup.
+RUN --mount=type=secret,id=github_token <<'EOF'
+set -e
+uv venv /app/.venv
+GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)"
+if [ -n "$GIT_AUTH" ]; then
+    git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"
+fi
+uv pip install --python /app/.venv/bin/python --no-cache .
+git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+EOF
 
 # Create non-root user for runtime.
 RUN groupadd -g $GID kestrel && \
@@ -88,15 +92,16 @@ RUN groupadd -g $GID kestrel && \
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV KESTREL_DB_PATH=/data
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Switch to non-root user
 USER kestrel
 
 # Lightweight health check — agent process can import its own package.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import kestrel_sovereign" || exit 1
+    CMD /app/.venv/bin/python -c "import kestrel_sovereign" || exit 1
 
 # Default: interactive chat against /data/kestrel_prime.db.
 # Override with: docker run ... kestrel-sovereign kestrel <subcommand>
-ENTRYPOINT ["python"]
+ENTRYPOINT ["/app/.venv/bin/python"]
 CMD ["main.py", "/data/kestrel_prime.db"]

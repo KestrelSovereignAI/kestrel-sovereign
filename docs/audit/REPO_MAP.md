@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-15
-**Scope:** 2311 tracked files (1546 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-16
+**Scope:** 2314 tracked files (1549 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -64,7 +64,7 @@ Repo entry points and standard project files.
 - **package.json** — (configuration)
 - **pyproject.toml** — (configuration)
 - **run_tests.py** — Kestrel Smart Test Runner - Unified Test System
-  - `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `class SmartTestRunner`; `def configure_ci_defaults(args)`; `def main()`
+  - `def interpreter_uses_project_environment(interpreter)`; `def is_project_environment()`; `def ensure_project_environment()`; `def parse_collection_summary(output)`; `def parse_collection_duration(output)`; `def get_database_url()`; `def get_redis_url()`; `class ServiceChecker`; `…`
 - **serve_models.example.toml** — (configuration)
 - **server.py** — Backward-compat shim for ``uvicorn server:app`` from a source clone.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
@@ -2632,7 +2632,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_compute_destructive_safety.py** — Focused regressions for compute shell rewriting and trash containment.
   - `def trash_dir(tmp_path)`; `def test_each_compound_rm_segment_is_rewritten(trash_dir, script, preserved_boundary)`; `def test_multiple_quoted_rm_commands_execute_as_independent_safe_moves(tmp_path, trash_dir)`; `def test_one_rm_with_duplicate_basenames_preserves_both_files(tmp_path, trash_dir)`; `def test_generated_commands_bypass_utility_function_overrides(tmp_path, trash_dir)`; `def test_command_override_is_rejected_fail_closed(trash_dir)`; `def test_static_non_rm_dispatcher_remains_compatible(trash_dir)`; `def test_non_dispatching_command_may_print_rm_word(trash_dir)`; `…`
 - **tests/unit/test_compute_executors.py** — Focused lifecycle tests for the built-in compute executors.
-  - `def test_base_executor_preserves_no_argument_subclass_construction()`; `async def test_owned_task_failure_during_repeated_cancellation_keeps_cancellation(caplog)`; `async def test_capture_failure_during_repeated_cancellation_keeps_cancellation(monkeypatch)`; `async def test_success_uses_concurrent_byte_bounded_capture_and_cleans_workdir(monkeypatch, tmp_path, executor_name)`; `async def test_launch_failure_returns_typed_record_and_cleans_workdir(monkeypatch, tmp_path, executor_name)`; `async def test_timeout_terminates_reaps_propagates_and_cleans_workdir(monkeypatch, tmp_path, executor_name)`; `async def test_cancellation_terminates_reaps_and_cleans_workdir(monkeypatch, tmp_path, executor_name)`; `async def test_repeated_docker_cancellation_waits_for_removal_then_propagates(monkeypatch, tmp_path)`; `…`
+  - `def test_base_executor_preserves_no_argument_subclass_construction()`; `def test_uv_base_python_prefers_canonical_base_executable(monkeypatch, tmp_path)`; `def test_uv_base_python_falls_back_to_versioned_posix_executable(monkeypatch, tmp_path)`; `def test_uv_base_python_fails_closed_outside_supported_virtual_environment(monkeypatch, tmp_path)`; `async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requirements(monkeypatch, tmp_path)`; `async def test_uv_real_process_isolated_from_nested_host_workspace(monkeypatch, tmp_path)`; `async def test_owned_task_failure_during_repeated_cancellation_keeps_cancellation(caplog)`; `async def test_capture_failure_during_repeated_cancellation_keeps_cancellation(monkeypatch)`; `…`
 - **tests/unit/test_compute_feature.py** — Unit tests for Kestrel Compute Feature.
   - `def temp_db()`; `def temp_trash_dir(temp_dir)`; `def sample_script()`; `def signer_with_ecdsa_keys(temp_db)`; `def sample_bash_script()`; `class TestModels`; `class TestScriptStore`; `class TestScriptSigner`; `…`
 - **tests/unit/test_compute_package_imports.py** — Cold-import contracts for the compute package boundary.
@@ -2991,6 +2991,8 @@ Repo entry points and standard project files.
   - `def test_adapter_family_maps_to_identity_substrate(vendor, route, model, family, …)`; `def test_composite_preference_selects_matching_route()`; `def test_heterogeneous_route_uses_active_model_family(vendor, model, expected)`; `def test_heterogeneous_route_keeps_explicit_fallback_when_model_is_auto(vendor, expected)`; `def test_plugin_family_is_preserved_without_framework_vendor_branch()`; `def test_missing_runtime_is_explicit_unknown()`; `async def test_exporter_uses_its_agent_llm_service_not_process_global_config()`
 - **tests/unit/test_implicit_sessions.py** — Tests for implicit session_id derivation in AsyncConversationStore.
   - `async def store()`; `class TestImplicitSessionDerivation`; `class TestSessionGapBoundary`; `class TestSessionIdRetrieval`; `class TestErrorIsolation`; `class TestSessionGapMinutesCentralized`; `class TestSearchHistorySessionScoping`
+- **tests/unit/test_import_validation_runner.py** — Contracts for import validation timing and project-environment selection.
+  - `def test_parse_collection_summary_accepts_pytest_summary_forms(summary, expected)`; `def test_collection_parser_uses_last_complete_summary_not_node_id_text()`; `def test_validate_imports_times_direct_pytest_and_pins_summary_environment(monkeypatch, capsys)`; `def test_validate_imports_enforces_pytest_duration_not_process_wall_time(monkeypatch)`; `def test_validate_imports_rejects_real_pytest_over_budget_summary(monkeypatch, capsys)`; `def test_validate_imports_warns_before_collection_budget(monkeypatch, capsys)`; `def test_successful_unparseable_collection_reports_parser_failure(monkeypatch, capsys)`; `def test_interpreter_project_environment_predicate(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_inception_atomicity.py** — Inception must record an agent atomically with its governing edge (#2867).
   - `async def external_db(tmp_path)`; `async def test_constitution_agent_and_edge_all_commit(external_db, tmp_path)`; `async def test_failure_between_agent_node_and_edge_leaves_no_agent_node(external_db, tmp_path, monkeypatch)`; `async def test_rag_and_embedding_work_stays_outside_the_transaction_span(external_db, tmp_path, monkeypatch)`
 - **tests/unit/test_inception_cli_args.py** — —
@@ -3346,7 +3348,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_route_state_check_constraint.py** — ``route_state`` must be enforced by the schema, not merely intended (#2804).
   - `async def test_upgraded_database_gains_the_constraint()`; `async def test_rebuild_preserves_rows_and_indexes()`; `async def test_rows_violating_the_vocabulary_are_quarantined_not_dropped()`; `async def test_second_call_does_not_rebuild_again()`; `async def test_fresh_database_needs_no_rebuild()`
 - **tests/unit/test_run_script_approval_failclosed.py** — F126: run_script approval gate must fail CLOSED when no queue is reachable.
-  - `def temp_db()`; `def signer_with_ecdsa_keys(temp_db)`; `async def test_missing_security_feature_fails_closed(temp_db, signer_with_ecdsa_keys)`; `async def test_missing_approval_queue_fails_closed(temp_db, signer_with_ecdsa_keys)`
+  - `def temp_db()`; `def signer_with_ecdsa_keys(temp_db)`; `async def test_missing_security_feature_fails_closed(temp_db, signer_with_ecdsa_keys)`; `async def test_missing_approval_queue_fails_closed(temp_db, signer_with_ecdsa_keys)`; `async def test_unavailable_executor_returns_structured_failure(temp_db, signer_with_ecdsa_keys)`; `async def test_available_executor_does_not_probe_unrequested_alternatives(temp_db, signer_with_ecdsa_keys)`; `async def test_raising_availability_probe_fails_closed_with_structured_result(temp_db, signer_with_ecdsa_keys, caplog)`; `async def test_compute_capabilities_shares_off_loop_availability_snapshot(temp_db, signer_with_ecdsa_keys)`
 - **tests/unit/test_runtime_identity.py** — Tests for :mod:`kestrel_sovereign.identity.runtime_identity`.
   - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_on_disk(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_on_disk(post_ceremony_material)`; `def test_load_legacy_only_agent(legacy_agent_on_disk)`; `def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key)`; `def test_load_hybrid_agent(post_ceremony_agent_on_disk)`; `def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk)`; `def test_hybrid_loader_proves_private_keys_bind_to_successor_did(post_ceremony_agent_on_disk)`; `…`
 - **tests/unit/test_save_feature.py** — ToolResult contract tests for SaveFeature (#1061 wave 7).
@@ -3457,6 +3459,10 @@ Repo entry points and standard project files.
   - `def test_wizard_quickstart_full_run(tmp_path, monkeypatch)`; `def test_configured_setup_injects_auditor_into_real_inception_boundary(tmp_path, monkeypatch)`; `def test_wizard_idempotent_second_run_is_noop(tmp_path, monkeypatch)`; `def test_wizard_check_mode_never_writes(tmp_path)`; `def test_wizard_check_mode_returns_zero_when_ready(tmp_path)`; `def test_wizard_check_with_reset_does_not_move_files(tmp_path)`; `def test_wizard_reset_moves_existing_files_aside(tmp_path)`; `def test_wizard_only_step_runs_just_that_step(tmp_path)`; `…`
 - **tests/unit/test_shacl_validation.py** — Contracts for the governed, capability-pinned SHACL validation service.
   - `def test_core_constraint_fixture_reports_nonconformance_without_data_values()`; `def test_write_policy_is_explicit_by_source_for_a_violation(source, expected)`; `def test_failed_prepublication_report_cannot_claim_or_retain_an_assertion_identity()`; `def test_warning_is_accept_with_report_but_never_changes_violation_semantics()`; `def test_core_logical_qualified_property_and_compound_path_fixtures()`; `def test_qualified_value_shapes_disjoint_changes_the_qualified_count()`; `def test_deactivated_property_shapes_never_evaluate_their_path()`; `def test_incremental_focus_uses_full_graph_and_matches_full_audit_for_changed_node()`; `…`
+- **tests/unit/test_shared_content_node_ownership.py** — Co-ownership of a fleet-shared graph node — the two questions (#2893).
+  - `async def db(db_backend)`; `def artifact_bytes()`; `def constitution_bytes()`; `class TestAcceptanceDoesNotDependOnOrder`; `class TestCoOwnersMustAgree`; `class TestTheSwapDoorDeclinesSharedRows`; `class TestLegacyNormalisationIsNarrow`; `class TestTheShapeIsReadOffTheStoredRow`
+- **tests/unit/test_shared_content_node_properties.py** — The key-set guard on properties a PostgreSQL fleet co-owns (#2893).
+  - `class TestConstitutionAnchor`; `class TestAmendmentArtifact`; `def test_a_naive_signed_timestamp_is_still_shareable()`; `def test_an_unbounded_timestamp_is_still_refused()`
 - **tests/unit/test_shared_model_cache.py** — Tests for SharedModelCache — process-wide model discovery cache.
   - `class TestSharedModelCache`; `class TestSharedModelCacheSingleton`
 - **tests/unit/test_shell_exit_tokens.py** — Shell exit tokens — #658.

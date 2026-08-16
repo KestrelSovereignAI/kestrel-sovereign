@@ -131,14 +131,33 @@ These volumes persist across container rebuilds:
 
 Those are the names *inside* the compose file. Docker prefixes a named volume
 with the Compose project, so what `docker volume ls` shows is
-`devcontainer_postgres16-data` — and under VS Code the prefix is derived from
-your workspace path, so it is not the same string on two machines. Reset
-through Compose, which knows its own prefix, rather than by typing the names:
+`<project>_postgres16-data` — and under VS Code the prefix is derived from your
+workspace path, so it is not the same string on two machines.
+
+This README deliberately gives you no copy-pasteable command for deleting
+them, because every short spelling of it destroys the wrong thing somewhere:
+
+- A bare `docker compose -f .devcontainer/… down -v` does **not** rediscover
+  VS Code's project name. Invoked by hand, Compose derives the project from
+  this file's own directory (`devcontainer`), so it targets `devcontainer_*` —
+  removing nothing under VS Code, or removing some *other* project's volumes.
+- Passing `-p` with a project read from `docker inspect kestrel-dev-postgres`
+  is worse. That container name is fixed globally in the compose file, so with
+  a second clone or git worktree it resolves to **whatever checkout is running**
+  — which may not be this one. The lookup still succeeds while this checkout is
+  stopped, and the teardown then deletes the other checkout's database.
+
+Identify the volumes first, decide what each belongs to, and remove them by
+their full names:
 
 ```bash
-# ⚠️ DELETES DATA — removes the containers and every volume declared above
-docker compose -f .devcontainer/docker-compose.devcontainer.yml down -v
+docker volume ls | grep postgres16-data
 ```
+
+For a scripted reset, derive the project from the checkout you are in —
+`docker compose ls` lists each project with its `config_files` path — rather
+than from a globally-named container. Under VS Code, the extension's own
+teardown is the reliable route, because it knows which project it launched.
 
 ### Upgrading from the PostgreSQL 15 devcontainer
 
@@ -161,17 +180,24 @@ docker volume ls | grep postgres-data       # find your project's prefix
 docker volume rm <project>_postgres-data
 ```
 
-If you do need something out of it, dump it with a **15** server before
-removing it, then load the dump into the running devcontainer:
+If you do need something out of it, that is a manual database task and this
+README deliberately does not hand you a one-shot recipe for it. Two facts are
+what you actually need:
 
-```bash
-docker run --rm -v <project>_postgres-data:/var/lib/postgresql/data \
-  -e POSTGRES_PASSWORD=kestrel_password -e PGDATA=/var/lib/postgresql/data/pgdata \
-  -d --name kestrel-pg15-dump pgvector/pgvector:pg15
-docker exec kestrel-pg15-dump pg_dumpall -U kestrel_user > pg15-dump.sql
-docker rm -f kestrel-pg15-dump
-docker exec -i kestrel-dev-postgres psql -U kestrel_user -d kestrel < pg15-dump.sql
-```
+- **A data directory is only readable by the major that wrote it.** Mount
+  `<project>_postgres-data` into a **PostgreSQL 15** server to read it at all.
+- **A `pg_dumpall` cluster dump is the wrong shape for this target.** The
+  devcontainer's `pg16` is already initialized with the `kestrel_user` role and
+  the `kestrel` database, so a cluster dump necessarily replays
+  role/database creation on top of them. `psql` does not stop on those errors
+  and still exits 0, so a restore can report success having applied only part
+  of the dump. Dump the specific databases you want with `pg_dump` and restore
+  them deliberately, with `ON_ERROR_STOP=1`.
+
+Write any dump **outside this repository**. The repo root is a Docker build
+context and several deployment Dockerfiles use `COPY . .`, so a cluster dump
+left here can be committed or baked into a published image — it contains
+conversation data and role password hashes.
 
 ## Port Forwarding
 

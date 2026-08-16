@@ -35,8 +35,9 @@ services:
     user: vscode
 
   # PostgreSQL with pgvector. 16 is the floor: the #2958 session_id backfill
-  # needs `IS JSON OBJECT` (16+) to reject malformed metadata without raising
-  # on it mid-migration. Keep this in step with .github/workflows/ci.yml.
+  # needs `pg_input_is_valid(metadata,'jsonb')` (16+) to skip metadata it
+  # cannot cast, rather than raising on it mid-migration. Keep this in step
+  # with .github/workflows/ci.yml.
   postgres:
     image: pgvector/pgvector:pg16
     container_name: kestrel-dev-postgres

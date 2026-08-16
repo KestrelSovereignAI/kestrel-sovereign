@@ -168,7 +168,12 @@ class AsyncStorage:
             self.semantic_capabilities.validate()
             self._semantic_rdf_codec = self.semantic_capabilities.create_rdf_codec()
         except ValueError as exc:
-            raise ValueError("semantic runtime capability is unavailable") from exc
+            # This is the line an operator actually reads when agent boot
+            # fails; leaving the cause in the traceback alone is what made a
+            # CRLF-smudged checkout look like an unexplained total failure.
+            raise ValueError(
+                f"semantic runtime capability is unavailable: {exc}"
+            ) from exc
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
             self._backend = backend
