@@ -16,9 +16,13 @@ The five places inception writes the constitution to (per
   4. ``graph_edges`` — a ``governed_by`` edge: agent_did → hash.
   5. ``document_chunks`` — RAG-indexed chunks keyed by file_hash.
 
-We also append an audit entry at ``agent.properties.constitution_reanchor``
-(format matches the runtime ``!reanchor-constitution`` chat command for
-consistency: timestamp + old_hash + new_hash + source_path).
+We also record an audit entry at ``agent.properties.constitution_reanchor``
+(timestamp + old_hash + new_hash + source_path), and append the receipt it
+replaces to ``agent.properties.constitution_reanchor_history`` — see
+:mod:`kestrel_sovereign.constitution.reanchor_receipt`. Until #2963 this
+docstring said "append" while the code assigned, so each reanchor destroyed the
+previous receipt; the runtime ``!reanchor-constitution`` chat command shares the
+same helper but still records ``path`` where this writer records ``source_path``.
 
 We do NOT delete the old document node or the old file blob — they're
 retained for audit. Only the ``governed_by`` edge and the RAG chunks
@@ -79,6 +83,9 @@ from kestrel_sovereign.constitution.amendment_artifact import (
     AmendmentArtifactError,
     AmendmentArtifactVerification,
     load_verified_reanchor_artifact,
+)
+from kestrel_sovereign.constitution.reanchor_receipt import (
+    supersede_constitution_reanchor,
 )
 from kestrel_sovereign.constitution.resolver import (
     resolve_governing_constitution_bytes,
@@ -1210,18 +1217,22 @@ async def _write_reanchor(
                     constitution_hash=new_hash,
                     provenance="setup:constitution_reanchor",
                 )
-            agent.properties["constitution_reanchor"] = {
-                "timestamp": _now_iso(),
-                "old_hash": old_hash,
-                "new_hash": new_hash,
-                "source_path": str(canonical_path),
-                "authorization": authorization,
-                "signed_artifact_hash": artifact_hash,
-                "signed_artifact_path": str(amendment_artifact_path),
-                "signed_artifact_signer": amendment_verification.signer,
-                "signed_artifact_verification": amendment_verification.reason,
-                "stale_edges_removed": stale_edge_targets,
-            }
+            supersede_constitution_reanchor(
+                agent.properties,
+                receipt={
+                    "timestamp": _now_iso(),
+                    "old_hash": old_hash,
+                    "new_hash": new_hash,
+                    "source_path": str(canonical_path),
+                    "authorization": authorization,
+                    "signed_artifact_hash": artifact_hash,
+                    "signed_artifact_path": str(amendment_artifact_path),
+                    "signed_artifact_signer": amendment_verification.signer,
+                    "signed_artifact_verification": amendment_verification.reason,
+                    "stale_edges_removed": stale_edge_targets,
+                },
+                provenance="setup:constitution_reanchor",
+            )
             # Anchor (or refresh) the structured contract receipt.
             # Idempotent for the unchanged-active case; performs the
             # dormant→active activation when reanchor enables Amendment

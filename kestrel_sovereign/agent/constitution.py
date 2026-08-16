@@ -1635,6 +1635,9 @@ class ConstitutionMixin:
         from kestrel_sovereign.constitution.genesis_audit import (
             supersede_genesis_audit,
         )
+        from kestrel_sovereign.constitution.reanchor_receipt import (
+            supersede_constitution_reanchor,
+        )
 
         # Every mutation below — the new constitution blob, the artifact
         # blob + node, the governed_by edge convergence, the superseded
@@ -1702,18 +1705,23 @@ class ConstitutionMixin:
                     provenance="runtime:constitution_reanchor",
                     recorded_at=self._get_timestamp(),
                 )
-                agent_node.properties["constitution_reanchor"] = {
-                    "timestamp": self._get_timestamp(),
-                    "old_hash": old_hash,
-                    "new_hash": stored_hash,
-                    "path": constitution_path_used,
-                    "signed_artifact_hash": artifact_hash,
-                    "signed_artifact_path": artifact_path_used,
-                    "signed_artifact_signer": verification.signer,
-                    "signed_artifact_verification": verification.reason,
-                    "authorization": authorization or "unspecified",
-                    "expected_hash_prefix": expected_hash,
-                }
+                supersede_constitution_reanchor(
+                    agent_node.properties,
+                    receipt={
+                        "timestamp": self._get_timestamp(),
+                        "old_hash": old_hash,
+                        "new_hash": stored_hash,
+                        "path": constitution_path_used,
+                        "signed_artifact_hash": artifact_hash,
+                        "signed_artifact_path": artifact_path_used,
+                        "signed_artifact_signer": verification.signer,
+                        "signed_artifact_verification": verification.reason,
+                        "authorization": authorization or "unspecified",
+                        "expected_hash_prefix": expected_hash,
+                    },
+                    provenance="runtime:constitution_reanchor",
+                    recorded_at=self._get_timestamp(),
+                )
                 await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
         except Exception as e:
             return (
