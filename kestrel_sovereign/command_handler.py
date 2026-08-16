@@ -138,19 +138,6 @@ class CommandHandler:
         "!safe-mode",
     ])
 
-    # Non-cognitive commands that remain useful while the agent is behind a
-    # readiness or integrity gate.  Routing gates consume this canonical set
-    # through ``get_recovery_commands`` below rather than maintaining their
-    # own allowlists.
-    RECOVERY_COMMANDS = frozenset([
-        "!status",
-        "!help",
-        "!verify-constitution",
-        "!get-privacy-mode",
-        "!privacy-status",
-        "!bootstrap-status",
-    ]) | SOVEREIGN_COMMANDS
-
     async def handle(self, user_input: str, caller=None) -> Optional[str]:
         """
         Handle a command input.
@@ -864,39 +851,3 @@ class CommandHandler:
                 return f"Heartbeat error: {result.reason or result.message}"
         except Exception as e:
             return f"Heartbeat failed: {e}"
-
-
-def get_recovery_commands(command_handler=None) -> frozenset[str]:
-    """Return the effective recovery allowlist for a command-handler instance.
-
-    The canonical recovery set is a floor: a malformed test double or subclass
-    must not accidentally remove the commands needed to escape a readiness
-    gate. Valid instance-level recovery and sovereign extensions are unioned in
-    so readiness routers stay aligned with :meth:`CommandHandler.handle`'s
-    authority gate.
-    """
-
-    def _command_strings(value: object) -> frozenset[str]:
-        if isinstance(value, str):
-            return frozenset()
-        try:
-            return frozenset(item for item in value if isinstance(item, str))
-        except TypeError:
-            return frozenset()
-
-    source = command_handler if command_handler is not None else CommandHandler
-    recovery_commands = getattr(
-        source,
-        "RECOVERY_COMMANDS",
-        CommandHandler.RECOVERY_COMMANDS,
-    )
-    sovereign_commands = getattr(
-        source,
-        "SOVEREIGN_COMMANDS",
-        CommandHandler.SOVEREIGN_COMMANDS,
-    )
-    return (
-        CommandHandler.RECOVERY_COMMANDS
-        | _command_strings(recovery_commands)
-        | _command_strings(sovereign_commands)
-    )

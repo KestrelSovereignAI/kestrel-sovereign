@@ -44,10 +44,7 @@ from kestrel_sovereign.features import (
     verify_mandatory_feature_set,
 )
 from kestrel_sovereign.features.base import Feature
-from kestrel_sovereign.command_handler import (
-    CommandHandler,
-    get_recovery_commands,
-)
+from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.a2a.stores import (
     SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
@@ -5058,18 +5055,14 @@ Expected Duration: {expected_duration}
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if safe_mode or audit_pending:
-            recovery_commands = get_recovery_commands(
-                getattr(self, "command_handler", None)
-            )
+            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
             if user_input.startswith("!"):
-                cmd = user_input.split(maxsplit=1)[0].lower()
-                if cmd not in recovery_commands:
+                cmd = user_input.split()[0]
+                if cmd not in safe_mode_commands:
                     return (
-                        "🚨 SAFE MODE ACTIVE\n\n"
-                        "The agent has detected an integrity issue and is "
-                        "operating in restricted mode.\n"
-                        "Only recovery and diagnostic commands are available: "
-                        f"{', '.join(sorted(recovery_commands))}\n\n"
+                        "🚨 SAFE MODE ACTIVE\\n\\n"
+                        "The agent has detected an integrity issue and is operating in restricted mode.\\n"
+                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
@@ -5079,10 +5072,9 @@ Expected Duration: {expected_duration}
                     else "an integrity failure"
                 )
                 return (
-                    "🚨 SAFE MODE ACTIVE\n\n"
-                    f"The agent cannot process queries due to {restriction}.\n"
-                    "Use !safe-mode to check status or !verify-constitution "
-                    "to re-verify.\n\n"
+                    "🚨 SAFE MODE ACTIVE\\n\\n"
+                    f"The agent cannot process queries due to {restriction}.\\n"
+                    "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
                     "Normal operation will resume once integrity is restored."
                 )
 
@@ -5105,23 +5097,20 @@ Expected Duration: {expected_duration}
 
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-                # Bootstrap controls and the canonical recovery commands remain
-                # available while onboarding. Resolve the effective policy from
-                # the same handler instance that performs authority checks so a
-                # subclass or instance-level extension cannot drift here.
                 bootstrap_commands = {
                     "!skip-discovery",
                     "!restart-discovery",
+                    "!bootstrap-status",
                 }
                 command = (
                     user_input.split(maxsplit=1)[0].lower()
                     if user_input.startswith("!")
                     else None
                 )
-                recovery_commands = get_recovery_commands(
-                    getattr(self, "command_handler", None)
-                )
-                if command in bootstrap_commands or command in recovery_commands:
+                if (
+                    command in bootstrap_commands
+                    or command in self.command_handler.SOVEREIGN_COMMANDS
+                ):
                     pass  # Let command handler process these
                 elif command is not None:
                     # Never feed command text into discovery. Bootstrap may

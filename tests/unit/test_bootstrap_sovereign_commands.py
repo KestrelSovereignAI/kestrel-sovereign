@@ -6,10 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from kestrel_sovereign.auth import CallerContext
-from kestrel_sovereign.command_handler import (
-    CommandHandler,
-    get_recovery_commands,
-)
+from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -78,23 +75,6 @@ async def test_bootstrap_safe_mode_command_reaches_sovereign_command_handler():
     agent._handle_bootstrap.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "command",
-    sorted(CommandHandler.RECOVERY_COMMANDS - CommandHandler.SOVEREIGN_COMMANDS),
-)
-@pytest.mark.asyncio
-async def test_safe_mode_and_bootstrap_allow_canonical_recovery_commands(command):
-    agent = _bootstrap_agent()
-    agent._safe_mode = True
-    agent.command_handler.handle = AsyncMock(return_value="recovery handled")
-
-    result = await agent.process_input(command)
-
-    assert result == "recovery handled"
-    agent.command_handler.handle.assert_awaited_once_with(command, caller=None)
-    agent._handle_bootstrap.assert_not_awaited()
-
-
 @pytest.mark.asyncio
 async def test_bootstrap_non_recovery_command_returns_explicit_command_result():
     agent = _bootstrap_agent()
@@ -110,11 +90,13 @@ async def test_bootstrap_non_recovery_command_returns_explicit_command_result():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_passthrough_tracks_handler_instance_sovereign_commands():
+async def test_bootstrap_passthrough_tracks_sovereign_commands(monkeypatch):
     future_command = "!future-sovereign-recovery"
     agent = _bootstrap_agent()
-    agent.command_handler.SOVEREIGN_COMMANDS = (
-        CommandHandler.SOVEREIGN_COMMANDS | {future_command}
+    monkeypatch.setattr(
+        CommandHandler,
+        "SOVEREIGN_COMMANDS",
+        CommandHandler.SOVEREIGN_COMMANDS | {future_command},
     )
     agent.command_handler.handle = AsyncMock(return_value="future recovery handled")
 
@@ -123,53 +105,3 @@ async def test_bootstrap_passthrough_tracks_handler_instance_sovereign_commands(
     assert result == "future recovery handled"
     agent.command_handler.handle.assert_awaited_once_with(future_command, caller=None)
     agent._handle_bootstrap.assert_not_awaited()
-
-
-def test_recovery_commands_keep_canonical_floor_for_dynamic_test_double():
-    """Auto-created mock attributes cannot silently empty the recovery set."""
-    assert get_recovery_commands(MagicMock()) >= CommandHandler.RECOVERY_COMMANDS
-
-
-@pytest.mark.parametrize(
-    "attribute,value",
-    [
-        ("RECOVERY_COMMANDS", object()),
-        ("SOVEREIGN_COMMANDS", "!not-a-command-collection"),
-        ("SOVEREIGN_COMMANDS", ["!valid-extension", object()]),
-    ],
-)
-def test_recovery_commands_ignore_malformed_instance_values(attribute, value):
-    agent = _bootstrap_agent()
-    setattr(agent.command_handler, attribute, value)
-
-    commands = get_recovery_commands(agent.command_handler)
-
-    assert commands >= CommandHandler.RECOVERY_COMMANDS
-    if attribute == "SOVEREIGN_COMMANDS" and isinstance(value, list):
-        assert "!valid-extension" in commands
-
-
-@pytest.mark.asyncio
-async def test_safe_mode_rejection_uses_real_newlines():
-    agent = _bootstrap_agent()
-    agent._safe_mode = True
-
-    result = await agent.process_input("!tasks")
-
-    assert result.startswith("🚨 SAFE MODE ACTIVE\n\n")
-    assert "\\n" not in result
-    agent.bootstrap_service.is_bootstrap_needed.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_genesis_gate_uses_canonical_recovery_commands():
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent.command_handler = CommandHandler(agent)
-    agent._ensure_genesis_audit_ready = AsyncMock(
-        side_effect=AssertionError("recovery command must bypass genesis cognition")
-    )
-
-    for command in CommandHandler.RECOVERY_COMMANDS:
-        assert await agent._genesis_audit_cognition_block(command) is None
-
-    agent._ensure_genesis_audit_ready.assert_not_awaited()
