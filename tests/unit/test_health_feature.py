@@ -19,6 +19,7 @@ import pytest
 import pytest_asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.bootstrap.service import BootstrapService, BootstrapState
@@ -29,6 +30,7 @@ from kestrel_sovereign.features.health.checks import (
     check_disk_space,
     check_llm_service,
     check_memory_system,
+    check_resource_locks,
 )
 from kestrel_sovereign.features.health.feature import (
     DEFAULT_INTERVAL_SECONDS,
@@ -257,6 +259,124 @@ class TestCheckMemorySystem:
         assert result["status"] == "warn"
 
 
+class TestCheckResourceLocks:
+    @staticmethod
+    def _agent(holds):
+        lock_manager = SimpleNamespace(
+            active_hold_diagnostics=lambda: holds
+        )
+        return SimpleNamespace(
+            dispatcher=SimpleNamespace(lock_manager=lock_manager)
+        )
+
+    @pytest.mark.asyncio
+    async def test_passes_without_lock_diagnostics(self):
+        result = await check_resource_locks(SimpleNamespace())
+
+        assert result["status"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_warns_for_slow_blocked_hold(self):
+        result = await check_resource_locks(
+            self._agent(
+                [
+                    {
+                        "resource": "memory",
+                        "label": "cron sleep",
+                        "held_seconds": 120.0,
+                        "blocked_acquirers": 2,
+                    }
+                ]
+            )
+        )
+
+        assert result["status"] == "warn"
+        assert "memory lock has been held for 120 seconds" in result["message"]
+        assert "cron sleep" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_ignores_contended_conversation_turn(self):
+        result = await check_resource_locks(
+            self._agent(
+                [
+                    {
+                        "resource": "conversation",
+                        "label": "Claw turn_abc",
+                        "held_seconds": 66.7 * 3600,
+                        "blocked_acquirers": 2,
+                    }
+                ]
+            )
+        )
+
+        assert result["status"] == "pass"
+        assert "memory lock" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_reads_slow_threshold_from_lock_manager(self, monkeypatch):
+        monkeypatch.setattr(
+            "kestrel_sovereign.signals.lock_manager.SLOW_HOLD_WARN_SECONDS",
+            180.0,
+        )
+
+        result = await check_resource_locks(
+            self._agent(
+                [
+                    {
+                        "resource": "memory",
+                        "label": "cron sleep",
+                        "held_seconds": 120.0,
+                        "blocked_acquirers": 2,
+                    }
+                ]
+            )
+        )
+
+        assert result["status"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_reads_escalation_threshold_from_lock_manager(self, monkeypatch):
+        monkeypatch.setattr(
+            "kestrel_sovereign.signals.lock_manager.BLOCKED_HOLD_ERROR_SECONDS",
+            110.0,
+        )
+
+        result = await check_resource_locks(
+            self._agent(
+                [
+                    {
+                        "resource": "memory",
+                        "label": "cron sleep",
+                        "held_seconds": 120.0,
+                        "blocked_acquirers": 2,
+                    }
+                ]
+            )
+        )
+
+        assert result["status"] == "fail"
+        assert result["details"]["escalation_threshold_seconds"] == 110.0
+
+    @pytest.mark.asyncio
+    async def test_fails_and_reports_hours_after_escalation_threshold(self):
+        result = await check_resource_locks(
+            self._agent(
+                [
+                    {
+                        "resource": "memory",
+                        "label": "Claw MemoryFeature.memory_consolidate",
+                        "held_seconds": 66.7 * 3600,
+                        "blocked_acquirers": 2,
+                    }
+                ]
+            )
+        )
+
+        assert result["status"] == "fail"
+        assert "66.7 hours" in result["message"]
+        assert result["details"]["held_locks"][0]["resource"] == "memory"
+
+
 class TestCheckDiskSpace:
     @pytest.mark.asyncio
     async def test_pass_normally(self):
@@ -419,6 +539,14 @@ class TestDeriveOverallStatus:
         checks = [
             {"name": "database", "status": "pass"},
             {"name": "llm_service", "status": "fail"},
+        ]
+        assert _derive_overall_status(checks) == "unhealthy"
+
+    def test_escalated_resource_lock_is_unhealthy(self):
+        checks = [
+            {"name": "database", "status": "pass"},
+            {"name": "llm_service", "status": "pass"},
+            {"name": "resource_locks", "status": "fail"},
         ]
         assert _derive_overall_status(checks) == "unhealthy"
 

@@ -942,7 +942,7 @@ class SleepMixin:
                     # this operator-facing report.
                     report.error = unavailability_reason
             except Exception:
-                logger.error("Consolidation failed")
+                logger.error("Consolidation failed", exc_info=True)
                 report.error = "consolidation_failed"
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)

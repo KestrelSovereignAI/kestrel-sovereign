@@ -16,6 +16,9 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List
 
+from kestrel_sdk.signals import ResourceLock
+from kestrel_sovereign.signals import lock_manager as resource_lock_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -454,6 +457,111 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
     }
 
 
+async def check_resource_locks(agent) -> Dict[str, Any]:
+    """Surface a MEMORY lock that is both long-held and blocking work.
+
+    MEMORY protects bounded maintenance passes, so prolonged contention is an
+    actionable health signal. Other resources have different healthy hold
+    envelopes: in particular, CONVERSATION spans an entire agentic turn and
+    must not make routine multi-minute work degrade readiness. The snapshot is
+    in-memory and cannot itself block behind the resource being diagnosed.
+    """
+    start = time.monotonic()
+    dispatcher = getattr(agent, "dispatcher", None)
+    lock_manager = (
+        getattr(dispatcher, "lock_manager", None)
+        if dispatcher is not None
+        else None
+    )
+    snapshot = getattr(lock_manager, "active_hold_diagnostics", None)
+    if not callable(snapshot):
+        return {
+            "name": "resource_locks",
+            "status": "pass",
+            "message": "Resource lock diagnostics not available",
+            "duration_ms": _elapsed(start),
+        }
+
+    raw_holds = snapshot()
+    if not isinstance(raw_holds, list):
+        return {
+            "name": "resource_locks",
+            "status": "pass",
+            "message": "Resource lock diagnostics not available",
+            "duration_ms": _elapsed(start),
+        }
+
+    slow_holds: list[dict[str, Any]] = []
+    for raw in raw_holds:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("resource") != ResourceLock.MEMORY.value:
+            continue
+        held_seconds = raw.get("held_seconds")
+        blocked = raw.get("blocked_acquirers")
+        if (
+            isinstance(held_seconds, bool)
+            or not isinstance(held_seconds, (int, float))
+            or isinstance(blocked, bool)
+            or not isinstance(blocked, int)
+            or held_seconds < resource_lock_manager.SLOW_HOLD_WARN_SECONDS
+            or blocked < 0
+        ):
+            continue
+        slow_holds.append(dict(raw))
+
+    if not slow_holds:
+        return {
+            "name": "resource_locks",
+            "status": "pass",
+            "message": "The memory lock is not held past the slow-hold threshold",
+            "duration_ms": _elapsed(start),
+        }
+
+    blocked_holds = [
+        hold for hold in slow_holds if hold["blocked_acquirers"] > 0
+    ]
+    if not blocked_holds:
+        return {
+            "name": "resource_locks",
+            "status": "pass",
+            "message": (
+                f"{len(slow_holds)} resource lock(s) are long-held, but no "
+                "acquirers are blocked"
+            ),
+            "duration_ms": _elapsed(start),
+            "details": {"held_locks": slow_holds},
+        }
+
+    longest = max(blocked_holds, key=lambda hold: hold["held_seconds"])
+    held_seconds = float(longest["held_seconds"])
+    held_for = (
+        f"{held_seconds / 3600:.1f} hours"
+        if held_seconds >= 3600
+        else f"{held_seconds:.0f} seconds"
+    )
+    escalated = any(
+        hold["held_seconds"] >= resource_lock_manager.BLOCKED_HOLD_ERROR_SECONDS
+        for hold in blocked_holds
+    )
+    return {
+        "name": "resource_locks",
+        "status": "fail" if escalated else "warn",
+        "message": (
+            f"{longest.get('resource', 'unknown')} lock has been held for "
+            f"{held_for} by {longest.get('label', 'unknown')} with "
+            f"{longest['blocked_acquirers']} acquirer(s) blocked"
+        ),
+        "duration_ms": _elapsed(start),
+        "details": {
+            "held_locks": slow_holds,
+            "escalation_threshold_seconds": (
+                resource_lock_manager.BLOCKED_HOLD_ERROR_SECONDS
+            ),
+        },
+    }
+
+
 async def check_birth_record(agent) -> Dict[str, Any]:
     """Report birth-record capability the runtime database does not have (#2871).
 
@@ -527,6 +635,7 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
         await check_context_budget(agent),
         await check_bootstrap_state(agent),
         await check_signal_audit_log(agent),
+        await check_resource_locks(agent),
         await check_birth_record(agent),
     ]
 

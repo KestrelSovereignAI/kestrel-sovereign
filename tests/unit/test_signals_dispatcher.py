@@ -1025,6 +1025,35 @@ async def test_action_acquires_declared_resources(dispatcher_components):
     ), order
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_labels_declared_resource_holder(dispatcher_components):
+    """A blocked operator can identify the source and kind that owns MEMORY."""
+    c = dispatcher_components
+    assert c.dispatcher.lock_manager is c.locks
+    labels: list[str] = []
+
+    async def handler(_payload):
+        labels.append(c.locks.holder(ResourceLock.MEMORY).label)
+        return {"ok": True}
+
+    c.registry.register(
+        SourceRegistration(
+            name="cron",
+            schema=dict,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+            resources=frozenset({ResourceLock.MEMORY}),
+        )
+    )
+
+    result = await c.dispatcher.dispatch_signal(_signal("cron", kind="sleep"))
+
+    assert result.status is Status.OK
+    assert labels == ["cron sleep"]
+
+
 # ---------------------------------------------------------------------------
 # signal_log integration
 # ---------------------------------------------------------------------------

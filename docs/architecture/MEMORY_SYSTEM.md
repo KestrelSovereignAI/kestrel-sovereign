@@ -672,6 +672,16 @@ during sleep. It performs three operations.
 > in that PR; consolidation now runs nightly at 04:00 when the
 > `MemoryFeature` is loaded.
 
+Both the nightly sleep cycle and the manual tool route through
+`MemorySystem.consolidate()`, the single bounded maintenance chokepoint. Set
+`retrieval.memory_consolidation_timeout_seconds` to change its positive,
+finite deadline (default: 1,800 seconds). Expiry raises
+`MemoryConsolidationTimeoutError`; the caller must report failure rather than
+claiming a completed pass. The coroutine and its `ResourceLock.MEMORY` context
+unwind in the same task. An aiosqlite statement already running in the driver's
+worker thread cannot be interrupted by coroutine cancellation and may still be
+draining after the lock context is released.
+
 ### 1. Episode Creation
 
 Related messages are grouped into narrative episodes:

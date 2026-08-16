@@ -31,6 +31,10 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+from kestrel_sovereign.storage.memory_system import (
+    MemoryConsolidationTimeoutError,
+    _consolidation_timeout_seconds,
+)
 from kestrel_sovereign.storage.memory_retriever import _is_user_query_echo
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -1447,19 +1451,96 @@ class MemoryFeature(Feature):
         # same span (round-3 finding). No-op when no dispatcher lock manager is
         # wired (standalone / tests).
         dispatcher = getattr(self.agent, "dispatcher", None)
-        lock_manager = getattr(dispatcher, "_locks", None) if dispatcher is not None else None
+        lock_manager = (
+            getattr(dispatcher, "lock_manager", None)
+            if dispatcher is not None
+            else None
+        )
+        agent_name = getattr(self.agent, "agent_name", None)
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            agent_name = "agent"
+        lock_label = f"{agent_name.strip()} MemoryFeature.memory_consolidate"
 
         try:
+            timeout_seconds = _consolidation_timeout_seconds()
+            # Start the tool guard slightly after MemorySystem's canonical
+            # deadline. That leaves the chokepoint time to raise its precise,
+            # drain-aware exception while still bounding nonstandard
+            # MemorySystem stand-ins. Lock waiting gets a separate full budget
+            # below, so contention cannot silently consume consolidation time.
+            tool_timeout_seconds = timeout_seconds + min(timeout_seconds, 1.0)
             async with AsyncExitStack() as stack:
-                if lock_manager is not None:
-                    await stack.enter_async_context(
-                        lock_manager.acquire([ResourceLock.MEMORY])
+                owns_memory = getattr(
+                    lock_manager, "is_owned_by_current_task", None
+                )
+                already_owned = (
+                    lock_manager is not None
+                    and callable(owns_memory)
+                    and owns_memory(ResourceLock.MEMORY) is True
+                )
+                if lock_manager is not None and not already_owned:
+                    lock_deadline: asyncio.Timeout | None = None
+                    try:
+                        async with asyncio.timeout(
+                            tool_timeout_seconds
+                        ) as lock_deadline:
+                            await stack.enter_async_context(
+                                lock_manager.acquire(
+                                    [ResourceLock.MEMORY], label=lock_label
+                                )
+                            )
+                    except TimeoutError:
+                        if lock_deadline is None or not lock_deadline.expired():
+                            raise
+                        logger.error(
+                            "memory_consolidate could not acquire the MEMORY "
+                            "lock within %gs; consolidation did not start",
+                            tool_timeout_seconds,
+                        )
+                        return ToolResult.failed(
+                            "Memory consolidation could not acquire the memory "
+                            f"lock within {tool_timeout_seconds:g} seconds; "
+                            "consolidation did not start"
+                        )
+
+                # consolidate() is the single chokepoint — it runs
+                # consolidation AND the forgetting deletion tier (#1674), so
+                # the tool and nightly sleep cycle forget identically. A
+                # scheduled memory_consolidate dispatch already owns MEMORY in
+                # this same task; skip only that task-owned nested acquisition
+                # to avoid self-deadlocking a non-reentrant lock.
+                #
+                # This timeout begins only after lock acquisition. It cancels
+                # THIS task at the deadline, so the surrounding lock context
+                # unwinds in its owner task before TimeoutError is surfaced.
+                # asyncio.wait_for would move the coroutine into a child task
+                # and break that contract.
+                tool_deadline: asyncio.Timeout | None = None
+                try:
+                    async with asyncio.timeout(
+                        tool_timeout_seconds
+                    ) as tool_deadline:
+                        result = await memory_system.consolidate()
+                except TimeoutError:
+                    if tool_deadline is None or not tool_deadline.expired():
+                        raise
+                    logger.error(
+                        "memory_consolidate exceeded its %gs tool deadline; the "
+                        "pass was abandoned and in-flight database work may "
+                        "still be draining",
+                        tool_timeout_seconds,
                     )
-                # consolidate() is the single chokepoint — it runs consolidation
-                # AND the forgetting deletion tier (#1674), so the tool and the
-                # nightly sleep cycle forget identically. The MEMORY lock here
-                # serializes a manual `!memory consolidate` against the cron.
-                result = await memory_system.consolidate()
+                    return ToolResult.failed(
+                        "Memory consolidation did not complete within the "
+                        f"configured {timeout_seconds:g}-second deadline; the "
+                        "pass was abandoned and in-flight database work may "
+                        "still be draining"
+                    )
+        except MemoryConsolidationTimeoutError as exc:
+            logger.error(
+                "memory_consolidate reached its configured deadline: %s", exc
+            )
+            return ToolResult.failed(str(exc))
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))

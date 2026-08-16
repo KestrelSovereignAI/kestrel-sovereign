@@ -57,10 +57,10 @@ def _derive_overall_status(checks: List[Dict[str, Any]]) -> str:
 
     - healthy: all checks pass
     - degraded: at least one warn, no fails
-    - unhealthy: at least one critical check fails (database, llm_service)
+    - unhealthy: a critical database, LLM, or resource-lock check fails
     """
     statuses = [c.get("status", "pass") for c in checks]
-    critical_names = {"database", "llm_service"}
+    critical_names = {"database", "llm_service", "resource_locks"}
     critical_checks = [c for c in checks if c.get("name") in critical_names]
     critical_statuses = [c.get("status", "pass") for c in critical_checks]
 
