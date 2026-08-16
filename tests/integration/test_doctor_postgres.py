@@ -178,6 +178,78 @@ def runtime_db():
             admin.close()
 
 
+def _seed_governance_schema(dsn: str, schema: str, constitution_hash: str) -> None:
+    """Create one complete, owned governance state outside ``public``."""
+    import psycopg2
+    from psycopg2 import sql
+
+    connection = psycopg2.connect(dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
+            )
+            for table in (
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
+                "schema_backfills",
+            ):
+                cursor.execute(
+                    sql.SQL("CREATE TABLE {}.{} (LIKE {} INCLUDING ALL)").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table),
+                        sql.Identifier(table),
+                    )
+                )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_nodes "
+                    "(node_id, node_type, label, properties) "
+                    "VALUES (%s, 'agent', 'Test', %s)"
+                ).format(sql.Identifier(schema)),
+                (
+                    AGENT_DID,
+                    json.dumps(
+                        {"name": "Test", "constitution_hash": constitution_hash}
+                    ),
+                ),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_node_owners (node_id, agent_id) "
+                    "VALUES (%s, %s)"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, AGENT_DID),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_edges "
+                    "(source_id, target_id, label) "
+                    "VALUES (%s, %s, 'governed_by')"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, constitution_hash),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.graph_edge_owners "
+                    "(source_id, target_id, label, agent_id) "
+                    "VALUES (%s, %s, 'governed_by', %s)"
+                ).format(sql.Identifier(schema)),
+                (AGENT_DID, constitution_hash, AGENT_DID),
+            )
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.schema_backfills (name) "
+                    "VALUES ('ownership_2649')"
+                ).format(sql.Identifier(schema))
+            )
+    finally:
+        connection.close()
+
+
 def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
     """A ready project whose *anchor* carries ``anchored_hash``."""
     write_env(
@@ -544,6 +616,45 @@ def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
     ), report.ok
 
 
+async def test_direct_startup_setting_outranks_options_for_doctor_and_asyncpg(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Both drivers must read tenant even when URI order suggests public."""
+    import asyncpg
+
+    stale = hashlib.sha256(b"public schema must lose precedence").hexdigest()
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": stale},
+        governed_by=stale,
+    )
+    schema = f"tenant_{uuid.uuid4().hex[:12]}"
+    _seed_governance_schema(runtime_db.dsn, schema, canonical)
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?search_path="
+        + quote(schema, safe="")
+        + "&options=-c%20search_path%3Dpublic"
+    )
+
+    connection = await asyncpg.connect(runtime_dsn)
+    try:
+        assert await connection.fetchval("SELECT current_schema()") == schema
+    finally:
+        await connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+    assert any(
+        "constitution anchored to current file" in message
+        for message in report.ok
+    ), report.ok
+
+
 def test_libpq_only_pgoptions_cannot_change_doctors_schema(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
@@ -553,9 +664,6 @@ def test_libpq_only_pgoptions_cannot_change_doctors_schema(
     DSN stops stating ``options=``, libpq inherits PGOPTIONS, reads that stale
     tenant, and this test reports drift instead of passing vacuously.
     """
-    import psycopg2
-    from psycopg2 import sql
-
     stale = hashlib.sha256(b"ambient PGOPTIONS changed the schema").hexdigest()
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
@@ -564,66 +672,7 @@ def test_libpq_only_pgoptions_cannot_change_doctors_schema(
         governed_by=canonical,
     )
     schema = f"leaked_{uuid.uuid4().hex[:12]}"
-    connection = psycopg2.connect(runtime_db.dsn)
-    connection.autocommit = True
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
-            )
-            for table in (
-                "graph_nodes",
-                "graph_edges",
-                "graph_node_owners",
-                "graph_edge_owners",
-                "schema_backfills",
-            ):
-                cursor.execute(
-                    sql.SQL("CREATE TABLE {}.{} (LIKE {} INCLUDING ALL)").format(
-                        sql.Identifier(schema),
-                        sql.Identifier(table),
-                        sql.Identifier(table),
-                    )
-                )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_nodes "
-                    "(node_id, node_type, label, properties) "
-                    "VALUES (%s, 'agent', 'Test', %s)"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, json.dumps({"constitution_hash": stale})),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_node_owners (node_id, agent_id) "
-                    "VALUES (%s, %s)"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, AGENT_DID),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_edges "
-                    "(source_id, target_id, label) "
-                    "VALUES (%s, %s, 'governed_by')"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, stale),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_edge_owners "
-                    "(source_id, target_id, label, agent_id) "
-                    "VALUES (%s, %s, 'governed_by', %s)"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, stale, AGENT_DID),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.schema_backfills (name) "
-                    "VALUES ('ownership_2649')"
-                ).format(sql.Identifier(schema))
-            )
-    finally:
-        connection.close()
+    _seed_governance_schema(runtime_db.dsn, schema, stale)
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
@@ -737,6 +786,60 @@ def test_asyncpg_recognized_and_startup_options_remain_connectable(
     monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn + "?" + query)
 
     report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+@pytest.mark.parametrize(
+    ("query", "tls_env"),
+    [
+        ("?sslmode=disable&sslnegotiation=direct", {}),
+        ("?sslmode=disable", {"PGSSLNEGOTIATION": "direct"}),
+        ("?sslnegotiation=direct", {"PGSSLMODE": "disable"}),
+        (
+            "",
+            {"PGSSLMODE": "disable", "PGSSLNEGOTIATION": "direct"},
+        ),
+        ("?sslmode=allow&sslnegotiation=direct", {}),
+        ("", {"PGSSLMODE": "allow", "PGSSLNEGOTIATION": "direct"}),
+    ],
+    ids=(
+        "disable-query",
+        "disable-query-environment-direct",
+        "disable-query-direct-environment",
+        "disable-environment",
+        "allow-query",
+        "allow-environment",
+    ),
+)
+async def test_direct_negotiation_with_plaintext_path_remains_connectable(
+    tmp_path, monkeypatch, canonical, runtime_db, query, tls_env
+):
+    """Doctor follows asyncpg when disabled/allow selects plaintext."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    runtime_dsn = runtime_db.dsn + query
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    # PGSSL* affects psycopg2 even when its fixture passes an explicit DSN.
+    # Drop these overrides before runtime_db's finalizer reconnects to drop
+    # the throwaway database.
+    with pytest.MonkeyPatch.context() as tls:
+        for name in ("PGSSLMODE", "PGSSLNEGOTIATION"):
+            tls.delenv(name, raising=False)
+        for name, value in tls_env.items():
+            tls.setenv(name, value)
+
+        connection = await asyncpg.connect(runtime_dsn)
+        await connection.close()
+        report = diagnose(tmp_path)
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 

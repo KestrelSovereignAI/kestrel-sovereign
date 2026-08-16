@@ -1960,6 +1960,143 @@ def test_asyncpg_environment_option_unknown_to_linked_libpq_is_not_emitted(
     assert "sslnegotiation" not in parse_dsn(effective)
 
 
+def test_asyncpg_query_option_unknown_to_linked_libpq_is_not_emitted(
+    monkeypatch,
+    tmp_path,
+):
+    """A newer URI option is capability-checked before TLS normalization."""
+    import psycopg2
+    from psycopg2.extensions import make_dsn as real_make_dsn
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    def reject_newer_option(dsn=None, **kwargs):
+        if "sslnegotiation" in kwargs:
+            raise psycopg2.ProgrammingError("unsupported by this libpq")
+        return real_make_dsn(dsn, **kwargs)
+
+    monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_newer_option)
+    effective = _doctor_postgres_dsn(
+        "postgresql://u@h/db?sslnegotiation=direct",
+        {},
+        tmp_path,
+    )
+    parsed = parse_dsn(effective)
+
+    assert parsed["sslmode"] == "prefer"
+    assert "sslnegotiation" not in parsed
+
+
+@pytest.mark.parametrize(
+    ("dsn", "env", "sslmode", "sslnegotiation"),
+    [
+        (
+            "postgresql://u@h/db",
+            {"PGSSLNEGOTIATION": "direct"},
+            "require",
+            "direct",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "prefer", "PGSSLNEGOTIATION": "direct"},
+            "require",
+            "direct",
+        ),
+        (
+            "postgresql://u@h/db?sslnegotiation=direct",
+            {},
+            "require",
+            "direct",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=prefer&sslnegotiation=direct",
+            {},
+            "require",
+            "direct",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=allow&sslnegotiation=direct",
+            {},
+            "allow",
+            "postgres",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "allow", "PGSSLNEGOTIATION": "direct"},
+            "allow",
+            "postgres",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=verify-full&sslnegotiation=direct",
+            {},
+            "verify-full",
+            "direct",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "disable", "PGSSLNEGOTIATION": "direct"},
+            "disable",
+            "postgres",
+        ),
+        (
+            "postgresql://u@%2Ftmp/db?sslnegotiation=direct",
+            {},
+            "disable",
+            "postgres",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=disable&sslnegotiation=direct",
+            {},
+            "disable",
+            "postgres",
+        ),
+        (
+            "postgresql://u@h/db?sslnegotiation=direct",
+            {"PGSSLMODE": "disable"},
+            "disable",
+            "postgres",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=disable",
+            {"PGSSLNEGOTIATION": "direct"},
+            "disable",
+            "postgres",
+        ),
+    ],
+    ids=(
+        "environment-default-prefer",
+        "environment-explicit-prefer",
+        "query-default-prefer",
+        "query-explicit-prefer",
+        "query-allow",
+        "environment-allow",
+        "query-verify-full",
+        "environment-disable",
+        "unix-socket-default-disable",
+        "query-disable",
+        "query-direct-environment-disable",
+        "query-disable-environment-direct",
+    ),
+)
+def test_direct_tls_is_normalized_to_a_valid_libpq_pair(
+    dsn,
+    env,
+    sslmode,
+    sslnegotiation,
+    tmp_path,
+):
+    """asyncpg accepts weak/disabled modes that libpq rejects with direct."""
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    parsed = parse_dsn(_doctor_postgres_dsn(dsn, env, tmp_path))
+
+    assert parsed["sslmode"] == sslmode
+    assert parsed["sslnegotiation"] == sslnegotiation
+
+
 @pytest.mark.parametrize(
     ("query", "server_option"),
     [
@@ -1992,15 +2129,22 @@ def test_libpq_only_query_names_remain_asyncpg_server_settings(
     assert "+" not in effective
 
 
-def test_asyncpg_options_and_other_server_settings_share_libpq_options(tmp_path):
-    """The startup ``options`` field is already the channel libpq needs."""
+@pytest.mark.parametrize(
+    "query",
+    [
+        "options=-c%20statement_timeout%3D1000&search_path=tenant",
+        "search_path=tenant&options=-c%20statement_timeout%3D1000",
+    ],
+    ids=("options-first", "direct-setting-first"),
+)
+def test_asyncpg_options_precede_direct_startup_settings(query, tmp_path):
+    """PostgreSQL applies raw options first, independent of URI order."""
     from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
 
     effective = _doctor_postgres_dsn(
-        "postgresql://u@h/db?options=-c%20statement_timeout%3D1000"
-        "&search_path=tenant",
+        f"postgresql://u@h/db?{query}",
         {},
         tmp_path,
     )

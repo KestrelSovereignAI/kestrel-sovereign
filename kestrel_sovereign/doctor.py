@@ -865,6 +865,30 @@ def _state_asyncpg_connection_defaults(
         query.setdefault("target_session_attrs", "any")
 
 
+def _normalize_asyncpg_direct_tls(query: dict[str, str]) -> None:
+    """Keep asyncpg's direct-TLS intent valid and fail-closed in libpq."""
+    if query.get("sslnegotiation") != "direct":
+        return
+
+    sslmode = query.get("sslmode")
+    if sslmode == "disable":
+        # asyncpg never consults the negotiation mode when SSL is disabled.
+        # State libpq's ordinary negotiation explicitly so an ambient
+        # PGSSLNEGOTIATION cannot recreate its invalid direct+disable pair.
+        query["sslnegotiation"] = "postgres"
+    elif sslmode == "allow":
+        # asyncpg tries plaintext first for ``allow`` and only retries with
+        # TLS after a connection failure. libpq's ordinary negotiation has
+        # the same ordering and, unlike direct negotiation, is valid with a
+        # weak SSL mode.
+        query["sslnegotiation"] = "postgres"
+    elif sslmode == "prefer":
+        # libpq only permits direct negotiation with require or a verifying
+        # mode. Keep the direct-TLS path asyncpg attempts, while conservatively
+        # declining asyncpg's weaker plaintext fallback in the diagnostic.
+        query["sslmode"] = "require"
+
+
 _ASYNCPG_CONNECTION_FILE_OPTIONS = frozenset(
     {"passfile", "sslrootcert", "sslcrl", "sslkey", "sslcert"}
 )
@@ -907,10 +931,17 @@ def _doctor_postgres_dsn(
         ) from exc
 
     stated = _dsn_stated_options(parts, raw_query)
+    # asyncpg can understand connection options newer than the libpq linked
+    # into psycopg2. Keep only options this diagnostic driver can express,
+    # before any cross-driver normalization depends on their presence.
     query = {
         name: value
         for name, value in raw_query.items()
         if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS
+        and _libpq_accepts_dsn_option(
+            "dbname" if name == "database" else name,
+            value,
+        )
     }
 
     # asyncpg accepts ``database`` as an alias; libpq accepts ``dbname``.
@@ -948,6 +979,7 @@ def _doctor_postgres_dsn(
     # database-selecting value left to fill. This never mutates os.environ.
     has_libpq_service = "PGSERVICE" in env
     _state_asyncpg_connection_defaults(parts, query, hosts, user, env)
+    _normalize_asyncpg_direct_tls(query)
 
     for env_name, dsn_name, asyncpg_default in _LIBPQ_ONLY_ENV_DSN_DEFAULTS:
         should_neutralize = env_name in env or has_libpq_service
@@ -959,17 +991,14 @@ def _doctor_postgres_dsn(
     _resolve_connection_file_paths(query, project_dir)
 
     # These are server settings under asyncpg even when libpq happens to have
-    # a connection parameter with the same name. ``options`` itself is already
-    # PostgreSQL's startup-options field, so keep its value directly and add
-    # every other setting through ``-c name=value``.
-    option_fragments = []
+    # a connection parameter with the same name. PostgreSQL processes the raw
+    # ``options`` field before direct startup settings regardless of URI order,
+    # so put it first and append every other setting through ``-c name=value``.
+    option_fragments = [raw_query["options"]] if "options" in raw_query else []
     for name, value in raw_query.items():
-        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS:
+        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS or name == "options":
             continue
-        if name == "options":
-            option_fragments.append(value)
-        else:
-            option_fragments.append(_libpq_option_fragment(name, value))
+        option_fragments.append(_libpq_option_fragment(name, value))
     # State this unconditionally. ``options=`` is a valid explicit empty value
     # and prevents ambient PGOPTIONS from changing doctor's schema or startup
     # settings when the spawned asyncpg process would ignore it.
