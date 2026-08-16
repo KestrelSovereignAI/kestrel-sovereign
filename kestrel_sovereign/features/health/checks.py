@@ -526,6 +526,13 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             "Scheduler worker telemetry is stale "
             f"({status['report_age_seconds']}s old)"
         )
+    elif state == "tick_stalled":
+        tick_age = status.get("tick_age_seconds")
+        age_detail = f"{tick_age}s exceeds" if tick_age is not None else "exceeded"
+        message = (
+            f"Scheduler polling tick is stalled ({age_detail} the "
+            f"{status['tick_in_progress_limit_seconds']}s liveness bound)"
+        )
     elif state == "overdue":
         message = (
             "Scheduler has unclaimed work overdue by "

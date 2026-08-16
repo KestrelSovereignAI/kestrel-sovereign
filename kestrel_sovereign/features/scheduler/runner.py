@@ -41,6 +41,7 @@ from kestrel_sovereign.features.scheduler.status import (
     DEFAULT_MISFIRE_GRACE_SECONDS,
     emit_runtime_status,
     ensure_runtime_status_table,
+    scheduler_tick_in_progress_limit_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -986,6 +987,15 @@ class SchedulerRunner:
         self._running = False
         self._last_tick_started_at: Optional[str] = None
         self._last_tick_completed_at: Optional[str] = None
+        self._tick_started_monotonic: Optional[float] = None
+        self._live_claim_deadlines: dict[str, float] = {}
+        self._live_claim_deadline_snapshot: tuple[float, ...] = ()
+        self._tick_in_progress_limit_seconds = (
+            scheduler_tick_in_progress_limit_seconds(
+                poll_interval=poll_interval,
+                lease_seconds=normalized_lease_seconds,
+            )
+        )
         self._worker_restart_count = 0
         self._consecutive_worker_failures = 0
         self._last_worker_error_type: Optional[str] = None
@@ -1022,11 +1032,45 @@ class SchedulerRunner:
             and self._task is not None
             and not self._task.done()
             and self._consecutive_worker_failures == 0
+            and not self.tick_stalled
             and (
                 self._worker_task is None
                 or not self._worker_task.done()
             )
         )
+
+    @property
+    def tick_stalled(self) -> bool:
+        """Whether polling is over-bound without a live claimed execution."""
+
+        started = self._tick_started_monotonic
+        return bool(
+            self._running
+            and started is not None
+            and self._active_claimed_execution_count == 0
+            and time.monotonic() - started
+            > self._tick_in_progress_limit_seconds
+        )
+
+    @property
+    def _active_claimed_execution_count(self) -> int:
+        """Count claims whose last successful renewal is still in-bound."""
+
+        now = time.monotonic()
+        return sum(
+            deadline > now for deadline in self._live_claim_deadline_snapshot
+        )
+
+    def _reported_worker_state(self) -> str:
+        """Derive one coherent telemetry state from the live worker lifecycle."""
+
+        if self._runtime_worker_state != "running":
+            return self._runtime_worker_state
+        if self.tick_stalled:
+            return "stalled"
+        if self._active_claimed_execution_count:
+            return "executing"
+        return "running"
 
     def _latch_protocol_failure(self, error: BaseException) -> None:
         """Persist the first safety failure in process state and notify host."""
@@ -1123,6 +1167,7 @@ class SchedulerRunner:
         self._arm_requested_monotonic = None
         self._arm_requested_at = None
         self._running = False
+        self._tick_started_monotonic = None
         owned_tasks = tuple(dict.fromkeys(
             task
             for task in (self._task, self._worker_task, self._telemetry_task)
@@ -1162,13 +1207,21 @@ class SchedulerRunner:
             raise pending_cancellation
 
     async def _publish_runtime_status(self, worker_state: str) -> None:
+        agent_ids = await self._current_authorized_agent_ids()
+        # The tick may have completed while this heartbeat waited for its
+        # publication lock or a dynamic authority snapshot. Revalidate the
+        # derived state, then capture one internally-consistent timestamp view.
+        if worker_state in {"running", "executing", "stalled"}:
+            worker_state = self._reported_worker_state()
+        last_tick_started_at = self._last_tick_started_at
+        last_tick_completed_at = self._last_tick_completed_at
         await emit_runtime_status(
             self._db,
-            agent_ids=await self._current_authorized_agent_ids(),
+            agent_ids=agent_ids,
             owner_id=self._owner_id,
             worker_state=worker_state,
-            last_tick_started_at=self._last_tick_started_at,
-            last_tick_completed_at=self._last_tick_completed_at,
+            last_tick_started_at=last_tick_started_at,
+            last_tick_completed_at=last_tick_completed_at,
             restart_count=self._worker_restart_count,
             consecutive_failures=self._consecutive_worker_failures,
             last_error_type=self._last_worker_error_type,
@@ -1181,7 +1234,7 @@ class SchedulerRunner:
 
         try:
             async with self._runtime_status_publish_lock:
-                state = worker_state or self._runtime_worker_state
+                state = worker_state or self._reported_worker_state()
                 await asyncio.wait_for(
                     self._publish_runtime_status(state),
                     timeout=RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS,
@@ -1301,15 +1354,19 @@ class SchedulerRunner:
             self._last_tick_started_at = (
                 await scheduler_database_clock(self._db)
             ).isoformat()
+            self._tick_started_monotonic = time.monotonic()
             self._runtime_worker_state = "running"
             self._runtime_status_wake.set()
             # Per-occurrence failures are isolated and finalized by ``_tick``.
             # Infrastructure failures escape to the supervisor, which reports
             # and replaces this worker instead of letting it vanish.
-            await self._tick()
-            self._last_tick_completed_at = (
-                await scheduler_database_clock(self._db)
-            ).isoformat()
+            try:
+                await self._tick()
+                self._last_tick_completed_at = (
+                    await scheduler_database_clock(self._db)
+                ).isoformat()
+            finally:
+                self._tick_started_monotonic = None
             self._consecutive_worker_failures = 0
             self._last_worker_error_type = None
             self._runtime_status_wake.set()
@@ -2567,7 +2624,7 @@ class SchedulerRunner:
         # before waiting for the active rollout epoch; the exact non-locking
         # token/live admission check occurs inside that epoch immediately before
         # the target effect. A stale or fenced token is never executable.
-        if not await self._renew_lease_once(task):
+        if not await self._renew_live_claim_once(task):
             logger.warning(
                 "Refusing to execute scheduler claim %s: lease is no longer live",
                 task.claim_execution_id,
@@ -2589,10 +2646,14 @@ class SchedulerRunner:
             owner=self._owner_id,
         )
         renewal_state = _LeaseRenewalState()
-        renewal = asyncio.create_task(
-            self._monitor_lease_renewal(task, renewal_state),
-            name=f"scheduler-lease:{execution.id}",
-        )
+        try:
+            renewal = asyncio.create_task(
+                self._monitor_lease_renewal(task, renewal_state),
+                name=f"scheduler-lease:{execution.id}",
+            )
+        except BaseException:
+            self._forget_live_claim(task)
+            raise
         started = time.monotonic()
         in_preparation = True
         try:
@@ -2863,6 +2924,42 @@ class SchedulerRunner:
             # The renewal loop has no successful terminal state. A normal
             # return means the exact claim or live authority was lost.
             state.mark_lost()
+        finally:
+            self._forget_live_claim(task)
+
+    async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
+        """Renew a claim and expose only its bounded live-lease interval."""
+
+        renewed = await self._renew_lease_once(task)
+        execution_id = task.claim_execution_id
+        if not execution_id:
+            return renewed
+        if not renewed:
+            self._forget_live_claim(task)
+            return False
+        now = time.monotonic()
+        was_live = self._live_claim_deadlines.get(execution_id, 0.0) > now
+        self._live_claim_deadlines[execution_id] = now + self._lease_seconds
+        self._refresh_live_claim_deadline_snapshot()
+        if not was_live:
+            self._runtime_status_wake.set()
+        return True
+
+    def _forget_live_claim(self, task: ScheduledTask) -> None:
+        execution_id = task.claim_execution_id
+        if (
+            execution_id
+            and self._live_claim_deadlines.pop(execution_id, None) is not None
+        ):
+            self._refresh_live_claim_deadline_snapshot()
+            self._runtime_status_wake.set()
+
+    def _refresh_live_claim_deadline_snapshot(self) -> None:
+        """Publish an immutable view for synchronous health-probe threads."""
+
+        self._live_claim_deadline_snapshot = tuple(
+            self._live_claim_deadlines.values()
+        )
 
     def _log_lease_loss(self, execution: SchedulerExecution, *, phase: str) -> None:
         """Report a fail-closed lease loss without exposing backend details."""
@@ -2993,7 +3090,7 @@ class SchedulerRunner:
         interval = max(0.001, interval)
         while True:
             await asyncio.sleep(interval)
-            if not await self._renew_lease_once(task):
+            if not await self._renew_live_claim_once(task):
                 logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
                 return
 

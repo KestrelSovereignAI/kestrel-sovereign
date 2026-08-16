@@ -1,5 +1,6 @@
 """Focused tests for server health endpoint behavior."""
 
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -245,6 +246,51 @@ def test_health_fails_while_scheduler_supervisor_has_no_worker():
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
 
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_public_health_fails_while_scheduler_tick_is_stalled():
+    """A fresh heartbeat cannot hide a polling tick beyond its hard bound."""
+    from server import app
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SchedulerRunner(None, "agent-1", lambda *_: None)
+    live_task = SimpleNamespace(done=lambda: False)
+    runner._arm_requested = True
+    runner._running = True
+    runner._task = live_task
+    runner._worker_task = live_task
+    runner._tick_started_monotonic = (
+        time.monotonic() - runner._tick_in_progress_limit_seconds - 1
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert runner.tick_stalled is True
+    assert runner.worker_available is False
     assert response.status_code == 503
     assert response.json() == {
         "status": "unhealthy",

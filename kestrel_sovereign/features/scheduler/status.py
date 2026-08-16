@@ -62,6 +62,20 @@ def _parse_utc(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def scheduler_tick_in_progress_limit_seconds(
+    *,
+    poll_interval: int,
+    lease_seconds: int,
+    stale_after_ticks: int = DEFAULT_STALE_AFTER_TICKS,
+) -> int:
+    """Return the shared upper bound for one unfinished polling tick."""
+
+    stale_after_seconds = max(1, int(poll_interval)) * max(
+        1, int(stale_after_ticks)
+    )
+    return stale_after_seconds + max(1, int(lease_seconds))
+
+
 def classify_disablement(
     *,
     enabled: bool,
@@ -554,21 +568,41 @@ async def emit_runtime_status(
     """Emit one explicit report per authorized agent, including zero counts."""
 
     normalized_ids = tuple(sorted(set(agent_ids)))
-    if not normalized_ids:
-        return
     database_now = await scheduler_database_clock(db)
     reported_at_sql = scheduler_database_now_sql(db)
-    inventories = await _schedule_inventories(
-        db, normalized_ids, database_now=database_now
-    )
-    placeholders = ", ".join("?" for _ in normalized_ids)
     retention_cutoff = (
         database_now - timedelta(seconds=RUNTIME_STATUS_RETENTION_SECONDS)
     ).isoformat()
+    # Retention is telemetry-global rather than publication-scope-local. A
+    # stopped runner can no longer reap its own rows, and a revoked tenant no
+    # longer appears in another runner's live authority scope. Expiry is safe
+    # to enforce from any publisher because fresh peer reports are untouched.
     await db.execute(
         f"DELETE FROM {RUNTIME_STATUS_TABLE} "
-        f"WHERE agent_id IN ({placeholders}) AND reported_at < ?",
-        (*normalized_ids, retention_cutoff),
+        "WHERE reported_at < ?",
+        (retention_cutoff,),
+    )
+    # A live runner owns only the rows bearing its opaque lifetime UUID. Drop
+    # rows for DIDs that disappeared from its current authority snapshot while
+    # preserving every other runner's view of the same tenants. This also runs
+    # for an empty fleet, so repeated create/remove cycles are immediately
+    # bounded instead of waiting for the retention horizon.
+    if normalized_ids:
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        await db.execute(
+            f"DELETE FROM {RUNTIME_STATUS_TABLE} "
+            f"WHERE owner_id = ? AND agent_id NOT IN ({placeholders})",
+            (owner_id, *normalized_ids),
+        )
+    else:
+        await db.execute(
+            f"DELETE FROM {RUNTIME_STATUS_TABLE} WHERE owner_id = ?",
+            (owner_id,),
+        )
+        return
+
+    inventories = await _schedule_inventories(
+        db, normalized_ids, database_now=database_now
     )
     upsert_sql = f"""
         INSERT INTO {RUNTIME_STATUS_TABLE}
@@ -631,6 +665,11 @@ async def scheduler_status(
 
     stale_after_seconds = max(1, int(poll_interval)) * max(
         1, int(stale_after_ticks)
+    )
+    tick_in_progress_limit_seconds = scheduler_tick_in_progress_limit_seconds(
+        poll_interval=poll_interval,
+        lease_seconds=lease_seconds,
+        stale_after_ticks=stale_after_ticks,
     )
     database_now = await scheduler_database_clock(db)
     inventory = await _schedule_inventory(
@@ -716,9 +755,37 @@ async def scheduler_status(
         if report_age(report) is not None
         and report_age(report) <= stale_after_seconds
     ]
-    running_reports = [
+    reported_running_reports = [
         report for report in fresh_reports
-        if str(report[1] or "unknown") == "running"
+        if str(report[1] or "unknown") in {"running", "executing"}
+    ]
+
+    def unfinished_tick_age(report: Any) -> Optional[float]:
+        tick_started = _parse_utc(report[3])
+        tick_completed = _parse_utc(report[4])
+        if (
+            tick_started is None
+            or (tick_completed is not None and tick_started <= tick_completed)
+        ):
+            return None
+        tick_age = (database_now - tick_started).total_seconds()
+        return tick_age if tick_age >= 0 else None
+
+    stalled_reports = [
+        report
+        for report in fresh_reports
+        if (
+            str(report[1] or "unknown") == "stalled"
+            or (
+                str(report[1] or "unknown") == "running"
+                and (unfinished_tick_age(report) or 0)
+                > tick_in_progress_limit_seconds
+            )
+        )
+    ]
+    running_reports = [
+        report for report in reported_running_reports
+        if report not in stalled_reports
     ]
 
     details: Dict[str, Any] = {
@@ -729,6 +796,7 @@ async def scheduler_status(
         "worker_reports_received": len(reports),
         "fresh_worker_count": len(fresh_reports),
         "running_worker_count": len(running_reports),
+        "stalled_worker_count": len(stalled_reports),
         "fresh_non_running_worker_count": (
             len(fresh_reports) - len(running_reports)
         ),
@@ -799,23 +867,11 @@ async def scheduler_status(
         "reported_system_disabled_count": int(selected_report[13] or 0),
     })
 
-    tick_in_progress_limit_seconds = stale_after_seconds + max(
-        1, int(lease_seconds)
-    )
-
     def tick_in_progress(report: Any) -> bool:
-        tick_started = _parse_utc(report[3])
-        tick_completed = _parse_utc(report[4])
-        tick_age = (
-            (database_now - tick_started).total_seconds()
-            if tick_started is not None
-            else None
-        )
+        tick_age = unfinished_tick_age(report)
         return bool(
-            tick_started is not None
-            and tick_age is not None
+            tick_age is not None
             and 0 <= tick_age <= tick_in_progress_limit_seconds
-            and (tick_completed is None or tick_started > tick_completed)
         )
 
     details["tick_in_progress"] = any(
@@ -824,6 +880,13 @@ async def scheduler_status(
     details["tick_in_progress_limit_seconds"] = (
         tick_in_progress_limit_seconds
     )
+    selected_tick_age = unfinished_tick_age(selected_report)
+    details["tick_age_seconds"] = (
+        round(selected_tick_age, 3)
+        if selected_tick_age is not None
+        else None
+    )
+    details["tick_stalled"] = bool(stalled_reports)
 
     if expected_owner_id and not current_reports:
         details["state"] = (
@@ -842,6 +905,10 @@ async def scheduler_status(
             "awaiting_telemetry" if prior_owner_grace else "stale"
         )
         details["status"] = "warn" if prior_owner_grace else "fail"
+        return details
+    if stalled_reports and not running_reports:
+        details["state"] = "tick_stalled"
+        details["status"] = "fail"
         return details
     if not running_reports and worker_state == "starting":
         details["state"] = (
@@ -906,4 +973,5 @@ __all__ = [
     "ensure_runtime_status_table",
     "scheduler_status",
     "scheduler_status_parameters",
+    "scheduler_tick_in_progress_limit_seconds",
 ]

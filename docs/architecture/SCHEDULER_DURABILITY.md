@@ -111,9 +111,12 @@ Every poller emits one row per `(authorized agent, worker owner)` pair to
 and freshness use database statement time, so skew between PostgreSQL replica
 process clocks cannot make a current worker stale or preserve an old one. The
 reader selects only the current freshness window (plus at most one prior-owner
-diagnostic row), and publication reaps reports older than 24 hours, so random
-per-runner owner IDs cannot grow health-query work without bound. Each owner ID
-is an opaque UUID created once for a runner lifetime: it neither depends on a
+diagnostic row). Every publication globally reaps reports older than 24 hours
+and immediately removes that runner owner's rows for DIDs no longer in its live
+authority scope, including when the scope becomes empty. Fresh rows from peer
+runners remain untouched, so revoked dynamic tenants and random per-runner
+owner IDs cannot grow health-query work without bound. Each owner ID is an
+opaque UUID created once for a runner lifetime: it neither depends on a
 container PID that peer replicas may share nor contains an agent identifier.
 Fleet inventory is loaded once per heartbeat and owner reports are
 batch-upserted.
@@ -138,8 +141,14 @@ overwrite or flap a healthy peer. Missing or stale telemetry, no running worker,
 or unclaimed work older than both the telemetry threshold and its misfire grace
 fails the critical `scheduler_liveness` check. A due batch owned by a current
 tick remains healthy while rows wait behind the bounded concurrency semaphore,
-but that exemption expires after the telemetry threshold plus one claim lease
-so a wedged tick cannot hide an overdue queue forever. With heterogeneous
+but that exemption expires after the telemetry threshold plus one claim lease.
+An unfinished tick past that same bound is explicitly `tick_stalled` and fails
+both public worker availability and detailed scheduler health even when the
+queue contains zero schedules; a tick that later completes recovers those live
+signals. A tick with a live claimed execution reports `executing` instead: its
+lease-renewal contract remains the liveness evidence for intentionally long
+target work, while unrelated overdue rows still fail once the bounded
+in-progress exemption expires. With heterogeneous
 misfire grace, the reported overdue age belongs to the row with the earliest
 expired deadline rather than an unrelated older row still inside its grace.
 Tick boundaries are stamped from database time as well.

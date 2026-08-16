@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -26,6 +27,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerRunner,
 )
 from kestrel_sovereign.features.scheduler.status import (
+    RUNTIME_STATUS_RETENTION_SECONDS,
     emit_runtime_status,
     ensure_runtime_status_table,
     scheduler_status,
@@ -328,6 +330,88 @@ async def test_runtime_status_bounds_historical_owners_and_reaps_expired_rows(
         assert status["owner_id"] == "healthy"
         assert status["worker_reports_received"] == 1
         assert status["stale_worker_count"] == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_reaps_revoked_tenants_without_deleting_peer_rows(
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-revoked-tenant-status.db")
+    authorized = {"tenant-a", "tenant-b"}
+    runner = SchedulerRunner(
+        db,
+        None,
+        lambda *_: None,
+        owner_id="dynamic-runner",
+        authorized_agent_ids=authorized,
+        authorized_agent_ids_provider=lambda: authorized,
+    )
+    now = datetime.now(timezone.utc)
+    try:
+        await runner._ensure_tables()
+        await runner._publish_runtime_status("running")
+        await emit_runtime_status(
+            db,
+            agent_ids=("tenant-a", "tenant-b"),
+            owner_id="live-peer",
+            worker_state="running",
+            last_tick_started_at=now.isoformat(),
+            last_tick_completed_at=now.isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        authorized.remove("tenant-a")
+        await runner._publish_runtime_status("running")
+        assert await db.fetchall(
+            "SELECT agent_id, owner_id FROM scheduler_runtime_status "
+            "ORDER BY agent_id, owner_id"
+        ) == [
+            ("tenant-a", "live-peer"),
+            ("tenant-b", "dynamic-runner"),
+            ("tenant-b", "live-peer"),
+        ]
+
+        # Re-creating and removing the same DID does not accumulate this
+        # runner's old UUID rows, including when its live fleet becomes empty.
+        authorized.add("tenant-a")
+        await runner._publish_runtime_status("running")
+        authorized.clear()
+        await runner._publish_runtime_status("running")
+        assert await db.fetchall(
+            "SELECT agent_id, owner_id FROM scheduler_runtime_status "
+            "ORDER BY agent_id, owner_id"
+        ) == [
+            ("tenant-a", "live-peer"),
+            ("tenant-b", "live-peer"),
+        ]
+
+        # Any active publisher also bounds orphaned reports from dead runners,
+        # regardless of whether that retired DID is in its current scope.
+        await db.execute(
+            "UPDATE scheduler_runtime_status SET reported_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                (
+                    now
+                    - timedelta(seconds=RUNTIME_STATUS_RETENTION_SECONDS + 1)
+                ).isoformat(),
+                "tenant-a",
+                "live-peer",
+            ),
+        )
+        authorized.add("tenant-b")
+        await runner._publish_runtime_status("running")
+        assert await db.fetchall(
+            "SELECT agent_id, owner_id FROM scheduler_runtime_status "
+            "ORDER BY agent_id, owner_id"
+        ) == [
+            ("tenant-b", "dynamic-runner"),
+            ("tenant-b", "live-peer"),
+        ]
     finally:
         await db.close()
 
@@ -822,7 +906,198 @@ async def test_long_running_tick_keeps_independent_worker_heartbeat(
         assert status["status"] == "pass"
         assert status["state"] == "running_zero_schedules"
         assert status["tick_in_progress"] is True
+        assert status["tick_stalled"] is False
         assert status["report_age_seconds"] < 0.5
+        assert runner.worker_available is True
+    finally:
+        release_tick.set()
+        await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_claimed_execution_is_not_a_stalled_poller(
+    monkeypatch,
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-long-claimed-execution.db")
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+
+    async def execute(_task_name, _args):
+        execution_started.set()
+        await release_execution.wait()
+
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        execute,
+        owner_id="long-claimed-execution",
+        poll_interval=0.01,
+        lease_seconds=1,
+    )
+    runner._tick_in_progress_limit_seconds = 0.05
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    try:
+        await runner._ensure_tables()
+        now = await scheduler_database_clock(db)
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, scheduler_protocol_version)
+            VALUES ('long-running', 'agent-1', 'wait_reconcile', '* * * * *',
+                    '{}', 1, ?, ?, ?)
+            """,
+            (
+                (now - timedelta(seconds=1)).isoformat(),
+                now.isoformat(),
+                SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        await runner.arm()
+        await asyncio.wait_for(execution_started.wait(), timeout=2)
+
+        # Exercise the production state after both the in-process and durable
+        # hard bounds, without spending real seconds waiting in this test.
+        runner._tick_started_monotonic = time.monotonic() - 1
+        runner._last_tick_started_at = (now - timedelta(seconds=5)).isoformat()
+        await runner._publish_runtime_status_best_effort()
+
+        assert runner._active_claimed_execution_count == 1
+        assert runner.tick_stalled is False
+        assert runner.worker_available is True
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=1,
+            stale_after_ticks=1,
+            lease_seconds=1,
+            expected_owner_id=runner._owner_id,
+        )
+        assert status["tick_age_seconds"] >= 5
+        assert status["tick_in_progress_limit_seconds"] == 2
+        assert status["tick_stalled"] is False
+        assert status["worker_state"] == "executing"
+        assert status["executing_count"] == 1
+        assert status["status"] == "pass"
+
+        agent = SimpleNamespace(
+            did="agent-1",
+            features={
+                "SchedulerFeature": SimpleNamespace(
+                    enabled=True,
+                    _runner=runner,
+                    _initialized_monotonic=0.0,
+                )
+            },
+        )
+        health = await check_scheduler_liveness(agent, db)
+        assert health["status"] == "pass"
+        assert "executing schedule" in health["message"]
+
+        # A live execution exempts only itself. Work that became due after the
+        # current batch was selected still surfaces once the bounded in-flight
+        # grace expires.
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, misfire_grace_seconds,
+                 scheduler_protocol_version)
+            VALUES ('starved', 'agent-1', 'wait_reconcile', '* * * * *',
+                    '{}', 1, ?, ?, 0, ?)
+            """,
+            (
+                (now - timedelta(seconds=5)).isoformat(),
+                now.isoformat(),
+                SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        await runner._publish_runtime_status_best_effort()
+        overdue = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=1,
+            stale_after_ticks=1,
+            lease_seconds=1,
+            expected_owner_id=runner._owner_id,
+        )
+        assert overdue["worker_state"] == "executing"
+        assert overdue["tick_stalled"] is False
+        assert overdue["state"] == "overdue"
+        assert overdue["status"] == "fail"
+    finally:
+        release_execution.set()
+        await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_tick_fails_closed_and_recovers_after_completion(
+    monkeypatch,
+    tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-blocked-tick.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="blocked-tick",
+        poll_interval=0.01,
+    )
+    runner._tick_in_progress_limit_seconds = 0.05
+    tick_started = asyncio.Event()
+    release_tick = asyncio.Event()
+    attempts = 0
+
+    async def blocked_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            tick_started.set()
+            await release_tick.wait()
+
+    async def wait_for_worker_state(expected):
+        while True:
+            row = await db.fetchone(
+                "SELECT worker_state FROM scheduler_runtime_status "
+                "WHERE agent_id = ? AND owner_id = ?",
+                ("agent-1", runner._owner_id),
+            )
+            if row == (expected,):
+                return
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(runner, "_tick", blocked_once)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    try:
+        await runner.start()
+        await asyncio.wait_for(tick_started.wait(), timeout=2)
+        await asyncio.wait_for(wait_for_worker_state("stalled"), timeout=2)
+
+        assert runner.tick_stalled is True
+        assert runner.worker_available is False
+        stalled = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=1,
+            expected_owner_id=runner._owner_id,
+        )
+        assert stalled["state"] == "tick_stalled"
+        assert stalled["status"] == "fail"
+
+        release_tick.set()
+        await asyncio.wait_for(wait_for_worker_state("running"), timeout=2)
+        assert runner.tick_stalled is False
         assert runner.worker_available is True
     finally:
         release_tick.set()
@@ -1214,8 +1489,65 @@ async def test_wedged_tick_cannot_hide_overdue_queue_forever(tmp_path):
         assert status["report_age_seconds"] < 1
         assert status["tick_in_progress"] is False
         assert status["tick_in_progress_limit_seconds"] == 210
-        assert status["state"] == "overdue"
+        assert status["tick_stalled"] is True
+        assert status["state"] == "tick_stalled"
         assert status["status"] == "fail"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_wedged_tick_with_zero_schedules_fails_detailed_health(tmp_path):
+    db = await _database(tmp_path / "scheduler-wedged-empty-tick.db")
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        lambda *_: None,
+        owner_id="wedged-empty-tick",
+        lease_seconds=120,
+    )
+    try:
+        await runner._ensure_tables()
+        now = await scheduler_database_clock(db)
+        await emit_runtime_status(
+            db,
+            agent_ids=("agent-1",),
+            owner_id=runner._owner_id,
+            worker_state="running",
+            last_tick_started_at=(now - timedelta(seconds=211)).isoformat(),
+            last_tick_completed_at=(now - timedelta(seconds=212)).isoformat(),
+            restart_count=0,
+            consecutive_failures=0,
+            last_error_type=None,
+        )
+
+        status = await scheduler_status(
+            db,
+            agent_id="agent-1",
+            poll_interval=30,
+            lease_seconds=120,
+            expected_owner_id=runner._owner_id,
+        )
+        assert status["configured_enabled_count"] == 0
+        assert status["tick_in_progress_limit_seconds"] == 210
+        assert status["tick_stalled"] is True
+        assert status["state"] == "tick_stalled"
+        assert status["status"] == "fail"
+
+        agent = SimpleNamespace(
+            did="agent-1",
+            features={
+                "SchedulerFeature": SimpleNamespace(
+                    enabled=True,
+                    _runner=runner,
+                    _initialized_monotonic=0.0,
+                )
+            },
+        )
+        health = await check_scheduler_liveness(agent, db)
+        assert health["status"] == "fail"
+        assert health["details"]["state"] == "tick_stalled"
+        assert "liveness bound" in health["message"]
     finally:
         await db.close()
 
