@@ -55,6 +55,7 @@ Tools:
 
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -71,6 +72,7 @@ from kestrel_sovereign.features.scheduler.cron import (
     parse,
 )
 from kestrel_sovereign.features.scheduler.runner import (
+    ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_STATE_QUIESCING,
     SchedulerProtocolVersionIncompatible,
@@ -172,6 +174,7 @@ class SchedulerFeature(Feature):
         self._db = None
         self._agent_id = ""
         self._runner: Optional[SchedulerRunner] = None
+        self._initialized_monotonic = time.monotonic()
         self._polling_managed_by_host = (
             getattr(self.agent, "_scheduler_polling_managed_by_host", False)
             is True
@@ -696,10 +699,13 @@ class SchedulerFeature(Feature):
 
     async def shutdown(self):
         """Stop the background runner."""
-        if self._runner:
-            await self._runner.stop()
-        # Unregister the cron / pr-watch / discovery sources (base #2522 P2).
-        await super().shutdown()
+        try:
+            if self._runner:
+                await self._runner.stop()
+        finally:
+            # Source ownership must unwind even when runner cancellation is
+            # propagated through the feature's bounded shutdown slice.
+            await super().shutdown()
 
     # ------------------------------------------------------------------
     # Task executor — dispatches via SignalDispatcher (Phase 4 of #889)
@@ -2103,13 +2109,15 @@ class SchedulerFeature(Feature):
             return ToolResult.failed("Database not available")
 
         try:
+            schedule_now = await scheduler_database_clock(self._db)
             rows = await self._db.fetchall(
                 """
                 SELECT id, task_name, cron_expression, args_json,
                        enabled, last_run_at, next_run_at, created_at,
                        schedule_kind, run_at, timezone_name, misfire_policy,
                        misfire_grace_seconds, idempotency_key, lease_owner,
-                       lease_expires_at, attempt_count, terminal_status, terminal_at
+                       lease_expires_at, attempt_count, terminal_status, terminal_at,
+                       scheduler_rollout_fenced, scheduler_claim_fenced
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -2165,10 +2173,51 @@ class SchedulerFeature(Feature):
                 "attempt_count": row[16] if len(row) > 16 else 0,
                 "terminal_status": row[17] if len(row) > 17 else None,
                 "terminal_at": row[18] if len(row) > 18 else None,
+                "disablement": self._schedule_disablement(
+                    enabled=bool(row[4]),
+                    schedule_kind=(
+                        row[8] if len(row) > 8 and row[8] else "cron"
+                    ),
+                    terminal_status=row[17] if len(row) > 17 else None,
+                    database_now=schedule_now,
+                    rollout_fenced=bool(row[19]) if len(row) > 19 else False,
+                    claim_fenced=bool(row[20]) if len(row) > 20 else False,
+                    lease_owner=row[14] if len(row) > 14 else None,
+                    lease_expires_at=row[15] if len(row) > 15 else None,
+                ),
             })
 
-        data: Dict[str, Any] = {"tasks": tasks, "count": len(tasks)}
-        confirmation = f"Listed {len(tasks)} scheduled task(s)"
+        try:
+            from kestrel_sovereign.features.scheduler.status import (
+                scheduler_status,
+                scheduler_status_parameters,
+            )
+            liveness = await scheduler_status(
+                self._db,
+                agent_id=self._agent_id,
+                **scheduler_status_parameters(self),
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to inspect scheduler runtime status: %s",
+                type(error).__name__,
+            )
+            liveness = {
+                "state": "inspection_failed",
+                "status": "fail",
+                "enabled_count": None,
+                "telemetry_received": False,
+                "error_type": type(error).__name__,
+            }
+        data: Dict[str, Any] = {
+            "tasks": tasks,
+            "count": len(tasks),
+            "scheduler_status": liveness,
+        }
+        confirmation = (
+            f"Listed {len(tasks)} scheduled task(s); "
+            f"scheduler={liveness['state']} enabled={liveness['enabled_count']}"
+        )
 
         if load_errors:
             data["load_errors"] = load_errors
@@ -2183,6 +2232,29 @@ class SchedulerFeature(Feature):
             )
 
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @staticmethod
+    def _schedule_disablement(
+        *, enabled: bool, schedule_kind: str,
+        terminal_status: Optional[str], database_now: datetime,
+        rollout_fenced: bool, claim_fenced: bool,
+        lease_owner: Optional[str] = None,
+        lease_expires_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from kestrel_sovereign.features.scheduler.status import (
+            classify_disablement,
+        )
+
+        return classify_disablement(
+            enabled=enabled,
+            schedule_kind=schedule_kind,
+            terminal_status=terminal_status,
+            database_now=database_now,
+            rollout_fenced=rollout_fenced,
+            claim_fenced=claim_fenced,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+        )
 
     @tool(
         "schedule_add",
@@ -2562,12 +2634,19 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule resume",
     )
-    async def schedule_resume(self, task_id: str) -> ToolResult:
+    async def schedule_resume(
+        self,
+        task_id: str,
+        acknowledge_ambiguous_effect: bool = False,
+    ) -> ToolResult:
         """
         Resume a paused scheduled task.
 
         Args:
             task_id: The UUID of the task to resume
+            acknowledge_ambiguous_effect: Confirm that an operator reconciled
+                the possible legacy effect before re-enabling an occurrence
+                disabled during protocol rollout.
         """
         if not self._db:
             return ToolResult.failed("Database not available")
@@ -2614,9 +2693,68 @@ class SchedulerFeature(Feature):
                 run_at = row[4] if len(row) > 4 else None
                 timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
                 terminal_status = row[6] if len(row) > 6 else None
-                if schedule_kind == "one_shot" and terminal_status:
+                if terminal_status == "invalid_idempotency_key":
                     return ToolResult.failed(
-                        f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
+                        f"Task {task_id} has an invalid persisted idempotency key; "
+                        "repair or recreate the schedule before enabling it",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recovery_action": (
+                                "repair or recreate the schedule with a valid "
+                                "idempotency key"
+                            ),
+                        },
+                    )
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status == "execution_log_inconsistent"
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} has inconsistent execution history for "
+                        "its one-shot occurrence; reconcile the execution log "
+                        "and recreate the deadline instead of replaying it",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recoverable": False,
+                            "recovery_action": (
+                                "reconcile the execution log and recreate the "
+                                "one-shot schedule"
+                            ),
+                        },
+                    )
+                if (
+                    terminal_status == ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE
+                    and not acknowledge_ambiguous_effect
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} may already have run under the legacy "
+                        "scheduler; reconcile its external effect, then retry "
+                        "with acknowledge_ambiguous_effect=true",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recoverable": True,
+                            "recovery_action": (
+                                "verify the legacy occurrence's effect and retry "
+                                "schedule_resume with "
+                                "acknowledge_ambiguous_effect=true"
+                            ),
+                        },
+                    )
+                from kestrel_sovereign.features.scheduler.status import (
+                    SCHEDULER_SAFETY_DISABLEMENT_REASONS,
+                )
+
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status
+                    and terminal_status not in SCHEDULER_SAFETY_DISABLEMENT_REASONS
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} is a terminal one-shot deadline "
+                        f"({terminal_status}) and cannot be resumed"
                     )
                 cron_now_invalid = False
                 if schedule_kind == "one_shot":
@@ -2665,7 +2803,14 @@ class SchedulerFeature(Feature):
             "task_id": task_id,
             "status": "resumed",
             "next_run_at": next_run_at,
+            "recovered_from": terminal_status,
         }
+
+        if terminal_status == ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE:
+            data["recovery"] = (
+                "operator explicitly re-enabled an occurrence disabled during "
+                "legacy rollout ambiguity"
+            )
 
         # Honesty: a resumed task whose cron expression no longer parses
         # is enabled in the DB but has next_run_at=None — the runner will

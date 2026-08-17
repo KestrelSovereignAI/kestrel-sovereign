@@ -277,6 +277,15 @@ def _latch_scheduler_readiness_failure(
         )
 
 
+def _is_enabled_scheduler_feature(name: object, feature: object) -> bool:
+    """Return whether a feature-map entry is an active scheduler feature."""
+
+    return (
+        name == "SchedulerFeature"
+        or type(feature).__name__ == "SchedulerFeature"
+    ) and bool(getattr(feature, "enabled", True))
+
+
 def _latch_active_scheduler_runner_failures(
     app: FastAPI,
     agent,
@@ -310,12 +319,30 @@ def _latch_active_scheduler_runner_failures(
             )
 
     for agent_name, candidate in candidates:
-        features = getattr(candidate, "features", None)
+        try:
+            features = getattr(candidate, "features", None)
+        except Exception:  # pragma: no cover - health must not crash
+            logger.warning(
+                "Unable to inspect scheduler features for %s",
+                agent_name,
+                exc_info=True,
+            )
+            continue
         if not isinstance(features, dict):
             continue
-        for feature in features.values():
-            runner = getattr(feature, "_runner", None)
-            failure = getattr(runner, "readiness_failure", None)
+        for name, feature in features.items():
+            try:
+                if not _is_enabled_scheduler_feature(name, feature):
+                    continue
+                runner = getattr(feature, "_runner", None)
+                failure = getattr(runner, "readiness_failure", None)
+            except Exception:  # pragma: no cover - health must not crash
+                logger.warning(
+                    "Unable to inspect scheduler runner for %s",
+                    agent_name,
+                    exc_info=True,
+                )
+                continue
             if isinstance(failure, BaseException):
                 _latch_scheduler_readiness_failure(
                     app,
@@ -328,6 +355,67 @@ def _latch_active_scheduler_runner_failures(
     host_failure = getattr(host_runner, "readiness_failure", None)
     if isinstance(host_failure, BaseException):
         _latch_scheduler_readiness_failure(app, "protocol", host_failure)
+
+
+def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
+    """Return false when an enabled scheduler lacks its topology's live worker."""
+
+    runners = []
+    host_worker_required = False
+    candidates = [agent] if agent is not None else []
+    if manager is not None:
+        try:
+            candidates.extend(manager.list_agents().values())
+        except Exception:  # pragma: no cover - public health must not crash
+            return False
+    for candidate in candidates:
+        try:
+            features = getattr(candidate, "features", None)
+        except Exception:  # pragma: no cover - public health must not crash
+            logger.warning(
+                "Unable to inspect scheduler worker availability",
+                exc_info=True,
+            )
+            return False
+        if not isinstance(features, dict):
+            continue
+        for name, feature in features.items():
+            try:
+                if not _is_enabled_scheduler_feature(name, feature):
+                    continue
+                runner = getattr(feature, "_runner", None)
+                if runner is None:
+                    if getattr(feature, "_polling_managed_by_host", False) is True:
+                        host_worker_required = True
+                        continue
+                    return False
+                if not hasattr(runner, "worker_available"):
+                    return False
+                runners.append(runner)
+            except Exception:  # pragma: no cover - public health must not crash
+                logger.warning(
+                    "Unable to inspect scheduler worker availability",
+                    exc_info=True,
+                )
+                return False
+    try:
+        host_runner = getattr(app.state, "host_scheduler_runner", None)
+        if host_runner is None:
+            if host_worker_required:
+                return False
+        else:
+            if not hasattr(host_runner, "worker_available"):
+                return False
+            runners.append(host_runner)
+        return all(
+            getattr(runner, "worker_available", False) for runner in runners
+        )
+    except Exception:  # pragma: no cover - public health must not crash
+        logger.warning(
+            "Unable to inspect scheduler worker availability",
+            exc_info=True,
+        )
+        return False
 
 
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
@@ -1644,7 +1732,6 @@ async def _prepare_shared_postgres_scheduler_protocol(app: FastAPI, manager, con
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
-            owner_id=f"host-scheduler-preflight:{os.getpid()}",
         )
         # This is intentionally ``_ensure_tables`` rather than ``start``.  It
         # establishes the durable schema/provenance/rollout state but never
@@ -1774,7 +1861,6 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
             misfire_grace_seconds=SchedulerFeature._load_misfire_grace_seconds(),
             max_concurrent_tasks=SchedulerFeature._load_max_concurrent_tasks(),
             lease_seconds=SchedulerFeature._load_lease_seconds(),
-            owner_id=f"host-scheduler:{os.getpid()}",
         )
         # ``runner.start`` runs schema migration / rollout fencing and can fail.
         # Publish it first so cleanup also reaches a partially-started runner.
@@ -1804,7 +1890,6 @@ async def _start_host_scheduler(app: FastAPI, manager, config) -> None:
                     SchedulerFeature._load_max_concurrent_tasks()
                 ),
                 lease_seconds=SchedulerFeature._load_lease_seconds(),
-                owner_id=f"host-scheduler-register:{os.getpid()}:{agent_id}",
             )
             registration = await tenant_runner.prepare_tenant_registration()
 
@@ -3201,6 +3286,9 @@ def health_check(request: Request):
             content={"status": "unhealthy", "agent_initialized": False},
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
+    scheduler_workers_available = _active_scheduler_workers_available(
+        request.app, agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state,
         "scheduler_readiness_failures",
@@ -3213,6 +3301,7 @@ def health_check(request: Request):
         or identity_failures
         or constitution_safe_mode
         or scheduler_failures
+        or not scheduler_workers_available
     ):
         return JSONResponse(
             status_code=503,
@@ -3374,24 +3463,43 @@ async def health_detailed(request: Request):
                 "tracing": tracing,
             },
         )
+    scheduler_workers_available = _active_scheduler_workers_available(
+        request.app, agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state, "scheduler_readiness_failures", []
     )
-    if scheduler_failures:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": "Scheduler unavailable",
-                "scheduler_readiness_failures": scheduler_failures,
-                "checks": [],
-                "tracing": tracing,
-            },
-        )
+    scheduler_unavailable = bool(
+        scheduler_failures or not scheduler_workers_available
+    )
     if agent:
-        result = await _agent_detailed_health(agent)
+        try:
+            result = await _agent_detailed_health(agent)
+        except Exception:
+            if not scheduler_unavailable:
+                raise
+            logger.warning(
+                "Detailed agent health failed during scheduler outage",
+                exc_info=True,
+            )
+            result = {"status": "unhealthy", "checks": []}
         if isinstance(result, dict):
             result.setdefault("tracing", tracing)
+        if scheduler_unavailable:
+            content = dict(result) if isinstance(result, dict) else {
+                "checks": []
+            }
+            content.update(
+                {
+                    "status": "unhealthy",
+                    "overall_healthy": False,
+                    "error": "Scheduler unavailable",
+                    "scheduler_readiness_failures": scheduler_failures,
+                }
+            )
+            content.setdefault("checks", [])
+            content.setdefault("tracing", tracing)
+            return JSONResponse(status_code=503, content=content)
         return result
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
@@ -3422,7 +3530,7 @@ async def health_detailed(request: Request):
         overall = _roll_up_fleet_status(
             [entry["status"] for entry in breakdown.values()]
         )
-        return {
+        content = {
             "status": overall,
             "agents": breakdown,
             "checks": [],
@@ -3431,13 +3539,34 @@ async def health_detailed(request: Request):
                 request.app.state, "scheduler_cold_agent_failures", []
             ),
         }
+        if scheduler_unavailable:
+            content.update(
+                {
+                    "status": "unhealthy",
+                    "overall_healthy": False,
+                    "error": "Scheduler unavailable",
+                    "scheduler_readiness_failures": scheduler_failures,
+                }
+            )
+            return JSONResponse(status_code=503, content=content)
+        return content
 
-    return {
+    content = {
         "status": "unhealthy",
         "error": "No agent available",
         "checks": [],
         "tracing": tracing,
     }
+    if scheduler_unavailable:
+        content.update(
+            {
+                "overall_healthy": False,
+                "error": "Scheduler unavailable",
+                "scheduler_readiness_failures": scheduler_failures,
+            }
+        )
+        return JSONResponse(status_code=503, content=content)
+    return content
 
 
 def _enforce_host_csrf(request: Request):

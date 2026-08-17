@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from kestrel_sovereign.storage.database_clock import database_now_sql
+
 
 # Terminal states — a request in any of these is locked. The
 # coordinator must not re-execute, the agent must not re-modify.
@@ -115,6 +117,14 @@ _ADDED_COLUMNS = (
     # failure was ~18 re-emissions inside one boot; a count makes that storm
     # visible in the row itself rather than only in the logs.
     ("wake_dispatch_count", "INTEGER DEFAULT 0"),
+    # Start of the current uninterrupted busy deferral. This must not be
+    # inferred from requested_at: old pending rows may predate this policy by
+    # weeks and cannot become immediately escalation-eligible on upgrade.
+    ("first_blocked_at", "TEXT DEFAULT ''"),
+    # Legacy rows receive 0 from the additive migration. Fresh requests are
+    # inserted with 1 explicitly, so only a pre-upgrade backlog needs the
+    # one-time acknowledgement before bounded escalation may override idle.
+    ("escalation_acknowledged", "INTEGER DEFAULT 0"),
 )
 
 # One-time data backfills for legacy rows, keyed by the column whose addition
@@ -167,7 +177,8 @@ _COLUMNS = (
     "update_repo_path, update_target_ref, update_profile, "
     "update_allow_migrations, update_log, requester_request_id, "
     "executing_boot_id, origin_session_id, wake_delivered, "
-    "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count"
+    "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count, "
+    "first_blocked_at, escalation_acknowledged"
 )
 
 
@@ -214,6 +225,11 @@ class RestartRequest:
     wake_dispatch_boot_id: str = ""
     # Number of completion wakes dispatched for this row (#2738).
     wake_dispatch_count: int = 0
+    # Start of the current continuous idle-policy deferral (#2900).
+    first_blocked_at: str = ""
+    # Fresh rows opt into bounded escalation. Migrated rows remain false until
+    # an explicit acknowledgement records acceptance of the new behavior.
+    escalation_acknowledged: bool = False
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -246,6 +262,8 @@ class RestartRequest:
             wake_dispatched_at=str(g(20) or ""),
             wake_dispatch_boot_id=str(g(21) or ""),
             wake_dispatch_count=int(g(22) or 0),
+            first_blocked_at=str(g(23) or ""),
+            escalation_acknowledged=bool(int(g(24) or 0)),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -286,6 +304,8 @@ class RestartRequest:
             "wake_dispatched_at": self.wake_dispatched_at,
             "wake_dispatch_boot_id": self.wake_dispatch_boot_id,
             "wake_dispatch_count": self.wake_dispatch_count,
+            "first_blocked_at": self.first_blocked_at,
+            "escalation_acknowledged": self.escalation_acknowledged,
         }
 
 
@@ -316,7 +336,9 @@ async def ensure_restart_requests_table(db) -> None:
             wake_delivered INTEGER DEFAULT 0,
             wake_dispatched_at TEXT DEFAULT '',
             wake_dispatch_boot_id TEXT DEFAULT '',
-            wake_dispatch_count INTEGER DEFAULT 0
+            wake_dispatch_count INTEGER DEFAULT 0,
+            first_blocked_at TEXT DEFAULT '',
+            escalation_acknowledged INTEGER DEFAULT 0
         )
         """
     )
@@ -357,43 +379,28 @@ async def insert_request(
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
-    now = datetime.now(timezone.utc).isoformat()
+    now_sql = database_now_sql(db)
     await db.execute(
-        """
+        f"""
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
             completed_at, operation, update_repo_path, update_target_ref,
             update_profile, update_allow_migrations, update_log,
-            requester_request_id, origin_session_id
+            requester_request_id, origin_session_id, escalation_acknowledged
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?, ?)
+        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
+                ?, ?, ?, ?, ?, '', ?, ?, 1)
         """,
-        (req_id, requested_by_agent, reason, now, desired_window,
+        (req_id, requested_by_agent, reason, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
          requester_request_id, origin_session_id),
     )
-    return RestartRequest(
-        id=req_id,
-        requested_by_agent=requested_by_agent,
-        reason=reason,
-        requested_at=now,
-        desired_window=desired_window,
-        urgency=urgency,
-        policy=policy,
-        status="pending",
-        status_reason="",
-        completed_at=None,
-        operation=operation,
-        update_repo_path=update_repo_path,
-        update_target_ref=update_target_ref,
-        update_profile=update_profile,
-        update_allow_migrations=update_allow_migrations,
-        update_log="",
-        requester_request_id=requester_request_id,
-        origin_session_id=origin_session_id,
-    )
+    inserted = await get_request(db, req_id)
+    if inserted is None:
+        raise RuntimeError("restart request insert did not become visible")
+    return inserted
 
 
 async def list_requests(
@@ -523,6 +530,65 @@ async def get_request(db, request_id: str) -> Optional[RestartRequest]:
     if not rows:
         return None
     return RestartRequest.from_row(rows[0])
+
+
+async def mark_deferral_started(
+    db,
+    request_id: str,
+    *,
+    expected_current_status: str,
+    blocked_at: Optional[str] = None,
+) -> Optional[RestartRequest]:
+    """Persist the beginning of one uninterrupted busy deferral.
+
+    The conditional write preserves the first timestamp when multiple host
+    coordinators observe the same row. The status compare-and-set prevents a
+    stale coordinator from annotating a canceled or executing row. Returning
+    the authoritative row lets the caller distinguish an existing timestamp
+    from a lost lifecycle race.
+    """
+
+    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
+    params = (
+        (blocked_at, request_id, expected_current_status)
+        if blocked_at is not None
+        else (request_id, expected_current_status)
+    )
+    await db.execute(
+        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "WHERE id = ? AND status = ? "
+        "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
+        params,
+    )
+    return await get_request(db, request_id)
+
+
+async def clear_deferral_started(
+    db, request_id: str, *, expected_current_status: str,
+) -> bool:
+    """Clear a busy interval after fleet quiescence is observed."""
+
+    result = await db.execute(
+        "UPDATE restart_requests SET first_blocked_at = '' "
+        "WHERE id = ? AND status = ?",
+        (request_id, expected_current_status),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.first_blocked_at == "",
+    )
+
+
+async def acknowledge_escalation(db, request_id: str) -> bool:
+    """Acknowledge bounded escalation for one migrated pending request."""
+
+    result = await db.execute(
+        "UPDATE restart_requests SET escalation_acknowledged = 1 "
+        "WHERE id = ? AND status IN ('pending', 'approved')",
+        (request_id,),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.escalation_acknowledged,
+    )
 
 
 async def record_update_log(db, request_id: str, update_log: str) -> None:

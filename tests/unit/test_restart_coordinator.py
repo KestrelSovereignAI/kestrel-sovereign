@@ -37,9 +37,11 @@ from kestrel_sovereign.features.restart_coordinator.event_store import (
 )
 from kestrel_sovereign.features.restart_coordinator.feature import (
     _MAX_NAMED_BUSY_KINDS,
+    MAX_IDLE_ONLY_DEFERRAL_SECONDS,
     _describe_background_tasks,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
+    clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
     insert_request,
@@ -370,6 +372,9 @@ async def test_fleet_idle_defers_when_a_sibling_is_busy(tmp_path):
     state = feat._fleet_idle(ignore_request_id="")
     assert state["idle"] is False
     assert "did:test:sibling" in state["reason"]
+    assert state["blocker"]["count"] is None
+    assert state["blocker"]["oldest_age_seconds"] is None
+    assert "1 active request" not in state["reason"]
 
 
 @pytest.mark.asyncio
@@ -430,6 +435,53 @@ async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path):
     # counts (it is NOT the requester's turn).
     assert state["idle"] is False
     assert "did:test:sibling" in state["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    sibling = _idle_sibling("did:test:sibling", busy=False)
+    blocked = asyncio.Event()
+
+    async def private_counterparty_sync():
+        await blocked.wait()
+
+    task = asyncio.create_task(
+        private_counterparty_sync(), name="private-counterparty-sync"
+    )
+    sibling._background_tasks = {task}
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+    try:
+        state = feat._fleet_idle(ignore_request_id="")
+        assert state["idle"] is False
+        assert state["blocker"]["count"] is None
+        assert state["blocker"]["summary"] is None
+        assert state["blocker"]["oldest_age_seconds"] is None
+        assert "private-counterparty-sync" not in state["reason"]
+        assert "1 background task" not in state["reason"]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_fleet_blocker_does_not_disclose_sibling_dispatcher_load(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    sibling = _idle_sibling("did:test:sibling", busy=False)
+    sibling.dispatcher = SimpleNamespace(in_flight_signals=7)
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+
+    state = feat._fleet_idle(ignore_request_id="")
+
+    assert state["idle"] is False
+    assert state["blocker"]["kind"] == "dispatcher"
+    assert state["blocker"]["surface"] is None
+    assert state["blocker"]["count"] is None
+    assert "in_flight_signals" not in state["reason"]
+    assert "7" not in state["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +571,8 @@ async def test_request_restart_creates_pending_row(tmp_path):
     req = result.data["request"]
     assert req["status"] == "pending"
     assert req["requested_by_agent"] == "did:test:agent"
+    assert req["first_blocked_at"] == ""
+    assert req["escalation_acknowledged"] is True
     # Persisted to the table.
     rows = await list_requests(backend)
     assert any(r.id == req["id"] for r in rows)
@@ -751,6 +805,114 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     assert "busy" in result.data["deferred"][0]["reason"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("racing_status", ["canceled", "executing"])
+async def test_deferral_status_race_cannot_dispatch_or_resurrect_request(
+    tmp_path, racing_status,
+):
+    """A cancellation or competing claim after selection wins permanently."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="race")
+    request_id = created.data["request"]["id"]
+    feat.agent._active_request_ids.add("unrelated-request")
+
+    async def lose_race(db, selected_id, *, expected_current_status):
+        assert selected_id == request_id
+        assert expected_current_status == "pending"
+        assert await update_status(
+            db,
+            selected_id,
+            status=racing_status,
+            status_reason="concurrent transition",
+            expected_current_status="pending",
+        )
+        return await get_request(db, selected_id)
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature."
+        "mark_deferral_started",
+        side_effect=lose_race,
+    ), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    mock_spawn.assert_not_called()
+    assert result.data["executed"] == []
+    assert result.data["deferred"][0]["request_id"] == request_id
+    assert "lost race" in result.data["deferred"][0]["reason"]
+    row = await get_request(backend, request_id)
+    assert row.status == racing_status
+    assert row.first_blocked_at == ""
+
+
+@pytest.mark.asyncio
+async def test_escalation_event_is_not_emitted_before_lifecycle_cas(tmp_path):
+    """A cancellation winning the dispatch CAS cannot leave a false event."""
+
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="escalation CAS race")
+    request_id = created.data["request"]["id"]
+    feat.agent._active_request_ids.add("other-active-request")
+    blocked_at = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
+    ).isoformat()
+    await backend.execute(
+        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
+        (blocked_at, request_id),
+    )
+    captured = _attach_emit_capture(feat)
+
+    async def lose_transition(*args, **kwargs):
+        return False
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature.update_status",
+        side_effect=lose_transition,
+    ), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    assert result.data["executed"] == []
+    assert not any(
+        event["status"] == "escalated"
+        for event in _restart_status_events(captured)
+    )
+
+
+@pytest.mark.asyncio
+async def test_deferral_clear_cannot_reset_competing_execution_interval(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="clear race")
+    request_id = created.data["request"]["id"]
+    blocked_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    await backend.execute(
+        "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
+        (blocked_at, request_id),
+    )
+    assert await update_status(
+        backend,
+        request_id,
+        status="executing",
+        expected_current_status="pending",
+    )
+
+    cleared = await clear_deferral_started(
+        backend,
+        request_id,
+        expected_current_status="pending",
+    )
+
+    assert cleared is False
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.first_blocked_at == blocked_at
+
+
 def _attach_lifecycle(agent):
     """Bind the real RequestLifecycleMixin surface onto a mock agent so
     the coordinator's stale-request sweep (#1558) can run against it.
@@ -962,6 +1124,12 @@ async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
 
     assert mock_spawn.call_count == 1
     assert result.data["executed"][0]["request_id"] == req.id
+    events = await feat.list_restart_status_events()
+    request_events = [
+        event for event in events.data["events"]
+        if event["request_id"] == req.id
+    ]
+    assert all(event["state"] != "escalated" for event in request_events)
 
 
 @pytest.mark.asyncio
@@ -4057,6 +4225,22 @@ async def _insert_raw(db, request_id, **cols):
         f"INSERT INTO restart_requests ({names}) VALUES ({marks})",
         tuple(fields.values()),
     )
+
+
+@pytest.mark.asyncio
+async def test_migrated_pending_request_requires_escalation_acknowledgement(
+    tmp_path,
+):
+    db = await _db_at_schema(
+        tmp_path, "legacy-escalation.db", through_column="wake_dispatch_count",
+    )
+    await _insert_raw(db, "legacy-pending", status="pending")
+
+    await ensure_restart_requests_table(db)
+
+    row = await get_request(db, "legacy-pending")
+    assert row.first_blocked_at == ""
+    assert row.escalation_acknowledged is False
 
 
 @pytest.mark.asyncio

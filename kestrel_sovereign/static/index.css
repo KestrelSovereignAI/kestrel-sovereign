@@ -1469,6 +1469,11 @@ nav {
     opacity: 0.9;
 }
 
+.restart-status-state-escalated {
+    color: rgb(239, 68, 68);
+    font-weight: 700;
+}
+
 .restart-status-body {
     display: flex;
     flex-direction: column;

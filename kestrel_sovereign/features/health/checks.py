@@ -64,13 +64,13 @@ def derive_overall_status(checks: List[Dict[str, Any]]) -> str:
 
     - healthy: all checks pass
     - degraded: at least one warning or non-critical failure
-    - unhealthy: a critical database or LLM check fails
+    - unhealthy: a critical database, LLM, or scheduler-liveness check fails
 
     Both HealthFeature and the no-feature ``/health/detailed`` fallback use
     this function so installing the feature cannot change a check's severity.
     """
     statuses = [check.get("status", "pass") for check in checks]
-    critical_names = {"database", "llm_service"}
+    critical_names = {"database", "llm_service", "scheduler_liveness"}
     critical_statuses = [
         check.get("status", "pass")
         for check in checks
@@ -441,6 +441,129 @@ async def check_context_budget(agent) -> Dict[str, Any]:
         }
 
 
+async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
+    """Verify that an enabled SchedulerFeature has a current worker report."""
+
+    start = time.monotonic()
+    features = getattr(agent, "features", None)
+    scheduler = None
+    if isinstance(features, dict):
+        for name, feature in features.items():
+            if name == "SchedulerFeature" or type(feature).__name__ == "SchedulerFeature":
+                if getattr(feature, "enabled", True):
+                    scheduler = feature
+                break
+    if scheduler is None:
+        return {
+            "name": "scheduler_liveness",
+            "status": "pass",
+            "message": "SchedulerFeature is not enabled for this agent",
+            "details": {"state": "not_configured"},
+            "duration_ms": _elapsed(start),
+        }
+    if db is None:
+        return {
+            "name": "scheduler_liveness",
+            "status": "fail",
+            "message": "SchedulerFeature has no database for worker telemetry",
+            "details": {"state": "storage_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
+
+    try:
+        from kestrel_sovereign.features.scheduler.status import (
+            scheduler_status,
+            scheduler_status_parameters,
+        )
+        parameters = scheduler_status_parameters(scheduler)
+        status = await scheduler_status(
+            db,
+            agent_id=str(getattr(agent, "did", "") or getattr(agent, "agent_id", "")),
+            **parameters,
+        )
+    except Exception as error:
+        return {
+            "name": "scheduler_liveness",
+            "status": "fail",
+            "message": f"Scheduler liveness inspection failed: {error}",
+            "details": {"state": "inspection_failed"},
+            "duration_ms": _elapsed(start),
+        }
+
+    state = status["state"]
+    if status["status"] == "pass":
+        if status.get("executing_count"):
+            message = (
+                "Scheduler worker is current with "
+                f"{status['enabled_count']} runnable and "
+                f"{status['executing_count']} executing schedule(s)"
+            )
+        elif state == "running_zero_schedules":
+            message = "Scheduler worker is current and reports zero schedules"
+        elif state == "running_only_terminal_schedules":
+            message = (
+                "Scheduler worker is current; all "
+                f"{status['terminal_count']} schedule(s) are terminal history"
+            )
+        elif state == "running_only_operator_paused_schedules":
+            message = (
+                "Scheduler worker is current; all "
+                f"{status['disabled_count']} schedule(s) are operator-paused"
+            )
+        else:
+            message = (
+                "Scheduler worker is current with "
+                f"{status['enabled_count']} runnable schedule(s)"
+            )
+    elif state == "awaiting_telemetry":
+        message = "Scheduler is starting; no worker telemetry received yet"
+    elif state == "no_telemetry":
+        message = "No scheduler worker telemetry received"
+    elif state == "no_current_telemetry":
+        message = "No telemetry received from the current scheduler worker"
+    elif state == "stale":
+        message = (
+            "Scheduler worker telemetry is stale "
+            f"({status['report_age_seconds']}s old)"
+        )
+    elif state == "tick_stalled":
+        tick_age = status.get("tick_age_seconds")
+        age_detail = f"{tick_age}s exceeds" if tick_age is not None else "exceeded"
+        message = (
+            f"Scheduler polling tick is stalled ({age_detail} the "
+            f"{status['tick_in_progress_limit_seconds']}s liveness bound)"
+        )
+    elif state == "overdue":
+        message = (
+            "Scheduler has unclaimed work overdue by "
+            f"{status['overdue_seconds']}s"
+        )
+    elif state == "non_runnable_schedules":
+        message = (
+            f"Scheduler has {status['non_runnable_count']} enabled schedule(s) "
+            "without a valid next_run_at"
+        )
+    elif state == "system_disabled_schedules":
+        message = (
+            f"Scheduler worker is current; {status['system_disabled_count']} "
+            "schedule(s) were disabled by scheduler safety policy"
+        )
+    elif state == "protocol_fenced_schedules":
+        message = (
+            f"Scheduler worker is current; {status['fenced_count']} "
+            "schedule(s) are temporarily fenced by scheduler protocol"
+        )
+    else:
+        message = f"Scheduler worker state is {state}"
+    return {
+        "name": "scheduler_liveness",
+        "status": status["status"],
+        "message": message,
+        "details": status,
+        "duration_ms": _elapsed(start),
+    }
+
+
 async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[str, Any]:
     """Check whether first-contact bootstrap is stuck in PENDING."""
     start = time.monotonic()
@@ -767,6 +890,10 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
         await check_memory_system(agent),
         await check_disk_space(),
         await check_context_budget(agent),
+        await _run_database_bound_check(
+            "scheduler_liveness",
+            check_scheduler_liveness(agent, db),
+        ),
         await _run_database_bound_check(
             "bootstrap_state",
             check_bootstrap_state(agent),

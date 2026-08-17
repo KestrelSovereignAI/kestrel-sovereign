@@ -7,14 +7,14 @@ having to trust the agent's natural-language report.
 
 This module builds the JSON payload for the ``restart_status`` UI
 side-channel event. The feature emits one through ``agent.emit_event``
-at each lifecycle point (filed/pending, deferred, executing/updating,
+at each lifecycle point (filed/pending, deferred, escalated, executing/updating,
 completed, rejected, canceled); the Sovereign Console renders it as a
 system/status bubble in the conversation.
 
 The payload deliberately mirrors the fields the issue calls out:
 request id, requesting agent, operation, target ref + update profile,
-policy/urgency, current state, and a deferral reason when the
-coordinator defers execution.
+policy/urgency, current state, and a deferral reason when the coordinator
+defers execution, plus structured blocker age/evidence when it escalates.
 """
 
 from __future__ import annotations
@@ -34,6 +34,10 @@ def build_restart_status_event(
     status_reason: str = "",
     agent_did: str = "",
     requested_by_agent_name: str = "",
+    blocker: Optional[Dict[str, Any]] = None,
+    request_age_seconds: Optional[float] = None,
+    deferral_age_seconds: Optional[float] = None,
+    escalated: bool = False,
 ) -> Dict[str, Any]:
     """Build the ``restart_status`` UI event payload for one request.
 
@@ -68,6 +72,10 @@ def build_restart_status_event(
         "update_profile": str(getattr(request, "update_profile", "")),
         "deferral_reason": str(deferral_reason or ""),
         "status_reason": str(status_reason or ""),
+        "blocker": dict(blocker) if blocker else None,
+        "request_age_seconds": request_age_seconds,
+        "deferral_age_seconds": deferral_age_seconds,
+        "escalated": bool(escalated),
         "completed_at": _opt_str(getattr(request, "completed_at", None)),
         # Chat session this request was filed from (#1812). Carried in
         # the payload so chat-history reload can scope the repainted

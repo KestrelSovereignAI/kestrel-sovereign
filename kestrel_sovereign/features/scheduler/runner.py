@@ -26,75 +26,36 @@ from typing import Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Pr
 
 from kestrel_sovereign._async_ownership import await_owned_task, run_blocking_operation
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign.features.scheduler.constants import (
+    ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
+)
+from kestrel_sovereign.storage.database_clock import (
+    database_backend_type as scheduler_database_backend_type,
+    database_clock as scheduler_database_clock,
+    database_now_sql as scheduler_database_now_sql,
+)
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.status import (
+    DEFAULT_LEASE_SECONDS,
+    DEFAULT_MISFIRE_GRACE_SECONDS,
+    emit_runtime_status,
+    ensure_runtime_status_table,
+    scheduler_tick_in_progress_limit_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _scheduler_database_backend_type(db: Any) -> str:
-    """Return a concrete scheduler DB type without trusting loose doubles."""
-
-    backend_type = getattr(db, "backend_type", "")
-    return backend_type.lower() if isinstance(backend_type, str) else ""
-
-
-def scheduler_database_now_sql(db: Any) -> str:
-    """Return the scheduler's portable statement-time UTC clock expression."""
-
-    backend_type = _scheduler_database_backend_type(db)
-    if backend_type == "postgres":
-        return (
-            "(to_char(clock_timestamp() AT TIME ZONE 'UTC', "
-            "'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')"
-        )
-    if backend_type == "sqlite":
-        return "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
-    raise RuntimeError("scheduler database clock is unavailable for this backend")
-
-
-async def scheduler_database_clock(db: Any) -> datetime:
-    """Read the scheduler's wall clock from its durable database.
-
-    Cron progression must use the same authority as the due-work predicates.
-    Concrete PostgreSQL and SQLite backends therefore read their statement-time
-    clocks; deliberately minimal test/adaptor doubles retain the historical
-    host-clock fallback.
-    """
-
-    backend_type = _scheduler_database_backend_type(db)
-    if backend_type == "postgres":
-        value = await db.fetchval("SELECT clock_timestamp()")
-    elif backend_type == "sqlite":
-        value = await db.fetchval(
-            "SELECT strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
-        )
-    else:
-        return datetime.now(timezone.utc)
-
-    if isinstance(value, datetime):
-        return (
-            value.replace(tzinfo=timezone.utc)
-            if value.tzinfo is None
-            else value.astimezone(timezone.utc)
-        )
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        parsed = None
-    if parsed is None:
-        raise RuntimeError("scheduler database returned an invalid wall-clock timestamp")
-    return (
-        parsed.replace(tzinfo=timezone.utc)
-        if parsed.tzinfo is None
-        else parsed.astimezone(timezone.utc)
-    )
+_scheduler_database_backend_type = scheduler_database_backend_type
 
 
 POLL_INTERVAL = 30
-DEFAULT_MISFIRE_GRACE_SECONDS = 600
 DEFAULT_MAX_CONCURRENT_TASKS = 4
-DEFAULT_LEASE_SECONDS = 120
+SUPERVISOR_MIN_BACKOFF_SECONDS = 1.0
+SUPERVISOR_MAX_BACKOFF_SECONDS = 30.0
+RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS = 1.0
+RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS = 5.0
 
 MISFIRE_SKIP = "skip"
 MISFIRE_FIRE_ONCE = "fire_once"
@@ -130,8 +91,6 @@ SCHEDULER_SCHEMA_PROVENANCE_LEGACY_UNKNOWN = "legacy-unknown"
 # may have been dispatched by that selector just before the fence.  There is
 # no safe way to infer that its external effect did not happen, so activation
 # deliberately leaves it paused and visible for an explicit operator resume.
-ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE = "rollout_ambiguous_legacy_occurrence"
-
 # Distinct from every real DID and used only as the key for the file-backed
 # SQLite bootstrap gate. It serializes provenance discovery, additive DDL, and
 # rollout seeding across independently opened connections to the same file.
@@ -1011,8 +970,37 @@ class SchedulerRunner:
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
         self._schema_provenance: Optional[str] = None
+        # ``_task`` owns the supervisor; ``_worker_task`` is the replaceable
+        # polling loop it watches.  A dead worker must never become an
+        # unobserved completed asyncio task while the process stays healthy.
         self._task: Optional[asyncio.Task] = None
+        self._worker_task: Optional[asyncio.Task] = None
+        self._telemetry_task: Optional[asyncio.Task] = None
+        self._runtime_status_publish_task: Optional[asyncio.Task] = None
+        self._runtime_status_publish_lock = asyncio.Lock()
+        self._runtime_status_wake = asyncio.Event()
+        # Set as soon as arm() is requested and cleared only by stop(). Health
+        # uses this separately from _running so a failed arm cannot disappear
+        # from the public readiness inventory.
+        self._arm_requested = False
+        self._arm_requested_monotonic: Optional[float] = None
+        self._arm_requested_at: Optional[str] = None
         self._running = False
+        self._last_tick_started_at: Optional[str] = None
+        self._last_tick_completed_at: Optional[str] = None
+        self._tick_started_monotonic: Optional[float] = None
+        self._live_claim_deadlines: dict[str, float] = {}
+        self._live_claim_deadline_snapshot: tuple[float, ...] = ()
+        self._tick_in_progress_limit_seconds = (
+            scheduler_tick_in_progress_limit_seconds(
+                poll_interval=poll_interval,
+                lease_seconds=normalized_lease_seconds,
+            )
+        )
+        self._worker_restart_count = 0
+        self._consecutive_worker_failures = 0
+        self._last_worker_error_type: Optional[str] = None
+        self._runtime_worker_state = "stopped"
         # Set only after the schema and durable rollout state have both been
         # established. Production starts always go through ``start``; retaining
         # a false default keeps legacy private-tick test doubles from inventing
@@ -1034,6 +1022,55 @@ class SchedulerRunner:
         """
 
         return self._readiness_failure
+
+    @property
+    def worker_available(self) -> bool:
+        """Whether supervision currently owns a non-failing polling worker."""
+
+        supervisor_task = self._task
+        worker_task = self._worker_task
+        return bool(
+            self._arm_requested
+            and self._running
+            and supervisor_task is not None
+            and not supervisor_task.done()
+            and self._consecutive_worker_failures == 0
+            and not self.tick_stalled
+            and (worker_task is None or not worker_task.done())
+        )
+
+    @property
+    def tick_stalled(self) -> bool:
+        """Whether polling is over-bound without a live claimed execution."""
+
+        started = self._tick_started_monotonic
+        return bool(
+            self._running
+            and started is not None
+            and self._active_claimed_execution_count == 0
+            and time.monotonic() - started
+            > self._tick_in_progress_limit_seconds
+        )
+
+    @property
+    def _active_claimed_execution_count(self) -> int:
+        """Count claims whose last successful renewal is still in-bound."""
+
+        now = time.monotonic()
+        return sum(
+            deadline > now for deadline in self._live_claim_deadline_snapshot
+        )
+
+    def _reported_worker_state(self) -> str:
+        """Derive one coherent telemetry state from the live worker lifecycle."""
+
+        if self._runtime_worker_state != "running":
+            return self._runtime_worker_state
+        if self.tick_stalled:
+            return "stalled"
+        if self._active_claimed_execution_count:
+            return "executing"
+        return "running"
 
     def _latch_protocol_failure(self, error: BaseException) -> None:
         """Persist the first safety failure in process state and notify host."""
@@ -1105,37 +1142,385 @@ class SchedulerRunner:
             raise RuntimeError(
                 "SchedulerRunner cannot poll before protocol preparation"
             )
+        arm_requested_at = await scheduler_database_clock(self._db)
+        self._arm_requested = True
+        self._arm_requested_monotonic = time.monotonic()
+        self._arm_requested_at = arm_requested_at.isoformat()
         self._running = True
-        self._task = asyncio.create_task(self._loop(), name="scheduler-runner")
-        logger.info("SchedulerRunner %s started (poll every %ds)", self._owner_id, self._poll_interval)
+        self._runtime_worker_state = "starting"
+        self._task = asyncio.create_task(
+            self._supervise_loop(), name="scheduler-supervisor"
+        )
+        self._telemetry_task = asyncio.create_task(
+            self._telemetry_loop(), name="scheduler-runtime-telemetry"
+        )
+        # Polling ownership exists before the best-effort telemetry task. A
+        # reporting failure cannot delay or prevent the worker from starting.
+        logger.info(
+            "SchedulerRunner %s started (poll every %ds)",
+            self._owner_id,
+            self._poll_interval,
+        )
 
     async def stop(self):
+        self._arm_requested = False
+        self._arm_requested_monotonic = None
+        self._arm_requested_at = None
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        self._tick_started_monotonic = None
+        owned_tasks = tuple(dict.fromkeys(
+            task
+            for task in (self._task, self._worker_task, self._telemetry_task)
+            if task is not None
+        ))
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+
+        pending_cancellation: Optional[asyncio.CancelledError] = None
+        for task in owned_tasks:
+            outcome = await await_owned_task(task, pending_cancellation)
+            if outcome.cancellation is not None:
+                pending_cancellation = outcome.cancellation
+            if outcome.error is not None and not isinstance(
+                outcome.error, asyncio.CancelledError
+            ):
+                logger.warning(
+                    "SchedulerRunner %s task %s failed during stop",
+                    self._owner_id,
+                    task.get_name(),
+                    exc_info=(
+                        type(outcome.error),
+                        outcome.error,
+                        outcome.error.__traceback__,
+                    ),
+                )
+
+        self._task = None
+        self._worker_task = None
+        self._telemetry_task = None
+        self._runtime_worker_state = "stopped"
+        try:
+            await self._finish_runtime_status_publication(
+                publish_stopped=pending_cancellation is None,
+                timeout=(
+                    RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
+                    if pending_cancellation is None
+                    else 0.0
+                ),
+            )
+        except asyncio.CancelledError as error:
+            if pending_cancellation is None:
+                pending_cancellation = error
+        except Exception as error:
+            logger.warning(
+                "SchedulerRunner %s runtime-status cleanup failed during stop",
+                self._owner_id,
+                exc_info=(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                ),
+            )
         logger.info("SchedulerRunner %s stopped", self._owner_id)
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
+    async def _publish_runtime_status(self, worker_state: str) -> None:
+        agent_ids = await self._current_authorized_agent_ids()
+        # The tick may have completed while this heartbeat waited for its
+        # publication lock or a dynamic authority snapshot. Revalidate the
+        # derived state, then capture one internally-consistent timestamp view.
+        if worker_state in {"running", "executing", "stalled"}:
+            worker_state = self._reported_worker_state()
+        last_tick_started_at = self._last_tick_started_at
+        last_tick_completed_at = self._last_tick_completed_at
+        await emit_runtime_status(
+            self._db,
+            agent_ids=agent_ids,
+            owner_id=self._owner_id,
+            worker_state=worker_state,
+            last_tick_started_at=last_tick_started_at,
+            last_tick_completed_at=last_tick_completed_at,
+            restart_count=self._worker_restart_count,
+            consecutive_failures=self._consecutive_worker_failures,
+            last_error_type=self._last_worker_error_type,
+        )
+
+    async def _publish_runtime_status_best_effort(
+        self,
+        worker_state: Optional[str] = None,
+        *,
+        deadline: Optional[float] = None,
+    ) -> None:
+        """Publish telemetry without allowing the observer to kill its worker."""
+
+        try:
+            async with self._runtime_status_publish_lock:
+                loop = asyncio.get_running_loop()
+                if deadline is None:
+                    deadline = (
+                        loop.time() + RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
+                    )
+                pending = self._runtime_status_publish_task
+                if pending is not None:
+                    if not pending.done():
+                        wait_seconds = max(0.0, deadline - loop.time())
+                        done, _ = await asyncio.wait(
+                            {pending},
+                            timeout=wait_seconds,
+                        )
+                        if not done:
+                            logger.warning(
+                                "SchedulerRunner %s runtime-status publish is "
+                                "still pending after %g seconds",
+                                self._owner_id,
+                                wait_seconds,
+                            )
+                            return
+                    self._runtime_status_publish_task = None
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                state = worker_state or self._reported_worker_state()
+                publish_task = loop.create_task(
+                    self._publish_runtime_status(state),
+                    name=f"scheduler-runtime-status:{self._owner_id}",
+                )
+                self._runtime_status_publish_task = publish_task
+
+                def _publish_done(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    error = task.exception()
+                    if error is not None:
+                        logger.warning(
+                            "SchedulerRunner %s could not publish %s state",
+                            self._owner_id,
+                            state,
+                            exc_info=(type(error), error, error.__traceback__),
+                        )
+
+                publish_task.add_done_callback(_publish_done)
+                wait_seconds = max(0.0, deadline - loop.time())
+                done, _ = await asyncio.wait(
+                    {publish_task},
+                    timeout=wait_seconds,
+                )
+                if done:
+                    self._runtime_status_publish_task = None
+                else:
+                    logger.warning(
+                        "SchedulerRunner %s runtime-status publish is still "
+                        "pending after %g seconds",
+                        self._owner_id,
+                        wait_seconds,
+                    )
+        except Exception:
+            logger.warning(
+                "SchedulerRunner %s could not publish %s state",
+                self._owner_id,
+                worker_state or self._runtime_worker_state,
+                exc_info=True,
+            )
+
+    async def _finish_runtime_status_publication(
+        self,
+        *,
+        publish_stopped: bool,
+        timeout: float,
+    ) -> None:
+        """Drain owned telemetry before storage teardown, cancelling last."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        try:
+            prior_completed = await self._join_runtime_status_publish_task(
+                deadline=deadline,
+            )
+            if not prior_completed:
+                return
+            if publish_stopped and self._database_is_connected():
+                await self._publish_runtime_status_best_effort(
+                    "stopped",
+                    deadline=deadline,
+                )
+                await self._join_runtime_status_publish_task(deadline=deadline)
+        except asyncio.CancelledError:
+            publish_task = self._runtime_status_publish_task
+            if publish_task is not None and not publish_task.done():
+                publish_task.cancel()
+                await await_owned_task(publish_task)
+            if self._runtime_status_publish_task is publish_task:
+                self._runtime_status_publish_task = None
+            raise
+
+    async def _join_runtime_status_publish_task(self, *, deadline: float) -> bool:
+        """Join one publish for a bounded interval, then cancel as a last resort."""
+
+        publish_task = self._runtime_status_publish_task
+        if publish_task is None:
+            return True
+        if not publish_task.done():
+            wait_seconds = max(
+                0.0,
+                deadline - asyncio.get_running_loop().time(),
+            )
+            done, _ = await asyncio.wait(
+                {publish_task},
+                timeout=wait_seconds,
+            )
+            if not done:
+                logger.warning(
+                    "SchedulerRunner %s cancelling runtime-status publish "
+                    "that did not drain during shutdown after %g seconds",
+                    self._owner_id,
+                    wait_seconds,
+                )
+                publish_task.cancel()
+                outcome = await await_owned_task(publish_task)
+                if self._runtime_status_publish_task is publish_task:
+                    self._runtime_status_publish_task = None
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+                return False
+
+        outcome = await await_owned_task(publish_task)
+        if self._runtime_status_publish_task is publish_task:
+            self._runtime_status_publish_task = None
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        return True
+
+    async def _telemetry_loop(self) -> None:
+        """Publish worker liveness independently of tick execution time."""
+
+        interval = max(
+            RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS,
+            float(self._poll_interval),
+        )
+        while self._running:
+            self._runtime_status_wake.clear()
+            await self._publish_runtime_status_best_effort()
+            try:
+                await asyncio.wait_for(
+                    self._runtime_status_wake.wait(), timeout=interval
+                )
+            except TimeoutError:
+                pass
+
+    async def _supervise_loop(self) -> None:
+        """Restart a polling worker that exits unexpectedly with bounded backoff."""
+
+        while self._running:
+            if not self._database_is_connected():
+                self._running = False
+                self._runtime_worker_state = "storage_unavailable"
+                self._runtime_status_wake.set()
+                logger.info(
+                    "SchedulerRunner %s stopped supervision after storage closed",
+                    self._owner_id,
+                )
+                break
+            self._runtime_worker_state = "running"
+            self._runtime_status_wake.set()
+            self._worker_task = asyncio.create_task(
+                self._loop(), name="scheduler-runner"
+            )
+            failure: Optional[BaseException] = None
+            supervisor_task = asyncio.current_task()
+            supervisor_cancellation_count = (
+                supervisor_task.cancelling()
+                if supervisor_task is not None
+                else 0
+            )
+            try:
+                await self._worker_task
+                if self._running:
+                    failure = RuntimeError("scheduler worker exited unexpectedly")
+            except asyncio.CancelledError as error:
+                supervisor_was_cancelled = bool(
+                    supervisor_task is not None
+                    and supervisor_task.cancelling()
+                    > supervisor_cancellation_count
+                )
+                if supervisor_was_cancelled or not self._running:
+                    self._running = False
+                    self._runtime_worker_state = "stopped"
+                    self._runtime_status_wake.set()
+                    raise
+                failure = RuntimeError("scheduler worker was cancelled unexpectedly")
+                failure.__cause__ = error
+            except Exception as error:
+                failure = error
+            finally:
+                self._worker_task = None
+
+            if not self._running:
+                break
+            if not self._database_is_connected():
+                self._running = False
+                self._runtime_worker_state = "storage_unavailable"
+                self._runtime_status_wake.set()
+                logger.info(
+                    "SchedulerRunner %s will not restart after storage closed",
+                    self._owner_id,
+                )
+                break
+            if failure is None:
+                failure = RuntimeError("scheduler worker stopped unexpectedly")
+            # Executor failures are normalized and finalized within _tick.
+            # Anything that escapes the tick is scheduler infrastructure or
+            # protocol failure: retain the original fail-closed readiness
+            # contract even though the supervisor also attempts recovery.
+            self._latch_protocol_failure(failure)
+            self._worker_restart_count += 1
+            self._consecutive_worker_failures += 1
+            self._last_worker_error_type = type(failure).__name__
+            self._runtime_worker_state = "restarting"
+            self._runtime_status_wake.set()
+            backoff = min(
+                SUPERVISOR_MIN_BACKOFF_SECONDS
+                * (2 ** min(self._consecutive_worker_failures - 1, 16)),
+                SUPERVISOR_MAX_BACKOFF_SECONDS,
+            )
+            logger.error(
+                "SchedulerRunner %s worker died; restart %d in %.1fs",
+                self._owner_id,
+                self._worker_restart_count,
+                backoff,
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+            await self._publish_runtime_status_best_effort("restarting")
+            await asyncio.sleep(backoff)
 
     async def _loop(self):
         while self._running:
+            # Arm the local watchdog before any tick I/O. In particular, the
+            # PostgreSQL clock read can block independently of telemetry; if it
+            # does, the heartbeat must report a stalled tick rather than keep
+            # publishing the prior healthy running state indefinitely.
+            self._tick_started_monotonic = time.monotonic()
+            self._runtime_worker_state = "running"
+            self._runtime_status_wake.set()
+            # Per-occurrence failures are isolated and finalized by ``_tick``.
+            # Infrastructure failures escape to the supervisor, which reports
+            # and replaces this worker instead of letting it vanish.
             try:
+                self._last_tick_started_at = (
+                    await scheduler_database_clock(self._db)
+                ).isoformat()
                 await self._tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                # Executor failures are normalized into durable task outcomes
-                # inside ``_execute_claim``. Anything escaping a tick is
-                # scheduler infrastructure/protocol failure and must make host
-                # readiness fail rather than merely emit a log line.
-                self._latch_protocol_failure(error)
-                logger.exception("SchedulerRunner tick error")
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                raise
+                self._last_tick_completed_at = (
+                    await scheduler_database_clock(self._db)
+                ).isoformat()
+            finally:
+                self._tick_started_monotonic = None
+            self._consecutive_worker_failures = 0
+            self._last_worker_error_type = None
+            self._runtime_status_wake.set()
+            await asyncio.sleep(self._poll_interval)
 
     async def _tick(self):
         # A legacy binary can insert a row after this runner started. Check the
@@ -1302,6 +1687,18 @@ class SchedulerRunner:
         """Return the concrete backend type without trusting loose test doubles."""
 
         return _scheduler_database_backend_type(self._db)
+
+    def _database_is_connected(self) -> bool:
+        """Return false only when a concrete backend is definitively closed."""
+
+        try:
+            backend = getattr(self._db, "backend", self._db)
+            connected = getattr(backend, "is_connected", None)
+        except Exception:
+            # A wrapper withholding backend internals is not evidence that
+            # storage closed. The next database operation remains authoritative.
+            return True
+        return connected is not False
 
     def _uses_database_clock(self) -> bool:
         """Whether this DB supports the portable statement-time SQL paths."""
@@ -2377,7 +2774,7 @@ class SchedulerRunner:
         # before waiting for the active rollout epoch; the exact non-locking
         # token/live admission check occurs inside that epoch immediately before
         # the target effect. A stale or fenced token is never executable.
-        if not await self._renew_lease_once(task):
+        if not await self._renew_live_claim_once(task):
             logger.warning(
                 "Refusing to execute scheduler claim %s: lease is no longer live",
                 task.claim_execution_id,
@@ -2399,10 +2796,14 @@ class SchedulerRunner:
             owner=self._owner_id,
         )
         renewal_state = _LeaseRenewalState()
-        renewal = asyncio.create_task(
-            self._monitor_lease_renewal(task, renewal_state),
-            name=f"scheduler-lease:{execution.id}",
-        )
+        try:
+            renewal = asyncio.create_task(
+                self._monitor_lease_renewal(task, renewal_state),
+                name=f"scheduler-lease:{execution.id}",
+            )
+        except BaseException:
+            self._forget_live_claim(task)
+            raise
         started = time.monotonic()
         in_preparation = True
         try:
@@ -2673,6 +3074,42 @@ class SchedulerRunner:
             # The renewal loop has no successful terminal state. A normal
             # return means the exact claim or live authority was lost.
             state.mark_lost()
+        finally:
+            self._forget_live_claim(task)
+
+    async def _renew_live_claim_once(self, task: ScheduledTask) -> bool:
+        """Renew a claim and expose only its bounded live-lease interval."""
+
+        renewed = await self._renew_lease_once(task)
+        execution_id = task.claim_execution_id
+        if not execution_id:
+            return renewed
+        if not renewed:
+            self._forget_live_claim(task)
+            return False
+        now = time.monotonic()
+        was_live = self._live_claim_deadlines.get(execution_id, 0.0) > now
+        self._live_claim_deadlines[execution_id] = now + self._lease_seconds
+        self._refresh_live_claim_deadline_snapshot()
+        if not was_live:
+            self._runtime_status_wake.set()
+        return True
+
+    def _forget_live_claim(self, task: ScheduledTask) -> None:
+        execution_id = task.claim_execution_id
+        if (
+            execution_id
+            and self._live_claim_deadlines.pop(execution_id, None) is not None
+        ):
+            self._refresh_live_claim_deadline_snapshot()
+            self._runtime_status_wake.set()
+
+    def _refresh_live_claim_deadline_snapshot(self) -> None:
+        """Publish an immutable view for synchronous health-probe threads."""
+
+        self._live_claim_deadline_snapshot = tuple(
+            self._live_claim_deadlines.values()
+        )
 
     def _log_lease_loss(self, execution: SchedulerExecution, *, phase: str) -> None:
         """Report a fail-closed lease loss without exposing backend details."""
@@ -2803,7 +3240,7 @@ class SchedulerRunner:
         interval = max(0.001, interval)
         while True:
             await asyncio.sleep(interval)
-            if not await self._renew_lease_once(task):
+            if not await self._renew_live_claim_once(task):
                 logger.warning("Lost scheduler lease for task %s execution %s", task.id, task.claim_execution_id)
                 return
 
@@ -3716,6 +4153,7 @@ class SchedulerRunner:
         )
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_task ON task_execution_log(task_id, executed_at DESC)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_idempotency ON task_execution_log(agent_id, idempotency_key)")
+        await ensure_runtime_status_table(self._db)
         return await self._ensure_protocol_rollout(
             preexisting_schedule_table=preexisting_schedule_table,
             rollout_gates_held=True,
