@@ -196,9 +196,75 @@ class ProcessManager:
         """Log file path for an agent process."""
         return agent_dir / "agent.log"
 
+    # Command-line fragments that identify a Kestrel process. Deliberately
+    # broad: the cost of failing to recognise our own process is a refusal the
+    # operator can clear, while the cost of a false match is signalling a
+    # stranger — so this errs toward recognising, and only ever REFUSES on a
+    # positive identification of something else.
+    _KESTREL_CMDLINE_MARKERS = ("kestrel", "uvicorn")
+
+    @staticmethod
+    def describe_process(pid: int) -> Optional[str]:
+        """The command line of ``pid``, or ``None`` when it cannot be read.
+
+        ``None`` means undeterminable — no process, no ``ps``, or an
+        unsupported platform — and is deliberately distinct from "read it and
+        it was not Kestrel".
+        """
+        if sys.platform == "win32":  # pragma: no cover - Windows-only branch
+            return None
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        described = completed.stdout.strip()
+        return described or None
+
+    @staticmethod
+    def process_is_recognisably_kestrel(pid: int) -> Optional[bool]:
+        """Whether ``pid`` looks like a Kestrel process. ``None`` if undeterminable."""
+        described = ProcessManager.describe_process(pid)
+        if described is None:
+            return None
+        lowered = described.lower()
+        return any(m in lowered for m in ProcessManager._KESTREL_CMDLINE_MARKERS)
+
     @staticmethod
     def kill_process(pid: int, force: bool = False) -> bool:
-        """Send signal to a process. Returns True if signal sent."""
+        """Send a signal to a process, refusing PIDs that are provably not ours.
+
+        A PID outlives the process it names. Every caller here sources the PID
+        from a file (``.host.pid`` / ``agent.pid``) or a port scan, and a file
+        survives an unclean exit — OOM, ``kill -9``, a host reboot — after
+        which the OS is free to reuse that number. Signalling it then reaches
+        an unrelated process, and ``force`` makes that unsurvivable (#2987).
+
+        ``os.kill(pid, 0)`` cannot catch this: it proves a PID is *allocated*,
+        not whose it is. So this checks the command line instead, and refuses
+        only on a POSITIVE identification of something else. An undeterminable
+        answer proceeds, because failing to stop a real Kestrel host is its own
+        outage — the guarantee is "never knowingly signal a stranger", not
+        "only ever signal a proven Kestrel".
+        """
+        identified = ProcessManager.process_is_recognisably_kestrel(pid)
+        if identified is False:
+            logger.error(
+                "Refusing to signal PID %d: it is running %r, which is not a "
+                "Kestrel process. A stale PID file almost certainly named a "
+                "process that has since exited and had its PID reused — delete "
+                "the stale pid file rather than forcing this.",
+                pid,
+                ProcessManager.describe_process(pid),
+            )
+            return False
+
         try:
             if sys.platform == "win32":
                 subprocess.run(

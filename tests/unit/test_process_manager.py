@@ -990,3 +990,68 @@ class TestSpawnDetached:
             "Detached spawn must open with O_APPEND so prior content "
             "(another agent's pre-restart logs) is preserved."
         )
+
+
+# ---------------------------------------------------------------------------
+# #2987: a PID outlives the process it names, so signalling one read from a
+# file can reach a stranger. These mock the process description rather than
+# assume anything about the host's real processes — a test that depends on
+# who owns PID 1 fails as root and proves nothing about the implementation.
+# ---------------------------------------------------------------------------
+
+def test_kill_process_refuses_a_pid_that_is_provably_not_kestrel():
+    """A reused PID must not be signalled, and force must not override it.
+
+    `.host.pid` and `agent.pid` survive an unclean exit — OOM, `kill -9`, a
+    host reboot — after which the OS may hand that number to anything.
+    `os.kill(pid, 0)` cannot detect it: it proves a PID is allocated, not
+    whose it is.
+    """
+    with patch.object(
+        ProcessManager, "describe_process", return_value="/usr/bin/postgres -D /data",
+    ), patch("os.kill") as mock_kill:
+        assert ProcessManager.kill_process(4321) is False
+        assert ProcessManager.kill_process(4321, force=True) is False
+    mock_kill.assert_not_called()
+
+
+def test_kill_process_signals_a_recognisable_kestrel_process():
+    """The real host must stay stoppable — a refusal that locks out a
+    legitimate stop is its own outage."""
+    cmdline = (
+        "/opt/kestrel/.venv/bin/python3 -m uvicorn kestrel_sovereign.server:app "
+        "--host 0.0.0.0 --port 8888"
+    )
+    with patch.object(ProcessManager, "describe_process", return_value=cmdline), \
+         patch("os.kill") as mock_kill:
+        assert ProcessManager.kill_process(4321) is True
+    mock_kill.assert_called_once()
+
+
+def test_kill_process_proceeds_when_identity_is_undeterminable():
+    """Undeterminable is NOT the same as "not Kestrel".
+
+    No `ps`, an unsupported platform, or a process that has already exited all
+    yield None. Refusing there would make hosts unstoppable on those systems,
+    so the guarantee is "never knowingly signal a stranger" — not "only ever
+    signal a proven Kestrel".
+    """
+    with patch.object(ProcessManager, "describe_process", return_value=None), \
+         patch("os.kill") as mock_kill:
+        assert ProcessManager.kill_process(4321) is True
+    mock_kill.assert_called_once()
+
+
+def test_process_identity_distinguishes_unknown_from_foreign():
+    """Three states, because two of them must behave differently."""
+    with patch.object(ProcessManager, "describe_process", return_value=None):
+        assert ProcessManager.process_is_recognisably_kestrel(1) is None
+    with patch.object(ProcessManager, "describe_process", return_value="/sbin/launchd"):
+        assert ProcessManager.process_is_recognisably_kestrel(1) is False
+    with patch.object(ProcessManager, "describe_process", return_value="kestrel start"):
+        assert ProcessManager.process_is_recognisably_kestrel(1) is True
+
+
+def test_describe_process_returns_none_for_a_pid_that_does_not_exist():
+    """Driven against the real `ps`, so the None contract is not just mocked."""
+    assert ProcessManager.describe_process(2**22) is None
