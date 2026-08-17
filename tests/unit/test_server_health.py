@@ -862,6 +862,94 @@ def _make_health_agent(status, checks=None):
     return agent
 
 
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_matches_lock_warning_rollup():
+    """The lock diagnosis has one severity with or without HealthFeature."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": "resource_locks", "status": "warn"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "degraded", "checks": checks}
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_uses_raw_db_behind_privacy_storage(
+    tmp_path,
+):
+    """The no-feature path must not probe the privacy database facade."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.server import _agent_detailed_health
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyEnforcingStorage,
+    )
+
+    raw_storage = AsyncStorage(
+        str(tmp_path / "privacy-health.db"),
+        agent_id="did:key:health-test",
+    )
+    await raw_storage.initialize()
+    try:
+        privacy_storage = PrivacyEnforcingStorage(
+            raw_storage, PrivacyMode.NORMAL
+        )
+        agent = SimpleNamespace(
+            features={},
+            storage=privacy_storage,
+            llm_service=SimpleNamespace(providers=[]),
+        )
+
+        # Deliberately run the real shared suite. ``storage.db.backend`` raises
+        # PrivacyViolationError on this wrapper, so a passing database result
+        # proves the fallback resolved the feature-internal raw database.
+        result = await _agent_detailed_health(agent)
+    finally:
+        await raw_storage.close()
+
+    database = next(
+        check for check in result["checks"] if check["name"] == "database"
+    )
+    assert database["status"] == "pass"
+    assert database["message"] == "Database connection healthy"
+
+
+@pytest.mark.parametrize(
+    "failed_check", ["bootstrap_state", "disk_space", "memory_system"]
+)
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_matches_noncritical_failure_rollup(
+    failed_check,
+):
+    """Installing HealthFeature cannot change a non-critical severity."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": failed_check, "status": "fail"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "degraded", "checks": checks}
+
+
 def test_detailed_health_reports_fleet_when_no_singleton_agent():
     """Multi-agent hosts (app.state.agent is None) must resolve from the fleet.
 

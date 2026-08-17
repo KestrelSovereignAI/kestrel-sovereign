@@ -63,7 +63,7 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
-from kestrel_sovereign.features.base import Feature, _serialize_tool_result, tool
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
     CronParseError,
     get_timezone,
@@ -207,7 +207,7 @@ class SchedulerFeature(Feature):
         registry = getattr(self.agent, "signal_registry", None)
         if registry is not None:
             cron_registrations = build_cron_registrations(
-                tool_lookup=self._lookup_and_run_tool,
+                tool_lookup=self._lookup_raw_tool_result,
                 builtin_handlers={
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
@@ -1002,6 +1002,23 @@ class SchedulerFeature(Feature):
         return bool(getattr(feature, "enabled", True))
 
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
+        """Run a tool directly through the canonical scheduler result boundary.
+
+        Source-registered tasks call :meth:`_lookup_raw_tool_result` and let the
+        source factory apply this same preparation. Direct fallback/custom-tool
+        paths use this wrapper so validation and JSON serialization still have
+        exactly one owner per invocation.
+        """
+        from kestrel_sovereign.signals.sources.scheduler import (
+            _prepare_scheduled_tool_result,
+        )
+
+        return _prepare_scheduled_tool_result(
+            task_name,
+            await self._lookup_raw_tool_result(task_name, args),
+        )
+
+    async def _lookup_raw_tool_result(self, task_name: str, args: dict) -> Any:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
         tool-search logic, lifted out so the source registrations can
@@ -1016,6 +1033,7 @@ class SchedulerFeature(Feature):
             if blocked is not None:
                 return blocked
         features = getattr(self.agent, "features", {})
+
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
                 continue
@@ -1029,14 +1047,7 @@ class SchedulerFeature(Feature):
                     result = await self._run_tool_hook_gated(
                         type(feature).__name__, agent_tool, args,
                     )
-                    if isinstance(result, ScheduledTaskOutcome):
-                        return result
-                    # Preserve the legacy JSON-encode contract for
-                    # downstream consumers (task_execution_log.result_text,
-                    # endpoints/agent.py history view).
-                    if isinstance(result, str):
-                        return result
-                    return json.dumps(_serialize_tool_result(result), default=str)
+                    return result
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
@@ -1045,11 +1056,7 @@ class SchedulerFeature(Feature):
                 result = await self._run_tool_hook_gated(
                     type(self).__name__, agent_tool, args,
                 )
-                if isinstance(result, ScheduledTaskOutcome):
-                    return result
-                if isinstance(result, str):
-                    return result
-                return json.dumps(_serialize_tool_result(result), default=str)
+                return result
 
         # A persisted schedule that names a tool owned by a NOW-disabled feature
         # must not execute it. Skip benignly (like the startup-order race below)
@@ -1221,13 +1228,36 @@ class SchedulerFeature(Feature):
         if sync:
             snap = getattr(sync, "snapshot_if_changed", None) or sync.force_snapshot
             results = await snap()
-            return json.dumps(
-                {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
-                default=str,
+            targets = {
+                target: {
+                    "success": result.success,
+                    "bytes": result.bytes_synced,
+                }
+                for target, result in results.items()
+            }
+            if not targets:
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": "no sync targets configured",
+                    }
+                )
+            success = all(
+                target["success"] is True for target in targets.values()
             )
-        return json.dumps({"error": "no sync service configured"})
+            payload: dict[str, Any] = {
+                "success": success,
+                "targets": targets,
+            }
+            if not success:
+                payload["error"] = "backup_snapshot_failed"
+            return json.dumps(payload, default=str)
+        return json.dumps({
+            "skipped": True,
+            "reason": "no sync service configured",
+        })
 
-    async def _handle_sleep(self, args: dict) -> str:
+    async def _handle_sleep(self, args: dict) -> str | ScheduledTaskOutcome:
         """Built-in handler for the nightly ``sleep`` cron (#1674 P3).
 
         Runs the agent's single memory-maintenance cycle: reflection (via the
@@ -1247,6 +1277,7 @@ class SchedulerFeature(Feature):
 
         skip_export = bool(args.get("skip_export", True))
         skip_consolidation = bool(args.get("skip_consolidation", False))
+        maintenance_only = skip_consolidation and skip_export
         # Caller can force reflection on/off; otherwise gate it on activity.
         if "skip_reflection" in args:
             skip_reflection = bool(args["skip_reflection"])
@@ -1259,13 +1290,61 @@ class SchedulerFeature(Feature):
                 skip_consolidation=skip_consolidation,
                 skip_reflection=skip_reflection,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[sleep] agent=%s cycle failed: %s", self._agent_id, e)
-            return json.dumps({"error": str(e)})
+        except Exception:  # noqa: BLE001
+            # The local feature log is the trusted diagnostic boundary. The
+            # scheduled result crosses into signal/task audit stores, where it
+            # must remain content-free and bounded.
+            logger.exception("[sleep] agent=%s cycle failed", self._agent_id)
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=json.dumps({"error": "sleep_failed"}),
+                pause_schedule=False,
+            )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
         data["skip_reflection"] = skip_reflection
-        return json.dumps(data, default=str)
+        semantic_maintenance = data.get("semantic_maintenance")
+        semantic_status = (
+            semantic_maintenance.get("status")
+            if isinstance(semantic_maintenance, dict)
+            else None
+        )
+        maintenance_skipped = (
+            maintenance_only
+            and not data.get("error")
+            and semantic_status in {None, "complete", "no_op", "disabled"}
+        )
+        if maintenance_skipped:
+            # ``SleepMixin.sleep`` still performs retention sweeping,
+            # explicitly requested reflection, and semantic maintenance when
+            # consolidation/export are disabled. Those phases do not count as
+            # a completed consolidation/export in ``SleepReport.success``;
+            # after running them successfully, represent that expected verdict
+            # as a non-terminal scheduled skip.
+            data["skipped"] = True
+            data["reason"] = "consolidation and export were both skipped"
+        consolidation_skipped = (
+            data.get("success") is False
+            and data.get("error") == "consolidation_skipped"
+        )
+        if consolidation_skipped:
+            # SleepMixin uses this content-free error token when consolidation
+            # is intentionally inapplicable (for example, a privacy mode that
+            # forbids persistence). Preserve the report's verdict while making
+            # the expected no-op explicit to the scheduler envelope.
+            data["skipped"] = True
+        result_text = json.dumps(data, default=str)
+        if (
+            data.get("success") is False
+            and not consolidation_skipped
+            and not maintenance_skipped
+        ):
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=result_text,
+                pause_schedule=False,
+            )
+        return result_text
 
     async def _sleep_had_activity(self) -> bool:
         """Best-effort: has anything happened since the last episode?

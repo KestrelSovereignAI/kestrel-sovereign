@@ -140,9 +140,14 @@ async def test_erasure_authority_rejects_malformed_receipts_and_non_erasure_rece
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enabled_home(monkeypatch, tmp_path)
-    before = len(kite_evidence_signing._nonce_receipts)
+    # Keep the live weak keys strongly referenced across the assertion.  A
+    # receipt from an earlier test can be retained temporarily by pytest's
+    # exception machinery, then disappear between two ``len`` calls when that
+    # traceback is collected.  Exact key membership proves this operation did
+    # not issue a receipt without making the test depend on GC timing.
+    receipts_before = set(kite_evidence_signing._nonce_receipts)
     assert consume_kite_evidence_nonce("d" * 64) is None
-    assert len(kite_evidence_signing._nonce_receipts) == before
+    assert set(kite_evidence_signing._nonce_receipts) == receipts_before
 
     with _typed_kite_erasure_endpoint_issuance_scope():
         with pytest.raises(KiteEvidenceSigningError, match="receipt is invalid"):

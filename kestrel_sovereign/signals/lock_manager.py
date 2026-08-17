@@ -23,8 +23,9 @@ now emit periodic WARNINGs that name the holder and the elapsed time.
 These are diagnostics, not enforcement: acquisition still blocks indefinitely
 rather than failing. Turns legitimately run for minutes (the Anthropic SDK's
 default read timeout alone is 600s, and generation is retried up to 5 times), so
-a hard acquire deadline would cancel healthy work. The goal is that the next
-stall is legible from one log line instead of a manual bisect.
+a hard acquire deadline would cancel healthy work. A blocked hold that crosses
+the escalation threshold emits ERROR once and appears in authenticated detailed
+health; the goal is that the next stall is legible without a manual bisect.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterable, Optional
 
 from kestrel_sdk.signals import ResourceLock
@@ -59,6 +60,11 @@ SLOW_WAIT_WARN_SECONDS = 30.0
 # WARNING-keyed alerting would learn to ignore exactly this signal.
 SLOW_HOLD_WARN_SECONDS = 60.0
 
+# A blocked hold past this point is no longer merely a slow operation. Do not
+# cancel it here — some operations intentionally retain task-owned locks — but
+# emit one ERROR per hold and expose the same threshold to health reporting.
+BLOCKED_HOLD_ERROR_SECONDS = 60 * 60.0
+
 
 @dataclass(frozen=True)
 class LockHolder:
@@ -66,6 +72,9 @@ class LockHolder:
 
     label: str
     acquired_at: float
+    owner_task: Optional[asyncio.Task[object]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def held_seconds(self) -> float:
         return time.monotonic() - self.acquired_at
@@ -182,7 +191,11 @@ class OrderedLockManager:
             # taken between this check and the acquire below simply costs a
             # missed wait warning, never correctness.
             await lock.acquire()
-            self._holders[name] = LockHolder(label or name.value, time.monotonic())
+            self._holders[name] = LockHolder(
+                label or name.value,
+                time.monotonic(),
+                owner_task=asyncio.current_task(),
+            )
             return
 
         watchdog = asyncio.ensure_future(self._warn_while_waiting(name, label))
@@ -199,7 +212,11 @@ class OrderedLockManager:
             else:
                 self._waiters.pop(name, None)
             watchdog.cancel()
-        self._holders[name] = LockHolder(label or name.value, time.monotonic())
+        self._holders[name] = LockHolder(
+            label or name.value,
+            time.monotonic(),
+            owner_task=asyncio.current_task(),
+        )
 
     async def _warn_while_waiting(
         self, name: ResourceLock, label: Optional[str]
@@ -237,6 +254,7 @@ class OrderedLockManager:
         may this claim that work is queued — the holder has no other way to know,
         so the count comes from the manager's own waiter bookkeeping.
         """
+        escalated = False
         while True:
             await asyncio.sleep(SLOW_HOLD_WARN_SECONDS)
             holder = self._holders.get(name)
@@ -244,14 +262,28 @@ class OrderedLockManager:
                 return
             waiting = self._waiters.get(name, 0)
             if waiting:
-                logger.warning(
-                    "%s has held the %s lock for %.0fs with %d acquirer(s) "
-                    "blocked behind it.",
-                    holder.label,
-                    name.value,
-                    holder.held_seconds(),
-                    waiting,
-                )
+                held_seconds = holder.held_seconds()
+                if held_seconds >= BLOCKED_HOLD_ERROR_SECONDS and not escalated:
+                    logger.error(
+                        "%s has held the %s lock for %.0fs with %d acquirer(s) "
+                        "blocked behind it; the hold exceeded the %.0fs "
+                        "escalation threshold and is degrading readiness.",
+                        holder.label,
+                        name.value,
+                        held_seconds,
+                        waiting,
+                        BLOCKED_HOLD_ERROR_SECONDS,
+                    )
+                    escalated = True
+                else:
+                    logger.warning(
+                        "%s has held the %s lock for %.0fs with %d acquirer(s) "
+                        "blocked behind it.",
+                        holder.label,
+                        name.value,
+                        held_seconds,
+                        waiting,
+                    )
             else:
                 logger.info(
                     "%s has held the %s lock for %.0fs (nothing is waiting on "
@@ -266,9 +298,43 @@ class OrderedLockManager:
         lock = self._locks.get(name)
         return bool(lock and lock.locked())
 
+    def is_owned_by_current_task(self, name: ResourceLock) -> bool:
+        """Whether ``name`` is held by the calling coroutine's task.
+
+        This narrow ownership check lets a tool invoked inside a dispatch that
+        already owns a non-reentrant resource avoid acquiring that same lock a
+        second time. It must not be used to skip acquisition merely because a
+        different task currently holds the resource.
+        """
+        holder = self._holders.get(name)
+        return bool(
+            holder is not None
+            and holder.owner_task is not None
+            and holder.owner_task is asyncio.current_task()
+        )
+
     def holder(self, name: ResourceLock) -> Optional[LockHolder]:
         """Who currently holds ``name``, for diagnostics and tests.
 
         Best-effort like :meth:`is_held` — never use it for routing.
         """
         return self._holders.get(name)
+
+    def active_hold_diagnostics(self) -> list[dict[str, object]]:
+        """Return a health-safe snapshot of every currently held resource.
+
+        The task object is intentionally excluded. Labels are operator-authored
+        runtime identifiers and this snapshot is consumed only by authenticated
+        detailed health surfaces; the public readiness probe remains aggregate.
+        """
+        return [
+            {
+                "resource": name.value,
+                "label": holder.label,
+                "held_seconds": holder.held_seconds(),
+                "blocked_acquirers": self._waiters.get(name, 0),
+            }
+            for name, holder in sorted(
+                self._holders.items(), key=lambda item: lock_sort_key(item[0])
+            )
+        ]
