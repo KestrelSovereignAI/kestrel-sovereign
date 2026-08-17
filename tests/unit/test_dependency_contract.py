@@ -68,13 +68,6 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     "observability fleet": ">=0.36.0,<0.37",
 }
 
-# Doctor deliberately invokes asyncpg 0.30's private connection parser to
-# validate TLS and GSS behavior in the spawned agent's exact environment. The
-# next minor adds service/servicefile precedence, so permitting it before that
-# translation exists can make every PostgreSQL Doctor probe fail closed.
-ASYNCPG_DOCTOR_SPECIFIERS = frozenset({(">=", "0.30.0"), ("<", "0.31")})
-
-
 def _pyproject() -> dict:
     with open(REPO_ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)
@@ -212,35 +205,24 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
     assert any(package["name"] == "tzdata" for package in _lock()["package"])
 
 
-def test_asyncpg_doctor_parser_contract_is_declared_and_locked():
-    """Published and locked installs must stay on Doctor's validated parser line."""
-
+def test_asyncpg_runtime_probe_supports_current_minor_releases():
+    """Doctor uses asyncpg's public connection path, not a pinned parser shape."""
     direct = [
         Requirement(raw)
         for raw in _pyproject()["project"]["dependencies"]
         if canonicalize_name(Requirement(raw).name) == "asyncpg"
     ]
     assert len(direct) == 1
-    assert {
-        (specifier.operator, specifier.version) for specifier in direct[0].specifier
-    } == ASYNCPG_DOCTOR_SPECIFIERS
+    assert Version("0.30") in direct[0].specifier
+    assert Version("0.31") in direct[0].specifier
 
-    lock = _lock()
-    root = _locked_root_package(lock)
+    root = _locked_root_package(_lock())
     locked_metadata = [
         requirement
         for requirement in root["metadata"]["requires-dist"]
         if requirement["name"] == "asyncpg"
     ]
-    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0,<0.31"}]
-
-    locked_versions = [
-        Version(package["version"])
-        for package in lock["package"]
-        if package["name"] == "asyncpg"
-    ]
-    assert locked_versions
-    assert all(version in direct[0].specifier for version in locked_versions)
+    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
 
 
 def _sdk_contract_requirement(raw_requirements, *, extras):

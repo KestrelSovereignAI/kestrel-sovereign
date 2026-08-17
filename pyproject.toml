@@ -128,10 +128,7 @@ dependencies = [
     "ollama>=0.6.1",
     # Database
     "aiosqlite>=0.21.0",
-    # Doctor's PostgreSQL parity layer mirrors asyncpg 0.30's private parser.
-    # Asyncpg 0.31 adds service/servicefile precedence; admit that line only
-    # after Doctor translates those settings with identical semantics.
-    "asyncpg>=0.30.0,<0.31",
+    "asyncpg>=0.30.0",
     "psycopg2-binary>=2.9.10",
     # SQLAlchemy (used by the generic vector_search backends in
     # kestrel_sovereign.storage.vector — feature packages already pull this

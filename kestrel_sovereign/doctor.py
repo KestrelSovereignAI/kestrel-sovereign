@@ -43,10 +43,9 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
@@ -59,8 +58,6 @@ from kestrel_sovereign.multi_agent.config import (
 )
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
-
-_IS_WINDOWS = sys.platform == "win32"
 
 
 @dataclass
@@ -314,11 +311,10 @@ class _GovernanceSource:
     contradicting each other is how operators learn to ignore the one that
     cries wolf.
 
-    Staying out of the stack costs nothing here: every property doctor reads is
-    plaintext JSON in ``graph_nodes.properties`` and every edge is a plain row,
-    so no ``KESTREL_DATA_KEY`` is involved on either backend, and
-    ``psycopg2`` — already a hard dependency — is a *synchronous* driver, so
-    there is no event loop to own.
+    Staying out of the storage stack costs nothing here: every property doctor
+    reads is plaintext JSON in ``graph_nodes.properties`` and every edge is a
+    plain row, so no ``KESTREL_DATA_KEY`` is involved. PostgreSQL reads run in
+    a bounded child using the same asyncpg runtime as the agent.
 
     ``agent_did`` always comes from the **anchor**, which is where identity is
     born on every backend (#2871, #2894), and it is required on both. On
@@ -331,27 +327,19 @@ class _GovernanceSource:
     anchor_path: Path
     agent_did: str
     dsn: str | None = None
-    #: Explicit or environment-derived connection identities to redact.
-    #: ``None`` asks the redactor to derive them from ``dsn`` (used for raw,
-    #: untranslatable URIs); an empty tuple is an intentional no-op.
+    #: Explicit DSN and environment-derived identities to redact from worker
+    #: failures.  Asyncpg receives the launcher environment unchanged, so the
+    #: redaction boundary must cover values that never appear in ``dsn``.
     dsn_identity: tuple | None = None
-    #: Absolute HOME seen by asyncpg in the spawned agent.  The isolated
-    #: libpq worker receives the same value so default TLS files under
-    #: ``~/.postgresql`` cannot come from doctor's unrelated account context.
+    #: HOME seen by asyncpg in the spawned agent, retained only for redaction
+    #: of default credential and TLS paths in driver errors.
     postgres_home: str | None = None
     #: Complete environment resolved by the launcher for the spawned agent.
-    #: The worker starts from this copy so non-libpq inputs such as Kerberos
-    #: credential/configuration paths retain runtime parity; its ``PG*`` and
-    #: Python-path steering variables are removed at the subprocess boundary.
+    #: The asyncpg worker receives this copy unchanged, just like the agent.
     postgres_env: dict[str, str] | None = None
     #: Working directory ProcessManager gives the spawned agent. Relative GSS
     #: configuration/cache locations must resolve beneath the same directory.
     postgres_cwd: str | None = None
-    #: GSS import capability measured in a short-lived Python process with the
-    #: exact environment and working directory used by ProcessManager.  The
-    #: libpq worker intentionally removes Python path steering, so it must not
-    #: infer this answer from its own import environment.
-    postgres_runtime_gss: dict[str, object] | None = None
     #: Whether the #2649 ownership backfill has already been recorded as
     #: complete. Boot re-runs it exactly once; until it has, a row with no
     #: witness is repaired at the next start, so its absence predicts nothing.
@@ -466,7 +454,7 @@ def _has_ownership_ledger(source: _GovernanceSource) -> bool:
             # be audited is the anchor's. Reporting it unreadable made doctor
             # answer "Not ready" to a correctly configured first boot.
             return _SchemaAbsent()
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
         return _postgres_unreadable(
             exc,
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
@@ -486,10 +474,10 @@ def _has_ownership_ledger(source: _GovernanceSource) -> bool:
         marker = _fetch_rows(
             source,
             "SELECT 1",
-            "SELECT 1 FROM schema_backfills WHERE name = %s",
+            "SELECT 1 FROM schema_backfills WHERE name = $1",
             postgres_params=(_OWNERSHIP_BACKFILL,),
         )
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
         return _postgres_unreadable(
             exc,
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
@@ -529,20 +517,13 @@ def _resolve_governance_source(
     else:
         runtime_dsn = env["KESTREL_DATABASE_URL"]
         try:
-            dsn = _doctor_postgres_dsn(runtime_dsn, env, project_dir)
-            postgres_home = _asyncpg_home(env, project_dir)
-            dsn_identity = _translated_dsn_identity(runtime_dsn, dsn, env)
-            postgres_runtime_gss = _inspect_asyncpg_runtime(
-                runtime_dsn,
-                env,
-                project_dir,
-            )
+            _doctor_postgres_timeout_seconds(env)
         except _DoctorPostgresConfigurationError as exc:
-            # Bind the raw URI to the same redactor used for driver failures.
             unsafe_source = _GovernanceSource(
                 anchor_path=anchor_path,
                 agent_did=agent_did,
                 dsn=runtime_dsn,
+                postgres_env=dict(env),
             )
             return _UnreadableDB(
                 reason=(
@@ -551,63 +532,18 @@ def _resolve_governance_source(
                 ),
                 postgres_failure="doctor_configuration",
             )
-        except _PostgresDiagnosticCapabilityError as exc:
-            unsafe_source = _GovernanceSource(
-                anchor_path=anchor_path,
-                agent_did=agent_did,
-                dsn=runtime_dsn,
-            )
-            return _UnreadableDB(
-                reason=(
-                    "doctor cannot construct an equivalent libpq diagnostic "
-                    f"connection ({_safe(exc, unsafe_source)})"
-                ),
-                postgres_failure="diagnostic_capability",
-            )
-        except _PostgresRuntimeConfigurationError as exc:
-            unsafe_source = _GovernanceSource(
-                anchor_path=anchor_path,
-                agent_did=agent_did,
-                dsn=runtime_dsn,
-            )
-            return _UnreadableDB(
-                reason=(
-                    "runtime PostgreSQL configuration is invalid "
-                    f"({_safe(exc, unsafe_source)})"
-                ),
-                postgres_failure="runtime_configuration",
-            )
-        except _PostgresTranslationError as exc:
-            # Every translation failure must become a structured doctor
-            # finding. This base-class guard contains future classified
-            # failures that do not yet have a more specific rendering.
-            unsafe_source = _GovernanceSource(
-                anchor_path=anchor_path,
-                agent_did=agent_did,
-                dsn=runtime_dsn,
-            )
-            return _UnreadableDB(
-                reason=(
-                    "doctor cannot construct an equivalent libpq diagnostic "
-                    f"connection ({_safe(exc, unsafe_source)})"
-                ),
-                postgres_failure="diagnostic_capability",
-            )
         source = _GovernanceSource(
             anchor_path=anchor_path,
             agent_did=agent_did,
-            dsn=dsn,
-            dsn_identity=dsn_identity,
-            postgres_home=postgres_home,
+            dsn=runtime_dsn,
+            dsn_identity=_postgres_redaction_identity(runtime_dsn, env),
+            postgres_home=env.get("HOME") or env.get("USERPROFILE"),
             postgres_env=dict(env),
             postgres_cwd=str(project_dir.resolve()),
-            postgres_runtime_gss=postgres_runtime_gss,
         )
     # Keyed on the DSN, or on the anchor path for a SQLite host where each
     # agent genuinely has its own file and its own answer.
-    cache_key = (
-        (source.dsn, source.postgres_home) if source.dsn else str(source.anchor_path)
-    )
+    cache_key = source.dsn if source.dsn else str(source.anchor_path)
     if ledger_by_dsn is not None and cache_key in ledger_by_dsn:
         ledger = ledger_by_dsn[cache_key]
     else:
@@ -624,310 +560,23 @@ def _resolve_governance_source(
     )
 
 
-#: Seconds doctor will wait for a PostgreSQL connection before calling the
-#: database unreadable. Doctor is the tool an operator reaches for *when the
-#: database is unavailable*, and a black-holed or firewalled endpoint does not
-#: refuse the connection — it drops the packets, and libpq's default is to wait
-#: out the OS TCP timeout, minutes of an apparently hung diagnostic. Failing
-#: fast turns that into the ``_UnreadableDB`` finding callers already report.
+#: Seconds Doctor lets the runtime-equivalent asyncpg probe run before it is
+#: killed and reaped.  This is a parent-process diagnostic deadline, not a
+#: connection argument, so it cannot override DSN, service-file, or PG*
+#: settings the spawned agent would use.
 _CONNECT_TIMEOUT_SECONDS = 5
-_MIN_LIBPQ_CONNECT_TIMEOUT_SECONDS = 2
 _POSTGRES_PROBE_GRACE_SECONDS = 5
 _POSTGRES_TIMEOUT_ENV = "KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS"
 _MAX_POSTGRES_TIMEOUT_SECONDS = 3600
 
 
-class _PostgresTranslationError(ValueError):
-    """Base class for failures before the isolated probe opens a socket."""
-
-
-class _DoctorPostgresConfigurationError(_PostgresTranslationError):
+class _DoctorPostgresConfigurationError(ValueError):
     """A doctor-only setting is invalid; the runtime is unaffected."""
 
 
-class _PostgresDiagnosticCapabilityError(_PostgresTranslationError):
-    """Libpq cannot express the spawned asyncpg connection faithfully."""
-
-
-class _PostgresRuntimeConfigurationError(_PostgresTranslationError):
-    """The effective asyncpg configuration is itself invalid."""
-
-
-# This preflight deliberately runs through ``python -c``.  Unlike executing a
-# helper file, ``-c`` gives Python the same current-working-directory import
-# entry as ProcessManager's ``python -m uvicorn`` command.  PYTHONPATH,
-# PYTHONHOME, user-site behavior, and every other launcher input remain intact.
-# The DSN travels over stdin and failures return only fixed classifications, so
-# neither credentials nor TLS paths can enter Doctor's diagnostics.
-_ASYNCPG_RUNTIME_PREFLIGHT_CODE = r"""
-import contextlib
-import importlib
-import inspect
-import io
-import json
-import sys
-
-
-def _module_supports_asyncpg_gss(module_name, addresses, parameters):
-    tcp_hosts = [
-        address[0]
-        for address in addresses
-        if isinstance(address, tuple)
-        and len(address) == 2
-        and isinstance(address[0], str)
-    ]
-    if not tcp_hosts:
-        # Asyncpg rejects GSSAPI/SSPI authentication over Unix sockets before
-        # it initializes either optional module.
-        return False
-
-    module = importlib.import_module(module_name)
-    service = parameters.krbsrvname or "postgres"
-    if module_name == "gssapi":
-        for host in tcp_hosts:
-            name = module.Name(
-                f"{service}@{host}", module.NameType.hostbased_service
-            )
-            context = module.SecurityContext(name=name, usage="initiate")
-            token = context.step(None)
-            if not isinstance(token, bytes) or not token:
-                return False
-        return True
-    if module_name == "sspilib":
-        # PostgreSQL can request either GSS (Kerberos) or SSPI (Negotiate).
-        # Asyncpg chooses the credential protocol from that server message, so
-        # both exact constructor paths must be usable before a libpq GSS/SSPI
-        # success can be treated as runtime-equivalent.
-        for host in tcp_hosts:
-            for protocol in ("Kerberos", "Negotiate"):
-                credential = module.UserCredential(protocol=protocol)
-                context = module.ClientSecurityContext(
-                    target_name=f"{service}/{host}", credential=credential
-                )
-                token = context.step(None)
-                if not isinstance(token, bytes) or not token:
-                    return False
-        return True
-    return False
-
-payload = json.loads(sys.stdin.buffer.read())
-result = {"ok": False, "kind": "diagnostic"}
-expected = {
-    "dsn", "host", "port", "user", "password", "passfile", "database",
-    "command_timeout", "statement_cache_size",
-    "max_cached_statement_lifetime", "max_cacheable_statement_size", "ssl",
-    "direct_tls", "server_settings", "target_session_attrs", "krbsrvname",
-    "gsslib",
-}
-try:
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        from asyncpg import connect_utils
-
-        parser = getattr(connect_utils, "_parse_connect_arguments", None)
-        if parser is not None and set(inspect.signature(parser).parameters) == expected:
-            try:
-                addresses, parameters, _configuration = parser(
-                    dsn=payload["dsn"], host=None, port=None, user=None,
-                    password=None, passfile=None, database=None,
-                    command_timeout=None, statement_cache_size=100,
-                    max_cached_statement_lifetime=300,
-                    max_cacheable_statement_size=15 * 1024, ssl=None,
-                    direct_tls=None, server_settings=None,
-                    target_session_attrs=None, krbsrvname=None, gsslib=None,
-                )
-            except BaseException:
-                result = {"ok": False, "kind": "runtime_configuration"}
-            else:
-                module = "sspilib" if parameters.gsslib == "sspi" else "gssapi"
-                try:
-                    available = _module_supports_asyncpg_gss(
-                        module, addresses, parameters
-                    )
-                except BaseException:
-                    available = False
-                result = {
-                    "ok": True,
-                    "gss": {"module": module, "available": available},
-                }
-except BaseException:
-    result = {"ok": False, "kind": "diagnostic"}
-sys.stdout.write(json.dumps(result, separators=(",", ":")))
-"""
-
-
-def _inspect_asyncpg_runtime(
-    runtime_dsn: str,
-    resolved_env: dict[str, str],
-    project_dir: Path,
-) -> dict[str, object]:
-    """Validate TLS and GSS APIs in the agent's Python context.
-
-    Asyncpg constructs its SSL context before it opens a socket, including for
-    ``sslmode=allow``.  Asking its installed parser in the launcher's exact
-    environment preserves certificate/key/password, protocol, default-file,
-    and Python import semantics. GSS availability means asyncpg's exact
-    target-specific constructors and initial ``step(None)`` call succeed, not
-    only that a same-named module imports or exposes similarly named classes.
-    The subprocess bound also bounds credential/KDC initialization. Doctor's
-    own process remains unchanged.
-    """
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", _ASYNCPG_RUNTIME_PREFLIGHT_CODE],
-            input=json.dumps({"dsn": runtime_dsn}).encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=dict(resolved_env),
-            cwd=str(project_dir.resolve()),
-            timeout=_POSTGRES_PROBE_GRACE_SECONDS,
-            check=False,
-        )
-    except (OSError, TypeError, ValueError, subprocess.TimeoutExpired) as exc:
-        raise _PostgresDiagnosticCapabilityError(
-            "spawned asyncpg runtime configuration could not be inspected safely"
-        ) from exc
-
-    if completed.returncode != 0:
-        raise _PostgresDiagnosticCapabilityError(
-            "spawned asyncpg runtime configuration could not be inspected safely"
-        )
-    try:
-        response = json.loads(completed.stdout)
-    except (TypeError, ValueError) as exc:
-        raise _PostgresDiagnosticCapabilityError(
-            "spawned asyncpg runtime configuration could not be inspected safely"
-        ) from exc
-    if not isinstance(response, dict) or response.get("ok") is not True:
-        if (
-            isinstance(response, dict)
-            and response.get("kind") == "runtime_configuration"
-        ):
-            raise _PostgresRuntimeConfigurationError(
-                "spawned asyncpg rejected its PostgreSQL connection configuration"
-            )
-        raise _PostgresDiagnosticCapabilityError(
-            "spawned asyncpg runtime configuration could not be inspected safely"
-        )
-
-    gss = response.get("gss")
-    if (
-        not isinstance(gss, dict)
-        or gss.get("module") not in {"gssapi", "sspilib"}
-        or type(gss.get("available")) is not bool
-    ):
-        raise _PostgresDiagnosticCapabilityError(
-            "spawned asyncpg GSSAPI/SSPI capability could not be inspected safely"
-        )
-    return {"module": gss["module"], "available": gss["available"]}
-
-
-# Query parameters consumed by asyncpg 0.30's connection parser. Every other
-# parameter is put in ``server_settings`` and sent in PostgreSQL's startup
-# packet. This is intentionally asyncpg's vocabulary, not libpq's: libpq knows
-# names such as ``connect_timeout`` and ``keepalives`` that the runtime sends
-# to PostgreSQL as settings (where PostgreSQL rejects them). Letting libpq
-# consume those names would make doctor report Ready for an agent that cannot
-# connect.
-_ASYNCPG_CONNECTION_QUERY_OPTIONS = frozenset(
-    {
-        "port",
-        "host",
-        "dbname",
-        "database",
-        "user",
-        "password",
-        "passfile",
-        "sslmode",
-        "sslcert",
-        "sslkey",
-        "sslrootcert",
-        "sslnegotiation",
-        "sslcrl",
-        "sslpassword",
-        "ssl_min_protocol_version",
-        "ssl_max_protocol_version",
-        "target_session_attrs",
-        "krbsrvname",
-        "gsslib",
-    }
-)
-
-
-# Scalar environment variables asyncpg 0.30 reads, and the equivalent DSN
-# parameter libpq accepts. PGHOST and PGPORT are resolved together below because
-# asyncpg's host-list grammar assigns a possibly different port to every host.
-# Deliberately absent are libpq-only variables such as PGCONNECT_TIMEOUT:
-# inheriting one would give doctor connection semantics the spawned asyncpg
-# process does not have. The diagnostic timeout below also states
-# connect_timeout explicitly, preventing libpq from consulting that
-# process-global default. The isolated probe removes the complete ``PG*``
-# namespace after these asyncpg-visible values have been frozen into the DSN.
-_ASYNCPG_ENV_DSN_OPTIONS = (
-    ("PGUSER", "user"),
-    ("PGPASSWORD", "password"),
-    ("PGDATABASE", "dbname"),
-    ("PGPASSFILE", "passfile"),
-    ("PGSSLMODE", "sslmode"),
-    ("PGSSLNEGOTIATION", "sslnegotiation"),
-    ("PGSSLROOTCERT", "sslrootcert"),
-    ("PGSSLCRL", "sslcrl"),
-    ("PGSSLKEY", "sslkey"),
-    ("PGSSLCERT", "sslcert"),
-    ("PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"),
-    ("PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"),
-    ("PGTARGETSESSIONATTRS", "target_session_attrs"),
-    ("PGKRBSRVNAME", "krbsrvname"),
-    ("PGGSSLIB", "gsslib"),
-)
-
-
-# Libpq has these non-disabled compiled defaults while asyncpg does not perform
-# either form of transport protection. State asyncpg's behavior on every probe,
-# not only when a corresponding environment variable happens to be present: a
-# system libpq build can otherwise change the connection before any environment
-# is involved. Each option is still capability-probed for older libpq builds.
-_LIBPQ_COMPILED_DSN_DEFAULTS = (
-    ("gssencmode", "disable"),
-    # asyncpg 0.30 advertises only SCRAM-SHA-256.  Its protocol source
-    # explicitly hard-codes the channel-binding flag to ``n`` and does not
-    # advertise SCRAM-SHA-256-PLUS, so libpq's ``prefer`` default is not the
-    # runtime-equivalent behavior.
-    ("channel_binding", "disable"),
-)
-
-_ABSENT_PASSFILE_SENTINEL = "__kestrel_doctor_absent_passfile__"
-
-_ASYNCPG_SSLMODE_ALIASES = {
-    "verify_ca": "verify-ca",
-    "verify_full": "verify-full",
-}
-
-_ASYNCPG_TLS_PROTOCOL_ALIASES = {
-    "MINIMUM_SUPPORTED": "TLSv1",
-    "MAXIMUM_SUPPORTED": "TLSv1.3",
-    "TLSv1_1": "TLSv1.1",
-    "TLSv1_2": "TLSv1.2",
-    "TLSv1_3": "TLSv1.3",
-}
-
-
-def _require_postgres_driver() -> None:
-    """Raise a useful diagnostic when psycopg2 itself is unavailable."""
-    try:
-        from psycopg2 import extensions as _pg_ext  # noqa: F401
-    except (ImportError, AttributeError) as exc:
-        raise _PostgresDiagnosticCapabilityError(
-            "PostgreSQL diagnostic driver psycopg2 is not installed"
-        ) from exc
-
-
 def _doctor_postgres_timeout_seconds(env: dict) -> int:
-    """Read the spawned-agent budget before libpq's host floor is applied."""
+    """Return the bounded probe budget configured in the launcher environment."""
     raw = env.get(_POSTGRES_TIMEOUT_ENV)
-    # ``KEY=`` and whitespace-only values in .env mean "not configured"
-    # throughout setup/runtime configuration. Preserve that convention for
-    # this doctor-only knob instead of turning an unset optional value into a
-    # configuration error.
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         raw = str(_CONNECT_TIMEOUT_SECONDS)
     try:
@@ -944,867 +593,36 @@ def _doctor_postgres_timeout_seconds(env: dict) -> int:
     return timeout
 
 
-def _per_host_connect_timeout(total_seconds: int, host_count: int) -> int:
-    """Divide a whole-attempt budget across libpq's per-host timeouts."""
-    host_count = max(1, host_count)
-    divided = (total_seconds + host_count - 1) // host_count
-    # libpq treats values below two seconds as two seconds.  State that floor
-    # ourselves so the parent can derive the worker's actual maximum rather
-    # than believing a five-host ``connect_timeout=1`` is a five-second bound.
-    return max(_MIN_LIBPQ_CONNECT_TIMEOUT_SECONDS, divided)
-
-
-def _dsn_host_count(parsed: dict) -> int:
-    hosts = parsed.get("host")
-    return max(1, len(hosts.split(","))) if hosts else 1
-
-
-def _libpq_accepts_dsn_option(name: str, value: str) -> bool:
-    """Whether the psycopg2-linked libpq can express one DSN option.
-
-    The project can run against a system libpq older than the environment
-    variable or runtime option being translated. Callers distinguish a safe
-    omission (a libpq-only variable that this older libpq also cannot read)
-    from an asyncpg runtime constraint, which must fail closed. An unavailable
-    or incomplete psycopg2 is likewise a negative capability result.
-    """
-    try:
-        from psycopg2 import extensions as _pg_ext
-
-        _pg_ext.make_dsn(**{name: value})
-    except Exception:  # noqa: BLE001 — an unusable libpq cannot express it
-        return False
-    return True
-
-
-def _require_libpq_dsn_option(name: str, value: str) -> None:
-    """Fail when doctor cannot preserve one effective runtime constraint."""
-    if not _libpq_accepts_dsn_option(name, value):
-        # Values can be credentials (``password`` / ``sslpassword``), so the
-        # diagnostic deliberately identifies only the unsupported field.
-        raise _PostgresDiagnosticCapabilityError(
-            "installed PostgreSQL diagnostic driver cannot represent "
-            f"runtime connection option {name!r}"
-        )
-
-
-def _authority_fields(netloc: str) -> tuple[str, str, str]:
-    """Return asyncpg's raw ``(user, password, hostspec)`` URI fields."""
-    if "@" in netloc:
-        auth, _, hostspec = netloc.partition("@")
-        user, _, password = auth.partition(":")
-        return user, password, hostspec
-    return "", "", netloc
-
-
-def _validate_asyncpg_ports(hosts: list[str], ports: int | list[int]) -> list[int]:
-    """Apply asyncpg 0.30's one-port-per-host validation."""
-    if isinstance(ports, list):
-        if len(ports) != len(hosts):
-            raise _PostgresRuntimeConfigurationError(
-                f"could not match {len(ports)} port numbers to {len(hosts)} hosts"
-            )
-        return ports
-    return [ports for _ in hosts]
-
-
-def _asyncpg_default_ports(hostspecs: list[str], env: dict) -> list[int]:
-    """Return the PGPORT/default ports asyncpg applies to a host list."""
-    portspec = env.get("PGPORT")
-    if portspec:
-        ports = (
-            [int(port) for port in portspec.split(",")]
-            if "," in portspec
-            else int(portspec)
-        )
-    else:
-        ports = 5432
-    return _validate_asyncpg_ports(hostspecs, ports)
-
-
-def _parse_asyncpg_hostlist(
-    hostlist: str,
-    ports: list[int] | None,
-    env: dict,
-    *,
-    unquote_hosts: bool = False,
-) -> tuple[list[str], list[int]]:
-    """Parse one host list with asyncpg 0.30's host/port rules."""
-    hostspecs = hostlist.split(",")
-    defaults = (
-        _asyncpg_default_ports(hostspecs, env)
-        if not ports
-        else _validate_asyncpg_ports(hostspecs, ports)
-    )
-    hosts: list[str] = []
-    resolved_ports: list[int] = []
-
-    for index, hostspec in enumerate(hostspecs):
-        if not hostspec:
-            # asyncpg indexes the first character while parsing and rejects
-            # empty members rather than treating them as libpq socket defaults.
-            raise _PostgresRuntimeConfigurationError(
-                "empty host in PostgreSQL host list"
-            )
-        if hostspec[0] == "/":
-            host = hostspec
-            host_port = ""
-        elif hostspec[0] == "[":
-            match = re.match(r"(?:\[([^\]]+)\])(?::([0-9]+))?", hostspec)
-            if not match:
-                raise _PostgresRuntimeConfigurationError(
-                    "invalid IPv6 address in PostgreSQL host list"
-                )
-            host = match.group(1)
-            host_port = match.group(2) or ""
-        else:
-            host, _, host_port = hostspec.partition(":")
-
-        if unquote_hosts:
-            host = unquote(host)
-        hosts.append(host)
-        if not ports:
-            if host_port and unquote_hosts:
-                host_port = unquote(host_port)
-            resolved_ports.append(int(host_port) if host_port else defaults[index])
-
-    return hosts, ports or resolved_ports
-
-
-def _resolve_asyncpg_hosts(
-    authority_hostspec: str, query: dict[str, str], env: dict
-) -> tuple[list[str], list[int], list[str]]:
-    """Resolve asyncpg's effective ordered hosts and per-host ports."""
-    hosts: list[str] | None = None
-    ports: list[int] | None = None
-    auth_hosts: list[str] | None = None
-
-    if authority_hostspec:
-        hosts, ports = _parse_asyncpg_hostlist(
-            authority_hostspec, None, env, unquote_hosts=True
-        )
-    else:
-        query_port = query.get("port")
-        if query_port:
-            ports = [int(port) for port in query_port.split(",")]
-
-        query_host = query.get("host")
-        if query_host:
-            hosts, ports = _parse_asyncpg_hostlist(query_host, ports, env)
-
-    if not hosts:
-        environment_host = env.get("PGHOST")
-        # asyncpg deliberately ignores an empty PGHOST. Libpq does not: it
-        # interprets it as its compiled socket directory, so it must never be
-        # copied verbatim into the translated DSN.
-        if environment_host:
-            hosts, ports = _parse_asyncpg_hostlist(environment_host, ports, env)
-
-    if not hosts:
-        # asyncpg uses only ``localhost`` to select a default passfile entry,
-        # even though it subsequently attempts every platform socket before
-        # localhost. Keep that distinct authentication host list intact.
-        auth_hosts = ["localhost"]
-        hosts = (
-            ["localhost"]
-            if _IS_WINDOWS
-            else [
-                "/run/postgresql",
-                "/var/run/postgresql",
-                "/tmp",
-                "/private/tmp",
-                "localhost",
-            ]
-        )
-
-    if not ports:
-        ports = _asyncpg_default_ports(hosts, env)
-    else:
-        ports = _validate_asyncpg_ports(hosts, [int(port) for port in ports])
-    return hosts, ports, auth_hosts or hosts
-
-
-def _dsn_stated_options(parts, query: dict[str, str]) -> set[str]:
-    """Connection options the runtime URI states before env resolution."""
-    user, password, hostspec = _authority_fields(parts.netloc)
-    stated = set(query).intersection(_ASYNCPG_CONNECTION_QUERY_OPTIONS)
-    if hostspec:
-        stated.add("host")
-    if user:
-        stated.add("user")
-    if password:
-        stated.add("password")
-    if parts.path:
-        stated.add("dbname")
-    if "database" in stated:
-        stated.add("dbname")
-    return stated
-
-
-def _libpq_option_fragment(name: str, value: str) -> str:
-    """Encode one startup setting for libpq's command-line-style options."""
-    # ``-c name=value`` has no escaping for its first equals delimiter. A NUL
-    # cannot cross libpq's C-string boundary either. Reject these shapes
-    # instead of probing a different setting from the one asyncpg will send in
-    # its startup packet.
-    if not name or "=" in name or "\x00" in name:
-        raise _PostgresDiagnosticCapabilityError(
-            "runtime PostgreSQL startup setting name cannot be represented "
-            "by the diagnostic driver"
-        )
-    if "\x00" in value:
-        raise _PostgresDiagnosticCapabilityError(
-            "runtime PostgreSQL startup setting value cannot be represented "
-            "by the diagnostic driver"
-        )
-    # libpq passes ``options`` through PostgreSQL's command-line splitter.
-    # Backslash is its escape character. PostgreSQL splits on every whitespace
-    # character, so escape tabs and newlines as well as ordinary spaces.
-    setting = f"{name}={value}".replace("\\", "\\\\")
-    setting = "".join(f"\\{char}" if char.isspace() else char for char in setting)
-    return f"-c {setting}"
-
-
-def _system_account_user() -> str:
-    """Return the OS-account fallback used by ``getpass.getuser``.
-
-    The environment-dependent half is handled separately against the exact
-    spawned-agent environment. Calling ``getpass.getuser()`` here would
-    inspect doctor's unchanged parent environment and could resurrect a login
-    name that the child environment explicitly blanked.
-    """
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid())[0]
-    except (ImportError, KeyError) as exc:
-        raise OSError("No username set in the environment") from exc
-
-
-def _asyncpg_default_user(env: dict) -> str:
-    """Resolve the login name asyncpg sees in the spawned agent."""
-    for name in ("LOGNAME", "USER", "LNAME", "USERNAME"):
-        value = env.get(name)
-        if value:
-            return value
-    try:
-        return _system_account_user()
-    except OSError as exc:
-        raise _PostgresRuntimeConfigurationError(
-            "runtime PostgreSQL user could not be determined"
-        ) from exc
-
-
-def _normalize_asyncpg_connection_options(query: dict[str, str]) -> None:
-    """Translate asyncpg spellings and ignored TLS settings for libpq."""
-    sslmode = query.get("sslmode")
-    if sslmode in _ASYNCPG_SSLMODE_ALIASES:
-        sslmode = _ASYNCPG_SSLMODE_ALIASES[sslmode]
-        query["sslmode"] = sslmode
-
-    if sslmode == "disable":
-        # Asyncpg never creates an SSLContext in this mode, so it never parses
-        # these values. Libpq does parse them even though SSL is disabled.
-        query.pop("ssl_min_protocol_version", None)
-        query.pop("ssl_max_protocol_version", None)
-        return
-
-    # Asyncpg 0.30 explicitly defaults every active SSLContext to TLS 1.2.
-    # Libpq's default depends on the linked library version, and an older
-    # libpq can otherwise connect with TLS 1.0/1.1 where the spawned runtime
-    # refuses. An empty PGSSLMINPROTOCOLVERSION is also "not configured" to
-    # asyncpg, so replace falsey values with the same explicit floor.
-    if not query.get("ssl_min_protocol_version"):
-        query["ssl_min_protocol_version"] = "TLSv1.2"
-
-    for name in (
-        "ssl_min_protocol_version",
-        "ssl_max_protocol_version",
-    ):
-        value = query.get(name)
-        if value in _ASYNCPG_TLS_PROTOCOL_ALIASES:
-            query[name] = _ASYNCPG_TLS_PROTOCOL_ALIASES[value]
-
-
-def _validate_libpq_hosts(hosts: list[str]) -> None:
-    """Fail closed when libpq would reinterpret an asyncpg endpoint."""
-    if any("," in host for host in hosts):
-        # Authority hosts are split before percent-decoding in asyncpg. Thus
-        # ``%2C`` belongs to one host there, while libpq splits the decoded
-        # ``host`` parameter into multiple endpoints. Libpq has no escaping
-        # that can preserve this single-host shape.
-        raise _PostgresDiagnosticCapabilityError(
-            "a single runtime PostgreSQL host containing a comma cannot be "
-            "represented by the diagnostic driver"
-        )
-    if any(host.startswith("/") and ".s.PGSQL." in host for host in hosts):
-        # Asyncpg treats a socket path already containing ``.s.PGSQL.`` as the
-        # complete socket filename. Libpq's host parameter accepts a socket
-        # directory and appends that filename itself, so passing this through
-        # would probe a different, doubled path.
-        raise _PostgresDiagnosticCapabilityError(
-            "a runtime PostgreSQL Unix-socket filename cannot be represented "
-            "by the diagnostic driver"
-        )
-    if any(host.startswith("@") for host in hosts):
-        # Asyncpg treats this as an ordinary TCP name. On platforms supporting
-        # abstract Unix-domain sockets, libpq reserves the same spelling for a
-        # socket address. Resolving it eagerly to ``hostaddr`` would add DNS
-        # and address-selection semantics the spawned runtime does not have.
-        raise _PostgresDiagnosticCapabilityError(
-            "runtime PostgreSQL TCP host uses a spelling the diagnostic "
-            "driver reserves for Unix sockets"
-        )
-
-
-def _state_asyncpg_connection_defaults(
-    parts,
-    query: dict[str, str],
-    hosts: list[str],
-    user: str,
-    env: dict,
-) -> None:
-    """State asyncpg's basic defaults for libpq's connection.
-
-    The drivers have different implicit host resolution: asyncpg tries its
-    platform socket list and then localhost, while libpq uses one compiled-in
-    socket directory. Making every database-selecting default explicit keeps
-    doctor on asyncpg's endpoint and also prevents an ambient ``PGSERVICE``
-    recipe from filling a value that asyncpg never reads.
-    """
-    effective_user = unquote(user) if user else query.get("user")
-    if not effective_user:
-        effective_user = _asyncpg_default_user(env)
-        query["user"] = effective_user
-
-    if parts.path == "/":
-        # asyncpg preserves the bare path as database="". Libpq drops that
-        # URI path and would otherwise fall through to ambient PGDATABASE (or
-        # its user-name default), so carry the empty value as an explicit key.
-        query["dbname"] = ""
-    elif not parts.path and "dbname" not in query:
-        query["dbname"] = effective_user
-
-    if "sslmode" not in query:
-        # State asyncpg's host-derived default unconditionally. Besides making
-        # libpq match asyncpg, this prevents libpq-only PGREQUIRESSL from
-        # changing TCP ``prefer`` or Unix-socket ``disable`` semantics.
-        have_tcp_host = any(not host.startswith("/") for host in hosts)
-        query["sslmode"] = "prefer" if have_tcp_host else "disable"
-
-    if _libpq_accepts_dsn_option("target_session_attrs", "any"):
-        query.setdefault("target_session_attrs", "any")
-
-
-def _normalize_asyncpg_direct_tls(query: dict[str, str]) -> None:
-    """Keep asyncpg's direct-TLS intent valid and fail-closed in libpq."""
-    if query.get("sslnegotiation") != "direct":
-        return
-
-    sslmode = query.get("sslmode")
-    if sslmode == "disable":
-        # asyncpg never consults the negotiation mode when SSL is disabled.
-        # State libpq's ordinary negotiation explicitly so an ambient
-        # PGSSLNEGOTIATION cannot recreate its invalid direct+disable pair.
-        query["sslnegotiation"] = "postgres"
-    else:
-        # Asyncpg 0.30 sends direct TLS without PostgreSQL's ALPN protocol,
-        # while libpq 17 sends ALPN. A PostgreSQL 17 server or proxy can
-        # therefore accept Doctor's connection and reject the spawned
-        # runtime, even for strict and verification modes. Rewriting this to
-        # ordinary negotiation can likewise reach a different endpoint.
-        raise _PostgresDiagnosticCapabilityError(
-            "installed PostgreSQL diagnostic driver cannot faithfully "
-            f"represent sslmode={sslmode!r} with direct TLS negotiation"
-        )
-
-
-def _validate_asyncpg_connection_options(query: dict[str, str]) -> None:
-    """Reject enum spellings asyncpg refuses before opening a socket."""
-    allowed_values = {
-        "sslmode": {
-            "disable",
-            "allow",
-            "prefer",
-            "require",
-            "verify-ca",
-            "verify-full",
-        },
-        "sslnegotiation": {"postgres", "direct"},
-        "target_session_attrs": {
-            "any",
-            "primary",
-            "standby",
-            "prefer-standby",
-            "read-write",
-            "read-only",
-        },
-        "gsslib": {"gssapi", "sspi"},
-    }
-    for name, allowed in allowed_values.items():
-        if name in query and query[name] not in allowed:
-            raise _PostgresRuntimeConfigurationError(
-                f"runtime PostgreSQL {name} connection option is not valid for asyncpg"
-            )
-
-
-_ASYNCPG_CONNECTION_FILE_OPTIONS = frozenset(
-    {"passfile", "sslrootcert", "sslcrl", "sslkey", "sslcert"}
-)
-
-
-def _resolve_connection_file_paths(query: dict[str, str], project_dir: Path) -> None:
-    """Resolve files from the spawned agent's working directory."""
-    for name in _ASYNCPG_CONNECTION_FILE_OPTIONS:
-        value = query.get(name)
-        if value:
-            # ``sslrootcert=system`` is special to recent libpq, but not to
-            # asyncpg 0.30: asyncpg passes it to SSLContext as an ordinary
-            # relative filename.  Resolving it below the agent cwd is thus
-            # intentional and prevents libpq from changing its meaning.
-            try:
-                path = Path(value)
-                if not path.is_absolute():
-                    path = (project_dir.resolve() / path).resolve()
-            except (OSError, ValueError) as exc:
-                raise _PostgresRuntimeConfigurationError(
-                    f"runtime PostgreSQL {name} file path cannot be resolved by asyncpg"
-                ) from exc
-            query[name] = str(path)
-
-
-def _validate_explicit_asyncpg_tls_files(query: dict[str, str]) -> None:
-    """Fail closed when asyncpg would reject an explicitly named TLS file.
-
-    Libpq tolerates some missing client TLS files that asyncpg loads eagerly
-    while parsing its connection arguments.  At this point the query contains
-    only URI/environment file values; platform defaults are stated later, so
-    validating these paths does not turn asyncpg's optional default files into
-    required configuration.
-    """
-    sslmode_order = {
-        "disable": 0,
-        "allow": 1,
-        "prefer": 2,
-        "require": 3,
-        "verify-ca": 4,
-        "verify-full": 5,
-    }
-    sslmode = sslmode_order[query["sslmode"]]
-    minimum_modes = {
-        "sslcert": sslmode_order["allow"],
-        "sslrootcert": sslmode_order["require"],
-        "sslcrl": sslmode_order["require"],
-    }
-    # Asyncpg never opens an explicitly named key on its own. It passes that
-    # key to ``SSLContext.load_cert_chain`` only when an explicit client
-    # certificate is also present; the optional default-certificate branch
-    # catches a missing key together with a missing default certificate.
-    # Requiring a lone PGSSLKEY here would therefore reject a runtime that
-    # asyncpg accepts.
-    if query.get("sslcert"):
-        minimum_modes["sslkey"] = sslmode_order["allow"]
-    for name, minimum_mode in minimum_modes.items():
-        value = query.get(name)
-        if not value or sslmode < minimum_mode:
-            continue
-        try:
-            Path(value).stat()
-        except (OSError, ValueError) as exc:
-            # Name the option, never its potentially sensitive path. The
-            # caller reports this as shared runtime-invalid configuration.
-            raise _PostgresRuntimeConfigurationError(
-                f"runtime PostgreSQL {name} file cannot be accessed by asyncpg"
-            ) from exc
-
-
-def _asyncpg_home(env: dict, project_dir: Path) -> str | None:
-    """Resolve the home that asyncpg's ``Path.home()`` observes."""
-    if _IS_WINDOWS:
-        home_value = env.get("USERPROFILE")
-        if not home_value:
-            drive = env.get("HOMEDRIVE", "")
-            tail = env.get("HOMEPATH", "")
-            home_value = f"{drive}{tail}" if drive or tail else env.get("HOME")
-        if not home_value:
-            return None
-        home = Path(home_value)
-    else:
-        try:
-            home = Path(env["HOME"] or "/") if "HOME" in env else Path.home()
-        except (RuntimeError, KeyError):
-            return None
-    try:
-        if not home.is_absolute():
-            home = project_dir.resolve() / home
-        return str(home.resolve())
-    except (OSError, ValueError) as exc:
-        raise _PostgresRuntimeConfigurationError(
-            "runtime PostgreSQL home directory cannot be resolved by asyncpg"
-        ) from exc
-
-
-def _state_asyncpg_windows_tls_defaults(
-    query: dict[str, str], postgres_home: str | None
-) -> None:
-    """Freeze asyncpg's Windows TLS files before libpq changes home roots.
-
-    Asyncpg always searches ``Path.home() / '.postgresql'``.  Windows libpq
-    instead searches ``%APPDATA% / 'postgresql'``.  The worker hides that
-    unrelated libpq directory. Root/CRL files are made explicit here, and
-    verification modes retain asyncpg's failure on a missing root CA. Client
-    identity defaults remain implicit until the worker reproduces asyncpg's
-    optional ``load_cert_chain`` branch; making them explicit here would lose
-    the distinction between an operator-supplied certificate and a default
-    chain that asyncpg is allowed to skip when its key is missing.
-    """
-    if not _IS_WINDOWS or postgres_home is None:
-        return
-
-    sslmode = query.get("sslmode", "disable")
-    if sslmode == "disable":
-        return
-    tls_dir = Path(postgres_home) / ".postgresql"
-
-    if sslmode in {"require", "verify-ca", "verify-full"}:
-        root = tls_dir / "root.crt"
-        if not query.get("sslrootcert") and (
-            root.exists() or sslmode in {"verify-ca", "verify-full"}
-        ):
-            query["sslrootcert"] = str(root.resolve())
-        crl = tls_dir / "root.crl"
-        if not query.get("sslcrl") and crl.exists():
-            query["sslcrl"] = str(crl.resolve())
-
-
-def _read_asyncpg_passfile_password(
-    passfile: Path,
-    hosts: list[str],
-    ports: list[int],
-    database: str,
-    user: str,
-) -> str | None:
-    """Select a passfile password with asyncpg 0.30's ordered-host rules."""
-    try:
-        if not passfile.is_file():
-            return None
-        if os.name != "nt" and passfile.stat().st_mode & 0o077:
-            return None
-        # Text-mode universal-newline handling matches asyncpg's file iterator;
-        # splitting only on the translated newline avoids treating vertical
-        # tabs and other Unicode line separators as record boundaries.
-        lines = passfile.read_text().split("\n")
-    except OSError:
-        return None
-    except ValueError as exc:
-        raise _PostgresRuntimeConfigurationError(
-            "runtime PostgreSQL passfile cannot be read by asyncpg"
-        ) from exc
-
-    entries: list[tuple[str, ...]] = []
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Match asyncpg's parser exactly: protect escaped backslashes while
-        # splitting on unescaped colons, then restore them afterward.
-        protected = line.replace(r"\\", "\n")
-        entries.append(
-            tuple(
-                field.replace("\n", r"\\")
-                for field in re.split(r"(?<!\\):", protected, maxsplit=4)
-            )
-        )
-
-    for host, port in zip(hosts, ports):
-        auth_host = "localhost" if host.startswith("/") else host
-        for entry in entries:
-            if len(entry) != 5:
-                raise _PostgresRuntimeConfigurationError(
-                    "runtime PostgreSQL passfile is malformed"
-                )
-            phost, pport, pdatabase, puser, password = entry
-            if phost not in {"*", auth_host}:
-                continue
-            if pport not in {"*", str(port)}:
-                continue
-            if pdatabase not in {"*", database}:
-                continue
-            if puser not in {"*", user}:
-                continue
-            return password
-    return None
-
-
-def _fold_asyncpg_passfile(
-    parts,
-    query: dict[str, str],
-    hosts: list[str],
-    ports: list[int],
-    auth_hosts: list[str],
-    env: dict,
-    project_dir: Path,
-) -> None:
-    """Freeze asyncpg's passfile behavior into explicit libpq parameters.
-
-    Asyncpg scans the ordered hosts once, selects the first matching passfile
-    password, and reuses it for every connection attempt. Libpq consults the
-    passfile again for each attempted host. Folding asyncpg's selection into
-    an explicit password prevents doctor from authenticating as a different
-    effective client after the first host fails.
-    """
-    authority_user, authority_password, _ = _authority_fields(parts.netloc)
-    if authority_password:
-        return
-    if "password" in query:
-        if query["password"] == "":
-            query["passfile"] = _ABSENT_PASSFILE_SENTINEL
-        return
-    if query.get("passfile") == "":
-        query["passfile"] = _ABSENT_PASSFILE_SENTINEL
-        return
-
-    user = unquote(authority_user) if authority_user else query["user"]
-    if parts.path:
-        database_path = parts.path.removeprefix("/")
-        database = unquote(database_path)
-    else:
-        database = query["dbname"]
-
-    if "passfile" in query:
-        # An explicitly empty PGPASSFILE becomes ``Path('')`` in asyncpg and
-        # therefore does not fall through to the default file.
-        passfile = Path(query["passfile"]) if query["passfile"] else None
-    elif _IS_WINDOWS:
-        # Asyncpg uses Windows' roaming AppData known folder rather than HOME.
-        try:
-            from asyncpg import compat as _asyncpg_compat
-
-            home = _asyncpg_compat.get_pg_home_directory()
-        except (AttributeError, ImportError, OSError) as exc:
-            raise _PostgresRuntimeConfigurationError(
-                "runtime PostgreSQL default passfile location could not be determined"
-            ) from exc
-        passfile = home / "pgpass.conf" if home is not None else None
-    else:
-        resolved_home = _asyncpg_home(env, project_dir)
-        home = Path(resolved_home) if resolved_home is not None else None
-        passfile = home / ".pgpass" if home is not None else None
-
-    password = (
-        _read_asyncpg_passfile_password(passfile, auth_hosts, ports, database, user)
-        if passfile is not None
-        else None
-    )
-    if password is not None:
-        query["password"] = password
-
-    # With no match asyncpg attempts passwordless authentication; it does not
-    # fall through to another passfile. The isolated probe replaces this
-    # marker with a path below a private temporary directory immediately
-    # before libpq connects, closing the old project-tree TOCTOU window.
-    query["passfile"] = _ABSENT_PASSFILE_SENTINEL
-
-
-def _doctor_postgres_dsn(runtime_dsn: str, env: dict, project_dir: Path) -> str:
-    """Translate asyncpg's effective connection data into a libpq URI.
-
-    ``runtime_dsn`` remains authoritative. Only fields it does not state are
-    filled from the launcher environment, and query options asyncpg treats as
-    server settings are carried through libpq's ``options`` parameter rather
-    than stripped or accidentally reclassified as libpq connection options.
-
-    The return value is the string stored on :class:`_GovernanceSource`, so a
-    password folded in from ``env`` remains inside the redaction boundary used
-    by every driver-error path.
-    """
-    _require_postgres_driver()
-    try:
-        parts = urlsplit(runtime_dsn)
-        if parts.scheme not in {"postgres", "postgresql"}:
-            raise _PostgresRuntimeConfigurationError("not an asyncpg PostgreSQL URI")
-        raw_query = (
-            dict(parse_qsl(parts.query, strict_parsing=True)) if parts.query else {}
-        )
-    except _PostgresRuntimeConfigurationError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise _PostgresRuntimeConfigurationError(
-            "runtime PostgreSQL DSN is not valid for asyncpg"
-        ) from exc
-
-    stated = _dsn_stated_options(parts, raw_query)
-    # Keep asyncpg's classification intact through precedence resolution and
-    # cross-driver normalization. Capability validation happens only after the
-    # final effective option set exists; an explicit constraint must never be
-    # silently deleted merely because the linked libpq predates it.
-    query = {
-        name: value
-        for name, value in raw_query.items()
-        if name in _ASYNCPG_CONNECTION_QUERY_OPTIONS
-    }
-
-    # asyncpg accepts ``database`` as an alias; libpq accepts ``dbname``.
-    # A URI path wins over either query spelling in asyncpg, so ignored query
-    # copies are removed instead of being allowed to override the path here.
-    if parts.path:
-        query.pop("dbname", None)
-        query.pop("database", None)
-    elif "dbname" in query:
-        query.pop("database", None)
-    elif "database" in query:
-        query["dbname"] = query.pop("database")
-
-    user, password, hostspec = _authority_fields(parts.netloc)
-    try:
-        hosts, ports, auth_hosts = _resolve_asyncpg_hosts(hostspec, raw_query, env)
-    except _PostgresRuntimeConfigurationError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise _PostgresRuntimeConfigurationError(
-            "runtime PostgreSQL host/port configuration is not valid for asyncpg"
-        ) from exc
-    _validate_libpq_hosts(hosts)
-    query["host"] = ",".join(hosts)
-    query["port"] = ",".join(str(port) for port in ports)
-    if user:
-        query.pop("user", None)
-    if password:
-        query.pop("password", None)
-
-    for env_name, dsn_name in _ASYNCPG_ENV_DSN_OPTIONS:
-        value = env.get(env_name)
-        if value is not None and dsn_name not in stated:
-            query[dsn_name] = value
-
-    # State the defaults even without PGSERVICE: asyncpg's host fallback list
-    # differs from libpq's compiled-in socket default. The connect boundary
-    # below removes an ambient service recipe rather than attempting to
-    # enumerate every authentication and TLS option a service could inject.
-    _state_asyncpg_connection_defaults(parts, query, hosts, user, env)
-    _normalize_asyncpg_connection_options(query)
-    _normalize_asyncpg_direct_tls(query)
-    _validate_asyncpg_connection_options(query)
-
-    for dsn_name, asyncpg_default in _LIBPQ_COMPILED_DSN_DEFAULTS:
-        if _libpq_accepts_dsn_option(dsn_name, asyncpg_default):
-            query[dsn_name] = asyncpg_default
-
-    total_timeout = _doctor_postgres_timeout_seconds(env)
-    query["connect_timeout"] = str(_per_host_connect_timeout(total_timeout, len(hosts)))
-
-    _resolve_connection_file_paths(query, project_dir)
-    _validate_explicit_asyncpg_tls_files(query)
-    _state_asyncpg_windows_tls_defaults(query, _asyncpg_home(env, project_dir))
-    _fold_asyncpg_passfile(parts, query, hosts, ports, auth_hosts, env, project_dir)
-
-    for name, value in query.items():
-        _require_libpq_dsn_option(name, value)
-
-    # These are server settings under asyncpg even when libpq happens to have
-    # a connection parameter with the same name. PostgreSQL processes the raw
-    # ``options`` field before direct startup settings regardless of URI order,
-    # so put it first and append every other setting through ``-c name=value``.
-    option_fragments = [raw_query["options"]] if "options" in raw_query else []
-    direct_settings = [
-        (name, value)
-        for name, value in raw_query.items()
-        if name not in _ASYNCPG_CONNECTION_QUERY_OPTIONS and name != "options"
-    ]
-    if option_fragments and direct_settings:
-        trailing_backslashes = len(option_fragments[0]) - len(
-            option_fragments[0].rstrip("\\")
-        )
-        if trailing_backslashes % 2:
-            raise _PostgresDiagnosticCapabilityError(
-                "runtime PostgreSQL options value cannot be combined "
-                "losslessly with direct startup settings"
-            )
-    for name, value in direct_settings:
-        option_fragments.append(_libpq_option_fragment(name, value))
-    # State this unconditionally. ``options=`` is a valid explicit empty value
-    # and prevents ambient PGOPTIONS from changing doctor's schema or startup
-    # settings when the spawned asyncpg process would ignore it.
-    query["options"] = " ".join(option_fragments)
-
-    # ``urlencode`` defaults to quote_plus. libpq percent-decodes according to
-    # RFC 3986 and keeps '+' literal, which would turn ``-c search_path=...``
-    # into ``-c+search_path=...``. Use percent-encoded spaces explicitly.
-    encoded_query = urlencode(query, quote_via=quote)
-    # Building this directly preserves the URI's ``//`` marker when it has no
-    # authority (``postgresql:///db``). ``urlunsplit`` normalizes that valid
-    # asyncpg/libpq form to the invalid ``postgresql:/db``.
-    # The normalized host list lives in query parameters so every host can
-    # carry the exact per-host port asyncpg resolved. Retain only URI userinfo;
-    # leaving the original authority hosts in place would let libpq reinterpret
-    # an embedded port or an IPv6/socket spelling a second time.
-    auth_netloc = f"{parts.netloc.partition('@')[0]}@" if "@" in parts.netloc else ""
-    path = (
-        parts.path if not parts.path or parts.path.startswith("/") else f"/{parts.path}"
-    )
-    effective = f"{parts.scheme}://{auth_netloc}{path}"
-    return f"{effective}?{encoded_query}" if encoded_query else effective
-
-
 def _safe(exc: object, source: _GovernanceSource) -> str:
-    """A driver error with the connection string taken out of it.
-
-    libpq echoes the DSN it could not parse. An unmatched ``[`` in a URI is
-    enough:
-
-        invalid dsn: end of string reached when looking for matching "]"
-        in IPv6 host address in URI: "postgresql://user:hunter2@[bad/kestrel"
-
-    Doctor puts these straight into its report, which an operator reads on a
-    terminal and CI archives, so the unredacted form prints the database
-    password. The whole DSN goes, not just the password: it also names a host
-    and database an operator may not want in a build log, and a message that
-    keeps everything except the secret is one parser bug away from keeping the
-    secret too.
-    """
+    """Return a driver error with connection identities and secrets removed."""
     text = str(exc)
     if not source.dsn:
         return text
 
     text = text.replace(source.dsn, "<dsn>")
-
-    # Then the individual fields, because the whole-string replace above only
-    # fires on a byte-identical echo — and that is the *rare* case. A malformed
-    # URI gets quoted back verbatim, but an ordinary DNS, connection, or
-    # authentication failure names the parts instead:
-    #
-    #     could not translate host name "db.internal" to address
-    #     FATAL:  password authentication failed for user "kestrel"
-    #
-    # so a redaction that only handled the verbatim echo left the database
-    # topology and account names in every routine outage message. Password
-    # first: it is the one field whose disclosure is unrecoverable, and
-    # redacting longest-first stops a shorter token reappearing inside a
-    # replacement.
-    for secret in _dsn_secrets(source.dsn):
+    env = source.postgres_env or {}
+    secrets = set(_dsn_secrets(source.dsn))
+    secrets.update(
+        value
+        for name in _POSTGRES_SECRET_ENV_FIELDS
+        if isinstance((value := env.get(name)), str) and value
+    )
+    for secret in sorted(secrets, key=len, reverse=True):
         if len(secret) > 2:
-            # Real credentials can appear beside arbitrary punctuation or
-            # inside a larger driver token (for example a role or file name).
-            # Redact every occurrence; a token boundary here would disclose
-            # the credential in those routine error shapes.
             text = text.replace(secret, "<redacted>")
         else:
-            # One- and two-character passwords can coincide with common
-            # diagnostic fragments. Replacing arbitrary substrings turns
-            # ``port`` and ``password`` into gibberish for a password of
-            # ``p``. The token-bounded form still covers explicit renderings
-            # such as ``credential=p`` without destroying the report.
             text = re.sub(
                 rf"(?<![\w-]){re.escape(secret)}(?![\w-])",
                 "<redacted>",
                 text,
             )
-    for field_name, value in _dsn_connection_files(source.dsn):
+
+    for field_name, value in _postgres_connection_files(source.dsn, env):
         text = text.replace(value, f"<{field_name}>")
     identities = (
         source.dsn_identity
         if source.dsn_identity is not None
-        else _dsn_identity(source.dsn)
+        else _postgres_redaction_identity(source.dsn, env)
     )
     for field_name, value in identities:
         text = text.replace(value, f"<{field_name}>")
@@ -1813,147 +631,137 @@ def _safe(exc: object, source: _GovernanceSource) -> str:
     return text
 
 
-def _dsn_secrets(dsn: str) -> tuple:
-    """Every secret-bearing token in ``dsn``, longest first.
+_POSTGRES_SECRET_ENV_FIELDS = ("PGPASSWORD", "PGSSLPASSWORD")
+_POSTGRES_CONNECTION_FILE_QUERY_FIELDS = frozenset(
+    {
+        "passfile",
+        "servicefile",
+        "sslcert",
+        "sslcrl",
+        "sslkey",
+        "sslrootcert",
+    }
+)
+_POSTGRES_CONNECTION_FILE_ENV_FIELDS = {
+    "PGPASSFILE": "passfile",
+    "PGSERVICEFILE": "servicefile",
+    "PGSSLCERT": "sslcert",
+    "PGSSLCRL": "sslcrl",
+    "PGSSLKEY": "sslkey",
+    "PGSSLROOTCERT": "sslrootcert",
+    "KRB5CCNAME": "kerberos_cache",
+    "KRB5_CONFIG": "kerberos_config",
+}
+_POSTGRES_IDENTITY_ENV_FIELDS = {
+    "PGHOST": "host",
+    "PGUSER": "user",
+    "PGDATABASE": "dbname",
+    "PGSERVICE": "service",
+}
+_DSN_IDENTITY_FIELDS = ("host", "user", "dbname", "service")
 
-    Longest first so that redacting one token cannot leave a shorter one
-    embedded in the replacement text.
-    """
-    secrets = set()
+
+def _dsn_query(dsn: str) -> tuple[tuple[str, str], ...]:
+    """Return URI query fields for redaction without validating the runtime DSN."""
     try:
-        from psycopg2.extensions import parse_dsn
-
-        parsed = parse_dsn(dsn)
-        for field in ("password", "sslpassword"):
-            value = parsed.get(field)
-            if value:
-                secrets.add(value)
-    except Exception:  # noqa: BLE001, S110 — malformed DSN; URI fallback follows
-        pass
-
-    # The isolated worker can reserialize the translated URI as libpq conninfo,
-    # which is no longer byte-identical to ``source.dsn``. Collect query
-    # credentials independently so their decoded forms remain redacted even
-    # when libpq echoes only ``field=value``.
-    try:
-        for field, value in parse_qsl(urlsplit(dsn).query, strict_parsing=True):
-            if field in {"password", "sslpassword"} and value:
-                secrets.add(value)
+        return tuple(parse_qsl(urlsplit(dsn).query, keep_blank_values=True))
     except (TypeError, ValueError):
-        pass
+        return ()
 
-    # ``parse_dsn`` raises on exactly the malformed URIs that leak, so fall
-    # back to the URI's own shape: everything between "://user:" and the "@".
+
+def _dsn_secrets(dsn: str) -> tuple:
+    """Return every URI-embedded credential token, longest first."""
+    secrets: set[str] = set()
+    for field, value in _dsn_query(dsn):
+        if field in {"password", "sslpassword"} and value:
+            secrets.add(value)
+
+    try:
+        raw_query = urlsplit(dsn).query
+    except (TypeError, ValueError):
+        raw_query = ""
+    for match in re.finditer(
+        r"(?:^|&)(?:password|sslpassword)=([^&#]+)", raw_query, re.IGNORECASE
+    ):
+        secrets.add(match.group(1))
+
     match = re.search(r"://[^:/?#]*:([^@/?#]+)@", dsn)
     if match:
         encoded_password = match.group(1)
         secrets.add(encoded_password)
         secrets.add(unquote(encoded_password))
-
-    # The isolated worker's ``make_dsn`` call reserializes a URI as libpq
-    # conninfo when it installs the absent-passfile sentinel. In that spelling
-    # apostrophes and backslashes gain a backslash, and whitespace-bearing
-    # values are quoted. Redact both the logical value and the exact escaped
-    # token a worker diagnostic can echo.
-    for secret in tuple(secrets):
-        conninfo_secret = re.sub(r"([\\'])", r"\\\1", secret)
-        if any(character.isspace() for character in conninfo_secret):
-            conninfo_secret = f"'{conninfo_secret}'"
-        secrets.add(conninfo_secret)
-
     return tuple(sorted(secrets, key=len, reverse=True))
 
 
 def _dsn_connection_files(dsn: str) -> tuple:
-    """Resolved connection-file paths that driver errors must not disclose."""
-    try:
-        from psycopg2.extensions import parse_dsn
-
-        parsed = parse_dsn(dsn)
-    except Exception:  # noqa: BLE001 — unparseable; whole-DSN redaction remains
-        return ()
-
+    """Return connection-file paths explicitly present in the runtime URI."""
     found = [
-        (field, parsed[field])
-        for field in _ASYNCPG_CONNECTION_FILE_OPTIONS
-        if isinstance(parsed.get(field), str) and len(parsed[field]) > 2
+        (field, value)
+        for field, value in _dsn_query(dsn)
+        if field in _POSTGRES_CONNECTION_FILE_QUERY_FIELDS
+        and isinstance(value, str)
+        and len(value) > 2
     ]
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
-#: Identity-bearing DSN fields, and the placeholder each becomes. Not secrets,
-#: but not things to scatter through CI logs either: together they are the map
-#: of an operator's database estate.
-_DSN_IDENTITY_FIELDS = ("host", "user", "dbname")
-
-
-def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
-    """``(field, value)`` for each identity field in ``dsn``, longest first.
-
-    Length-sorted for the same reason as the secrets, and short values are
-    dropped: a one- or two-character host or user is common enough as an
-    ordinary English fragment that replacing it would corrupt the message it
-    is meant to keep readable.
-    """
-    try:
-        from psycopg2.extensions import parse_dsn
-
-        parsed = parse_dsn(dsn)
-    except Exception:  # noqa: BLE001 — unparseable; the whole-DSN replace stands
-        return ()
-
-    found = []
-    for field_name in _DSN_IDENTITY_FIELDS:
-        if field_name == "host" and not include_host:
-            continue
-        value = parsed.get(field_name)
-        if not isinstance(value, str):
-            continue
-        values = value.split(",") if field_name == "host" else [value]
-        found.extend((field_name, member) for member in values if len(member) > 2)
+def _postgres_connection_files(dsn: str, env: dict) -> tuple:
+    found = set(_dsn_connection_files(dsn))
+    found.update(
+        (field_name, value)
+        for env_name, field_name in _POSTGRES_CONNECTION_FILE_ENV_FIELDS.items()
+        if isinstance((value := env.get(env_name)), str) and len(value) > 2
+    )
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
-def _translated_dsn_identity(runtime_dsn: str, translated_dsn: str, env: dict) -> tuple:
-    """Redact configured identities, excluding synthetic fallback hosts."""
-    parts = urlsplit(runtime_dsn)
-    query = dict(parse_qsl(parts.query, strict_parsing=True)) if parts.query else {}
-    _, _, authority_hostspec = _authority_fields(parts.netloc)
-    has_configured_host = bool(
-        authority_hostspec or query.get("host") or env.get("PGHOST")
-    )
-    return _dsn_identity(translated_dsn, include_host=has_configured_host)
-
-
-def _bounded_dsn(dsn: str) -> str:
-    """Verify that a translated PostgreSQL DSN carries doctor's bound.
-
-    PostgreSQL sources reach this function only after asyncpg-style query
-    parameters have been translated. A runtime ``connect_timeout`` query is
-    therefore a server setting in ``options``, never libpq's connection
-    timeout. ``_doctor_postgres_dsn`` has already read the spawned-agent
-    environment and divided the configured whole budget across its host list.
-    Rejecting a valid but unbounded translated DSN keeps this seam from
-    silently consulting the doctor's different process environment.
-    """
+def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
+    """Return identity-bearing URI fields without asking a different driver."""
+    found: set[tuple[str, str]] = set()
     try:
-        from psycopg2 import ProgrammingError
-        from psycopg2.extensions import parse_dsn
-    except (ImportError, AttributeError):
-        # Driver availability is reported by the connection path. Preserve
-        # that established diagnostic instead of replacing it here.
-        return dsn
-    try:
-        parsed = parse_dsn(dsn)
-    except ProgrammingError:
-        # An unparseable DSN is likewise the connection's own problem to
-        # report, with the existing redaction path around that message.
-        return dsn
-    if "connect_timeout" not in parsed:
-        raise ValueError(
-            "translated PostgreSQL diagnostic DSN is missing connect_timeout"
+        parts = urlsplit(dsn)
+    except (TypeError, ValueError):
+        parts = None
+
+    if parts is not None:
+        if parts.username:
+            found.add(("user", unquote(parts.username)))
+        if include_host and parts.hostname:
+            found.add(("host", unquote(parts.hostname)))
+        if parts.path and parts.path != "/":
+            found.add(("dbname", unquote(parts.path.removeprefix("/"))))
+
+    for field_name, value in _dsn_query(dsn):
+        normalized = "dbname" if field_name == "database" else field_name
+        if normalized not in _DSN_IDENTITY_FIELDS:
+            continue
+        if normalized == "host" and not include_host:
+            continue
+        for member in value.split(",") if normalized == "host" else (value,):
+            found.add((normalized, unquote(member)))
+
+    return tuple(
+        sorted(
+            (
+                (field_name, value)
+                for field_name, value in found
+                if isinstance(value, str) and len(value) > 2
+            ),
+            key=lambda pair: len(pair[1]),
+            reverse=True,
         )
-    return dsn
+    )
+
+
+def _postgres_redaction_identity(dsn: str, env: dict) -> tuple:
+    """Cover identities supplied only through the spawned-agent environment."""
+    found = set(_dsn_identity(dsn))
+    found.update(
+        (field_name, value)
+        for env_name, field_name in _POSTGRES_IDENTITY_ENV_FIELDS.items()
+        if isinstance((value := env.get(env_name)), str) and len(value) > 2
+    )
+    return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
 def _fetch_rows(
@@ -1963,52 +771,32 @@ def _fetch_rows(
     sqlite_params: tuple = (),
     postgres_params: tuple = (),
 ) -> list:
-    """Run the backend's form of one read-only query and return its rows.
-
-    Raises the driver's own error type; every caller maps that to
-    ``_UnreadableDB``, the same shape it always did.
-
-    Query *and* parameters are given per backend rather than templated. The
-    placeholder style differs (``?`` vs ``%s``), and so does the scoping:
-    SQLite reads the one agent in the anchor, PostgreSQL has to name its
-    tenant. Spelling both out keeps that difference where a reader can see it.
-    """
+    """Run one read-only query through the same database driver as the runtime."""
     if source.reads_the_anchor:
-        # ``isolation_level=None`` and ``uri=False`` are the defaults; we rely
-        # on them to avoid creating a transaction we won't commit.
         with sqlite3.connect(str(source.anchor_path)) as conn:
             return conn.execute(sqlite_sql, sqlite_params).fetchall()
 
     return _fetch_postgres_rows_isolated(
-        _bounded_dsn(source.dsn),
+        source.dsn,
         postgres_sql,
         postgres_params,
         postgres_home=source.postgres_home,
         postgres_env=source.postgres_env,
         postgres_cwd=source.postgres_cwd,
-        runtime_gss=source.postgres_runtime_gss,
         dsn_identity=source.dsn_identity,
     )
 
 
 class _PostgresProbeError(RuntimeError):
-    """A safely transported failure from the isolated libpq probe."""
+    """A safely transported failure from the isolated asyncpg probe."""
 
 
 class _PostgresProbeConnectionError(_PostgresProbeError):
-    """The equivalent libpq connection failed after an attempted open."""
+    """The spawned runtime's asyncpg connection failed."""
 
 
 class _PostgresProbeQueryError(_PostgresProbeError):
-    """Libpq connected, but the read-only governance query failed."""
-
-
-class _PostgresProbeRuntimeConfigurationError(_PostgresProbeError):
-    """Libpq connected through a capability absent from the asyncpg runtime."""
-
-
-class _PostgresProbeDiagnosticCapabilityError(_PostgresProbeError):
-    """The worker could not prove that its successful connection had parity."""
+    """Asyncpg connected, but the read-only governance query failed."""
 
 
 class _PostgresProbeTimeoutError(_PostgresProbeError):
@@ -2025,20 +813,12 @@ def _postgres_probe_failure_kind(exc: BaseException) -> str:
         return "connection"
     if isinstance(exc, _PostgresProbeQueryError):
         return "runtime_database"
-    if isinstance(exc, _PostgresProbeRuntimeConfigurationError):
-        return "runtime_configuration"
-    if isinstance(exc, _PostgresProbeDiagnosticCapabilityError):
-        return "diagnostic_capability"
     if isinstance(exc, _PostgresProbeTimeoutError):
         return "diagnostic_timeout"
     return "diagnostic_tooling"
 
 
-def _postgres_unreadable(
-    exc: BaseException,
-    *,
-    reason: str,
-):
+def _postgres_unreadable(exc: BaseException, *, reason: str):
     """Build an unreadable sentinel with explicit probe provenance."""
     return _UnreadableDB(
         reason=reason,
@@ -2049,30 +829,10 @@ def _postgres_unreadable(
     )
 
 
-def _postgres_probe_env(
-    resolved_env: dict[str, str], postgres_home: str | None = None
-) -> dict[str, str]:
-    """Sanitize the spawned agent's environment for the libpq worker.
-
-    The translated DSN freezes every PostgreSQL value asyncpg reads. Running
-    libpq in a dedicated process therefore lets doctor remove every ``PG*``
-    variable without mutating the long-lived caller. This covers service
-    recipes, startup GUCs, keepalive knobs, and future libpq additions without
-    relying on an inevitably incomplete list. All other inputs start from the
-    launcher's resolved environment, not doctor's parent environment, so GSS
-    configuration and credential caches match the process being diagnosed.
-    """
-    child_env = {
-        name: value
-        for name, value in resolved_env.items()
-        if not name.upper().startswith("PG")
-        and name.upper() not in {"PYTHONHOME", "PYTHONPATH"}
-    }
-    if postgres_home is not None:
-        child_env["HOME"] = postgres_home
-        if _IS_WINDOWS:
-            child_env["USERPROFILE"] = postgres_home
-    child_env["PYTHONIOENCODING"] = "utf-8"
+def _postgres_probe_env(resolved_env: dict[str, str]) -> dict[str, str]:
+    """Copy the environment ProcessManager gives the spawned agent."""
+    child_env = dict(resolved_env)
+    child_env.setdefault("PYTHONUNBUFFERED", "1")
     return child_env
 
 
@@ -2081,55 +841,29 @@ def _postgres_fetch_rows_in_process(
     sql: str,
     params: tuple | list,
     *,
-    runtime_gss: dict[str, object] | None = None,
-    driver=None,
+    connect=None,
 ) -> list:
-    """Exercise the production worker seam in-process for focused tests."""
+    """Exercise the asyncpg worker seam in-process for focused tests."""
     from kestrel_sovereign._doctor_postgres_probe import (
         ProbeConnectionError,
-        ProbeDiagnosticCapabilityError,
         ProbeError,
         ProbeQueryError,
-        ProbeRuntimeConfigurationError,
         fetch_rows_in_process,
     )
 
     try:
-        return fetch_rows_in_process(
-            dsn,
-            sql,
-            params,
-            absent_passfile_sentinel=_ABSENT_PASSFILE_SENTINEL,
-            runtime_gss=runtime_gss,
-            driver=driver,
-        )
+        return fetch_rows_in_process(dsn, sql, params, connect=connect)
     except ProbeConnectionError as exc:
         raise _PostgresProbeConnectionError(str(exc)) from exc
     except ProbeQueryError as exc:
         raise _PostgresProbeQueryError(str(exc)) from exc
-    except ProbeRuntimeConfigurationError as exc:
-        raise _PostgresProbeRuntimeConfigurationError(str(exc)) from exc
-    except ProbeDiagnosticCapabilityError as exc:
-        raise _PostgresProbeDiagnosticCapabilityError(str(exc)) from exc
     except ProbeError as exc:
         raise _PostgresProbeError(str(exc)) from exc
 
 
-def _postgres_probe_timeout_seconds(dsn: str) -> int:
-    """Bound worker startup, every per-host connect, and one read query."""
-    try:
-        from psycopg2 import ProgrammingError
-        from psycopg2.extensions import parse_dsn
-    except (ImportError, AttributeError):
-        connection_budget = _CONNECT_TIMEOUT_SECONDS
-    else:
-        try:
-            parsed = parse_dsn(dsn)
-            per_host = int(parsed.get("connect_timeout", _CONNECT_TIMEOUT_SECONDS))
-            connection_budget = per_host * _dsn_host_count(parsed)
-        except (ProgrammingError, TypeError, ValueError):
-            connection_budget = _CONNECT_TIMEOUT_SECONDS
-    return connection_budget + _POSTGRES_PROBE_GRACE_SECONDS
+def _postgres_probe_timeout_seconds(env: dict) -> int:
+    """Bound worker import, connect, query, serialization, and shutdown."""
+    return _doctor_postgres_timeout_seconds(env) + _POSTGRES_PROBE_GRACE_SECONDS
 
 
 def _probe_output_text(output: object) -> str:
@@ -2146,6 +880,7 @@ def _redact_probe_output(
     dsn: str,
     postgres_home: str | None,
     dsn_identity: tuple | None,
+    postgres_env: dict[str, str] | None,
 ) -> str:
     """Redact a worker fragment before it enters an exception."""
     if not output:
@@ -2156,6 +891,7 @@ def _redact_probe_output(
         dsn=dsn,
         dsn_identity=dsn_identity,
         postgres_home=postgres_home,
+        postgres_env=postgres_env,
     )
     return _safe(output, source)
 
@@ -2165,12 +901,19 @@ def _redacted_probe_output_tail(
     dsn: str,
     postgres_home: str | None,
     dsn_identity: tuple | None,
+    postgres_env: dict[str, str] | None,
     *,
     limit: int = 1000,
 ) -> str:
     """Redact raw worker output before normalizing and bounding it."""
     decoded = _probe_output_text(output)
-    redacted = _redact_probe_output(decoded, dsn, postgres_home, dsn_identity)
+    redacted = _redact_probe_output(
+        decoded,
+        dsn,
+        postgres_home,
+        dsn_identity,
+        postgres_env,
+    )
     normalized = " ".join(redacted.strip().split())
     return normalized[-limit:]
 
@@ -2181,14 +924,7 @@ def _partial_probe_diagnostic(
     *,
     limit: int = 2000,
 ) -> str:
-    """Preserve privacy-safe stderr breadcrumbs around worker termination.
-
-    Stdout is the worker's JSON result channel and may already contain
-    governance rows when the parent deadline expires. It is deliberately not
-    accepted here, so a timeout can never copy those rows into diagnostics.
-    Stderr is also allowlisted to the worker's two constant phase messages;
-    arbitrary driver or interpreter output has no timeout-reporting contract.
-    """
+    """Keep privacy-safe phase breadcrumbs, never timeout stdout/JSON rows."""
     allowed = {
         "PostgreSQL diagnostic phase: connecting",
         "PostgreSQL diagnostic phase: connected; querying",
@@ -2210,70 +946,23 @@ def _fetch_postgres_rows_isolated(
     postgres_home: str | None = None,
     postgres_env: dict[str, str] | None = None,
     postgres_cwd: str | None = None,
-    runtime_gss: dict[str, object] | None = None,
     dsn_identity: tuple | None = None,
 ) -> list:
-    """Execute one libpq query with parent-owned temporary-file cleanup.
-
-    The worker can be killed at the deadline and therefore cannot own cleanup
-    for copied TLS key material. The parent retains the temporary-directory
-    context until the child has exited or been killed and reaped.
-    """
+    """Run asyncpg under the spawned agent's executable, environment, and cwd."""
     try:
-        with tempfile.TemporaryDirectory(prefix="kestrel-doctor-") as probe_temp_dir:
-            return _fetch_postgres_rows_isolated_with_temp(
-                dsn,
-                sql,
-                params,
-                postgres_home=postgres_home,
-                postgres_env=postgres_env,
-                postgres_cwd=postgres_cwd,
-                runtime_gss=runtime_gss,
-                dsn_identity=dsn_identity,
-                probe_temp_dir=probe_temp_dir,
-            )
-    except _PostgresProbeError:
-        raise
-    except OSError as exc:
-        raise _PostgresProbeError(
-            "isolated PostgreSQL diagnostic private material could not be managed"
-        ) from exc
-
-
-def _fetch_postgres_rows_isolated_with_temp(
-    dsn: str,
-    sql: str,
-    params: tuple,
-    *,
-    postgres_home: str | None,
-    postgres_env: dict[str, str] | None,
-    postgres_cwd: str | None,
-    runtime_gss: dict[str, object] | None,
-    dsn_identity: tuple | None,
-    probe_temp_dir: str,
-) -> list:
-    """Run the isolated worker beneath one parent-owned private directory."""
-    try:
-        payload = json.dumps(
-            {
-                "dsn": dsn,
-                "sql": sql,
-                "params": params,
-                "absent_passfile_sentinel": _ABSENT_PASSFILE_SENTINEL,
-                "probe_temp_dir": probe_temp_dir,
-                "runtime_gss": runtime_gss,
-            }
-        )
+        payload = json.dumps({"dsn": dsn, "sql": sql, "params": params})
     except (TypeError, ValueError) as exc:
         raise _PostgresProbeError(
             "PostgreSQL diagnostic query parameters are not transportable"
         ) from exc
+
+    child_env = _postgres_probe_env(
+        postgres_env if postgres_env is not None else os.environ
+    )
     command = [
         sys.executable,
-        # Safe-path mode keeps the script/package directory out of sys.path,
-        # without disabling user-site packages for supported --user installs.
-        "-P",
-        str(Path(__file__).with_name("_doctor_postgres_probe.py")),
+        "-m",
+        "kestrel_sovereign._doctor_postgres_probe",
     ]
     try:
         process = subprocess.Popen(
@@ -2284,12 +973,10 @@ def _fetch_postgres_rows_isolated_with_temp(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_postgres_probe_env(
-                postgres_env if postgres_env is not None else {}, postgres_home
-            ),
+            env=child_env,
             cwd=postgres_cwd,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise _PostgresProbeError(
             "isolated PostgreSQL diagnostic process could not start"
         ) from exc
@@ -2297,15 +984,12 @@ def _fetch_postgres_rows_isolated_with_temp(
     try:
         stdout, stderr = process.communicate(
             payload,
-            timeout=_postgres_probe_timeout_seconds(dsn),
+            timeout=_postgres_probe_timeout_seconds(child_env),
         )
     except subprocess.TimeoutExpired as exc:
         process.kill()
         _stdout, stderr = process.communicate()
-        detail = _partial_probe_diagnostic(
-            exc,
-            stderr,
-        )
+        detail = _partial_probe_diagnostic(exc, stderr)
         message = (
             "isolated PostgreSQL diagnostic process exceeded its bounded "
             "timeout and was terminated"
@@ -2332,7 +1016,13 @@ def _fetch_postgres_rows_isolated_with_temp(
         raise
 
     if process.returncode:
-        detail = _redacted_probe_output_tail(stderr, dsn, postgres_home, dsn_identity)
+        detail = _redacted_probe_output_tail(
+            stderr,
+            dsn,
+            postgres_home,
+            dsn_identity,
+            child_env,
+        )
         message = "isolated PostgreSQL diagnostic process exited unexpectedly"
         raise _PostgresProbeError(f"{message}: {detail}" if detail else message)
     try:
@@ -2352,21 +1042,21 @@ def _fetch_postgres_rows_isolated_with_temp(
             if isinstance(error, str) and error
             else "PostgreSQL diagnostic query failed"
         )
-        message = _redacted_probe_output_tail(message, dsn, postgres_home, dsn_identity)
-        kind = response.get("kind")
+        message = _redacted_probe_output_tail(
+            message,
+            dsn,
+            postgres_home,
+            dsn_identity,
+            child_env,
+        )
         error_type = {
             "connection": _PostgresProbeConnectionError,
             "query": _PostgresProbeQueryError,
-            "runtime_configuration": _PostgresProbeRuntimeConfigurationError,
-            "diagnostic_capability": _PostgresProbeDiagnosticCapabilityError,
-        }.get(kind, _PostgresProbeError)
+        }.get(response.get("kind"), _PostgresProbeError)
         raise error_type(message)
+
     rows = response.get("rows")
-    if not isinstance(rows, list):
-        raise _PostgresProbeError(
-            "isolated PostgreSQL diagnostic process returned invalid rows"
-        )
-    if not all(isinstance(row, list) for row in rows):
+    if not isinstance(rows, list) or not all(isinstance(row, list) for row in rows):
         raise _PostgresProbeError(
             "isolated PostgreSQL diagnostic process returned invalid rows"
         )
@@ -2453,7 +1143,7 @@ def _row_physically_exists(source: _GovernanceSource) -> bool:
         rows = _fetch_rows(
             source,
             "SELECT 1 FROM graph_nodes WHERE node_id = ?",
-            "SELECT 1 FROM graph_nodes WHERE node_id = %s",
+            "SELECT 1 FROM graph_nodes WHERE node_id = $1",
             sqlite_params=(source.agent_did,),
             postgres_params=(source.agent_did,),
         )
@@ -2991,12 +1681,10 @@ def _report_unexamined(
 ) -> None:
     """Record that this agent's governance could not be read.
 
-    PostgreSQL failures retain explicit provenance from translation and the
-    isolated worker. A doctor-only timeout typo or an older libpq build proves
-    nothing about asyncpg reachability; a shared invalid runtime setting or an
-    equivalent connection failure does. All leave governance unverified and
-    therefore fail readiness, but the report must not turn diagnostic blindness
-    into a database outage by guessing from words in ``reason``.
+    PostgreSQL failures retain explicit provenance from the isolated asyncpg
+    worker. All leave governance unverified and therefore fail readiness, but
+    the report must not turn diagnostic blindness into integrity corruption by
+    guessing from words in ``reason``.
 
     An edge probe runs only after the agent-node read established the
     runtime-equivalent connection. ``database_was_reached`` preserves that
@@ -3038,17 +1726,11 @@ def _report_unexamined(
     if postgres_failure == "connection":
         report.fail.append(
             f"{name}: governance NOT verified — {reason}. Doctor cannot say "
-            f"whether this agent is correctly anchored. The equivalent libpq "
-            f"connection failed with the spawned agent's effective settings, "
-            f"so runtime database access with those settings will fail too; "
+            f"whether this agent is correctly anchored. The spawned runtime's "
+            f"own asyncpg connection failed with its effective settings, so "
+            f"runtime database access with those settings will fail too; "
             f"fix the access problem and re-run before treating this host as "
             f"ready."
-        )
-    elif postgres_failure == "runtime_configuration":
-        report.fail.append(
-            f"{name}: governance NOT verified — {reason}. This setting is "
-            f"shared with the spawned asyncpg runtime, which cannot open the "
-            f"configured database until it is fixed; re-run doctor afterward."
         )
     elif postgres_failure == "runtime_database":
         report.fail.append(
@@ -3063,13 +1745,6 @@ def _report_unexamined(
             f"reachability was not established by this diagnostic; fix the "
             f"doctor-only setting and re-run before treating this host as "
             f"ready."
-        )
-    elif postgres_failure == "diagnostic_capability":
-        report.fail.append(
-            f"{name}: governance NOT verified — {reason}. Runtime database "
-            f"reachability was not established by this diagnostic; install a "
-            f"diagnostic driver/libpq capable of preserving the runtime "
-            f"connection and re-run before treating this host as ready."
         )
     elif postgres_failure == "diagnostic_timeout":
         partial_advice = (
@@ -3162,9 +1837,9 @@ _AGENT_NODE_SQLITE = (
 )
 _AGENT_NODE_PG = (
     "SELECT node_id, label, properties FROM graph_nodes "
-    "WHERE node_id = %s AND node_type = 'agent' AND EXISTS ("
+    "WHERE node_id = $1 AND node_type = 'agent' AND EXISTS ("
     "  SELECT 1 FROM graph_node_owners AS owner "
-    "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = %s)"
+    "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = $2)"
 )
 #: Physical ``governed_by`` targets regardless of who witnesses them. Compared
 #: against the scoped read to tell "no such edge" from "an edge this agent
@@ -3173,7 +1848,7 @@ _GOVERNED_BY_ANY_OWNER_SQLITE = (
     "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
 )
 _GOVERNED_BY_ANY_OWNER_PG = (
-    "SELECT target_id FROM graph_edges WHERE source_id = %s AND label = 'governed_by'"
+    "SELECT target_id FROM graph_edges WHERE source_id = $1 AND label = 'governed_by'"
 )
 _GOVERNED_BY_SQLITE = (
     "SELECT target_id FROM graph_edges "
@@ -3185,11 +1860,11 @@ _GOVERNED_BY_SQLITE = (
 )
 _GOVERNED_BY_PG = (
     "SELECT target_id FROM graph_edges "
-    "WHERE source_id = %s AND label = 'governed_by' AND EXISTS ("
+    "WHERE source_id = $1 AND label = 'governed_by' AND EXISTS ("
     "  SELECT 1 FROM graph_edge_owners AS owner "
     "  WHERE owner.source_id = graph_edges.source_id "
     "  AND owner.target_id = graph_edges.target_id "
-    "  AND owner.label = graph_edges.label AND owner.agent_id = %s)"
+    "  AND owner.label = graph_edges.label AND owner.agent_id = $2)"
 )
 
 #: The same reads against a database predating the ownership migration
@@ -3202,7 +1877,7 @@ _AGENT_NODE_SQLITE_LEGACY = (
 )
 _AGENT_NODE_PG_LEGACY = (
     "SELECT node_id, label, properties FROM graph_nodes "
-    "WHERE node_id = %s AND node_type = 'agent' AND %s IS NOT NULL"
+    "WHERE node_id = $1 AND node_type = 'agent' AND $2::text IS NOT NULL"
 )
 _GOVERNED_BY_SQLITE_LEGACY = (
     "SELECT target_id FROM graph_edges "
@@ -3210,7 +1885,7 @@ _GOVERNED_BY_SQLITE_LEGACY = (
 )
 _GOVERNED_BY_PG_LEGACY = (
     "SELECT target_id FROM graph_edges "
-    "WHERE source_id = %s AND label = 'governed_by' AND %s IS NOT NULL"
+    "WHERE source_id = $1 AND label = 'governed_by' AND $2::text IS NOT NULL"
 )
 
 
@@ -3341,7 +2016,7 @@ def _read_agent_node(source: _GovernanceSource):
         return _UnreadableDB(reason=f"DB unreadable ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
         return _postgres_unreadable(
             exc,
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
@@ -3409,7 +2084,7 @@ def _read_governed_by_targets(
         return _UnreadableDB(reason=f"cannot read graph_edges ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
         return _postgres_unreadable(
             exc,
             reason=(

@@ -9,9 +9,9 @@ reported birth-time state as current — and after #2890 made
 anchor alone, that means doctor flags drift *permanently* while the repair it
 prescribes correctly answers "nothing to do".
 
-The unit suite fakes psycopg2. This runs the real driver against a real
-database, because "the query I wrote is the query PostgreSQL accepts" is
-exactly what a fake cannot tell me.
+The unit suite fakes asyncpg's public connection surface. This runs Doctor's
+isolated asyncpg worker against a real database, because "the query I wrote is
+the query PostgreSQL accepts" is exactly what a fake cannot tell me.
 
 Run against any throwaway PostgreSQL:
 
@@ -19,12 +19,6 @@ Run against any throwaway PostgreSQL:
         tests/integration/test_doctor_postgres.py
 
 Skipped when that is not set, so CI stays green.
-
-The active-TLS plus direct-negotiation cases use asyncpg's parser as their
-runtime precondition. Asyncpg 0.30 omits PostgreSQL's ALPN protocol from that
-handshake, so PostgreSQL 17 can reject it even where libpq 17's ALPN-bearing
-diagnostic handshake succeeds. No active direct mode can prove parity through
-libpq; disabled TLS remains transport-equivalent because negotiation is ignored.
 """
 
 from __future__ import annotations
@@ -34,18 +28,18 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import pytest
+import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import diagnose
 from kestrel_sovereign.multi_agent.config import (
-    MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
     LocalAgentConfig,
+    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import write_env
@@ -112,7 +106,9 @@ def runtime_db():
             " label TEXT NOT NULL, properties TEXT,"
             " PRIMARY KEY (source_id, target_id, label))"
         )
-        cursor.execute("CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)")
+        cursor.execute(
+            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
+        )
         cursor.execute(
             "CREATE TABLE graph_edge_owners ("
             " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
@@ -125,7 +121,9 @@ def runtime_db():
             " name TEXT PRIMARY KEY,"
             " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
-        cursor.execute("INSERT INTO schema_backfills (name) VALUES ('ownership_2649')")
+        cursor.execute(
+            "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
+        )
 
     def seed(
         did: str,
@@ -144,7 +142,8 @@ def runtime_db():
             )
             if witness_node:
                 cursor.execute(
-                    "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (%s, %s)",
+                    "INSERT INTO graph_node_owners (node_id, agent_id) "
+                    "VALUES (%s, %s)",
                     (did, did),
                 )
             if governed_by is not None:
@@ -178,75 +177,6 @@ def runtime_db():
                 cursor.execute(f'DROP DATABASE IF EXISTS "{name}"')
         finally:
             admin.close()
-
-
-def _seed_governance_schema(dsn: str, schema: str, constitution_hash: str) -> None:
-    """Create one complete, owned governance state outside ``public``."""
-    import psycopg2
-    from psycopg2 import sql
-
-    connection = psycopg2.connect(dsn)
-    connection.autocommit = True
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-            for table in (
-                "graph_nodes",
-                "graph_edges",
-                "graph_node_owners",
-                "graph_edge_owners",
-                "schema_backfills",
-            ):
-                cursor.execute(
-                    sql.SQL("CREATE TABLE {}.{} (LIKE {})").format(
-                        sql.Identifier(schema),
-                        sql.Identifier(table),
-                        sql.Identifier(table),
-                    )
-                )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_nodes "
-                    "(node_id, node_type, label, properties) "
-                    "VALUES (%s, 'agent', 'Test', %s)"
-                ).format(sql.Identifier(schema)),
-                (
-                    AGENT_DID,
-                    json.dumps(
-                        {"name": "Test", "constitution_hash": constitution_hash}
-                    ),
-                ),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_node_owners (node_id, agent_id) "
-                    "VALUES (%s, %s)"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, AGENT_DID),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_edges "
-                    "(source_id, target_id, label) "
-                    "VALUES (%s, %s, 'governed_by')"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, constitution_hash),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.graph_edge_owners "
-                    "(source_id, target_id, label, agent_id) "
-                    "VALUES (%s, %s, 'governed_by', %s)"
-                ).format(sql.Identifier(schema)),
-                (AGENT_DID, constitution_hash, AGENT_DID),
-            )
-            cursor.execute(
-                sql.SQL(
-                    "INSERT INTO {}.schema_backfills (name) VALUES ('ownership_2649')"
-                ).format(sql.Identifier(schema))
-            )
-    finally:
-        connection.close()
 
 
 def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
@@ -354,42 +284,6 @@ def canonical(tmp_path, monkeypatch):
     return hashlib.sha256(CONSTITUTION).hexdigest()
 
 
-def _write_client_identity(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Write one valid self-signed client identity in split and combined forms."""
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "kestrel-doctor-test")]
-    )
-    now = datetime.now(timezone.utc)
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=1))
-        .not_valid_after(now + timedelta(hours=1))
-        .sign(key, hashes.SHA256())
-    )
-    certificate_bytes = certificate.public_bytes(serialization.Encoding.PEM)
-    key_bytes = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption(),
-    )
-    certificate_path = tmp_path / "client.crt"
-    key_path = tmp_path / "client.key"
-    combined_path = tmp_path / "client-combined.pem"
-    certificate_path.write_bytes(certificate_bytes)
-    key_path.write_bytes(key_bytes)
-    combined_path.write_bytes(certificate_bytes + key_bytes)
-    return certificate_path, key_path, combined_path
-
-
 def test_doctor_reads_the_database_the_agent_is_governed_by(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
@@ -408,49 +302,9 @@ def test_doctor_reads_the_database_the_agent_is_governed_by(
 
     report = diagnose(tmp_path)
 
-    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
-        f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    )
-
-
-def test_gss_verification_ignores_search_path_shadowed_backend_pid(runtime_db):
-    """The auth parity query must resolve its PID function in pg_catalog."""
-    import psycopg2
-
-    from kestrel_sovereign import _doctor_postgres_probe as worker
-
-    connection = psycopg2.connect(runtime_db.dsn)
-    if connection.info.server_version < 120000:
-        connection.close()
-        pytest.skip("pg_stat_gssapi requires PostgreSQL 12+")
-    schema = f"doctor_shadow_{uuid.uuid4().hex[:10]}"
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(f'CREATE SCHEMA "{schema}"')
-            cursor.execute(
-                f'CREATE FUNCTION "{schema}".pg_backend_pid() '
-                "RETURNS integer LANGUAGE SQL IMMUTABLE AS 'SELECT -1'"
-            )
-            cursor.execute(f'SET search_path TO "{schema}", pg_catalog')
-
-        class RuntimeInfo:
-            server_version = connection.info.server_version
-            used_password = False
-
-        class RuntimeConnection:
-            info = RuntimeInfo()
-
-            @staticmethod
-            def cursor():
-                return connection.cursor()
-
-        worker._check_gss_runtime_parity(
-            RuntimeConnection(),
-            {"gsslib": "gssapi"},
-            {"module": "gssapi", "available": True},
-        )
-    finally:
-        connection.close()
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 def test_doctor_agrees_with_the_runtime_after_a_reanchor(
@@ -473,9 +327,9 @@ def test_doctor_agrees_with_the_runtime_after_a_reanchor(
     report = diagnose(tmp_path)
 
     assert not any("constitution drift" in m for m in report.fail), report.fail
-    assert any("constitution anchored to current file" in m for m in report.ok), (
-        report.ok
-    )
+    assert any(
+        "constitution anchored to current file" in m for m in report.ok
+    ), report.ok
 
 
 def test_doctor_does_not_answer_about_a_neighbouring_agent(
@@ -531,7 +385,7 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     from psycopg2.extensions import parse_dsn
 
     parsed = parse_dsn(runtime_db.dsn)
-    pg_env_names = {
+    connection_names = {
         "host": "PGHOST",
         "port": "PGPORT",
         "user": "PGUSER",
@@ -541,21 +395,17 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     }
     connection_env = {
         env_name: parsed[dsn_name]
-        for dsn_name, env_name in pg_env_names.items()
+        for dsn_name, env_name in connection_names.items()
         if parsed.get(dsn_name) is not None
     }
-    for name in (
-        "KESTREL_DB_BACKEND",
-        "KESTREL_DATABASE_URL",
-        *connection_env,
-    ):
+    for name in ("KESTREL_DB_BACKEND", "KESTREL_DATABASE_URL", *connection_env):
         monkeypatch.delenv(name, raising=False)
     write_env(
         tmp_path / ".env",
         {
             "KESTREL_DB_BACKEND": "postgres",
-            # Only the database remains in the URI. Host, account, password,
-            # and TLS data live exclusively in the project .env's PG* keys.
+            # Only the database is explicit. The spawned agent receives every
+            # host/authentication/TLS value solely through project PG* keys.
             "KESTREL_DATABASE_URL": (
                 "postgresql:///" + quote(parsed["dbname"], safe="")
             ),
@@ -565,177 +415,44 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
 
     report = diagnose(tmp_path)
 
-    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
-        f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    )
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
     assert "KESTREL_DB_BACKEND" not in os.environ, (
         "a diagnostic must not export the project's environment"
     )
     assert all(name not in os.environ for name in connection_env)
 
 
-def test_relative_pgpassfile_is_resolved_from_the_agent_working_directory(
+def test_explicit_dsn_parameters_outrank_project_pg_environment(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """Doctor can be invoked elsewhere, but the spawned agent runs here."""
-    from psycopg2.extensions import parse_dsn
-
+    """Installed asyncpg, not Doctor, resolves its documented precedence."""
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
     )
-    parsed = parse_dsn(runtime_db.dsn)
-    if not parsed.get("password"):
-        pytest.skip("live PostgreSQL URL has no password to exercise pgpass")
-    if any(character in parsed["password"] for character in (":", "\\", "\n")):
-        pytest.skip("asyncpg pgpass fixture requires an unescaped password")
-
-    passfile = tmp_path / "secrets" / "runtime.pgpass"
-    passfile.parent.mkdir()
-    passfile.write_text(f"*:*:*:*:{parsed['password']}\n")
-    passfile.chmod(0o600)
-
-    for name in (
-        "KESTREL_DB_BACKEND",
-        "KESTREL_DATABASE_URL",
-        "PGHOST",
-        "PGPORT",
-        "PGUSER",
-        "PGPASSWORD",
-        "PGPASSFILE",
-        "PGSSLMODE",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    project_env = {
-        "KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii"),
-        "OPENAI_API_KEY": "sk-x",
-        "KESTREL_DB_BACKEND": "postgres",
-        "KESTREL_DATABASE_URL": ("postgresql:///" + quote(parsed["dbname"], safe="")),
-        "PGHOST": parsed["host"],
-        "PGPORT": parsed["port"],
-        "PGUSER": parsed["user"],
-        "PGPASSFILE": "secrets/runtime.pgpass",
-    }
-    if parsed.get("sslmode"):
-        project_env["PGSSLMODE"] = parsed["sslmode"]
-    write_env(tmp_path / ".env", project_env)
-    invocation_dir = tmp_path / "nested" / "invocation"
-    invocation_dir.mkdir(parents=True)
-    monkeypatch.chdir(invocation_dir)
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+    monkeypatch.setenv("PGHOST", "127.0.0.1")
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGDATABASE", "not_the_runtime_database")
 
     report = diagnose(tmp_path)
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
-async def test_multi_host_pgpass_password_is_frozen_before_fallback(
+def test_asyncpg_search_path_is_applied_to_doctors_session(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """Doctor and asyncpg reuse the first host's credential on host two.
-
-    Raw libpq would read the deliberately-wrong second row after the refused
-    first connection. The translated diagnostic must instead fold the single
-    password asyncpg selected before it began trying hosts.
-    """
-    import asyncpg
-    from psycopg2.extensions import parse_dsn
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    parsed = parse_dsn(runtime_db.dsn)
-    required = ("host", "port", "user", "password", "dbname")
-    if any(not parsed.get(field) for field in required):
-        pytest.skip("live PostgreSQL URL needs TCP host, user, and password")
-    if any(
-        character in parsed[field]
-        for field in ("host", "user", "password", "dbname")
-        for character in (":", "\\", "\n")
-    ):
-        pytest.skip("adversarial pgpass fixture requires unescaped fields")
-
-    bad_port = "1" if parsed["port"] != "1" else "2"
-    passfile_host = "localhost" if parsed["host"].startswith("/") else parsed["host"]
-    passfile = tmp_path / "fallback.pgpass"
-    passfile.write_text(
-        f"{passfile_host}:{bad_port}:{parsed['dbname']}:"
-        f"{parsed['user']}:{parsed['password']}\n"
-        f"{passfile_host}:{parsed['port']}:{parsed['dbname']}:"
-        f"{parsed['user']}:deliberately-wrong-password\n"
-    )
-    passfile.chmod(0o600)
-    query = {
-        "host": f"{parsed['host']},{parsed['host']}",
-        "port": f"{bad_port},{parsed['port']}",
-        "user": parsed["user"],
-        "passfile": str(passfile),
-    }
-    if parsed.get("sslmode"):
-        query["sslmode"] = parsed["sslmode"]
-
-    def build_dsn(values):
-        return (
-            "postgresql:///"
-            + quote(parsed["dbname"], safe="")
-            + "?"
-            + "&".join(
-                f"{name}={quote(value, safe='')}" for name, value in values.items()
-            )
-        )
-
-    runtime_dsn = build_dsn(query)
-    wrong_password_query = {
-        **query,
-        "host": parsed["host"],
-        "port": parsed["port"],
-        "password": "deliberately-wrong-password",
-    }
-    wrong_password_query.pop("passfile")
-
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-    with pytest.MonkeyPatch.context() as connection_env:
-        for name in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE"):
-            connection_env.delenv(name, raising=False)
-        try:
-            wrong_connection = await asyncpg.connect(build_dsn(wrong_password_query))
-        except asyncpg.InvalidPasswordError:
-            pass
-        else:
-            await wrong_connection.close()
-            pytest.skip("live PostgreSQL server does not require a password")
-        connection = await asyncpg.connect(runtime_dsn)
-        await connection.close()
-        report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-@pytest.mark.skip(
-    reason=(
-        "production SQLAlchemy DSN parity for asyncpg startup settings is "
-        "tracked by #2984"
-    )
-)
-def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Exercise startup-setting translation after production parity lands.
-
-    The governance tables exist only in the tenant schema, so reading public
-    would produce a different verdict rather than merely exercising URI
-    parsing.
-    """
+    """A server setting asyncpg accepts is diagnosed instead of refused."""
     import psycopg2
     from psycopg2 import sql
 
-    stale = hashlib.sha256(b"tenant schema was not read").hexdigest()
-    _seed_project(tmp_path, anchored_hash=stale)
+    _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
@@ -771,343 +488,41 @@ def test_asyncpg_search_path_is_applied_to_doctors_postgres_session(
     report = diagnose(tmp_path)
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    assert any(
-        "constitution anchored to current file" in message for message in report.ok
-    ), report.ok
 
 
-async def test_direct_startup_setting_outranks_options_for_doctor_and_asyncpg(
+def test_runtime_rejected_startup_setting_is_not_reported_healthy(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """Both drivers must read tenant even when URI order suggests public."""
-    import asyncpg
-
-    stale = hashlib.sha256(b"public schema must lose precedence").hexdigest()
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": stale},
-        governed_by=stale,
-    )
-    schema = f"tenant_{uuid.uuid4().hex[:12]}"
-    _seed_governance_schema(runtime_db.dsn, schema, canonical)
-    runtime_dsn = (
-        runtime_db.dsn
-        + "?search_path="
-        + quote(schema, safe="")
-        + "&options=-c%20search_path%3Dpublic"
-    )
-
-    connection = await asyncpg.connect(runtime_dsn)
-    try:
-        assert await connection.fetchval("SELECT current_schema()") == schema
-    finally:
-        await connection.close()
-
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    assert any(
-        "constitution anchored to current file" in message for message in report.ok
-    ), report.ok
-
-
-def test_libpq_only_pgoptions_cannot_change_doctors_schema(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Doctor ignores the same ambient PGOPTIONS that asyncpg ignores.
-
-    The leaked schema deliberately carries stale governance. If the translated
-    DSN stops stating ``options=``, libpq inherits PGOPTIONS, reads that stale
-    tenant, and this test reports drift instead of passing vacuously.
-    """
-    stale = hashlib.sha256(b"ambient PGOPTIONS changed the schema").hexdigest()
+    """asyncpg sends unknown query names as startup settings, just as runtime does."""
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
     )
-    schema = f"leaked_{uuid.uuid4().hex[:12]}"
-    _seed_governance_schema(runtime_db.dsn, schema, stale)
-
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
-    monkeypatch.setenv("PGOPTIONS", f"-c search_path={schema}")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        runtime_db.dsn + "?connect_timeout=30",
+    )
 
     report = diagnose(tmp_path)
 
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    assert any(
-        "constitution anchored to current file" in message for message in report.ok
-    ), report.ok
-
-
-def test_libpq_service_recipe_cannot_redirect_doctor(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """A libpq recipe must not redirect doctor away from asyncpg's database."""
-    stale = hashlib.sha256(b"libpq service selected the anchor").hexdigest()
-    _seed_project(tmp_path, anchored_hash=stale)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
-    service_file = tmp_path / "pg_service.conf"
-    service_file.write_text(
-        "[libpq_only_recipe]\n"
-        "host=127.0.0.1\n"
-        "port=1\n"
-        "dbname=not_the_runtime_database\n"
-        "user=private_service_identity\n"
-        "password=private_service_password\n"
-        "sslmode=verify-full\n"
-        "sslrootcert=/private/service/root.crt\n"
-        "require_auth=gss\n"
-    )
-    # This context must close before ``runtime_db`` tears down: its finalizer
-    # also connects through libpq and must not inherit the deliberately
-    # divergent recipe used only for this diagnostic.
-    with pytest.MonkeyPatch.context() as service_env:
-        service_env.setenv("PGSERVICE", "libpq_only_recipe")
-        service_env.setenv("PGSERVICEFILE", str(service_file))
-        report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    assert any(
-        "constitution anchored to current file" in message for message in report.ok
-    ), report.ok
-    assert "private_service_identity" not in " ".join(
-        report.ok + report.warn + report.fail
-    )
-
-
-def test_missing_ambient_libpq_service_cannot_block_doctor(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Libpq must not resolve a service name that asyncpg never reads."""
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
-    service_name = "private_missing_service_identity"
-
-    with pytest.MonkeyPatch.context() as service_env:
-        service_env.setenv("PGSERVICE", service_name)
-        service_env.setenv("PGSERVICEFILE", str(tmp_path / "missing.conf"))
-        report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    assert service_name not in " ".join(report.ok + report.warn + report.fail)
-
-
-async def test_bare_slash_database_cannot_fall_through_to_pgdatabase(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Doctor and asyncpg must avoid the unrelated PGDATABASE target."""
-    import asyncpg
-    from psycopg2.extensions import parse_dsn
-
-    from kestrel_sovereign.doctor import _doctor_postgres_dsn
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    unrelated_hash = "f" * 64
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": unrelated_hash},
-        governed_by=unrelated_hash,
-    )
-    bare_database_dsn = runtime_db.dsn.rsplit("/", 1)[0] + "/"
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", bare_database_dsn)
-    monkeypatch.setenv("PGDATABASE", urlsplit(runtime_db.dsn).path.removeprefix("/"))
-
-    translated = parse_dsn(
-        _doctor_postgres_dsn(
-            bare_database_dsn,
-            dict(os.environ),
-            tmp_path,
-        )
-    )
-    assert translated["dbname"] == ""
-
-    try:
-        connection = await asyncpg.connect(bare_database_dsn)
-    except Exception:  # noqa: BLE001 - parity includes server rejection
-        asyncpg_connected = False
-    else:
-        asyncpg_connected = True
-        try:
-            selected_database = await connection.fetchval("SELECT current_database()")
-        finally:
-            await connection.close()
-        assert selected_database != urlsplit(runtime_db.dsn).path.removeprefix("/")
-
-    report = diagnose(tmp_path)
-
-    if not asyncpg_connected:
-        assert not report.ready, f"ok={report.ok} warn={report.warn}"
-        assert any("cannot read PostgreSQL" in message for message in report.fail)
-    else:
-        # A standard PostgreSQL installation has a database named after its
-        # bootstrap role (usually ``postgres``), so an empty dbname can be
-        # reachable. In that case doctor may validly report a pending anchor
-        # replication, but it must never read the unrelated PGDATABASE target.
-        findings = " ".join(report.ok + report.warn + report.fail)
-        assert unrelated_hash[:12] not in findings
-        assert any(
-            "PostgreSQL holds no record for this agent yet" in message
-            and "kestrel_prime.db" in message
-            for message in report.warn
-        )
-
-
-def test_all_libpq_only_environment_is_absent_from_the_probe_process(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Independent libpq-only poison values cannot steer the child probe."""
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
-
-    libpq_only_poison = {
-        "PGDATESTYLE": "not-a-datestyle",
-        "PGTZ": "Definitely/Not_A_Timezone",
-        "PGGEQO": "not-a-boolean",
-        "PGKEEPALIVES": "not-a-boolean",
-        "PGKEEPALIVESIDLE": "not-an-integer",
-        "PGKEEPALIVESINTERVAL": "not-an-integer",
-        "PGKEEPALIVESCOUNT": "not-an-integer",
-        "PGTCP_USER_TIMEOUT": "not-an-integer",
-    }
-    # Keep poison out of the runtime database fixture's teardown connection.
-    with pytest.MonkeyPatch.context() as libpq_only_env:
-        for env_name, value in libpq_only_poison.items():
-            libpq_only_env.setenv(env_name, value)
-        report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-def test_compiled_libpq_defaults_remain_connectable_without_environment(
-    tmp_path, monkeypatch, canonical, runtime_db
-):
-    """Unconditional asyncpg-equivalent defaults work with real libpq."""
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
-    for env_name in ("PGGSSENCMODE", "PGCHANNELBINDING"):
-        monkeypatch.delenv(env_name, raising=False)
-
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-@pytest.mark.parametrize("query", ["connect_timeout=30", "keepalives=1"])
-def test_libpq_connection_names_rejected_by_runtime_are_not_reported_healthy(
-    tmp_path, monkeypatch, canonical, runtime_db, query
-):
-    """asyncpg sends both names as GUCs, which PostgreSQL rejects."""
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn + "?" + query)
-
-    report = diagnose(tmp_path)
-
-    assert not report.ready, f"ok={report.ok} warn={report.warn}"
+    assert not report.ready
     assert any("governance NOT verified" in message for message in report.fail)
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "sslmode=prefer",
-        "options=-c%20statement_timeout%3D5000",
-    ],
-)
-def test_asyncpg_recognized_and_startup_options_remain_connectable(
-    tmp_path, monkeypatch, canonical, runtime_db, query
-):
-    """The two non-GUC query shapes retain their distinct semantics."""
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn + "?" + query)
-
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-@pytest.mark.parametrize(
-    ("minimum", "maximum"),
-    [
-        ("TLSv1_2", "TLSv1_3"),
-        ("MINIMUM_SUPPORTED", "MAXIMUM_SUPPORTED"),
-    ],
-    ids=("version-members", "symbolic-bounds"),
-)
-async def test_tls_protocol_aliases_reach_asyncpg_and_libpq_live(
-    tmp_path, monkeypatch, canonical, runtime_db, minimum, maximum
-):
-    """Both real drivers accept asyncpg's underscore spellings after folding."""
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    runtime_dsn = (
-        runtime_db.dsn
-        + f"?sslmode=prefer&ssl_min_protocol_version={minimum}"
-        + f"&ssl_max_protocol_version={maximum}"
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    connection = await asyncpg.connect(runtime_dsn)
-    await connection.close()
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-async def test_disabled_ssl_ignores_invalid_tls_versions_live(
+def test_asyncpg_031_service_file_reaches_doctor_unchanged(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """Libpq must not validate settings the real asyncpg path never reads."""
-    import asyncpg
+    """The current minor's public service/servicefile behavior needs no mirror."""
+    from importlib.metadata import version
+
+    from packaging.version import Version
+    from psycopg2.extensions import parse_dsn
+
+    if Version(version("asyncpg")) < Version("0.31"):
+        pytest.skip("asyncpg 0.31 service-file support is not installed")
 
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
@@ -1115,336 +530,23 @@ async def test_disabled_ssl_ignores_invalid_tls_versions_live(
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
     )
-    runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=disable&ssl_min_protocol_version=not-a-version"
-        + "&ssl_max_protocol_version=also-not-a-version"
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    connection = await asyncpg.connect(runtime_dsn)
-    await connection.close()
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-@pytest.mark.parametrize(
-    ("query", "tls_env", "doctor_ready"),
-    [
-        ("?sslmode=disable&sslnegotiation=direct", {}, True),
-        ("?sslmode=disable", {"PGSSLNEGOTIATION": "direct"}, True),
-        ("?sslnegotiation=direct", {"PGSSLMODE": "disable"}, True),
-        (
-            "",
-            {"PGSSLMODE": "disable", "PGSSLNEGOTIATION": "direct"},
-            True,
-        ),
-        ("?sslmode=allow&sslnegotiation=direct", {}, False),
-        (
-            "",
-            {"PGSSLMODE": "allow", "PGSSLNEGOTIATION": "direct"},
-            False,
-        ),
-        ("?sslmode=prefer&sslnegotiation=direct", {}, False),
-        (
-            "",
-            {"PGSSLMODE": "prefer", "PGSSLNEGOTIATION": "direct"},
-            False,
-        ),
-        ("?sslmode=require&sslnegotiation=direct", {}, False),
-        (
-            "",
-            {"PGSSLMODE": "require", "PGSSLNEGOTIATION": "direct"},
-            False,
-        ),
-        ("?sslmode=verify-ca&sslnegotiation=direct", {}, False),
-        (
-            "",
-            {"PGSSLMODE": "verify-ca", "PGSSLNEGOTIATION": "direct"},
-            False,
-        ),
-        ("?sslmode=verify-full&sslnegotiation=direct", {}, False),
-        (
-            "",
-            {"PGSSLMODE": "verify-full", "PGSSLNEGOTIATION": "direct"},
-            False,
-        ),
-    ],
-    ids=(
-        "disable-query",
-        "disable-query-environment-direct",
-        "disable-query-direct-environment",
-        "disable-environment",
-        "allow-query",
-        "allow-environment",
-        "prefer-query",
-        "prefer-environment",
-        "require-query-postgresql-17-alpn",
-        "require-environment-postgresql-17-alpn",
-        "verify-ca-query-postgresql-17-alpn",
-        "verify-ca-environment-postgresql-17-alpn",
-        "verify-full-query-postgresql-17-alpn",
-        "verify-full-environment-postgresql-17-alpn",
-    ),
-)
-async def test_direct_negotiation_matches_runtime_or_fails_closed(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-    query,
-    tls_env,
-    doctor_ready,
-):
-    """ALPN-divergent active direct TLS fails closed; disable stays exact."""
-    import asyncpg
-    from asyncpg.connect_utils import (
-        SSLMode,
-        SSLNegotiation,
-        _parse_connect_dsn_and_args,
-    )
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    runtime_dsn = runtime_db.dsn + query
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    # PGSSL* affects psycopg2 even when its fixture passes an explicit DSN.
-    # Drop these overrides before runtime_db's finalizer reconnects to drop
-    # the throwaway database.
-    with pytest.MonkeyPatch.context() as tls:
-        for name in ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT"):
-            tls.delenv(name, raising=False)
-        for name, value in tls_env.items():
-            tls.setenv(name, value)
-        if "verify-" in query or tls_env.get("PGSSLMODE", "").startswith("verify-"):
-            root_certificate, _key, _combined = _write_client_identity(tmp_path)
-            tls.setenv("PGSSLROOTCERT", str(root_certificate))
-
-        _, runtime_params = _parse_connect_dsn_and_args(
-            dsn=runtime_dsn,
-            host=None,
-            port=None,
-            user=None,
-            password=None,
-            passfile=None,
-            database=None,
-            ssl=None,
-            direct_tls=None,
-            server_settings=None,
-            target_session_attrs=None,
-            krbsrvname=None,
-            gsslib=None,
+    parsed = parse_dsn(runtime_db.dsn)
+    service_file = tmp_path / "pg_service.conf"
+    service_file.write_text(
+        "[doctor_runtime]\n"
+        + "\n".join(
+            f"{name}={parsed[name]}"
+            for name in ("host", "port", "user", "password", "dbname", "sslmode")
+            if parsed.get(name) is not None
         )
-        if runtime_params.sslmode != SSLMode.disable:
-            # This is the runtime shape under test, but a direct-TLS transport
-            # cannot be used as a portable live-server precondition. On
-            # PostgreSQL 17 specifically, asyncpg's ALPN-free handshake can
-            # fail where libpq's ALPN handshake succeeds. Doctor must fail
-            # translation closed instead of probing that different policy.
-            assert runtime_params.ssl_negotiation == SSLNegotiation.direct
-        else:
-            connection = await asyncpg.connect(runtime_dsn)
-            await connection.close()
-        report = diagnose(tmp_path)
-
-    assert report.ready is doctor_ready, (
-        f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    )
-    if not doctor_ready:
-        assert any(
-            "cannot construct an equivalent libpq diagnostic connection" in message
-            for message in report.fail
-        )
-        assert any(
-            "Runtime database reachability was not established" in message
-            for message in report.fail
-        )
-
-
-async def test_explicit_missing_tls_file_fails_like_the_asyncpg_runtime(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-):
-    """Libpq must not forgive a client certificate asyncpg requires."""
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    missing_certificate = tmp_path / "private" / "missing-client.crt"
-    runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=prefer&sslcert="
-        + quote(str(missing_certificate), safe="")
+        + "\n"
     )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    with pytest.raises(FileNotFoundError):
-        await asyncpg.connect(runtime_dsn)
-    report = diagnose(tmp_path)
-
-    assert not report.ready
-    assert any(
-        "runtime PostgreSQL configuration is invalid" in message
-        for message in report.fail
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL", "postgresql:///?service=doctor_runtime"
     )
-    assert any(
-        "shared with the spawned asyncpg runtime" in message for message in report.fail
-    )
-    assert all(str(missing_certificate) not in message for message in report.fail)
+    monkeypatch.setenv("PGSERVICEFILE", str(service_file))
 
-
-async def test_malformed_client_identity_fails_before_allow_mode_plaintext(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-):
-    """Asyncpg eagerly validates client material even when plaintext works."""
-    import ssl
-
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    malformed_certificate = tmp_path / "malformed-client.crt"
-    malformed_key = tmp_path / "malformed-client.key"
-    malformed_certificate.write_text("not a certificate")
-    malformed_key.write_text("not a private key")
-    runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=allow&sslcert="
-        + quote(str(malformed_certificate), safe="")
-        + "&sslkey="
-        + quote(str(malformed_key), safe="")
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    with pytest.raises((ssl.SSLError, OSError, ValueError)):
-        await asyncpg.connect(runtime_dsn)
-    report = diagnose(tmp_path)
-
-    findings = " ".join(report.fail)
-    assert not report.ready
-    assert "runtime PostgreSQL configuration is invalid" in findings
-    assert "spawned asyncpg rejected" in findings
-    assert str(malformed_certificate) not in findings
-    assert str(malformed_key) not in findings
-
-
-async def test_missing_explicit_key_with_default_certificate_matches_asyncpg(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-):
-    """Asyncpg skips its optional default chain when the lone key is absent."""
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    runtime_home = tmp_path / "runtime-home"
-    tls_dir = runtime_home / ".postgresql"
-    tls_dir.mkdir(parents=True)
-    certificate, _key, _combined = _write_client_identity(tls_dir)
-    certificate.rename(tls_dir / "postgresql.crt")
-    missing_key = tmp_path / "missing-explicit.key"
-    runtime_dsn = (
-        runtime_db.dsn + "?sslmode=allow&sslkey=" + quote(str(missing_key), safe="")
-    )
-    monkeypatch.setenv("HOME", str(runtime_home))
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    connection = await asyncpg.connect(runtime_dsn)
-    await connection.close()
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX key-mode parity")
-async def test_readable_0644_client_key_connects_for_asyncpg_and_doctor(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-):
-    """Libpq's stricter key-mode check must not manufacture a runtime outage."""
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    certificate, key, _combined = _write_client_identity(tmp_path)
-    key.chmod(0o644)
-    runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=prefer&sslcert="
-        + quote(str(certificate), safe="")
-        + "&sslkey="
-        + quote(str(key), safe="")
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    connection = await asyncpg.connect(runtime_dsn)
-    await connection.close()
-    report = diagnose(tmp_path)
-
-    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
-
-
-async def test_combined_client_certificate_and_key_connects_for_both_drivers(
-    tmp_path,
-    monkeypatch,
-    canonical,
-    runtime_db,
-):
-    """An absent sslkey means load the private key from sslcert in asyncpg."""
-    import asyncpg
-
-    _seed_project(tmp_path, anchored_hash=canonical)
-    runtime_db(
-        AGENT_DID,
-        {"name": "Test", "constitution_hash": canonical},
-        governed_by=canonical,
-    )
-    _certificate, _key, combined = _write_client_identity(tmp_path)
-    runtime_dsn = (
-        runtime_db.dsn + "?sslmode=prefer&sslcert=" + quote(str(combined), safe="")
-    )
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
-
-    connection = await asyncpg.connect(runtime_dsn)
-    await connection.close()
     report = diagnose(tmp_path)
 
     assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
@@ -1512,12 +614,12 @@ async def test_a_stale_anchor_awaiting_replication_is_not_ready(
 
     report = diagnose(tmp_path)
 
-    assert any("holds no record for this agent yet" in m for m in report.warn), (
-        f"warn={report.warn}"
-    )
-    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
-        f"ok={report.ok} warn={report.warn} fail={report.fail}"
-    )
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
@@ -1534,7 +636,6 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
     _seed_project(tmp_path, anchored_hash=canonical)
     # Drop the schema the fixture created: this database has never been booted.
     import psycopg2
-
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1543,10 +644,8 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
             # opened has *nothing*, and leaving the marker table behind made
             # this test pass against a probe that cannot survive its absence.
             for table in (
-                "graph_nodes",
-                "graph_edges",
-                "graph_node_owners",
-                "graph_edge_owners",
+                "graph_nodes", "graph_edges",
+                "graph_node_owners", "graph_edge_owners",
                 "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -1559,9 +658,9 @@ async def test_a_never_booted_postgres_is_a_first_boot_not_a_failure(
     report = diagnose(tmp_path)
 
     assert report.ready, f"fail={report.fail}"
-    assert any("holds no record for this agent yet" in m for m in report.warn), (
-        f"warn={report.warn}"
-    )
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
     assert any("constitution anchored to current file" in m for m in report.ok)
 
 
@@ -1572,7 +671,6 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     stale = hashlib.sha256(b"an older constitution").hexdigest()
     _seed_project(tmp_path, anchored_hash=stale)
     import psycopg2
-
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1581,10 +679,8 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
             # opened has *nothing*, and leaving the marker table behind made
             # this test pass against a probe that cannot survive its absence.
             for table in (
-                "graph_nodes",
-                "graph_edges",
-                "graph_node_owners",
-                "graph_edge_owners",
+                "graph_nodes", "graph_edges",
+                "graph_node_owners", "graph_edge_owners",
                 "schema_backfills",
             ):
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -1597,9 +693,9 @@ async def test_a_stale_anchor_on_a_never_booted_postgres_still_fails(
     report = diagnose(tmp_path)
 
     assert not report.ready
-    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
-        f"fail={report.fail}"
-    )
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"fail={report.fail}"
 
 
 async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
@@ -1619,7 +715,6 @@ async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
     runtime_db(AGENT_DID, {"initialBalance": "100.0"}, governed_by=None)
     # The label half of the predicate, as _ensure_agent_node_present writes it.
     import psycopg2
-
     connection = psycopg2.connect(runtime_db.dsn)
     connection.autocommit = True
     try:
@@ -1637,12 +732,12 @@ async def test_a_boot_fabricated_placeholder_is_not_a_birth_record(
     report = diagnose(tmp_path)
 
     assert not report.ready, f"ok={report.ok} warn={report.warn}"
-    assert any("holds no record for this agent yet" in m for m in report.warn), (
-        f"warn={report.warn}"
-    )
-    assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
-        f"fail={report.fail}"
-    )
+    assert any(
+        "holds no record for this agent yet" in m for m in report.warn
+    ), f"warn={report.warn}"
+    assert any(
+        "constitution drift" in m and stale[:12] in m for m in report.fail
+    ), f"fail={report.fail}"
 
 
 async def test_a_real_agent_row_is_not_mistaken_for_a_placeholder(
@@ -1839,7 +934,7 @@ async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
         AGENT_DID,
         {"name": "Test", "constitution_hash": canonical},
         governed_by=canonical,
-        witness_edge=False,  # the node is owned; the edge is not
+        witness_edge=False,   # the node is owned; the edge is not
     )
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION)
