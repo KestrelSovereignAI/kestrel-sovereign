@@ -43,6 +43,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
@@ -338,6 +339,19 @@ class _GovernanceSource:
     #: libpq worker receives the same value so default TLS files under
     #: ``~/.postgresql`` cannot come from doctor's unrelated account context.
     postgres_home: str | None = None
+    #: Complete environment resolved by the launcher for the spawned agent.
+    #: The worker starts from this copy so non-libpq inputs such as Kerberos
+    #: credential/configuration paths retain runtime parity; its ``PG*`` and
+    #: Python-path steering variables are removed at the subprocess boundary.
+    postgres_env: dict[str, str] | None = None
+    #: Working directory ProcessManager gives the spawned agent. Relative GSS
+    #: configuration/cache locations must resolve beneath the same directory.
+    postgres_cwd: str | None = None
+    #: GSS import capability measured in a short-lived Python process with the
+    #: exact environment and working directory used by ProcessManager.  The
+    #: libpq worker intentionally removes Python path steering, so it must not
+    #: infer this answer from its own import environment.
+    postgres_runtime_gss: dict[str, object] | None = None
     #: Whether the #2649 ownership backfill has already been recorded as
     #: complete. Boot re-runs it exactly once; until it has, a row with no
     #: witness is repaired at the next start, so its absence predicts nothing.
@@ -518,6 +532,11 @@ def _resolve_governance_source(
             dsn = _doctor_postgres_dsn(runtime_dsn, env, project_dir)
             postgres_home = _asyncpg_home(env, project_dir)
             dsn_identity = _translated_dsn_identity(runtime_dsn, dsn, env)
+            postgres_runtime_gss = _inspect_asyncpg_runtime(
+                runtime_dsn,
+                env,
+                project_dir,
+            )
         except _DoctorPostgresConfigurationError as exc:
             # Bind the raw URI to the same redactor used for driver failures.
             unsafe_source = _GovernanceSource(
@@ -580,6 +599,9 @@ def _resolve_governance_source(
             dsn=dsn,
             dsn_identity=dsn_identity,
             postgres_home=postgres_home,
+            postgres_env=dict(env),
+            postgres_cwd=str(project_dir.resolve()),
+            postgres_runtime_gss=postgres_runtime_gss,
         )
     # Keyed on the DSN, or on the anchor path for a SQLite host where each
     # agent genuinely has its own file and its own answer.
@@ -629,6 +651,124 @@ class _PostgresDiagnosticCapabilityError(_PostgresTranslationError):
 
 class _PostgresRuntimeConfigurationError(_PostgresTranslationError):
     """The effective asyncpg configuration is itself invalid."""
+
+
+# This preflight deliberately runs through ``python -c``.  Unlike executing a
+# helper file, ``-c`` gives Python the same current-working-directory import
+# entry as ProcessManager's ``python -m uvicorn`` command.  PYTHONPATH,
+# PYTHONHOME, user-site behavior, and every other launcher input remain intact.
+# The DSN travels over stdin and failures return only fixed classifications, so
+# neither credentials nor TLS paths can enter Doctor's diagnostics.
+_ASYNCPG_RUNTIME_PREFLIGHT_CODE = r"""
+import contextlib
+import importlib
+import inspect
+import io
+import json
+import sys
+
+payload = json.loads(sys.stdin.buffer.read())
+result = {"ok": False, "kind": "diagnostic"}
+expected = {
+    "dsn", "host", "port", "user", "password", "passfile", "database",
+    "command_timeout", "statement_cache_size",
+    "max_cached_statement_lifetime", "max_cacheable_statement_size", "ssl",
+    "direct_tls", "server_settings", "target_session_attrs", "krbsrvname",
+    "gsslib",
+}
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        from asyncpg import connect_utils
+
+        parser = getattr(connect_utils, "_parse_connect_arguments", None)
+        if parser is not None and set(inspect.signature(parser).parameters) == expected:
+            try:
+                _addresses, parameters, _configuration = parser(
+                    dsn=payload["dsn"], host=None, port=None, user=None,
+                    password=None, passfile=None, database=None,
+                    command_timeout=None, statement_cache_size=100,
+                    max_cached_statement_lifetime=300,
+                    max_cacheable_statement_size=15 * 1024, ssl=None,
+                    direct_tls=None, server_settings=None,
+                    target_session_attrs=None, krbsrvname=None, gsslib=None,
+                )
+            except BaseException:
+                result = {"ok": False, "kind": "runtime_configuration"}
+            else:
+                module = "sspilib" if parameters.gsslib == "sspi" else "gssapi"
+                try:
+                    importlib.import_module(module)
+                except BaseException:
+                    available = False
+                else:
+                    available = True
+                result = {
+                    "ok": True,
+                    "gss": {"module": module, "available": available},
+                }
+except BaseException:
+    result = {"ok": False, "kind": "diagnostic"}
+sys.stdout.write(json.dumps(result, separators=(",", ":")))
+"""
+
+
+def _inspect_asyncpg_runtime(
+    runtime_dsn: str,
+    resolved_env: dict[str, str],
+    project_dir: Path,
+) -> dict[str, object]:
+    """Validate TLS and measure GSS imports in the agent's Python context.
+
+    Asyncpg constructs its SSL context before it opens a socket, including for
+    ``sslmode=allow``.  Asking its installed parser in the launcher's exact
+    environment preserves certificate/key/password, protocol, default-file,
+    and Python import semantics without mutating Doctor's own process.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _ASYNCPG_RUNTIME_PREFLIGHT_CODE],
+            input=json.dumps({"dsn": runtime_dsn}).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=dict(resolved_env),
+            cwd=str(project_dir.resolve()),
+            timeout=_POSTGRES_PROBE_GRACE_SECONDS,
+            check=False,
+        )
+    except (OSError, TypeError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise _PostgresDiagnosticCapabilityError(
+            "spawned asyncpg runtime configuration could not be inspected safely"
+        ) from exc
+
+    if completed.returncode != 0:
+        raise _PostgresDiagnosticCapabilityError(
+            "spawned asyncpg runtime configuration could not be inspected safely"
+        )
+    try:
+        response = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise _PostgresDiagnosticCapabilityError(
+            "spawned asyncpg runtime configuration could not be inspected safely"
+        ) from exc
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        if isinstance(response, dict) and response.get("kind") == "runtime_configuration":
+            raise _PostgresRuntimeConfigurationError(
+                "spawned asyncpg rejected its PostgreSQL connection configuration"
+            )
+        raise _PostgresDiagnosticCapabilityError(
+            "spawned asyncpg runtime configuration could not be inspected safely"
+        )
+
+    gss = response.get("gss")
+    if (
+        not isinstance(gss, dict)
+        or gss.get("module") not in {"gssapi", "sspilib"}
+        or type(gss.get("available")) is not bool
+    ):
+        raise _PostgresDiagnosticCapabilityError(
+            "spawned asyncpg GSSAPI/SSPI capability could not be inspected safely"
+        )
+    return {"module": gss["module"], "available": gss["available"]}
 
 
 # Query parameters consumed by asyncpg 0.30's connection parser. Every other
@@ -1253,8 +1393,12 @@ def _state_asyncpg_windows_tls_defaults(
 
     Asyncpg always searches ``Path.home() / '.postgresql'``.  Windows libpq
     instead searches ``%APPDATA% / 'postgresql'``.  The worker hides that
-    unrelated libpq directory; existing asyncpg files are made explicit here,
-    and verification modes retain asyncpg's failure on a missing root CA.
+    unrelated libpq directory. Root/CRL files are made explicit here, and
+    verification modes retain asyncpg's failure on a missing root CA. Client
+    identity defaults remain implicit until the worker reproduces asyncpg's
+    optional ``load_cert_chain`` branch; making them explicit here would lose
+    the distinction between an operator-supplied certificate and a default
+    chain that asyncpg is allowed to skip when its key is missing.
     """
     if not _IS_WINDOWS or postgres_home is None:
         return
@@ -1273,14 +1417,6 @@ def _state_asyncpg_windows_tls_defaults(
         crl = tls_dir / "root.crl"
         if not query.get("sslcrl") and crl.exists():
             query["sslcrl"] = str(crl.resolve())
-
-    key = tls_dir / "postgresql.key"
-    if not query.get("sslkey") and key.exists():
-        query["sslkey"] = str(key.resolve())
-    certificate = tls_dir / "postgresql.crt"
-    if not query.get("sslcert") and certificate.exists():
-        query["sslcert"] = str(certificate.resolve())
-
 
 def _read_asyncpg_passfile_password(
     passfile: Path,
@@ -1789,6 +1925,9 @@ def _fetch_rows(
         postgres_sql,
         postgres_params,
         postgres_home=source.postgres_home,
+        postgres_env=source.postgres_env,
+        postgres_cwd=source.postgres_cwd,
+        runtime_gss=source.postgres_runtime_gss,
         dsn_identity=source.dsn_identity,
     )
 
@@ -1805,6 +1944,14 @@ class _PostgresProbeQueryError(_PostgresProbeError):
     """Libpq connected, but the read-only governance query failed."""
 
 
+class _PostgresProbeRuntimeConfigurationError(_PostgresProbeError):
+    """Libpq connected through a capability absent from the asyncpg runtime."""
+
+
+class _PostgresProbeDiagnosticCapabilityError(_PostgresProbeError):
+    """The worker could not prove that its successful connection had parity."""
+
+
 class _PostgresProbeTimeoutError(_PostgresProbeError):
     """The bounded worker was terminated with its result still unknown."""
 
@@ -1819,6 +1966,10 @@ def _postgres_probe_failure_kind(exc: BaseException) -> str:
         return "connection"
     if isinstance(exc, _PostgresProbeQueryError):
         return "runtime_database"
+    if isinstance(exc, _PostgresProbeRuntimeConfigurationError):
+        return "runtime_configuration"
+    if isinstance(exc, _PostgresProbeDiagnosticCapabilityError):
+        return "diagnostic_capability"
     if isinstance(exc, _PostgresProbeTimeoutError):
         return "diagnostic_timeout"
     return "diagnostic_tooling"
@@ -1839,18 +1990,22 @@ def _postgres_unreadable(
     )
 
 
-def _postgres_probe_env(postgres_home: str | None = None) -> dict[str, str]:
-    """Return a child environment with the libpq namespace removed.
+def _postgres_probe_env(
+    resolved_env: dict[str, str], postgres_home: str | None = None
+) -> dict[str, str]:
+    """Sanitize the spawned agent's environment for the libpq worker.
 
     The translated DSN freezes every PostgreSQL value asyncpg reads. Running
     libpq in a dedicated process therefore lets doctor remove every ``PG*``
     variable without mutating the long-lived caller. This covers service
     recipes, startup GUCs, keepalive knobs, and future libpq additions without
-    relying on an inevitably incomplete list.
+    relying on an inevitably incomplete list. All other inputs start from the
+    launcher's resolved environment, not doctor's parent environment, so GSS
+    configuration and credential caches match the process being diagnosed.
     """
     child_env = {
         name: value
-        for name, value in os.environ.items()
+        for name, value in resolved_env.items()
         if not name.upper().startswith("PG")
         and name.upper() not in {"PYTHONHOME", "PYTHONPATH"}
     }
@@ -1863,13 +2018,20 @@ def _postgres_probe_env(postgres_home: str | None = None) -> dict[str, str]:
 
 
 def _postgres_fetch_rows_in_process(
-    dsn: str, sql: str, params: tuple | list, *, driver=None
+    dsn: str,
+    sql: str,
+    params: tuple | list,
+    *,
+    runtime_gss: dict[str, object] | None = None,
+    driver=None,
 ) -> list:
     """Exercise the production worker seam in-process for focused tests."""
     from kestrel_sovereign._doctor_postgres_probe import (
         ProbeConnectionError,
+        ProbeDiagnosticCapabilityError,
         ProbeError,
         ProbeQueryError,
+        ProbeRuntimeConfigurationError,
         fetch_rows_in_process,
     )
 
@@ -1879,12 +2041,17 @@ def _postgres_fetch_rows_in_process(
             sql,
             params,
             absent_passfile_sentinel=_ABSENT_PASSFILE_SENTINEL,
+            runtime_gss=runtime_gss,
             driver=driver,
         )
     except ProbeConnectionError as exc:
         raise _PostgresProbeConnectionError(str(exc)) from exc
     except ProbeQueryError as exc:
         raise _PostgresProbeQueryError(str(exc)) from exc
+    except ProbeRuntimeConfigurationError as exc:
+        raise _PostgresProbeRuntimeConfigurationError(str(exc)) from exc
+    except ProbeDiagnosticCapabilityError as exc:
+        raise _PostgresProbeDiagnosticCapabilityError(str(exc)) from exc
     except ProbeError as exc:
         raise _PostgresProbeError(str(exc)) from exc
 
@@ -1982,9 +2149,51 @@ def _fetch_postgres_rows_isolated(
     params: tuple = (),
     *,
     postgres_home: str | None = None,
+    postgres_env: dict[str, str] | None = None,
+    postgres_cwd: str | None = None,
+    runtime_gss: dict[str, object] | None = None,
     dsn_identity: tuple | None = None,
 ) -> list:
-    """Execute one libpq query without exposing the parent to libpq env."""
+    """Execute one libpq query with parent-owned temporary-file cleanup.
+
+    The worker can be killed at the deadline and therefore cannot own cleanup
+    for copied TLS key material. The parent retains the temporary-directory
+    context until the child has exited or been killed and reaped.
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="kestrel-doctor-") as probe_temp_dir:
+            return _fetch_postgres_rows_isolated_with_temp(
+                dsn,
+                sql,
+                params,
+                postgres_home=postgres_home,
+                postgres_env=postgres_env,
+                postgres_cwd=postgres_cwd,
+                runtime_gss=runtime_gss,
+                dsn_identity=dsn_identity,
+                probe_temp_dir=probe_temp_dir,
+            )
+    except _PostgresProbeError:
+        raise
+    except OSError as exc:
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic private material could not be managed"
+        ) from exc
+
+
+def _fetch_postgres_rows_isolated_with_temp(
+    dsn: str,
+    sql: str,
+    params: tuple,
+    *,
+    postgres_home: str | None,
+    postgres_env: dict[str, str] | None,
+    postgres_cwd: str | None,
+    runtime_gss: dict[str, object] | None,
+    dsn_identity: tuple | None,
+    probe_temp_dir: str,
+) -> list:
+    """Run the isolated worker beneath one parent-owned private directory."""
     try:
         payload = json.dumps(
             {
@@ -1992,6 +2201,8 @@ def _fetch_postgres_rows_isolated(
                 "sql": sql,
                 "params": params,
                 "absent_passfile_sentinel": _ABSENT_PASSFILE_SENTINEL,
+                "probe_temp_dir": probe_temp_dir,
+                "runtime_gss": runtime_gss,
             }
         )
     except (TypeError, ValueError) as exc:
@@ -2014,9 +2225,12 @@ def _fetch_postgres_rows_isolated(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_postgres_probe_env(postgres_home),
+            env=_postgres_probe_env(
+                postgres_env if postgres_env is not None else {}, postgres_home
+            ),
+            cwd=postgres_cwd,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise _PostgresProbeError(
             "isolated PostgreSQL diagnostic process could not start"
         ) from exc
@@ -2084,6 +2298,8 @@ def _fetch_postgres_rows_isolated(
         error_type = {
             "connection": _PostgresProbeConnectionError,
             "query": _PostgresProbeQueryError,
+            "runtime_configuration": _PostgresProbeRuntimeConfigurationError,
+            "diagnostic_capability": _PostgresProbeDiagnosticCapabilityError,
         }.get(kind, _PostgresProbeError)
         raise error_type(message)
     rows = response.get("rows")

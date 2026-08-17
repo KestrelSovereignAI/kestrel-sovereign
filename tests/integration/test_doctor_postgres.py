@@ -33,6 +33,7 @@ import json
 import os
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -352,6 +353,42 @@ def canonical(tmp_path, monkeypatch):
     return hashlib.sha256(CONSTITUTION).hexdigest()
 
 
+def _write_client_identity(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Write one valid self-signed client identity in split and combined forms."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "kestrel-doctor-test")]
+    )
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(hours=1))
+        .sign(key, hashes.SHA256())
+    )
+    certificate_bytes = certificate.public_bytes(serialization.Encoding.PEM)
+    key_bytes = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+    certificate_path = tmp_path / "client.crt"
+    key_path = tmp_path / "client.key"
+    combined_path = tmp_path / "client-combined.pem"
+    certificate_path.write_bytes(certificate_bytes)
+    key_path.write_bytes(key_bytes)
+    combined_path.write_bytes(certificate_bytes + key_bytes)
+    return certificate_path, key_path, combined_path
+
+
 def test_doctor_reads_the_database_the_agent_is_governed_by(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
@@ -373,6 +410,46 @@ def test_doctor_reads_the_database_the_agent_is_governed_by(
     assert any("constitution drift" in m and stale[:12] in m for m in report.fail), (
         f"ok={report.ok} warn={report.warn} fail={report.fail}"
     )
+
+
+def test_gss_verification_ignores_search_path_shadowed_backend_pid(runtime_db):
+    """The auth parity query must resolve its PID function in pg_catalog."""
+    import psycopg2
+
+    from kestrel_sovereign import _doctor_postgres_probe as worker
+
+    connection = psycopg2.connect(runtime_db.dsn)
+    if connection.info.server_version < 120000:
+        connection.close()
+        pytest.skip("pg_stat_gssapi requires PostgreSQL 12+")
+    schema = f"doctor_shadow_{uuid.uuid4().hex[:10]}"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f'CREATE FUNCTION "{schema}".pg_backend_pid() '
+                "RETURNS integer LANGUAGE SQL IMMUTABLE AS 'SELECT -1'"
+            )
+            cursor.execute(f'SET search_path TO "{schema}", pg_catalog')
+
+        class RuntimeInfo:
+            server_version = connection.info.server_version
+            used_password = False
+
+        class RuntimeConnection:
+            info = RuntimeInfo()
+
+            @staticmethod
+            def cursor():
+                return connection.cursor()
+
+        worker._check_gss_runtime_parity(
+            RuntimeConnection(),
+            {"gsslib": "gssapi"},
+            {"module": "gssapi", "available": True},
+        )
+    finally:
+        connection.close()
 
 
 def test_doctor_agrees_with_the_runtime_after_a_reanchor(
@@ -1201,6 +1278,152 @@ async def test_explicit_missing_tls_file_fails_like_the_asyncpg_runtime(
         "shared with the spawned asyncpg runtime" in message for message in report.fail
     )
     assert all(str(missing_certificate) not in message for message in report.fail)
+
+
+async def test_malformed_client_identity_fails_before_allow_mode_plaintext(
+    tmp_path,
+    monkeypatch,
+    canonical,
+    runtime_db,
+):
+    """Asyncpg eagerly validates client material even when plaintext works."""
+    import ssl
+
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    malformed_certificate = tmp_path / "malformed-client.crt"
+    malformed_key = tmp_path / "malformed-client.key"
+    malformed_certificate.write_text("not a certificate")
+    malformed_key.write_text("not a private key")
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?sslmode=allow&sslcert="
+        + quote(str(malformed_certificate), safe="")
+        + "&sslkey="
+        + quote(str(malformed_key), safe="")
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    with pytest.raises((ssl.SSLError, OSError, ValueError)):
+        await asyncpg.connect(runtime_dsn)
+    report = diagnose(tmp_path)
+
+    findings = " ".join(report.fail)
+    assert not report.ready
+    assert "runtime PostgreSQL configuration is invalid" in findings
+    assert "spawned asyncpg rejected" in findings
+    assert str(malformed_certificate) not in findings
+    assert str(malformed_key) not in findings
+
+
+async def test_missing_explicit_key_with_default_certificate_matches_asyncpg(
+    tmp_path,
+    monkeypatch,
+    canonical,
+    runtime_db,
+):
+    """Asyncpg skips its optional default chain when the lone key is absent."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    runtime_home = tmp_path / "runtime-home"
+    tls_dir = runtime_home / ".postgresql"
+    tls_dir.mkdir(parents=True)
+    certificate, _key, _combined = _write_client_identity(tls_dir)
+    certificate.rename(tls_dir / "postgresql.crt")
+    missing_key = tmp_path / "missing-explicit.key"
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?sslmode=allow&sslkey="
+        + quote(str(missing_key), safe="")
+    )
+    monkeypatch.setenv("HOME", str(runtime_home))
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    connection = await asyncpg.connect(runtime_dsn)
+    await connection.close()
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX key-mode parity")
+async def test_readable_0644_client_key_connects_for_asyncpg_and_doctor(
+    tmp_path,
+    monkeypatch,
+    canonical,
+    runtime_db,
+):
+    """Libpq's stricter key-mode check must not manufacture a runtime outage."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    certificate, key, _combined = _write_client_identity(tmp_path)
+    key.chmod(0o644)
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?sslmode=prefer&sslcert="
+        + quote(str(certificate), safe="")
+        + "&sslkey="
+        + quote(str(key), safe="")
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    connection = await asyncpg.connect(runtime_dsn)
+    await connection.close()
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+async def test_combined_client_certificate_and_key_connects_for_both_drivers(
+    tmp_path,
+    monkeypatch,
+    canonical,
+    runtime_db,
+):
+    """An absent sslkey means load the private key from sslcert in asyncpg."""
+    import asyncpg
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    _certificate, _key, combined = _write_client_identity(tmp_path)
+    runtime_dsn = (
+        runtime_db.dsn
+        + "?sslmode=prefer&sslcert="
+        + quote(str(combined), safe="")
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+
+    connection = await asyncpg.connect(runtime_dsn)
+    await connection.close()
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
