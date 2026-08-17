@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import Any
 
 from sqlalchemy import event
@@ -39,6 +40,52 @@ from kestrel_sovereign.storage.db.sqlite import (
     _prune_retained_aiosqlite_closes,
     _retain_aiosqlite_close,
 )
+
+
+def _guard_factory_session_operation(operation):
+    """Reject database work that races or follows factory retirement."""
+
+    @wraps(operation)
+    async def guarded(self, *args, **kwargs):
+        self._assert_factory_available()
+        return await operation(self, *args, **kwargs)
+
+    return guarded
+
+
+class _LifecycleBoundAsyncSession(AsyncSession):
+    """An ``AsyncSession`` whose database operations honor factory close.
+
+    SQLAlchemy sessions acquire connections lazily and disposed engines are
+    reusable.  A session yielded before factory shutdown could therefore open
+    a replacement connection after the engine had been retired.  Bind the
+    session to the factory's permanent admission fence so every operation that
+    can acquire or use a connection revalidates at call time.
+    """
+
+    def __init__(self, *args, factory_available, **kwargs) -> None:
+        self._factory_available = factory_available
+        super().__init__(*args, **kwargs)
+
+    def _assert_factory_available(self) -> None:
+        self._factory_available()
+
+    execute = _guard_factory_session_operation(AsyncSession.execute)
+    scalar = _guard_factory_session_operation(AsyncSession.scalar)
+    scalars = _guard_factory_session_operation(AsyncSession.scalars)
+    stream = _guard_factory_session_operation(AsyncSession.stream)
+    stream_scalars = _guard_factory_session_operation(
+        AsyncSession.stream_scalars
+    )
+    connection = _guard_factory_session_operation(AsyncSession.connection)
+    commit = _guard_factory_session_operation(AsyncSession.commit)
+    flush = _guard_factory_session_operation(AsyncSession.flush)
+    get = _guard_factory_session_operation(AsyncSession.get)
+    get_one = _guard_factory_session_operation(AsyncSession.get_one)
+    refresh = _guard_factory_session_operation(AsyncSession.refresh)
+    delete = _guard_factory_session_operation(AsyncSession.delete)
+    merge = _guard_factory_session_operation(AsyncSession.merge)
+    run_sync = _guard_factory_session_operation(AsyncSession.run_sync)
 
 
 class SovereignSqlaSessionFactory:
@@ -65,9 +112,6 @@ class SovereignSqlaSessionFactory:
 
     def __init__(self, engine: Any) -> None:
         self._engine = engine
-        self._async_session = async_sessionmaker(
-            engine, class_=AsyncSession, expire_on_commit=False
-        )
         # SQLAlchemy's aiosqlite dialect acknowledges ``engine.dispose()``
         # after each driver's ``Connection.close()`` returns, which has the
         # same final-worker-turn gap as our primary SQLite backend.  Track the
@@ -76,9 +120,19 @@ class SovereignSqlaSessionFactory:
         self._sqlite_connections: list[Any] = []
         self._retired_sqlite_closes: _RetainedAiosqliteCloses = {}
         self._close_started = False
+        self._active_sessions: set[_LifecycleBoundAsyncSession] = set()
+        self._session_close_tasks: set[asyncio.Task[None]] = set()
+        self._session_close_error: BaseException | None = None
+        self._session_close_error_reported = False
         self._engine_dispose_task: asyncio.Task[None] | None = None
         self._engine_dispose_error: BaseException | None = None
         self._engine_dispose_error_reported = False
+        self._async_session = async_sessionmaker(
+            engine,
+            class_=_LifecycleBoundAsyncSession,
+            expire_on_commit=False,
+            factory_available=self._assert_session_connection_available,
+        )
         if getattr(engine.dialect, "name", None) == "sqlite":
             event.listen(
                 engine.sync_engine, "connect", self._track_sqlite_connection
@@ -105,9 +159,15 @@ class SovereignSqlaSessionFactory:
     def retirement_pending(self) -> bool:
         """Whether any dialect-neutral engine resource is still retiring."""
         dispose_task = self._engine_dispose_task
+        dispose_pending = dispose_task is not None and not dispose_task.done()
+        session_pending = any(
+            not task.done() for task in self._session_close_tasks
+        )
         return (
-            dispose_task is not None and not dispose_task.done()
-        ) or self.sqlite_connection_retirement_pending
+            dispose_pending
+            or session_pending
+            or self.sqlite_connection_retirement_pending
+        )
 
     def _capture_engine_dispose_result(
         self, task: asyncio.Task[None]
@@ -130,6 +190,20 @@ class SovereignSqlaSessionFactory:
         if error is not None and self._engine_dispose_error is None:
             self._engine_dispose_error = error
 
+    def _capture_session_close_result(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        """Retrieve and retain a late active-session close failure."""
+        if task.cancelled():
+            if self._session_close_error is None:
+                self._session_close_error = ConnectionError(
+                    "SQLAlchemy session close was cancelled before completion"
+                )
+            return
+        error = task.exception()
+        if error is not None and self._session_close_error is None:
+            self._session_close_error = error
+
     def finalize_retirement(self) -> None:
         """Validate completion and surface any previously unseen failure."""
         if self.retirement_pending:
@@ -142,15 +216,34 @@ class SovereignSqlaSessionFactory:
         if dispose_task is not None:
             self._capture_engine_dispose_result(dispose_task)
 
-        error = self._engine_dispose_error
-        if error is None or self._engine_dispose_error_reported:
-            return
-        self._engine_dispose_error_reported = True
-        if isinstance(error, Exception):
-            raise error
-        raise ConnectionError(
-            "SQLAlchemy engine disposal failed during lifecycle retirement"
-        ) from error
+        for session_task in self._session_close_tasks:
+            if session_task.done():
+                self._capture_session_close_result(session_task)
+
+        errors = (
+            (
+                "session",
+                self._session_close_error,
+                self._session_close_error_reported,
+                "SQLAlchemy session close failed during lifecycle retirement",
+            ),
+            (
+                "engine",
+                self._engine_dispose_error,
+                self._engine_dispose_error_reported,
+                "SQLAlchemy engine disposal failed during lifecycle retirement",
+            ),
+        )
+        for owner, error, reported, message in errors:
+            if error is None or reported:
+                continue
+            if owner == "session":
+                self._session_close_error_reported = True
+            else:
+                self._engine_dispose_error_reported = True
+            if isinstance(error, Exception):
+                raise error
+            raise ConnectionError(message) from error
 
     def _track_sqlite_connection(self, dbapi_connection: Any, _record: Any) -> None:
         """Remember one raw aiosqlite connection opened by this engine."""
@@ -171,25 +264,45 @@ class SovereignSqlaSessionFactory:
     @asynccontextmanager
     async def read_session(self):
         self._assert_session_connection_available()
-        async with self._async_session() as session:
-            yield session
+        session = self._async_session()
+        self._active_sessions.add(session)
+        try:
+            async with session:
+                yield session
+        finally:
+            self._active_sessions.discard(session)
 
     @asynccontextmanager
     async def write_session(self):
         self._assert_session_connection_available()
-        async with self._async_session() as session:
-            try:
-                yield session
-                await session.commit()
-            except BaseException:
-                await session.rollback()
-                raise
+        session = self._async_session()
+        self._active_sessions.add(session)
+        try:
+            async with session:
+                try:
+                    yield session
+                    await session.commit()
+                except BaseException:
+                    await session.rollback()
+                    raise
+        finally:
+            self._active_sessions.discard(session)
 
     async def close(self) -> None:
         """Dispose the engine and drain every SQLite worker it opened."""
-        self._close_started = True
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _minimum_close_timeout_s()
+        if not self._close_started:
+            self._close_started = True
+            for session in tuple(self._active_sessions):
+                close_task = loop.create_task(
+                    session.close(),
+                    name=f"sqla-session-close:{id(session)}",
+                )
+                close_task.add_done_callback(
+                    self._capture_session_close_result
+                )
+                self._session_close_tasks.add(close_task)
         if self._engine_dispose_task is None:
             self._engine_dispose_task = loop.create_task(
                 self._engine.dispose(),
@@ -206,22 +319,44 @@ class SovereignSqlaSessionFactory:
         # when that happens.
         self._begin_sqlite_connection_retirement()
 
-        dispose_error: BaseException | None = None
+        lifecycle_error: BaseException | None = None
         try:
             # ``asyncio.wait`` does not transfer caller cancellation to the
             # owned task.  Unlike ``asyncio.shield`` on Python 3.14, it also
             # does not install a proxy that logs a late task exception after
             # hard GeneratorExit abandonment; our done callback retrieves and
             # retains that outcome for lifecycle finalization.
-            await asyncio.wait({self._engine_dispose_task})
-            self._engine_dispose_task.result()
+            owned_tasks = {
+                self._engine_dispose_task,
+                *self._session_close_tasks,
+            }
+            remaining = max(0.0, deadline - loop.time())
+            _, pending = await asyncio.wait(
+                owned_tasks,
+                timeout=remaining,
+            )
+            if pending:
+                lifecycle_error = ConnectionError(
+                    "SQLAlchemy engine or session disposal did not complete "
+                    f"within {_minimum_close_timeout_s():.2f}s"
+                )
+            else:
+                self._capture_engine_dispose_result(
+                    self._engine_dispose_task
+                )
+                for session_task in self._session_close_tasks:
+                    self._capture_session_close_result(session_task)
+                lifecycle_error = (
+                    self._session_close_error
+                    or self._engine_dispose_error
+                )
         except (Exception, asyncio.CancelledError) as exc:
             # ``AsyncEngine.dispose`` can fail before it visits all of its
             # connections (and deliberately leaves checked-out connections
             # alone).  The per-driver lifecycle tasks above remain independently
             # owned, wait for this one-shot disposal attempt, and then explicitly
             # close any worker the engine left alive.
-            dispose_error = exc
+            lifecycle_error = exc
             if self._engine_dispose_task.done():
                 self._capture_engine_dispose_result(
                     self._engine_dispose_task
@@ -246,11 +381,19 @@ class SovereignSqlaSessionFactory:
             # The cleanup failure is primary because it describes the resource
             # that may still be alive; the disposal failure remains available
             # to callers as its explicit cause.
-            if dispose_error is not None:
-                raise cleanup_error from dispose_error
+            if lifecycle_error is not None:
+                if lifecycle_error is self._session_close_error:
+                    self._session_close_error_reported = True
+                elif lifecycle_error is self._engine_dispose_error:
+                    self._engine_dispose_error_reported = True
+                raise cleanup_error from lifecycle_error
             raise cleanup_error
-        if dispose_error is not None:
-            raise dispose_error
+        if lifecycle_error is not None:
+            if lifecycle_error is self._session_close_error:
+                self._session_close_error_reported = True
+            elif lifecycle_error is self._engine_dispose_error:
+                self._engine_dispose_error_reported = True
+            raise lifecycle_error
 
     def _begin_sqlite_connection_retirement(self, connections: Any = None) -> None:
         """Synchronously retain close ownership for every live SQLite worker."""
@@ -330,6 +473,7 @@ class SovereignSqlaSessionFactory:
                         retained_closes=self._retired_sqlite_closes,
                         deadline=deadline,
                         close_task=retained.close_task,
+                        cancel_close_task_on_timeout=False,
                     ),
                     name=f"sqla-aiosqlite-close:{id(connection)}",
                 )

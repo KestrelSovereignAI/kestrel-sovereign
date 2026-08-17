@@ -178,6 +178,7 @@ async def _close_aiosqlite_connection(
     retained_closes: _RetainedAiosqliteCloses,
     deadline: Optional[float] = None,
     close_task: Optional[asyncio.Task[None]] = None,
+    cancel_close_task_on_timeout: bool = True,
 ) -> None:
     """Close an owned aiosqlite connection through its full lifecycle.
 
@@ -186,6 +187,9 @@ async def _close_aiosqlite_connection(
     or snapshot connection from bypassing the shutdown contract.  A caller
     coordinating several connections may pass an already-started ``close_task``
     after installing retained ownership before its first cancellable await.
+    SQLAlchemy callers set ``cancel_close_task_on_timeout=False`` because their
+    task is the one engine-disposal attempt already closing the same driver;
+    starting a second close would race two sentinels against one worker.
     """
     loop = asyncio.get_running_loop()
     if deadline is None:
@@ -199,6 +203,7 @@ async def _close_aiosqlite_connection(
             close_task=close_task,
             deadline=deadline,
             retained_closes=retained_closes,
+            cancel_close_task_on_timeout=cancel_close_task_on_timeout,
         )
     except BaseException:
         # Repeated cancellation can interrupt either bounded retry. Never let
@@ -216,6 +221,7 @@ async def _finish_aiosqlite_connection_close(
     close_task: asyncio.Task[None],
     deadline: float,
     retained_closes: _RetainedAiosqliteCloses,
+    cancel_close_task_on_timeout: bool,
 ) -> None:
     """Complete one bounded close under the caller's retention guard."""
     loop = asyncio.get_running_loop()
@@ -242,7 +248,8 @@ async def _finish_aiosqlite_connection_close(
                 interrupt_error = exc
         except Exception as exc:
             interrupt_error = exc
-        close_task.cancel()
+        if cancel_close_task_on_timeout:
+            close_task.cancel()
         _retain_aiosqlite_close(
             connection, close_task, retained_closes
         )

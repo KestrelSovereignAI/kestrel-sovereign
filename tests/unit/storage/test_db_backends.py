@@ -1946,7 +1946,12 @@ class TestAsyncDatabase:
         real_close = session_module._close_aiosqlite_connection
 
         async def record_deadline(
-            connection, *, retained_closes, deadline=None, close_task=None
+            connection,
+            *,
+            retained_closes,
+            deadline=None,
+            close_task=None,
+            cancel_close_task_on_timeout=True,
         ):
             deadlines.append(deadline)
             await real_close(
@@ -1954,6 +1959,7 @@ class TestAsyncDatabase:
                 retained_closes=retained_closes,
                 deadline=deadline,
                 close_task=close_task,
+                cancel_close_task_on_timeout=cancel_close_task_on_timeout,
             )
 
         try:
@@ -2398,6 +2404,156 @@ class TestAsyncDatabase:
                 assert len(factory._sqlite_connections) == tracked_count
         finally:
             await db.close()
+            worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_pre_admitted_lazy_session_cannot_connect_after_factory_close(
+        self, tmp_path,
+    ):
+        """A yielded but still-lazy session observes the permanent close fence."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "sqla-lazy-session.db"))
+        factory = make_session_factory(db)
+        session_context = factory.read_session()
+        session = await session_context.__aenter__()
+
+        try:
+            # Merely entering an AsyncSession context does not check out a
+            # connection.  This is the ordering that previously let a stale
+            # session reopen SQLAlchemy's disposed engine.
+            assert factory._sqlite_connections == []
+
+            await db.dispose_cached_sqla_factory()
+            assert not factory.retirement_pending
+
+            with pytest.raises(
+                ConnectionError, match="factory is closing or closed"
+            ):
+                await session.execute(text("SELECT 42"))
+            assert factory._sqlite_connections == []
+        finally:
+            await session_context.__aexit__(None, None, None)
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_checked_in_blocked_worker_does_not_bypass_factory_deadline(
+        self, tmp_path, monkeypatch,
+    ):
+        """Engine disposal and raw-driver cleanup share one bounded deadline."""
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        timeout_seconds = 0.03
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            timeout_seconds,
+        )
+        db = await AsyncDatabase.sqlite(str(tmp_path / "sqla-dispose-deadline.db"))
+        factory = make_session_factory(db)
+        async with factory.read_session() as session:
+            await session.execute(text("SELECT 1"))
+
+        connection = factory._sqlite_connections[0]
+        worker = aiosqlite_worker(connection)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+        blocked_read = None
+        retirement_tasks = []
+        close_task = None
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        await connection.create_function(
+            "block_in_worker", 0, block_in_worker
+        )
+
+        try:
+            watchdog.start()
+            blocked_read = asyncio.create_task(
+                connection.execute("SELECT block_in_worker()")
+            )
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked_read
+
+            started = asyncio.get_running_loop().time()
+            close_task = asyncio.create_task(
+                db.dispose_cached_sqla_factory()
+            )
+            with pytest.raises(
+                ConnectionError,
+                match=(
+                    "(?:SQLite worker did not terminate|"
+                    "SQLite connection close did not complete)"
+                ),
+            ) as close_error:
+                await close_task
+            elapsed = asyncio.get_running_loop().time() - started
+
+            assert elapsed >= timeout_seconds
+            assert elapsed < 1.5
+            assert isinstance(close_error.value.__cause__, ConnectionError)
+            assert "engine or session disposal did not complete" in str(
+                close_error.value.__cause__
+            )
+            assert worker.is_alive()
+            assert factory._engine_dispose_task is not None
+            assert not factory._engine_dispose_task.done()
+            assert factory.retirement_pending
+            assert factory.sqlite_connection_retirement_pending
+            assert db._sovereign_sqla_factory is None
+            assert db._sovereign_sqla_retirement_owner is factory
+            assert db.connection_retirement_pending
+
+            retirement_tasks = [
+                retained.retirement_task
+                for retained in factory._retired_sqlite_closes.values()
+                if retained.retirement_task is not None
+            ]
+            assert len(retirement_tasks) == 1
+
+            release_worker.set()
+            await asyncio.gather(
+                factory._engine_dispose_task,
+                *retirement_tasks,
+                return_exceptions=True,
+            )
+            assert not worker.is_alive()
+            assert not factory.retirement_pending
+            await db.finalize_retired_sqla_factory()
+            assert db._sovereign_sqla_retirement_owner is None
+        finally:
+            watchdog.cancel()
+            release_worker.set()
+            if blocked_read is not None:
+                await asyncio.gather(blocked_read, return_exceptions=True)
+            await asyncio.gather(*retirement_tasks, return_exceptions=True)
+            if factory._engine_dispose_task is not None:
+                await asyncio.gather(
+                    factory._engine_dispose_task, return_exceptions=True
+                )
+            if close_task is not None:
+                await asyncio.gather(close_task, return_exceptions=True)
+            if db.connection_retirement_pending:
+                await db.finalize_retired_sqla_factory()
+            if db.backend.is_connected:
+                await db.close()
             worker.join(timeout=1.0)
 
         assert not worker.is_alive()
