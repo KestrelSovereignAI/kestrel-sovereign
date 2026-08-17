@@ -196,12 +196,18 @@ class ProcessManager:
         """Log file path for an agent process."""
         return agent_dir / "agent.log"
 
-    # Command-line fragments that identify a Kestrel process. Deliberately
-    # broad: the cost of failing to recognise our own process is a refusal the
-    # operator can clear, while the cost of a false match is signalling a
-    # stranger — so this errs toward recognising, and only ever REFUSES on a
-    # positive identification of something else.
-    _KESTREL_CMDLINE_MARKERS = ("kestrel", "uvicorn")
+    # What identifies a Kestrel process on the command line. These are
+    # deliberately SPECIFIC, not broad: a bare "uvicorn" marker matches any
+    # unrelated ASGI service (``python -m uvicorn other_app:app``), and a bare
+    # "kestrel" substring matches anything merely living under a kestrel-named
+    # path — both would hand a stranger back to the killer this exists to stop.
+    #
+    # ``kestrel_sovereign.server`` covers the host and the per-agent uvicorn
+    # subprocesses (see this module's docstring); ``kestrel_sovereign.cli``
+    # covers ``python -m`` invocations; the program-name set covers the
+    # installed console script.
+    _KESTREL_MODULE_TARGETS = ("kestrel_sovereign.server", "kestrel_sovereign.cli")
+    _KESTREL_PROGRAM_NAMES = frozenset({"kestrel"})
 
     @staticmethod
     def describe_process(pid: int) -> Optional[str]:
@@ -228,13 +234,34 @@ class ProcessManager:
         return described or None
 
     @staticmethod
+    def process_program_name(pid: int) -> Optional[str]:
+        """The basename of ``pid``'s executable — safe to log, unlike its args.
+
+        A foreign process's arguments can carry that process's credentials, so
+        a refusal must not copy them into Kestrel's logs (#2987).
+        """
+        described = ProcessManager.describe_process(pid)
+        if described is None:
+            return None
+        first = described.split()[0] if described.split() else ""
+        return Path(first).name or None
+
+    @staticmethod
     def process_is_recognisably_kestrel(pid: int) -> Optional[bool]:
         """Whether ``pid`` looks like a Kestrel process. ``None`` if undeterminable."""
         described = ProcessManager.describe_process(pid)
         if described is None:
             return None
-        lowered = described.lower()
-        return any(m in lowered for m in ProcessManager._KESTREL_CMDLINE_MARKERS)
+        tokens = described.split()
+        for token in tokens:
+            if any(
+                token.startswith(target)
+                for target in ProcessManager._KESTREL_MODULE_TARGETS
+            ):
+                return True
+        if tokens and Path(tokens[0]).name in ProcessManager._KESTREL_PROGRAM_NAMES:
+            return True
+        return False
 
     @staticmethod
     def kill_process(pid: int, force: bool = False) -> bool:
@@ -256,12 +283,14 @@ class ProcessManager:
         identified = ProcessManager.process_is_recognisably_kestrel(pid)
         if identified is False:
             logger.error(
-                "Refusing to signal PID %d: it is running %r, which is not a "
+                "Refusing to signal PID %d: its program is %s, which is not a "
                 "Kestrel process. A stale PID file almost certainly named a "
                 "process that has since exited and had its PID reused — delete "
-                "the stale pid file rather than forcing this.",
+                "the stale pid file rather than forcing this. (Arguments are "
+                "not logged: they belong to that process and may carry its "
+                "credentials.)",
                 pid,
-                ProcessManager.describe_process(pid),
+                ProcessManager.process_program_name(pid) or "unreadable",
             )
             return False
 

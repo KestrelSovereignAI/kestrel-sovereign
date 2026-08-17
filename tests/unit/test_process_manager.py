@@ -1055,3 +1055,51 @@ def test_process_identity_distinguishes_unknown_from_foreign():
 def test_describe_process_returns_none_for_a_pid_that_does_not_exist():
     """Driven against the real `ps`, so the None contract is not just mocked."""
     assert ProcessManager.describe_process(2**22) is None
+
+
+@pytest.mark.parametrize("cmdline,expected,why", [
+    (
+        "/opt/kestrel/.venv/bin/python3 -m uvicorn kestrel_sovereign.server:app "
+        "--host 0.0.0.0 --port 8888",
+        True,
+        "the host and per-agent subprocesses both name this target",
+    ),
+    ("/usr/local/bin/kestrel start", True, "installed console script"),
+    ("python -m kestrel_sovereign.cli status", True, "module invocation"),
+    (
+        "python -m uvicorn other_app:app --port 9000",
+        False,
+        "an unrelated ASGI service is NOT ours — a bare 'uvicorn' marker would "
+        "have handed this stranger to SIGKILL",
+    ),
+    (
+        "/opt/kestrel-tools/bin/postgres -D /data",
+        False,
+        "living under a kestrel-named path does not make a process ours",
+    ),
+    ("/sbin/launchd", False, "init is emphatically not ours"),
+])
+def test_kestrel_identification_is_specific_not_substring(cmdline, expected, why):
+    """Identity must key on the Kestrel server/CLI target, not loose fragments.
+
+    Both loose markers were real holes: "uvicorn" matches any ASGI app, and
+    "kestrel" matches anything merely installed under a kestrel-named
+    directory — including the venv path of a completely unrelated tool.
+    """
+    with patch.object(ProcessManager, "describe_process", return_value=cmdline):
+        assert ProcessManager.process_is_recognisably_kestrel(1) is expected, why
+
+
+def test_a_refusal_does_not_copy_the_foreign_process_arguments_into_our_logs():
+    """A stranger's argv may carry that stranger's credentials.
+
+    The refusal has to identify the process well enough to act on without
+    persisting someone else's secrets into Kestrel's logs.
+    """
+    secretive = "/usr/bin/psql --password=hunter2 -h db.internal"
+    with patch.object(ProcessManager, "describe_process", return_value=secretive):
+        assert ProcessManager.process_program_name(9) == "psql"
+
+        with patch("os.kill") as mock_kill:
+            assert ProcessManager.kill_process(9, force=True) is False
+        mock_kill.assert_not_called()
