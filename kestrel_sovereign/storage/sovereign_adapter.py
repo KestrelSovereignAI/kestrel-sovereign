@@ -31,6 +31,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from kestrel_sovereign.storage.providers.base import StorageTier
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
+from kestrel_sovereign.storage.conversation_sessions import (
+    ConversationSessionProjection,
+)
 from kestrel_sovereign.storage.session_id_column import column_session_id
 
 # Lazy-imported below inside import_agent — identity/__init__ pulls in
@@ -897,6 +900,26 @@ class SovereignStorageAdapter:
                                 session_id,
                             ),
                         )
+
+                # The DELETE above destroyed the history the projection
+                # described, so every row of it is now a claim about messages
+                # this database no longer has — dropped in the SAME transaction
+                # as the delete, because that is the ordering the pointer
+                # invariant is about (#2959).
+                await ConversationSessionProjection(
+                    self.db, self.agent_id
+                ).forget_all()
+
+            # ...and rebuilt from the imported rows once that transaction has
+            # committed, deliberately OUTSIDE it: a rebuild takes a boundary per
+            # session, and an import can carry thousands, which nested inside one
+            # transaction would hold thousands of PostgreSQL advisory keys until
+            # it committed. Between the commit and this sweep the projection is
+            # ABSENT for the agent, which invariant 2 permits and a stale row
+            # does not. See ConversationSessionProjection.rebuild.
+            await ConversationSessionProjection(
+                self.db, self.agent_id
+            ).rebuild()
 
             # Asset restoration (#1391) — runs AFTER conversation
             # restore so a restorer failure surfaces against an

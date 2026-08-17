@@ -36,6 +36,7 @@ from .agent_resource_store import (
     AgentResourceVersion,
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from .conversation_sessions import ConversationSessionProjection
 from .semantic_binding import SemanticAssertionBinding
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
@@ -2481,6 +2482,24 @@ class AsyncStorage:
                             )
                         )
                         stats["messages_restored"] += 1
+
+                    # A restore lands whole sessions at once, so the projection
+                    # is rebuilt rather than refreshed per row (#2959): the
+                    # answer is the same and the pass is one sweep instead of
+                    # one per restored message. It reads the rows that are now
+                    # live, so a backup predating the projection produces the
+                    # same table a live agent would have.
+                    #
+                    # Restored rows can join a session this agent already has, so
+                    # its stored row is dropped BEFORE the sweep — during the
+                    # restore the projection is absent for those sessions rather
+                    # than undercounting them, and absent is the direction
+                    # invariant 2 permits.
+                    projection = ConversationSessionProjection(
+                        self.db, self.agent_id
+                    )
+                    await projection.forget_all()
+                    await projection.rebuild()
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     

@@ -18,6 +18,35 @@ logger = logging.getLogger(__name__)
 
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 
+#: Marker AND advisory-lock name for the #2959 session-projection backfill.
+#: One constant for both because they are one identity: a lock's NAME is its
+#: PostgreSQL advisory key, so renaming it later would let an old process and a
+#: new one hold what they each believe is the same lock. Nothing has shipped
+#: under a previous spelling of this name, so there is no legacy key to also
+#: take; a future rename would have to take both.
+_SESSION_PROJECTION_BACKFILL = "conversation_sessions_2959"
+
+#: ``(name, table, columns)`` of the index that makes the #2959 projection worth
+#: having — Phase C lists an agent's sessions newest-activity-first.
+#:
+#: Declared here and created through :meth:`AsyncDatabase.ensure_index` rather
+#: than as a ``CREATE INDEX IF NOT EXISTS`` line in ``CORE_SCHEMA``, because that
+#: spelling is idempotent in SEQUENCE and unsafe in PARALLEL: PostgreSQL
+#: evaluates the existence test before taking the lock that would exclude a
+#: peer, so two ``from_pool()`` initializers racing the first post-upgrade boot
+#: can both proceed and one dies on ``pg_class``' unique index — failing its
+#: whole request, not merely skipping an index. ``ensure_index`` owns the
+#: probe → lock → re-probe that closes it. (The older index lines still in
+#: ``CORE_SCHEMA`` predate that helper; this one has no excuse to join them.)
+#:
+#: One tuple, unpacked into the call and read by the test that races it, so the
+#: declaration a concurrency test exercises is provably the shipped one.
+_SESSION_PROJECTION_INDEX = (
+    "idx_conversation_sessions_recent",
+    "conversation_sessions",
+    "agent_id, last_message_at",
+)
+
 
 def _collapse_ws(text: str) -> str:
     """Normalize whitespace so stored DDL can be compared to a declaration.
@@ -185,6 +214,37 @@ CREATE TABLE IF NOT EXISTS conversation_titles (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_titles_agent
     ON conversation_titles(agent_id);
+
+-- The write path's session decision, recorded instead of re-derived (#2959).
+-- One row per (agent_id, session_id) describing the LIVE rows filed under that
+-- id. Maintained in the same write unit as every mutation of those rows, by
+-- recomputation rather than by deltas -- see storage/conversation_sessions.py.
+--
+-- first_user_message_id is a POINTER at the first real user turn (the #2947
+-- skip applied once, at write time), never a copy of its text: content is
+-- ciphertext, and a preview column here would be a plaintext duplicate that
+-- outlives the row it describes (#2948).
+--
+-- Both timestamps are written in ONE canonical form (naive-UTC ISO-8601 from
+-- session_grouping.coerce_session_timestamp), unlike conversation_history's
+-- mixture of historical SQL and ISO spellings, so ordering on them is sound in
+-- either dialect.
+--
+-- The ordering index that makes it worth reading is deliberately NOT declared
+-- in this block. It is created through AsyncDatabase.ensure_index, which is
+-- concurrency-safe where a bare CREATE INDEX IF NOT EXISTS is not -- see
+-- _SESSION_PROJECTION_INDEX above for the failure that distinction prevents.
+CREATE TABLE IF NOT EXISTS conversation_sessions (
+    agent_id              TEXT NOT NULL,
+    session_id            TEXT NOT NULL,
+    started_at            TIMESTAMP,
+    last_message_at       TIMESTAMP,
+    message_count         INTEGER NOT NULL DEFAULT 0,
+    user_message_count    INTEGER NOT NULL DEFAULT 0,
+    first_user_message_id INTEGER,
+    wake_source           TEXT,
+    PRIMARY KEY (agent_id, session_id)
+);
 
 CREATE TABLE IF NOT EXISTS model_usage (
     model_id TEXT PRIMARY KEY,
@@ -1212,6 +1272,24 @@ class AsyncDatabase:
                 e, exc_info=True,
             )
 
+        # #2959: the projection's ordering index. The table itself is in
+        # CORE_SCHEMA (it is created, never altered), so nothing is probed here
+        # first — but the INDEX goes through ``ensure_index``, which is where the
+        # concurrent-initializer safety lives. See _SESSION_PROJECTION_INDEX.
+        await self.ensure_index(*_SESSION_PROJECTION_INDEX)
+
+        # #2959: build the session projection from pre-existing history. LAST,
+        # and specifically after the #2012 relink above, because that migration
+        # REWRITES ``session_id`` — a row keyed by a bare integer before it
+        # carries a canonical UUID after. Projecting first would file history
+        # under keys the relink then replaces, and the marker would stop this
+        # from ever being reconsidered. Everything this reads is settled by
+        # here.
+        if not await self._backfill_completed(_SESSION_PROJECTION_BACKFILL):
+            await self._backfill_conversation_sessions_once(
+                _SESSION_PROJECTION_BACKFILL
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _backfill_graph_ownership(self) -> None:
@@ -2075,6 +2153,60 @@ class AsyncDatabase:
             await self._backfill_graph_ownership()
             await self._backfill_file_ownership()
             await self._backfill_document_chunk_ownership()
+            await self._mark_backfill_completed(name)
+
+    async def _backfill_conversation_sessions_once(self, name: str) -> None:
+        """Build the #2959 session projection for pre-existing history.
+
+        **The pass runs outside ``migration_lock`` and this is not an
+        oversight.** That lock is one transaction — ``BEGIN IMMEDIATE`` on
+        SQLite, a transaction-scoped advisory lock on PostgreSQL — held for its
+        entire block, and its own docstring says the whole migration belongs
+        inside it. That instruction is for a migration expressible as
+        statements. This one is a Python iteration pass: it reads a session's
+        rows, groups them, writes a row, and repeats, per session, per agent.
+        Nesting that inside the lock's transaction is the ABBA shape #2958
+        spent its lock budget on. Phase A's backfill was a single statement and
+        correctly rode inside ``migrate_columns_once``; the two cases are
+        genuinely different and the placement is not copied between them.
+
+        What the lock still guards is the **marker**, so concurrent
+        initializers do not each write "done" while one of them is mid-pass.
+
+        Running the pass twice is harmless — each session is recomputed from
+        the rows, not adjusted — so the cost of the split is at worst duplicated
+        work on the one boot after an upgrade, and the benefit is that a boot
+        cannot wedge on a lock held across per-session I/O.
+
+        Failure is non-fatal: nothing reads this table yet (#2959 is Phase B),
+        and the projection repairs itself the next time a session is written or
+        this backfill is retried. A raise here would turn a derived index into
+        a reason a boot fails.
+        """
+        from .conversation_sessions import ConversationSessionProjection
+
+        try:
+            agent_ids = [
+                row[0]
+                for row in await self.fetchall(
+                    "SELECT DISTINCT agent_id FROM conversation_history "
+                    "WHERE session_id IS NOT NULL",
+                    (),
+                )
+            ]
+            for agent_id in agent_ids:
+                await ConversationSessionProjection(self, agent_id).rebuild()
+        except Exception as error:  # noqa: BLE001 - see docstring
+            logger.error(
+                "conversation_sessions backfill failed (%s); the projection "
+                "stays partial until a later boot or write repairs it: %s",
+                name, error,
+            )
+            return
+
+        async with self.migration_lock(name):
+            if await self._backfill_completed(name):
+                return
             await self._mark_backfill_completed(name)
 
     async def _migrate_add_column(

@@ -327,6 +327,16 @@ async def salvage_messages(
                     f"but expected {len(original_ids)} — refusing to "
                     "commit a salvage with broken linkage"
                 )
+
+            # The marker is a live row in the session it salvaged, so that
+            # session now has one more message than its projection says
+            # (#2959). Recomputed inside this same transaction, like every
+            # other write that changes which rows are live. The stub store the
+            # unit tests inject does not carry the projection; a salvage must
+            # not fail because a test double is narrower than the store.
+            refresh = getattr(conv_store, "refresh_session_projection", None)
+            if refresh is not None:
+                await refresh([column_session_id(marker_metadata)])
         # Transaction committed — fail-closed gate passes.
     except SalvageWriteError:
         raise
