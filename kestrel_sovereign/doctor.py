@@ -41,15 +41,26 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlsplit
 
-from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
+from kestrel_sovereign._doctor_postgres_probe import (
+    ERROR_KIND_CONNECTION,
+    ERROR_KIND_DIAGNOSTIC,
+    ERROR_KIND_QUERY,
+)
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
     effective_identity_export_roots,
 )
-from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
+from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
+from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
+    MultiAgentConfig,
+)
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -198,9 +209,7 @@ def _check_data_key(env: dict, env_path: Path, report: DoctorReport) -> None:
         report.fail.append(f"KESTREL_DATA_KEY missing in {env_path}")
 
 
-def _check_llm(
-    config: dict, env: dict, toml_path: Path, report: DoctorReport
-) -> None:
+def _check_llm(config: dict, env: dict, toml_path: Path, report: DoctorReport) -> None:
     llm = config.get("llm") or {}
     priority = llm.get("route_priority") or []
     if not priority:
@@ -307,11 +316,10 @@ class _GovernanceSource:
     contradicting each other is how operators learn to ignore the one that
     cries wolf.
 
-    Staying out of the stack costs nothing here: every property doctor reads is
-    plaintext JSON in ``graph_nodes.properties`` and every edge is a plain row,
-    so no ``KESTREL_DATA_KEY`` is involved on either backend, and
-    ``psycopg2`` — already a hard dependency — is a *synchronous* driver, so
-    there is no event loop to own.
+    Staying out of the storage stack costs nothing here: every property doctor
+    reads is plaintext JSON in ``graph_nodes.properties`` and every edge is a
+    plain row, so no ``KESTREL_DATA_KEY`` is involved. PostgreSQL reads run in
+    a bounded child using the same asyncpg runtime as the agent.
 
     ``agent_did`` always comes from the **anchor**, which is where identity is
     born on every backend (#2871, #2894), and it is required on both. On
@@ -324,6 +332,19 @@ class _GovernanceSource:
     anchor_path: Path
     agent_did: str
     dsn: str | None = None
+    #: Explicit DSN and environment-derived identities to redact from worker
+    #: failures.  Asyncpg receives the launcher environment unchanged, so the
+    #: redaction boundary must cover values that never appear in ``dsn``.
+    dsn_identity: tuple | None = None
+    #: HOME seen by asyncpg in the spawned agent, retained only for redaction
+    #: of default credential and TLS paths in driver errors.
+    postgres_home: str | None = None
+    #: Complete environment resolved by the launcher for the spawned agent.
+    #: The asyncpg worker receives this copy unchanged, just like the agent.
+    postgres_env: dict[str, str] | None = None
+    #: Working directory ProcessManager gives the spawned agent. Relative GSS
+    #: configuration/cache locations must resolve beneath the same directory.
+    postgres_cwd: str | None = None
     #: Whether the #2649 ownership backfill has already been recorded as
     #: complete. Boot re-runs it exactly once; until it has, a row with no
     #: witness is repaired at the next start, so its absence predicts nothing.
@@ -376,7 +397,7 @@ def _discover_agent_did(anchor_path: Path):
     return rows[0][0]
 
 
-def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
+def _has_ownership_ledger(source: _GovernanceSource) -> bool:
     """Whether this database has the ownership tables at all.
 
     A database written before the ownership migration (#2649) has neither
@@ -420,9 +441,7 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
             return _UnreadableDB(reason=f"DB unreadable ({exc})")
         except sqlite3.Error as exc:
             return _UnreadableDB(reason=f"sqlite error ({exc})")
-        return _LedgerState(
-            present=row is not None, settled=settled is not None
-        )
+        return _LedgerState(present=row is not None, settled=settled is not None)
 
     try:
         rows = _fetch_rows(
@@ -440,9 +459,10 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
             # be audited is the anchor's. Reporting it unreadable made doctor
             # answer "Not ready" to a correctly configured first boot.
             return _SchemaAbsent()
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
-        return _UnreadableDB(
-            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
+        return _postgres_unreadable(
+            exc,
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
         )
     # The marker is read in a *second* statement, on purpose. PostgreSQL
     # resolves every relation in a statement before evaluating any of it, so a
@@ -459,18 +479,22 @@ def _has_ownership_ledger(source: "_GovernanceSource") -> bool:
         marker = _fetch_rows(
             source,
             "SELECT 1",
-            "SELECT 1 FROM schema_backfills WHERE name = %s",
+            "SELECT 1 FROM schema_backfills WHERE name = $1",
             postgres_params=(_OWNERSHIP_BACKFILL,),
         )
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
-        return _UnreadableDB(
-            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
+        return _postgres_unreadable(
+            exc,
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
         )
     return _LedgerState(present=bool(rows[0][1]), settled=bool(marker))
 
 
 def _resolve_governance_source(
-    anchor_path: Path, env: dict, ledger_by_dsn: dict | None = None
+    anchor_path: Path,
+    env: dict,
+    project_dir: Path,
+    ledger_by_dsn: dict | None = None,
 ):
     """Resolve where to read this agent's governance from, and as whom.
 
@@ -496,14 +520,35 @@ def _resolve_governance_source(
     if _anchor_is_the_runtime_database(env):
         source = _GovernanceSource(anchor_path=anchor_path, agent_did=agent_did)
     else:
+        runtime_dsn = env["KESTREL_DATABASE_URL"]
+        try:
+            _doctor_postgres_timeout_seconds(env)
+        except _DoctorPostgresConfigurationError as exc:
+            unsafe_source = _GovernanceSource(
+                anchor_path=anchor_path,
+                agent_did=agent_did,
+                dsn=runtime_dsn,
+                postgres_env=dict(env),
+            )
+            return _UnreadableDB(
+                reason=(
+                    "PostgreSQL doctor configuration is invalid "
+                    f"({_safe(exc, unsafe_source)})"
+                ),
+                postgres_failure="doctor_configuration",
+            )
         source = _GovernanceSource(
             anchor_path=anchor_path,
             agent_did=agent_did,
-            dsn=env["KESTREL_DATABASE_URL"],
+            dsn=runtime_dsn,
+            dsn_identity=_postgres_redaction_identity(runtime_dsn, env),
+            postgres_home=env.get("HOME") or env.get("USERPROFILE"),
+            postgres_env=dict(env),
+            postgres_cwd=str(project_dir.resolve()),
         )
     # Keyed on the DSN, or on the anchor path for a SQLite host where each
     # agent genuinely has its own file and its own answer.
-    cache_key = source.dsn or str(source.anchor_path)
+    cache_key = source.dsn if source.dsn else str(source.anchor_path)
     if ledger_by_dsn is not None and cache_key in ledger_by_dsn:
         ledger = ledger_by_dsn[cache_key]
     else:
@@ -520,171 +565,520 @@ def _resolve_governance_source(
     )
 
 
-#: Seconds doctor will wait for a PostgreSQL connection before calling the
-#: database unreadable. Doctor is the tool an operator reaches for *when the
-#: database is unavailable*, and a black-holed or firewalled endpoint does not
-#: refuse the connection — it drops the packets, and libpq's default is to wait
-#: out the OS TCP timeout, minutes of an apparently hung diagnostic. Failing
-#: fast turns that into the ``_UnreadableDB`` finding callers already report.
+#: Seconds Doctor lets the runtime-equivalent asyncpg probe run before it is
+#: killed and reaped.  This is a parent-process diagnostic deadline, not a
+#: connection argument, so it cannot override DSN, service-file, or PG*
+#: settings the spawned agent would use.
 _CONNECT_TIMEOUT_SECONDS = 5
+_POSTGRES_PROBE_GRACE_SECONDS = 5
+_POSTGRES_TIMEOUT_ENV = "KESTREL_DOCTOR_POSTGRES_TIMEOUT_SECONDS"
+_MAX_POSTGRES_TIMEOUT_SECONDS = 3600
 
 
-def _safe(exc: object, source: "_GovernanceSource") -> str:
-    """A driver error with the connection string taken out of it.
+class _DoctorPostgresConfigurationError(ValueError):
+    """A doctor-only setting is invalid; the runtime is unaffected."""
 
-    libpq echoes the DSN it could not parse. An unmatched ``[`` in a URI is
-    enough:
 
-        invalid dsn: end of string reached when looking for matching "]"
-        in IPv6 host address in URI: "postgresql://user:hunter2@[bad/kestrel"
+def _doctor_postgres_timeout_seconds(env: dict) -> int:
+    """Return the bounded probe budget configured in the launcher environment."""
+    raw = env.get(_POSTGRES_TIMEOUT_ENV)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = str(_CONNECT_TIMEOUT_SECONDS)
+    try:
+        timeout = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise _DoctorPostgresConfigurationError(
+            f"{_POSTGRES_TIMEOUT_ENV} must be a positive integer"
+        ) from exc
+    if not 1 <= timeout <= _MAX_POSTGRES_TIMEOUT_SECONDS:
+        raise _DoctorPostgresConfigurationError(
+            f"{_POSTGRES_TIMEOUT_ENV} must be between 1 and "
+            f"{_MAX_POSTGRES_TIMEOUT_SECONDS} seconds"
+        )
+    return timeout
 
-    Doctor puts these straight into ``report.warn``, which an operator reads on
-    a terminal and CI archives, so the unredacted form prints the database
-    password. The whole DSN goes, not just the password: it also names a host
-    and database an operator may not want in a build log, and a message that
-    keeps everything except the secret is one parser bug away from keeping the
-    secret too.
-    """
+
+def _safe(exc: object, source: _GovernanceSource) -> str:
+    """Return a driver error with connection identities and secrets removed."""
     text = str(exc)
     if not source.dsn:
         return text
 
     text = text.replace(source.dsn, "<dsn>")
+    env = source.postgres_env or {}
+    secrets = set(_dsn_secrets(source.dsn))
+    secrets.update(
+        value
+        for name in _POSTGRES_SECRET_ENV_FIELDS
+        if isinstance((value := env.get(name)), str) and value
+    )
+    for secret in sorted(secrets, key=len, reverse=True):
+        if len(secret) > 2:
+            text = text.replace(secret, "<redacted>")
+        else:
+            text = re.sub(
+                rf"(?<![\w-]){re.escape(secret)}(?![\w-])",
+                "<redacted>",
+                text,
+            )
 
-    # Then the individual fields, because the whole-string replace above only
-    # fires on a byte-identical echo — and that is the *rare* case. A malformed
-    # URI gets quoted back verbatim, but an ordinary DNS, connection, or
-    # authentication failure names the parts instead:
-    #
-    #     could not translate host name "db.internal" to address
-    #     FATAL:  password authentication failed for user "kestrel"
-    #
-    # so a redaction that only handled the verbatim echo left the database
-    # topology and account names in every routine outage message. Password
-    # first: it is the one field whose disclosure is unrecoverable, and
-    # redacting longest-first stops a shorter token reappearing inside a
-    # replacement.
-    for secret in _dsn_secrets(source.dsn):
-        text = text.replace(secret, "<redacted>")
-    for field_name, value in _dsn_identity(source.dsn):
+    for field_name, value in _postgres_connection_files(source.dsn, env):
         text = text.replace(value, f"<{field_name}>")
+    identities = (
+        source.dsn_identity
+        if source.dsn_identity is not None
+        else _postgres_redaction_identity(source.dsn, env)
+    )
+    for field_name, value in identities:
+        text = text.replace(value, f"<{field_name}>")
+    if source.postgres_home and len(source.postgres_home) > 2:
+        text = text.replace(source.postgres_home, "<home>")
     return text
 
 
-def _dsn_secrets(dsn: str) -> tuple:
-    """Every secret-bearing token in ``dsn``, longest first.
+_POSTGRES_SECRET_ENV_FIELDS = ("PGPASSWORD", "PGSSLPASSWORD")
+_POSTGRES_CONNECTION_FILE_QUERY_FIELDS = frozenset(
+    {
+        "passfile",
+        "servicefile",
+        "sslcert",
+        "sslcrl",
+        "sslkey",
+        "sslrootcert",
+    }
+)
+_POSTGRES_CONNECTION_FILE_ENV_FIELDS = {
+    "PGPASSFILE": "passfile",
+    "PGSERVICEFILE": "servicefile",
+    "PGSSLCERT": "sslcert",
+    "PGSSLCRL": "sslcrl",
+    "PGSSLKEY": "sslkey",
+    "PGSSLROOTCERT": "sslrootcert",
+    "KRB5CCNAME": "kerberos_cache",
+    "KRB5_CONFIG": "kerberos_config",
+}
+_POSTGRES_IDENTITY_ENV_FIELDS = {
+    "PGHOST": "host",
+    "PGUSER": "user",
+    "PGDATABASE": "dbname",
+    "PGSERVICE": "service",
+}
+_DSN_IDENTITY_FIELDS = ("host", "user", "dbname", "service")
 
-    Longest first so that redacting one token cannot leave a shorter one
-    embedded in the replacement text.
-    """
-    secrets = set()
+
+def _dsn_query(dsn: str) -> tuple[tuple[str, str], ...]:
+    """Return URI query fields for redaction without validating the runtime DSN."""
     try:
-        from psycopg2.extensions import parse_dsn
+        return tuple(parse_qsl(urlsplit(dsn).query, keep_blank_values=True))
+    except (TypeError, ValueError):
+        return ()
 
-        password = parse_dsn(dsn).get("password")
-        if password:
-            secrets.add(password)
-    except Exception:  # noqa: BLE001 — an unparseable DSN is why we are here
-        pass
 
-    # ``parse_dsn`` raises on exactly the malformed URIs that leak, so fall
-    # back to the URI's own shape: everything between "://user:" and the "@".
-    match = re.search(r"://[^:/?#]*:([^@/?#]+)@", dsn)
-    if match:
+def _dsn_secrets(dsn: str) -> tuple:
+    """Return every URI-embedded credential token, longest first."""
+    secrets: set[str] = set()
+    for query_field, value in _dsn_query(dsn):
+        if query_field in {"password", "sslpassword"} and value:
+            secrets.add(value)
+
+    try:
+        raw_query = urlsplit(dsn).query
+    except (TypeError, ValueError):
+        raw_query = ""
+    for match in re.finditer(
+        r"(?:^|&)(?:password|sslpassword)=([^&#]+)", raw_query, re.IGNORECASE
+    ):
         secrets.add(match.group(1))
 
+    match = re.search(r"://[^:/?#]*:([^@/?#]+)@", dsn)
+    if match:
+        encoded_password = match.group(1)
+        secrets.add(encoded_password)
+        secrets.add(unquote(encoded_password))
     return tuple(sorted(secrets, key=len, reverse=True))
 
 
-#: Identity-bearing DSN fields, and the placeholder each becomes. Not secrets,
-#: but not things to scatter through CI logs either: together they are the map
-#: of an operator's database estate.
-_DSN_IDENTITY_FIELDS = ("host", "user", "dbname")
-
-
-def _dsn_identity(dsn: str) -> tuple:
-    """``(field, value)`` for each identity field in ``dsn``, longest first.
-
-    Length-sorted for the same reason as the secrets, and short values are
-    dropped: a one- or two-character host or user is common enough as an
-    ordinary English fragment that replacing it would corrupt the message it
-    is meant to keep readable.
-    """
-    try:
-        from psycopg2.extensions import parse_dsn
-
-        parsed = parse_dsn(dsn)
-    except Exception:  # noqa: BLE001 — unparseable; the whole-DSN replace stands
-        return ()
-
+def _dsn_connection_files(dsn: str) -> tuple:
+    """Return connection-file paths explicitly present in the runtime URI."""
     found = [
-        (field, parsed[field])
-        for field in _DSN_IDENTITY_FIELDS
-        if isinstance(parsed.get(field), str) and len(parsed[field]) > 2
+        (field, value)
+        for field, value in _dsn_query(dsn)
+        if field in _POSTGRES_CONNECTION_FILE_QUERY_FIELDS
+        and isinstance(value, str)
+        and len(value) > 2
     ]
     return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
-def _bounded_dsn(dsn: str) -> str:
-    """``dsn`` with a connection timeout, unless it already states one.
+def _postgres_connection_files(dsn: str, env: dict) -> tuple:
+    found = set(_dsn_connection_files(dsn))
+    found.update(
+        (field_name, value)
+        for env_name, field_name in _POSTGRES_CONNECTION_FILE_ENV_FIELDS.items()
+        if isinstance((value := env.get(env_name)), str) and len(value) > 2
+    )
+    return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
-    ``psycopg2.connect(dsn, connect_timeout=...)`` merges through
-    ``make_dsn``, where the **keyword wins** over the DSN. Passing the default
-    that way would silently overrule an operator who tuned a slow or distant
-    link, and doctor would then report a reachable database as unreadable —
-    the cry-wolf failure this whole change is about. So the default is applied
-    only where the DSN is silent.
-    """
+
+def _dsn_identity(dsn: str, *, include_host: bool = True) -> tuple:
+    """Return identity-bearing URI fields without asking a different driver."""
+    found: set[tuple[str, str]] = set()
     try:
-        from psycopg2.extensions import make_dsn, parse_dsn
+        parts = urlsplit(dsn)
+    except (TypeError, ValueError):
+        parts = None
 
-        if "connect_timeout" in parse_dsn(dsn):
-            return dsn
-        return make_dsn(dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS)
-    except Exception:  # noqa: BLE001 — psycopg2.ProgrammingError on a bad DSN
-        # The import is inside the ``try`` on purpose. An unparseable DSN is
-        # the connection's own problem to report, with its own message, and a
-        # psycopg2 that cannot offer these helpers is not a reason for doctor
-        # to stop reading — either way the unbounded DSN is exactly the
-        # behaviour that preceded this bound, and ``connect`` still speaks.
-        return dsn
+    if parts is not None:
+        if parts.username:
+            found.add(("user", unquote(parts.username)))
+        if include_host and parts.hostname:
+            found.add(("host", unquote(parts.hostname)))
+        if parts.path and parts.path != "/":
+            found.add(("dbname", unquote(parts.path.removeprefix("/"))))
+
+    for field_name, value in _dsn_query(dsn):
+        normalized = "dbname" if field_name == "database" else field_name
+        if normalized not in _DSN_IDENTITY_FIELDS:
+            continue
+        if normalized == "host" and not include_host:
+            continue
+        for member in value.split(",") if normalized == "host" else (value,):
+            found.add((normalized, unquote(member)))
+
+    return tuple(
+        sorted(
+            (
+                (field_name, value)
+                for field_name, value in found
+                if isinstance(value, str) and len(value) > 2
+            ),
+            key=lambda pair: len(pair[1]),
+            reverse=True,
+        )
+    )
+
+
+def _postgres_redaction_identity(dsn: str, env: dict) -> tuple:
+    """Cover identities supplied only through the spawned-agent environment."""
+    found = set(_dsn_identity(dsn))
+    found.update(
+        (field_name, value)
+        for env_name, field_name in _POSTGRES_IDENTITY_ENV_FIELDS.items()
+        if isinstance((value := env.get(env_name)), str) and len(value) > 2
+    )
+    return tuple(sorted(found, key=lambda pair: len(pair[1]), reverse=True))
 
 
 def _fetch_rows(
-    source: "_GovernanceSource",
+    source: _GovernanceSource,
     sqlite_sql: str,
     postgres_sql: str,
     sqlite_params: tuple = (),
     postgres_params: tuple = (),
 ) -> list:
-    """Run the backend's form of one read-only query and return its rows.
-
-    Raises the driver's own error type; every caller maps that to
-    ``_UnreadableDB``, the same shape it always did.
-
-    Query *and* parameters are given per backend rather than templated. The
-    placeholder style differs (``?`` vs ``%s``), and so does the scoping:
-    SQLite reads the one agent in the anchor, PostgreSQL has to name its
-    tenant. Spelling both out keeps that difference where a reader can see it.
-    """
+    """Run one read-only query through the same database driver as the runtime."""
     if source.reads_the_anchor:
-        # ``isolation_level=None`` and ``uri=False`` are the defaults; we rely
-        # on them to avoid creating a transaction we won't commit.
         with sqlite3.connect(str(source.anchor_path)) as conn:
             return conn.execute(sqlite_sql, sqlite_params).fetchall()
 
-    import psycopg2
+    return _fetch_postgres_rows_isolated(
+        source.dsn,
+        postgres_sql,
+        postgres_params,
+        postgres_home=source.postgres_home,
+        postgres_env=source.postgres_env,
+        postgres_cwd=source.postgres_cwd,
+        dsn_identity=source.dsn_identity,
+    )
 
-    # A fresh connection per query: doctor makes a handful of reads per agent,
-    # is not a hot path, and a connection that closes with its query cannot
-    # outlive a diagnostic that fails halfway.
-    connection = psycopg2.connect(_bounded_dsn(source.dsn))
+
+class _PostgresProbeError(RuntimeError):
+    """A safely transported failure from the isolated asyncpg probe."""
+
+
+class _PostgresProbeConnectionError(_PostgresProbeError):
+    """The spawned runtime's asyncpg connection failed."""
+
+
+class _PostgresProbeQueryError(_PostgresProbeError):
+    """Asyncpg connected, but the read-only governance query failed."""
+
+
+class _PostgresProbeTimeoutError(_PostgresProbeError):
+    """The bounded worker was terminated with its result still unknown."""
+
+    def __init__(self, message: str, *, partial_diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.partial_diagnostic = partial_diagnostic
+
+
+def _postgres_probe_failure_kind(exc: BaseException) -> str:
+    """Classify runtime impact without inferring it from rendered text."""
+    if isinstance(exc, _PostgresProbeConnectionError):
+        return "connection"
+    if isinstance(exc, _PostgresProbeQueryError):
+        return "runtime_database"
+    if isinstance(exc, _PostgresProbeTimeoutError):
+        return "diagnostic_timeout"
+    return "diagnostic_tooling"
+
+
+def _postgres_unreadable(exc: BaseException, *, reason: str):
+    """Build an unreadable sentinel with explicit probe provenance."""
+    return _UnreadableDB(
+        reason=reason,
+        postgres_failure=_postgres_probe_failure_kind(exc),
+        postgres_partial_diagnostic=bool(
+            isinstance(exc, _PostgresProbeTimeoutError) and exc.partial_diagnostic
+        ),
+    )
+
+
+def _source_unreadable(
+    source: _GovernanceSource,
+    exc: BaseException,
+    *,
+    reason: str,
+):
+    """Preserve PostgreSQL probe provenance only for PostgreSQL reads."""
+    if source.reads_the_anchor:
+        return _UnreadableDB(reason=reason)
+    return _postgres_unreadable(exc, reason=reason)
+
+
+def _postgres_probe_env(resolved_env: dict[str, str]) -> dict[str, str]:
+    """Copy the environment ProcessManager gives the spawned agent."""
+    child_env = dict(resolved_env)
+    child_env.setdefault("PYTHONUNBUFFERED", "1")
+    return child_env
+
+
+def _postgres_fetch_rows_in_process(
+    dsn: str,
+    sql: str,
+    params: tuple | list,
+    *,
+    connect=None,
+) -> list:
+    """Exercise the asyncpg worker seam in-process for focused tests."""
+    from kestrel_sovereign._doctor_postgres_probe import (
+        ProbeConnectionError,
+        ProbeError,
+        ProbeQueryError,
+        fetch_rows_in_process,
+    )
+
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(postgres_sql, postgres_params)
-            return cursor.fetchall()
-    finally:
-        connection.close()
+        return fetch_rows_in_process(dsn, sql, params, connect=connect)
+    except ProbeConnectionError as exc:
+        raise _PostgresProbeConnectionError(str(exc)) from exc
+    except ProbeQueryError as exc:
+        raise _PostgresProbeQueryError(str(exc)) from exc
+    except ProbeError as exc:
+        raise _PostgresProbeError(str(exc)) from exc
+
+
+def _postgres_probe_timeout_seconds(env: dict) -> int:
+    """Bound worker import, connect, query, serialization, and shutdown."""
+    return _doctor_postgres_timeout_seconds(env) + _POSTGRES_PROBE_GRACE_SECONDS
+
+
+def _probe_output_text(output: object) -> str:
+    """Decode worker output without changing redaction-sensitive bytes."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    if not isinstance(output, str):
+        return ""
+    return output
+
+
+def _redact_probe_output(
+    output: str,
+    dsn: str,
+    postgres_home: str | None,
+    dsn_identity: tuple | None,
+    postgres_env: dict[str, str] | None,
+) -> str:
+    """Redact a worker fragment before it enters an exception."""
+    if not output:
+        return ""
+    source = _GovernanceSource(
+        anchor_path=Path("."),
+        agent_did="",
+        dsn=dsn,
+        dsn_identity=dsn_identity,
+        postgres_home=postgres_home,
+        postgres_env=postgres_env,
+    )
+    return _safe(output, source)
+
+
+def _redacted_probe_output_tail(
+    output: object,
+    dsn: str,
+    postgres_home: str | None,
+    dsn_identity: tuple | None,
+    postgres_env: dict[str, str] | None,
+    *,
+    limit: int = 1000,
+) -> str:
+    """Redact raw worker output before normalizing and bounding it."""
+    decoded = _probe_output_text(output)
+    redacted = _redact_probe_output(
+        decoded,
+        dsn,
+        postgres_home,
+        dsn_identity,
+        postgres_env,
+    )
+    normalized = " ".join(redacted.strip().split())
+    return normalized[-limit:]
+
+
+def _partial_probe_diagnostic(
+    exc: subprocess.TimeoutExpired,
+    stderr: object,
+    *,
+    limit: int = 2000,
+) -> str:
+    """Keep privacy-safe phase breadcrumbs, never timeout stdout/JSON rows."""
+    allowed = {
+        "PostgreSQL diagnostic phase: connecting",
+        "PostgreSQL diagnostic phase: connected; querying",
+    }
+    breadcrumbs: list[str] = []
+    for value in (exc.stderr, stderr):
+        for line in _probe_output_text(value).splitlines():
+            phase = line.strip()
+            if phase in allowed and phase not in breadcrumbs:
+                breadcrumbs.append(phase)
+    return "; ".join(f"stderr: {phase}" for phase in breadcrumbs)[:limit]
+
+
+def _fetch_postgres_rows_isolated(
+    dsn: str,
+    sql: str,
+    params: tuple = (),
+    *,
+    postgres_home: str | None = None,
+    postgres_env: dict[str, str] | None = None,
+    postgres_cwd: str | None = None,
+    dsn_identity: tuple | None = None,
+) -> list:
+    """Run asyncpg under the spawned agent's executable, environment, and cwd."""
+    try:
+        payload = json.dumps({"dsn": dsn, "sql": sql, "params": params})
+    except (TypeError, ValueError) as exc:
+        raise _PostgresProbeError(
+            "PostgreSQL diagnostic query parameters are not transportable"
+        ) from exc
+
+    child_env = _postgres_probe_env(
+        postgres_env if postgres_env is not None else os.environ
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "kestrel_sovereign._doctor_postgres_probe",
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+            cwd=postgres_cwd,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic process could not start"
+        ) from exc
+
+    try:
+        stdout, stderr = process.communicate(
+            payload,
+            timeout=_postgres_probe_timeout_seconds(child_env),
+        )
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        _stdout, stderr = process.communicate()
+        detail = _partial_probe_diagnostic(exc, stderr)
+        message = (
+            "isolated PostgreSQL diagnostic process exceeded its bounded "
+            "timeout and was terminated"
+        )
+        raise _PostgresProbeTimeoutError(
+            f"{message}; partial diagnostic: {detail}" if detail else message,
+            partial_diagnostic=detail,
+        ) from exc
+    except OSError as exc:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic process communication failed"
+        ) from exc
+    except BaseException:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+        raise
+
+    if process.returncode:
+        detail = _redacted_probe_output_tail(
+            stderr,
+            dsn,
+            postgres_home,
+            dsn_identity,
+            child_env,
+        )
+        message = "isolated PostgreSQL diagnostic process exited unexpectedly"
+        raise _PostgresProbeError(f"{message}: {detail}" if detail else message)
+    try:
+        response = json.loads(stdout)
+    except (TypeError, ValueError) as exc:
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic process returned invalid data"
+        ) from exc
+    if not isinstance(response, dict):
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic process returned invalid data"
+        )
+    if response.get("ok") is not True:
+        error = response.get("error")
+        message = (
+            error
+            if isinstance(error, str) and error
+            else "PostgreSQL diagnostic query failed"
+        )
+        message = _redacted_probe_output_tail(
+            message,
+            dsn,
+            postgres_home,
+            dsn_identity,
+            child_env,
+        )
+        error_type = {
+            ERROR_KIND_CONNECTION: _PostgresProbeConnectionError,
+            ERROR_KIND_DIAGNOSTIC: _PostgresProbeError,
+            ERROR_KIND_QUERY: _PostgresProbeQueryError,
+        }.get(response.get("kind"), _PostgresProbeError)
+        raise error_type(message)
+
+    rows = response.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(row, list) for row in rows):
+        raise _PostgresProbeError(
+            "isolated PostgreSQL diagnostic process returned invalid rows"
+        )
+    return [tuple(row) for row in rows]
 
 
 @dataclass(frozen=True)
@@ -745,7 +1139,7 @@ def _is_placeholder_node(node: object) -> bool:
     )
 
 
-def _row_physically_exists(source: "_GovernanceSource") -> bool:
+def _row_physically_exists(source: _GovernanceSource) -> bool:
     """Whether the agent row is in the table at all, ownership aside.
 
     The scoped read cannot tell "no row" from "a row this agent does not own",
@@ -767,7 +1161,7 @@ def _row_physically_exists(source: "_GovernanceSource") -> bool:
         rows = _fetch_rows(
             source,
             "SELECT 1 FROM graph_nodes WHERE node_id = ?",
-            "SELECT 1 FROM graph_nodes WHERE node_id = %s",
+            "SELECT 1 FROM graph_nodes WHERE node_id = $1",
             sqlite_params=(source.agent_did,),
             postgres_params=(source.agent_did,),
         )
@@ -778,7 +1172,7 @@ def _row_physically_exists(source: "_GovernanceSource") -> bool:
 
 def _read_agent_governance(
     multi_agent_path: Path, project_dir: Path, env: dict
-) -> "list[_AgentGovernance]":
+) -> list[_AgentGovernance]:
     """Resolve and read every registered local agent's governance, once each.
 
     Agents whose anchor file is missing are skipped silently: that is already
@@ -800,7 +1194,7 @@ def _read_agent_governance(
         if not db_path.exists():
             continue
 
-        source = _resolve_governance_source(db_path, env, ledger_by_dsn)
+        source = _resolve_governance_source(db_path, env, project_dir, ledger_by_dsn)
         node = (
             source
             if isinstance(source, (_UnreadableDB, _SchemaAbsent))
@@ -829,19 +1223,25 @@ def _read_agent_governance(
             and source.ownership_settled
             and _row_physically_exists(source)
         )
-        runtime_is_empty = on_postgres and not unowned and (
-            isinstance(node, (_NoAgentNode, _SchemaAbsent))
-            # A boot-fabricated placeholder is *present* but is not a birth
-            # record, and boot does not keep it: ``birth_record`` counts it as
-            # an identity shortfall and replaces it from the anchor before the
-            # audit. Reading it as populated made doctor judge a row nobody
-            # will be governed by, warn only that it had no hash, and exit
-            # Ready while the stale anchor about to replace it safe-modes the
-            # agent.
-            or _is_placeholder_node(node)
+        runtime_is_empty = (
+            on_postgres
+            and not unowned
+            and (
+                isinstance(node, (_NoAgentNode, _SchemaAbsent))
+                # A boot-fabricated placeholder is *present* but is not a birth
+                # record, and boot does not keep it: ``birth_record`` counts it as
+                # an identity shortfall and replaces it from the anchor before the
+                # audit. Reading it as populated made doctor judge a row nobody
+                # will be governed by, warn only that it had no hash, and exit
+                # Ready while the stale anchor about to replace it safe-modes the
+                # agent.
+                or _is_placeholder_node(node)
+            )
         )
         if runtime_is_empty:
-            anchor_source = _resolve_governance_source(db_path, {}, ledger_by_dsn)
+            anchor_source = _resolve_governance_source(
+                db_path, {}, project_dir, ledger_by_dsn
+            )
             if isinstance(anchor_source, _GovernanceSource):
                 source, node, pending = (
                     anchor_source,
@@ -862,7 +1262,7 @@ def _read_agent_governance(
 
 
 def _check_constitution_drift(
-    readings: "list[_AgentGovernance]", report: DoctorReport
+    readings: list[_AgentGovernance], report: DoctorReport
 ) -> None:
     """Compare each agent's anchored constitution_hash against the on-disk file.
 
@@ -917,7 +1317,7 @@ def _check_constitution_drift(
 
         node = reading.node
         if isinstance(node, _UnreadableDB):
-            _report_unexamined(name, node.reason, source, report)
+            _report_unexamined(name, node.reason, node, report)
             continue
         if isinstance(node, _NoAgentNode):
             # The same verdict on either backend: the row is there, #2649 is
@@ -1030,7 +1430,7 @@ _OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
 
 
 def _check_anchor_consistency(
-    readings: "list[_AgentGovernance]", report: DoctorReport
+    readings: list[_AgentGovernance], report: DoctorReport
 ) -> None:
     """Pre-upgrade anchor-drift checks beyond base-hash drift (#2616).
 
@@ -1076,7 +1476,7 @@ def _check_anchor_consistency(
 
 def _check_governance_edge(
     name: str,
-    source: "_GovernanceSource",
+    source: _GovernanceSource,
     node_id: str,
     properties: dict,
     report: DoctorReport,
@@ -1089,6 +1489,15 @@ def _check_governance_edge(
 
     targets = _read_governed_by_targets(source, node_id)
     if isinstance(targets, _UnreadableDB):
+        if _edge_probe_left_governance_unexamined(targets):
+            _report_unexamined(
+                name,
+                targets.reason,
+                targets,
+                report,
+                database_was_reached=True,
+            )
+            return
         # FAIL, not warn: we could read the agent node moments ago, so the
         # DB is not sqlcipher-encrypted — the edges specifically cannot be
         # read (missing graph_edges table / corruption). The runtime fails
@@ -1113,9 +1522,18 @@ def _check_governance_edge(
     # by another agent"). Promising a repair for the second would send an
     # operator to a command that cannot clear the finding it was given for.
     if stored_hash not in targets:
-        physical = _read_governed_by_targets(
-            source, node_id, any_owner=True
-        )
+        physical = _read_governed_by_targets(source, node_id, any_owner=True)
+        if isinstance(physical, _UnreadableDB) and (
+            _edge_probe_left_governance_unexamined(physical)
+        ):
+            _report_unexamined(
+                name,
+                physical.reason,
+                physical,
+                report,
+                database_was_reached=True,
+            )
+            return
         if not isinstance(physical, _UnreadableDB) and stored_hash in physical:
             report.fail.append(
                 f"{name}: the governed_by edge to {stored_hash[:12]}… exists "
@@ -1162,6 +1580,21 @@ def _check_governance_edge(
             f"`kestrel constitution reanchor --agent-name {name} --force` "
             f"with a signed artifact to repair ({_rollback_advice(source)})."
         )
+
+
+def _edge_probe_left_governance_unexamined(result: _UnreadableDB) -> bool:
+    """Whether an edge read failed without establishing integrity damage.
+
+    ``runtime_database`` means the equivalent connection opened and the edge
+    query itself failed, which is evidence the runtime cannot perform proof 2.
+    Every other classified PostgreSQL failure stopped before that conclusion:
+    it may block readiness, but it cannot justify a force-reanchor repair.
+    Unclassified SQLite failures retain the established integrity finding.
+    """
+    return (
+        result.postgres_failure is not None
+        and result.postgres_failure != "runtime_database"
+    )
 
 
 def _describe_overlay_anchor(anchor: object) -> str:
@@ -1257,19 +1690,23 @@ def _check_overlay_anchor(
 
 
 def _report_unexamined(
-    name: str, reason: str, source: object, report: DoctorReport
+    name: str,
+    reason: str,
+    source: object,
+    report: DoctorReport,
+    *,
+    database_was_reached: bool = False,
 ) -> None:
     """Record that this agent's governance could not be read.
 
-    Whether that is a *fail* turns on one question: can the **agent** open this
-    database either?
+    PostgreSQL failures retain explicit provenance from the isolated asyncpg
+    worker. All leave governance unverified and therefore fail readiness, but
+    the report must not turn diagnostic blindness into integrity corruption by
+    guessing from words in ``reason``.
 
-    On PostgreSQL it cannot. A database that is down, misconfigured, or
-    refusing this account refuses the runtime too, so readiness is false and
-    must say so — ``ready`` is ``not report.fail``, and a warning here made
-    ``kestrel doctor`` print "Ready" and exit 0 having inspected no governance
-    at all, in exactly the state an operator most needs told about. "I did not
-    check" and "I checked and it is fine" are different answers.
+    An edge probe runs only after the agent-node read established the
+    runtime-equivalent connection. ``database_was_reached`` preserves that
+    evidence while still failing readiness for the incomplete governance read.
 
     On the local anchor it usually can. ``KESTREL_DB_KEY`` at inception gives a
     whole-DB sqlcipher file that stock ``sqlite3`` cannot open and the agent
@@ -1284,29 +1721,74 @@ def _report_unexamined(
     strength of a read that never happened is how an operator rewrites
     governance to fix a network problem.
     """
-    if isinstance(source, _GovernanceSource) and not source.reads_the_anchor:
-        agent_blind = True
-    elif isinstance(source, _UnreadableDB):
-        # Resolution failed before a source existed. Only PostgreSQL hosts
-        # reach that through a network read; name it from the reason.
-        agent_blind = "PostgreSQL" in reason
-    else:
-        agent_blind = False
-
-    if agent_blind:
+    postgres_failure = (
+        source.postgres_failure if isinstance(source, _UnreadableDB) else None
+    )
+    if (
+        isinstance(source, _UnreadableDB)
+        and postgres_failure is not None
+        and database_was_reached
+    ):
+        partial_advice = (
+            " Inspect the preserved partial diagnostic, then fix its cause"
+            if source.postgres_partial_diagnostic
+            else " Fix the reported failure"
+        )
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. A runtime-equivalent "
+            f"database connection succeeded while reading the agent node, but "
+            f"the governance edge read did not complete.{partial_advice} and "
+            f"re-run before treating this host as ready."
+        )
+        return
+    if postgres_failure == "connection":
         report.fail.append(
             f"{name}: governance NOT verified — {reason}. Doctor cannot say "
-            f"whether this agent is correctly anchored, and the runtime cannot "
-            f"reach that database either; fix the access problem and re-run "
-            f"before treating this host as ready."
+            f"whether this agent is correctly anchored. The spawned runtime's "
+            f"own asyncpg connection failed with its effective settings, so "
+            f"runtime database access with those settings will fail too; "
+            f"fix the access problem and re-run before treating this host as "
+            f"ready."
+        )
+    elif postgres_failure == "runtime_database":
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. The equivalent "
+            f"diagnostic connection opened but could not read governance, so "
+            f"the runtime cannot use this database for governance either; fix "
+            f"the database access problem and re-run doctor."
+        )
+    elif postgres_failure == "doctor_configuration":
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. Runtime database "
+            f"reachability was not established by this diagnostic; fix the "
+            f"doctor-only setting and re-run before treating this host as "
+            f"ready."
+        )
+    elif postgres_failure == "diagnostic_timeout":
+        partial_advice = (
+            "inspect the preserved partial diagnostic, then fix "
+            if source.postgres_partial_diagnostic
+            else "fix "
+        )
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. Runtime database "
+            f"reachability was not established before the finite diagnostic "
+            f"deadline; {partial_advice}connectivity or adjust the doctor "
+            f"timeout and re-run before "
+            f"treating this host as ready."
+        )
+    elif postgres_failure == "diagnostic_tooling":
+        report.fail.append(
+            f"{name}: governance NOT verified — {reason}. Runtime database "
+            f"reachability was not established by this diagnostic; repair the "
+            f"local diagnostic tooling and re-run before "
+            f"treating this host as ready."
         )
     else:
-        report.warn.append(
-            f"{name}: constitution drift check skipped — {reason}"
-        )
+        report.warn.append(f"{name}: constitution drift check skipped — {reason}")
 
 
-def _rollback_advice(source: "_GovernanceSource") -> str:
+def _rollback_advice(source: _GovernanceSource) -> str:
     """What an operator actually gets to undo the prescribed repair.
 
     "DB is backed up first" is true of a SQLite anchor, which the reanchor
@@ -1373,20 +1855,18 @@ _AGENT_NODE_SQLITE = (
 )
 _AGENT_NODE_PG = (
     "SELECT node_id, label, properties FROM graph_nodes "
-    "WHERE node_id = %s AND node_type = 'agent' AND EXISTS ("
+    "WHERE node_id = $1 AND node_type = 'agent' AND EXISTS ("
     "  SELECT 1 FROM graph_node_owners AS owner "
-    "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = %s)"
+    "  WHERE owner.node_id = graph_nodes.node_id AND owner.agent_id = $2)"
 )
 #: Physical ``governed_by`` targets regardless of who witnesses them. Compared
 #: against the scoped read to tell "no such edge" from "an edge this agent
 #: cannot use" — different findings, with different remedies.
 _GOVERNED_BY_ANY_OWNER_SQLITE = (
-    "SELECT target_id FROM graph_edges "
-    "WHERE source_id = ? AND label = 'governed_by'"
+    "SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'"
 )
 _GOVERNED_BY_ANY_OWNER_PG = (
-    "SELECT target_id FROM graph_edges "
-    "WHERE source_id = %s AND label = 'governed_by'"
+    "SELECT target_id FROM graph_edges WHERE source_id = $1 AND label = 'governed_by'"
 )
 _GOVERNED_BY_SQLITE = (
     "SELECT target_id FROM graph_edges "
@@ -1398,11 +1878,11 @@ _GOVERNED_BY_SQLITE = (
 )
 _GOVERNED_BY_PG = (
     "SELECT target_id FROM graph_edges "
-    "WHERE source_id = %s AND label = 'governed_by' AND EXISTS ("
+    "WHERE source_id = $1 AND label = 'governed_by' AND EXISTS ("
     "  SELECT 1 FROM graph_edge_owners AS owner "
     "  WHERE owner.source_id = graph_edges.source_id "
     "  AND owner.target_id = graph_edges.target_id "
-    "  AND owner.label = graph_edges.label AND owner.agent_id = %s)"
+    "  AND owner.label = graph_edges.label AND owner.agent_id = $2)"
 )
 
 #: The same reads against a database predating the ownership migration
@@ -1415,7 +1895,7 @@ _AGENT_NODE_SQLITE_LEGACY = (
 )
 _AGENT_NODE_PG_LEGACY = (
     "SELECT node_id, label, properties FROM graph_nodes "
-    "WHERE node_id = %s AND node_type = 'agent' AND %s IS NOT NULL"
+    "WHERE node_id = $1 AND node_type = 'agent' AND $2::text IS NOT NULL"
 )
 _GOVERNED_BY_SQLITE_LEGACY = (
     "SELECT target_id FROM graph_edges "
@@ -1423,15 +1903,22 @@ _GOVERNED_BY_SQLITE_LEGACY = (
 )
 _GOVERNED_BY_PG_LEGACY = (
     "SELECT target_id FROM graph_edges "
-    "WHERE source_id = %s AND label = 'governed_by' AND %s IS NOT NULL"
+    "WHERE source_id = $1 AND label = 'governed_by' AND $2::text IS NOT NULL"
 )
 
 
 @dataclass(frozen=True)
 class _UnreadableDB:
-    """Sentinel: the agent DB exists but stock sqlite3 can't open it."""
+    """Sentinel: doctor could not read the agent's governance database.
+
+    ``postgres_failure`` records what was actually established. It is absent
+    for SQLite and must never be reconstructed from prose in ``reason``.
+    """
 
     reason: str
+    postgres_failure: str | None = None
+    #: True only when a timed-out isolated worker yielded redacted output.
+    postgres_partial_diagnostic: bool = False
 
 
 @dataclass(frozen=True)
@@ -1521,7 +2008,7 @@ def _anchored_emancipation_contract(properties: dict | None):
     return properties.get("emancipation_contract")
 
 
-def _read_agent_node(source: "_GovernanceSource"):
+def _read_agent_node(source: _GovernanceSource):
     """Read the agent node's id + properties as the *runtime* sees it.
 
     Scoped to the bound tenant on both backends — see the query constants for
@@ -1536,10 +2023,10 @@ def _read_agent_node(source: "_GovernanceSource"):
     try:
         rows = _fetch_rows(
             source,
-            _AGENT_NODE_SQLITE if source.ownership_settled
+            _AGENT_NODE_SQLITE
+            if source.ownership_settled
             else _AGENT_NODE_SQLITE_LEGACY,
-            _AGENT_NODE_PG if source.ownership_settled
-            else _AGENT_NODE_PG_LEGACY,
+            _AGENT_NODE_PG if source.ownership_settled else _AGENT_NODE_PG_LEGACY,
             sqlite_params=(source.agent_did, source.agent_did),
             postgres_params=(source.agent_did, source.agent_did),
         )
@@ -1547,9 +2034,11 @@ def _read_agent_node(source: "_GovernanceSource"):
         return _UnreadableDB(reason=f"DB unreadable ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
-        return _UnreadableDB(
-            reason=f"cannot read {source.describe()} ({_safe(exc, source)})"
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
+        return _source_unreadable(
+            source,
+            exc,
+            reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
         )
 
     if not rows:
@@ -1575,7 +2064,7 @@ def _read_agent_node(source: "_GovernanceSource"):
 
 
 def _read_governed_by_targets(
-    source: "_GovernanceSource", source_id: str, *, any_owner: bool = False
+    source: _GovernanceSource, source_id: str, *, any_owner: bool = False
 ):
     """Return the targets of the agent's ``governed_by`` edges.
 
@@ -1587,11 +2076,15 @@ def _read_governed_by_targets(
     try:
         rows = _fetch_rows(
             source,
-            _GOVERNED_BY_ANY_OWNER_SQLITE if any_owner
-            else _GOVERNED_BY_SQLITE if source.ownership_settled
+            _GOVERNED_BY_ANY_OWNER_SQLITE
+            if any_owner
+            else _GOVERNED_BY_SQLITE
+            if source.ownership_settled
             else _GOVERNED_BY_SQLITE_LEGACY,
-            _GOVERNED_BY_ANY_OWNER_PG if any_owner
-            else _GOVERNED_BY_PG if source.ownership_settled
+            _GOVERNED_BY_ANY_OWNER_PG
+            if any_owner
+            else _GOVERNED_BY_PG
+            if source.ownership_settled
             else _GOVERNED_BY_PG_LEGACY,
             # The any-owner form binds only ``source_id``; the scoped and
             # legacy forms bind the DID a second time. Passing the scoped
@@ -1610,12 +2103,13 @@ def _read_governed_by_targets(
         return _UnreadableDB(reason=f"cannot read graph_edges ({exc})")
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
-    except Exception as exc:  # noqa: BLE001 — psycopg2 raises its own tree
-        return _UnreadableDB(
+    except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
+        return _source_unreadable(
+            source,
+            exc,
             reason=(
-                f"cannot read graph_edges in {source.describe()} "
-                f"({_safe(exc, source)})"
-            )
+                f"cannot read graph_edges in {source.describe()} ({_safe(exc, source)})"
+            ),
         )
 
     return tuple(row[0] for row in rows if row[0])

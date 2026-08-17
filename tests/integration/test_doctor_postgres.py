@@ -9,9 +9,9 @@ reported birth-time state as current — and after #2890 made
 anchor alone, that means doctor flags drift *permanently* while the repair it
 prescribes correctly answers "nothing to do".
 
-The unit suite fakes psycopg2. This runs the real driver against a real
-database, because "the query I wrote is the query PostgreSQL accepts" is
-exactly what a fake cannot tell me.
+The unit suite fakes asyncpg's public connection surface. This runs Doctor's
+isolated asyncpg worker against a real database, because "the query I wrote is
+the query PostgreSQL accepts" is exactly what a fake cannot tell me.
 
 Run against any throwaway PostgreSQL:
 
@@ -29,6 +29,7 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import toml
@@ -381,13 +382,34 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     runtime_db(
         AGENT_DID, {"name": "Test", "constitution_hash": stale}, governed_by=stale
     )
-    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
-    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    from psycopg2.extensions import parse_dsn
+
+    parsed = parse_dsn(runtime_db.dsn)
+    connection_names = {
+        "host": "PGHOST",
+        "port": "PGPORT",
+        "user": "PGUSER",
+        "password": "PGPASSWORD",
+        "sslmode": "PGSSLMODE",
+        "sslrootcert": "PGSSLROOTCERT",
+    }
+    connection_env = {
+        env_name: parsed[dsn_name]
+        for dsn_name, env_name in connection_names.items()
+        if parsed.get(dsn_name) is not None
+    }
+    for name in ("KESTREL_DB_BACKEND", "KESTREL_DATABASE_URL", *connection_env):
+        monkeypatch.delenv(name, raising=False)
     write_env(
         tmp_path / ".env",
         {
             "KESTREL_DB_BACKEND": "postgres",
-            "KESTREL_DATABASE_URL": runtime_db.dsn,
+            # Only the database is explicit. The spawned agent receives every
+            # host/authentication/TLS value solely through project PG* keys.
+            "KESTREL_DATABASE_URL": (
+                "postgresql:///" + quote(parsed["dbname"], safe="")
+            ),
+            **connection_env,
         },
     )
 
@@ -399,6 +421,135 @@ def test_the_project_env_alone_is_enough_to_reach_postgres(
     assert "KESTREL_DB_BACKEND" not in os.environ, (
         "a diagnostic must not export the project's environment"
     )
+    assert all(name not in os.environ for name in connection_env)
+
+
+def test_explicit_dsn_parameters_outrank_project_pg_environment(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """Installed asyncpg, not Doctor, resolves its documented precedence."""
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_db.dsn)
+    monkeypatch.setenv("PGHOST", "127.0.0.1")
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGDATABASE", "not_the_runtime_database")
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+def test_asyncpg_search_path_is_applied_to_doctors_session(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """A server setting asyncpg accepts is diagnosed instead of refused."""
+    import psycopg2
+    from psycopg2 import sql
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    schema = f"doctor_{uuid.uuid4().hex[:12]}"
+    connection = psycopg2.connect(runtime_db.dsn)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+            for table in (
+                "graph_nodes",
+                "graph_edges",
+                "graph_node_owners",
+                "graph_edge_owners",
+                "schema_backfills",
+            ):
+                cursor.execute(
+                    sql.SQL("ALTER TABLE {} SET SCHEMA {}").format(
+                        sql.Identifier(table), sql.Identifier(schema)
+                    )
+                )
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        runtime_db.dsn + "?search_path=" + quote(schema, safe=""),
+    )
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
+
+
+def test_runtime_rejected_startup_setting_is_not_reported_healthy(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """asyncpg sends unknown query names as startup settings, just as runtime does."""
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        runtime_db.dsn + "?connect_timeout=30",
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("governance NOT verified" in message for message in report.fail)
+
+
+def test_asyncpg_031_service_file_reaches_doctor_unchanged(
+    tmp_path, monkeypatch, canonical, runtime_db
+):
+    """The current minor's public service/servicefile behavior needs no mirror."""
+    from importlib.metadata import version
+
+    from packaging.version import Version
+    from psycopg2.extensions import parse_dsn
+
+    if Version(version("asyncpg")) < Version("0.31"):
+        pytest.skip("asyncpg 0.31 service-file support is not installed")
+
+    _seed_project(tmp_path, anchored_hash=canonical)
+    runtime_db(
+        AGENT_DID,
+        {"name": "Test", "constitution_hash": canonical},
+        governed_by=canonical,
+    )
+    parsed = parse_dsn(runtime_db.dsn)
+    service_file = tmp_path / "pg_service.conf"
+    service_file.write_text(
+        "[doctor_runtime]\n"
+        + "\n".join(
+            f"{name}={parsed[name]}"
+            for name in ("host", "port", "user", "password", "dbname", "sslmode")
+            if parsed.get(name) is not None
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL", "postgresql:///?service=doctor_runtime"
+    )
+    monkeypatch.setenv("PGSERVICEFILE", str(service_file))
+
+    report = diagnose(tmp_path)
+
+    assert report.ready, f"ok={report.ok} warn={report.warn} fail={report.fail}"
 
 
 def test_a_row_the_bound_runtime_cannot_see_is_not_a_clean_bill_of_health(
@@ -799,4 +950,3 @@ async def test_an_unwitnessed_edge_is_drift_the_reanchor_will_repair(
 
     assert not result.unchanged, "reported nothing to do for a failing proof 2"
     assert result.drift_unforced, result
-
