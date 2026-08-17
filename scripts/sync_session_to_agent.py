@@ -129,6 +129,12 @@ def sync_to_agent(messages: list[dict], db_path: str, agent_id: str = None) -> d
         # Normalize timestamp format
         ts = ts.replace("T", " ").split("+")[0].split(".")[0] if "T" in ts else ts
 
+        # No ``session_id`` (#2958). The column is derived from
+        # ``metadata.session_id`` and the metadata built above never carries
+        # one, so the correct value here is the column's NULL default —
+        # stamping it would be a call that can only ever return None. If this
+        # script ever starts filing synced turns under a session, that changes:
+        # write ``column_session_id(metadata)`` rather than the id directly.
         db.execute(
             "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
             (agent_id, msg["role"], tagged_content, metadata, ts),

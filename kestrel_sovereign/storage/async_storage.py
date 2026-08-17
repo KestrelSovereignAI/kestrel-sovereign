@@ -37,6 +37,7 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
+from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import DatabaseBackend, SQLiteBackend, create_backend
 
@@ -2423,7 +2424,11 @@ class AsyncStorage:
                     # created_at to now() destroyed history ordering, and
                     # dropping deleted_at resurrected trashed (soft-deleted)
                     # messages. session_id rides inside ``metadata`` and is
-                    # carried verbatim.
+                    # carried verbatim; the indexed column is re-derived from
+                    # it below, so a backup taken before that column existed
+                    # restores with it populated wherever the stored id is
+                    # inside the column's contract, and NULL where it is not
+                    # (#2958).
                     cursor = await backup_conn.execute(
                         "SELECT role, content, metadata"
                         + (", model" if has_model else ", NULL AS model")
@@ -2466,11 +2471,13 @@ class AsyncStorage:
                         await self.db.execute_commit(
                             "INSERT INTO conversation_history "
                             "(agent_id, role, content, model, provider, metadata, "
-                            "created_at, deleted_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            "session_id, created_at, deleted_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, role, content, model, provider,
-                                metadata_json, _ts(created_at), _ts(deleted_at),
+                                metadata_json,
+                                column_session_id(metadata_json),
+                                _ts(created_at), _ts(deleted_at),
                             )
                         )
                         stats["messages_restored"] += 1

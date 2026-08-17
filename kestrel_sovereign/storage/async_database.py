@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
+from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     model TEXT DEFAULT NULL,
     provider TEXT DEFAULT NULL,
     metadata TEXT,
+    session_id TEXT DEFAULT NULL,
     lexical_index_id TEXT DEFAULT NULL,
     lexical_index_version TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -954,6 +956,12 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "conversation_history", "provider", "TEXT DEFAULT NULL"
         )
+        # #2958: session identity becomes an indexable column instead of a
+        # value buried in metadata JSON. Backfilled from metadata in the same
+        # transaction as the ALTER; a row keeps the column's NULL default
+        # wherever metadata holds no session id, or holds one outside the
+        # column's portable contract.
+        await self._migrate_conversation_session_id_column()
         # #1710 follow-up: if a pending A2A question observes a terminal
         # answer but fails to enqueue the local resumption signal, keep the
         # terminal payload on the WAITING row so replay/sweeps can retry the
@@ -1039,10 +1047,17 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "wait_signal_state", "last_surface_status", "TEXT"
         )
+        # Both indexes go through ``ensure_index`` rather than a bare
+        # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
+        # sequence but not safe in parallel, and ``_init_schema`` runs on every
+        # ``from_pool()``. The column probes stay — unlike the session_id
+        # migration, these ALTERs are non-fatal, so the column genuinely may be
+        # absent here (#795).
         if await self._column_exists("conversation_history", "deleted_at"):
-            await self._backend.execute(
-                "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
-                "ON conversation_history(agent_id, deleted_at)"
+            await self.ensure_index(
+                "idx_conversation_deleted_at",
+                "conversation_history",
+                "agent_id, deleted_at",
             )
         else:
             logger.error(
@@ -1051,9 +1066,10 @@ class AsyncDatabase:
                 "preceding logs."
             )
         if await self._column_exists("conversation_history", "archived_at"):
-            await self._backend.execute(
-                "CREATE INDEX IF NOT EXISTS idx_conversation_archived_at "
-                "ON conversation_history(agent_id, archived_at)"
+            await self.ensure_index(
+                "idx_conversation_archived_at",
+                "conversation_history",
+                "agent_id, archived_at",
             )
         else:
             logger.error(
@@ -1715,6 +1731,181 @@ class AsyncDatabase:
                     f"{table} is missing column(s) after migration: "
                     + ", ".join(still_missing)
                 )
+
+    async def ensure_index(
+        self, name: str, table: str, columns: str, *, lock_name: str = "",
+    ) -> None:
+        """Create an index if it is absent, serialized across initializers.
+
+        ``IF NOT EXISTS`` is not the whole answer, which is why this exists.
+        It makes the statement idempotent in SEQUENCE — run twice, the second
+        is a no-op — but it does not make it safe in PARALLEL. Postgres
+        evaluates the existence test before taking the lock that would exclude
+        a peer, so two initializers that pass it together both proceed to build
+        the index and one loses on ``pg_class``' unique index
+        (``duplicate key value ... pg_class_relname_nsp_index``). ``_init_schema``
+        runs on every ``from_pool()`` — frinz calls it per request — so a
+        post-upgrade request burst is exactly the parallel case, and the loser
+        does not merely skip the index: its whole initialization raises and the
+        request fails.
+
+        Same probe → lock → re-probe as :meth:`ensure_check_constraint`, for
+        the same reason: the check that decided to enter is stale by the time
+        the lock is held.
+
+        Returns only once ``table`` really carries ``name``, and raises
+        otherwise. That last check is not belt-and-braces: the probe above asks
+        about the (name, table) PAIR, while ``IF NOT EXISTS`` is satisfied by
+        the NAME alone — index names are unique per database on SQLite and per
+        schema on PostgreSQL, both wider than one table. Given a same-named
+        index on a different table the two disagree, and the disagreement is
+        silent in the worst direction: the probe says "absent", the DDL says
+        "already there" and does nothing, and the only symptom is a query plan.
+        Verified against both engines rather than inferred — sqlite 3.50 and
+        PostgreSQL 16.14 each no-op.
+
+        ``columns`` is the index expression as it appears inside the
+        parentheses (``"agent_id, session_id"``). Neither it nor ``name`` may
+        come from untrusted input — both are interpolated, as no backend binds
+        parameters into DDL.
+        """
+        if await self._index_exists(name, table):
+            return
+        created = False
+        async with self.migration_lock(lock_name or f"index_{name}"):
+            # Re-probed under the lock: a concurrent initializer may have
+            # created it while this one waited.
+            if not await self._index_exists(name, table):
+                await self._backend.execute(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+                )
+                created = True
+        # Outside the lock deliberately: the statement has committed, so this
+        # reads what the next boot would read, and a raise here is the caller's
+        # own error rather than a rolled-back transaction's.
+        if not await self._index_exists(name, table):
+            owner = await self._index_name_owner(name, table)
+            raise RuntimeError(
+                f"{table}: index {name}({columns}) was not created. The name "
+                f"is already taken by "
+                + (f"an index on {owner!r}" if owner else "another relation")
+                + " — index names are unique per database on SQLite and per "
+                "schema on PostgreSQL, so CREATE INDEX IF NOT EXISTS treated "
+                "it as already present and did nothing. Rename one of them."
+            )
+        if created:
+            logger.info("%s: created index %s(%s)", table, name, columns)
+
+    async def _index_name_owner(self, name: str, table: str) -> Optional[str]:
+        """Which relation already holds the index name ``name``, if any.
+
+        Only ever consulted to name a collision in the error above, so it
+        answers with a display string and ``None`` rather than raising: a
+        diagnostic that can itself fail would replace the message it exists to
+        improve.
+
+        Scoped to the namespace the ``CREATE INDEX`` would have written into,
+        because that is the scope the collision happened in — on PostgreSQL an
+        index in a *different* schema is not a collision at all (the migration
+        succeeds beside its own table), so reporting one would send the reader
+        after the wrong object.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT COALESCE(owner.relname, taken.relname) "
+                "FROM pg_class taken "
+                "LEFT JOIN pg_index i ON i.indexrelid = taken.oid "
+                "LEFT JOIN pg_class owner ON owner.oid = i.indrelid "
+                "WHERE taken.relname = ? AND taken.relnamespace = "
+                "(SELECT relnamespace FROM pg_class WHERE oid = to_regclass(?))",
+                (name, table),
+            )
+        else:
+            # SQLite has one namespace per database file, so no scoping term.
+            row = await self._backend.fetch_one(
+                "SELECT tbl_name FROM sqlite_master WHERE name = ?", (name,)
+            )
+        return row[0] if row and row[0] else None
+
+    async def _index_exists(self, name: str, table: str) -> bool:
+        """Whether ``table`` already carries an index called ``name``.
+
+        Asked of the TABLE, never of the index name alone. An index name is
+        only unique within its schema, so ``to_regclass(name)`` answers about
+        the first index of that name on the search path — which need not be the
+        one beside the table an unqualified ``CREATE INDEX`` would build. With a
+        decoy index in an earlier schema and the target table in a later one,
+        the name-only probe reports "present", the index is never created, and
+        nothing downstream notices: ``CREATE INDEX IF NOT EXISTS`` would have
+        shrugged too, and the only symptom is a query plan.
+
+        ``to_regclass(table)`` resolves the same relation the ``CREATE INDEX``
+        will target — the reasoning ``_column_exists`` spells out — and
+        ``pg_index.indrelid`` then restricts the answer to indexes that actually
+        belong to it. SQLite's ``sqlite_master.tbl_name`` is the same question
+        in that dialect's terms.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
+                (table, name),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'index' AND name = ? AND tbl_name = ?",
+                (name, table),
+            )
+        return bool(row and row[0])
+
+    def _conversation_session_id_backfill(self) -> tuple:
+        """``(sql, params)`` lifting legacy ``metadata.session_id`` into the column.
+
+        The statement itself is owned by
+        :mod:`kestrel_sovereign.storage.session_id_column`, next to the Python
+        predicate the write path stamps with and the contract both derive from.
+        Two spellings of one rule is the shape that drifts, so they are not
+        allowed to live in different files.
+        """
+        return backfill_statement(self.backend_type)
+
+    async def _migrate_conversation_session_id_column(self) -> None:
+        """Give ``conversation_history.session_id`` a column and an index (#2958).
+
+        Session identity has only ever lived inside each row's ``metadata``
+        JSON. A value inside a JSON blob cannot be indexed, so
+        ``list_conversations`` could not query by it and had to oversample
+        history and hope the session it wanted was in the window.
+
+        The ALTER and the legacy backfill are declared together so
+        ``migrate_columns_once`` runs them in ONE transaction: a column that
+        exists without its backfill is undetectable afterwards (the schema is
+        the marker), so it must not be reachable.
+
+        Additive for this release — the write path stamps the column but every
+        reader still resolves sessions through metadata, which stays
+        authoritative until the read path moves (#2948). The column is
+        therefore allowed to be NULL wherever the backfill could not safely
+        derive a value, and Phase C has to tolerate that anyway.
+        """
+        await self.migrate_columns_once(
+            "conversation_history",
+            (("session_id", "TEXT DEFAULT NULL"),),
+            {"session_id": self._conversation_session_id_backfill()},
+        )
+        # The column is guaranteed here — migrate_columns_once raises unless it
+        # landed — but the INDEX still needs ``ensure_index``: that guarantee is
+        # about the schema, not about how many initializers are building the
+        # index at once. The ALTER is serialized by its own migration lock; a
+        # bare CREATE INDEX after it is not, and two boots racing there is a
+        # failed request rather than a skipped index.
+        await self.ensure_index(
+            "idx_conversation_agent_session",
+            "conversation_history",
+            "agent_id, session_id",
+        )
 
     async def ensure_check_constraint(
         self,

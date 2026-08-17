@@ -32,6 +32,11 @@ from .session_grouping import (
     timestamp_predicate,
     timestamp_query_param,
 )
+from .session_id_column import (
+    SESSION_ID_KEY,
+    column_session_id,
+    merged_column_assignment,
+)
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .lexical_memory_index import (
@@ -1373,6 +1378,12 @@ class AsyncConversationStore:
                 content=prepared.content,
                 rendered_content=prepared.rendered_content,
                 metadata=json.dumps(prepared.metadata) if prepared.metadata else None,
+                # Derived from the metadata this same INSERT is about to
+                # store, rather than from a variable that may have moved on
+                # (#2958). The rule is deliberately narrower than session
+                # grouping's, so the column stays NULL for ids grouping still
+                # honours: it may be silent, never wrong.
+                session_id=column_session_id(prepared.metadata),
                 embedding=prepared.embedding,
                 embedding_profile_id=prepared.embedding_profile_id,
                 model=prepared.model,
@@ -1503,6 +1514,7 @@ class AsyncConversationStore:
         embedding_profile_id: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        session_id: Optional[str] = None,
         lexical_index_id: Optional[str] = None,
         lexical_index_version: Optional[str] = None,
     ) -> bool:
@@ -1526,26 +1538,39 @@ class AsyncConversationStore:
         when embeddings are unavailable. ``embedding_profile_id`` is
         always written alongside ``embedding_vec`` — they share the
         same row state (#1477).
+
+        ``session_id`` duplicates the id already inside ``metadata`` into its
+        own indexed column, or is ``None`` where that id is outside the
+        column's contract (#2958). It rides in the base AND legacy column
+        lists because its migration raises unless the column exists, so no
+        schema this method can reach is without it — unlike the
+        lexical/embedding columns, whose migrations are non-fatal and whose
+        absence the fallbacks below exist to survive.
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, lexical_index_id, lexical_index_version, created_at"
+            "metadata, session_id, lexical_index_id, lexical_index_version, "
+            "created_at"
         )
         base_vals_suffix = f", {self._now_sql()}"
         base_params = (
             self.agent_id, role, content, rendered_content, model, provider,
-            metadata, lexical_index_id, lexical_index_version,
+            metadata, session_id, lexical_index_id, lexical_index_version,
         )
         legacy_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, created_at"
+            "metadata, session_id, created_at"
         )
-        legacy_params = base_params[:7]
+        legacy_params = base_params[:8]
+        # Generated, not hand-counted: these lists are spelled into six
+        # statements below and a miscount would only surface at runtime.
+        base_binds = ", ".join(["?"] * len(base_params))
+        legacy_binds = ", ".join(["?"] * len(legacy_params))
 
         if embedding is None:
             sql = (
                 f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
+                f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
                 await self.db.execute_commit(sql, base_params)
@@ -1559,7 +1584,7 @@ class AsyncConversationStore:
                 )
                 await self.db.execute_commit(
                     f"INSERT INTO conversation_history ({legacy_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                    f"VALUES ({legacy_binds}{base_vals_suffix})",
                     legacy_params,
                 )
                 return False
@@ -1580,7 +1605,7 @@ class AsyncConversationStore:
             sql = (
                 f"INSERT INTO conversation_history "
                 f"({base_cols}, embedding_vec, embedding_profile_id) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
             await self.db.execute_commit(
@@ -1596,7 +1621,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder}, ?)",
                         legacy_params + (emb_bind, embedding_profile_id),
                     )
@@ -1622,7 +1647,7 @@ class AsyncConversationStore:
                 sql = (
                     f"INSERT INTO conversation_history "
                     f"({base_cols}, embedding_vec) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                    f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
                 await self.db.execute_commit(sql, base_params + (emb_bind,))
@@ -1636,7 +1661,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder})",
                         legacy_params + (emb_bind,),
                     )
@@ -1648,7 +1673,7 @@ class AsyncConversationStore:
                     )
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history ({legacy_cols}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                        f"VALUES ({legacy_binds}{base_vals_suffix})",
                         legacy_params,
                     )
                     return False
@@ -3381,6 +3406,26 @@ class AsyncConversationStore:
         rehearsal, reflection, tagging, and routing writes cannot be erased by
         a stale Python read-modify-write cycle.
 
+        The key set is the caller's, so this is the one door through which
+        ``metadata.session_id`` can be rewritten after insertion. When it is,
+        the derived column moves in the SAME statement (#2958) — a merge that
+        left the column behind would put the row in the single state the column
+        is not allowed to occupy: naming a session its metadata no longer does.
+        Every other key leaves the column untouched, including the merge that
+        deletes nothing and the empty update.
+
+        The column follows the metadata down to NULL where the merge cannot
+        speak for the whole document, and "cannot" is wider than it looks. On
+        BOTH backends a metadata root that is not an object — ``42``, ``[]``,
+        ``"text"``, JSON ``null``, all shapes free-text legacy metadata holds —
+        declines the merge while reporting success: SQLite's ``json_set``
+        returns the document unchanged and PostgreSQL's ``||`` concatenates
+        into an array instead of merging. On SQLite a legacy row carrying the
+        key twice additionally stays ambiguous after ``json_set``. None of
+        those rows has an id the column may claim. See
+        :func:`~kestrel_sovereign.storage.session_id_column.merged_column_assignment`
+        for the measurements and why the metadata is left as it is.
+
         Args:
             message_id: The message ID to update
             metadata_updates: Dict of metadata fields to update (merged with existing)
@@ -3388,15 +3433,32 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
+        # The value is derived from the update rather than re-read from the
+        # row, because the merge is last-writer-wins on this key and re-reading
+        # would reintroduce the read-modify-write race this method exists to
+        # avoid. Whether that value may be stamped at all is a question about
+        # the DOCUMENT, though, and the two dialects merge documents
+        # differently, so the clause comes from the shared contract rather than
+        # being spelled here (#2958).
+        if SESSION_ID_KEY in metadata_updates:
+            column_assignment = ", " + merged_column_assignment(
+                self.db.backend_type
+            )
+            column_params: tuple = (column_session_id(metadata_updates),)
+        else:
+            column_assignment = ""
+            column_params = ()
+
         if self.db.backend_type == "postgres":
             updates_json = json.dumps(metadata_updates)
             # PostgreSQL: atomic JSON merge via || operator
             # COALESCE handles NULL metadata columns gracefully
             result = await self.db.execute_commit(
                 "UPDATE conversation_history "
-                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb "
+                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb"
+                f"{column_assignment} "
                 "WHERE id = ? AND agent_id = ?",
-                (updates_json, message_id, self.agent_id)
+                (updates_json, *column_params, message_id, self.agent_id)
             )
             updated = result.rowcount > 0 if hasattr(result, 'rowcount') else True
             if not updated:
@@ -3415,11 +3477,15 @@ class AsyncConversationStore:
                     merge_params.extend((f'$."{escaped_key}"', json.dumps(value)))
                 sql = (
                     "UPDATE conversation_history SET metadata = "
-                    f"json_set(COALESCE(metadata, '{{}}'), {assignments}) "
+                    f"json_set(COALESCE(metadata, '{{}}'), {assignments})"
+                    f"{column_assignment} "
                     "WHERE id = ? AND agent_id = ?"
                 )
-                params = (*merge_params, message_id, self.agent_id)
+                params = (*merge_params, *column_params,
+                          message_id, self.agent_id)
             else:
+                # No keys, so no session_id among them — the column cannot be
+                # stale after a merge that changes nothing.
                 sql = (
                     "UPDATE conversation_history SET metadata = "
                     "COALESCE(metadata, '{}') WHERE id = ? AND agent_id = ?"
@@ -3653,7 +3719,24 @@ class AsyncConversationStore:
         Backend-aware: both SQLite (3.38+) and PostgreSQL (jsonb)
         support ``json_set`` + ``json_extract`` natively, so the
         statement is a single atomic UPDATE on either.
+
+        Both field names come from the caller, which makes this the second door
+        onto ``metadata.session_id`` — and unlike
+        :meth:`update_message_metadata` it declines rather than keeping the
+        derived column in step (#2958). Not squeamishness: this writes a
+        counter or a timestamp, and neither is ever a session identity. A
+        caller asking for one has a bug that a silently-synchronized column
+        would hide.
         """
+        if SESSION_ID_KEY in (counter_field, timestamp_field):
+            raise ValueError(
+                f"atomic_increment_metadata_counter cannot write metadata."
+                f"{SESSION_ID_KEY}: it writes counters and timestamps, and "
+                f"neither is a session identity. Session identity is moved "
+                f"through update_message_metadata, which keeps the indexed "
+                f"conversation_history.{SESSION_ID_KEY} column in step (#2958)."
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat() if timestamp_field else None
 
         if self.db.backend_type == "postgres":
@@ -3747,6 +3830,10 @@ class AsyncConversationStore:
         metadata_updates: Dict[str, Any]
     ) -> int:
         """Update metadata for multiple messages.
+
+        One :meth:`update_message_metadata` per id, so the derived
+        ``session_id`` column moves with the metadata here too (#2958) — the
+        per-row statement stays atomic; only the batch is not.
 
         Args:
             message_ids: List of message IDs to update
