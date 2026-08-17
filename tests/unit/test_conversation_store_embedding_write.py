@@ -45,12 +45,6 @@ def _make_store(
     db.execute = AsyncMock(return_value=1)
     db.fetchone = AsyncMock(return_value=None)  # no prior history → new session
     db.fetchall = AsyncMock(return_value=[])
-    # A persisted turn also maintains the #2959 session projection, which reads
-    # and writes through this same double: ``execute`` for the row, and —
-    # on PostgreSQL — ``fetchval`` for the advisory boundary it holds across the
-    # refresh. A double missing either fails as an un-awaitable MagicMock, which
-    # says nothing about embeddings, the subject here.
-    db.fetchval = AsyncMock(return_value=None)
     store = AsyncConversationStore(db=db, agent_id=agent_id)
     # Per-instance override of the provider-embedding lookup. Doing this
     # post-construction instead of via ``__init__`` keeps the production
@@ -292,11 +286,6 @@ async def test_add_conversation_skips_embedding_when_route_is_none(monkeypatch):
     db = MagicMock()
     db.backend_type = "sqlite"
     db.execute_commit = AsyncMock(return_value=1)
-    # ``execute`` as well as ``execute_commit``: a persisted turn also
-    # maintains the #2959 session projection, which writes through it. A double
-    # missing it fails as an un-awaitable MagicMock, which says nothing about
-    # embeddings — the subject here.
-    db.execute = AsyncMock(return_value=1)
     db.fetchone = AsyncMock(return_value=None)
     db.fetchall = AsyncMock(return_value=[])
     store = AsyncConversationStore(db=db, agent_id="a", llm_service=off_service)

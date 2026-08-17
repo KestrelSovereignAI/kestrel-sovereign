@@ -358,50 +358,9 @@ def backfill_conversation_history(
             )
             conn.commit()
             report.encrypted_now += 1
-        if report.encrypted_now:
-            _invalidate_session_projection(conn)
     finally:
         conn.close()
     return report
-
-
-def _invalidate_session_projection(conn: sqlite3.Connection) -> None:
-    """Make the next boot rebuild the #2959 ``conversation_sessions`` table.
-
-    The UPDATE above can RE-TAG a legacy untagged row to this agent, which moves
-    it between the ``(agent_id, session_id)`` keys the projection groups by. That
-    projection may be absent or right, never stale — and this tool cannot
-    maintain it: it runs offline against a raw ``sqlite3`` connection, with no
-    async database, no store and no event loop.
-
-    So it clears the completion marker and the rows instead of trying to write
-    them. The projection's backfill is also its repair pass, so the next boot
-    rebuilds every session from the rows as they now stand — turning what would
-    be a wrong row into an absent one for the interval, which is the recoverable
-    direction. Without this the marker says "done" forever and nothing revisits
-    the sessions this pass re-homed.
-
-    Best-effort: a database old enough to predate either table has no projection
-    to be wrong about, and failing an encryption migration over a derived index
-    would be the wrong trade.
-    """
-    from kestrel_sovereign.storage.async_database import (
-        _SESSION_PROJECTION_BACKFILL,
-    )
-
-    try:
-        conn.execute(
-            "DELETE FROM schema_backfills WHERE name = ?",
-            (_SESSION_PROJECTION_BACKFILL,),
-        )
-        conn.execute("DELETE FROM conversation_sessions")
-        conn.commit()
-    except sqlite3.Error as exc:
-        logger.warning(
-            "Could not invalidate the conversation_sessions projection after "
-            "re-tagging rows (%s); it will be repaired on the next write to "
-            "each session rather than at boot.", exc,
-        )
 
 
 def backfill_files(

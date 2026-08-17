@@ -67,11 +67,6 @@ class MemoryConsolidator:
 
     # Thresholds
     DECAY_ARCHIVE_THRESHOLD = 0.1  # Archive if strength < 10%
-    # How many archival stamps share one transaction with their #2959
-    # projection refresh. A batch is the unit of "rows and the row describing
-    # them move together"; the number only bounds how long the writer slot is
-    # held on a history large enough to decay thousands of rows in one night.
-    ARCHIVE_WRITE_BATCH = 200
     MIN_EPISODE_MESSAGES = 3       # Minimum messages for an episode
     MAX_EPISODE_HOURS = 24         # Maximum episode time span
     SESSION_EPISODE_THRESHOLD = 20 # Create episode after N messages in session
@@ -2003,33 +1998,14 @@ class MemoryConsolidator:
         They won't appear in normal retrieval but can still be
         accessed if specifically requested.
 
-        Archival takes rows OUT OF THE LIVE SET, so it is a mutation the #2959
-        ``conversation_sessions`` projection describes — archive the first user
-        turn of a session and an unmaintained projection is left pointing at a
-        row no reader can see, which is the one state that table may never be
-        in. The decision pass below is therefore separated from the write pass:
-        deciding is a read (and a long one, over every live row), while each
-        write batch is one transaction carrying both the ``archived_at`` stamps
-        and the projection refresh for the sessions they belong to. Batched
-        rather than one transaction for the whole night, so a large history does
-        not hold the writer slot for its entire decay sweep; each batch is
-        internally consistent, which is what the invariant asks for.
-
         Returns:
             Number of messages archived
         """
-        # The projection is built from ``self._db`` directly rather than from
-        # the optional ``conversation_store``: this method is reached with that
-        # store absent (raw storage, offline CLI, tests), and an invariant that
-        # holds only when a collaborator happens to be wired is not one.
-        from .conversation_sessions import ConversationSessionProjection
+        archived_count = 0
 
-        # ``session_id`` is the indexed column (#2958), read rather than
-        # re-derived from metadata — that is what Phase A exists to have
-        # removed. It also survives the metadata rewrite below, which is why
-        # the session is captured from the row and not from the new document.
+        # Get all messages (paginated for large histories)
         rows = await self._db.fetchall(
-            """SELECT id, metadata, created_at, session_id
+            """SELECT id, metadata, created_at
                FROM conversation_history
                WHERE agent_id = ?
                  AND deleted_at IS NULL AND archived_at IS NULL
@@ -2037,12 +2013,8 @@ class MemoryConsolidator:
             (self.agent_id,)
         )
 
-        # (message id, metadata JSON to store, archived_at, session id) for
-        # every row this pass has decided to archive. Nothing is written yet.
-        planned: List[Tuple[Any, str, str, Optional[str]]] = []
-
         for row in rows:
-            msg_id, metadata, created_at, session_id = row
+            msg_id, metadata, created_at = row
 
             if isinstance(metadata, str):
                 try:
@@ -2066,9 +2038,14 @@ class MemoryConsolidator:
                 metadata.pop("archived", None)
                 if not archived_at:
                     archived_at = datetime.now(timezone.utc).isoformat()
-                planned.append(
-                    (msg_id, json.dumps(metadata), archived_at, session_id)
+                await self._db.execute(
+                    """UPDATE conversation_history
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id),
                 )
+                archived_count += 1
                 continue
 
             # decay_protected pins prevent ROUTINE archival only.
@@ -2096,38 +2073,17 @@ class MemoryConsolidator:
 
             # Archive if below threshold
             if strength < self.DECAY_ARCHIVE_THRESHOLD:
+                archived_at = datetime.now(timezone.utc).isoformat()
                 metadata["archived_strength"] = strength
-                planned.append((
-                    msg_id,
-                    json.dumps(metadata),
-                    datetime.now(timezone.utc).isoformat(),
-                    session_id,
-                ))
 
-        if not planned:
-            return 0
-
-        projection = ConversationSessionProjection(self._db, self.agent_id)
-        archived_count = 0
-        for start in range(0, len(planned), self.ARCHIVE_WRITE_BATCH):
-            batch = planned[start:start + self.ARCHIVE_WRITE_BATCH]
-            async with self._db.transaction():
-                for msg_id, metadata_json, archived_at, _session_id in batch:
-                    await self._db.execute(
-                        """UPDATE conversation_history
-                           SET metadata = ?, archived_at = ?
-                           WHERE id = ? AND agent_id = ?
-                             AND deleted_at IS NULL AND archived_at IS NULL""",
-                        (metadata_json, archived_at, msg_id, self.agent_id),
-                    )
-                    archived_count += 1
-                # Same transaction as the stamps above: rows out of the live
-                # set with a projection that still counts them is the forbidden
-                # window, and it is the ordering — not the statement — that
-                # closes it.
-                await projection.refresh(
-                    session_id for _, _, _, session_id in batch
+                await self._db.execute(
+                    """UPDATE conversation_history
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id)
                 )
+                archived_count += 1
 
         return archived_count
 

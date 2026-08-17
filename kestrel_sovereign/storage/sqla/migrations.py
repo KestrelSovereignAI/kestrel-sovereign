@@ -39,7 +39,6 @@ from ..async_assertion_store import (
     _legacy_erasure_assertion_key,
     _now,
 )
-from ..conversation_sessions import ConversationSessionProjection
 from ..session_id_column import column_session_id
 
 if TYPE_CHECKING:
@@ -2323,11 +2322,8 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
     # Rewrite conversation_history rows whose session_id is an integer naming
     # one of those owned markers.
     rewritten_history = 0
-    # Which sessions each agent's relinked rows left and joined, for the #2959
-    # projection below.
-    resettled: dict[str, set] = {}
     async with db.transaction():
-        for row_id, agent_id, raw in history_rows:
+        for row_id, _agent_id, raw in history_rows:
             meta, sid = _extract_session_id(raw)
             if meta is None or sid is None:
                 continue
@@ -2339,14 +2335,6 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
                 continue
             new_meta = dict(meta)
             new_meta["session_id"] = canonical
-            # Both ends of the move, derived rather than assumed: the source is
-            # an integer key the column contract declines, so in practice it
-            # contributes nothing — but "in practice" is the shape of a fix that
-            # stops being true when the contract widens, and asking
-            # ``column_session_id`` costs a function call.
-            for touched in (column_session_id(meta), column_session_id(new_meta)):
-                if touched:
-                    resettled.setdefault(agent_id, set()).add(touched)
             # The indexed ``session_id`` column is derived from metadata
             # (#2958), so a relink that moved metadata must move it too —
             # otherwise this row keeps the value the backfill left while its
@@ -2364,21 +2352,6 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
                 (json.dumps(new_meta), column_session_id(new_meta), row_id),
             )
             rewritten_history += 1
-
-        # #2959: a relinked row changes which session the projection should be
-        # counting it under, so the sessions it left and joined are recomputed
-        # inside this same transaction. This must NOT be left to the
-        # projection's own one-time backfill: that runs behind a completion
-        # marker, while this relink runs on every boot and can therefore move a
-        # row after the marker is set — a numeric key created by an old client
-        # after the upgrade. The projection would then keep describing a
-        # membership the relink has already changed, and nothing would ever
-        # revisit it. Absent is recoverable; stale is the state this table may
-        # not be in.
-        for agent_id, session_ids in sorted(resettled.items()):
-            await ConversationSessionProjection(db, agent_id).refresh(
-                sorted(session_ids)
-            )
 
     # Step 3: remap user-assigned conversation names keyed by the integer
     # session_id. PK is (agent_id, session_id); if a UUID-keyed name already

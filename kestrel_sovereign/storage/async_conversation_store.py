@@ -23,7 +23,6 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
-from .conversation_sessions import ConversationSessionProjection
 from .session_grouping import (
     canonical_timestamp_sql,
     coerce_session_timestamp,
@@ -523,71 +522,6 @@ class AsyncConversationStore:
         self._lexical_index = ConversationLexicalIndex(db, agent_id)
         self._last_lexical_bridge_stats: Dict[str, Any] = {}
         self._lexical_coverage_index_available: Optional[bool] = None
-        #: The #2959 projection of this agent's sessions. Every mutation below
-        #: that changes which rows are live tells it which sessions to
-        #: recompute; it never receives a delta.
-        self.session_projection = ConversationSessionProjection(db, agent_id)
-
-    # ------------------------------------------------------------------
-    # Session projection maintenance (#2959)
-    # ------------------------------------------------------------------
-    #
-    # THE INVARIANT: a ``conversation_sessions`` row may only claim a
-    # ``first_user_message_id`` that is live, and counts that describe rows
-    # that are live. Every mutation below that changes which rows are live
-    # therefore names the sessions it touched and has them RECOMPUTED — never
-    # incremented, never decremented. A derived count cannot drift and a
-    # derived pointer cannot outlive its row.
-    #
-    # Deletions do that inside the same write unit as the mutation, because
-    # only there does the ordering matter: rows gone + projection unrefreshed
-    # is precisely the forbidden state, a record claiming what nobody can
-    # observe. Insertion is deliberately NOT wrapped (see
-    # ``_persist_prepared_conversation``): a torn insert leaves the projection
-    # one message short, which is the recoverable direction.
-
-    async def refresh_session_projection(
-        self, session_ids: Iterable[Optional[str]]
-    ) -> None:
-        """Recompute the named sessions' projection rows.
-
-        Public because writers that do not go through this store — the salvage
-        marker, backup restore — own rows in these sessions too, and a writer
-        that cannot say what it changed leaves the projection lying.
-        """
-        await self.session_projection.refresh(session_ids)
-
-    @staticmethod
-    def _session_ids_of(rows: Iterable[Sequence[Any]], metadata_index: int) -> List[str]:
-        """The sessions a set of already-fetched rows belongs to.
-
-        Derived from each row's stored metadata with the same function the
-        column is stamped from, so this asks the question the column answers
-        without a second query for a value the caller is already holding.
-        """
-        return [
-            session_id
-            for session_id in (
-                column_session_id(row[metadata_index]) for row in rows
-            )
-            if session_id
-        ]
-
-    async def _sessions_of_messages(self, message_ids: Sequence[int]) -> List[str]:
-        """The sessions the given rows are filed under, read from the column."""
-        sessions: List[str] = []
-        ids = [int(message_id) for message_id in message_ids]
-        for start in range(0, len(ids), _EXACT_PURGE_BATCH_SIZE):
-            batch = ids[start:start + _EXACT_PURGE_BATCH_SIZE]
-            placeholders = ",".join("?" for _ in batch)
-            rows = await self.db.fetchall(
-                "SELECT session_id FROM conversation_history "
-                f"WHERE agent_id = ? AND id IN ({placeholders}) "
-                "AND session_id IS NOT NULL",
-                (self.agent_id, *batch),
-            )
-            sessions.extend(row[0] for row in rows if row[0])
-        return sessions
 
     async def _audit_destructive_operation(
         self,
@@ -850,20 +784,6 @@ class AsyncConversationStore:
                     (self.agent_id, *batch),
                 )
                 purged += _rows_affected(affected)
-
-            # #2959: in the SAME transaction as the DELETE, and derived from
-            # the snapshot rather than from a re-read, because there is
-            # nothing left to re-read. A purged row that a session row still
-            # pointed at would be the exact failure this projection is not
-            # allowed to have — a pointer at something nobody can observe —
-            # and it would be permanent, since purge leaves no trace to
-            # reconcile against. The sessions come from the snapshot's stored
-            # metadata (index 3) through the same derivation that stamped the
-            # column, so no purged id is needed to find them.
-            if message_ids:
-                await self.refresh_session_projection(
-                    self._session_ids_of(rows, metadata_index=3)
-                )
 
             # Delete a key only after its selected owners are gone, and only
             # when no surviving row still owns it.  Legacy databases did not
@@ -1479,19 +1399,6 @@ class AsyncConversationStore:
         if not lexical_columns_written and prepared.lexical_index_id:
             await self._discard_lexical_tokens(prepared.lexical_index_id)
             prepared.lexical_index_id = None
-
-        # #2959: the row is live, so its session's projection is now one
-        # message behind. Recomputed here rather than inside a transaction
-        # wrapping the INSERT above: that INSERT is a fallback CHAIN which
-        # advances by letting a statement fail, and on PostgreSQL a failed
-        # statement aborts the enclosing transaction — wrapping it would turn
-        # every partial-schema fallback into a hard write failure. The
-        # ordering is safe in this direction anyway: a crash between the two
-        # leaves the projection one message SHORT, never pointing at a row
-        # that is not there, and the next write to the session restores it.
-        await self.refresh_session_projection(
-            [column_session_id(prepared.metadata)]
-        )
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
@@ -2676,16 +2583,11 @@ class AsyncConversationStore:
         Use ``purge_all`` when you genuinely need to destroy the rows
         (administrative wipe, EPHEMERAL session close, restore-from-CAR).
         """
-        async with self.db.transaction():
-            await self.db.execute_commit(
-                f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
-                "WHERE agent_id = ? AND deleted_at IS NULL",
-                (self.agent_id,)
-            )
-            # Nothing of this agent's is live afterwards, so no session has a
-            # live row to describe. Dropping them all is the same answer a
-            # per-session recompute would reach, without the scan (#2959).
-            await self.session_projection.forget_all()
+        await self.db.execute_commit(
+            f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
+            "WHERE agent_id = ? AND deleted_at IS NULL",
+            (self.agent_id,)
+        )
 
     # ------------------------------------------------------------------
     # Conversation titles (user-assigned rename support — issue #716).
@@ -2783,20 +2685,12 @@ class AsyncConversationStore:
             True if a live row was soft-deleted, False if not found or
             already in trash.
         """
-        async with self.db.transaction():
-            # Read the session BEFORE the stamp: afterwards the row is no
-            # longer live, and a projection refresh has to be told which
-            # session lost it (#2959).
-            sessions = await self._sessions_of_messages([message_id])
-            affected = await self.db.execute_commit(
-                f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
-                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                (message_id, self.agent_id)
-            )
-            deleted = _rows_affected(affected) > 0
-            if deleted:
-                await self.refresh_session_projection(sessions)
-        return deleted
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET deleted_at = {self._now_sql()} "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+            (message_id, self.agent_id)
+        )
+        return _rows_affected(affected) > 0
 
     async def delete_conversation_session(self, session_id: str) -> int:
         """Soft-delete every live message in the given session (#763).
@@ -2844,21 +2738,13 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
-        async with self.db.transaction():
-            affected = await self.db.execute_commit(
-                f"UPDATE conversation_history "
-                f"SET deleted_at = {self._now_sql()} "
-                f"WHERE id IN ({placeholders}) AND agent_id = ? "
-                f"AND deleted_at IS NULL",
-                tuple(params),
-            )
-            # A resolved session can span several ids — a legacy row-id
-            # session absorbs the UUID sessions inside its time window — so
-            # every session those rows were filed under is recomputed, not
-            # just the one that was asked for (#2959).
-            await self.refresh_session_projection(
-                self._session_ids_of(rows, metadata_index=3)
-            )
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history "
+            f"SET deleted_at = {self._now_sql()} "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NULL",
+            tuple(params),
+        )
         return _rows_affected(affected)
 
     async def archive_conversation_session(self, session_id: str) -> int:
@@ -2891,19 +2777,13 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
-        async with self.db.transaction():
-            affected = await self.db.execute_commit(
-                f"UPDATE conversation_history "
-                f"SET archived_at = {self._now_sql()} "
-                f"WHERE id IN ({placeholders}) AND agent_id = ? "
-                f"AND deleted_at IS NULL AND archived_at IS NULL",
-                tuple(params),
-            )
-            # Archiving takes rows out of the live set exactly as deletion
-            # does, so the pointer must move off an archived row too (#2959).
-            await self.refresh_session_projection(
-                self._session_ids_of(rows, metadata_index=3)
-            )
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history "
+            f"SET archived_at = {self._now_sql()} "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NULL AND archived_at IS NULL",
+            tuple(params),
+        )
         return _rows_affected(affected)
 
     async def unarchive_conversation_session(self, session_id: str) -> int:
@@ -2930,17 +2810,12 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
-        async with self.db.transaction():
-            affected = await self.db.execute_commit(
-                f"UPDATE conversation_history SET archived_at = NULL "
-                f"WHERE id IN ({placeholders}) AND agent_id = ? "
-                f"AND archived_at IS NOT NULL",
-                tuple(params),
-            )
-            # ...and back, so a restored turn can be the pointer again (#2959).
-            await self.refresh_session_projection(
-                self._session_ids_of(rows, metadata_index=3)
-            )
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET archived_at = NULL "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND archived_at IS NOT NULL",
+            tuple(params),
+        )
         return _rows_affected(affected)
 
     # ------------------------------------------------------------------
@@ -2959,20 +2834,12 @@ class AsyncConversationStore:
             doesn't exist, isn't owned by this agent, or wasn't actually
             in trash.
         """
-        async with self.db.transaction():
-            affected = await self.db.execute_commit(
-                "UPDATE conversation_history SET deleted_at = NULL "
-                "WHERE id = ? AND agent_id = ? AND deleted_at IS NOT NULL",
-                (message_id, self.agent_id),
-            )
-            restored = _rows_affected(affected) > 0
-            if restored:
-                # Read AFTER the clear — the row is live again, which is the
-                # state the projection describes (#2959).
-                await self.refresh_session_projection(
-                    await self._sessions_of_messages([message_id])
-                )
-        return restored
+        affected = await self.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = NULL "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NOT NULL",
+            (message_id, self.agent_id),
+        )
+        return _rows_affected(affected) > 0
 
     async def restore_conversation_session(self, session_id: str) -> int:
         """Clear deleted_at on every soft-deleted message in a session.
@@ -2999,18 +2866,12 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
-        async with self.db.transaction():
-            affected = await self.db.execute_commit(
-                f"UPDATE conversation_history SET deleted_at = NULL "
-                f"WHERE id IN ({placeholders}) AND agent_id = ? "
-                f"AND deleted_at IS NOT NULL",
-                tuple(params),
-            )
-            # The mirror of the delete: the sessions those rows belong to have
-            # them back, so the pointer moves back too (#2959).
-            await self.refresh_session_projection(
-                self._session_ids_of(rows, metadata_index=3)
-            )
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET deleted_at = NULL "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NOT NULL",
+            tuple(params),
+        )
         return _rows_affected(affected)
 
     # ------------------------------------------------------------------
@@ -3565,11 +3426,6 @@ class AsyncConversationStore:
         :func:`~kestrel_sovereign.storage.session_id_column.merged_column_assignment`
         for the measurements and why the metadata is left as it is.
 
-        A row that moves between sessions changes BOTH of them, so the #2959
-        projection is recomputed for the session it left and the one it joined,
-        in the same write unit as the merge. An update that does not mention
-        the key cannot move the row and so touches neither.
-
         Args:
             message_id: The message ID to update
             metadata_updates: Dict of metadata fields to update (merged with existing)
@@ -3577,30 +3433,6 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
-        if SESSION_ID_KEY not in metadata_updates:
-            return await self._merge_message_metadata(message_id, metadata_updates)
-
-        async with self.db.transaction():
-            # Before and after, because "which sessions changed" is a question
-            # about both ends of the move and only the row itself knows the
-            # first one. Whether the merge actually lands the incoming id is
-            # the merge's business (it declines documents it cannot speak
-            # for), so the AFTER value is read back rather than assumed.
-            before = await self._sessions_of_messages([message_id])
-            updated = await self._merge_message_metadata(
-                message_id, metadata_updates
-            )
-            if updated:
-                after = await self._sessions_of_messages([message_id])
-                await self.refresh_session_projection([*before, *after])
-        return updated
-
-    async def _merge_message_metadata(
-        self,
-        message_id: int,
-        metadata_updates: Dict[str, Any]
-    ) -> bool:
-        """The metadata merge itself, without the projection bookkeeping."""
         # The value is derived from the update rather than re-read from the
         # row, because the merge is last-writer-wins on this key and re-reading
         # would reintroduce the read-modify-write race this method exists to

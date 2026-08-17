@@ -33,16 +33,20 @@ file must report zero skips.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import AsyncIterator
 from uuid import uuid4
 
 import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.conversation_sessions import (
+    PROJECTION_INPUT_COLUMNS,
+    ConversationSessionProjection,
+)
 from kestrel_sovereign.storage.session_grouping import group_messages_into_sessions
 from kestrel_sovereign.storage.session_id_column import (
     SESSION_ID_MAX_LENGTH,
@@ -58,6 +62,10 @@ POSTGRES_URL = (
 )
 
 UUID_A = "3a6c1f0e-2b7d-4c8a-9e10-000000000001"
+#: Sorts after ``UUID_A``, which the fence case depends on: a repair refreshes
+#: sessions in sorted order, so the pass parked on its first ``_store`` is
+#: holding session A's row.
+UUID_B = "3a6c1f0e-2b7d-4c8a-9e10-000000000002"
 
 # A JSON document whose session_id is a NUL. Written as the escape the way any
 # ``json.dumps`` would store it — PostgreSQL accepts this text as JSON and then
@@ -221,6 +229,16 @@ async def _advisory_lock_holders(db: AsyncDatabase, name: str) -> list:
     )
 
 
+def _accounting(watermark) -> tuple:
+    """What a watermark *claims*, without its epoch.
+
+    The epoch is an ownership token that counts repairs, so pinning its value in
+    an assertion would make every case that adds one fail for a reason unrelated
+    to what it tests. The three fields below are the promise.
+    """
+    return (watermark.valid, watermark.frontier, watermark.changes)
+
+
 async def _before_the_budget(db: AsyncDatabase, what: str, awaitable, budget=None):
     """Await ``awaitable``, failing — never hanging — if it blocks too long."""
     try:
@@ -333,15 +351,7 @@ async def _isolated_schema(db_backend) -> AsyncIterator[AsyncDatabase]:
 
 
 async def _create_pre_migration_table(db: AsyncDatabase, table: str = "conversation_history") -> None:
-    """The table as it stood before session_id was a column.
-
-    "Pre-migration" means *this* migration, not every one before it: the
-    soft-delete and archive columns are here because the store's own write
-    paths read them, and a fixture missing those would fail for a reason that
-    has nothing to do with what these tests measure. The #2959 projection table
-    is created for the same reason — the store maintains it on every write, and
-    the tests below drive real store methods.
-    """
+    """The table as it stood before session_id was a column."""
     id_column = (
         "BIGSERIAL PRIMARY KEY"
         if db.backend_type == "postgres"
@@ -352,17 +362,7 @@ async def _create_pre_migration_table(db: AsyncDatabase, table: str = "conversat
         f"id {id_column}, agent_id TEXT NOT NULL DEFAULT '', "
         "role TEXT NOT NULL, content TEXT NOT NULL, metadata TEXT, "
         "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-        "deleted_at TIMESTAMP DEFAULT NULL, "
-        "archived_at TIMESTAMP DEFAULT NULL)"
-    )
-    await db.execute(
-        "CREATE TABLE IF NOT EXISTS conversation_sessions ("
-        "agent_id TEXT NOT NULL, session_id TEXT NOT NULL, "
-        "started_at TIMESTAMP, last_message_at TIMESTAMP, "
-        "message_count INTEGER NOT NULL DEFAULT 0, "
-        "user_message_count INTEGER NOT NULL DEFAULT 0, "
-        "first_user_message_id INTEGER, wake_source TEXT, "
-        "PRIMARY KEY (agent_id, session_id))"
+        "deleted_at TIMESTAMP DEFAULT NULL)"
     )
 
 
@@ -1332,13 +1332,83 @@ async def test_a_lock_order_inversion_is_detected_rather_than_waited_out(postgre
     assert await _advisory_lock_holders(db, second) == []
 
 
-# ── #2959: the projection, against a real engine ─────────────────────────
+@pytest.mark.asyncio
+async def test_postgres_refuses_a_nul_in_the_column_so_the_contract_must(postgres_db):
+    """Why the NUL exclusion is a contract clause and not a nicety.
+
+    The backfill guard keeps a NUL out of the column during upgrade; this pins
+    the reason. If a later change relaxed the charset, PostgreSQL would start
+    rejecting ordinary conversation writes — not one row, every turn in that
+    session — and the failure would surface as a broken chat, not a bad value.
+    """
+    db = postgres_db
+    table = f"nul_probe_{uuid4().hex[:10]}"
+    await db.execute(f"CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, session_id TEXT)")
+    try:
+        with pytest.raises(Exception) as raised:
+            await db.execute(f"INSERT INTO {table} (session_id) VALUES (?)", ("a\x00b",))
+        assert "0x00" in str(raised.value), str(raised.value)
+
+        assert column_session_id({"session_id": "a\x00b"}) is None
+    finally:
+        await db.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@asynccontextmanager
+async def _schema_every_task_can_see(db: AsyncDatabase) -> AsyncIterator[AsyncDatabase]:
+    """Like ``_isolated_schema``, but the isolation survives into other TASKS.
+
+    ``_isolated_schema`` pins its schema with ``SET LOCAL search_path`` inside
+    one transaction — connection-local state on the one connection that
+    transaction holds. A concurrent task's queries acquire a DIFFERENT pool
+    connection, which never saw that ``SET``, so a concurrency test built on it
+    would quietly write half its rows into ``public`` and measure nothing there.
+    (Measured during Phase A: four gathered initializers built their index in
+    ``public`` while the assertion looked in the isolated schema and found none.)
+    Setting the search_path as a pool server setting makes it the default for
+    every connection the pool opens, which is the only form of this isolation a
+    multi-task test can use.
+
+    ``db`` is the control connection — used to create and tear down the schema.
+    """
+    import asyncpg
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    schema = f"session_projection_{uuid4().hex}"
+    await db.execute(f'CREATE SCHEMA "{schema}"')
+    pool = await asyncpg.create_pool(
+        POSTGRES_URL,
+        min_size=2,
+        max_size=8,
+        server_settings={"search_path": schema},
+    )
+    try:
+        yield AsyncDatabase(PostgresBackend.from_pool(pool))
+    finally:
+        await pool.close()
+        await db.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+# ── #2959: the projection and its change stamp, against a real engine ─────
 #
-# The projection's SQL is dialect-sensitive in three places the SQLite suite
-# cannot speak for: an ``ON CONFLICT ... DO UPDATE`` upsert, a TIMESTAMP column
-# bound from the grouper's ISO text (asyncpg rejects a str where SQLite wants
-# one), and a maintenance write that has to live inside the purge's real
-# transaction. Each is exercised here through the real store.
+# The projection's SQL is dialect-sensitive in four places the SQLite suite
+# cannot speak for:
+#
+# * an ``ON CONFLICT ... DO UPDATE`` upsert, and a compare-and-swap ``UPDATE``
+#   whose affected-row count decides whether a watermark may advance -- asyncpg
+#   reports that count by parsing a status string, SQLite by ``cursor.rowcount``;
+# * a TIMESTAMP column bound from the grouper's ISO text, which asyncpg rejects
+#   where SQLite requires it;
+# * the TRIGGERS that maintain the change stamp. SQLite writes three trigger
+#   bodies; PostgreSQL writes one PL/pgSQL function and three triggers that call
+#   it, in a language SQLite does not have. Nothing about one leg is evidence
+#   about the other, and a stamp that does not move is a projection that reports
+#   itself current forever;
+# * the WIDTH of the watermark columns. SQLite has one integer type and stores
+#   whatever fits in 64 bits, so an overflow of the declared width is not a
+#   thing that can happen there. PostgreSQL raises, out of the compare-and-swap,
+#   and the projection then never advances again.
 
 
 def _without_embeddings(monkeypatch) -> None:
@@ -1346,7 +1416,7 @@ def _without_embeddings(monkeypatch) -> None:
 
     ``add_conversation`` co-writes ``embedding_vec`` when a provider is
     reachable, and that column arrives by a migration these fixtures do not
-    run — so whether the INSERT takes its primary path would depend on whether
+    run -- so whether the INSERT takes its primary path would depend on whether
     a local model happens to be up. The projection has nothing to do with
     embeddings; this is the documented opt-out, so the test measures the same
     thing on every machine.
@@ -1372,17 +1442,446 @@ async def _create_core_tables(db: AsyncDatabase, *tables: str) -> None:
         await db.execute(matching[0].strip())
 
 
+#: Every CORE_SCHEMA table the #2959 projection reads or writes beside. The
+#: projection's OWN tables are deliberately absent: they are no longer declared
+#: in ``CORE_SCHEMA`` at all, and are created through the shipped
+#: ``ensure_session_projection_schema`` by :func:`_create_projection_schema`
+#: below — so a case cannot exercise a hand-copied table the product does not
+#: have, nor skip the triggers that come with them.
+_PROJECTION_TABLES = (
+    "conversation_history",
+    "conversation_lexical_tokens",
+)
+
+
+async def _create_projection_schema(db: AsyncDatabase) -> None:
+    """Everything the projection needs, through the path production uses."""
+    await _create_core_tables(db, *_PROJECTION_TABLES)
+    await db.ensure_session_projection_schema()
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_the_projection_is_written_and_maintained_on_both_backends(
+async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
+    """Tables, triggers and indexes, through whichever dialect actually ran.
+
+    None of it is decoration. ``idx_conversation_sessions_recent`` is what makes
+    a page of the newest sessions cost the page instead of the table, which is
+    the only reason the projection exists. ``idx_conversation_agent_row_id`` is
+    what makes reading the frontier one backward index step — SQLite gets that
+    plan free from its implicit rowid, so without a PostgreSQL leg an absent
+    index would look fine and quietly be an O(history) scan on the engine that
+    matters. And the triggers are the entire staleness contract: PostgreSQL
+    needs a PL/pgSQL function SQLite has no counterpart for, so "it works on
+    SQLite" is no evidence at all here.
+
+    Every declaration is read from the shipped constants rather than respelled,
+    so this cannot pass against objects the product does not create.
+    """
+    from kestrel_sovereign.storage.async_database import (
+        _SESSION_FRONTIER_INDEX,
+        _SESSION_PROJECTION_INDEX,
+    )
+    from kestrel_sovereign.storage.conversation_sessions import (
+        mutation_triggers,
+        projection_tables,
+    )
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+        for table, _ddl in projection_tables():
+            assert await db.table_exists(table) is False, table
+        for name, table, _columns in (
+            _SESSION_PROJECTION_INDEX,
+            _SESSION_FRONTIER_INDEX,
+        ):
+            assert await db._index_exists(name, table) is False
+
+        await db.ensure_session_projection_schema()
+        # Idempotent: ``_init_schema`` runs on every ``from_pool()``, so the
+        # second call is the one that happens thousands of times.
+        await db.ensure_session_projection_schema()
+
+        for table, _ddl in projection_tables():
+            assert await db.table_exists(table) is True, table
+        for trigger, _ddl in mutation_triggers(db.backend_type):
+            assert await db._trigger_exists(trigger, "conversation_history"), trigger
+        for name, table, _columns in (
+            _SESSION_PROJECTION_INDEX,
+            _SESSION_FRONTIER_INDEX,
+        ):
+            assert await db._index_exists(name, table) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_each_row_event_moves_the_change_stamp_by_exactly_one(db_backend):
+    """The arithmetic the incremental branch rests on, on the real engine.
+
+    A repair may skip everything below its frontier only when the stamp's
+    movement equals the number of rows standing above it, and that equality is
+    only meaningful while every row event counts once. PostgreSQL routes all
+    three triggers through one PL/pgSQL function with a ``TG_OP`` switch, so a
+    mis-written branch could stamp an UPDATE twice — which would make the cheap
+    branch unreachable, silently, with every test that only checks CONTENT still
+    passing.
+
+    Writes go through raw SQL rather than the store so that each statement's
+    row-event count is exactly what this case says it is.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        ConversationSessionProjection as _Projection,
+    )
+    from kestrel_sovereign.storage.session_grouping import timestamp_query_param
+
+    def _at(hour: int, minute: int):
+        return timestamp_query_param(
+            db.backend_type, f"2026-03-01T{hour:02d}:{minute:02d}:00"
+        )
+
+    agent_id = f"did:test:change-stamp:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        projection = _Projection(db, agent_id)
+        assert await projection.observed_changes() == 0
+
+        for index in range(3):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at) "
+                "VALUES (?, 'user', ?, ?, ?, ?)",
+                (agent_id, f"turn {index}", json.dumps({"session_id": UUID_A}),
+                 UUID_A, _at(9, index)),
+            )
+        assert await projection.observed_changes() == 3
+
+        first = int(await db.fetchval(
+            "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        ))
+        await db.execute(
+            "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
+            (_at(10, 0), first),
+        )
+        assert await projection.observed_changes() == 4, (
+            "one UPDATE moved the stamp by more than one, so the incremental "
+            "branch's arithmetic no longer holds"
+        )
+
+        # A write to a column no field of the projection is derived from must
+        # not move it at all -- otherwise the encryption backfill and the
+        # embedding co-write would each force a full rebuild.
+        await db.execute(
+            "UPDATE conversation_history SET content = ? WHERE id = ?",
+            ("rewritten", first),
+        )
+        assert await projection.observed_changes() == 4
+
+        await db.execute(
+            "DELETE FROM conversation_history WHERE id = ?", (first,)
+        )
+        assert await projection.observed_changes() == 5
+
+
+#: The columns an UPDATE trigger must watch, spelled out **independently** of
+#: ``PROJECTION_INPUT_COLUMNS`` and then required to equal it by
+#: :func:`test_every_watched_column_has_a_case`.
+#:
+#: Not derived from that constant, and the difference is the whole point:
+#: parametrizing a case over the list it defends means deleting an entry deletes
+#: the case with it, so the suite stays green while the protection goes away.
+#: Measured — the first spelling of this file did exactly that, and four
+#: mutations of the watched list survived it.
+_WATCHED_COLUMNS = (
+    "agent_id",
+    "session_id",
+    "role",
+    "metadata",
+    "created_at",
+    "deleted_at",
+    "archived_at",
+)
+
+
+def test_every_watched_column_has_a_case():
+    """The two lists are one list, checked rather than assumed.
+
+    Adding a column to ``PROJECTION_INPUT_COLUMNS`` without adding it here would
+    leave the new entry undefended; removing one from there without removing it
+    here leaves the case below standing, to fail — which is the direction that
+    matters.
+    """
+    assert _WATCHED_COLUMNS == PROJECTION_INPUT_COLUMNS
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("column", _WATCHED_COLUMNS)
+async def test_writing_any_watched_column_alone_moves_the_change_stamp(
+    db_backend, column
+):
+    """Every watched column, defended one at a time.
+
+    A column can be in that list and still have no case that fails when it is
+    removed, because most mutations move several columns at once — the metadata
+    merge that re-homes a row rewrites ``session_id`` *and* ``metadata``, so a
+    trigger watching only the second still notices. Which means the first entry
+    would read as protection while a mutation deleting it went unnoticed, and
+    that is precisely the shape Phase A's review named as the worst kind.
+
+    ``session_id`` alone really does move: Phase A's backfill is
+    ``UPDATE conversation_history SET session_id = ...`` and touches nothing
+    else, so it is the shape written here. Each column gets its own
+    parametrization so removing any one of them fails exactly one case.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        ConversationSessionProjection as _Projection,
+    )
+    from kestrel_sovereign.storage.session_grouping import timestamp_query_param
+
+    agent_id = f"did:test:watched-{column}:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, 'user', 'a turn', ?, ?, ?)",
+            (agent_id, json.dumps({"session_id": UUID_A}), UUID_A,
+             timestamp_query_param(db.backend_type, "2026-03-01T09:00:00")),
+        )
+        projection = _Projection(db, agent_id)
+        assert await projection.observed_changes() == 1
+
+        # A value genuinely different from the one the row holds, so the
+        # trigger's IS DISTINCT FROM / IS NOT test really fires.
+        replacement = {
+            "agent_id": f"did:test:somewhere-else:{uuid4()}",
+            "session_id": "3a6c1f0e-2b7d-4c8a-9e10-00000000000f",
+            "role": "assistant",
+            "metadata": json.dumps({"session_id": UUID_A, "operator_signal": True}),
+            "created_at": timestamp_query_param(
+                db.backend_type, "2026-03-01T11:00:00"
+            ),
+            "deleted_at": timestamp_query_param(
+                db.backend_type, "2026-03-01T12:00:00"
+            ),
+            "archived_at": timestamp_query_param(
+                db.backend_type, "2026-03-01T13:00:00"
+            ),
+        }[column]
+        await db.execute(
+            f"UPDATE conversation_history SET {column} = ? WHERE agent_id = ?",
+            (replacement, agent_id),
+        )
+
+        # Asked of the ORIGINAL agent even when the row has just left it: a row
+        # changing hands is a change for the agent that lost it too, and only
+        # the trigger's second stamp says so.
+        assert await projection.observed_changes() == 2, (
+            f"writing {column} alone did not move the change stamp, so a "
+            "projection derived from it would report itself current"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_concurrent_initializers_build_the_projection_schema_once(postgres_db):
+    """A post-upgrade request burst, with none of the objects present yet.
+
+    ``_init_schema`` runs on every ``from_pool()`` — frinz calls it per request —
+    so the first boot after this ticket ships is genuinely parallel. A bare
+    ``CREATE TABLE IF NOT EXISTS`` evaluates its existence test before taking the
+    lock that would exclude a peer, so two initializers can both proceed and one
+    dies on ``pg_class``' unique index: not a skipped table, a failed request.
+    The same is true of ``CREATE OR REPLACE FUNCTION`` on ``pg_proc``.
+
+    PostgreSQL-only because SQLite serializes writers on one file and cannot
+    exhibit the catalog race at all, so a dual-backend spelling would contribute
+    a leg that passes no matter what the code does.
+
+    Bounded: the case carries a timeout, because a lock test that can hang is a
+    timed-out job with no failing assertion.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        mutation_triggers,
+        projection_tables,
+    )
+
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+        for table, _ddl in projection_tables():
+            assert await db.table_exists(table) is False, table
+
+        outcomes = await _before_the_budget(
+            db,
+            "eight concurrent initializers building the projection schema",
+            asyncio.gather(
+                *(db.ensure_session_projection_schema() for _ in range(8)),
+                return_exceptions=True,
+            ),
+            budget=60.0,
+        )
+        raised = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        assert not raised, raised
+
+        for table, _ddl in projection_tables():
+            assert await db.table_exists(table) is True, table
+        for trigger, _ddl in mutation_triggers(db.backend_type):
+            assert await db.fetchval(
+                "SELECT COUNT(*) FROM pg_trigger WHERE tgname = ? "
+                "AND tgrelid = to_regclass('conversation_history') "
+                "AND NOT tgisinternal",
+                (trigger,),
+            ) == 1, trigger
+        assert not await _advisory_lock_holders(db, "conversation_sessions_2959")
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypatch):
+    """A repaired projection reports itself current on this engine too.
+
+    Staleness is an equality between two values that arrive by different routes:
+    one counted by a trigger, one read back out of a column. Nothing normalizes
+    them -- deliberately, since a coercion there would be a guard no test could
+    kill -- so this is where the two routes are required to meet. If they did
+    not, the equality would be false forever: the projection rebuilt on every
+    read, never once reporting itself current, while every assertion about its
+    CONTENT still passed.
+
+    ``accounted_valid`` is asserted here rather than inferred, because on
+    PostgreSQL it is an ``INTEGER`` bound from a Python ``bool`` and asyncpg is
+    strict about that pairing: getting it wrong raises out of the
+    compare-and-swap rather than storing a wrong flag.
+
+    Width is the other half of that, and is a separate case:
+    :func:`test_a_watermark_wider_than_int4_is_storable`.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+    from kestrel_sovereign.storage.conversation_sessions import (
+        CURRENT,
+        REBUILT,
+        SessionWatermark,
+    )
+
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:session-watermark:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
+
+        assert await projection.observed_changes() == 0
+        assert _accounting(await projection.accounted()) == (False, 0, 0)
+        assert await projection.is_stale()
+        assert (await projection.repair()).kind == REBUILT
+        assert _accounting(await projection.accounted()) == (True, 0, 0)
+        assert not await projection.is_stale()
+
+        await store.add_conversation("user", "first turn", session_id=UUID_A)
+        await store.add_conversation("assistant", "reply", session_id=UUID_A)
+
+        assert await projection.is_stale()
+        # Compared as the ints they are declared to be, on the engine whose
+        # aggregates are typed. A driver handing back any other numeric type
+        # would make the equality below false forever.
+        changes = await projection.observed_changes()
+        assert isinstance(changes, int) and changes == 2
+
+        assert (await projection.repair()).advanced
+        accounted = await projection.accounted()
+        assert accounted.valid is True
+        assert accounted.changes == changes
+        assert accounted.frontier > 0
+        assert not await projection.is_stale()
+        assert (await projection.repair()).kind == CURRENT
+
+
+#: PostgreSQL's ``int4`` ceiling. Named because the case below is about this
+#: number and nothing else, and a bare ``2147483647`` in an assertion reads like
+#: an arbitrary large integer.
+_INT4_MAX = 2_147_483_647
+
+
+@pytest.mark.asyncio
+async def test_a_watermark_wider_than_int4_is_storable(postgres_db):
+    """``accounted_changes`` counts row events for the agent's whole life.
+
+    Which is precisely the number this table exists to stop being bounded by: an
+    agent expected to run indefinitely crosses 2,147,483,647 row events, and the
+    symptom would not be a wrong count. PostgreSQL refuses the parameter, the
+    compare-and-swap raises out of :meth:`repair`, and the projection can never
+    advance its watermark again — every read stale, every repair raising.
+
+    PostgreSQL-only because SQLite has a single 64-bit integer type and cannot
+    exhibit a declared-width overflow at all, so a dual-backend spelling would
+    contribute a leg that passes no matter what the column says.
+
+    The ledger is set directly rather than accumulated: reaching this count by
+    performing two billion row events would test the same column and never
+    finish. It is exercised in both places it lives — the ledger the triggers
+    write and the watermark the compare-and-swap binds — because a wide value
+    has to survive being read out of one and written into the other.
+
+    ``accounted_frontier`` is not pushed past ``int4`` beside it, and that is a
+    fact about the schema rather than an omission: ``conversation_history.id`` is
+    ``SERIAL``, so PostgreSQL refuses a row id in that range at the INSERT
+    (measured — "value out of int32 range"). The column is declared ``BIGINT``
+    anyway because it is part of the same watermark, not because a value could
+    reach it today.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import CURRENT
+
+    agent_id = f"did:test:watermark-width:{uuid4()}"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, 'user', 'x', ?, ?, ?)",
+            (
+                agent_id, json.dumps({"session_id": UUID_A}), UUID_A,
+                datetime(2026, 3, 1, 9, 0, 0),
+            ),
+        )
+        row_id = int(await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        ))
+        changes = _INT4_MAX + 7
+        await db.execute(
+            "UPDATE conversation_history_changes SET changes = ? WHERE agent_id = ?",
+            (changes, agent_id),
+        )
+
+        projection = ConversationSessionProjection(db, agent_id)
+        assert await projection.observed_changes() == changes > _INT4_MAX
+
+        assert (await projection.repair()).advanced
+        accounted = await projection.accounted()
+        assert accounted.valid is True
+        assert accounted.changes == changes, (
+            "the change stamp read back out of the table is not the one that "
+            "was written, so a column truncated it"
+        )
+        assert accounted.frontier == row_id
+        assert not await projection.is_stale()
+        assert (await projection.repair()).kind == CURRENT
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_the_projection_is_repaired_after_each_mutation_on_both_backends(
     db_backend, monkeypatch
 ):
-    """Insert, soft-delete, restore, purge — each through the real dialect.
+    """Insert, soft-delete, restore, archive, purge -- through the real dialect.
 
-    The pointer assertions are the same claims the SQLite suite makes; what is
-    new here is that every statement carrying them is the PostgreSQL spelling.
-    A broken upsert would surface as a duplicate-key error on the second turn,
-    and a timestamp bound as text would fail at the column.
+    The claims are the ones the SQLite suite makes; what is new here is that
+    every statement carrying them is the PostgreSQL spelling. A broken upsert
+    would surface as a duplicate-key error on the second repair, and a timestamp
+    bound as text would fail at the column.
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
@@ -1391,16 +1890,13 @@ async def test_the_projection_is_written_and_maintained_on_both_backends(
     _without_embeddings(monkeypatch)
     agent_id = f"did:test:session-projection:{uuid4()}"
     async with _isolated_schema(db_backend) as db:
-        await _create_core_tables(
-            db, "conversation_history", "conversation_sessions",
-            "conversation_lexical_tokens",
-        )
+        await _create_projection_schema(db)
         store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
 
         await store.add_conversation("user", "first turn", session_id=UUID_A)
         await store.add_conversation("assistant", "reply", session_id=UUID_A)
         await store.add_conversation("user", "second turn", session_id=UUID_A)
-
         ids = [
             row[0]
             for row in await db.fetchall(
@@ -1408,29 +1904,47 @@ async def test_the_projection_is_written_and_maintained_on_both_backends(
                 (agent_id,),
             )
         ]
-        projected = await store.session_projection.get(UUID_A)
+
+        assert await projection.is_stale()
+        await projection.repair()
+        projected = await projection.get(UUID_A)
         assert projected["message_count"] == 3
         assert projected["user_message_count"] == 2
         assert projected["first_user_message_id"] == ids[0]
 
-        # The pointer moves off a trashed row and back, on this engine.
+        # The pointer moves off a trashed row and back, on this engine, with the
+        # census noticing each way round.
         assert await store.delete_message(ids[0])
-        assert (await store.session_projection.get(UUID_A))[
-            "first_user_message_id"
-        ] == ids[2]
-        assert await store.restore_message(ids[0])
-        assert (await store.session_projection.get(UUID_A))[
-            "first_user_message_id"
-        ] == ids[0]
+        assert await projection.is_stale()
+        await projection.repair()
+        assert (await projection.get(UUID_A))["first_user_message_id"] == ids[2]
 
-        # ...and a purge takes the row with it, inside the destructive
-        # transaction rather than after it.
+        assert await store.restore_message(ids[0])
+        assert await projection.is_stale()
+        await projection.repair()
+        assert (await projection.get(UUID_A))["first_user_message_id"] == ids[0]
+
+        # An archive leaves through a different column and is seen the same way.
+        assert await store.archive_conversation_session(UUID_A) == 3
+        assert await projection.is_stale()
+        await projection.repair()
+        assert await projection.get(UUID_A) is None
+
+        assert await store.unarchive_conversation_session(UUID_A) == 3
+        assert await projection.is_stale()
+        await projection.repair()
+        assert (await projection.get(UUID_A))["message_count"] == 3
+
+        # ...and a purge takes the projection row with it.
         assert await store.purge_conversation_session(UUID_A) == 3
-        assert await store.session_projection.get(UUID_A) is None
+        assert await projection.is_stale()
+        await projection.repair()
+        assert await projection.get(UUID_A) is None
         assert await db.fetchval(
             "SELECT COUNT(*) FROM conversation_sessions WHERE agent_id = ?",
             (agent_id,),
         ) == 0
+        assert not await projection.is_stale()
 
 
 @pytest.mark.asyncio
@@ -1457,11 +1971,9 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
     agent_id = f"did:test:session-projection-diff:{uuid4()}"
     other = "3a6c1f0e-2b7d-4c8a-9e10-00000000000b"
     async with _isolated_schema(db_backend) as db:
-        await _create_core_tables(
-            db, "conversation_history", "conversation_sessions",
-            "conversation_lexical_tokens",
-        )
+        await _create_projection_schema(db)
         store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
 
         await store.add_conversation("user", "A one", session_id=UUID_A)
         await store.add_conversation("assistant", "A two", session_id=UUID_A)
@@ -1471,6 +1983,7 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
             "user", "B wake", session_id=other,
             metadata={"signal_wake": {"source": "heartbeat"}},
         )
+        await projection.repair()
 
         history = [
             {
@@ -1493,9 +2006,7 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
                 group_messages_into_sessions(history, keep_empty_markers=True)
             )
         }
-        stored = {
-            row["session_id"]: row for row in await store.session_projection.list()
-        }
+        stored = {row["session_id"]: row for row in await projection.list()}
 
         assert set(stored) == set(reference)
         for session_id, row in stored.items():
@@ -1517,398 +2028,196 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
         assert stored[other]["wake_source"] == "heartbeat"
 
 
-# ── #2959: concurrent maintenance of one session ─────────────────────────
-#
-# Recomputing from the surviving rows is only truthful about the rows the
-# refresh could SEE. Two refreshes of one session can each be describing a world
-# the other has already changed, and the projection then records the loser's
-# answer: a count that does not match the live rows, or — worse — a pointer at a
-# row the other transaction deleted.
-#
-# PostgreSQL is where this bites, and it bites in a way SQLite cannot reproduce:
-# separate connections mean separate snapshots, so two transactions really do
-# each see the other's deleted row as live. The SQLite legs below assert the same
-# invariant and pass either way (its single writer already serializes the
-# destructive paths, which open their own transaction) — so credit them with
-# covering the dialect, not with proving the boundary. The insert case
-# discriminates on BOTH engines, because an insert's refresh is not inside a
-# caller's transaction on either.
-#
-# Every wait here is bounded. A lock test that can hang cannot report the bug it
-# exists to catch — see the 23h26m wedge at the top of this file.
-
-#: How long the second writer is given to complete AHEAD of the parked one.
-#: Under the boundary it cannot, so blowing this budget is the EXPECTED path and
-#: must never be an assertion; without the boundary the second writer needs two
-#: statements, which fit inside this window on any machine that can run the
-#: suite at all. It is therefore the length of the window in which the bug would
-#: have happened, not a guess at how slow the engine is.
-INTERLEAVE_GRACE = 2.0
-
-
-async def _within_budget(what: str, awaitable, budget: float = LOCK_WAIT_BUDGET):
-    """Await ``awaitable``, failing — never hanging — if it blocks too long.
-
-    Dialect-neutral counterpart to ``_before_the_budget``: these cases run on
-    SQLite too, and the PostgreSQL activity dump that makes that helper's
-    failure message useful cannot be asked of SQLite at all.
-    """
-    try:
-        async with asyncio.timeout(budget):
-            return await awaitable
-    except TimeoutError:
-        raise AssertionError(f"{what} did not finish within {budget}s") from None
-
-
-@asynccontextmanager
-async def _schema_every_task_can_see(db: AsyncDatabase) -> AsyncIterator[AsyncDatabase]:
-    """Like ``_isolated_schema``, but the isolation survives into other TASKS.
-
-    ``_isolated_schema`` pins its schema with ``SET LOCAL search_path`` inside
-    one transaction — connection-local state on the one connection that
-    transaction holds. A concurrent task's ``transaction()`` acquires a
-    DIFFERENT pool connection (the per-task ContextVar of #1726), which never saw
-    that ``SET``, so a concurrency test built on it would quietly write half its
-    rows into ``public`` and measure nothing there. (Measured: the first draft of
-    the index case below did exactly that — four gathered initializers built the
-    index in ``public`` while the assertion looked in the isolated schema and
-    found none.) Setting the search_path as a pool server setting makes it the
-    default for every connection the pool opens, which is the only form of this
-    isolation a multi-task test can use.
-
-    ``db`` is the control connection — used to create and drop the schema, and
-    yielded unchanged on SQLite, where a file is already the isolation.
-    """
-    if db.backend_type == "sqlite":
-        yield db
-        return
-
-    import asyncpg
-
-    from kestrel_sovereign.storage.db.postgres import PostgresBackend
-
-    schema = f"session_projection_{uuid4().hex}"
-    await db.execute(f'CREATE SCHEMA "{schema}"')
-    pool = await asyncpg.create_pool(
-        POSTGRES_URL,
-        min_size=2,
-        max_size=8,
-        server_settings={"search_path": schema},
-    )
-    try:
-        yield AsyncDatabase(PostgresBackend.from_pool(pool))
-    finally:
-        await pool.close()
-        await db.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-
-
-async def _assert_the_projection_matches_the_rows(
-    db: AsyncDatabase, store, agent_id: str, session_id: str
-) -> None:
-    """The invariant asked of the database: counts match, pointer is live."""
-    live = await db.fetchall(
-        "SELECT id, role FROM conversation_history WHERE agent_id = ? "
-        "AND session_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
-        "ORDER BY id",
-        (agent_id, session_id),
-    )
-    row = await store.session_projection.get(session_id)
-    if not live:
-        assert row is None, (
-            f"session {session_id!r} has no live rows but still has {row}"
-        )
-        return
-    assert row is not None, f"session {session_id!r} has {len(live)} live rows, no row"
-    assert row["message_count"] == len(live), (
-        f"projection counts {row['message_count']} for {len(live)} live rows: "
-        f"{live}"
-    )
-    pointer = row["first_user_message_id"]
-    if pointer is not None:
-        assert pointer in {row_id for row_id, _ in live}, (
-            f"pointer {pointer} is not among the live rows {live}"
-        )
-
-
-@asynccontextmanager
-async def _parked_between_the_read_and_the_write(monkeypatch, *, park_when):
-    """Hold one projection write open between its own read and its upsert.
-
-    The window this ticket's boundary closes is invisible without help: it is
-    the gap between a refresh reading the session's rows and writing what it
-    read. So one write is parked inside that gap while a second mutation runs to
-    completion, which is the interleaving that produced the stale projection.
-    ``park_when`` picks which write parks, from the projection it is about to
-    store.
-
-    Yields ``(parked, other_write_landed, release)``. ``other_write_landed`` is
-    what discriminates: it is set only if a SECOND write got through while the
-    first was parked, which the boundary must prevent.
-    """
-    from kestrel_sovereign.storage.conversation_sessions import (
-        ConversationSessionProjection,
-    )
-
-    original = ConversationSessionProjection._store
-    parked = asyncio.Event()
-    other_write_landed = asyncio.Event()
-    release = asyncio.Event()
-
-    async def parking_store(self, projection):
-        if park_when(projection) and not parked.is_set():
-            parked.set()
-            # Bounded, and its timeout is the holder rescuing itself rather
-            # than an error: whoever was waiting on it owns that assertion.
-            try:
-                await asyncio.wait_for(release.wait(), HOLDER_PARK_BUDGET)
-            except TimeoutError:
-                pass
-        elif parked.is_set() and not release.is_set():
-            other_write_landed.set()
-        await original(self, projection)
-
-    monkeypatch.setattr(ConversationSessionProjection, "_store", parking_store)
-    try:
-        yield parked, other_write_landed, release
-    finally:
-        release.set()
-
-
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-@pytest.mark.timeout(120)
-async def test_a_stale_refresh_cannot_overwrite_a_newer_one(db_backend, monkeypatch):
-    """Two turns in one session, the first refresh parked mid-flight.
+async def test_a_rebuild_equals_the_repairs_on_both_backends(db_backend, monkeypatch):
+    """Dropping the table and rebuilding it lands on the same rows.
 
-    Without the boundary the second turn's refresh reads two live rows and
-    stores ``message_count = 2``, then the parked first refresh stores the ``1``
-    it read before that row existed — leaving the projection claiming one
-    message for a session that has two. This is the SQLite reproduction from
-    review as well as the PostgreSQL one: an insert's refresh has no enclosing
-    transaction on either engine, so nothing else serializes it.
+    Asked of PostgreSQL as well because the rebuild path binds the same
+    timestamps through a different code route than the incremental one, and
+    because ``ORDER BY last_message_at`` over a TIMESTAMP column is the engine's
+    collation rather than Python's.
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
     )
 
     _without_embeddings(monkeypatch)
-    agent_id = f"did:test:session-projection-race:{uuid4()}"
-    async with _schema_every_task_can_see(AsyncDatabase(db_backend)) as db:
-        await _create_core_tables(
-            db, "conversation_history", "conversation_sessions",
-            "conversation_lexical_tokens",
-        )
+    agent_id = f"did:test:session-rebuild:{uuid4()}"
+    other = "3a6c1f0e-2b7d-4c8a-9e10-00000000000c"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
         store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
 
-        async with _parked_between_the_read_and_the_write(
-            monkeypatch, park_when=lambda p: p.message_count == 1
-        ) as (parked, second_write_landed, release):
-            first = asyncio.create_task(
-                store.add_conversation("user", "first turn", session_id=UUID_A)
-            )
-            await _within_budget(
-                "the first turn's refresh reaching its write", parked.wait()
-            )
-            second = asyncio.create_task(
-                store.add_conversation("user", "second turn", session_id=UUID_A)
-            )
-            # The grace is the window the bug needed. A timeout here is the
-            # boundary doing its job, so it is deliberately not asserted on.
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(INTERLEAVE_GRACE):
-                    await second_write_landed.wait()
-            release.set()
-            await _within_budget(
-                "both turns finishing",
-                asyncio.gather(first, second),
-            )
+        await store.add_conversation("user", "A one", session_id=UUID_A)
+        await projection.repair()
+        await store.add_conversation("user", "B one", session_id=other)
+        await projection.repair()
+        first = await db.fetchval(
+            "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        )
+        assert await store.delete_message(int(first))
+        await projection.repair()
 
-        assert await db.fetchval(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? "
-            "AND session_id = ?",
-            (agent_id, UUID_A),
-        ) == 2
-        await _assert_the_projection_matches_the_rows(db, store, agent_id, UUID_A)
+        incremental = await projection.list()
+        assert incremental
+
+        await db.execute(
+            "DELETE FROM conversation_sessions WHERE agent_id = ?", (agent_id,)
+        )
+        assert await projection.rebuild() == len(incremental)
+        assert await projection.list() == incremental
+        assert not await projection.is_stale()
 
 
 @pytest.mark.asyncio
-@pytest.mark.dual_backend
 @pytest.mark.timeout(120)
-async def test_concurrent_deletions_cannot_leave_the_pointer_on_a_deleted_row(
-    db_backend, monkeypatch
+async def test_the_superseded_repair_publishes_nothing_on_postgres(
+    postgres_db, monkeypatch
 ):
-    """The MVCC case, and the reason the boundary is transaction-scoped.
+    """Two repairs in genuinely separate transactions, on real MVCC.
 
-    Two transactions soft-delete different rows of one session. On PostgreSQL
-    each has its own snapshot, so each sees the OTHER's row as still live and
-    picks it as the pointer — and the second write to land names a row that is
-    deleted by the time both commit. Holding the boundary until the mutation
-    commits is what forces the later refresh to read after the earlier one's
-    delete rather than beside it.
+    PostgreSQL is where the concurrency claim has to be made: separate
+    connections mean separate snapshots, so two passes really can each derive a
+    projection row from rows the other has already changed. Nothing serializes
+    them -- by design, after two review rounds spent on a boundary that did --
+    so the guarantee is that the pass whose epoch was taken away publishes
+    nothing, leaving the winner's watermark standing over the winner's rows.
 
-    The SQLite leg asserts the same invariant but cannot exhibit the failure:
-    its destructive paths already run inside one writer's transaction. Read the
-    PostgreSQL leg as the one under test.
+    Bounded on both sides. The parked pass rescues itself on the wait budget and
+    the case carries a timeout: a concurrency test that can hang is a timed-out
+    job with no failing assertion, which is how a 23-hour advisory-lock wedge
+    went unnoticed during Phase A.
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
     )
 
     _without_embeddings(monkeypatch)
-    agent_id = f"did:test:session-projection-delete-race:{uuid4()}"
-    async with _schema_every_task_can_see(AsyncDatabase(db_backend)) as db:
-        await _create_core_tables(
-            db, "conversation_history", "conversation_sessions",
-            "conversation_lexical_tokens",
-        )
-        store = AsyncConversationStore(db, agent_id=agent_id)
-        for turn in ("first", "second", "third"):
-            await store.add_conversation("user", f"{turn} turn", session_id=UUID_A)
-        ids = [
-            row[0]
-            for row in await db.fetchall(
-                "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id",
-                (agent_id,),
-            )
-        ]
-        assert (await store.session_projection.get(UUID_A))[
-            "first_user_message_id"
-        ] == ids[0]
-
-        # The refresh that follows the FIRST deletion parks: it has already
-        # read, and has chosen the row the second deletion is about to remove.
-        async with _parked_between_the_read_and_the_write(
-            monkeypatch, park_when=lambda p: p.first_user_message_id == ids[1]
-        ) as (parked, other_write_landed, release):
-            deleting_first = asyncio.create_task(store.delete_message(ids[0]))
-            await _within_budget(
-                "the first deletion's refresh reaching its write", parked.wait()
-            )
-            deleting_second = asyncio.create_task(store.delete_message(ids[1]))
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(INTERLEAVE_GRACE):
-                    await other_write_landed.wait()
-            release.set()
-            assert await _within_budget(
-                "both deletions finishing",
-                asyncio.gather(deleting_first, deleting_second),
-            ) == [True, True]
-
-        assert await db.fetchval(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? "
-            "AND session_id = ? AND deleted_at IS NULL",
-            (agent_id, UUID_A),
-        ) == 1
-        row = await store.session_projection.get(UUID_A)
-        assert row["first_user_message_id"] == ids[2], (
-            "the surviving turn is the only row a pointer may name"
-        )
-        await _assert_the_projection_matches_the_rows(db, store, agent_id, UUID_A)
-
-
-async def _advisory_lock_waiters(db: AsyncDatabase, name: str) -> list:
-    """Sessions BLOCKED on the migration lock ``name``.
-
-    The counterpart to ``_advisory_lock_holders``, and it answers a question no
-    other probe in this file can: whether a given piece of work actually goes
-    through the serialized path. A waiter on the key is positive evidence — the
-    code reached the creation and asked for the boundary. Its absence, when the
-    work has finished anyway, is positive evidence of the opposite.
-    """
-    from kestrel_sovereign.storage.async_database import _backfill_lock_id
-
-    return await db.fetchall(
-        "SELECT l.pid, a.state, left(a.query, 60) "
-        "FROM pg_locks l JOIN pg_stat_activity a USING (pid) "
-        f"WHERE l.locktype = 'advisory' AND NOT l.granted AND {_ADVISORY_KEY} = ?",
-        (_backfill_lock_id(name),),
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(180)
-async def test_the_first_upgrade_creates_the_projection_index_through_the_lock(
-    postgres_db,
-):
-    """The shipped initialization takes the boundary for this index.
-
-    ``_init_schema`` runs on every ``from_pool()`` — frinz calls it per request —
-    so the first boot after this table ships has several initializers arriving at
-    once. A bare ``CREATE INDEX IF NOT EXISTS`` passes its existence test before
-    taking any lock, so two of them build the index together and the loser dies
-    on ``pg_class``' unique index, failing its whole request rather than merely
-    skipping an index. ``ensure_index`` owns the probe → lock → re-probe that
-    closes that, and the tests above already prove that helper serializes.
-
-    What is left to prove is that THIS index goes through it, which is a claim
-    about ``_init_schema`` and not about ``ensure_index``. So the real
-    initialization is driven against a virgin schema while the key
-    ``ensure_index`` derives for this index is held, and the assertion is that a
-    waiter appears on that key: the initializer reached the creation and asked
-    for the boundary. Declared in ``CORE_SCHEMA`` instead, it would create the
-    index unserialized and run to completion without ever asking — which is the
-    other branch below, reported as a failure that names what happened.
-    """
-    from kestrel_sovereign.storage.async_database import _SESSION_PROJECTION_INDEX
-
-    name, table, _columns = _SESSION_PROJECTION_INDEX
-    lock = f"index_{name}"  # the name ensure_index derives, so the same key
-    # The pool-level schema, not ``_isolated_schema``: initialization runs in its
-    # own task on its own connection, and only a pool default follows it there.
+    agent_id = f"did:test:session-race:{uuid4()}"
     async with _schema_every_task_can_see(postgres_db) as db:
-        initializing = asyncio.create_task(db._init_schema())
-        try:
-            async with _parked_lock_holder(postgres_db, lock):
-                waited = False
-                async with asyncio.timeout(LOCK_WAIT_BUDGET):
-                    while True:
-                        if await _advisory_lock_waiters(postgres_db, lock):
-                            waited = True
-                            break
-                        if initializing.done():
-                            break
-                        await asyncio.sleep(0.05)
-                assert waited, (
-                    f"initialization finished without ever waiting on {lock!r}: "
-                    f"{name} was created outside the serialized path. Index "
-                    f"present while the key was held: "
-                    f"{await db._index_exists(name, table)}"
-                )
-                assert await db._index_exists(name, table) is False
-            await _before_the_budget(
-                postgres_db, "initialization after the lock was released",
-                initializing,
-            )
-        finally:
-            if not initializing.done():
-                initializing.cancel()
-                await asyncio.gather(initializing, return_exceptions=True)
+        await _create_projection_schema(db)
+        store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
 
-        assert await db.fetchval(
-            "SELECT COUNT(*) FROM pg_index i JOIN pg_class c "
-            "ON c.oid = i.indexrelid WHERE c.relname = ? "
-            "AND i.indrelid = to_regclass(?)",
-            (name, table),
-        ) == 1
+        await store.add_conversation("user", "first turn", session_id=UUID_A)
+        await store.add_conversation("assistant", "reply", session_id=UUID_A)
+        await projection.repair()
+        first = int(await db.fetchval(
+            "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        ))
+        assert await store.delete_message(first)
+
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+
+        class _Parks(ConversationSessionProjection):
+            async def _refresh(self, session_ids, epoch):
+                written = await super()._refresh(session_ids, epoch)
+                parked.set()
+                await asyncio.wait_for(resume.wait(), LOCK_WAIT_BUDGET)
+                return written
+
+        slow = asyncio.create_task(_Parks(db, agent_id).repair())
+        try:
+            await _before_the_budget(db, "the parked repair reaching its pause",
+                                     parked.wait())
+            winner = await ConversationSessionProjection(db, agent_id).repair()
+            assert winner.advanced
+        finally:
+            resume.set()
+        loser = await _before_the_budget(
+            db, "the parked repair finishing", asyncio.shield(slow)
+        )
+
+        assert not loser.advanced
+        assert not await projection.is_stale(), (
+            "the superseded pass knocked down the winner's watermark, so a "
+            "correct projection now reports itself stale"
+        )
+        assert (await projection.get(UUID_A))["message_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_postgres_refuses_a_nul_in_the_column_so_the_contract_must(postgres_db):
-    """Why the NUL exclusion is a contract clause and not a nicety.
+@pytest.mark.timeout(120)
+async def test_a_superseded_repair_cannot_overwrite_a_published_row_on_postgres(
+    postgres_db, monkeypatch
+):
+    """The fence, at the ordering that detection-after-the-fact cannot save.
 
-    The backfill guard keeps a NUL out of the column during upgrade; this pins
-    the reason. If a later change relaxed the charset, PostgreSQL would start
-    rejecting ordinary conversation writes — not one row, every turn in that
-    session — and the failure would surface as a broken chat, not a bad value.
+    A repair writes its rows before it can know whether it won. Park one between
+    deriving a row and storing it, let a newer repair publish a correct row and
+    its watermark, and the parked pass is holding an answer that is now wrong. If
+    its write were merely regretted afterwards, the published row would be wrong
+    for the interval between the write and the discovery -- and permanently if
+    that pass died in between, because a watermark cannot un-write a row.
+
+    On PostgreSQL rather than only on SQLite because this is where the two passes
+    hold genuinely separate snapshots, and because the guarded upsert is a
+    different statement in this dialect: the parameters' types come from the
+    INSERT's target columns rather than from a value list, so a spelling that
+    works on SQLite can still fail here at the ``TIMESTAMP`` pair.
     """
-    db = postgres_db
-    table = f"nul_probe_{uuid4().hex[:10]}"
-    await db.execute(f"CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, session_id TEXT)")
-    try:
-        with pytest.raises(Exception) as raised:
-            await db.execute(f"INSERT INTO {table} (session_id) VALUES (?)", ("a\x00b",))
-        assert "0x00" in str(raised.value), str(raised.value)
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
 
-        assert column_session_id({"session_id": "a\x00b"}) is None
-    finally:
-        await db.execute(f"DROP TABLE IF EXISTS {table}")
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:session-fence:{uuid4()}"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        store = AsyncConversationStore(db, agent_id=agent_id)
+        projection = ConversationSessionProjection(db, agent_id)
+
+        await store.add_conversation("user", "first turn", session_id=UUID_A)
+        await store.add_conversation("assistant", "reply", session_id=UUID_A)
+        await store.add_conversation("user", "second turn", session_id=UUID_B)
+        await projection.repair()
+        # Something for the slow pass to do that does not touch session A, so
+        # the row it derives for A is the one already stored.
+        second = int(await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        ))
+        assert await store.delete_message(second)
+        stale_count = (await projection.get(UUID_A))["message_count"]
+
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+
+        class _ParksBeforeStoring(ConversationSessionProjection):
+            async def _store(self, session, epoch):
+                if not parked.is_set():
+                    parked.set()
+                    await asyncio.wait_for(resume.wait(), LOCK_WAIT_BUDGET)
+                return await super()._store(session, epoch)
+
+        slow = asyncio.create_task(_ParksBeforeStoring(db, agent_id).repair())
+        try:
+            await _before_the_budget(db, "the parked repair reaching its pause",
+                                     parked.wait())
+            first = int(await db.fetchval(
+                "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
+                (agent_id,),
+            ))
+            assert await store.delete_message(first)
+            winner = await ConversationSessionProjection(db, agent_id).repair()
+            assert winner.advanced
+            published = await projection.list()
+            assert (await projection.get(UUID_A))["message_count"] != stale_count
+        finally:
+            resume.set()
+        loser = await _before_the_budget(
+            db, "the parked repair finishing", asyncio.shield(slow)
+        )
+
+        assert not loser.advanced
+        assert await projection.list() == published, (
+            "a superseded repair overwrote rows the winning repair had "
+            "published, while the watermark went on saying it was current"
+        )
+        assert loser.sessions == 0
+        assert not await projection.is_stale()
