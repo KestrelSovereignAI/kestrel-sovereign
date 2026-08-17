@@ -3302,10 +3302,16 @@ async def _agent_detailed_health(agent) -> dict:
         derive_overall_status,
         run_standard_checks,
     )
+    from kestrel_sovereign.features.storage_access import (
+        resolve_feature_database,
+    )
 
-    db = None
-    if hasattr(agent, 'storage') and agent.storage:
-        db = getattr(agent.storage, 'db', None)
+    # HealthFeature uses the feature-internal database resolver during its
+    # own initialization.  The fallback must honor that same boundary: a real
+    # agent's public ``storage.db`` is a privacy-governed view whose
+    # ``backend`` property is intentionally unavailable, while the database
+    # health check needs backend lifecycle state to diagnose retained workers.
+    db = resolve_feature_database(agent)
 
     checks = await run_standard_checks(agent, db)
     overall = derive_overall_status(checks)

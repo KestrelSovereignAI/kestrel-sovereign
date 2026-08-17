@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from kestrel_sovereign.storage.db.interface import ConnectionError
 from kestrel_sovereign.storage.db.sqlite import (
     _RetainedAiosqliteCloses,
     _close_aiosqlite_connection,
@@ -100,13 +101,26 @@ class SovereignSqlaSessionFactory:
         if connection is not None and connection not in self._sqlite_connections:
             self._sqlite_connections.append(connection)
 
+    def _assert_session_connection_available(self) -> None:
+        """Fence new SQLite work while an old worker is still retiring."""
+        if (
+            getattr(self._engine.dialect, "name", None) == "sqlite"
+            and self.sqlite_connection_retirement_pending
+        ):
+            raise ConnectionError(
+                "SQLite SQLAlchemy connection worker is still retiring; "
+                "new sessions are unavailable until retirement completes"
+            )
+
     @asynccontextmanager
     async def read_session(self):
+        self._assert_session_connection_available()
         async with self._async_session() as session:
             yield session
 
     @asynccontextmanager
     async def write_session(self):
+        self._assert_session_connection_available()
         async with self._async_session() as session:
             try:
                 yield session
@@ -153,17 +167,61 @@ class SovereignSqlaSessionFactory:
         SQLite helper couples the sentinel with the bounded worker-drain wait,
         so no tracked worker can escape a failed disposal path.
         """
-        cleanup_errors: list[BaseException] = []
-        for connection in self._sqlite_connections:
-            try:
-                await _close_aiosqlite_connection(
+        if not self._sqlite_connections:
+            return
+
+        # A QueuePool can own several aiosqlite workers.  The factory advertises
+        # one bounded shutdown reservation, so every connection must begin
+        # retirement immediately and share one absolute deadline.  Sequential
+        # per-connection waits both exceeded that reservation and could leave
+        # later workers without retained lifecycle ownership when an outer
+        # shutdown guard expired.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _minimum_close_timeout_s()
+        close_tasks = [
+            loop.create_task(
+                _close_aiosqlite_connection(
                     connection,
                     retained_closes=self._retired_sqlite_closes,
+                    deadline=deadline,
+                ),
+                name=f"sqla-aiosqlite-close:{id(connection)}",
+            )
+            for connection in self._sqlite_connections
+        ]
+
+        pending_cancellation: asyncio.CancelledError | None = None
+        try:
+            results = await asyncio.gather(
+                *close_tasks, return_exceptions=True
+            )
+        except asyncio.CancelledError as exc:
+            # Preserve the existing cancellation contract: each connection
+            # gets the cancellation signal, then the factory waits within the
+            # shared lifecycle deadline so the helper can either finish or
+            # install retained ownership before cancellation reaches its
+            # caller.
+            pending_cancellation = exc
+            for task in close_tasks:
+                task.cancel()
+            try:
+                results = await asyncio.gather(
+                    *close_tasks, return_exceptions=True
                 )
-            except (Exception, asyncio.CancelledError) as exc:
-                # One timed-out worker must not prevent another tracked driver
-                # from receiving its own close sentinel.
-                cleanup_errors.append(exc)
+            except asyncio.CancelledError:
+                # Repeated caller cancellation may end this wait.  Each close
+                # helper retains any worker that is still alive in its
+                # BaseException guard, so no connection loses ownership.
+                for task in close_tasks:
+                    task.cancel()
+                raise
+
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
+        cleanup_errors = [
+            result for result in results if isinstance(result, BaseException)
+        ]
 
         if cleanup_errors:
             primary_error = cleanup_errors[0]

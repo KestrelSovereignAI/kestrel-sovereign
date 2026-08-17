@@ -883,6 +883,47 @@ async def test_detailed_health_fallback_matches_lock_warning_rollup():
     assert result == {"status": "degraded", "checks": checks}
 
 
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_uses_raw_db_behind_privacy_storage(
+    tmp_path,
+):
+    """The no-feature path must not probe the privacy database facade."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.server import _agent_detailed_health
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyEnforcingStorage,
+    )
+
+    raw_storage = AsyncStorage(
+        str(tmp_path / "privacy-health.db"),
+        agent_id="did:key:health-test",
+    )
+    await raw_storage.initialize()
+    try:
+        privacy_storage = PrivacyEnforcingStorage(
+            raw_storage, PrivacyMode.NORMAL
+        )
+        agent = SimpleNamespace(
+            features={},
+            storage=privacy_storage,
+            llm_service=SimpleNamespace(providers=[]),
+        )
+
+        # Deliberately run the real shared suite. ``storage.db.backend`` raises
+        # PrivacyViolationError on this wrapper, so a passing database result
+        # proves the fallback resolved the feature-internal raw database.
+        result = await _agent_detailed_health(agent)
+    finally:
+        await raw_storage.close()
+
+    database = next(
+        check for check in result["checks"] if check["name"] == "database"
+    )
+    assert database["status"] == "pass"
+    assert database["message"] == "Database connection healthy"
+
+
 @pytest.mark.parametrize(
     "failed_check", ["bootstrap_state", "disk_space", "memory_system"]
 )
