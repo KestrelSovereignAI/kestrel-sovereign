@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-16
-**Scope:** 2314 tracked files (1549 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-17
+**Scope:** 2317 tracked files (1552 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -254,6 +254,8 @@ Repo entry points and standard project files.
   - `class GenesisAuditError`; `class GenesisAuditPendingError`; `class GenesisAuditRejectedError`; `def utc_timestamp()`; `def pending_genesis_audit(constitution_hash)`; `def supersede_genesis_audit(properties)`; `def genesis_audit_prompt(constitution)`; `def validate_completed_genesis_audit(record, constitution_hash)`; `…`
 - **kestrel_sovereign/constitution/hierarchy.py** — Constitutional Hierarchy: 4-layer constitutional framework for Kestrel agents.
   - `class ConstitutionalLayer`; `def parse_amendment_ix_grants(constitution_text)`; `class LayerViolation`; `class ConstitutionalLayerData`; `class LayeredConstitution`; `def validate_layer_narrowing(parent_layer, child_layer, child_policy)`
+- **kestrel_sovereign/constitution/reanchor_receipt.py** — Per-agent constitution reanchor receipts: current pointer plus history.
+  - `def supersede_constitution_reanchor(properties)`
 - **kestrel_sovereign/constitution/resolver.py** — Single production resolver for the governing constitution bytes.
   - `def governing_constitution_path()`; `def is_authoritative_governing_source(constitution_path)`; `def resolve_governing_constitution_bytes(contract)`
 - **kestrel_sovereign/constitution/runtime_state.py** — Durable constitutional runtime state.
@@ -2771,6 +2773,8 @@ Repo entry points and standard project files.
   - `def kestrel_data_key(monkeypatch)`; `def post_ceremony_dir(post_ceremony_material)`; `def test_dry_run_preserves_legacy_key(post_ceremony_dir)`; `def test_confirm_without_env_var_rejects(post_ceremony_dir)`; `def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir)`; `def test_rollback_window_blocks_fresh_succession(post_ceremony_dir)`; `def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir)`; `def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path)`; `…`
 - **tests/unit/test_detached_signal_delivery_harvest.py** — Detached signal dispatches are owned and harvested (#2532, AC4).
   - `class TestDetachedDeliveryIsOwnedAndHarvested`; `async def test_supervisor_cancellation_restores_optimistically_retired_state()`; `async def test_supervisor_advances_the_checkpoint_only_on_terminal_ok()`
+- **tests/unit/test_devcontainer_postgres_volume.py** — The devcontainer's PostgreSQL volume must be versioned with its server.
+  - `def test_the_cluster_volume_is_versioned_with_the_server_major()`; `def test_the_versioned_volume_is_declared()`; `def test_the_devcontainer_and_ci_agree_on_the_major()`; `def test_no_document_ships_a_destructive_project_wide_command(doc)`; `def test_no_document_derives_a_project_from_the_global_container_name(doc)`; `def test_no_document_removes_a_live_volume_by_its_compose_file_name(doc)`
 - **tests/unit/test_did_web.py** — did:web producer + resolver — Wave 2 sub-PR 3 (#917).
   - `def test_build_did_host_only()`; `def test_build_did_with_path()`; `def test_build_did_with_port_encoded_as_percent_3a()`; `def test_build_did_rejects_bare_colon_in_domain()`; `def test_build_did_rejects_scheme_in_domain()`; `def test_build_did_rejects_slash_in_domain()`; `def test_build_did_rejects_colon_in_segment()`; `def test_build_did_rejects_empty_segment()`; `…`
 - **tests/unit/test_diminishing_returns.py** — Tests for diminishing returns detection in orchestrator loops.
@@ -2795,6 +2799,8 @@ Repo entry points and standard project files.
   - `def test_doctor_reports_ready_when_everything_set(tmp_path)`; `def test_doctor_blocks_on_missing_data_key(tmp_path)`; `def test_doctor_blocks_on_empty_route_priority(tmp_path)`; `def test_doctor_blocks_on_missing_api_key_env(tmp_path)`; `def test_doctor_accepts_openrouter_management_key_only_undeclared_env(tmp_path)`; `def test_doctor_blocks_when_no_agents(tmp_path)`; `def test_doctor_blocks_when_agent_db_missing(tmp_path)`; `def test_format_report_renders_lines(tmp_path)`; `…`
 - **tests/unit/test_doctrine_bundle.py** — Unit tests for kestrel_sovereign.agent.doctrine_bundle.
   - `def test_hash_is_deterministic_for_same_inputs(tmp_path)`; `def test_hash_changes_when_anchored_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_order_changes(tmp_path)`; `def test_missing_anchored_files_are_skipped_not_errors(tmp_path)`; `def test_total_bytes_reflects_only_contributing_content(tmp_path)`; `def test_per_file_sha256_in_section_header(tmp_path)`; `def test_default_paths_are_three_canonical_files()`; `…`
+- **tests/unit/test_dump_exclusion_parity.py** — A database dump must be excluded from every channel that ships the tree.
+  - `def test_every_channel_excludes_every_dump_shape(channel, pattern)`; `def test_the_channels_agree_exactly()`
 - **tests/unit/test_durable_salvage.py** — Tests for the durable-salvage primitive + background worker (C / #1311).
   - `def conv_store()`; `class TestSalvageMessagesSync`; `class TestSyncSalvageThenCrashBeforeEnqueue`; `class TestQueueDepthThresholdExceeded`; `class TestConsolidatorWhileSalvagePending`; `class TestFeatureFlag`; `class TestStateCountsAndBoundary`
 - **tests/unit/test_durable_signal_delivery.py** — Durable signal consumer contract: replay, scoped leasing, and retention.
@@ -3306,7 +3312,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_read_attachment_pagination.py** — Pagination for read_attachment (#2134, F086).
   - `async def test_every_chunk_fits_under_cap_regardless_of_escaping(unit)`; `async def test_first_chunk_reports_range_and_total()`; `async def test_next_offset_returns_following_chunk()`; `async def test_small_length_is_honored()`; `async def test_oversized_length_shrinks_to_fit_the_cap()`; `async def test_small_document_reads_fully_with_no_next()`; `async def test_offset_beyond_end_returns_empty_and_no_next()`
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
-  - `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `async def test_reanchor_refuses_to_erase_active_amendment_viii_without_a_receipt(tmp_path)`; `async def test_reanchor_refuses_when_the_anchored_constitution_cannot_be_read(tmp_path)`; `async def test_reanchor_still_succeeds_for_an_ordinary_dormant_version_bump(tmp_path)`; `…`
+  - `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path)`; `async def test_reanchor_refuses_to_erase_active_amendment_viii_without_a_receipt(tmp_path)`; `async def test_reanchor_refuses_when_the_anchored_constitution_cannot_be_read(tmp_path)`; `…`
 - **tests/unit/test_reanchor_target.py** — Which database — and whose agent — ``kestrel constitution reanchor`` writes (#2890).
   - `def agent_dir(tmp_path)`; `async def test_default_target_is_the_local_anchor(agent_dir)`; `async def test_postgres_with_a_dsn_targets_postgres_not_the_anchor(agent_dir, monkeypatch)`; `async def test_postgres_without_a_dsn_is_a_sqlite_host(agent_dir, monkeypatch)`; `async def test_backend_is_case_insensitive(agent_dir, monkeypatch)`; `async def test_surrounding_whitespace_is_not_stripped(agent_dir, monkeypatch)`; `async def test_explicit_arguments_override_the_environment(agent_dir, monkeypatch)`; `async def test_an_explicitly_empty_dsn_is_an_answer_not_a_gap(agent_dir, monkeypatch)`; `…`
 - **tests/unit/test_release_manifest.py** — Release manifest tests — Wave 5 sub-PR 1 (#920).
