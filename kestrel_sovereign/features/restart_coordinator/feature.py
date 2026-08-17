@@ -583,20 +583,14 @@ class RestartCoordinatorFeature(Feature):
             getattr(self.agent, "_current_request_id", "") or ""
         )
         # Capture the chat session this request was filed from so the
-        # post-restart wake lands in the SAME window (#1809). Prefer the agent's
-        # authoritative per-turn ``_active_session_id`` (set by both the
-        # streaming and non-streaming turn bodies from the effective session,
-        # incl. the JSON-body session the primary chat path uses). Fall back to
-        # the logging ``session_id_var`` (set only from a query param / header).
-        # Empty for CLI/system-filed requests with no session — those wake
-        # system-initiated, as before.
-        origin_session_id = getattr(self.agent, "_active_session_id", "") or ""
-        if not origin_session_id:
-            try:
-                from kestrel_sovereign.logging_config import session_id_var
-                origin_session_id = session_id_var.get() or ""
-            except Exception:
-                origin_session_id = ""
+        # post-restart wake lands in the SAME window (#1809, #2928). The
+        # lifecycle accessor proves the calling task owns the live turn before
+        # exposing its effective session. Reading the agent-global
+        # ``_active_session_id`` directly can cross-wire unattended work into a
+        # concurrent chat, while the logging ContextVar only covers an optional
+        # query/header value and is not the turn's routing authority.
+        # CLI/system/session-less requests remain explicitly unbound.
+        origin_session_id = self._turn_session_id() or ""
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),
