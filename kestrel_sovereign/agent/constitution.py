@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Mapping, Optional, Tuple
 from datetime import datetime, timezone
 
+from kestrel_sovereign.command_policy import (
+    GENESIS_AUDIT_BYPASS_COMMANDS,
+    prefixed_command_token,
+)
+
 # Import the concrete submodule, not the ``storage`` package aggregator.
 # constitution.py is pulled into the LLMService import chain (via
 # ``agent/__init__`` -> token_counter), and the storage package itself
@@ -2160,18 +2165,8 @@ class ConstitutionMixin:
         commands and ``!continue`` can fall through to an LLM turn, so they must
         complete genesis just like ordinary text.
         """
-        recovery_commands = {
-            "!status",
-            "!help",
-            "!verify-constitution",
-            "!reanchor-constitution",
-            "!safe-mode",
-            "!get-privacy-mode",
-            "!privacy-status",
-            "!bootstrap-status",
-        }
-        command = user_input.split(maxsplit=1)[0] if user_input else ""
-        if command in recovery_commands:
+        command = prefixed_command_token(user_input)
+        if command in GENESIS_AUDIT_BYPASS_COMMANDS:
             return None
 
         from kestrel_sovereign.constitution.genesis_audit import (
