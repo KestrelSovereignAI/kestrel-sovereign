@@ -47,6 +47,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from kestrel_sovereign._doctor_postgres_probe import (
+    ERROR_KIND_CONNECTION,
+    ERROR_KIND_DIAGNOSTIC,
+    ERROR_KIND_QUERY,
+)
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
     effective_identity_export_roots,
@@ -672,8 +677,8 @@ def _dsn_query(dsn: str) -> tuple[tuple[str, str], ...]:
 def _dsn_secrets(dsn: str) -> tuple:
     """Return every URI-embedded credential token, longest first."""
     secrets: set[str] = set()
-    for field, value in _dsn_query(dsn):
-        if field in {"password", "sslpassword"} and value:
+    for query_field, value in _dsn_query(dsn):
+        if query_field in {"password", "sslpassword"} and value:
             secrets.add(value)
 
     try:
@@ -827,6 +832,18 @@ def _postgres_unreadable(exc: BaseException, *, reason: str):
             isinstance(exc, _PostgresProbeTimeoutError) and exc.partial_diagnostic
         ),
     )
+
+
+def _source_unreadable(
+    source: _GovernanceSource,
+    exc: BaseException,
+    *,
+    reason: str,
+):
+    """Preserve PostgreSQL probe provenance only for PostgreSQL reads."""
+    if source.reads_the_anchor:
+        return _UnreadableDB(reason=reason)
+    return _postgres_unreadable(exc, reason=reason)
 
 
 def _postgres_probe_env(resolved_env: dict[str, str]) -> dict[str, str]:
@@ -1050,8 +1067,9 @@ def _fetch_postgres_rows_isolated(
             child_env,
         )
         error_type = {
-            "connection": _PostgresProbeConnectionError,
-            "query": _PostgresProbeQueryError,
+            ERROR_KIND_CONNECTION: _PostgresProbeConnectionError,
+            ERROR_KIND_DIAGNOSTIC: _PostgresProbeError,
+            ERROR_KIND_QUERY: _PostgresProbeQueryError,
         }.get(response.get("kind"), _PostgresProbeError)
         raise error_type(message)
 
@@ -2017,7 +2035,8 @@ def _read_agent_node(source: _GovernanceSource):
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error ({exc})")
     except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
-        return _postgres_unreadable(
+        return _source_unreadable(
+            source,
             exc,
             reason=f"cannot read {source.describe()} ({_safe(exc, source)})",
         )
@@ -2085,7 +2104,8 @@ def _read_governed_by_targets(
     except sqlite3.Error as exc:
         return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
     except Exception as exc:  # noqa: BLE001 — asyncpg raises its own tree
-        return _postgres_unreadable(
+        return _source_unreadable(
+            source,
             exc,
             reason=(
                 f"cannot read graph_edges in {source.describe()} ({_safe(exc, source)})"

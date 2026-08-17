@@ -8,8 +8,13 @@ deadline without changing any asyncpg connection setting.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
+
+ERROR_KIND_CONNECTION = "connection"
+ERROR_KIND_QUERY = "query"
+ERROR_KIND_DIAGNOSTIC = "diagnostic"
 
 
 class ProbeError(RuntimeError):
@@ -55,18 +60,20 @@ async def _fetch_rows(
 
     _emit_phase(connected=True)
     try:
-        try:
-            records = await connection.fetch(sql, *params)
-            return [list(record) for record in records]
-        except Exception as exc:
-            raise ProbeQueryError(str(exc)) from exc
-    finally:
-        try:
+        records = await connection.fetch(sql, *params)
+    except Exception as exc:
+        with contextlib.suppress(Exception):
             await connection.close()
-        except Exception as exc:
-            raise ProbeError(
-                "asyncpg could not close the diagnostic connection cleanly"
-            ) from exc
+        raise ProbeQueryError(str(exc)) from exc
+
+    rows = [list(record) for record in records]
+    try:
+        await connection.close()
+    except Exception as exc:
+        raise ProbeError(
+            "asyncpg could not close the diagnostic connection cleanly"
+        ) from exc
+    return rows
 
 
 def fetch_rows_in_process(
@@ -91,11 +98,17 @@ def main() -> None:
         )
         output = json.dumps({"ok": True, "rows": rows})
     except ProbeConnectionError as exc:
-        output = json.dumps({"ok": False, "kind": "connection", "error": str(exc)})
+        output = json.dumps(
+            {"ok": False, "kind": ERROR_KIND_CONNECTION, "error": str(exc)}
+        )
     except ProbeQueryError as exc:
-        output = json.dumps({"ok": False, "kind": "query", "error": str(exc)})
+        output = json.dumps(
+            {"ok": False, "kind": ERROR_KIND_QUERY, "error": str(exc)}
+        )
     except Exception as exc:  # noqa: BLE001 - protocol carries redacted text later
-        output = json.dumps({"ok": False, "kind": "diagnostic", "error": str(exc)})
+        output = json.dumps(
+            {"ok": False, "kind": ERROR_KIND_DIAGNOSTIC, "error": str(exc)}
+        )
     sys.stdout.write(output)
 
 

@@ -1101,6 +1101,30 @@ def test_read_governed_by_targets_unreadable_without_table(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "reader",
+    [
+        lambda source: _read_agent_node(source),
+        lambda source: _read_governed_by_targets(source, "did:x"),
+    ],
+)
+def test_unexpected_sqlite_read_failures_do_not_gain_postgres_provenance(
+    tmp_path,
+    monkeypatch,
+    reader,
+):
+    source = _anchor(tmp_path / "k.db", "did:x")
+    monkeypatch.setattr(
+        "kestrel_sovereign.doctor._fetch_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unexpected")),
+    )
+
+    result = reader(source)
+
+    assert isinstance(result, _UnreadableDB)
+    assert result.postgres_failure is None
+
+
 # ---------------------------------------------------------------------------
 # A database from before the ownership migration (#2649) has no ledgers at all.
 # Doctor is *meant* to run before boot (#2616), which is exactly when it meets
@@ -1786,9 +1810,9 @@ def test_asyncpg_worker_uses_only_the_public_connection_surface():
 
 def test_asyncpg_cleanup_failure_is_diagnostic_not_a_query_integrity_failure():
     from kestrel_sovereign.doctor import (
+        _postgres_fetch_rows_in_process,
         _PostgresProbeError,
         _PostgresProbeQueryError,
-        _postgres_fetch_rows_in_process,
     )
 
     class _Connection:
@@ -1810,6 +1834,126 @@ def test_asyncpg_cleanup_failure_is_diagnostic_not_a_query_integrity_failure():
         )
 
     assert not isinstance(raised.value, _PostgresProbeQueryError)
+
+
+def test_asyncpg_cleanup_failure_surfaces_inside_an_unrelated_exception_handler():
+    from kestrel_sovereign.doctor import (
+        _postgres_fetch_rows_in_process,
+        _PostgresProbeError,
+    )
+
+    class _Connection:
+        async def fetch(self, sql, *params):
+            return [[1]]
+
+        async def close(self):
+            raise RuntimeError("cleanup failed")
+
+    async def connect(dsn):
+        return _Connection()
+
+    try:
+        raise ValueError("unrelated")
+    except ValueError:
+        with pytest.raises(_PostgresProbeError, match="could not close"):
+            _postgres_fetch_rows_in_process(
+                "postgresql://runtime/database",
+                "SELECT 1",
+                (),
+                connect=connect,
+            )
+
+
+def test_asyncpg_cleanup_failure_does_not_replace_a_query_failure():
+    from kestrel_sovereign.doctor import (
+        _postgres_fetch_rows_in_process,
+        _PostgresProbeQueryError,
+    )
+
+    class _Connection:
+        async def fetch(self, sql, *params):
+            raise RuntimeError("query failed")
+
+        async def close(self):
+            raise RuntimeError("cleanup failed")
+
+    async def connect(dsn):
+        return _Connection()
+
+    with pytest.raises(_PostgresProbeQueryError, match="query failed") as raised:
+        _postgres_fetch_rows_in_process(
+            "postgresql://runtime/database",
+            "SELECT 1",
+            (),
+            connect=connect,
+        )
+
+    assert "cleanup failed" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_exception", "message"),
+    [
+        ("connection", "_PostgresProbeConnectionError", "connection sentinel"),
+        ("query", "_PostgresProbeQueryError", "query sentinel"),
+        ("diagnostic", "_PostgresProbeError", "diagnostic sentinel"),
+    ],
+)
+def test_real_worker_error_kinds_decode_across_json_boundary(
+    tmp_path,
+    failure_kind,
+    expected_exception,
+    message,
+):
+    import os
+
+    from kestrel_sovereign import doctor
+
+    module_dir = tmp_path / "runtime-imports"
+    module_dir.mkdir()
+    (module_dir / "asyncpg.py").write_text(
+        """
+import os
+
+
+if os.environ["KESTREL_TEST_PROBE_FAILURE"] == "diagnostic":
+    raise RuntimeError("diagnostic sentinel")
+
+
+class Connection:
+    async def fetch(self, sql, *params):
+        if os.environ["KESTREL_TEST_PROBE_FAILURE"] == "query":
+            raise RuntimeError("query sentinel")
+        return [[1]]
+
+    async def close(self):
+        return None
+
+
+async def connect(dsn):
+    if os.environ["KESTREL_TEST_PROBE_FAILURE"] == "connection":
+        raise RuntimeError("connection sentinel")
+    return Connection()
+"""
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": str(module_dir),
+            "KESTREL_TEST_PROBE_FAILURE": failure_kind,
+        }
+    )
+
+    exception_type = getattr(doctor, expected_exception)
+    with pytest.raises(exception_type, match=message) as raised:
+        doctor._fetch_postgres_rows_isolated(
+            "postgresql://runtime/database",
+            "SELECT 1",
+            postgres_env=environment,
+            postgres_cwd=str(tmp_path),
+        )
+
+    assert type(raised.value) is exception_type
 
 
 def test_project_environment_password_is_redacted_from_worker_errors(tmp_path):
@@ -1879,8 +2023,8 @@ def test_isolated_probe_kills_and_reaps_a_timed_out_worker(tmp_path, monkeypatch
     import subprocess
 
     from kestrel_sovereign.doctor import (
-        _PostgresProbeTimeoutError,
         _fetch_postgres_rows_isolated,
+        _PostgresProbeTimeoutError,
     )
 
     class _Process:
@@ -2085,14 +2229,8 @@ def test_the_diagnostic_connection_is_bounded(tmp_path, monkeypatch):
     assert _postgres_probe_timeout_seconds({}) == 10
 
 
-def test_an_agent_costs_one_postgres_connection(tmp_path, monkeypatch):
-    """Both checks read one shared result, so the timeout is paid once.
-
-    Resolving and reading per check meant an unreachable database cost two
-    connection timeouts *per agent*: a ten-agent fleet waiting 100 seconds to
-    be told the database is down, from the tool whose bound is five seconds and
-    whose purpose is to answer quickly when the database is down.
-    """
+def test_agent_node_read_is_memoized_across_governance_checks(tmp_path, monkeypatch):
+    """The drift and ownership checks share one agent-node read result."""
     _seed_matching_anchor(tmp_path, monkeypatch)
     properties = json.dumps({"name": "Test", "constitution_hash": "a" * 64})
     fake = _FakePostgres(
@@ -2161,10 +2299,18 @@ def test_sqlite_hosts_never_reach_for_postgres(tmp_path, monkeypatch):
     monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
     stored = _seed_matching_anchor(tmp_path, monkeypatch)
-    fake = _FakePostgres({})
+    from kestrel_sovereign import doctor
+
+    def fail_if_postgres_is_probed(*_args, **_kwargs):
+        pytest.fail("SQLite host reached for PostgreSQL")
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        fail_if_postgres_is_probed,
+    )
     report = diagnose(tmp_path)
 
-    assert not fake.executed
     assert any(stored[:12] in m for m in report.ok)
 
 
