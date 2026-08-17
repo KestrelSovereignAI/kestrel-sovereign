@@ -131,7 +131,8 @@ semantic_recall_result_limit = 8
 semantic_recall_max_tokens = 1200
 # Hard deadline for consolidation + forgetting. The coroutine abandons a
 # timed-out pass and releases its MEMORY lock context so queued work can run;
-# an aiosqlite statement already executing in its worker may still be draining.
+# SQLite interruption and rollback are retained by the backend, though a Python
+# UDF or stalled VFS operation may still drain until it returns control to SQLite.
 # memory_consolidation_timeout_seconds = 1800
 
 # =============================================================================

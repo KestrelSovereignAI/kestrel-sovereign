@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Dict, List
 
 from kestrel_sdk.signals import ResourceLock
+from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 
 logger = logging.getLogger(__name__)
@@ -290,7 +291,7 @@ async def check_memory_system(agent) -> Dict[str, Any]:
         if consolidator:
             components.append("consolidator")
 
-        db = getattr(storage, "db", None)
+        db = resolve_feature_database(agent)
         if db:
             components.append("database")
 

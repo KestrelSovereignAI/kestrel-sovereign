@@ -38,6 +38,16 @@ AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S = max(
 )
 _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 
+# SQLite already treats a lock wait of up to 30 seconds as healthy runtime
+# behavior.  Cancellation cleanup is a runtime-availability concern, not a
+# worker-shutdown concern, so it must not inherit the much shorter lifecycle
+# timeout above.  Interrupting the abandoned statement normally makes this
+# handoff immediate; the busy window covers operations (such as a Python UDF
+# or stalled VFS call) that cannot observe sqlite3_interrupt() until they
+# return control to SQLite.
+_SQLITE_BUSY_TIMEOUT_S = 30.0
+_CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
+
 
 class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
     """A retained rollback is still running after a later writer's budget."""
@@ -387,7 +397,7 @@ class SQLiteBackend(DatabaseBackend):
             and not drain.done()
             and started_at is not None
             and time.monotonic() - started_at
-            >= AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+            >= _CANCELLED_OPERATION_DRAIN_TIMEOUT_S
         )
 
     @property
@@ -440,13 +450,17 @@ class SQLiteBackend(DatabaseBackend):
                 db_dir = Path(self.db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
             
-            self._connection = await aiosqlite.connect(self.db_path, timeout=30)
+            self._connection = await aiosqlite.connect(
+                self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+            )
             
             # Enable WAL mode for better concurrency
             await self._connection.execute("PRAGMA journal_mode=WAL")
             
             # Allow concurrent writers to wait up to 30s for the lock
-            await self._connection.execute("PRAGMA busy_timeout=30000")
+            await self._connection.execute(
+                f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
+            )
             
             # Enable foreign keys
             await self._connection.execute("PRAGMA foreign_keys=ON")
@@ -583,7 +597,9 @@ class SQLiteBackend(DatabaseBackend):
             raise ValueError("Cannot back up an in-memory database")
         conn = self._ensure_connected()
         async with self._write_guard():
-            dest = await aiosqlite.connect(dest_path, timeout=30)
+            dest = await aiosqlite.connect(
+                dest_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+            )
             try:
                 await conn.backup(dest)
             finally:
@@ -594,9 +610,13 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
-        conn = await aiosqlite.connect(self.db_path, timeout=30)
+        conn = await aiosqlite.connect(
+            self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+        )
         try:
-            await conn.execute("PRAGMA busy_timeout=30000")
+            await conn.execute(
+                f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
+            )
             await conn.execute("PRAGMA foreign_keys=ON")
             await conn.execute("PRAGMA query_only=ON")
             conn.row_factory = aiosqlite.Row
@@ -722,10 +742,15 @@ class SQLiteBackend(DatabaseBackend):
         if drain is not None and drain is not asyncio.current_task():
             # A caller cancelled while waiting must not cancel the backend-owned
             # cleanup task.  The retained task remains the sole drain owner.
+            started_at = self._cancelled_write_drain_started_at
+            remaining = _CANCELLED_OPERATION_DRAIN_TIMEOUT_S
+            if started_at is not None:
+                remaining = max(
+                    0.0,
+                    remaining - (time.monotonic() - started_at),
+                )
             try:
-                async with asyncio.timeout(
-                    AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
-                ):
+                async with asyncio.timeout(remaining):
                     await asyncio.shield(drain)
             except TimeoutError:
                 # A later writer must never inherit the unbounded worker wait
@@ -777,8 +802,9 @@ class SQLiteBackend(DatabaseBackend):
         The aiosqlite worker serializes its queue.  If the cancelled statement
         is blocked inside that worker, directly awaiting ``rollback()`` here
         would put the caller's timeout behind the same statement and defeat the
-        deadline.  The background drain deliberately does not acquire
-        ``_write_lock``; ``_write_guard`` fences all later writers on the
+        deadline.  The background drain interrupts the abandoned SQLite VM
+        before queueing rollback. It deliberately does not acquire
+        ``_write_lock``; ``_write_guard`` fences all later operations on the
         retained task instead.
         """
         # ``close`` owns every queued operation after it fences handoffs. A
@@ -808,9 +834,27 @@ class SQLiteBackend(DatabaseBackend):
     async def _drain_cancelled_write(
         self, conn: aiosqlite.Connection
     ) -> None:
-        """Roll back one cancelled worker operation and retire its fence."""
+        """Interrupt and roll back one cancelled operation, then retire its fence."""
         this_task = asyncio.current_task()
         try:
+            try:
+                await conn.interrupt()
+            except ValueError as exc:
+                if "no active connection" not in str(exc):
+                    logger.warning(
+                        "Could not interrupt cancelled SQLite operation for %s: %s",
+                        self.db_path,
+                        exc,
+                    )
+            except Exception:
+                # Rollback is still the terminal marker even when interrupt is
+                # unavailable. Preserve the retained fence and let the runtime
+                # drain deadline expose a genuinely stuck operation.
+                logger.warning(
+                    "Could not interrupt cancelled SQLite operation for %s",
+                    self.db_path,
+                    exc_info=True,
+                )
             await conn.rollback()
         except Exception as exc:
             self._cancelled_write_drain_error = exc
@@ -818,10 +862,10 @@ class SQLiteBackend(DatabaseBackend):
                 "SQLite cancellation cleanup failed for %s", self.db_path
             )
         else:
-            # The deadline belongs to each waiting writer, not to the
+            # The availability deadline belongs to the handoff, not to the
             # backend-owned rollback. A rollback that eventually succeeds
-            # restores the shared connection and must remove only that
-            # transient marker; genuine cleanup failures remain latched.
+            # restores the shared connection and must remove only the
+            # transient deadline marker; genuine cleanup failures stay latched.
             if isinstance(
                 self._cancelled_write_drain_error,
                 _CancelledWriteDrainDeadlineExceeded,

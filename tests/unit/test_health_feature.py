@@ -206,7 +206,7 @@ class TestCheckDatabase:
         """Health ages a real worker drain without requiring another query."""
         monkeypatch.setattr(
             sqlite_backend_module,
-            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
             0.1,
         )
         backend = SQLiteBackend(str(tmp_path / "expired-cleanup.db"))
@@ -255,6 +255,86 @@ class TestCheckDatabase:
             watchdog.cancel()
             release_worker.set()
             await asyncio.gather(blocked_read, return_exceptions=True)
+            drain = backend._cancelled_write_drain
+            if drain is not None:
+                await asyncio.gather(drain, return_exceptions=True)
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_timed_out_probe_does_not_poison_later_database_work(
+        self, tmp_path, monkeypatch
+    ):
+        """A probe-created drain uses runtime, not worker-shutdown, timing."""
+        backend = SQLiteBackend(str(tmp_path / "probe-cancellation.db"))
+        await backend.connect()
+        db = AsyncDatabase(backend)
+        conn = backend._ensure_connected()
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+        first_probe = True
+        real_fetchone = db.fetchone
+
+        def block_first_probe() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        async def fetchone_with_slow_first_probe(query, params=()):
+            nonlocal first_probe
+            if first_probe:
+                first_probe = False
+                return await backend.fetch_one("SELECT block_first_probe()")
+            return await real_fetchone(query, params)
+
+        await conn.create_function("block_first_probe", 0, block_first_probe)
+        db.fetchone = fetchone_with_slow_first_probe
+        release_handle = None
+        try:
+            watchdog.start()
+            with (
+                monkeypatch.context() as deadlines,
+                patch.object(
+                    health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.02
+                ),
+            ):
+                deadlines.setattr(
+                    sqlite_backend_module,
+                    "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                    0.02,
+                )
+                deadlines.setattr(
+                    sqlite_backend_module,
+                    "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+                    0.3,
+                )
+                first = await health_checks._run_database_bound_check(
+                    "database", check_database(db)
+                )
+                assert entered_worker.is_set()
+                assert first["status"] == "fail"
+                assert "timed out" in first["message"]
+                assert backend.write_connection_unavailable is True
+
+                # This release occurs after the old 20ms shutdown window. The
+                # following application write must wait for retained rollback
+                # and recover instead of receiving a false lifecycle failure.
+                release_handle = asyncio.get_running_loop().call_later(
+                    0.08, release_worker.set
+                )
+                async with asyncio.timeout(0.5):
+                    await db.execute(
+                        "CREATE TABLE after_probe (id INTEGER PRIMARY KEY)"
+                    )
+
+                recovered = await check_database(db)
+                assert recovered["status"] == "pass"
+                assert backend.write_connection_unavailable is False
+        finally:
+            watchdog.cancel()
+            if release_handle is not None:
+                release_handle.cancel()
+            release_worker.set()
             drain = backend._cancelled_write_drain
             if drain is not None:
                 await asyncio.gather(drain, return_exceptions=True)
@@ -361,6 +441,30 @@ class TestCheckMemorySystem:
         agent.memory_consolidator = None
         result = await check_memory_system(agent)
         assert result["status"] == "warn"
+
+    @pytest.mark.asyncio
+    async def test_privacy_wrapper_database_is_resolved_without_deprecation(self):
+        from warnings import catch_warnings, simplefilter
+
+        from kestrel_sovereign.privacy import PrivacyMode
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            PrivacyEnforcingStorage,
+        )
+
+        raw_db = object()
+        raw_storage = SimpleNamespace(db=raw_db)
+        agent = SimpleNamespace(
+            storage=PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL),
+            memory_retriever=object(),
+            memory_consolidator=None,
+        )
+
+        with catch_warnings():
+            simplefilter("error", DeprecationWarning)
+            result = await check_memory_system(agent)
+
+        assert result["status"] == "pass"
+        assert "database" in result["message"]
 
 
 class TestCheckResourceLocks:

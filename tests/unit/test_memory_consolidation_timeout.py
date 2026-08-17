@@ -193,7 +193,7 @@ async def test_hung_consolidation_times_out_in_owner_task_and_releases_lock(
     assert observed_tasks == [owner_task, owner_task]
     assert holder_labels == ["Claw MemoryFeature.memory_consolidate"]
     assert result.status is ToolResultStatus.ERROR
-    assert "configured 0.02-second deadline" in result.error
+    assert "configured deadline of 0.02 seconds" in result.error
     assert not locks.is_held(ResourceLock.MEMORY)
     assert locks.holder(ResourceLock.MEMORY) is None
 
@@ -360,7 +360,7 @@ async def test_real_blocked_aiosqlite_read_releases_memory_lock_near_deadline(
         assert elapsed >= timeout_seconds
         assert elapsed < 1.5
         assert result.status is ToolResultStatus.ERROR
-        assert "configured 0.05-second deadline" in result.error
+        assert "configured deadline of 0.05 seconds" in result.error
         assert not locks.is_held(ResourceLock.MEMORY)
         assert backend.write_connection_unavailable
 
@@ -449,24 +449,30 @@ async def test_tool_skips_same_task_dispatch_lock_reacquisition(monkeypatch):
     assert result.status is ToolResultStatus.OK
 
 
-async def test_lock_wait_and_consolidation_share_one_deadline(monkeypatch):
+async def test_lock_wait_does_not_consume_consolidation_deadline(monkeypatch):
     locks = OrderedLockManager()
     held = asyncio.Event()
     consolidation_started = asyncio.Event()
 
-    async def consolidate():
+    async def run_consolidation():
         consolidation_started.set()
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.06)
         return {"episodes_created": 1}
 
     async def hold_memory():
         async with locks.acquire({ResourceLock.MEMORY}, label="other task"):
             held.set()
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.06)
 
     holder_task = asyncio.create_task(hold_memory())
     await held.wait()
-    feature = _feature(SimpleNamespace(consolidate=consolidate), locks)
+    memory_system = MemorySystem(
+        storage=SimpleNamespace(), agent_id="did:test:independent-deadlines"
+    )
+    memory_system.consolidator = SimpleNamespace(
+        run_consolidation=run_consolidation
+    )
+    feature = _feature(memory_system, locks)
     monkeypatch.setattr(
         "kestrel_sovereign.storage.memory_system.load_section",
         lambda _section: {"memory_consolidation_timeout_seconds": 0.1},
@@ -475,10 +481,8 @@ async def test_lock_wait_and_consolidation_share_one_deadline(monkeypatch):
     result = await feature.memory_consolidate()
     await holder_task
 
-    assert not consolidation_started.is_set()
-    assert result.status is ToolResultStatus.ERROR
-    assert "configured 0.1-second deadline" in result.error
-    assert "consolidation did not start" in result.error
+    assert consolidation_started.is_set()
+    assert result.status is ToolResultStatus.OK
     assert not locks.is_held(ResourceLock.MEMORY)
 
 

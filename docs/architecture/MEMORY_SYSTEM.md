@@ -679,8 +679,11 @@ finite deadline (default: 1,800 seconds). Expiry raises
 `MemoryConsolidationTimeoutError`; the caller must report failure rather than
 claiming a completed pass. The coroutine and its `ResourceLock.MEMORY` context
 unwind in the same task. An aiosqlite statement already running in the driver's
-worker thread cannot be interrupted by coroutine cancellation and may still be
-draining after the lock context is released.
+worker thread is not stopped by coroutine cancellation itself. The SQLite
+backend hands the abandoned operation to a retained `sqlite3_interrupt()` plus
+rollback drain, but a Python UDF or stalled VFS operation may not observe that
+interrupt until it returns control to SQLite and can therefore keep draining
+after the lock context is released.
 
 ### 1. Episode Creation
 

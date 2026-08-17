@@ -466,6 +466,101 @@ class TestSQLiteBackend:
             )
 
     @pytest.mark.asyncio
+    async def test_cancelled_statement_uses_runtime_drain_budget(
+        self, backend, monkeypatch
+    ):
+        """Cleanup interrupts first and does not inherit the shutdown timeout."""
+        await backend.execute("CREATE TABLE recoverable (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO recoverable (value) VALUES (0)")
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(2.0, release_worker.set)
+
+        def block_in_worker(value):
+            entered_worker.set()
+            release_worker.wait()
+            return value
+
+        conn = backend._ensure_connected()
+        await conn.create_function("block_in_worker", 1, block_in_worker)
+        blocked_read = asyncio.create_task(
+            backend.fetch_one("SELECT block_in_worker(value) FROM recoverable")
+        )
+        following_read = None
+        following_write = None
+        release_handle = None
+        try:
+            watchdog.start()
+            async with asyncio.timeout(0.5):
+                while not entered_worker.is_set():
+                    await asyncio.sleep(0.005)
+
+            interrupt = AsyncMock(wraps=conn.interrupt)
+            with (
+                monkeypatch.context() as deadlines,
+                patch.object(conn, "interrupt", new=interrupt),
+            ):
+                # Prove runtime cleanup remains available beyond the much
+                # shorter worker-shutdown lifecycle window.
+                deadlines.setattr(
+                    sqlite_backend_module,
+                    "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+                    0.02,
+                )
+                deadlines.setattr(
+                    sqlite_backend_module,
+                    "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
+                    0.3,
+                )
+                blocked_read.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await blocked_read
+
+                following_read = asyncio.create_task(
+                    backend.fetch_one("SELECT value FROM recoverable")
+                )
+                following_write = asyncio.create_task(
+                    backend.execute(
+                        "UPDATE recoverable SET value = value + 1"
+                    )
+                )
+                release_handle = asyncio.get_running_loop().call_later(
+                    0.08, release_worker.set
+                )
+
+                async with asyncio.timeout(0.5):
+                    read_result, _ = await asyncio.gather(
+                        following_read, following_write
+                    )
+
+                assert read_result in {(0,), (1,)}
+                assert await backend.fetch_one(
+                    "SELECT value FROM recoverable"
+                ) == (1,)
+                assert backend.write_connection_unavailable is False
+                assert (
+                    backend.write_connection_cleanup_deadline_exceeded
+                    is False
+                )
+                interrupt.assert_awaited_once_with()
+        finally:
+            watchdog.cancel()
+            if release_handle is not None:
+                release_handle.cancel()
+            release_worker.set()
+            for task in (blocked_read, following_read, following_write):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(
+                    task
+                    for task in (blocked_read, following_read, following_write)
+                    if task is not None
+                ),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_cancelled_snapshot_read_interrupts_before_owned_close(
         self, backend, monkeypatch
     ):
@@ -1152,7 +1247,7 @@ class TestSQLiteBackend:
         """A wedged rollback cannot block every later writer indefinitely."""
         monkeypatch.setattr(
             sqlite_backend_module,
-            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            "_CANCELLED_OPERATION_DRAIN_TIMEOUT_S",
             0.02,
         )
         backend = SQLiteBackend(str(tmp_path / "bounded-drain-wait.db"))

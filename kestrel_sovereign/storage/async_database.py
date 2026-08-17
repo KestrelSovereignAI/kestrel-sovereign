@@ -2258,14 +2258,10 @@ class AsyncDatabase:
             # false success here: ``close()`` still gives the primary backend
             # its close chance before reporting this failure, and whole-agent
             # shutdown records it as degraded after that same primary close.
-            try:
-                await sqla_factory.close()
-            except (Exception, asyncio.CancelledError):
-                raise
-            else:
-                if not sqla_factory.retirement_pending:
-                    sqla_factory.finalize_retirement()
-                    self._sovereign_sqla_retirement_owner = None
+            await sqla_factory.close()
+            if not sqla_factory.retirement_pending:
+                sqla_factory.finalize_retirement()
+                self._sovereign_sqla_retirement_owner = None
 
     async def finalize_retired_sqla_factory(self) -> None:
         """Finalize and detach a prior SQLAlchemy retirement owner."""
