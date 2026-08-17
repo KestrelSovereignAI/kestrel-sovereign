@@ -62,10 +62,12 @@ def _check_gss_runtime_parity(
     """Reject a libpq GSS success that bare asyncpg cannot reproduce.
 
     PostgreSQL 12 added ``pg_stat_gssapi``, which reports the authentication
-    method for this backend without exposing another session's identity. On an
-    older server, password use proves GSS was not selected; otherwise doctor
-    fails closed when asyncpg's optional module is absent because libpq does
-    not expose the selected non-password authentication method directly.
+    method for this backend without exposing another session's identity. The
+    parent can safely validate asyncpg's optional module initialization, but a
+    successful libpq exchange is not proof that asyncpg can complete the same
+    server challenge sequence. Doctor therefore fails diagnostic-capability
+    whenever GSS/SSPI was actually used unless the probe itself is eventually
+    replaced with a bounded asyncpg connection/query.
     """
     info = getattr(connection, "info", None)
     server_version = getattr(info, "server_version", None)
@@ -89,14 +91,15 @@ def _check_gss_runtime_parity(
         # A password-authenticated connection did not use GSS.
         return
     if server_version < 120000:
-        if module_available:
-            # The old server cannot expose its selected auth method, but the
-            # runtime has the only optional capability that could diverge.
-            return
+        capability = (
+            "initialized its optional module"
+            if module_available
+            else f"lacks usable optional module {module!r}"
+        )
         raise ProbeDiagnosticCapabilityError(
             "PostgreSQL diagnostic driver cannot determine whether this "
-            "pre-12 connection used GSSAPI/SSPI authentication, while the "
-            f"spawned asyncpg runtime lacks optional module {module!r}"
+            "pre-12 connection used GSSAPI/SSPI authentication; the spawned "
+            f"asyncpg runtime {capability}"
         )
 
     try:
@@ -126,7 +129,13 @@ def _check_gss_runtime_parity(
     if used_gss and not module_available:
         raise ProbeRuntimeConfigurationError(
             "the PostgreSQL server selected GSSAPI/SSPI authentication, but "
-            f"the spawned asyncpg runtime lacks optional module {module!r}"
+            f"the spawned asyncpg runtime lacks usable optional module {module!r}"
+        )
+    if used_gss:
+        raise ProbeDiagnosticCapabilityError(
+            "the PostgreSQL diagnostic connection used GSSAPI/SSPI "
+            "authentication; module initialization alone cannot verify the "
+            "spawned asyncpg runtime's complete server exchange"
         )
 
 
@@ -139,9 +148,10 @@ def _copy_private_key(source: Path, destination: Path) -> None:
             # Materialized key custody is an exact contract, including under
             # unusually restrictive service umasks.
             os.fchmod(descriptor, 0o600)
-        with source.open("rb") as input_file, os.fdopen(
-            descriptor, "wb", closefd=False
-        ) as output_file:
+        with (
+            source.open("rb") as input_file,
+            os.fdopen(descriptor, "wb", closefd=False) as output_file,
+        ):
             shutil.copyfileobj(input_file, output_file)
     finally:
         os.close(descriptor)
@@ -340,13 +350,9 @@ def _fetch_rows_with_temp_dir(
                 # ``absent`` child is never created, so no process can race a
                 # passfile into place between translation and libpq's open.
                 passfile = Path(temp_dir) / "absent" / "pgpass"
-                effective_dsn = driver.extensions.make_dsn(
-                    dsn, passfile=str(passfile)
-                )
+                effective_dsn = driver.extensions.make_dsn(dsn, passfile=str(passfile))
 
-            effective_dsn = _materialize_libpq_tls_key(
-                driver, effective_dsn, temp_dir
-            )
+            effective_dsn = _materialize_libpq_tls_key(driver, effective_dsn, temp_dir)
             dsn_parameters = driver.extensions.parse_dsn(effective_dsn)
             return _query_postgres_driver(
                 driver,

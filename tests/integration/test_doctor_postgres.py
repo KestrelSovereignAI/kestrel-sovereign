@@ -20,10 +20,11 @@ Run against any throwaway PostgreSQL:
 
 Skipped when that is not set, so CI stays green.
 
-The ``sslmode=prefer`` plus direct-negotiation cases use asyncpg's parser as
-their runtime precondition. Asyncpg 0.30 attempts direct TLS before plaintext,
-and that transport attempt is rejected before its fallback on stock servers
-that lack direct TLS (PostgreSQL 16) or require ALPN for it (PostgreSQL 17).
+The active-TLS plus direct-negotiation cases use asyncpg's parser as their
+runtime precondition. Asyncpg 0.30 omits PostgreSQL's ALPN protocol from that
+handshake, so PostgreSQL 17 can reject it even where libpq 17's ALPN-bearing
+diagnostic handshake succeeds. No active direct mode can prove parity through
+libpq; disabled TLS remains transport-equivalent because negotiation is ignored.
 """
 
 from __future__ import annotations
@@ -1152,6 +1153,24 @@ async def test_disabled_ssl_ignores_invalid_tls_versions_live(
             {"PGSSLMODE": "prefer", "PGSSLNEGOTIATION": "direct"},
             False,
         ),
+        ("?sslmode=require&sslnegotiation=direct", {}, False),
+        (
+            "",
+            {"PGSSLMODE": "require", "PGSSLNEGOTIATION": "direct"},
+            False,
+        ),
+        ("?sslmode=verify-ca&sslnegotiation=direct", {}, False),
+        (
+            "",
+            {"PGSSLMODE": "verify-ca", "PGSSLNEGOTIATION": "direct"},
+            False,
+        ),
+        ("?sslmode=verify-full&sslnegotiation=direct", {}, False),
+        (
+            "",
+            {"PGSSLMODE": "verify-full", "PGSSLNEGOTIATION": "direct"},
+            False,
+        ),
     ],
     ids=(
         "disable-query",
@@ -1162,6 +1181,12 @@ async def test_disabled_ssl_ignores_invalid_tls_versions_live(
         "allow-environment",
         "prefer-query",
         "prefer-environment",
+        "require-query-postgresql-17-alpn",
+        "require-environment-postgresql-17-alpn",
+        "verify-ca-query-postgresql-17-alpn",
+        "verify-ca-environment-postgresql-17-alpn",
+        "verify-full-query-postgresql-17-alpn",
+        "verify-full-environment-postgresql-17-alpn",
     ),
 )
 async def test_direct_negotiation_matches_runtime_or_fails_closed(
@@ -1173,7 +1198,7 @@ async def test_direct_negotiation_matches_runtime_or_fails_closed(
     tls_env,
     doctor_ready,
 ):
-    """Unrepresentable weak direct TLS fails closed; disable stays exact."""
+    """ALPN-divergent active direct TLS fails closed; disable stays exact."""
     import asyncpg
     from asyncpg.connect_utils import (
         SSLMode,
@@ -1195,10 +1220,13 @@ async def test_direct_negotiation_matches_runtime_or_fails_closed(
     # Drop these overrides before runtime_db's finalizer reconnects to drop
     # the throwaway database.
     with pytest.MonkeyPatch.context() as tls:
-        for name in ("PGSSLMODE", "PGSSLNEGOTIATION"):
+        for name in ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT"):
             tls.delenv(name, raising=False)
         for name, value in tls_env.items():
             tls.setenv(name, value)
+        if "verify-" in query or tls_env.get("PGSSLMODE", "").startswith("verify-"):
+            root_certificate, _key, _combined = _write_client_identity(tmp_path)
+            tls.setenv("PGSSLROOTCERT", str(root_certificate))
 
         _, runtime_params = _parse_connect_dsn_and_args(
             dsn=runtime_dsn,
@@ -1215,13 +1243,13 @@ async def test_direct_negotiation_matches_runtime_or_fails_closed(
             krbsrvname=None,
             gsslib=None,
         )
-        if runtime_params.sslmode == SSLMode.prefer:
-            # This is the runtime shape under test, but its first transport
-            # attempt cannot be used as a portable live-server precondition;
-            # see the module docstring. Doctor must still fail translation
-            # closed rather than probe a different connection policy.
+        if runtime_params.sslmode != SSLMode.disable:
+            # This is the runtime shape under test, but a direct-TLS transport
+            # cannot be used as a portable live-server precondition. On
+            # PostgreSQL 17 specifically, asyncpg's ALPN-free handshake can
+            # fail where libpq's ALPN handshake succeeds. Doctor must fail
+            # translation closed instead of probing that different policy.
             assert runtime_params.ssl_negotiation == SSLNegotiation.direct
-            assert runtime_params.ssl is not None
         else:
             connection = await asyncpg.connect(runtime_dsn)
             await connection.close()
@@ -1345,9 +1373,7 @@ async def test_missing_explicit_key_with_default_certificate_matches_asyncpg(
     certificate.rename(tls_dir / "postgresql.crt")
     missing_key = tmp_path / "missing-explicit.key"
     runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=allow&sslkey="
-        + quote(str(missing_key), safe="")
+        runtime_db.dsn + "?sslmode=allow&sslkey=" + quote(str(missing_key), safe="")
     )
     monkeypatch.setenv("HOME", str(runtime_home))
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -1412,9 +1438,7 @@ async def test_combined_client_certificate_and_key_connects_for_both_drivers(
     )
     _certificate, _key, combined = _write_client_identity(tmp_path)
     runtime_dsn = (
-        runtime_db.dsn
-        + "?sslmode=prefer&sslcert="
-        + quote(str(combined), safe="")
+        runtime_db.dsn + "?sslmode=prefer&sslcert=" + quote(str(combined), safe="")
     )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)

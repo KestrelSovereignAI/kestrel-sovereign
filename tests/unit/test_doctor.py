@@ -1653,6 +1653,7 @@ def test_asyncpg_environment_settings_are_folded_into_the_libpq_dsn(tmp_path):
         "user": "project_user",
         "password": "project-password",
         "sslmode": "verify-full",
+        "ssl_min_protocol_version": "TLSv1.2",
         "sslrootcert": str(root_certificate),
         "target_session_attrs": "any",
         "gssencmode": "disable",
@@ -2832,7 +2833,7 @@ def test_asyncpg_environment_option_unknown_to_linked_libpq_fails_closed(
     with pytest.raises(ValueError, match="sslnegotiation"):
         _doctor_postgres_dsn(
             "postgresql://u@h/db",
-            {"PGSSLMODE": "require", "PGSSLNEGOTIATION": "direct"},
+            {"PGSSLMODE": "require", "PGSSLNEGOTIATION": "postgres"},
             tmp_path,
         )
 
@@ -2855,7 +2856,7 @@ def test_asyncpg_query_option_unknown_to_linked_libpq_fails_closed(
     monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_newer_option)
     with pytest.raises(ValueError, match="sslnegotiation"):
         _doctor_postgres_dsn(
-            "postgresql://u@h/db?sslmode=require&sslnegotiation=direct",
+            "postgresql://u@h/db?sslmode=require&sslnegotiation=postgres",
             {},
             tmp_path,
         )
@@ -2995,6 +2996,53 @@ def test_asyncpg_tls_protocol_aliases_are_normalized_for_libpq(
     assert parsed["ssl_max_protocol_version"] == libpq_maximum
 
 
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, "TLSv1.2"),
+        ({"PGSSLMINPROTOCOLVERSION": ""}, "TLSv1.2"),
+    ],
+    ids=("unset", "blank-environment"),
+)
+def test_active_ssl_states_asyncpg_default_tls_1_2_floor(
+    tmp_path, environment, expected
+):
+    from psycopg2.extensions import parse_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    parsed = parse_dsn(
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslmode=require",
+            environment,
+            tmp_path,
+        )
+    )
+
+    assert parsed["ssl_min_protocol_version"] == expected
+
+
+def test_default_tls_floor_unknown_to_linked_libpq_fails_closed(monkeypatch, tmp_path):
+    import psycopg2
+    from psycopg2.extensions import make_dsn as real_make_dsn
+
+    from kestrel_sovereign.doctor import _doctor_postgres_dsn
+
+    def reject_protocol_floor(dsn=None, **kwargs):
+        if "ssl_min_protocol_version" in kwargs:
+            raise psycopg2.ProgrammingError("unsupported by this libpq")
+        return real_make_dsn(dsn, **kwargs)
+
+    monkeypatch.setattr("psycopg2.extensions.make_dsn", reject_protocol_floor)
+
+    with pytest.raises(ValueError, match="ssl_min_protocol_version"):
+        _doctor_postgres_dsn(
+            "postgresql://u@h/db?sslmode=require",
+            {},
+            tmp_path,
+        )
+
+
 @pytest.mark.parametrize("source", ["query", "environment"])
 def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
     tmp_path, monkeypatch, source
@@ -3050,12 +3098,6 @@ def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
     ("dsn", "env", "sslmode", "sslnegotiation"),
     [
         (
-            "postgresql://u@h/db?sslmode=verify-full&sslnegotiation=direct",
-            {},
-            "verify-full",
-            "direct",
-        ),
-        (
             "postgresql://u@h/db",
             {"PGSSLMODE": "disable", "PGSSLNEGOTIATION": "direct"},
             "disable",
@@ -3087,7 +3129,6 @@ def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
         ),
     ],
     ids=(
-        "query-verify-full",
         "environment-disable",
         "unix-socket-default-disable",
         "query-disable",
@@ -3095,14 +3136,14 @@ def test_disabled_ssl_omits_tls_protocol_settings_asyncpg_ignores(
         "query-disable-environment-direct",
     ),
 )
-def test_direct_tls_is_normalized_to_a_valid_libpq_pair(
+def test_disabled_direct_tls_is_normalized_to_a_valid_libpq_pair(
     dsn,
     env,
     sslmode,
     sslnegotiation,
     tmp_path,
 ):
-    """asyncpg accepts weak/disabled modes that libpq rejects with direct."""
+    """Asyncpg ignores direct negotiation when TLS itself is disabled."""
     from psycopg2.extensions import parse_dsn
 
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
@@ -3138,9 +3179,39 @@ def test_direct_tls_is_normalized_to_a_valid_libpq_pair(
             {"PGSSLMODE": "allow", "PGSSLNEGOTIATION": "direct"},
             "allow",
         ),
+        (
+            "postgresql://u@h/db?sslmode=require&sslnegotiation=direct",
+            {},
+            "require",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "require", "PGSSLNEGOTIATION": "direct"},
+            "require",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=verify-ca&sslnegotiation=direct",
+            {},
+            "verify-ca",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "verify-ca", "PGSSLNEGOTIATION": "direct"},
+            "verify-ca",
+        ),
+        (
+            "postgresql://u@h/db?sslmode=verify-full&sslnegotiation=direct",
+            {},
+            "verify-full",
+        ),
+        (
+            "postgresql://u@h/db",
+            {"PGSSLMODE": "verify-full", "PGSSLNEGOTIATION": "direct"},
+            "verify-full",
+        ),
     ],
 )
-def test_weak_direct_tls_fails_closed_when_libpq_cannot_represent_it(
+def test_active_direct_tls_fails_closed_when_libpq_cannot_represent_asyncpg_alpn(
     dsn, env, sslmode, tmp_path
 ):
     from kestrel_sovereign.doctor import _doctor_postgres_dsn
@@ -3724,7 +3795,7 @@ def test_postgres_probe_child_strips_the_complete_libpq_namespace(monkeypatch):
     assert os.environ["KRB5CCNAME"] == "/doctor/credentials"
 
 
-def test_asyncpg_runtime_preflight_uses_agent_pythonpath_and_cwd(tmp_path):
+def test_asyncpg_runtime_preflight_rejects_incomplete_agent_gss_shadow(tmp_path):
     import subprocess
     import sys
 
@@ -3745,7 +3816,9 @@ def test_asyncpg_runtime_preflight_uses_agent_pythonpath_and_cwd(tmp_path):
         tmp_path,
     )
 
-    assert capability == {"module": "sspilib", "available": True}
+    # Importability alone is insufficient: asyncpg dereferences these APIs
+    # only after the server selects SSPI authentication.
+    assert capability == {"module": "sspilib", "available": False}
     sanitized = _postgres_probe_env(resolved)
     hidden = subprocess.run(
         [
@@ -3767,6 +3840,190 @@ def test_asyncpg_runtime_preflight_uses_agent_pythonpath_and_cwd(tmp_path):
     assert hidden.stdout.strip() != "spawned-agent"
 
 
+def test_asyncpg_runtime_preflight_accepts_complete_agent_gss_surface(tmp_path):
+    from kestrel_sovereign.doctor import _inspect_asyncpg_runtime
+
+    agent_modules = tmp_path / "agent-modules"
+    agent_modules.mkdir()
+    (agent_modules / "sspilib.py").write_text(
+        "class UserCredential:\n"
+        "    def __init__(self, *, protocol):\n"
+        "        assert protocol in {'Kerberos', 'Negotiate'}\n"
+        "class ClientSecurityContext:\n"
+        "    def __init__(self, *, target_name, credential):\n"
+        "        assert target_name == 'postgres/h'\n"
+        "        assert isinstance(credential, UserCredential)\n"
+        "    def step(self, token):\n"
+        "        assert token is None\n"
+        "        return b'initial-token'\n"
+    )
+    resolved = dict(os.environ)
+    resolved["PYTHONPATH"] = str(agent_modules)
+
+    capability = _inspect_asyncpg_runtime(
+        "postgresql://u@h/db?sslmode=disable&gsslib=sspi",
+        resolved,
+        tmp_path,
+    )
+
+    assert capability == {"module": "sspilib", "available": True}
+
+
+def test_asyncpg_runtime_preflight_accepts_complete_agent_gssapi_surface(tmp_path):
+    from kestrel_sovereign.doctor import _inspect_asyncpg_runtime
+
+    agent_modules = tmp_path / "agent-modules"
+    agent_modules.mkdir()
+    (agent_modules / "gssapi.py").write_text(
+        "class NameType:\n"
+        "    hostbased_service = object()\n"
+        "class Name:\n"
+        "    def __init__(self, value, name_type):\n"
+        "        assert value == 'postgres@h'\n"
+        "        assert name_type is NameType.hostbased_service\n"
+        "class SecurityContext:\n"
+        "    def __init__(self, *, name, usage):\n"
+        "        assert isinstance(name, Name)\n"
+        "        assert usage == 'initiate'\n"
+        "    def step(self, token):\n"
+        "        assert token is None\n"
+        "        return b'initial-token'\n"
+    )
+    resolved = dict(os.environ)
+    resolved["PYTHONPATH"] = str(agent_modules)
+
+    capability = _inspect_asyncpg_runtime(
+        "postgresql://u@h/db?sslmode=disable&gsslib=gssapi",
+        resolved,
+        tmp_path,
+    )
+
+    assert capability == {"module": "gssapi", "available": True}
+
+
+@pytest.mark.parametrize(
+    ("module_name", "gsslib", "module_source"),
+    [
+        (
+            "gssapi",
+            "gssapi",
+            "class NameType:\n"
+            "    hostbased_service = object()\n"
+            "class Name:\n"
+            "    def __init__(self): pass\n"
+            "class SecurityContext:\n"
+            "    def __init__(self, *, name, usage): pass\n"
+            "    def step(self, token): return b'token'\n",
+        ),
+        (
+            "gssapi",
+            "gssapi",
+            "class NameType:\n"
+            "    hostbased_service = object()\n"
+            "class Name:\n"
+            "    def __init__(self, value, name_type): pass\n"
+            "class SecurityContext:\n"
+            "    def __init__(self, *, name, usage): pass\n"
+            "    def step(self, token): raise RuntimeError('initialization failed')\n",
+        ),
+        (
+            "sspilib",
+            "sspi",
+            "class UserCredential:\n"
+            "    def __init__(self): pass\n"
+            "class ClientSecurityContext:\n"
+            "    def __init__(self, *, target_name, credential): pass\n"
+            "    def step(self, token): return b'token'\n",
+        ),
+        (
+            "sspilib",
+            "sspi",
+            "class UserCredential:\n"
+            "    def __init__(self, *, protocol): pass\n"
+            "class ClientSecurityContext:\n"
+            "    def __init__(self, *, target_name, credential): pass\n"
+            "    def step(self, token): raise RuntimeError('initialization failed')\n",
+        ),
+    ],
+    ids=(
+        "gssapi-constructor-signature",
+        "gssapi-initial-step",
+        "sspi-constructor-signature",
+        "sspi-initial-step",
+    ),
+)
+def test_asyncpg_runtime_preflight_rejects_unusable_gss_apis(
+    tmp_path, module_name, gsslib, module_source
+):
+    from kestrel_sovereign.doctor import _inspect_asyncpg_runtime
+
+    agent_modules = tmp_path / "agent-modules"
+    agent_modules.mkdir()
+    (agent_modules / f"{module_name}.py").write_text(module_source)
+    resolved = dict(os.environ)
+    resolved["PYTHONPATH"] = str(agent_modules)
+
+    capability = _inspect_asyncpg_runtime(
+        f"postgresql://u@h/db?sslmode=disable&gsslib={gsslib}",
+        resolved,
+        tmp_path,
+    )
+
+    assert capability == {"module": module_name, "available": False}
+
+
+def test_incomplete_gssapi_shadow_cannot_yield_ready_after_gss_auth(tmp_path):
+    from kestrel_sovereign import _doctor_postgres_probe as worker
+    from kestrel_sovereign.doctor import _inspect_asyncpg_runtime
+
+    agent_modules = tmp_path / "agent-modules"
+    agent_modules.mkdir()
+    (agent_modules / "gssapi.py").write_text("ORIGIN = 'incomplete-shadow'\n")
+    resolved = dict(os.environ)
+    resolved["PYTHONPATH"] = str(agent_modules)
+
+    capability = _inspect_asyncpg_runtime(
+        "postgresql://u@h/db?sslmode=disable&gsslib=gssapi",
+        resolved,
+        tmp_path,
+    )
+    assert capability == {"module": "gssapi", "available": False}
+
+    class Info:
+        server_version = 170000
+        used_password = False
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, _params=()):
+            assert "pg_catalog.pg_backend_pid()" in sql
+
+        def fetchall(self):
+            return [(True,)]
+
+    class Connection:
+        info = Info()
+
+        @staticmethod
+        def cursor():
+            return Cursor()
+
+    with pytest.raises(
+        worker.ProbeRuntimeConfigurationError,
+        match="spawned asyncpg runtime lacks usable optional module 'gssapi'",
+    ):
+        worker._check_gss_runtime_parity(
+            Connection(),
+            {"gsslib": "gssapi"},
+            capability,
+        )
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -3774,9 +4031,7 @@ def test_asyncpg_runtime_preflight_uses_agent_pythonpath_and_cwd(tmp_path):
         "sslmode=require&ssl_min_protocol_version=not-a-tls-version",
     ],
 )
-def test_asyncpg_runtime_preflight_rejects_eager_tls_configuration(
-    tmp_path, query
-):
+def test_asyncpg_runtime_preflight_rejects_eager_tls_configuration(tmp_path, query):
     from urllib.parse import quote
 
     from kestrel_sovereign.doctor import (
@@ -3992,6 +4247,44 @@ def test_worker_rejects_libpq_gss_auth_when_asyncpg_extra_is_absent():
     assert Driver.connection.closed
 
 
+def test_worker_fails_diagnostic_capability_after_initialized_gss_auth():
+    from kestrel_sovereign import _doctor_postgres_probe as worker
+
+    class Info:
+        server_version = 170000
+        used_password = False
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, _params=()):
+            assert "pg_catalog.pg_stat_gssapi" in sql
+
+        def fetchall(self):
+            return [(True,)]
+
+    class Connection:
+        info = Info()
+
+        @staticmethod
+        def cursor():
+            return Cursor()
+
+    with pytest.raises(
+        worker.ProbeDiagnosticCapabilityError,
+        match="module initialization alone cannot verify",
+    ):
+        worker._check_gss_runtime_parity(
+            Connection(),
+            {"gsslib": "gssapi"},
+            {"module": "gssapi", "available": True},
+        )
+
+
 def test_worker_accepts_non_gss_auth_without_asyncpg_gss_extra():
     from kestrel_sovereign import _doctor_postgres_probe as worker
 
@@ -4068,9 +4361,7 @@ def test_worker_gss_check_ignores_search_path_function_shadowing():
                 # A tenant.pg_backend_pid() shadow would return no matching
                 # row. The catalog-qualified call returns this backend's row.
                 self.rows = (
-                    [(False,)]
-                    if "pg_catalog.pg_backend_pid()" in normalized
-                    else []
+                    [(False,)] if "pg_catalog.pg_backend_pid()" in normalized else []
                 )
             else:
                 self.rows = [(1,)]
@@ -4150,9 +4441,7 @@ def test_worker_fails_closed_on_invalid_gss_verification_rows(rows):
         )
 
 
-def test_doctor_never_reports_libpq_only_gss_success_as_ready(
-    tmp_path, monkeypatch
-):
+def test_doctor_never_reports_libpq_only_gss_success_as_ready(tmp_path, monkeypatch):
     _seed_matching_anchor(tmp_path, monkeypatch)
     fake = _FakePostgres(
         {
@@ -4176,7 +4465,7 @@ def test_doctor_never_reports_libpq_only_gss_success_as_ready(
     findings = " ".join(report.fail)
     assert not report.ready
     assert "server selected GSSAPI/SSPI authentication" in findings
-    assert "spawned asyncpg runtime lacks optional module" in findings
+    assert "spawned asyncpg runtime lacks usable optional module" in findings
     assert "shared with the spawned asyncpg runtime" in findings
 
 
@@ -5296,7 +5585,7 @@ def test_libpq_direct_tls_limit_is_diagnostic_blindness_not_runtime_outage(
     assert not report.ready
     assert not fake.executed
     assert "cannot construct an equivalent libpq diagnostic connection" in findings
-    assert "runtime connection option 'sslnegotiation'" in findings
+    assert "cannot faithfully represent sslmode='require' with direct TLS" in findings
     assert "Runtime database reachability was not established" in findings
     assert "runtime database access with those settings will fail" not in findings
 

@@ -667,6 +667,49 @@ import io
 import json
 import sys
 
+
+def _module_supports_asyncpg_gss(module_name, addresses, parameters):
+    tcp_hosts = [
+        address[0]
+        for address in addresses
+        if isinstance(address, tuple)
+        and len(address) == 2
+        and isinstance(address[0], str)
+    ]
+    if not tcp_hosts:
+        # Asyncpg rejects GSSAPI/SSPI authentication over Unix sockets before
+        # it initializes either optional module.
+        return False
+
+    module = importlib.import_module(module_name)
+    service = parameters.krbsrvname or "postgres"
+    if module_name == "gssapi":
+        for host in tcp_hosts:
+            name = module.Name(
+                f"{service}@{host}", module.NameType.hostbased_service
+            )
+            context = module.SecurityContext(name=name, usage="initiate")
+            token = context.step(None)
+            if not isinstance(token, bytes) or not token:
+                return False
+        return True
+    if module_name == "sspilib":
+        # PostgreSQL can request either GSS (Kerberos) or SSPI (Negotiate).
+        # Asyncpg chooses the credential protocol from that server message, so
+        # both exact constructor paths must be usable before a libpq GSS/SSPI
+        # success can be treated as runtime-equivalent.
+        for host in tcp_hosts:
+            for protocol in ("Kerberos", "Negotiate"):
+                credential = module.UserCredential(protocol=protocol)
+                context = module.ClientSecurityContext(
+                    target_name=f"{service}/{host}", credential=credential
+                )
+                token = context.step(None)
+                if not isinstance(token, bytes) or not token:
+                    return False
+        return True
+    return False
+
 payload = json.loads(sys.stdin.buffer.read())
 result = {"ok": False, "kind": "diagnostic"}
 expected = {
@@ -683,7 +726,7 @@ try:
         parser = getattr(connect_utils, "_parse_connect_arguments", None)
         if parser is not None and set(inspect.signature(parser).parameters) == expected:
             try:
-                _addresses, parameters, _configuration = parser(
+                addresses, parameters, _configuration = parser(
                     dsn=payload["dsn"], host=None, port=None, user=None,
                     password=None, passfile=None, database=None,
                     command_timeout=None, statement_cache_size=100,
@@ -697,11 +740,11 @@ try:
             else:
                 module = "sspilib" if parameters.gsslib == "sspi" else "gssapi"
                 try:
-                    importlib.import_module(module)
+                    available = _module_supports_asyncpg_gss(
+                        module, addresses, parameters
+                    )
                 except BaseException:
                     available = False
-                else:
-                    available = True
                 result = {
                     "ok": True,
                     "gss": {"module": module, "available": available},
@@ -717,12 +760,16 @@ def _inspect_asyncpg_runtime(
     resolved_env: dict[str, str],
     project_dir: Path,
 ) -> dict[str, object]:
-    """Validate TLS and measure GSS imports in the agent's Python context.
+    """Validate TLS and GSS APIs in the agent's Python context.
 
     Asyncpg constructs its SSL context before it opens a socket, including for
     ``sslmode=allow``.  Asking its installed parser in the launcher's exact
     environment preserves certificate/key/password, protocol, default-file,
-    and Python import semantics without mutating Doctor's own process.
+    and Python import semantics. GSS availability means asyncpg's exact
+    target-specific constructors and initial ``step(None)`` call succeed, not
+    only that a same-named module imports or exposes similarly named classes.
+    The subprocess bound also bounds credential/KDC initialization. Doctor's
+    own process remains unchanged.
     """
     try:
         completed = subprocess.run(
@@ -751,7 +798,10 @@ def _inspect_asyncpg_runtime(
             "spawned asyncpg runtime configuration could not be inspected safely"
         ) from exc
     if not isinstance(response, dict) or response.get("ok") is not True:
-        if isinstance(response, dict) and response.get("kind") == "runtime_configuration":
+        if (
+            isinstance(response, dict)
+            and response.get("kind") == "runtime_configuration"
+        ):
             raise _PostgresRuntimeConfigurationError(
                 "spawned asyncpg rejected its PostgreSQL connection configuration"
             )
@@ -1159,6 +1209,14 @@ def _normalize_asyncpg_connection_options(query: dict[str, str]) -> None:
         query.pop("ssl_max_protocol_version", None)
         return
 
+    # Asyncpg 0.30 explicitly defaults every active SSLContext to TLS 1.2.
+    # Libpq's default depends on the linked library version, and an older
+    # libpq can otherwise connect with TLS 1.0/1.1 where the spawned runtime
+    # refuses. An empty PGSSLMINPROTOCOLVERSION is also "not configured" to
+    # asyncpg, so replace falsey values with the same explicit floor.
+    if not query.get("ssl_min_protocol_version"):
+        query["ssl_min_protocol_version"] = "TLSv1.2"
+
     for name in (
         "ssl_min_protocol_version",
         "ssl_max_protocol_version",
@@ -1249,12 +1307,12 @@ def _normalize_asyncpg_direct_tls(query: dict[str, str]) -> None:
         # State libpq's ordinary negotiation explicitly so an ambient
         # PGSSLNEGOTIATION cannot recreate its invalid direct+disable pair.
         query["sslnegotiation"] = "postgres"
-    elif sslmode in {"allow", "prefer"}:
-        # libpq rejects direct negotiation with a weak mode.  Rewriting it to
-        # ordinary negotiation reaches a normal PostgreSQL server but not a
-        # direct-TLS-only proxy that asyncpg can use.  That is not parity, so
-        # fail translation closed instead of silently probing a weaker and
-        # potentially different endpoint shape.
+    else:
+        # Asyncpg 0.30 sends direct TLS without PostgreSQL's ALPN protocol,
+        # while libpq 17 sends ALPN. A PostgreSQL 17 server or proxy can
+        # therefore accept Doctor's connection and reject the spawned
+        # runtime, even for strict and verification modes. Rewriting this to
+        # ordinary negotiation can likewise reach a different endpoint.
         raise _PostgresDiagnosticCapabilityError(
             "installed PostgreSQL diagnostic driver cannot faithfully "
             f"represent sslmode={sslmode!r} with direct TLS negotiation"
@@ -1417,6 +1475,7 @@ def _state_asyncpg_windows_tls_defaults(
         crl = tls_dir / "root.crl"
         if not query.get("sslcrl") and crl.exists():
             query["sslcrl"] = str(crl.resolve())
+
 
 def _read_asyncpg_passfile_password(
     passfile: Path,
