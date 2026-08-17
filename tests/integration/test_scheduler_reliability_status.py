@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -949,6 +950,173 @@ async def test_runtime_telemetry_failure_cannot_prevent_or_kill_polling(
         assert runner.readiness_failure is None
     finally:
         await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_runtime_telemetry_remains_owned_without_cancellation(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-slow-telemetry.db")
+    runner = SchedulerRunner(
+        db, "agent-1", lambda *_: None, owner_id="slow-telemetry",
+    )
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+
+    async def slow_publish(_state):
+        publish_started.set()
+        await release_publish.wait()
+
+    monkeypatch.setattr(runner, "_publish_runtime_status", slow_publish)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    try:
+        await runner._publish_runtime_status_best_effort()
+        await asyncio.wait_for(publish_started.wait(), timeout=1)
+        publish_task = runner._runtime_status_publish_task
+
+        assert publish_task is not None
+        assert publish_task.done() is False
+        assert publish_task.cancelled() is False
+
+        release_publish.set()
+        await asyncio.wait_for(publish_task, timeout=1)
+        assert publish_task.cancelled() is False
+    finally:
+        release_publish.set()
+        pending = runner._runtime_status_publish_task
+        if pending is not None:
+            await pending
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_drains_or_cancels_owned_runtime_telemetry(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-stop-telemetry.db")
+    runner = SchedulerRunner(
+        db, "agent-1", lambda *_: None, owner_id="stop-telemetry",
+    )
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+
+    async def slow_publish(_state):
+        publish_started.set()
+        await release_publish.wait()
+
+    monkeypatch.setattr(runner, "_publish_runtime_status", slow_publish)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    try:
+        await runner._publish_runtime_status_best_effort()
+        await asyncio.wait_for(publish_started.wait(), timeout=1)
+        publish_task = runner._runtime_status_publish_task
+
+        await runner.stop()
+
+        assert publish_task is not None
+        assert publish_task.done() is True
+        assert publish_task.cancelled() is True
+        assert runner._runtime_status_publish_task is None
+    finally:
+        release_publish.set()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_drains_pending_telemetry_then_publishes_stopped(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-stop-drain-telemetry.db")
+    runner = SchedulerRunner(
+        db, "agent-1", lambda *_: None, owner_id="stop-drain-telemetry",
+    )
+    publish_started = asyncio.Event()
+    release_publish = asyncio.Event()
+    published = []
+
+    async def delayed_publish(state):
+        if state != "stopped":
+            publish_started.set()
+            await release_publish.wait()
+        published.append(state)
+
+    monkeypatch.setattr(runner, "_publish_runtime_status", delayed_publish)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    try:
+        await runner._publish_runtime_status_best_effort("running")
+        await asyncio.wait_for(publish_started.wait(), timeout=1)
+        asyncio.get_running_loop().call_later(0.01, release_publish.set)
+        started = asyncio.get_running_loop().time()
+
+        await runner.stop()
+
+        elapsed = asyncio.get_running_loop().time() - started
+        assert published == ["running", "stopped"]
+        assert runner._runtime_status_publish_task is None
+        assert elapsed < 0.2
+    finally:
+        release_publish.set()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancellation_does_not_wait_out_publish_deadline(
+    monkeypatch, tmp_path,
+):
+    db = await _database(tmp_path / "scheduler-stop-cancel-telemetry.db")
+    runner = SchedulerRunner(
+        db, "agent-1", lambda *_: None, owner_id="stop-cancel-telemetry",
+    )
+    publish_started = asyncio.Event()
+
+    async def blocked_publish():
+        publish_started.set()
+        await asyncio.Event().wait()
+
+    publish_task = asyncio.create_task(blocked_publish())
+    runner._runtime_status_publish_task = publish_task
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.scheduler.runner."
+        "RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS",
+        0.5,
+    )
+
+    try:
+        await asyncio.wait_for(publish_started.wait(), timeout=1)
+        stop_task = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0.01)
+        started = asyncio.get_running_loop().time()
+        stop_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        elapsed = asyncio.get_running_loop().time() - started
+        assert elapsed < 0.2
+        assert publish_task.done() is True
+        assert publish_task.cancelled() is True
+        assert runner._runtime_status_publish_task is None
+    finally:
+        if not publish_task.done():
+            publish_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await publish_task
         await db.close()
 
 

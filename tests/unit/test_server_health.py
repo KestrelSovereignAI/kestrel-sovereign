@@ -305,7 +305,17 @@ def test_detailed_health_fails_for_enabled_scheduler_without_live_worker():
     original_manager = getattr(app.state, "agent_manager", None)
     health_feature = MagicMock()
     health_feature.get_latest = AsyncMock(
-        return_value={"status": "healthy", "checks": []}
+        return_value={
+            "status": "healthy",
+            "overall_healthy": True,
+            "checks": [
+                {
+                    "name": "database",
+                    "status": "pass",
+                    "message": "Database healthy",
+                }
+            ],
+        }
     )
     health_feature.__class__.__name__ = "HealthFeature"
     agent = SimpleNamespace(
@@ -329,15 +339,33 @@ def test_detailed_health_fails_for_enabled_scheduler_without_live_worker():
                     "/health/detailed",
                     headers={"X-API-Key": "test-key"},
                 )
+                health_feature.get_latest.side_effect = RuntimeError(
+                    "synthetic health failure"
+                )
+                failed_health_response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
     finally:
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
 
     assert response.status_code == 503
+    assert response.json()["overall_healthy"] is False
     assert response.json()["error"] == "Scheduler unavailable"
     assert response.json()["scheduler_readiness_failures"] == []
-    health_feature.get_latest.assert_not_awaited()
+    assert response.json()["checks"] == [
+        {
+            "name": "database",
+            "status": "pass",
+            "message": "Database healthy",
+        }
+    ]
+    assert failed_health_response.status_code == 503
+    assert failed_health_response.json()["error"] == "Scheduler unavailable"
+    assert failed_health_response.json()["checks"] == []
+    assert health_feature.get_latest.await_count == 2
 
 
 def test_host_managed_scheduler_without_scoped_runner_uses_host_worker():
@@ -1415,6 +1443,7 @@ def test_healthy_fleet_with_unavailable_scheduler_identity_fails_readiness():
     assert public.json() == {"status": "unhealthy", "agent_initialized": True}
     assert detailed.status_code == 503
     assert detailed.json()["status"] == "unhealthy"
+    assert detailed.json()["overall_healthy"] is False
     assert detailed.json()["scheduler_readiness_failures"] == [cold_failure]
     assert "identity database" not in detailed.text
 
@@ -1509,14 +1538,25 @@ def test_detailed_health_no_agents_reports_no_agent_available():
     original_lifespan = app.router.lifespan_context
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
 
     try:
         app.router.lifespan_context = noop_lifespan
         app.state.agent = None
         app.state.agent_manager = None
+        app.state.scheduler_readiness_failures = []
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app, client=("203.0.113.10", 55000)) as client:
                 response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+                app.state.scheduler_readiness_failures = [
+                    {"scope": "protocol", "state": "unavailable"}
+                ]
+                scheduler_response = client.get(
                     "/health/detailed",
                     headers={"X-API-Key": "test-key"},
                 )
@@ -1524,12 +1564,16 @@ def test_detailed_health_no_agents_reports_no_agent_available():
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
+        app.state.scheduler_readiness_failures = original_scheduler_failures
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "unhealthy"
     assert body["error"] == "No agent available"
     assert "tracing" in body
+    assert scheduler_response.status_code == 503
+    assert scheduler_response.json()["overall_healthy"] is False
+    assert scheduler_response.json()["error"] == "Scheduler unavailable"
 
 
 def test_oauth_session_can_access_detailed_health():

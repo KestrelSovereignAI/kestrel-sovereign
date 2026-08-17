@@ -3469,21 +3469,37 @@ async def health_detailed(request: Request):
     scheduler_failures = getattr(
         request.app.state, "scheduler_readiness_failures", []
     )
-    if scheduler_failures or not scheduler_workers_available:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": "Scheduler unavailable",
-                "scheduler_readiness_failures": scheduler_failures,
-                "checks": [],
-                "tracing": tracing,
-            },
-        )
+    scheduler_unavailable = bool(
+        scheduler_failures or not scheduler_workers_available
+    )
     if agent:
-        result = await _agent_detailed_health(agent)
+        try:
+            result = await _agent_detailed_health(agent)
+        except Exception:
+            if not scheduler_unavailable:
+                raise
+            logger.warning(
+                "Detailed agent health failed during scheduler outage",
+                exc_info=True,
+            )
+            result = {"status": "unhealthy", "checks": []}
         if isinstance(result, dict):
             result.setdefault("tracing", tracing)
+        if scheduler_unavailable:
+            content = dict(result) if isinstance(result, dict) else {
+                "checks": []
+            }
+            content.update(
+                {
+                    "status": "unhealthy",
+                    "overall_healthy": False,
+                    "error": "Scheduler unavailable",
+                    "scheduler_readiness_failures": scheduler_failures,
+                }
+            )
+            content.setdefault("checks", [])
+            content.setdefault("tracing", tracing)
+            return JSONResponse(status_code=503, content=content)
         return result
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
@@ -3514,7 +3530,7 @@ async def health_detailed(request: Request):
         overall = _roll_up_fleet_status(
             [entry["status"] for entry in breakdown.values()]
         )
-        return {
+        content = {
             "status": overall,
             "agents": breakdown,
             "checks": [],
@@ -3523,13 +3539,34 @@ async def health_detailed(request: Request):
                 request.app.state, "scheduler_cold_agent_failures", []
             ),
         }
+        if scheduler_unavailable:
+            content.update(
+                {
+                    "status": "unhealthy",
+                    "overall_healthy": False,
+                    "error": "Scheduler unavailable",
+                    "scheduler_readiness_failures": scheduler_failures,
+                }
+            )
+            return JSONResponse(status_code=503, content=content)
+        return content
 
-    return {
+    content = {
         "status": "unhealthy",
         "error": "No agent available",
         "checks": [],
         "tracing": tracing,
     }
+    if scheduler_unavailable:
+        content.update(
+            {
+                "overall_healthy": False,
+                "error": "Scheduler unavailable",
+                "scheduler_readiness_failures": scheduler_failures,
+            }
+        )
+        return JSONResponse(status_code=503, content=content)
+    return content
 
 
 def _enforce_host_csrf(request: Request):

@@ -976,6 +976,7 @@ class SchedulerRunner:
         self._task: Optional[asyncio.Task] = None
         self._worker_task: Optional[asyncio.Task] = None
         self._telemetry_task: Optional[asyncio.Task] = None
+        self._runtime_status_publish_task: Optional[asyncio.Task] = None
         self._runtime_status_publish_lock = asyncio.Lock()
         self._runtime_status_wake = asyncio.Event()
         # Set as soon as arm() is requested and cleared only by stop(). Health
@@ -1026,17 +1027,16 @@ class SchedulerRunner:
     def worker_available(self) -> bool:
         """Whether supervision currently owns a non-failing polling worker."""
 
+        supervisor_task = self._task
+        worker_task = self._worker_task
         return bool(
             self._arm_requested
             and self._running
-            and self._task is not None
-            and not self._task.done()
+            and supervisor_task is not None
+            and not supervisor_task.done()
             and self._consecutive_worker_failures == 0
             and not self.tick_stalled
-            and (
-                self._worker_task is None
-                or not self._worker_task.done()
-            )
+            and (worker_task is None or not worker_task.done())
         )
 
     @property
@@ -1200,8 +1200,28 @@ class SchedulerRunner:
         self._worker_task = None
         self._telemetry_task = None
         self._runtime_worker_state = "stopped"
-        if pending_cancellation is None and self._database_is_connected():
-            await self._publish_runtime_status_best_effort("stopped")
+        try:
+            await self._finish_runtime_status_publication(
+                publish_stopped=pending_cancellation is None,
+                timeout=(
+                    RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
+                    if pending_cancellation is None
+                    else 0.0
+                ),
+            )
+        except asyncio.CancelledError as error:
+            if pending_cancellation is None:
+                pending_cancellation = error
+        except Exception as error:
+            logger.warning(
+                "SchedulerRunner %s runtime-status cleanup failed during stop",
+                self._owner_id,
+                exc_info=(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                ),
+            )
         logger.info("SchedulerRunner %s stopped", self._owner_id)
         if pending_cancellation is not None:
             raise pending_cancellation
@@ -1228,17 +1248,75 @@ class SchedulerRunner:
         )
 
     async def _publish_runtime_status_best_effort(
-        self, worker_state: Optional[str] = None,
+        self,
+        worker_state: Optional[str] = None,
+        *,
+        deadline: Optional[float] = None,
     ) -> None:
         """Publish telemetry without allowing the observer to kill its worker."""
 
         try:
             async with self._runtime_status_publish_lock:
+                loop = asyncio.get_running_loop()
+                if deadline is None:
+                    deadline = (
+                        loop.time() + RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
+                    )
+                pending = self._runtime_status_publish_task
+                if pending is not None:
+                    if not pending.done():
+                        wait_seconds = max(0.0, deadline - loop.time())
+                        done, _ = await asyncio.wait(
+                            {pending},
+                            timeout=wait_seconds,
+                        )
+                        if not done:
+                            logger.warning(
+                                "SchedulerRunner %s runtime-status publish is "
+                                "still pending after %g seconds",
+                                self._owner_id,
+                                wait_seconds,
+                            )
+                            return
+                    self._runtime_status_publish_task = None
+
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
                 state = worker_state or self._reported_worker_state()
-                await asyncio.wait_for(
+                publish_task = loop.create_task(
                     self._publish_runtime_status(state),
-                    timeout=RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS,
+                    name=f"scheduler-runtime-status:{self._owner_id}",
                 )
+                self._runtime_status_publish_task = publish_task
+
+                def _publish_done(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    error = task.exception()
+                    if error is not None:
+                        logger.warning(
+                            "SchedulerRunner %s could not publish %s state",
+                            self._owner_id,
+                            state,
+                            exc_info=(type(error), error, error.__traceback__),
+                        )
+
+                publish_task.add_done_callback(_publish_done)
+                wait_seconds = max(0.0, deadline - loop.time())
+                done, _ = await asyncio.wait(
+                    {publish_task},
+                    timeout=wait_seconds,
+                )
+                if done:
+                    self._runtime_status_publish_task = None
+                else:
+                    logger.warning(
+                        "SchedulerRunner %s runtime-status publish is still "
+                        "pending after %g seconds",
+                        self._owner_id,
+                        wait_seconds,
+                    )
         except Exception:
             logger.warning(
                 "SchedulerRunner %s could not publish %s state",
@@ -1246,6 +1324,74 @@ class SchedulerRunner:
                 worker_state or self._runtime_worker_state,
                 exc_info=True,
             )
+
+    async def _finish_runtime_status_publication(
+        self,
+        *,
+        publish_stopped: bool,
+        timeout: float,
+    ) -> None:
+        """Drain owned telemetry before storage teardown, cancelling last."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        try:
+            prior_completed = await self._join_runtime_status_publish_task(
+                deadline=deadline,
+            )
+            if not prior_completed:
+                return
+            if publish_stopped and self._database_is_connected():
+                await self._publish_runtime_status_best_effort(
+                    "stopped",
+                    deadline=deadline,
+                )
+                await self._join_runtime_status_publish_task(deadline=deadline)
+        except asyncio.CancelledError:
+            publish_task = self._runtime_status_publish_task
+            if publish_task is not None and not publish_task.done():
+                publish_task.cancel()
+                await await_owned_task(publish_task)
+            if self._runtime_status_publish_task is publish_task:
+                self._runtime_status_publish_task = None
+            raise
+
+    async def _join_runtime_status_publish_task(self, *, deadline: float) -> bool:
+        """Join one publish for a bounded interval, then cancel as a last resort."""
+
+        publish_task = self._runtime_status_publish_task
+        if publish_task is None:
+            return True
+        if not publish_task.done():
+            wait_seconds = max(
+                0.0,
+                deadline - asyncio.get_running_loop().time(),
+            )
+            done, _ = await asyncio.wait(
+                {publish_task},
+                timeout=wait_seconds,
+            )
+            if not done:
+                logger.warning(
+                    "SchedulerRunner %s cancelling runtime-status publish "
+                    "that did not drain during shutdown after %g seconds",
+                    self._owner_id,
+                    wait_seconds,
+                )
+                publish_task.cancel()
+                outcome = await await_owned_task(publish_task)
+                if self._runtime_status_publish_task is publish_task:
+                    self._runtime_status_publish_task = None
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+                return False
+
+        outcome = await await_owned_task(publish_task)
+        if self._runtime_status_publish_task is publish_task:
+            self._runtime_status_publish_task = None
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        return True
 
     async def _telemetry_loop(self) -> None:
         """Publish worker liveness independently of tick execution time."""
