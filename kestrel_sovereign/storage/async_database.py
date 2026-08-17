@@ -2375,8 +2375,21 @@ class AsyncDatabase:
         return await self._backend.fetch_val(sql, params)
     
     @asynccontextmanager
-    async def transaction(self):
-        """Transaction context manager with automatic rollback on error."""
+    async def transaction(self, *, immediate: bool = False):
+        """Transaction context manager with automatic rollback on error.
+
+        ``immediate`` asks SQLite for its writer slot at ``BEGIN`` instead of on
+        the first write. Pass it for a read-then-write unit: a deferred
+        transaction that has already read cannot upgrade, so a second writer
+        fails outright rather than waiting its turn. It is ignored on backends
+        whose transactions do not have the deferred/immediate distinction —
+        PostgreSQL serializes such a unit with a row lock instead (see
+        ``ConversationSessionProjection._claim``).
+        """
+        if immediate and self.backend_type == "sqlite":
+            async with self._backend.transaction(immediate=True):  # type: ignore[call-arg]
+                yield
+            return
         async with self._backend.transaction():
             yield
     

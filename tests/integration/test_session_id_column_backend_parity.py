@@ -47,7 +47,10 @@ from kestrel_sovereign.storage.conversation_sessions import (
     PROJECTION_INPUT_COLUMNS,
     ConversationSessionProjection,
 )
-from kestrel_sovereign.storage.session_grouping import group_messages_into_sessions
+from kestrel_sovereign.storage.session_grouping import (
+    group_messages_into_sessions,
+    timestamp_query_param,
+)
 from kestrel_sovereign.storage.session_id_column import (
     SESSION_ID_MAX_LENGTH,
     column_session_id,
@@ -62,10 +65,13 @@ POSTGRES_URL = (
 )
 
 UUID_A = "3a6c1f0e-2b7d-4c8a-9e10-000000000001"
-#: Sorts after ``UUID_A``, which the fence case depends on: a repair refreshes
-#: sessions in sorted order, so the pass parked on its first ``_store`` is
-#: holding session A's row.
+#: Sorts after ``UUID_A``, which the fence case depends on: a repair folds a
+#: chunk's sessions in sorted order, so the pass parked on its first ``_store``
+#: is holding session A's row.
 UUID_B = "3a6c1f0e-2b7d-4c8a-9e10-000000000002"
+#: A third, for the cases that need to change a value to something that is
+#: neither of the first two.
+UUID_C = "3a6c1f0e-2b7d-4c8a-9e10-000000000003"
 
 # A JSON document whose session_id is a NUL. Written as the escape the way any
 # ``json.dumps`` would store it — PostgreSQL accepts this text as JSON and then
@@ -230,13 +236,76 @@ async def _advisory_lock_holders(db: AsyncDatabase, name: str) -> list:
 
 
 def _accounting(watermark) -> tuple:
-    """What a watermark *claims*, without its epoch.
+    """What a watermark claims, as a tuple a case can pin exactly.
 
-    The epoch is an ownership token that counts repairs, so pinning its value in
+    Spelled out rather than compared field by field, so a case that means "this
+    is the whole state" cannot silently stop checking one of them. Pinning it in
     an assertion would make every case that adds one fail for a reason unrelated
-    to what it tests. The three fields below are the promise.
+    to what it tests. The four fields below are the promise.
     """
-    return (watermark.valid, watermark.frontier, watermark.changes)
+    return (
+        watermark.valid,
+        watermark.stamp,
+        watermark.through,
+        watermark.target,
+    )
+
+
+async def _assert_the_projection_agrees_with_the_grouper(
+    db: AsyncDatabase, projection, agent_id: str
+) -> None:
+    """The differential, on whichever engine actually ran.
+
+    Extracted rather than written twice: the concurrency case has to make the
+    same claim as the direct one — a projection that has stopped disagreeing
+    with the grouper only because it stopped projecting anything would satisfy a
+    weaker one — and two spellings of one claim is how they drift apart.
+    """
+    from kestrel_sovereign.storage.session_grouping import (
+        coalesce_sessions_by_session_id,
+        coerce_session_timestamp,
+    )
+
+    history = [
+        {
+            "id": row[0],
+            "role": row[1],
+            "content": row[2],
+            "metadata": json.loads(row[3]) if row[3] else {},
+            "created_at": row[4],
+        }
+        for row in await db.fetchall(
+            "SELECT id, role, content, metadata, created_at "
+            "FROM conversation_history WHERE agent_id = ? "
+            "AND deleted_at IS NULL AND archived_at IS NULL ORDER BY id",
+            (agent_id,),
+        )
+    ]
+    reference = {
+        str(session["session_id"]): session
+        for session in coalesce_sessions_by_session_id(
+            group_messages_into_sessions(history, keep_empty_markers=True)
+        )
+    }
+    stored = {row["session_id"]: row for row in await projection.list()}
+
+    assert set(stored) == set(reference)
+    for session_id, row in stored.items():
+        expected = reference[session_id]
+        # As instants, not spellings: this column comes back as text from
+        # SQLite and as a ``datetime`` from PostgreSQL, and the claim is
+        # about the moment, not about which engine formatted it.
+        assert coerce_session_timestamp(row["started_at"]) == (
+            coerce_session_timestamp(expected["started_at"])
+        ), session_id
+        assert coerce_session_timestamp(row["last_message_at"]) == (
+            coerce_session_timestamp(expected["last_message_at"])
+        ), session_id
+        assert row["message_count"] == expected["message_count"], session_id
+        assert (
+            row["user_message_count"] == expected["user_message_count"]
+        ), session_id
+        assert row["wake_source"] == expected["preview_wake_source"], session_id
 
 
 async def _before_the_budget(db: AsyncDatabase, what: str, awaitable, budget=None):
@@ -255,6 +324,20 @@ async def _before_the_budget(db: AsyncDatabase, what: str, awaitable, budget=Non
             f"{what} did not finish within {budget or LOCK_WAIT_BUDGET}s. "
             f"Server activity: {activity}"
         ) from None
+
+
+async def _reached(event: asyncio.Event, budget: float) -> bool:
+    """Whether ``event`` fires within ``budget``. Never raises, never hangs.
+
+    For the cases whose claim is that something did NOT happen. ``wait_for``
+    alone would turn "it correctly never happened" into a timeout error, and the
+    absence is the assertion.
+    """
+    try:
+        await asyncio.wait_for(event.wait(), budget)
+        return True
+    except TimeoutError:
+        return False
 
 
 @asynccontextmanager
@@ -1468,7 +1551,8 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
     None of it is decoration. ``idx_conversation_sessions_recent`` is what makes
     a page of the newest sessions cost the page instead of the table, which is
     the only reason the projection exists. ``idx_conversation_agent_row_id`` is
-    what makes reading the frontier one backward index step — SQLite gets that
+    what makes reading the agent's highest id one backward index step — SQLite
+    gets that
     plan free from its implicit rowid, so without a PostgreSQL leg an absent
     index would look fine and quietly be an O(history) scan on the engine that
     matters. And the triggers are the entire staleness contract: PostgreSQL
@@ -1518,8 +1602,9 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
 async def test_each_row_event_moves_the_change_stamp_by_exactly_one(db_backend):
     """The arithmetic the incremental branch rests on, on the real engine.
 
-    A repair may skip everything below its frontier only when the stamp's
-    movement equals the number of rows standing above it, and that equality is
+    A repair may skip everything it has already accounted for only when the
+    stamp's movement equals the number of rows standing above its target, and
+    that equality is
     only meaningful while every row event counts once. PostgreSQL routes all
     three triggers through one PL/pgSQL function with a ``TG_OP`` switch, so a
     mis-written branch could stamp an UPDATE twice — which would make the cheap
@@ -1683,6 +1768,162 @@ async def test_writing_any_watched_column_alone_moves_the_change_stamp(
         )
 
 
+async def _seed_one_projected_row(db: AsyncDatabase, agent_id: str, metadata) -> int:
+    """One stamped history row, and its id."""
+    await db.execute(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, session_id, created_at) "
+        "VALUES (?, 'user', 'a turn', ?, ?, ?)",
+        (
+            agent_id,
+            metadata,
+            column_session_id(metadata),
+            timestamp_query_param(db.backend_type, "2026-03-01T09:00:00"),
+        ),
+    )
+    return int(
+        await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_metadata_bookkeeping_does_not_move_the_change_stamp(
+    db_backend, monkeypatch
+):
+    """The read path's own write, on whichever engine renders the comparison.
+
+    ``MemoryRetriever.update_access`` and ``update_applied`` bump counters and
+    stamp timestamps inside the same document the session id lives in, on every
+    retrieval. A trigger comparing ``metadata`` whole moved the stamp for those,
+    and a stamp movement with no row appended is the movement ``_plan`` cannot
+    attribute — so recall rebuilt the whole projection.
+
+    This has to be asked of both engines because the two comparisons share no
+    code at all: SQLite reads four paths out with ``json_extract`` under a
+    ``json_valid`` guard, PostgreSQL builds a ``jsonb`` object under
+    ``pg_input_is_valid``. And the statement being defended against differs too
+    — the PostgreSQL form of ``atomic_increment_metadata_counter`` rewrites the
+    document through ``jsonb_set``, which reserializes it, so the bytes differ
+    there even where no value the projection reads did.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:bookkeeping:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        message_id = await _seed_one_projected_row(
+            db, agent_id, json.dumps({"session_id": UUID_A, "access_count": 0})
+        )
+        projection = ConversationSessionProjection(db, agent_id)
+        assert (await projection.repair()).current
+        before = await projection.observed_changes()
+
+        store = AsyncConversationStore(db, agent_id=agent_id)
+        assert await store.atomic_increment_metadata_counter(
+            message_id, "access_count", "last_accessed"
+        )
+
+        assert await projection.observed_changes() == before, (
+            "bookkeeping on the read path moved the change stamp, so every "
+            "memory retrieval invalidates the projection"
+        )
+        assert not await projection.is_stale()
+
+        # The write really landed, so nothing above passed because nothing
+        # happened — and the session id survived the merge, which is the value
+        # the comparison is narrowed to watching.
+        written = json.loads(
+            await db.fetchval(
+                "SELECT metadata FROM conversation_history WHERE id = ?",
+                (message_id,),
+            )
+        )
+        assert written["access_count"] == 1
+        assert written["last_accessed"]
+        assert written["session_id"] == UUID_A
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_metadata_the_engine_cannot_parse_neither_raises_nor_hides(
+    db_backend,
+):
+    """The fallback, on both engines, in both directions it has to be right.
+
+    ``metadata`` is free text and legacy rows hold documents that will not
+    parse. So the comparison must never *raise* — it rides along with every
+    UPDATE of every other column, including the encryption backfill and the
+    #1402 canonical/transport split, and a trigger that raised would fail those
+    writes on exactly the rows least able to afford it. And it must never
+    *hide* a change: two unparseable documents are two documents.
+
+    PostgreSQL is the engine that makes this urgent. ``metadata::jsonb`` raises
+    on malformed text, on the NUL escape, and on a lone surrogate — the last of
+    which Phase A had to reach for ``pg_input_is_valid`` to cover, after an
+    enumeration of "ways JSON can fail jsonb" turned out to be incomplete.
+
+    A duplicated key ends in the same place by two different routes, which is
+    the parity claim worth making: PostgreSQL's ``jsonb`` resolves it the way
+    ``json.loads`` does, so it can extract; SQLite's ``json_extract`` would read
+    the *first* occurrence where the derivation reads the last, so it declines
+    to extract and compares the document instead.
+    """
+    agent_id = f"did:test:unparseable:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        message_id = await _seed_one_projected_row(
+            db, agent_id, json.dumps({"session_id": UUID_A})
+        )
+        projection = ConversationSessionProjection(db, agent_id)
+
+        async def _set(metadata):
+            await db.execute(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (metadata, message_id),
+            )
+
+        stamp = await projection.observed_changes()
+        for document, moves, why in (
+            ("not json at all", 1, "a readable document became an unreadable one"),
+            ("also not json, but different", 1, "two unreadable documents differ"),
+            ("also not json, but different", 0, "the same document was rewritten"),
+            ('{"session_id": "%s"}' % UUID_A, 1, "a session id came back"),
+            ('{"session_id": "%s", "seen": 1}' % UUID_A, 0,
+             "an unwatched key was added"),
+            ('{"session_id": "%s", "session_id": "%s"}' % (UUID_A, UUID_B), 1,
+             "a duplicated key changed what the derivation would read"),
+            ('{"session_id": "%s", "session_id": "%s"}' % (UUID_A, UUID_C), 1,
+             "the last occurrence of a duplicated key changed"),
+            # Valid to Python's json, refused by jsonb: the case an enumeration
+            # of "how JSON fails jsonb" missed during Phase A.
+            ('{"session_id": "\\ud800"}', 1, "an unrepresentable document"),
+        ):
+            await _set(document)
+            moved = await projection.observed_changes() - stamp
+            assert moved == moves, f"{why}: stamp moved by {moved}, wanted {moves}"
+            stamp += moved
+
+        # ...and a write to a column the projection cannot see, on a row whose
+        # metadata the engine cannot parse. The trigger runs. It must not raise.
+        await _set("not json at all")
+        stamp = await projection.observed_changes()
+        await db.execute(
+            "UPDATE conversation_history SET content = ? WHERE id = ?",
+            ("rewritten while the metadata is unreadable", message_id),
+        )
+        assert await projection.observed_changes() == stamp, (
+            "an unwatched write moved the stamp for a row whose metadata "
+            "cannot be parsed"
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
 async def test_concurrent_initializers_build_the_projection_schema_once(postgres_db):
@@ -1751,8 +1992,8 @@ async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypa
 
     ``accounted_valid`` is asserted here rather than inferred, because on
     PostgreSQL it is an ``INTEGER`` bound from a Python ``bool`` and asyncpg is
-    strict about that pairing: getting it wrong raises out of the
-    compare-and-swap rather than storing a wrong flag.
+    strict about that pairing: getting it wrong raises out of the statement that
+    records the watermark rather than storing a wrong flag.
 
     Width is the other half of that, and is a separate case:
     :func:`test_a_watermark_wider_than_int4_is_storable`.
@@ -1774,10 +2015,10 @@ async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypa
         projection = ConversationSessionProjection(db, agent_id)
 
         assert await projection.observed_changes() == 0
-        assert _accounting(await projection.accounted()) == (False, 0, 0)
+        assert _accounting(await projection.accounted()) == (False, 0, 0, 0)
         assert await projection.is_stale()
         assert (await projection.repair()).kind == REBUILT
-        assert _accounting(await projection.accounted()) == (True, 0, 0)
+        assert _accounting(await projection.accounted()) == (True, 0, 0, 0)
         assert not await projection.is_stale()
 
         await store.add_conversation("user", "first turn", session_id=UUID_A)
@@ -1790,11 +2031,11 @@ async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypa
         changes = await projection.observed_changes()
         assert isinstance(changes, int) and changes == 2
 
-        assert (await projection.repair()).advanced
+        assert (await projection.repair()).current
         accounted = await projection.accounted()
         assert accounted.valid is True
-        assert accounted.changes == changes
-        assert accounted.frontier > 0
+        assert accounted.stamp == changes
+        assert accounted.through > 0
         assert not await projection.is_stale()
         assert (await projection.repair()).kind == CURRENT
 
@@ -1807,13 +2048,13 @@ _INT4_MAX = 2_147_483_647
 
 @pytest.mark.asyncio
 async def test_a_watermark_wider_than_int4_is_storable(postgres_db):
-    """``accounted_changes`` counts row events for the agent's whole life.
+    """``accounted_stamp`` counts row events for the agent's whole life.
 
     Which is precisely the number this table exists to stop being bounded by: an
     agent expected to run indefinitely crosses 2,147,483,647 row events, and the
     symptom would not be a wrong count. PostgreSQL refuses the parameter, the
-    compare-and-swap raises out of :meth:`repair`, and the projection can never
-    advance its watermark again — every read stale, every repair raising.
+    statement that records the watermark raises out of :meth:`repair`, and the
+    projection can never advance again — every read stale, every repair raising.
 
     PostgreSQL-only because SQLite has a single 64-bit integer type and cannot
     exhibit a declared-width overflow at all, so a dual-backend spelling would
@@ -1822,10 +2063,10 @@ async def test_a_watermark_wider_than_int4_is_storable(postgres_db):
     The ledger is set directly rather than accumulated: reaching this count by
     performing two billion row events would test the same column and never
     finish. It is exercised in both places it lives — the ledger the triggers
-    write and the watermark the compare-and-swap binds — because a wide value
-    has to survive being read out of one and written into the other.
+    write and the watermark a chunk records — because a wide value has to
+    survive being read out of one and written into the other.
 
-    ``accounted_frontier`` is not pushed past ``int4`` beside it, and that is a
+    ``accounted_through`` is not pushed past ``int4`` beside it, and that is a
     fact about the schema rather than an omission: ``conversation_history.id`` is
     ``SERIAL``, so PostgreSQL refuses a row id in that range at the INSERT
     (measured — "value out of int32 range"). The column is declared ``BIGINT``
@@ -1859,14 +2100,14 @@ async def test_a_watermark_wider_than_int4_is_storable(postgres_db):
         projection = ConversationSessionProjection(db, agent_id)
         assert await projection.observed_changes() == changes > _INT4_MAX
 
-        assert (await projection.repair()).advanced
+        assert (await projection.repair()).current
         accounted = await projection.accounted()
         assert accounted.valid is True
-        assert accounted.changes == changes, (
+        assert accounted.stamp == changes, (
             "the change stamp read back out of the table is not the one that "
             "was written, so a column truncated it"
         )
-        assert accounted.frontier == row_id
+        assert accounted.through == row_id
         assert not await projection.is_stale()
         assert (await projection.repair()).kind == CURRENT
 
@@ -1962,10 +2203,6 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
     )
-    from kestrel_sovereign.storage.session_grouping import (
-        coalesce_sessions_by_session_id,
-        coerce_session_timestamp,
-    )
 
     _without_embeddings(monkeypatch)
     agent_id = f"did:test:session-projection-diff:{uuid4()}"
@@ -1985,46 +2222,8 @@ async def test_the_projection_agrees_with_the_grouper_on_both_backends(
         )
         await projection.repair()
 
-        history = [
-            {
-                "id": row[0],
-                "role": row[1],
-                "content": row[2],
-                "metadata": json.loads(row[3]) if row[3] else {},
-                "created_at": row[4],
-            }
-            for row in await db.fetchall(
-                "SELECT id, role, content, metadata, created_at "
-                "FROM conversation_history WHERE agent_id = ? "
-                "AND deleted_at IS NULL AND archived_at IS NULL ORDER BY id",
-                (agent_id,),
-            )
-        ]
-        reference = {
-            str(session["session_id"]): session
-            for session in coalesce_sessions_by_session_id(
-                group_messages_into_sessions(history, keep_empty_markers=True)
-            )
-        }
+        await _assert_the_projection_agrees_with_the_grouper(db, projection, agent_id)
         stored = {row["session_id"]: row for row in await projection.list()}
-
-        assert set(stored) == set(reference)
-        for session_id, row in stored.items():
-            expected = reference[session_id]
-            # As instants, not spellings: this column comes back as text from
-            # SQLite and as a ``datetime`` from PostgreSQL, and the claim is
-            # about the moment, not about which engine formatted it.
-            assert coerce_session_timestamp(row["started_at"]) == (
-                coerce_session_timestamp(expected["started_at"])
-            ), session_id
-            assert coerce_session_timestamp(row["last_message_at"]) == (
-                coerce_session_timestamp(expected["last_message_at"])
-            ), session_id
-            assert row["message_count"] == expected["message_count"], session_id
-            assert (
-                row["user_message_count"] == expected["user_message_count"]
-            ), session_id
-            assert row["wake_source"] == expected["preview_wake_source"], session_id
         assert stored[other]["wake_source"] == "heartbeat"
 
 
@@ -2074,22 +2273,40 @@ async def test_a_rebuild_equals_the_repairs_on_both_backends(db_backend, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_the_superseded_repair_publishes_nothing_on_postgres(
+async def test_a_repair_that_loses_a_race_can_only_leave_the_pair_behind(
     postgres_db, monkeypatch
 ):
-    """Two repairs in genuinely separate transactions, on real MVCC.
+    """The one pass that can still derive from history somebody has moved past.
 
     PostgreSQL is where the concurrency claim has to be made: separate
-    connections mean separate snapshots, so two passes really can each derive a
-    projection row from rows the other has already changed. Nothing serializes
-    them -- by design, after two review rounds spent on a boundary that did --
-    so the guarantee is that the pass whose epoch was taken away publishes
-    nothing, leaving the winner's watermark standing over the winner's rows.
+    connections mean separate snapshots. Repair *steps* are serialized on the
+    agent's watermark row, so a chunked pass cannot act on a conclusion another
+    pass has invalidated — it replans under the lock. The transcript derivation
+    is the exception, and deliberately so: attribution is a property of the whole
+    sequence, so that pass must read every live row, and reading every live row
+    is exactly the unbounded work nothing may hold a lock across. It therefore
+    reaches the lock holding a stamp it read before the read.
 
-    Bounded on both sides. The parked pass rescues itself on the wait budget and
-    the case carries a timeout: a concurrency test that can hang is a timed-out
-    job with no failing assertion, which is how a 23-hour advisory-lock wedge
-    went unnoticed during Phase A.
+    The claim is not that this loser is prevented. It is that it can only leave
+    the projection **behind**, never falsely current: it writes its rows and its
+    watermark in one transaction, so what stands afterwards is the pair it
+    derived — an older stamp, and rows consistent with it. A pair that is behind
+    is a detected stale projection, which this contract permits and the next
+    repair fixes.
+
+    So the loser is parked after it derives and before it takes the lock, a
+    mutation lands, a second pass repairs to current, and then the loser is let
+    go to overwrite the watermark with its older stamp. What must never happen is
+    the projection calling itself current over rows nobody rechecked.
+
+    The unstamped row is what puts this agent on the transcript path, and it is
+    load-bearing rather than corpus decoration: without it every pass is chunked
+    and there is no loser left to test.
+
+    Bounded on both sides: the parked pass rescues itself on the wait budget and
+    the case carries a timeout, because a concurrency test that can hang is a
+    timed-out job with no failing assertion — which is how a 23-hour
+    advisory-lock wedge went unnoticed during Phase A.
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
@@ -2104,7 +2321,25 @@ async def test_the_superseded_repair_publishes_nothing_on_postgres(
 
         await store.add_conversation("user", "first turn", session_id=UUID_A)
         await store.add_conversation("assistant", "reply", session_id=UUID_A)
-        await projection.repair()
+        # A row filed under no session id at all, which is what forces the
+        # transcript derivation this case is about. Written directly because
+        # ``add_conversation`` resolves an implicit session for every row it
+        # takes, so it cannot produce the legacy shape this needs.
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, 'assistant', 'an unlabeled reply', NULL, NULL, ?)",
+            (
+                agent_id,
+                timestamp_query_param(db.backend_type, "2026-03-01T09:05:00"),
+            ),
+        )
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND session_id IS NULL",
+            (agent_id,),
+        ) == 1, "the transcript derivation this case needs is not reachable"
+        assert (await projection.repair()).current
         first = int(await db.fetchval(
             "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
             (agent_id,),
@@ -2115,109 +2350,313 @@ async def test_the_superseded_repair_publishes_nothing_on_postgres(
         resume = asyncio.Event()
 
         class _Parks(ConversationSessionProjection):
-            async def _refresh(self, session_ids, epoch):
-                written = await super()._refresh(session_ids, epoch)
-                parked.set()
-                await asyncio.wait_for(resume.wait(), LOCK_WAIT_BUDGET)
-                return written
+            """Derives, then waits — before it takes the agent's repair lock."""
 
-        slow = asyncio.create_task(_Parks(db, agent_id).repair())
+            deriving = False
+            held = False
+
+            async def _rebuild_from_transcript(self):
+                self.deriving = True
+                return await super()._rebuild_from_transcript()
+
+            async def _claim(self):
+                if self.deriving and not self.held:
+                    self.held = True
+                    parked.set()
+                    await asyncio.wait_for(resume.wait(), LOCK_WAIT_BUDGET)
+                return await super()._claim()
+
+        slow = asyncio.create_task(_Parks(db, agent_id, step_budget=1).repair())
         try:
-            await _before_the_budget(db, "the parked repair reaching its pause",
-                                     parked.wait())
-            winner = await ConversationSessionProjection(db, agent_id).repair()
-            assert winner.advanced
+            await _before_the_budget(
+                db, "the parked repair reaching its pause", parked.wait()
+            )
+            # History moves under the parked pass, and a second pass accounts
+            # for it. From here the parked pass's stamp is provably old.
+            await store.add_conversation("user", "a later turn", session_id=UUID_A)
+            assert (await ConversationSessionProjection(db, agent_id).repair()).current
         finally:
             resume.set()
-        loser = await _before_the_budget(
+        await _before_the_budget(
             db, "the parked repair finishing", asyncio.shield(slow)
         )
 
-        assert not loser.advanced
-        assert not await projection.is_stale(), (
-            "the superseded pass knocked down the winner's watermark, so a "
-            "correct projection now reports itself stale"
+        # What UUID_A ends up holding: its surviving reply, the later turn, and
+        # the unlabeled row — a row filed under nothing belongs to the cluster
+        # it fell next to, which is exactly why this agent takes the transcript
+        # derivation at all.
+        settled = 3
+
+        accounted = await projection.accounted()
+        observed = await projection.observed_changes()
+        assert accounted.stamp <= observed
+        if accounted.stamp != observed or not accounted.complete:
+            assert await projection.is_stale(), (
+                "the loser left a watermark that does not describe history, and "
+                "the projection still reports itself current"
+            )
+        else:
+            # The loser landed on the same accounting; then it must also hold
+            # the same rows, which is what "idempotent" has to mean here.
+            assert (await projection.get(UUID_A))["message_count"] == settled
+
+        # ...and whatever it left, one more repair is all it costs.
+        assert (await projection.repair()).current
+        assert not await projection.is_stale()
+        assert (await projection.get(UUID_A))["message_count"] == settled
+        await _assert_the_projection_agrees_with_the_grouper(
+            db, projection, agent_id
         )
-        assert (await projection.get(UUID_A))["message_count"] == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_a_superseded_repair_cannot_overwrite_a_published_row_on_postgres(
+@pytest.mark.parametrize("primed", [False, True], ids=["unbuilt", "already-built"])
+async def test_a_newer_rebuild_cannot_publish_over_an_older_ones_orphan(
+    postgres_db, monkeypatch, primed
+):
+    """The state MVCC makes reachable and the stamp cannot see.
+
+    A rebuild clears the ground and then walks it. Under PostgreSQL's MVCC a
+    ``DELETE`` cannot see rows another transaction has inserted but not
+    committed, so with nothing serializing the two, this interleaving is
+    available:
+
+    1. the older rebuild deletes, derives, and inserts its rows — including a
+       session that still existed when it read history;
+    2. history moves: that session is purged;
+    3. the newer rebuild deletes — and sees none of the older's uncommitted rows;
+    4. the older commits, so its rows land *after* the newer's delete;
+    5. the newer stores what it derived and commits a watermark that says
+       **current**, standing over an orphan session no live row supports.
+
+    Nothing downstream detects that. ``is_stale`` compares the stamp, and the
+    stamp is right; it is the table that is wrong. It is also not covered by the
+    atomic-pair argument that governs everything else here, because each
+    transaction did write a consistent pair — the *table* is the union of two of
+    them.
+
+    So the interleaving is scripted exactly, and the assertion is that step 3
+    cannot happen while step 1 is in flight: the newer rebuild is held at the
+    agent's repair lock and never reaches its delete. Asserting only the end
+    state would pass for a projection that got lucky, which is why the block
+    itself is what is checked, and the end state checked beside it.
+
+    **Both starting states, because ``_claim`` has two statements and they hold
+    different halves of the same door.** The insert that makes the watermark row
+    exist is what serializes a pair racing to *create* it, on the primary key;
+    the row lock is what serializes everyone after that, because an insert that
+    conflicts takes no lock on the row it declined to write. So each statement is
+    the only mechanism in exactly one of these states, and a case that ran only
+    one of them passes with the other statement deleted. Measured, in both
+    directions, against this file.
+
+    ``unbuilt`` is the first repair an agent ever runs, where there is no
+    watermark row to lock. ``already-built`` repairs to current first, so the
+    insert is a no-op for both passes; its soft-delete is what makes each pass
+    plan a REBUILD rather than an incremental step.
+
+    Both parks are bounded and the case carries a timeout, so a mechanism that
+    stopped working reports a failed assertion rather than a wedged run.
+    """
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:session-orphan:{uuid4()}"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        projection = ConversationSessionProjection(db, agent_id)
+
+        for index, session in enumerate((UUID_A, UUID_A, UUID_B, UUID_B)):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    "user" if index % 2 == 0 else "assistant",
+                    f"turn {index}",
+                    json.dumps({"session_id": session}),
+                    session,
+                    timestamp_query_param(
+                        db.backend_type, f"2026-03-01T09:0{index}:00"
+                    ),
+                ),
+            )
+
+        if primed:
+            # Repair first, so the watermark row exists and ``_claim``'s insert
+            # cannot be what serializes the two passes below.
+            assert (await projection.repair()).current
+            # A change no append can explain, so both passes plan a REBUILD —
+            # which is the plan whose clearing DELETE this case is about.
+            await db.execute(
+                "UPDATE conversation_history SET deleted_at = ? "
+                "WHERE agent_id = ? AND session_id = ? "
+                "AND id = (SELECT MIN(id) FROM conversation_history "
+                "          WHERE agent_id = ? AND session_id = ?)",
+                (
+                    timestamp_query_param(db.backend_type, "2026-03-01T10:00:00"),
+                    agent_id, UUID_A, agent_id, UUID_A,
+                ),
+            )
+        # The starting state each leg claims to be in, asserted rather than
+        # assumed — the two legs differ ONLY in this, and a leg that had drifted
+        # into the other's state would defend the other's statement twice.
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_session_watermarks "
+            "WHERE agent_id = ?",
+            (agent_id,),
+        ) == (1 if primed else 0)
+        assert await projection.is_stale()
+
+        older_parked = asyncio.Event()
+        older_may_commit = asyncio.Event()
+        newer_reached_delete = asyncio.Event()
+        newer_may_finish = asyncio.Event()
+
+        class _OlderRebuild(ConversationSessionProjection):
+            """Stores its rows, then waits — uncommitted, inside its step."""
+
+            held = False
+
+            async def _record(self, watermark):
+                if not self.held:
+                    self.held = True
+                    older_parked.set()
+                    await asyncio.wait_for(
+                        older_may_commit.wait(), LOCK_WAIT_BUDGET
+                    )
+                return await super()._record(watermark)
+
+        class _NewerRebuild(ConversationSessionProjection):
+            """Announces reaching its clearing delete, then waits after it."""
+
+            held = False
+
+            async def _chunk(self, plan):
+                if plan.discard:
+                    newer_reached_delete.set()
+                return await super()._chunk(plan)
+
+            async def _store(self, session):
+                if not self.held:
+                    self.held = True
+                    await asyncio.wait_for(
+                        newer_may_finish.wait(), LOCK_WAIT_BUDGET
+                    )
+                return await super()._store(session)
+
+        older = asyncio.create_task(
+            _OlderRebuild(db, agent_id, step_budget=1).repair()
+        )
+        newer = None
+        try:
+            await _before_the_budget(
+                db, "the older rebuild storing its rows", older_parked.wait()
+            )
+            # History moves: the session the older rebuild has already derived
+            # and inserted no longer exists. Only its uncommitted row does.
+            purged = await db.execute(
+                "DELETE FROM conversation_history "
+                "WHERE agent_id = ? AND session_id = ?",
+                (agent_id, UUID_B),
+            )
+            assert purged == 2
+
+            newer = asyncio.create_task(_NewerRebuild(db, agent_id).repair())
+            raced = await _reached(newer_reached_delete, LOCK_WAIT_BUDGET / 4)
+            assert not raced, (
+                "a second rebuild reached its clearing DELETE while another was "
+                "mid-flight — under MVCC that DELETE cannot see the rows in "
+                "flight, so the projection can be left holding an orphan under "
+                "a watermark that reports itself current"
+            )
+        finally:
+            older_may_commit.set()
+            newer_may_finish.set()
+        await _before_the_budget(
+            db, "the older rebuild finishing", asyncio.shield(older)
+        )
+        await _before_the_budget(
+            db, "the newer rebuild finishing", asyncio.shield(newer)
+        )
+
+        assert (await projection.repair()).current
+        assert not await projection.is_stale()
+        assert await projection.get(UUID_B) is None, (
+            "the projection holds a session whose every row was purged, while "
+            "reporting itself current"
+        )
+        await _assert_the_projection_agrees_with_the_grouper(
+            db, projection, agent_id
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_three_repairs_racing_never_leave_a_projection_that_lies(
     postgres_db, monkeypatch
 ):
-    """The fence, at the ordering that detection-after-the-fact cannot save.
+    """Overlapping idempotent work is the whole concurrency mechanism.
 
-    A repair writes its rows before it can know whether it won. Park one between
-    deriving a row and storing it, let a newer repair publish a correct row and
-    its watermark, and the parked pass is holding an answer that is now wrong. If
-    its write were merely regretted afterwards, the published row would be wrong
-    for the interval between the write and the discovery -- and permanently if
-    that pass died in between, because a watermark cannot un-write a row.
+    Three passes are started at once over one agent, at ``chunk_rows=1`` so
+    their chunks interleave rather than each pass being one statement. Every
+    chunk recomputes from the rows instead of incrementing, so duplicated work
+    is harmless; every chunk writes its rows and its watermark together, so no
+    pass can leave another's rows under its own claim.
 
-    On PostgreSQL rather than only on SQLite because this is where the two passes
-    hold genuinely separate snapshots, and because the guarded upsert is a
-    different statement in this dialect: the parameters' types come from the
-    INSERT's target columns rather than from a value list, so a spelling that
-    works on SQLite can still fail here at the ``TIMESTAMP`` pair.
+    What is asserted is the invariant, not an outcome: the projection may end up
+    behind — a pass that read an older state can land last and knock the
+    accounting back, costing a redo — but it may never report itself current
+    while disagreeing with the grouper. Asserting convergence directly would be
+    asserting that racing passes cannot lose a step, which is neither true nor
+    required.
+
+    This also exercises the ordering the sessions are refreshed in: every pass
+    walks a chunk's sessions sorted, and takes the watermark row last, so two
+    passes cannot acquire the same two rows in opposite orders and deadlock. On
+    PostgreSQL that would surface here as a deadlock detection rather than as a
+    hang, and either way the timeout bounds it.
     """
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
     )
 
     _without_embeddings(monkeypatch)
-    agent_id = f"did:test:session-fence:{uuid4()}"
+    agent_id = f"did:test:session-racers:{uuid4()}"
     async with _schema_every_task_can_see(postgres_db) as db:
         await _create_projection_schema(db)
         store = AsyncConversationStore(db, agent_id=agent_id)
         projection = ConversationSessionProjection(db, agent_id)
 
-        await store.add_conversation("user", "first turn", session_id=UUID_A)
-        await store.add_conversation("assistant", "reply", session_id=UUID_A)
-        await store.add_conversation("user", "second turn", session_id=UUID_B)
-        await projection.repair()
-        # Something for the slow pass to do that does not touch session A, so
-        # the row it derives for A is the one already stored.
-        second = int(await db.fetchval(
-            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?",
+        for index in range(4):
+            await store.add_conversation(
+                "user", f"turn {index}", session_id=UUID_A if index % 2 else UUID_B
+            )
+        assert (await projection.repair()).current
+        first = int(await db.fetchval(
+            "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
             (agent_id,),
         ))
-        assert await store.delete_message(second)
-        stale_count = (await projection.get(UUID_A))["message_count"]
+        assert await store.delete_message(first)
 
-        parked = asyncio.Event()
-        resume = asyncio.Event()
-
-        class _ParksBeforeStoring(ConversationSessionProjection):
-            async def _store(self, session, epoch):
-                if not parked.is_set():
-                    parked.set()
-                    await asyncio.wait_for(resume.wait(), LOCK_WAIT_BUDGET)
-                return await super()._store(session, epoch)
-
-        slow = asyncio.create_task(_ParksBeforeStoring(db, agent_id).repair())
-        try:
-            await _before_the_budget(db, "the parked repair reaching its pause",
-                                     parked.wait())
-            first = int(await db.fetchval(
-                "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
-                (agent_id,),
-            ))
-            assert await store.delete_message(first)
-            winner = await ConversationSessionProjection(db, agent_id).repair()
-            assert winner.advanced
-            published = await projection.list()
-            assert (await projection.get(UUID_A))["message_count"] != stale_count
-        finally:
-            resume.set()
-        loser = await _before_the_budget(
-            db, "the parked repair finishing", asyncio.shield(slow)
+        await _before_the_budget(
+            db,
+            "three concurrent repairs",
+            asyncio.gather(
+                *(
+                    ConversationSessionProjection(
+                        db, agent_id, chunk_rows=1
+                    ).repair()
+                    for _ in range(3)
+                )
+            ),
         )
 
-        assert not loser.advanced
-        assert await projection.list() == published, (
-            "a superseded repair overwrote rows the winning repair had "
-            "published, while the watermark went on saying it was current"
-        )
-        assert loser.sessions == 0
+        if not await projection.is_stale():
+            await _assert_the_projection_agrees_with_the_grouper(
+                db, projection, agent_id
+            )
+
+        assert (await projection.repair()).current
         assert not await projection.is_stale()
+        await _assert_the_projection_agrees_with_the_grouper(db, projection, agent_id)

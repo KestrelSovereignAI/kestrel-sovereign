@@ -37,20 +37,20 @@ never read. The crash and concurrency cases below are the ones that check the
 direction, and each carries a bounded timeout — a lock or interleaving test that
 can hang cannot report the bug it exists to catch.
 
-The concurrency cases are about the fence rather than about detection, and the
-distinction is what the earlier design got wrong. A superseded repair used to
-write its rows first and discover it had lost afterwards, so between those two
-moments — and forever, if it died in between — a published watermark stood over
-rows a stale pass had overwritten. So the cases below park a repair on both
-sides of its write: after ``_refresh``, and after deriving a row but *before*
-``_store``, which is the ordering only a fence survives.
+The concurrency and crash cases are about that direction rather than about
+detection, and they are what the chunk contract has to earn. A repair walks
+history in bounded chunks, each one a short transaction that writes its rows and
+records what it accounted for together — so a chunk that dies leaves neither, a
+pass that dies resumes from the last chunk that committed, and three passes
+racing merely do overlapping idempotent work. Each carries a bounded timeout: a
+concurrency case that can hang cannot report the bug it exists to catch, and in
+CI it is a timed-out job with no failing assertion.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -60,7 +60,6 @@ from kestrel_sovereign.storage.async_conversation_store import AsyncConversation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
     CURRENT,
-    DEFERRED,
     INCREMENTAL,
     PROJECTION_INPUT_COLUMNS,
     REBUILT,
@@ -84,22 +83,14 @@ OUTSIDE_THE_CONTRACT = "did:x:1"
 
 BASE = datetime(2026, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
 
-#: How long an interleaved repair may be parked before the test rescues itself.
-#: Bounded because a hung interleaving test is a timed-out CI job with no failing
-#: assertion — indistinguishable from flake, which is how a 23-hour advisory-lock
-#: wedge went unreported during Phase A.
-INTERLEAVE_BUDGET = 10.0
-
-
 def _accounting(watermark: SessionWatermark) -> tuple:
-    """What a watermark *claims*, without its epoch.
-
-    The epoch is an ownership token whose value is nobody's contract — it counts
-    repairs, so pinning it in an assertion would make every case that adds one
-    fail for a reason unrelated to what it tests. What the projection promises is
-    the other three fields.
-    """
-    return (watermark.valid, watermark.frontier, watermark.changes)
+    """What a watermark claims, as a tuple a case can pin exactly."""
+    return (
+        watermark.valid,
+        watermark.stamp,
+        watermark.through,
+        watermark.target,
+    )
 
 
 def _at(minutes: int) -> str:
@@ -283,6 +274,72 @@ async def _assert_repaired_projection_is_true(
     # ...and the differential, so no case can pass by having quietly stopped
     # projecting anything at all.
     await _assert_agrees_with_the_grouper(db, projection, agent_id)
+
+
+async def _assert_watermark_is_not_ahead(
+    db: AsyncDatabase,
+    projection: ConversationSessionProjection,
+    agent_id: str = AGENT,
+) -> None:
+    """Everything the watermark claims to have accounted for really is stored.
+
+    The forbidden direction, asserted directly rather than inferred from a repair
+    that went on to succeed. A watermark is a claim about rows, and a precise
+    one: **every session's stored row describes that session's live rows at or
+    below ``through``, and nothing above it.** So the claim is checked against
+    the grouper's answer over exactly that prefix of history — the same reference
+    the differential uses, restricted to the part the projection says it has
+    read.
+
+    The restriction is what makes this a real check rather than a weaker one. A
+    repair folds each chunk's rows in as it walks, so a session straddling
+    ``through`` is genuinely partial part-way through a walk, and comparing it
+    against the WHOLE transcript's answer would fail for a projection that is
+    behaving exactly as designed. Comparing against the prefix instead still
+    fails for a fold that double-counted, dropped a chunk, or ran ahead of its
+    watermark — which are the mistakes this exists to catch.
+
+    Sessions with no row at or below ``through`` are deliberately not checked: an
+    unfinished walk is *allowed* to be silent about them, and a case that
+    required otherwise would be asserting the opposite of what chunking is for.
+
+    The claim is also *as of the recorded stamp*, so when the stamp has moved
+    since, there is no content claim left to check — only that the projection
+    says as much. Comparing content there would be asserting that a projection
+    permitted to be stale is not stale, which is the opposite of this contract.
+    """
+    accounted = await projection.accounted()
+    if not accounted.valid:
+        return
+    if await projection.observed_changes() != accounted.stamp:
+        assert await projection.is_stale(), (
+            "the change stamp moved and the projection still reports itself "
+            "current"
+        )
+        return
+    prefix = [
+        message
+        for message in await _live_history(db, agent_id)
+        if message["id"] <= accounted.through
+    ]
+    reference = _reference_sessions(prefix)
+    stored = {row["session_id"]: _stored(row) for row in await projection.list()}
+    claimed = {
+        str(row[0])
+        for row in await db.fetchall(
+            "SELECT DISTINCT session_id FROM conversation_history "
+            "WHERE agent_id = ? AND id <= ? AND session_id IS NOT NULL "
+            "AND deleted_at IS NULL AND archived_at IS NULL",
+            (agent_id, accounted.through),
+        )
+        if is_stampable_session_id(row[0])
+    }
+    for session_id in claimed & set(reference):
+        assert session_id in stored, (
+            f"the watermark accounts for history through {accounted.through}, "
+            f"which includes session {session_id!r} — and it is not stored"
+        )
+        assert stored[session_id] == reference[session_id], session_id
 
 
 async def _message_ids(db: AsyncDatabase, agent_id: str = AGENT) -> Dict[str, int]:
@@ -598,7 +655,7 @@ async def test_an_insert_is_detected_and_repaired_incrementally(modern):
     assert await projection.is_stale()
     outcome = await projection.repair()
     assert outcome.kind == INCREMENTAL, outcome
-    assert outcome.advanced
+    assert outcome.current
     assert (await projection.get(UUID_B))["message_count"] == 2
     await _assert_repaired_projection_is_true(db, projection)
 
@@ -872,6 +929,114 @@ async def test_a_write_the_projection_cannot_see_does_not_force_a_rebuild(modern
     assert (await projection.repair()).kind == CURRENT
 
 
+@pytest.mark.asyncio
+async def test_recalling_a_memory_does_not_invalidate_the_projection(modern):
+    """The narrowing that matters most, because the write is on the READ path.
+
+    ``MemoryRetriever.update_access`` bumps ``access_count`` and stamps
+    ``last_accessed`` through ``atomic_increment_metadata_counter`` every time a
+    memory is retrieved, and ``update_applied`` does the same for
+    ``applied_count``. Those keys share the document the session id lives in, so
+    a trigger comparing ``metadata`` WHOLE moved the stamp on every recall —
+    appending no row, which is exactly the movement ``_plan`` cannot attribute.
+    Recall therefore rebuilt the entire projection, and recall is not a rare
+    event; it is what the agent does.
+
+    Driven through the real store method rather than a hand-written UPDATE,
+    because the claim is about the statement production actually issues — its
+    PostgreSQL form reserializes the whole document through ``jsonb_set``, so a
+    comparison of raw text would differ even where no value did.
+    """
+    db, store, projection = modern
+    ids = await _message_ids(db)
+    before = await projection.observed_changes()
+
+    assert await store.atomic_increment_metadata_counter(
+        ids["A human turn"], "access_count", "last_accessed"
+    )
+
+    assert await projection.observed_changes() == before, (
+        "bookkeeping on the read path moved the change stamp, so every memory "
+        "retrieval invalidates the projection"
+    )
+    assert not await projection.is_stale()
+    assert (await projection.repair()).kind == CURRENT
+
+    # ...and the write really landed, so this is not passing because nothing
+    # happened. A no-op UPDATE would move no stamp for the wrong reason.
+    stored = await db.fetchone(
+        "SELECT metadata FROM conversation_history WHERE id = ?",
+        (ids["A human turn"],),
+    )
+    written = json.loads(stored[0])
+    assert written["access_count"] == 1
+    assert written["last_accessed"]
+    assert written["session_id"] == UUID_A, "the merge dropped the session id"
+
+
+@pytest.mark.asyncio
+async def test_a_metadata_document_neither_reader_can_trust_is_compared_whole(
+    modern,
+):
+    """The fallback, in both of the directions it has to be right.
+
+    ``metadata`` is free text and legacy rows hold documents that will not
+    parse. The extraction must therefore *never raise* — an UPDATE of an
+    unrelated column on such a row is an ordinary write (the encryption
+    backfill, the #1402 canonical/transport split), and a trigger that raised
+    would fail it. And it must never *hide* a change: two malformed documents
+    are different documents, so they are compared as the raw text they are.
+
+    A document carrying a watched key twice takes the same branch on SQLite, for
+    the reason Phase A measured: ``json_extract`` reads the first occurrence and
+    ``json.loads`` the last, so an extraction there would compare a value the
+    derivation never sees.
+    """
+    db, _store, projection = modern
+    ids = await _message_ids(db)
+    target = ids["A reply"]
+
+    async def _set(metadata):
+        await db.execute(
+            "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+            (metadata, target),
+        )
+
+    before = await projection.observed_changes()
+    await _set("not json at all")
+    assert await projection.observed_changes() == before + 1
+
+    # An ordinary write to a column this table cannot see, on a row whose
+    # metadata cannot be parsed. The trigger runs; it must not raise.
+    after_malformed = await projection.observed_changes()
+    await db.execute(
+        "UPDATE conversation_history SET content = ? WHERE id = ?",
+        ("rewritten while the metadata is unreadable", target),
+    )
+    assert await projection.observed_changes() == after_malformed, (
+        "an unwatched write moved the stamp for a row whose metadata cannot "
+        "be parsed"
+    )
+
+    # Two malformed documents are two documents. Collapsing them to one value
+    # would make this change invisible.
+    await _set("also not json, but different")
+    assert await projection.observed_changes() == after_malformed + 1, (
+        "a change between two unreadable documents was not detected"
+    )
+
+    # A duplicated watched key: the readers disagree about which occurrence
+    # wins, so the whole document is compared instead of a value only one of
+    # them would read.
+    duplicated = await projection.observed_changes()
+    await _set('{"session_id": "%s", "session_id": "%s"}' % (UUID_A, UUID_B))
+    assert await projection.observed_changes() == duplicated + 1
+    await _set('{"session_id": "%s", "session_id": "%s"}' % (UUID_A, UUID_C))
+    assert await projection.observed_changes() == duplicated + 2, (
+        "a duplicated key hid a change from the reader that takes the last one"
+    )
+
+
 def test_the_triggers_watch_exactly_what_the_derivation_reads():
     """One column list, compiled into the SELECTs and into the triggers.
 
@@ -882,8 +1047,10 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     against, and this holds the generated SQL to it on both dialects.
     """
     from kestrel_sovereign.storage.conversation_sessions import (
+        _CHUNK,
+        _DERIVED_FROM,
         _LIVE_ROWS,
-        _OWN_ROWS,
+        _OWN_ROWS_THROUGH,
         mutation_triggers,
     )
 
@@ -898,10 +1065,58 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     # the primary key on both engines and cannot be updated in place, which is
     # why it is not watched.
     read = {"id", *PROJECTION_INPUT_COLUMNS}
-    for statement in (_OWN_ROWS, _LIVE_ROWS):
-        selected = statement.split("SELECT ")[1].split(" FROM ")[0]
-        for column in (name.strip() for name in selected.split(",")):
-            assert column in read, f"{column} is read but never watched"
+    for column in (name.strip() for name in _DERIVED_FROM.split(",")):
+        assert column in read, f"{column} is read but never watched"
+    # ...and every statement really does select that list, so the check above is
+    # about the SQL rather than about a constant nothing uses.
+    for statement in (_CHUNK, _OWN_ROWS_THROUGH, _LIVE_ROWS):
+        assert statement.split("SELECT ")[1].split(" FROM ")[0] == _DERIVED_FROM
+
+
+def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
+    """The narrowing that keeps ordinary recall from rebuilding the projection.
+
+    ``metadata`` is watched by KEY rather than whole, because ``access_count``
+    and ``last_accessed`` share that document and are rewritten every time a
+    memory is retrieved. Narrowing is only safe while the list really is every
+    key the grouper reads, so the list is checked against
+    ``session_grouping.py``'s own source rather than against a comment: a key
+    consulted there and missing here is a change the stamp cannot see, and the
+    symptom is a projection that quietly disagrees with the transcript.
+
+    Read from the AST rather than by importing and introspecting, because what
+    is being asked is "which literal keys does this module look up", and that is
+    a property of the text — a runtime probe would only see the keys the corpus
+    it was run against happened to contain.
+    """
+    import ast
+    import inspect
+
+    from kestrel_sovereign.storage import session_grouping
+    from kestrel_sovereign.storage.conversation_sessions import (
+        PROJECTION_METADATA_KEYS,
+    )
+
+    tree = ast.parse(inspect.getsource(session_grouping))
+    consulted = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        # The two names the metadata dict travels under in that module.
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in {"meta", "metadata"}
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+    assert consulted, "found no metadata lookups at all — the scan is broken"
+    assert consulted == set(PROJECTION_METADATA_KEYS), (
+        "the grouper consults metadata keys the change stamp does not watch "
+        f"(or the reverse): grouper={sorted(consulted)}, "
+        f"watched={sorted(PROJECTION_METADATA_KEYS)}"
+    )
 
 
 @pytest.mark.asyncio
@@ -918,14 +1133,14 @@ async def test_a_fresh_agent_is_rebuilt_once_and_then_reports_itself_current(
     db = await AsyncDatabase.sqlite(str(tmp_path / "empty.db"))
     try:
         projection = ConversationSessionProjection(db, AGENT)
-        assert _accounting(await projection.accounted()) == (False, 0, 0)
+        assert _accounting(await projection.accounted()) == (False, 0, 0, 0)
         assert await projection.observed_changes() == 0
         assert await projection.is_stale(), (
             "an unbuilt projection reported itself current"
         )
 
         assert (await projection.repair()).kind == REBUILT
-        assert _accounting(await projection.accounted()) == (True, 0, 0)
+        assert _accounting(await projection.accounted()) == (True, 0, 0, 0)
         assert not await projection.is_stale()
         assert (await projection.repair()).kind == CURRENT
     finally:
@@ -961,7 +1176,7 @@ async def test_a_database_that_gains_the_ledger_after_its_history_is_rebuilt(
         await db.execute("DELETE FROM conversation_session_watermarks", ())
 
         assert await projection.observed_changes() == 0
-        assert _accounting(await projection.accounted()) == (False, 0, 0), (
+        assert _accounting(await projection.accounted()) == (False, 0, 0, 0), (
             "this case only means anything while the NUMBERS say current"
         )
         assert await projection.is_stale()
@@ -1105,52 +1320,216 @@ async def test_an_append_beside_an_edit_is_never_repaired_incrementally(modern):
     await _assert_repaired_projection_is_true(db, projection)
 
 
+class _CountsHistoryRows:
+    """A database that also reports how many history rows were handed back.
+
+    Wrapping the database rather than the projection because the quantity under
+    test is I/O, and only the thing issuing the I/O can count it. Counting the
+    rows a *frontier query selects* would be the mistake the measurement exists
+    to catch: the old derivation selected a bounded chunk of ids and then read
+    every row of every session those ids named.
+    """
+
+    def __init__(self, db):
+        self._db = db
+        self.rows_read = 0
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    async def fetchall(self, sql, params=()):
+        rows = await self._db.fetchall(sql, params)
+        if "FROM conversation_history" in sql:
+            self.rows_read += len(rows)
+        return rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_a_whale_session_is_read_once_per_walk_not_once_per_chunk(tmp_path):
+    """The bound this table exists for, measured in rows READ.
+
+    #2877 binds completion wakes to their originating chat session, so a
+    long-lived autonomous agent accumulates very large message counts in
+    comparatively few sessions — the "whale" the epic measured a 4.9-second
+    skip-scan against. A repair that recomputed each session named by a chunk
+    from all of that session's live rows would read the whale once *per chunk*:
+    quadratic in history, inside transactions this design advertises as short,
+    and completely invisible to a test that only checked the frontier query's
+    LIMIT.
+
+    So the measurement is total rows read, and the walk is forced to be many
+    chunks before it is taken. The bound is deliberately loose — twice the
+    corpus, where the honest answer is once — because what it has to separate is
+    ``O(history)`` from ``O(history × chunks)``, and at these numbers those are
+    400 and 16,000.
+    """
+    rows = 400
+    chunk = 10
+    db = await AsyncDatabase.sqlite(str(tmp_path / "whale.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {
+                    "content": f"whale turn {index}",
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    # Inside the gap window, so this really is one cluster and
+                    # not many that coalescing happens to merge.
+                    "created_at": _at(index),
+                    "metadata": {"session_id": UUID_A},
+                }
+                for index in range(rows)
+            ],
+        )
+        counting = _CountsHistoryRows(db)
+
+        class _CountsChunks(ConversationSessionProjection):
+            chunks = 0
+
+            async def _chunk(self, plan):
+                self.chunks += 1
+                return await super()._chunk(plan)
+
+        projection = _CountsChunks(counting, AGENT, chunk_rows=chunk)
+        assert (await projection.repair()).current
+
+        assert projection.chunks >= rows // chunk, (
+            "the walk was not chunked, so the bound below proves nothing"
+        )
+        assert counting.rows_read <= rows * 2, (
+            f"the walk read {counting.rows_read} history rows for a corpus of "
+            f"{rows} across {projection.chunks} chunks — the derivation is "
+            "re-reading whole sessions rather than folding the rows it selected"
+        )
+
+        # ...and it got the right answer, so the bound was not bought by
+        # reading less than the projection needed.
+        stored = await ConversationSessionProjection(db, AGENT).get(UUID_A)
+        assert stored["message_count"] == rows
+        assert stored["user_message_count"] == rows // 2
+        await _assert_agrees_with_the_grouper(
+            db, ConversationSessionProjection(db, AGENT)
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_session_whose_timestamps_go_backwards_is_derived_not_folded(
+    tmp_path,
+):
+    """The precondition the fold rests on, checked instead of assumed.
+
+    Folding combines a stored row with a chunk's slice through
+    ``coalesce_sessions_by_session_id``, which merges boundaries by min/max. A
+    single cluster's boundaries are *positional* — the first and last row in id
+    order — and the two agree only while ``created_at`` does not decrease as
+    ``id`` increases. Every writer produces both from one INSERT, so it holds;
+    but "holds in practice" is the reasoning that stops being true later, and the
+    disagreement would be silent: ``last_message_at`` reading the maximum where
+    the grouper reads the last.
+
+    Every timestamp here stays inside the gap window, so this really is one
+    cluster the grouper reads positionally, and not several that coalescing would
+    merge by min/max anyway — which is the shape that would make the case pass
+    without testing anything.
+
+    The walk is stopped mid-way first. That is not decoration: the exact
+    derivation is bounded to rows at or below the chunk's end, and a derivation
+    that read the session's *whole* history would still arrive at the right
+    answer by the end of the walk while claiming, in the middle of it, to have
+    accounted for rows the watermark says it has not reached — and the next chunk
+    would then fold those rows in a second time.
+    """
+    minutes = [10, 30, 20, 15, 40, 25]
+    db = await AsyncDatabase.sqlite(str(tmp_path / "backwards.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {
+                    "content": f"turn at {minute}",
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "created_at": _at(minute),
+                    "metadata": {"session_id": UUID_A},
+                }
+                for index, minute in enumerate(minutes)
+            ],
+        )
+        # Two chunks of two, which stops the walk with four of the six rows
+        # accounted for and the third row's backdating already crossed.
+        partial = ConversationSessionProjection(
+            db, AGENT, chunk_rows=2, step_budget=2
+        )
+        assert not (await partial.repair()).current
+        accounted = await partial.accounted()
+        assert accounted.valid and not accounted.complete
+        await _assert_watermark_is_not_ahead(db, partial)
+
+        projection = ConversationSessionProjection(db, AGENT, chunk_rows=2)
+        assert (await projection.repair()).current
+
+        stored = await projection.get(UUID_A)
+        assert stored["message_count"] == len(minutes)
+        assert coerce_session_timestamp(stored["last_message_at"]) == (
+            coerce_session_timestamp(_at(minutes[-1]))
+        ), (
+            "the fold reported the latest timestamp where the grouper reports "
+            "the last row's"
+        )
+        await _assert_agrees_with_the_grouper(db, projection)
+    finally:
+        await db.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
 async def test_a_crash_mid_repair_leaves_the_watermark_behind_never_ahead(modern):
     """A checkpoint may only advance when what it records is beyond loss.
 
-    The watermark is published last, after every session's row, so a pass that
-    dies part-way has written some rows and claimed none of them. The next repair
-    redoes the work. The forbidden direction is the other one: a watermark
-    recorded before the rows would claim to have accounted for rows it never
-    read, and nothing would ever revisit them.
+    Each chunk records what it accounted for in the *same transaction* that
+    writes the rows, so a pass that dies part-way leaves the watermark wherever
+    the last chunk to COMMIT left it — never at one that did not finish. The
+    forbidden direction is the other one: a watermark claiming rows nobody read,
+    because nothing would ever revisit them.
 
-    "Behind" is asserted as the two numbers plus the flag rather than as equality
-    with the state before the crash, because taking the epoch invalidates: a dead
-    pass leaves the projection accounting for NOTHING, which is further behind
-    than where it started and is the direction that costs a rebuild rather than
-    trusting rows a dead pass half-wrote.
+    Run at ``chunk_rows=1`` so the walk is many chunks and the crash lands inside
+    one rather than tidily between passes.
     """
     db, store, projection = modern
     ids = await _message_ids(db)
     assert await store.delete_message(ids["A human turn"])
-    before = await projection.accounted()
-    assert before.valid, "the case needs a valid watermark to fall behind FROM"
+    assert (await projection.repair()).current
 
     class _Crashes(ConversationSessionProjection):
-        """Fails on the second session it writes, mid-pass."""
+        """Dies while storing the third session of the walk."""
 
         written = 0
 
-        async def _store(self, session, epoch):
-            if self.written == 1:
+        async def _store(self, session):
+            if self.written == 2:
                 raise RuntimeError("crash mid-repair")
             self.written += 1
-            return await super()._store(session, epoch)
+            return await super()._store(session)
 
-    with pytest.raises(RuntimeError, match="crash mid-repair"):
-        await _Crashes(db, AGENT).repair()
+    await ConversationSessionProjection(db, AGENT).rebuild()
+    await db.execute(
+        "UPDATE conversation_session_watermarks SET accounted_valid = 0 "
+        "WHERE agent_id = ?",
+        (AGENT,),
+    )
+    with pytest.raises(Exception, match="crash mid-repair"):
+        await _Crashes(db, AGENT, chunk_rows=1).repair()
 
     after = await projection.accounted()
-    assert not after.valid, (
-        "a pass that died part-way left the projection claiming to account "
-        "for something"
+    assert not after.complete, (
+        "a pass that died part-way recorded a walk that had reached its target"
     )
-    assert after.frontier <= before.frontier and after.changes <= before.changes, (
-        "the watermark moved forward despite the pass not finishing"
-    )
+    assert after.through < await _frontier(db)
     assert await projection.is_stale()
+    await _assert_watermark_is_not_ahead(db, projection)
 
     # And the redo costs nothing but the redo.
     await _assert_repaired_projection_is_true(db, projection)
@@ -1158,292 +1537,242 @@ async def test_a_crash_mid_repair_leaves_the_watermark_behind_never_ahead(modern
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_a_row_arriving_mid_pass_leaves_the_watermark_behind(modern):
-    """The stamp and the frontier are read before the pass, not after it.
+async def test_a_chunk_that_dies_writes_neither_its_rows_nor_its_watermark(modern):
+    """Atomic by construction — the property the epoch machinery had to build.
 
-    A row that arrives while a repair is running may or may not be picked up by
-    the session read that follows it — the pass cannot know which. Recording the
-    state it *started* from means the answer is always "behind", and behind is
-    the recoverable direction. Re-reading at the end would record a frontier
-    covering a row this pass may never have looked at.
+    A chunk stores its sessions and then records what it accounted for. If the
+    recording fails, the rows must go with it: rows without their watermark is
+    the harmless direction only because it never happens *within* a chunk, and
+    rows the next pass would find already stored while the watermark says it
+    never got there is how a projection starts disagreeing with itself.
+
+    The mutation this defends against is moving the watermark write out of the
+    step's transaction, which no assertion about a *successful* repair can catch,
+    because a successful repair looks identical either way.
+    """
+    db, store, projection = modern
+    await store.add_conversation("user", "a turn to account for", session_id=UUID_B)
+    before_rows = await projection.list()
+    before = await projection.accounted()
+
+    class _FailsToRecord(ConversationSessionProjection):
+        async def _record(self, watermark):
+            await super()._record(watermark)
+            raise RuntimeError("the chunk died after recording")
+
+    with pytest.raises(Exception, match="the chunk died after recording"):
+        await _FailsToRecord(db, AGENT).repair()
+
+    assert await projection.list() == before_rows, (
+        "a chunk that could not finish left its rows behind, so the projection "
+        "holds work no watermark accounts for"
+    )
+    assert await projection.accounted() == before
+    await _assert_repaired_projection_is_true(db, projection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_walk_resumes_from_the_chunk_that_last_committed(modern):
+    """A crash costs one chunk's redo, not the whole walk.
+
+    That is the difference between a watermark that records *progress* and one
+    that only records completion, and it is why the stored state carries both how
+    far the walk has got and where it ends. A pass arriving after a crash finds a
+    part-walked projection and continues it, rather than discarding what previous
+    chunks paid for.
+    """
+    db, _store, projection = modern
+
+    class _Crashes(ConversationSessionProjection):
+        written = 0
+
+        async def _store(self, session):
+            if self.written == 2:
+                raise RuntimeError("crash mid-repair")
+            self.written += 1
+            return await super()._store(session)
+
+    with pytest.raises(Exception, match="crash mid-repair"):
+        await _Crashes(db, AGENT, chunk_rows=1).rebuild()
+    interrupted = await projection.accounted()
+    assert interrupted.valid and not interrupted.complete
+    assert interrupted.through > 0, (
+        "no chunk committed, so 'resumes' has nothing to prove"
+    )
+
+    resumed = []
+
+    class _Records(ConversationSessionProjection):
+        async def _chunk(self, plan):
+            resumed.append(plan)
+            return await super()._chunk(plan)
+
+    outcome = await _Records(db, AGENT, chunk_rows=1).repair()
+
+    assert outcome.kind == INCREMENTAL, (
+        "the walk started again from nothing rather than resuming"
+    )
+    assert resumed[0].through == interrupted.through
+    assert resumed[0].target == interrupted.target
+    assert not await projection.is_stale()
+    await _assert_agrees_with_the_grouper(db, projection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_row_arriving_during_a_chunk_leaves_the_watermark_behind(modern):
+    """The stamp is read before the derivation, never after it.
+
+    A row that lands while a chunk is running may or may not be in the rows that
+    chunk read — it cannot know which. Recording the stamp it *started* from
+    makes the answer always "behind", and behind is the recoverable direction.
+
+    The write is injected inside the chunk, which on SQLite means it joins that
+    chunk's own transaction: the row and its ledger bump commit *with* the
+    watermark that must nonetheless exclude them. That is the hardest form of the
+    claim — reading the stamp after the derivation would record a state covering
+    a row this pass may never have looked at, and the two writes committing
+    together would make it look deliberate.
     """
     db, store, projection = modern
     ids = await _message_ids(db)
     assert await store.delete_message(ids["A human turn"])
 
-    class _WritesMidPass(ConversationSessionProjection):
-        async def _refresh(self, session_ids, epoch):
-            written = await super()._refresh(session_ids, epoch)
-            if not getattr(self, "_done", False):
-                self._done = True
+    class _WritesMidChunk(ConversationSessionProjection):
+        arrived = False
+
+        async def _fold(self, rows, through):
+            written = await super()._fold(rows, through)
+            if not self.arrived:
+                self.arrived = True
                 await store.add_conversation(
-                    "user", "arrived mid-pass", session_id=UUID_B
+                    "user", "arrived mid-chunk", session_id=UUID_B
                 )
             return written
 
-    await _WritesMidPass(db, AGENT).repair()
+    # One step, so what is asserted is one step's own record rather than the
+    # loop's: a later step would read the higher stamp and legitimately catch up,
+    # which is correct behaviour and would hide the ordering this case is about.
+    outcome = await _WritesMidChunk(db, AGENT, step_budget=1).repair()
 
+    assert not outcome.current
     accounted = await projection.accounted()
-    assert accounted.frontier < await _frontier(db), (
-        "the watermark accounted for a row that arrived after it was read"
+    assert accounted.stamp < await projection.observed_changes(), (
+        "the watermark accounted for a row event that happened after it read "
+        "the stamp"
     )
+    assert accounted.target < await _frontier(db)
     assert await projection.is_stale()
+    await _assert_watermark_is_not_ahead(db, projection)
     await _assert_repaired_projection_is_true(db, projection)
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_a_superseded_repair_may_not_publish_what_it_accounted_for(
-    modern,
-):
-    """Two repairs racing: the superseded one may not claim a state it cannot
-    vouch for.
+async def test_a_repair_that_runs_out_of_chunks_says_it_is_still_behind(modern):
+    """A budget, not a loop until current — and the difference is reported.
 
-    This is the whole of the concurrency story, and it replaces the
-    serialization that failed review twice. Two passes can each derive a
-    projection row from rows the other has already changed, and a single upsert
-    does not order them — so ownership is settled by an epoch taken before either
-    derives anything, and the pass whose epoch was taken away publishes nothing.
-
-    Bounded on both sides: the parked pass rescues itself on
-    ``INTERLEAVE_BUDGET`` and the case carries a timeout, so a boundary that
-    stopped working reports a failure instead of a hung job.
+    An agent written to faster than a walk can cross it would keep a "repair
+    until nothing is left" call running forever. This contract permits a
+    projection to be behind and requires it to say so, so the pass stops and
+    reports, and what it did commit is kept.
     """
-    db, store, projection = modern
-    ids = await _message_ids(db)
-    assert await store.delete_message(ids["A human turn"])
+    db, _store, projection = modern
 
-    parked = asyncio.Event()
-    resume = asyncio.Event()
+    outcome = await ConversationSessionProjection(
+        db, AGENT, chunk_rows=1, step_budget=2
+    ).rebuild()
 
-    class _Parks(ConversationSessionProjection):
-        """Does its whole pass, then waits before publishing its watermark."""
-
-        async def _refresh(self, session_ids, epoch):
-            written = await super()._refresh(session_ids, epoch)
-            parked.set()
-            await asyncio.wait_for(resume.wait(), INTERLEAVE_BUDGET)
-            return written
-
-    slow = asyncio.create_task(_Parks(db, AGENT).repair())
-    try:
-        async with asyncio.timeout(INTERLEAVE_BUDGET):
-            await parked.wait()
-        winner = await ConversationSessionProjection(db, AGENT).repair()
-        assert winner.advanced
-    finally:
-        resume.set()
-    loser = await slow
-
-    assert not loser.advanced, (
-        "both passes published a watermark, so one of them claimed a state "
-        "the other had already superseded"
+    assert outcome == 2, "the budget bought two chunks' worth of sessions"
+    accounted = await projection.accounted()
+    assert accounted.valid and not accounted.complete
+    assert await projection.is_stale()
+    # What the budget DID buy is committed: chunks commit one at a time, so a
+    # pass that stops early leaves its finished chunks standing.
+    assert await projection.list(), (
+        "a pass that stopped early left nothing behind, so its chunks were not "
+        "committing as they went"
     )
-    # The winner rebuilt from history under its own epoch, so its watermark is
-    # the one standing and it describes the rows that are there. The superseded
-    # pass neither advanced it nor knocked it down.
-    assert not await projection.is_stale(), (
-        "the superseded pass invalidated the winner's watermark, so a correct "
-        "projection now reports itself stale"
-    )
-    assert (await projection.get(UUID_A))["message_count"] == len(
-        [
-            row
-            for row in await _live_history(db)
-            if row["metadata"].get("session_id") == UUID_A
-        ]
-    )
-    await _assert_repaired_projection_is_true(db, projection)
+    await _assert_watermark_is_not_ahead(db, projection)
+
+    assert (await projection.repair()).current
+    await _assert_agrees_with_the_grouper(db, projection)
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_a_superseded_repair_cannot_overwrite_a_published_row(modern):
-    """The fence, at the only moment detection could not have saved it.
+async def test_two_connections_repairing_one_file_take_turns(tmp_path):
+    """SQLite's half of the serialization, which is the transaction itself.
 
-    Every repair writes its rows before it can know whether it won, so a pass
-    parked between deriving a row and storing it is holding a *stale* answer. Let
-    a newer repair publish a correct row and its watermark in the meantime, and
-    then let the parked pass go: if its write is merely regretted afterwards, the
-    published row is wrong for the interval between the write and the discovery —
-    and permanently if the pass dies in between, since a watermark cannot
-    un-write a row. So the write itself has to be refused.
+    On PostgreSQL a repair step is held apart from its peers by a row lock. On
+    SQLite there is no second mechanism, because a write transaction is already
+    exclusive — but only if it *is* a write transaction from the start. A step
+    reads its state and then writes it, so under the default deferred ``BEGIN``
+    the second connection reads a snapshot, discovers on its first write that the
+    database has moved, and cannot upgrade: SQLite answers ``BUSY_SNAPSHOT``,
+    which ``busy_timeout`` does not retry because waiting cannot make a stale
+    snapshot fresh. Asking for the writer slot at ``BEGIN`` turns that into
+    taking turns.
 
-    Reproduced at exactly that ordering: park after ``project_transcript`` has
-    produced the row and before ``_store`` puts it anywhere.
+    Two genuinely separate connections to one file, because that is the only
+    shape that can tell the difference. Within one connection the backend's own
+    write lock already serializes transactions, so a same-connection case would
+    pass either way — which is exactly what makes this worth a case of its own.
     """
-    db, store, projection = modern
-    ids = await _message_ids(db)
-    # Something for the slow pass to do. Session A is untouched by it, so the
-    # row that pass is about to derive for A is the one already stored.
-    assert await store.delete_message(ids["C live turn"])
-    stale_count = (await projection.get(UUID_A))["message_count"]
-
-    parked = asyncio.Event()
-    resume = asyncio.Event()
-
-    class _ParksBeforeStoring(ConversationSessionProjection):
-        """Derives a row, then waits — holding an answer, having written none."""
-
-        async def _store(self, session, epoch):
-            if not parked.is_set():
-                parked.set()
-                await asyncio.wait_for(resume.wait(), INTERLEAVE_BUDGET)
-            return await super()._store(session, epoch)
-
-    # The slow pass derives session A from history as it stands now...
-    slow = asyncio.create_task(_ParksBeforeStoring(db, AGENT).repair())
+    path = str(tmp_path / "two-connections.db")
+    first = await AsyncDatabase.sqlite(path)
+    second = await AsyncDatabase.sqlite(path)
     try:
-        async with asyncio.timeout(INTERLEAVE_BUDGET):
-            await parked.wait()
-        # ...and history moves under it, so what it is holding is now wrong.
-        assert await store.delete_message(ids["A human turn"])
-        winner = await ConversationSessionProjection(db, AGENT).repair()
-        assert winner.advanced
-        published = await projection.list()
-        assert not await projection.is_stale()
-        assert (await projection.get(UUID_A))["message_count"] != stale_count, (
-            "the parked pass is holding the same answer the winner published, "
-            "so letting its write through would be undetectable and this case "
-            "would pass without the fence"
+        await _seed(first, MODERN_CORPUS)
+        outcomes = await asyncio.gather(
+            ConversationSessionProjection(first, AGENT, chunk_rows=1).repair(),
+            ConversationSessionProjection(second, AGENT, chunk_rows=1).repair(),
         )
-    finally:
-        resume.set()
-    loser = await slow
+        assert all(outcome.sessions >= 0 for outcome in outcomes)
 
-    assert not loser.advanced
-    # The claim, asserted before anything about what the pass *reported*: the
-    # rows are the winner's, byte for byte.
-    assert await projection.list() == published, (
-        "a superseded repair overwrote rows the winning repair had published, "
-        "while the watermark went on saying the projection was current"
-    )
-    assert loser.sessions == 0, (
-        "a superseded pass reported writing rows, so the fence let its writes "
-        "through"
-    )
-    assert not await projection.is_stale(), (
-        "the projection is reporting itself current, which is only honest "
-        "because the rows above are still the winner's"
-    )
-    # ...and the table really is what the grouper says, deletion included.
-    await _assert_repaired_projection_is_true(db, projection)
+        projection = ConversationSessionProjection(first, AGENT)
+        assert (await projection.repair()).current
+        assert not await projection.is_stale()
+        await _assert_agrees_with_the_grouper(first, projection)
+    finally:
+        await first.close()
+        await second.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
-async def test_a_superseded_repair_cannot_delete_a_published_row(modern):
-    """The other half of the fence: a repair removes rows as well as writing them.
+async def test_two_repairs_racing_leave_a_projection_that_is_true(modern):
+    """The whole concurrency story: overlapping idempotent work.
 
-    A pass that found a session empty goes on to drop its row, and that decision
-    ages exactly as badly as a derived count — restore the rows and the session
-    is alive again. A fence on the upsert alone would leave a superseded pass
-    able to delete a session the winner had just published, and "absent while
-    claiming to be current" is the same silent disagreement as "wrong": no reader
-    can tell either from the truth.
+    No epoch, no fence, no compare-and-swap — three passes are simply started at
+    once over the same agent. Each chunk recomputes from the rows rather than
+    incrementing, so duplicated work is harmless; each writes its rows and its
+    watermark together, so no pass can leave the other's rows under its own
+    claim. What must hold at the end is what holds after one pass: the table
+    agrees with the grouper, and it does not call itself current unless it is.
 
-    Given its own case rather than folded into the upsert's, because it is a
-    separate statement and a fence can be forgotten on one without the other.
-    """
-    db, store, projection = modern
-    ids = await _message_ids(db)
-    # Empty session B out, so a repair reaching it will drop its row.
-    for content in ("B marker", "B human turn"):
-        assert await store.delete_message(ids[content])
-    assert await projection.get(UUID_B) is not None, (
-        "the projection has not yet caught up, which is what makes the parked "
-        "pass's decision to drop this row a stale one"
-    )
-
-    parked = asyncio.Event()
-    resume = asyncio.Event()
-    dropping: List[str] = []
-
-    class _ParksBeforeForgetting(ConversationSessionProjection):
-        """Decides a session is gone, then waits before dropping its row."""
-
-        async def _forget(self, session_id, epoch):
-            if not parked.is_set():
-                dropping.append(session_id)
-                parked.set()
-                await asyncio.wait_for(resume.wait(), INTERLEAVE_BUDGET)
-            return await super()._forget(session_id, epoch)
-
-    slow = asyncio.create_task(_ParksBeforeForgetting(db, AGENT).repair())
-    try:
-        async with asyncio.timeout(INTERLEAVE_BUDGET):
-            await parked.wait()
-        assert dropping == [UUID_B]
-        # B comes back before the drop lands, so the decision is now wrong.
-        for content in ("B marker", "B human turn"):
-            assert await store.restore_message(ids[content])
-        winner = await ConversationSessionProjection(db, AGENT).repair()
-        assert winner.advanced
-        published = await projection.list()
-        assert await projection.get(UUID_B) is not None
-    finally:
-        resume.set()
-    loser = await slow
-
-    assert not loser.advanced
-    assert await projection.list() == published, (
-        "a superseded repair dropped a row the winning repair had published, "
-        "while the watermark went on saying the projection was current"
-    )
-    assert not await projection.is_stale()
-    await _assert_repaired_projection_is_true(db, projection)
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(120)
-async def test_a_repair_that_never_takes_the_epoch_writes_nothing(modern):
-    """Losing the claim is bounded, and costs nothing but the attempts.
-
-    A claim fails when another pass took the epoch first, and the answer is to
-    re-read and try again — but retrying forever is a spin, so after
-    ``CLAIM_ATTEMPTS`` the pass reports DEFERRED and stops. What it must not do
-    on the way out is leave a mark: it never owned the epoch, so it may not have
-    written a row, and it may not have moved the watermark of whichever pass
-    does.
-
-    Simulated by reading a watermark that has always already moved, which is
-    what unbounded contention looks like from inside one pass, and is the only
-    way to reach the exhausted branch deterministically. ``rebuild`` is asked
-    the same question because it answers differently on purpose: it is the verb
-    reached for when the table is known to be wrong, so it raises rather than
-    quietly doing nothing.
+    Bounded by a timeout because a concurrency case that can hang cannot report
+    the bug it exists to catch — in CI it is a timed-out job with no failing
+    assertion, indistinguishable from flake.
     """
     db, store, projection = modern
     ids = await _message_ids(db)
     assert await store.delete_message(ids["A human turn"])
-    before_rows = await projection.list()
-    before_watermark = await projection.accounted()
 
-    class _AlwaysBeaten(ConversationSessionProjection):
-        """Every epoch it reads is one another pass has already superseded."""
-
-        async def accounted(self):
-            watermark = await super().accounted()
-            return replace(watermark, epoch=watermark.epoch - 1)
-
-    outcome = await _AlwaysBeaten(db, AGENT).repair()
-
-    assert outcome.kind == DEFERRED
-    assert not outcome.advanced
-    assert outcome.sessions == 0
-    assert await projection.list() == before_rows, (
-        "a pass that never owned the epoch wrote a projection row anyway"
-    )
-    assert await projection.accounted() == before_watermark, (
-        "a pass that never owned the epoch moved the watermark anyway"
+    await asyncio.gather(
+        *(
+            ConversationSessionProjection(db, AGENT, chunk_rows=1).repair()
+            for _ in range(3)
+        )
     )
 
-    with pytest.raises(RuntimeError, match="could not take"):
-        await _AlwaysBeaten(db, AGENT).rebuild()
-    assert await projection.list() == before_rows
-
-    # ...and a pass that CAN take it still repairs normally afterwards.
-    await _assert_repaired_projection_is_true(db, projection)
+    assert not await projection.is_stale(), (
+        "racing repairs left the projection stale with nobody left to repair it"
+    )
+    await _assert_watermark_is_not_ahead(db, projection)
+    await _assert_agrees_with_the_grouper(db, projection)
+    assert ids["A human turn"] is not None
 
 
 # ── absent where it must be ──────────────────────────────────────────────
@@ -1476,9 +1805,9 @@ async def test_an_id_outside_the_column_contract_is_never_projected(seeded):
 async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
     """The guard that only a Phase A violation can reach — defended, not assumed.
 
-    ``_sessions`` filters the ids it found through
-    :func:`is_stampable_session_id`, and the column contract means no shipped
-    write path can produce one it rejects. That makes the filter a clause no
+``project_transcript`` drops any session whose id
+    :func:`is_stampable_session_id` rejects, and the column contract means no
+    shipped write path can produce one. That makes the filter a clause no
     ordinary test can exercise, which Phase A's Finding named as the worst kind:
     it reads as protection while a mutation removing it goes unnoticed.
 
@@ -1488,7 +1817,7 @@ async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
     keyed by a value the contract forbids is a key no reader can round-trip.
     Absent is the permitted direction.
 
-    On the all-stamped corpus deliberately: that is the derivation ``_sessions``
+    On the all-stamped corpus deliberately: that is the derivation a chunk
     feeds, so this is the path where the filter is load-bearing.
     """
     db, _store, projection = modern
