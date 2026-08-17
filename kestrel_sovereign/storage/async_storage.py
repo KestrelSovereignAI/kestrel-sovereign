@@ -39,7 +39,7 @@ from .agent_resource_store import (
 from .semantic_binding import SemanticAssertionBinding
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
-from .db import DatabaseBackend, SQLiteBackend, create_backend
+from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +314,17 @@ class AsyncStorage:
     async def initialize(self) -> None:
         """Initialize the storage (connect to database)."""
         if not self._initialized:
+            previous_db = self.db
+            if previous_db is not None:
+                if previous_db.connection_retirement_pending is True:
+                    raise ConnectionError(
+                        "Cannot initialize storage while a previous SQLAlchemy "
+                        "engine or database connection is still retiring"
+                    )
+                # A failed close retains its database-level lifecycle owner.
+                # Finalize and detach it before replacing ``self.db`` so the
+                # old factory cannot become an unowned stale worker source.
+                await previous_db.finalize_retired_sqla_factory()
             await self._backend.connect()
             self.db = AsyncDatabase(self._backend)
             await self.db._init_schema()
@@ -357,9 +368,10 @@ class AsyncStorage:
                 await self.db.close()
         finally:
             # ``AsyncDatabase.close`` closes the primary backend before it
-            # reports a cached SQLAlchemy-factory failure.  Reset the facade
-            # even when that failure propagates so a later initialize() opens
-            # a fresh backend instead of reusing a closed one.
+            # reports a cached SQLAlchemy-factory failure.  Mark the facade
+            # closed, but preserve ``self.db`` as the lifecycle owner: a later
+            # initialize is fenced while that database retains any live worker
+            # and may replace it only after retirement completes.
             self._initialized = False
 
     async def dispose_cached_sqla_factory(self) -> None:

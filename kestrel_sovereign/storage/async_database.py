@@ -10,7 +10,13 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
+from .db import (
+    ConnectionError,
+    DatabaseBackend,
+    SQLiteBackend,
+    get_backend,
+    normalize_schema,
+)
 from .db.sqlite import _minimum_close_timeout_s
 from .session_id_column import backfill_statement
 
@@ -776,6 +782,13 @@ class AsyncDatabase:
         """
         self._backend = backend
         self._initialized = False
+        # Active SQLAlchemy access and shutdown lifecycle ownership are
+        # deliberately separate.  The active cache is cleared before disposal
+        # so a later primary close never repeats abandoned pre-close work; the
+        # retirement owner remains reachable until engine disposal and every
+        # dialect-specific connection retirement have completed.
+        self._sovereign_sqla_factory = None
+        self._sovereign_sqla_retirement_owner = None
     
     @classmethod
     async def create(cls, config: Optional[Dict[str, Any]] = None) -> "AsyncDatabase":
@@ -2225,9 +2238,10 @@ class AsyncDatabase:
         stealing the primary SQLite connection's worker-drain reservation.
         Clearing the cache *before* the await makes a timed-out or abandoned
         disposal a one-shot attempt: a later backend close must not repeat the
-        same unbounded pre-close work and starve the primary connection.  A
-        factory that explicitly retains a live SQLite worker is re-cached so
-        its lifecycle owner remains reachable for a later close attempt.
+        same unbounded pre-close work and starve the primary connection.  The
+        separate retirement owner remains reachable through cancellation
+        and hard ``GeneratorExit`` abandonment without making the closing
+        factory look active or reusable.
         """
         # If the SQLA helper ever cached a session factory on us
         # (``kestrel_sovereign.storage.sqla.make_session_factory``),
@@ -2238,6 +2252,7 @@ class AsyncDatabase:
         sqla_factory = getattr(self, "_sovereign_sqla_factory", None)
         self._sovereign_sqla_factory = None
         if sqla_factory is not None:
+            self._sovereign_sqla_retirement_owner = sqla_factory
             # The caller owns the ordering between this independent engine and
             # the primary backend.  Do not turn a failed engine close into a
             # false success here: ``close()`` still gives the primary backend
@@ -2246,18 +2261,62 @@ class AsyncDatabase:
             try:
                 await sqla_factory.close()
             except (Exception, asyncio.CancelledError):
-                if getattr(
-                    sqla_factory,
-                    "sqlite_connection_retirement_pending",
-                    False,
-                ) is True:
-                    self._sovereign_sqla_factory = sqla_factory
                 raise
+            else:
+                if not sqla_factory.retirement_pending:
+                    sqla_factory.finalize_retirement()
+                    self._sovereign_sqla_retirement_owner = None
+
+    async def finalize_retired_sqla_factory(self) -> None:
+        """Finalize and detach a prior SQLAlchemy retirement owner."""
+        owner = getattr(self, "_sovereign_sqla_retirement_owner", None)
+        if owner is None:
+            return
+        if owner.retirement_pending:
+            raise ConnectionError(
+                "SQLAlchemy engine or connection retirement is still pending; "
+                "the database lifecycle owner cannot be detached"
+            )
+        # ``SovereignSqlaSessionFactory.close`` is deliberately one-shot.  A
+        # completed disposal error was already surfaced to the close caller;
+        # retrying the same failed task cannot improve cleanup.  Once engine
+        # disposal and every tracked connection retirement have settled,
+        # permanent factory admission fencing makes detaching safe.
+        try:
+            owner.finalize_retirement()
+        finally:
+            # A settled failure is surfaced exactly once, but no longer owns a
+            # live resource.  Detaching here lets a later initialize proceed
+            # only after the caller has observed that failure.
+            if (
+                self._sovereign_sqla_retirement_owner is owner
+                and not owner.retirement_pending
+            ):
+                self._sovereign_sqla_retirement_owner = None
+
+    @property
+    def connection_retirement_pending(self) -> bool:
+        """Whether this database still owns any retiring connection resource."""
+        backend_pending = getattr(
+            self._backend, "connection_retirement_pending", False
+        )
+        factories = (
+            getattr(self, "_sovereign_sqla_factory", None),
+            getattr(self, "_sovereign_sqla_retirement_owner", None),
+        )
+        factory_pending = any(
+            getattr(factory, "retirement_pending", False)
+            is True
+            for factory in factories
+        )
+        return backend_pending is True or factory_pending
 
     @property
     def minimum_sqla_factory_close_timeout_s(self) -> float:
         """Return the cached SQLAlchemy factory's optional close reservation."""
-        factory = getattr(self, "_sovereign_sqla_factory", None)
+        factory = getattr(self, "_sovereign_sqla_factory", None) or getattr(
+            self, "_sovereign_sqla_retirement_owner", None
+        )
         value = getattr(factory, "minimum_close_timeout_s", 0.0)
         return value if isinstance(value, (int, float)) and value > 0 else 0.0
 
@@ -2284,10 +2343,11 @@ class AsyncDatabase:
         """Close the SQLAlchemy factory and primary backend connection.
 
         A cancellation during optional SQLAlchemy disposal must not skip the
-        primary backend close.  In particular, SQLite owns an aiosqlite worker
-        whose shutdown has to run before the caller tears down its event loop.
-        Propagate cancellation only after that owned backend lifecycle has had
-        its chance to complete.
+        primary backend close.  SQLAlchemy engine retirement stays owned for
+        every dialect; SQLite additionally owns an aiosqlite worker whose
+        shutdown has to run before the caller tears down its event loop.
+        Propagate cancellation only after those owned lifecycles have had their
+        chance to complete.
         """
         cancelled = False
         factory_error: Exception | None = None
@@ -2314,6 +2374,19 @@ class AsyncDatabase:
             raise backend_error from factory_error
         finally:
             self._initialized = False
+
+        retirement_owner = getattr(
+            self, "_sovereign_sqla_retirement_owner", None
+        )
+        if retirement_owner is not None:
+            if retirement_owner.retirement_pending:
+                if factory_error is None:
+                    raise ConnectionError(
+                        "SQLAlchemy engine or connection retirement is still "
+                        "pending after the primary database connection closed"
+                    )
+            else:
+                await self.finalize_retired_sqla_factory()
 
         if cancelled:
             raise asyncio.CancelledError()

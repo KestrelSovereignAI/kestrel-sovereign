@@ -103,7 +103,7 @@ def _retain_aiosqlite_close(
     close_task: asyncio.Task[None],
     retained_closes: _RetainedAiosqliteCloses,
 ) -> None:
-    """Own a timed-out close until its non-daemon worker really exits."""
+    """Own an in-flight close until its non-daemon worker really exits."""
     existing = retained_closes.get(connection)
     if existing is not None and _aiosqlite_worker_is_alive(connection):
         return
@@ -177,17 +177,21 @@ async def _close_aiosqlite_connection(
     *,
     retained_closes: _RetainedAiosqliteCloses,
     deadline: Optional[float] = None,
+    close_task: Optional[asyncio.Task[None]] = None,
 ) -> None:
     """Close an owned aiosqlite connection through its full lifecycle.
 
     Every connection this backend opens owns an aiosqlite worker.  Keeping the
     close and worker-termination wait together prevents a short-lived backup
-    or snapshot connection from bypassing the shutdown contract.
+    or snapshot connection from bypassing the shutdown contract.  A caller
+    coordinating several connections may pass an already-started ``close_task``
+    after installing retained ownership before its first cancellable await.
     """
     loop = asyncio.get_running_loop()
     if deadline is None:
         deadline = loop.time() + _minimum_close_timeout_s()
-    close_task = loop.create_task(connection.close())
+    if close_task is None:
+        close_task = loop.create_task(connection.close())
 
     try:
         await _finish_aiosqlite_connection_close(

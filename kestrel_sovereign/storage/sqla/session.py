@@ -33,9 +33,11 @@ from sqlalchemy.ext.asyncio import (
 from kestrel_sovereign.storage.db.interface import ConnectionError
 from kestrel_sovereign.storage.db.sqlite import (
     _RetainedAiosqliteCloses,
+    _aiosqlite_worker_is_alive,
     _close_aiosqlite_connection,
     _minimum_close_timeout_s,
     _prune_retained_aiosqlite_closes,
+    _retain_aiosqlite_close,
 )
 
 
@@ -73,6 +75,10 @@ class SovereignSqlaSessionFactory:
         # their complete lifecycle too.
         self._sqlite_connections: list[Any] = []
         self._retired_sqlite_closes: _RetainedAiosqliteCloses = {}
+        self._close_started = False
+        self._engine_dispose_task: asyncio.Task[None] | None = None
+        self._engine_dispose_error: BaseException | None = None
+        self._engine_dispose_error_reported = False
         if getattr(engine.dialect, "name", None) == "sqlite":
             event.listen(
                 engine.sync_engine, "connect", self._track_sqlite_connection
@@ -91,25 +97,75 @@ class SovereignSqlaSessionFactory:
 
     @property
     def sqlite_connection_retirement_pending(self) -> bool:
-        """Whether a timed-out driver close still owns a live worker."""
+        """Whether an in-flight driver close still owns a live worker."""
         _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
         return bool(self._retired_sqlite_closes)
+
+    @property
+    def retirement_pending(self) -> bool:
+        """Whether any dialect-neutral engine resource is still retiring."""
+        dispose_task = self._engine_dispose_task
+        return (
+            dispose_task is not None and not dispose_task.done()
+        ) or self.sqlite_connection_retirement_pending
+
+    def _capture_engine_dispose_result(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        """Retrieve and retain a late engine-disposal failure.
+
+        Kestrel can hard-close the outer shutdown coroutine while the
+        independently owned disposal task continues.  Retrieving the task
+        outcome here prevents an unobserved-task warning; retaining it lets the
+        database lifecycle owner surface a late failure before it permits
+        replacement resources.
+        """
+        if task.cancelled():
+            if self._engine_dispose_error is None:
+                self._engine_dispose_error = ConnectionError(
+                    "SQLAlchemy engine disposal was cancelled before completion"
+                )
+            return
+        error = task.exception()
+        if error is not None and self._engine_dispose_error is None:
+            self._engine_dispose_error = error
+
+    def finalize_retirement(self) -> None:
+        """Validate completion and surface any previously unseen failure."""
+        if self.retirement_pending:
+            raise ConnectionError(
+                "SQLAlchemy engine or connection retirement is still pending; "
+                "the lifecycle owner cannot be detached"
+            )
+
+        dispose_task = self._engine_dispose_task
+        if dispose_task is not None:
+            self._capture_engine_dispose_result(dispose_task)
+
+        error = self._engine_dispose_error
+        if error is None or self._engine_dispose_error_reported:
+            return
+        self._engine_dispose_error_reported = True
+        if isinstance(error, Exception):
+            raise error
+        raise ConnectionError(
+            "SQLAlchemy engine disposal failed during lifecycle retirement"
+        ) from error
 
     def _track_sqlite_connection(self, dbapi_connection: Any, _record: Any) -> None:
         """Remember one raw aiosqlite connection opened by this engine."""
         connection = getattr(dbapi_connection, "driver_connection", None)
         if connection is not None and connection not in self._sqlite_connections:
             self._sqlite_connections.append(connection)
+            if self._close_started:
+                self._begin_sqlite_connection_retirement((connection,))
 
     def _assert_session_connection_available(self) -> None:
-        """Fence new SQLite work while an old worker is still retiring."""
-        if (
-            getattr(self._engine.dialect, "name", None) == "sqlite"
-            and self.sqlite_connection_retirement_pending
-        ):
+        """Permanently fence new work after factory close begins."""
+        if self._close_started:
             raise ConnectionError(
-                "SQLite SQLAlchemy connection worker is still retiring; "
-                "new sessions are unavailable until retirement completes"
+                "SQLAlchemy session factory is closing or closed; "
+                "new sessions are unavailable"
             )
 
     @asynccontextmanager
@@ -131,19 +187,57 @@ class SovereignSqlaSessionFactory:
 
     async def close(self) -> None:
         """Dispose the engine and drain every SQLite worker it opened."""
+        self._close_started = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _minimum_close_timeout_s()
+        if self._engine_dispose_task is None:
+            self._engine_dispose_task = loop.create_task(
+                self._engine.dispose(),
+                name=f"sqla-engine-dispose:{id(self)}",
+            )
+            self._engine_dispose_task.add_done_callback(
+                self._capture_engine_dispose_result
+            )
+
+        # Establish durable ownership and start every raw SQLite close before
+        # the first potentially blocking disposal await.  Kestrel's bounded
+        # shutdown can hard-close this coroutine with ``GeneratorExit``; the
+        # independent retained close/reaper tasks must already own each worker
+        # when that happens.
+        self._begin_sqlite_connection_retirement()
+
         dispose_error: BaseException | None = None
         try:
-            await self._engine.dispose()
+            # ``asyncio.wait`` does not transfer caller cancellation to the
+            # owned task.  Unlike ``asyncio.shield`` on Python 3.14, it also
+            # does not install a proxy that logs a late task exception after
+            # hard GeneratorExit abandonment; our done callback retrieves and
+            # retains that outcome for lifecycle finalization.
+            await asyncio.wait({self._engine_dispose_task})
+            self._engine_dispose_task.result()
         except (Exception, asyncio.CancelledError) as exc:
             # ``AsyncEngine.dispose`` can fail before it visits all of its
             # connections (and deliberately leaves checked-out connections
-            # alone).  A wait-only fallback cannot stop either kind of worker:
-            # explicitly close every live raw driver before draining it.
+            # alone).  The per-driver lifecycle tasks above remain independently
+            # owned, wait for this one-shot disposal attempt, and then explicitly
+            # close any worker the engine left alive.
             dispose_error = exc
+            if self._engine_dispose_task.done():
+                self._capture_engine_dispose_result(
+                    self._engine_dispose_task
+                )
+                current_task = asyncio.current_task()
+                caller_cancelled = (
+                    isinstance(exc, asyncio.CancelledError)
+                    and current_task is not None
+                    and current_task.cancelling() > 0
+                )
+                if not caller_cancelled:
+                    self._engine_dispose_error_reported = True
 
         cleanup_error: BaseException | None = None
         try:
-            await self._close_live_sqlite_connections()
+            await self._close_live_sqlite_connections(deadline=deadline)
         except (Exception, asyncio.CancelledError) as exc:
             cleanup_error = exc
 
@@ -158,7 +252,53 @@ class SovereignSqlaSessionFactory:
         if dispose_error is not None:
             raise dispose_error
 
-    async def _close_live_sqlite_connections(self) -> None:
+    def _begin_sqlite_connection_retirement(self, connections: Any = None) -> None:
+        """Synchronously retain close ownership for every live SQLite worker."""
+        if getattr(self._engine.dialect, "name", None) != "sqlite":
+            return
+
+        _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
+        loop = asyncio.get_running_loop()
+        candidates = (
+            self._sqlite_connections if connections is None else connections
+        )
+        for connection in candidates:
+            if not _aiosqlite_worker_is_alive(connection):
+                continue
+            if connection in self._retired_sqlite_closes:
+                continue
+
+            dispose_task = self._engine_dispose_task
+            if dispose_task is None:
+                raise RuntimeError(
+                    "SQLite retirement started before engine disposal ownership"
+                )
+
+            async def close_after_dispose(
+                owned_connection: Any = connection,
+                owned_dispose_task: asyncio.Task[None] = dispose_task,
+            ) -> None:
+                try:
+                    await asyncio.wait({owned_dispose_task})
+                    owned_dispose_task.result()
+                except (Exception, asyncio.CancelledError):
+                    # Disposal failure is surfaced by ``close``.  It cannot
+                    # transfer ownership of a checked-out/raw driver.
+                    pass
+                if _aiosqlite_worker_is_alive(owned_connection):
+                    await owned_connection.close()
+
+            raw_close_task = loop.create_task(
+                close_after_dispose(),
+                name=f"sqla-aiosqlite-driver-close:{id(connection)}",
+            )
+            _retain_aiosqlite_close(
+                connection,
+                raw_close_task,
+                self._retired_sqlite_closes,
+            )
+
+    async def _close_live_sqlite_connections(self, *, deadline: float) -> None:
         """Close and drain every live raw SQLite driver this factory owns.
 
         ``AsyncEngine.dispose()`` normally sends the close sentinel for pooled
@@ -176,19 +316,27 @@ class SovereignSqlaSessionFactory:
         # per-connection waits both exceeded that reservation and could leave
         # later workers without retained lifecycle ownership when an outer
         # shutdown guard expired.
+        self._begin_sqlite_connection_retirement()
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _minimum_close_timeout_s()
-        close_tasks = [
-            loop.create_task(
-                _close_aiosqlite_connection(
-                    connection,
-                    retained_closes=self._retired_sqlite_closes,
-                    deadline=deadline,
-                ),
-                name=f"sqla-aiosqlite-close:{id(connection)}",
+        close_tasks: list[asyncio.Task[None]] = []
+        for connection in self._sqlite_connections:
+            retained = self._retired_sqlite_closes.get(connection)
+            if retained is None:
+                continue
+            close_tasks.append(
+                loop.create_task(
+                    _close_aiosqlite_connection(
+                        connection,
+                        retained_closes=self._retired_sqlite_closes,
+                        deadline=deadline,
+                        close_task=retained.close_task,
+                    ),
+                    name=f"sqla-aiosqlite-close:{id(connection)}",
+                )
             )
-            for connection in self._sqlite_connections
-        ]
+
+        if not close_tasks:
+            return
 
         pending_cancellation: asyncio.CancelledError | None = None
         try:
@@ -240,6 +388,7 @@ class SovereignSqlaSessionFactory:
 # the per-request store construction would multiply engines —
 # exhausting Postgres connection slots in production.
 _CACHE_ATTR = "_sovereign_sqla_factory"
+_RETIREMENT_OWNER_ATTR = "_sovereign_sqla_retirement_owner"
 
 
 def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
@@ -276,6 +425,13 @@ def make_session_factory(db: Any) -> SovereignSqlaSessionFactory:
             error message points the way.
         ValueError: If the backend type isn't recognized.
     """
+    retirement_owner = getattr(db, _RETIREMENT_OWNER_ATTR, None)
+    if isinstance(retirement_owner, SovereignSqlaSessionFactory):
+        raise ConnectionError(
+            "SQLAlchemy session factory retirement is still owned by this "
+            "database; a replacement factory cannot be created"
+        )
+
     cached = getattr(db, _CACHE_ATTR, None)
     # Only treat the cached attribute as a hit if it's the right type —
     # ``MagicMock`` and similar test doubles auto-vivify attributes on
