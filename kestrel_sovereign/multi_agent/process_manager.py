@@ -106,26 +106,52 @@ class ProcessManager:
         Measured — such a listener probes True, then False after a single
         unaccepted connection, while ``bind`` keeps reporting it taken.
 
-        ``SO_REUSEADDR`` is set because uvicorn's asyncio server sets it
-        (verified on the live loop), and without it a port left in
+        ``SO_REUSEADDR`` is set on POSIX because uvicorn's asyncio server sets
+        it there (verified on the live loop), and without it a port left in
         ``TIME_WAIT`` by a clean shutdown reads as occupied. Kestrel would
         then stop the service and refuse to start it again — `restart` and
         `update` both abort on a failed stop — over a port uvicorn could have
         bound immediately. Measured: TIME_WAIT binds fine with the option, and
         a live listener still fails with ``EADDRINUSE``, so nothing is lost.
 
-        ``host`` matters and must be the address the server is configured to
-        bind. Measured both ways: a listener on ``0.0.0.0`` is invisible to a
-        probe of ``127.0.0.1``, and a listener on ``127.0.0.1`` is invisible
-        to a probe of ``0.0.0.0``. Probing where the server will actually bind
-        makes this succeed exactly when the server's own bind would.
+        It is deliberately NOT set on Windows, where asyncio does not enable
+        it either and Winsock's version is far more permissive: there it lets
+        a socket bind a port a live listener already holds, which would invert
+        this answer and let a stop report success over a running server. The
+        option is matched to the platform because the point is to mirror the
+        server, not to apply a flag.
+
+        ``host`` must be the address the server is configured to bind, and the
+        address family is resolved from it rather than assumed. Measured both
+        ways on IPv4: a listener on ``0.0.0.0`` is invisible to a probe of
+        ``127.0.0.1``, and one on ``127.0.0.1`` is invisible to a probe of
+        ``0.0.0.0``. Forcing ``AF_INET`` had the same effect on a configured
+        IPv6 bind such as ``::1`` — the bind raised and a free port read as
+        held, breaking start, stop and restart for a configuration uvicorn
+        serves happily.
         """
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind((host, port))
-            except OSError:
-                return True
+        try:
+            candidates = socket.getaddrinfo(
+                host or None,
+                port,
+                type=socket.SOCK_STREAM,
+                flags=socket.AI_PASSIVE,
+            )
+        except socket.gaierror:
+            # An address that does not resolve is a configuration fault, not
+            # an occupied port. Claiming occupancy here would wedge `stop`
+            # into permanent failure over a typo; the bind error surfaces at
+            # `start`, where it names the address and is actionable.
+            return False
+
+        for family, socktype, proto, _canonname, sockaddr in candidates:
+            with socket.socket(family, socktype, proto) as s:
+                if sys.platform != "win32":
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(sockaddr)
+                except OSError:
+                    return True
         return False
 
     @staticmethod

@@ -729,6 +729,40 @@ class TestCmdStopReportsOnlyVerifiedStops:
         with _listener_on() as port:
             assert ProcessManager.is_port_in_use(port, "127.0.0.1") is True
 
+    def test_an_ipv6_bind_address_is_probed_in_its_own_family(self):
+        """`host.bind` may be an IPv6 address, and uvicorn serves it fine.
+
+        Forcing AF_INET made the bind raise, which read as "port held" — so
+        start, stop and restart all failed on a configuration that works.
+        """
+        import socket as _socket
+
+        live = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
+        live.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        live.bind(("::1", 0))
+        held_port = live.getsockname()[1]
+        live.listen(5)
+        try:
+            assert ProcessManager.is_port_in_use(held_port, "::1") is True
+        finally:
+            live.close()
+
+        spare = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
+        spare.bind(("::1", 0))
+        free_port = spare.getsockname()[1]
+        spare.close()
+        assert ProcessManager.is_port_in_use(free_port, "::1") is False
+
+    def test_an_unresolvable_bind_address_is_not_called_occupied(self):
+        """A typo is a configuration fault, not another process holding a port.
+
+        Claiming occupancy would wedge `stop` into permanent failure; the bind
+        error surfaces at `start`, where it names the address.
+        """
+        assert ProcessManager.is_port_in_use(
+            9999, "not.a.real.host.invalid"
+        ) is False
+
     def test_reap_returns_still_held_when_port_survives_sigkill(self):
         with _listener_on() as port:
             result = _reap_orphans_on_port(port, "claw", force=False, bind="127.0.0.1")
