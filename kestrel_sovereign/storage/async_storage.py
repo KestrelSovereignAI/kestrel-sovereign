@@ -227,7 +227,12 @@ class AsyncStorage:
         else:
             self._assertion_tenant_capability = None
 
-        self.cold_read = cold_read
+        # Read back off the backend that was actually built, so the facade
+        # and the connection cannot disagree. The ``config=`` path carries
+        # ``cold_read`` in the dict while this keyword keeps its default, and
+        # a facade that thinks it is writable runs migrations against an
+        # immutable connection.
+        self.cold_read = bool(getattr(self._backend, "cold_read", cold_read))
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None

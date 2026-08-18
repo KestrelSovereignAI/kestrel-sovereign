@@ -113,3 +113,97 @@ async def test_cold_read_does_not_migrate_a_database_it_only_inspects(tmp_path):
         "a cold read created the destructive-audit database beside the one "
         "it was inspecting"
     )
+
+
+@pytest.mark.asyncio
+async def test_cold_read_follows_a_symlink_to_where_the_sidecars_really_are(tmp_path):
+    """Sidecars sit beside the RESOLVED database, not beside an alias.
+
+    Checking one location while opening another picks ``immutable=1`` for a
+    database that has a live WAL, and then serves pre-WAL state as current —
+    a governance decision made from a stale hash.
+    """
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    db = real_dir / "actual.db"
+    _wal_db(db)
+
+    holder = sqlite3.connect(db)
+    holder.execute("INSERT INTO t VALUES ('only-in-wal')")
+    holder.commit()
+    assert _sidecars(db), "setup must leave a live WAL beside the target"
+
+    link = tmp_path / "alias.db"
+    link.symlink_to(db)
+    assert not list(tmp_path.glob("alias.db-*")), (
+        "setup: no sidecars beside the alias, which is the whole trap"
+    )
+
+    backend = SQLiteBackend(str(link), cold_read=True)
+    await backend.connect()
+    try:
+        rows = await backend.fetch_all("SELECT v FROM t ORDER BY v")
+    finally:
+        await backend.close()
+        holder.close()
+
+    values = {tuple(r)[0] for r in rows}
+    assert "only-in-wal" in values, (
+        f"cold read through a symlink ignored committed WAL content: {values}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cold_read_refuses_to_report_after_a_writer_came_and_went(tmp_path):
+    """A whole write cycle can complete inside an immutable read.
+
+    The writer's final close checkpoints and REMOVES the sidecars, so looking
+    only for sidecars afterwards finds none and concludes nothing happened —
+    while this connection served the pre-write state throughout.
+    """
+    db = tmp_path / "raced.db"
+    _wal_db(db)
+    assert _sidecars(db) == []
+
+    backend = SQLiteBackend(str(db), cold_read=True)
+    await backend.connect()
+    try:
+        before = await backend.fetch_all("SELECT v FROM t")
+        assert len(before) == 1
+
+        writer = sqlite3.connect(db)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("INSERT INTO t VALUES ('arrived-during-the-read')")
+        writer.commit()
+        writer.close()  # checkpoints, and takes the sidecars with it
+
+        assert _sidecars(db) == [], (
+            "setup: the writer must leave no trace for the naive check to find"
+        )
+        with pytest.raises(Exception) as excinfo:
+            backend.assert_cold_read_still_valid()
+        assert "changed while it was being read" in str(excinfo.value)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_read_via_config_does_not_migrate_the_database(tmp_path):
+    """The facade must not think it is writable while its backend is not.
+
+    ``create_backend`` reads ``cold_read`` out of the config dict while the
+    keyword argument keeps its default; a facade that disagreed would run
+    schema migrations against an immutable connection.
+    """
+    db = tmp_path / "configured.db"
+    _wal_db(db)
+
+    storage = AsyncStorage(
+        config={"backend": "sqlite", "db_path": str(db), "cold_read": True},
+        agent_id="did:test",
+    )
+    assert storage.cold_read is True
+    async with storage:
+        assert await storage.db.fetchone("SELECT v FROM t") is not None
+        assert storage.destructive_audit is None
+    assert _sidecars(db) == []

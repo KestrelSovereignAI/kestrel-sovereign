@@ -81,7 +81,10 @@ async def read_anchor_agent_did(
     """
     if not isinstance(mode, AgentDIDLookupMode):
         raise ValueError(f"Unknown agent identity lookup mode: {mode!r}")
-    db_path = Path(storage_dir) / "kestrel_prime.db"
+    # Resolved up front: SQLite places -wal/-shm beside the RESOLVED target,
+    # so checking sidecars beside a symlinked alias while opening the target
+    # would pick the immutable path and ignore committed WAL data.
+    db_path = (Path(storage_dir) / "kestrel_prime.db").resolve()
 
     def _lookup() -> str:
         if not db_path.is_file():
@@ -128,7 +131,7 @@ async def read_anchor_agent_did(
             else:
                 uri_flags = "mode=rw"
             connection = sqlite3.connect(
-                f"{db_path.resolve().as_uri()}?{uri_flags}",
+                f"{db_path.as_uri()}?{uri_flags}",
                 uri=True,
             )
             rows = connection.execute(

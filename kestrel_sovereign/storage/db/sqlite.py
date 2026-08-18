@@ -354,9 +354,20 @@ class SQLiteBackend(DatabaseBackend):
         """
         self.db_path = db_path
         self.cold_read = cold_read
+        #: Resolved ONCE, and used for the URI, the sidecar checks and the
+        #: change marker alike. SQLite places ``-wal``/``-shm`` beside the
+        #: RESOLVED target, so a symlinked ``db_path`` would have the sidecar
+        #: check looking beside the alias while the connection opens the
+        #: target — selecting ``immutable=1`` and silently serving pre-WAL
+        #: governance state as current.
+        self._resolved_path = (
+            None if db_path == ":memory:" else Path(db_path).resolve()
+        )
         #: Whether the cold-read connection was opened ``immutable=1`` and is
         #: therefore blind to a WAL that appears while it is open.
         self._cold_read_ignored_wal = False
+        #: Committed-state fingerprint taken when an immutable read began.
+        self._cold_read_marker: tuple = ()
         self._connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
         # Serializes operation *units* on the single shared connection. aiosqlite
@@ -460,7 +471,37 @@ class SQLiteBackend(DatabaseBackend):
     
     def _wal_sidecars(self) -> tuple[Path, ...]:
         """The files SQLite creates beside a WAL database while it is in use."""
-        return (Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm"))
+        base = self._resolved_path
+        return (Path(f"{base}-wal"), Path(f"{base}-shm"))
+
+    def _committed_state_marker(self) -> tuple:
+        """A fingerprint of the database's committed state.
+
+        Sidecar presence alone cannot see a writer that opened, committed and
+        closed entirely within an immutable read: its final close checkpoints
+        and REMOVES the sidecars, so the after-check finds none and passes
+        while this connection has been serving pre-write state throughout.
+
+        Measured, because the obvious candidate does not work: SQLite does
+        NOT move the header's change counter (bytes 24-27) or its
+        version-valid-for number when a WAL commit is checkpointed back into
+        the main file — both were observed unchanged across exactly the write
+        this must catch. The file's mtime and contents do change, so identity
+        and modification time are what get compared. Inode is included because
+        a database replaced wholesale is the same event by another route.
+
+        This matters because an immutable reader caches what it has already
+        read: after a checkpoint it keeps serving the pages it cached, so a
+        second read of the same row returns the pre-write value indefinitely.
+        """
+        base = self._resolved_path
+        if base is None:
+            return ()
+        try:
+            stat = base.stat()
+        except OSError:
+            return ()
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
     def _has_wal_sidecars(self) -> bool:
         return any(sidecar.exists() for sidecar in self._wal_sidecars())
@@ -490,10 +531,11 @@ class SQLiteBackend(DatabaseBackend):
         # and swallow the flags that make this read cold — SQLite would fall
         # back to read-write-create and open a different file, silently
         # defeating the mechanism.
-        uri = Path(self.db_path).resolve().as_uri()
         self._cold_read_ignored_wal = not self._has_wal_sidecars()
+        if self._cold_read_ignored_wal:
+            self._cold_read_marker = self._committed_state_marker()
         flags = "mode=ro&immutable=1" if self._cold_read_ignored_wal else "mode=ro"
-        return f"{uri}?{flags}"
+        return f"{self._resolved_path.as_uri()}?{flags}"
 
     def assert_cold_read_still_valid(self) -> None:
         """Refuse to report on an immutable read that a writer raced.
@@ -507,12 +549,17 @@ class SQLiteBackend(DatabaseBackend):
         """
         if not self.cold_read or self.db_path == ":memory:":
             return
-        if self._cold_read_ignored_wal and self._has_wal_sidecars():
+        if not self._cold_read_ignored_wal:
+            return
+        if self._has_wal_sidecars() or (
+            self._cold_read_marker
+            and self._committed_state_marker() != self._cold_read_marker
+        ):
             raise ColdReadUnavailable(
-                f"Cannot report on {self.db_path}: SQLite WAL state appeared "
-                "while it was being read, and this connection was opened "
-                "immutable so it has been ignoring that WAL. Stop the agent "
-                "and retry."
+                f"Cannot report on {self.db_path}: the database changed while "
+                "it was being read, and this connection was opened immutable "
+                "so it has been serving the state from before that change. "
+                "Stop the agent and retry."
             )
 
     async def connect(self) -> None:
