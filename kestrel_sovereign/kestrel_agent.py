@@ -5065,16 +5065,25 @@ Expected Duration: {expected_duration}
                 if command not in SAFE_MODE_COMMANDS:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
-                        "The agent has detected an integrity issue and is operating in restricted mode.\\n"
+                        "The agent is in restricted mode: governance state could not be verified.\\n"
                         "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
-                restriction = (
-                    "a required startup integrity audit"
-                    if audit_pending
-                    else "an integrity failure"
-                )
+                unavailable = self.constitution_state_unavailable_detail()
+                if isinstance(unavailable, str):
+                    # Availability, not integrity (#2920). Naming the exception
+                    # is what lets an operator recognise DB contention rather
+                    # than hunting a tampered constitution that is fine.
+                    restriction = (
+                        f"unreadable governance state ({unavailable}) — an "
+                        "availability failure, not evidence the constitution "
+                        "was altered"
+                    )
+                elif audit_pending:
+                    restriction = "a required startup integrity audit"
+                else:
+                    restriction = "an integrity failure"
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"

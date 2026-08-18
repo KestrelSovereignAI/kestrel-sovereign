@@ -295,6 +295,9 @@ class _DurableConstitutionHarness:
     _mark_constitution_state_unavailable = (
         KestrelAgent._mark_constitution_state_unavailable
     )
+    constitution_state_unavailable_detail = (
+        KestrelAgent.constitution_state_unavailable_detail
+    )
     _persist_constitution_runtime_state = (
         KestrelAgent._persist_constitution_runtime_state
     )
@@ -1015,3 +1018,90 @@ async def test_verifier_fails_closed_on_governing_source_mutation(governing_sour
     ok, msg = await agent._verify_constitution_integrity()
     assert not ok
     assert "modified" in msg
+
+
+# ---------------------------------------------------------------------------
+# #2920: an unreadable governance state is an AVAILABILITY failure. Reporting
+# it as an integrity failure told an operator their constitution may have been
+# tampered with while `!verify-constitution` confirmed the anchor was intact.
+# ---------------------------------------------------------------------------
+
+def _agent_with_unreadable_state():
+    """An agent that fell into Safe Mode because the state could not be READ."""
+    from kestrel_sdk.storage.database.interface import TransactionError
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock()
+    agent._safe_mode = False
+    agent._safe_mode_entered_at = None
+    agent._safe_mode_reason = None
+    agent.agent_id = "did:example:kestrel"
+    agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
+    agent.constitution_state_unavailable_detail = (
+        ConstitutionMixin.constitution_state_unavailable_detail.__get__(agent)
+    )
+    ConstitutionMixin._mark_constitution_state_unavailable(
+        agent, TransactionError("database is locked")
+    )
+    return agent
+
+
+def test_an_unreadable_state_is_reported_as_availability_not_integrity():
+    """The marker records WHY, and the helper reads it back."""
+    agent = _agent_with_unreadable_state()
+
+    assert agent._safe_mode is True, "must still fail closed"
+    assert agent.constitution_state_unavailable_detail() == "TransactionError"
+
+
+def test_a_genuine_integrity_stop_still_reports_integrity():
+    """Only a failed READ sets the marker — a wrong constitution must not."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock()
+    agent._constitution_state_load_error = None
+    agent.constitution_state_unavailable_detail = (
+        ConstitutionMixin.constitution_state_unavailable_detail.__get__(agent)
+    )
+
+    assert agent.constitution_state_unavailable_detail() is None
+
+
+@pytest.mark.asyncio
+async def test_streamed_banner_names_availability_when_the_state_was_unreadable():
+    """The primary chat path is streamed — it must not announce tampering."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    agent = _agent_with_unreadable_state()
+    agent._constitution_audit_pending = False
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+        agent
+    )
+
+    chunks = [c async for c in agent.process_input_streaming("normal prompt")]
+
+    assert len(chunks) == 1
+    banner = chunks[0]
+    assert "SAFE MODE ACTIVE" in banner
+    assert "TransactionError" in banner, "the operator needs the actual cause"
+    assert "availability failure" in banner
+    # The claim that must NOT be made: nothing here says the bytes are wrong.
+    assert "due to an integrity failure" not in banner
+
+
+@pytest.mark.asyncio
+async def test_safe_mode_command_names_availability_when_the_state_was_unreadable():
+    """`!safe-mode` is the command the banner tells operators to run."""
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    agent = _agent_with_unreadable_state()
+    agent._constitution_audit_pending = False
+    handler = CommandHandler(agent)
+
+    reply = await handler._cmd_safe_mode("!safe-mode")
+
+    assert "TransactionError" in reply
+    assert "availability failure" in reply
+    assert "restricted due to integrity failure" not in reply

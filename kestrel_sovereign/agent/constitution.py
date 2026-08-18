@@ -628,6 +628,31 @@ class ConstitutionMixin:
         except Exception as exc:  # noqa: BLE001 - state failure must fail closed
             self._mark_constitution_state_unavailable(exc)
 
+    def constitution_state_unavailable_detail(self):
+        """The exception type that made governance state unreadable, or ``None``.
+
+        Safe Mode is entered for two different reasons that an operator must be
+        able to tell apart. The constitution may be *wrong* — a hash mismatch,
+        a missing identity node, a failed audit — which is an integrity
+        finding. Or the authoritative state may simply be **unreadable**: a
+        ``TransactionError`` because another connection holds the database, an
+        IO error, a DB that has not initialised yet.
+
+        Both fail closed, correctly — cognition must not run on governance that
+        cannot be verified. But they are not the same claim, and reporting an
+        availability failure as "integrity failure" tells the operator their
+        constitution may have been tampered with when nothing of the kind
+        happened. In #2920 a drift-only inspection opened a second connection
+        to a live agent's database and the agent fell into Safe Mode announcing
+        an integrity failure, while ``!verify-constitution`` cheerfully
+        confirmed the anchor was intact.
+
+        ``_constitution_state_load_error`` is set only by
+        ``_mark_constitution_state_unavailable``, so its presence is exactly
+        "we could not read the state", never "the state is wrong".
+        """
+        return vars(self).get("_constitution_state_load_error")
+
     def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()

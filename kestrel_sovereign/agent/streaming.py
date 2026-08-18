@@ -1007,11 +1007,23 @@ class StreamingMixin:
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if (safe_mode or audit_pending) and not user_input.startswith("!"):
-            restriction = (
-                "a required startup integrity audit"
-                if audit_pending
-                else "an integrity failure"
-            )
+            # Availability is not integrity (#2920). ``getattr`` because this
+            # mixin is driven by lightweight harnesses as well as the agent.
+            detail = getattr(self, "constitution_state_unavailable_detail", None)
+            unavailable = detail() if callable(detail) else None
+            # A str is the helper's documented contract; anything else (a test
+            # double's auto-attribute, a partially built agent) is not an
+            # availability claim and must not be reported as one.
+            if isinstance(unavailable, str):
+                restriction = (
+                    f"unreadable governance state ({unavailable}) — an "
+                    "availability failure, not evidence the constitution was "
+                    "altered"
+                )
+            elif audit_pending:
+                restriction = "a required startup integrity audit"
+            else:
+                restriction = "an integrity failure"
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
                 f"The agent cannot process queries due to {restriction}.\n"
