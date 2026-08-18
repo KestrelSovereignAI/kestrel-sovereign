@@ -52,7 +52,24 @@ async def test_acquire_releases_on_normal_exit():
     mgr = OrderedLockManager()
     async with mgr.acquire({ResourceLock.MEMORY}):
         assert mgr.is_held(ResourceLock.MEMORY)
+        assert mgr.is_owned_by_current_task(ResourceLock.MEMORY)
+        diagnostics = mgr.active_hold_diagnostics()
+        assert diagnostics[0]["resource"] == "memory"
+        assert diagnostics[0]["blocked_acquirers"] == 0
     assert not mgr.is_held(ResourceLock.MEMORY)
+    assert not mgr.is_owned_by_current_task(ResourceLock.MEMORY)
+    assert mgr.active_hold_diagnostics() == []
+
+
+@pytest.mark.asyncio
+async def test_task_ownership_does_not_confuse_a_different_task():
+    mgr = OrderedLockManager()
+
+    async with mgr.acquire({ResourceLock.MEMORY}):
+        async def inspect_from_child():
+            return mgr.is_owned_by_current_task(ResourceLock.MEMORY)
+
+        assert await asyncio.create_task(inspect_from_child()) is False
 
 
 @pytest.mark.asyncio

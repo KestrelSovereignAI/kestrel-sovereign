@@ -115,6 +115,40 @@ async def test_a_long_hold_that_blocks_someone_is_a_warning(fast_thresholds, cap
     assert "1 acquirer(s) blocked behind it" in caplog.text
 
 
+async def test_blocked_hold_escalates_once_to_error(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "kestrel_sovereign.signals.lock_manager.SLOW_WAIT_WARN_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.signals.lock_manager.SLOW_HOLD_WARN_SECONDS", 0.01
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.signals.lock_manager.BLOCKED_HOLD_ERROR_SECONDS", 0.03
+    )
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.MEMORY}, label="cron sleep"):
+            await released.wait()
+
+    async def waiter():
+        async with mgr.acquire({ResourceLock.MEMORY}, label="queued memory work"):
+            pass
+
+    with caplog.at_level(logging.WARNING):
+        holding = asyncio.create_task(holder())
+        await asyncio.sleep(0.005)
+        blocked = asyncio.create_task(waiter())
+        await asyncio.sleep(0.08)
+        released.set()
+        await asyncio.gather(holding, blocked)
+
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "degrading readiness" in errors[0].message
+
+
 async def test_waiter_count_does_not_leak_when_a_waiter_is_cancelled(
     fast_thresholds, caplog
 ):

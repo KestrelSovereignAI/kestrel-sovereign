@@ -37,8 +37,9 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
+from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
-from .db import DatabaseBackend, SQLiteBackend, create_backend
+from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,12 @@ class AsyncStorage:
             self.semantic_capabilities.validate()
             self._semantic_rdf_codec = self.semantic_capabilities.create_rdf_codec()
         except ValueError as exc:
-            raise ValueError("semantic runtime capability is unavailable") from exc
+            # This is the line an operator actually reads when agent boot
+            # fails; leaving the cause in the traceback alone is what made a
+            # CRLF-smudged checkout look like an unexplained total failure.
+            raise ValueError(
+                f"semantic runtime capability is unavailable: {exc}"
+            ) from exc
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
             self._backend = backend
@@ -308,6 +314,17 @@ class AsyncStorage:
     async def initialize(self) -> None:
         """Initialize the storage (connect to database)."""
         if not self._initialized:
+            previous_db = self.db
+            if previous_db is not None:
+                if previous_db.connection_retirement_pending is True:
+                    raise ConnectionError(
+                        "Cannot initialize storage while a previous SQLAlchemy "
+                        "engine or database connection is still retiring"
+                    )
+                # A failed close retains its database-level lifecycle owner.
+                # Finalize and detach it before replacing ``self.db`` so the
+                # old factory cannot become an unowned stale worker source.
+                await previous_db.finalize_retired_sqla_factory()
             await self._backend.connect()
             self.db = AsyncDatabase(self._backend)
             await self.db._init_schema()
@@ -351,9 +368,10 @@ class AsyncStorage:
                 await self.db.close()
         finally:
             # ``AsyncDatabase.close`` closes the primary backend before it
-            # reports a cached SQLAlchemy-factory failure.  Reset the facade
-            # even when that failure propagates so a later initialize() opens
-            # a fresh backend instead of reusing a closed one.
+            # reports a cached SQLAlchemy-factory failure.  Mark the facade
+            # closed, but preserve ``self.db`` as the lifecycle owner: a later
+            # initialize is fenced while that database retains any live worker
+            # and may replace it only after retirement completes.
             self._initialized = False
 
     async def dispose_cached_sqla_factory(self) -> None:
@@ -2418,7 +2436,11 @@ class AsyncStorage:
                     # created_at to now() destroyed history ordering, and
                     # dropping deleted_at resurrected trashed (soft-deleted)
                     # messages. session_id rides inside ``metadata`` and is
-                    # carried verbatim.
+                    # carried verbatim; the indexed column is re-derived from
+                    # it below, so a backup taken before that column existed
+                    # restores with it populated wherever the stored id is
+                    # inside the column's contract, and NULL where it is not
+                    # (#2958).
                     cursor = await backup_conn.execute(
                         "SELECT role, content, metadata"
                         + (", model" if has_model else ", NULL AS model")
@@ -2461,11 +2483,13 @@ class AsyncStorage:
                         await self.db.execute_commit(
                             "INSERT INTO conversation_history "
                             "(agent_id, role, content, model, provider, metadata, "
-                            "created_at, deleted_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            "session_id, created_at, deleted_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, role, content, model, provider,
-                                metadata_json, _ts(created_at), _ts(deleted_at),
+                                metadata_json,
+                                column_session_id(metadata_json),
+                                _ts(created_at), _ts(deleted_at),
                             )
                         )
                         stats["messages_restored"] += 1

@@ -8,9 +8,10 @@ must reject the script instead of falling through to execution.
 import asyncio
 import os
 import tempfile
+import threading
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.compute.feature import ComputeFeature
@@ -68,6 +69,7 @@ async def _make_feature(temp_db, signer):
     feature.policy = ComputePolicy()
 
     executor = MagicMock()
+    executor.is_available = True
     executor.supports_language.return_value = True
     executor.execute = AsyncMock(
         side_effect=AssertionError("script must NOT execute when failing closed")
@@ -77,6 +79,52 @@ async def _make_feature(temp_db, signer):
     feature._initialized = True
     feature._init_lock = asyncio.Lock()
     return feature, store, executor
+
+
+class _TrackedAvailabilityExecutor:
+    """Executor double that proves availability probes leave the event loop."""
+
+    def __init__(self, available, event_loop_thread_id):
+        self.available = available
+        self.event_loop_thread_id = event_loop_thread_id
+        self.calls = 0
+        self.probe_thread_ids = []
+
+    @property
+    def is_available(self):
+        self.calls += 1
+        thread_id = threading.get_ident()
+        self.probe_thread_ids.append(thread_id)
+        assert thread_id != self.event_loop_thread_id
+        return self.available
+
+    def supports_language(self, _language):
+        if not self.available:
+            raise AssertionError(
+                "unavailable executor must not reach language dispatch"
+            )
+        return True
+
+    async def execute(self, *_args, **_kwargs):
+        raise AssertionError("unavailable executor must not execute")
+
+
+class _RaisingAvailabilityExecutor:
+    """Executor double whose synchronous availability contract is broken."""
+
+    def __init__(self):
+        self.calls = 0
+
+    @property
+    def is_available(self):
+        self.calls += 1
+        raise RuntimeError("availability probe exploded")
+
+    def supports_language(self, _language):
+        raise AssertionError("broken executor must not reach language dispatch")
+
+    async def execute(self, *_args, **_kwargs):
+        raise AssertionError("broken executor must not execute")
 
 
 async def _make_signed_script(store, signer):
@@ -133,3 +181,96 @@ async def test_missing_approval_queue_fails_closed(temp_db, signer_with_ecdsa_ke
 
     refreshed = await store.get(script.id)
     assert refreshed.state == ScriptState.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_unavailable_executor_returns_structured_failure(
+    temp_db,
+    signer_with_ecdsa_keys,
+):
+    """Dispatch takes one off-loop snapshot and reports live alternatives."""
+    feature, store, _ = await _make_feature(temp_db, signer_with_ecdsa_keys)
+    event_loop_thread_id = threading.get_ident()
+    executor = _TrackedAvailabilityExecutor(False, event_loop_thread_id)
+    alternative = _TrackedAvailabilityExecutor(True, event_loop_thread_id)
+    feature.executors = {"uv": executor, "docker": alternative}
+    script = await _make_signed_script(store, signer_with_ecdsa_keys)
+
+    result = await feature.run_script(script.id, executor="uv")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "Executor 'uv' not available" in result.error
+    assert result.data == {"executor": "uv", "available": ["docker"]}
+    assert executor.calls == 1
+    assert alternative.calls == 1
+    assert (await store.get(script.id)).state == ScriptState.SIGNED
+
+
+@pytest.mark.asyncio
+async def test_available_executor_does_not_probe_unrequested_alternatives(
+    temp_db,
+    signer_with_ecdsa_keys,
+):
+    """A successful uv gate does not pay for Docker's daemon probe."""
+    feature, store, _ = await _make_feature(temp_db, signer_with_ecdsa_keys)
+    event_loop_thread_id = threading.get_ident()
+    executor = _TrackedAvailabilityExecutor(True, event_loop_thread_id)
+    alternative = _TrackedAvailabilityExecutor(False, event_loop_thread_id)
+    feature.executors = {"uv": executor, "docker": alternative}
+    script = await _make_signed_script(store, signer_with_ecdsa_keys)
+
+    result = await feature.run_script(script.id, executor="uv")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "approval" in result.error.lower()
+    assert executor.calls == 1
+    assert alternative.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_raising_availability_probe_fails_closed_with_structured_result(
+    temp_db,
+    signer_with_ecdsa_keys,
+    caplog,
+):
+    """A broken executor probe is unavailable, not an unhandled tool error."""
+    feature, store, _ = await _make_feature(temp_db, signer_with_ecdsa_keys)
+    executor = _RaisingAvailabilityExecutor()
+    alternative = _TrackedAvailabilityExecutor(True, threading.get_ident())
+    feature.executors = {"uv": executor, "docker": alternative}
+    script = await _make_signed_script(store, signer_with_ecdsa_keys)
+
+    with caplog.at_level("WARNING"):
+        result = await feature.run_script(script.id, executor="uv")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "Executor 'uv' not available" in result.error
+    assert result.data == {"executor": "uv", "available": ["docker"]}
+    assert executor.calls == 1
+    assert alternative.calls == 1
+    assert "availability probe exploded" in caplog.text
+    assert (await store.get(script.id)).state == ScriptState.SIGNED
+
+
+@pytest.mark.asyncio
+async def test_compute_capabilities_shares_off_loop_availability_snapshot(
+    temp_db,
+    signer_with_ecdsa_keys,
+):
+    """Capability reporting uses the same single-probe availability helper."""
+    feature, _, _ = await _make_feature(temp_db, signer_with_ecdsa_keys)
+    event_loop_thread_id = threading.get_ident()
+    uv = _TrackedAvailabilityExecutor(True, event_loop_thread_id)
+    docker = _TrackedAvailabilityExecutor(False, event_loop_thread_id)
+    feature.executors = {"uv": uv, "docker": docker, "local": None}
+
+    result = await feature.get_compute_capabilities()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["executors"] == {
+        "uv": True,
+        "docker": False,
+        "local": False,
+    }
+    assert uv.calls == 1
+    assert docker.calls == 1

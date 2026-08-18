@@ -85,6 +85,10 @@ class _Executor:
     def __init__(self):
         self.calls = 0
 
+    @property
+    def is_available(self):
+        return True
+
     def supports_language(self, language):
         return True
 

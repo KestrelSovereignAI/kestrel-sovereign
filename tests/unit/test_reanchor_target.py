@@ -152,6 +152,40 @@ async def test_explicit_arguments_override_the_environment(agent_dir, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_an_explicitly_empty_dsn_is_an_answer_not_a_gap(
+    agent_dir, monkeypatch,
+):
+    """A blank value in the project ``.env`` puts the agent on SQLite.
+
+    ``kestrel doctor`` and the reanchor CLI both relay the launcher's
+    environment here, and a ``.env`` that blanks ``KESTREL_DATABASE_URL`` while
+    leaving the backend at ``postgres`` describes a host whose agents run on
+    the local file. Treating that empty string as "not supplied" resurrected
+    whatever DSN was still exported in the operator's shell — so doctor would
+    examine SQLite while ``--force`` rewrote an unrelated PostgreSQL.
+    """
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/stale-export")
+
+    target = await resolve_reanchor_target(agent_dir, backend="postgres", dsn="")
+
+    assert target.backend == "sqlite"
+    assert target.dsn is None
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_empty_backend_is_an_answer_too(
+    agent_dir, monkeypatch,
+):
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://h/stale-export")
+
+    target = await resolve_reanchor_target(agent_dir, backend="")
+
+    assert target.backend == "sqlite"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_backend_lands_where_the_runtime_lands(
     agent_dir, monkeypatch, caplog,
 ):

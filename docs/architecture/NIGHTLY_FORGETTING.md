@@ -166,6 +166,20 @@ rides on. The robust KG mechanics from #1715 are preserved verbatim — the pair
 node is deleted before the row, the row is removed only if its node delete
 succeeded (no orphans), and a non-positive cap is a safe no-op.
 
+The shared `MemorySystem.consolidate()` pass has a finite deadline configured by
+`retrieval.memory_consolidation_timeout_seconds` (default: 1,800 seconds).
+Expiry raises `MemoryConsolidationTimeoutError`, so sleep records
+`consolidation_failed` and the manual tool returns an explicit failure; neither
+path reports success. Sleep also skips the remaining hooks and sovereignty
+export after this deadline because their database access would wait behind the
+same cleanup fence. Cancellation releases the coroutine-owned MEMORY lock, but
+does not itself stop a statement already running in the driver worker. The
+SQLite backend retains and interrupts that abandoned operation before rollback;
+a Python UDF or stalled VFS operation may not observe the interrupt until it
+returns control to SQLite and can still be draining as a later pass begins. The
+lock prevents overlapping live coroutines; it is not a database-worker interrupt
+primitive.
+
 ### 2. Episode participation in the decay model
 
 Episodes must carry a decayable signal before they can be deleted by

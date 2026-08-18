@@ -672,6 +672,19 @@ during sleep. It performs three operations.
 > in that PR; consolidation now runs nightly at 04:00 when the
 > `MemoryFeature` is loaded.
 
+Both the nightly sleep cycle and the manual tool route through
+`MemorySystem.consolidate()`, the single bounded maintenance chokepoint. Set
+`retrieval.memory_consolidation_timeout_seconds` to change its positive,
+finite deadline (default: 1,800 seconds). Expiry raises
+`MemoryConsolidationTimeoutError`; the caller must report failure rather than
+claiming a completed pass. The coroutine and its `ResourceLock.MEMORY` context
+unwind in the same task. An aiosqlite statement already running in the driver's
+worker thread is not stopped by coroutine cancellation itself. The SQLite
+backend hands the abandoned operation to a retained `sqlite3_interrupt()` plus
+rollback drain, but a Python UDF or stalled VFS operation may not observe that
+interrupt until it returns control to SQLite and can therefore keep draining
+after the lock context is released.
+
 ### 1. Episode Creation
 
 Related messages are grouped into narrative episodes:

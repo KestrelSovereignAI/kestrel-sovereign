@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
 
 from kestrel_sdk.signals import (
@@ -40,6 +41,8 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -186,11 +189,149 @@ _REDACTION = RedactionPolicy(
 ToolLookup = Callable[[str, dict], Awaitable[Any]]
 
 
+def _require_successful_task_result(
+    task_name: str,
+    result: Any,
+    *,
+    decode_json_envelope: bool = False,
+) -> Any:
+    """Turn a structured task failure into a failed scheduler dispatch.
+
+    Permission blocks remain normal handler results: the scheduler runner needs
+    their structured outcome to pause the schedule and persist operator-facing
+    recovery guidance without making an expected policy decision look like a
+    dispatcher error. ``decode_json_envelope`` is reserved for bespoke built-in
+    handlers, whose documented wire result is a JSON object string. Feature
+    tools may legitimately return arbitrary string artifacts, so their strings
+    must never be interpreted as scheduler control envelopes.
+    """
+    if isinstance(result, ScheduledTaskOutcome):
+        if result.status == "blocked":
+            return result
+        # ``result_text`` is the task_execution_log artifact and may contain a
+        # complete sleep report, third-party hook payloads, or governed
+        # semantic-maintenance maps. Never splice it into an exception: the
+        # dispatcher persists exception text in ``signal_log.error`` and emits
+        # it to ERROR logs without the result-summary redaction/cap boundary.
+        logger.error(
+            "Scheduled task %s returned %s: %s",
+            task_name,
+            result.status,
+            result.result_text,
+        )
+        raise RuntimeError(
+            f"scheduled task {task_name} returned {result.status}"
+        )
+
+    evaluated_result = result
+    if decode_json_envelope and isinstance(result, str):
+        try:
+            decoded_result = json.loads(result)
+        except json.JSONDecodeError:
+            decoded_result = None
+        if isinstance(decoded_result, Mapping):
+            evaluated_result = decoded_result
+
+    failed = (
+        isinstance(evaluated_result, ToolResult)
+        and evaluated_result.status is ToolResultStatus.ERROR
+    )
+    if isinstance(evaluated_result, Mapping):
+        # DynamicTool serializes ToolResult before scheduler lookup returns;
+        # its legacy exception wrapper uses ``success=False``.  Both shapes are
+        # terminal failures, not successful cron artifacts.
+        status = evaluated_result.get("status")
+        non_terminal = (
+            status == "blocked"
+            or evaluated_result.get("blocked") not in (None, False, "")
+            or evaluated_result.get("skipped") not in (None, False, "")
+        )
+        # Watchers use ``blocked`` plus ``error`` for expected retryable states,
+        # and built-ins use ``skipped`` for inapplicable configuration/policy
+        # states.  A bare built-in ``error`` remains terminal, but an explicit
+        # ``success=True`` verdict owns partial-operation diagnostics such as a
+        # successful consolidation followed by an optional export failure.
+        failed = (
+            not non_terminal
+            and (
+                status in (ToolResultStatus.ERROR, ToolResultStatus.ERROR.value)
+                or evaluated_result.get("success") is False
+                or (
+                    decode_json_envelope
+                    and evaluated_result.get("error") not in (None, False, "")
+                    and evaluated_result.get("success") is not True
+                )
+            )
+        )
+    if failed:
+        # ToolResult.error and built-in JSON ``error`` values are untrusted
+        # result bodies: they may contain provider/memory detail or a QueryError
+        # with SQL. The dispatcher persists exception text outside the bounded
+        # result-summary channel, so expose only the task identity and verdict.
+        if isinstance(evaluated_result, ToolResult):
+            detail = evaluated_result.error or evaluated_result.confirmation
+        else:
+            detail = evaluated_result.get("error") or evaluated_result.get(
+                "confirmation"
+            )
+        logger.error(
+            "Scheduled tool %s returned a failed result: %s",
+            task_name,
+            detail or "tool returned an error result",
+        )
+        raise RuntimeError(f"scheduled tool {task_name} failed")
+    return result
+
+
+def _prepare_scheduled_tool_result(task_name: str, result: Any) -> Any:
+    """Validate and serialize one feature-tool result at the source boundary."""
+    checked = _require_successful_task_result(task_name, result)
+    if isinstance(checked, ScheduledTaskOutcome) or isinstance(checked, str):
+        return checked
+
+    # Keep the established task_execution_log JSON contract without forcing
+    # the feature lookup itself to serialize before this boundary can inspect
+    # ToolResult/mapping failures.
+    from kestrel_sovereign.features.base import _serialize_tool_result
+
+    return json.dumps(_serialize_tool_result(checked), default=str)
+
+
+def _wrap_builtin_action_handler(
+    handler: ActionHandler,
+    task_name: str,
+) -> ActionHandler:
+    """Apply the scheduled-result contract to a bespoke ACTION handler."""
+
+    async def checked_handler(payload: dict) -> Any:
+        try:
+            result = await handler(payload)
+        except Exception:
+            # Keep the actionable traceback in the trusted local log while the
+            # dispatcher/audit boundary receives fixed, content-free text.
+            logger.exception("Scheduled built-in task %s raised", task_name)
+            raise RuntimeError(
+                f"scheduled task {task_name} raised"
+            ) from None
+        return _require_successful_task_result(
+            task_name, result, decode_json_envelope=True
+        )
+
+    return checked_handler
+
+
 def _make_action_handler(lookup: ToolLookup, task_name: str) -> ActionHandler:
     """Return an ACTION handler that runs `lookup(task_name, payload)`."""
 
     async def handler(payload: dict) -> Any:
-        return await lookup(task_name, payload)
+        try:
+            result = await lookup(task_name, payload)
+        except Exception:
+            logger.exception("Scheduled tool %s raised", task_name)
+            raise RuntimeError(
+                f"scheduled tool {task_name} raised"
+            ) from None
+        return _prepare_scheduled_tool_result(task_name, result)
 
     return handler
 
@@ -202,7 +343,14 @@ def _make_artifact_handler(
     and returns the tool's output as the artifact."""
 
     async def handler(signal: Signal) -> Any:
-        return await lookup(task_name, signal.payload)
+        try:
+            result = await lookup(task_name, signal.payload)
+        except Exception:
+            logger.exception("Scheduled tool %s raised", task_name)
+            raise RuntimeError(
+                f"scheduled tool {task_name} raised"
+            ) from None
+        return _prepare_scheduled_tool_result(task_name, result)
 
     return handler
 
@@ -221,9 +369,9 @@ def build_cron_registrations(
 
     Args:
         tool_lookup: Async fn `(task_name, args) -> result`. Used by all
-            tasks not in `builtin_handlers`. The existing scheduler's
-            tool-search logic is the production implementation; tests
-            inject a fake.
+            tasks not in `builtin_handlers`. It returns the raw feature-tool
+            result; the source handler owns structured failure validation and
+            legacy JSON serialization for every caller of this builder.
         builtin_handlers: Per-task ACTION handlers that bypass tool
             lookup entirely. Used for `backup_snapshot` (calls
             sync.force_snapshot directly) and `trash_retention` (calls
@@ -239,8 +387,11 @@ def build_cron_registrations(
     for task_name, mode, resources in CRON_TASKS:
         # Pick the handler. Builtins win over tool lookup.
         if mode == SignalMode.ACTION:
-            handler: ActionHandler | None = builtin_handlers.get(
-                task_name, _make_action_handler(tool_lookup, task_name)
+            builtin_handler = builtin_handlers.get(task_name)
+            handler: ActionHandler | None = (
+                _make_action_handler(tool_lookup, task_name)
+                if builtin_handler is None
+                else _wrap_builtin_action_handler(builtin_handler, task_name)
             )
             artifact_handler = None
         else:  # ARTIFACT

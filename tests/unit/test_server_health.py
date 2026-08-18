@@ -1,5 +1,6 @@
 """Focused tests for server health endpoint behavior."""
 
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -212,6 +213,385 @@ def test_health_latches_loaded_scheduler_runner_safety_failure():
         }
     ]
     assert "secret" not in detailed.text
+
+
+def test_health_fails_while_scheduler_supervisor_has_no_worker():
+    """A dead polling task cannot be hidden by otherwise healthy process state."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _running=True,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_health_fails_for_enabled_standalone_scheduler_without_runner():
+    """No-database scheduler mode cannot make an unpolled host look ready."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    agent = SimpleNamespace(
+        features={
+            "SchedulerFeature": SimpleNamespace(
+                enabled=True,
+                _runner=None,
+                _polling_managed_by_host=False,
+            )
+        }
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_detailed_health_fails_for_enabled_scheduler_without_live_worker():
+    """Cached subsystem health cannot mask a missing scheduler worker."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
+        return_value={
+            "status": "healthy",
+            "overall_healthy": True,
+            "checks": [
+                {
+                    "name": "database",
+                    "status": "pass",
+                    "message": "Database healthy",
+                }
+            ],
+        }
+    )
+    health_feature.__class__.__name__ = "HealthFeature"
+    agent = SimpleNamespace(
+        features={
+            "HealthFeature": health_feature,
+            "SchedulerFeature": SimpleNamespace(
+                enabled=True,
+                _runner=None,
+                _polling_managed_by_host=False,
+            ),
+        }
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+                health_feature.get_latest.side_effect = RuntimeError(
+                    "synthetic health failure"
+                )
+                failed_health_response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json()["overall_healthy"] is False
+    assert response.json()["error"] == "Scheduler unavailable"
+    assert response.json()["scheduler_readiness_failures"] == []
+    assert response.json()["checks"] == [
+        {
+            "name": "database",
+            "status": "pass",
+            "message": "Database healthy",
+        }
+    ]
+    assert failed_health_response.status_code == 503
+    assert failed_health_response.json()["error"] == "Scheduler unavailable"
+    assert failed_health_response.json()["checks"] == []
+    assert health_feature.get_latest.await_count == 2
+
+
+def test_host_managed_scheduler_without_scoped_runner_uses_host_worker():
+    """A shared host runner backs features that intentionally omit local pollers."""
+    from kestrel_sovereign.server import _active_scheduler_workers_available
+
+    feature = SimpleNamespace(
+        enabled=True,
+        _runner=None,
+        _polling_managed_by_host=True,
+    )
+    agent = SimpleNamespace(features={"SchedulerFeature": feature})
+    host_runner = SimpleNamespace(worker_available=True)
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(host_scheduler_runner=host_runner)
+    )
+
+    assert _active_scheduler_workers_available(fake_app, agent, None) is True
+
+
+def test_public_health_fails_while_scheduler_tick_is_stalled():
+    """A fresh heartbeat cannot hide a polling tick beyond its hard bound."""
+    from server import app
+    from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SchedulerRunner(None, "agent-1", lambda *_: None)
+    live_task = SimpleNamespace(done=lambda: False)
+    runner._arm_requested = True
+    runner._running = True
+    runner._task = live_task
+    runner._worker_task = live_task
+    runner._tick_started_monotonic = (
+        time.monotonic() - runner._tick_in_progress_limit_seconds - 1
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert runner.tick_stalled is True
+    assert runner.worker_available is False
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_health_fails_when_scheduler_arm_was_requested_but_never_started():
+    """A swallowed on_agent_ready failure remains visible to the LB probe."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _arm_requested=True,
+        _running=False,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+def test_health_fails_when_scheduler_ready_hook_never_armed_runner():
+    """A swallowed ready-hook failure cannot hide behind a private flag."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_failure=None,
+        _arm_requested=False,
+        _running=False,
+        worker_available=False,
+    )
+    agent = SimpleNamespace(
+        features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "feature_name, feature",
+    [
+        (
+            "ThirdPartyFeature",
+            SimpleNamespace(
+                _runner=SimpleNamespace(
+                    worker_available=False,
+                    readiness_failure=RuntimeError("unrelated failure"),
+                ),
+            ),
+        ),
+        (
+            "SchedulerFeature",
+            SimpleNamespace(
+                enabled=False,
+                _runner=SimpleNamespace(
+                    worker_available=False,
+                    readiness_failure=RuntimeError("disabled failure"),
+                ),
+            ),
+        ),
+    ],
+    ids=("unrelated-runner-contract", "disabled-scheduler"),
+)
+def test_health_ignores_non_active_scheduler_runners(feature_name, feature):
+    """Only an enabled SchedulerFeature participates in scheduler readiness."""
+    from kestrel_sovereign.server import (
+        _active_scheduler_workers_available,
+        _latch_active_scheduler_runner_failures,
+    )
+
+    agent = SimpleNamespace(features={feature_name: feature})
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(
+            host_scheduler_runner=None,
+            scheduler_readiness_failures=[],
+        )
+    )
+
+    _latch_active_scheduler_runner_failures(fake_app, agent, None)
+
+    assert _active_scheduler_workers_available(fake_app, agent, None) is True
+    assert fake_app.state.scheduler_readiness_failures == []
+
+
+def test_health_probe_fails_closed_when_agent_features_cannot_be_inspected():
+    """A broken feature accessor returns controlled 503 instead of HTTP 500."""
+    from server import app
+
+    class BrokenFeatureInventory:
+        @property
+        def features(self):
+            raise RuntimeError("synthetic feature inventory failure")
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = BrokenFeatureInventory()
+        app.state.agent_manager = None
+        app.state.scheduler_readiness_failures = []
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.scheduler_readiness_failures = original_scheduler_failures
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
 
 
 def test_load_balancer_probe_reports_minimal_degraded_state():
@@ -862,6 +1242,94 @@ def _make_health_agent(status, checks=None):
     return agent
 
 
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_matches_lock_warning_rollup():
+    """The lock diagnosis has one severity with or without HealthFeature."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": "resource_locks", "status": "warn"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "degraded", "checks": checks}
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_uses_raw_db_behind_privacy_storage(
+    tmp_path,
+):
+    """The no-feature path must not probe the privacy database facade."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.server import _agent_detailed_health
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyEnforcingStorage,
+    )
+
+    raw_storage = AsyncStorage(
+        str(tmp_path / "privacy-health.db"),
+        agent_id="did:key:health-test",
+    )
+    await raw_storage.initialize()
+    try:
+        privacy_storage = PrivacyEnforcingStorage(
+            raw_storage, PrivacyMode.NORMAL
+        )
+        agent = SimpleNamespace(
+            features={},
+            storage=privacy_storage,
+            llm_service=SimpleNamespace(providers=[]),
+        )
+
+        # Deliberately run the real shared suite. ``storage.db.backend`` raises
+        # PrivacyViolationError on this wrapper, so a passing database result
+        # proves the fallback resolved the feature-internal raw database.
+        result = await _agent_detailed_health(agent)
+    finally:
+        await raw_storage.close()
+
+    database = next(
+        check for check in result["checks"] if check["name"] == "database"
+    )
+    assert database["status"] == "pass"
+    assert database["message"] == "Database connection healthy"
+
+
+@pytest.mark.parametrize(
+    "failed_check", ["bootstrap_state", "disk_space", "memory_system"]
+)
+@pytest.mark.asyncio
+async def test_detailed_health_fallback_matches_noncritical_failure_rollup(
+    failed_check,
+):
+    """Installing HealthFeature cannot change a non-critical severity."""
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    checks = [
+        {"name": "database", "status": "pass"},
+        {"name": "llm_service", "status": "pass"},
+        {"name": failed_check, "status": "fail"},
+    ]
+    agent = SimpleNamespace(features={}, storage=None)
+
+    with patch(
+        "kestrel_sovereign.features.health.checks.run_standard_checks",
+        new=AsyncMock(return_value=checks),
+    ):
+        result = await _agent_detailed_health(agent)
+
+    assert result == {"status": "degraded", "checks": checks}
+
+
 def test_detailed_health_reports_fleet_when_no_singleton_agent():
     """Multi-agent hosts (app.state.agent is None) must resolve from the fleet.
 
@@ -975,6 +1443,7 @@ def test_healthy_fleet_with_unavailable_scheduler_identity_fails_readiness():
     assert public.json() == {"status": "unhealthy", "agent_initialized": True}
     assert detailed.status_code == 503
     assert detailed.json()["status"] == "unhealthy"
+    assert detailed.json()["overall_healthy"] is False
     assert detailed.json()["scheduler_readiness_failures"] == [cold_failure]
     assert "identity database" not in detailed.text
 
@@ -1069,14 +1538,25 @@ def test_detailed_health_no_agents_reports_no_agent_available():
     original_lifespan = app.router.lifespan_context
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
+    original_scheduler_failures = getattr(
+        app.state, "scheduler_readiness_failures", None
+    )
 
     try:
         app.router.lifespan_context = noop_lifespan
         app.state.agent = None
         app.state.agent_manager = None
+        app.state.scheduler_readiness_failures = []
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app, client=("203.0.113.10", 55000)) as client:
                 response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+                app.state.scheduler_readiness_failures = [
+                    {"scope": "protocol", "state": "unavailable"}
+                ]
+                scheduler_response = client.get(
                     "/health/detailed",
                     headers={"X-API-Key": "test-key"},
                 )
@@ -1084,12 +1564,16 @@ def test_detailed_health_no_agents_reports_no_agent_available():
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
+        app.state.scheduler_readiness_failures = original_scheduler_failures
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "unhealthy"
     assert body["error"] == "No agent available"
     assert "tracing" in body
+    assert scheduler_response.status_code == 503
+    assert scheduler_response.json()["overall_healthy"] is False
+    assert scheduler_response.json()["error"] == "Scheduler unavailable"
 
 
 def test_oauth_session_can_access_detailed_health():

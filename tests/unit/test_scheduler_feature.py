@@ -19,8 +19,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
@@ -287,6 +288,19 @@ class TestSchedulerTools:
     async def test_tool_description(self, feature):
         desc = feature.tool_description
         assert "scheduled" in desc.lower() or "schedule" in desc.lower()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_unregisters_sources_when_runner_propagates_cancellation(
+        self, feature,
+    ):
+        feature._runner.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        base_shutdown = AsyncMock()
+
+        with patch.object(Feature, "shutdown", base_shutdown):
+            with pytest.raises(asyncio.CancelledError):
+                await feature.shutdown()
+
+        base_shutdown.assert_awaited_once()
 
 
 # =========================================================================
@@ -623,6 +637,82 @@ class TestRetiredCronCleanup:
 
 class TestSleepCronHandler:
     @pytest.mark.asyncio
+    async def test_handle_sleep_runs_maintenance_when_core_work_is_disabled(self):
+        class _Report:
+            def to_dict(self):
+                return {"success": False, "error": None}
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        f = SchedulerFeature(agent)
+
+        out = await f._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": False,
+        })
+
+        assert json.loads(out) == {
+            "success": False,
+            "error": None,
+            "skipped": True,
+            "reason": "consolidation and export were both skipped",
+            "skip_reflection": False,
+        }
+        agent.sleep.assert_awaited_once_with(
+            skip_export=True,
+            skip_consolidation=True,
+            skip_reflection=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_fails_incomplete_maintenance_only_cycle(self):
+        class _Report:
+            def to_dict(self):
+                return {
+                    "success": False,
+                    "error": None,
+                    "semantic_maintenance": {"status": "partial"},
+                }
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        feature = SchedulerFeature(agent)
+
+        outcome = await feature._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": True,
+        })
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert json.loads(outcome.result_text)["semantic_maintenance"] == {
+            "status": "partial"
+        }
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_logs_raised_cycle_locally_with_traceback(
+        self, caplog
+    ):
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(side_effect=RuntimeError("sleep exploded"))
+        feature = SchedulerFeature(agent)
+        feature._agent_id = "did:test:sleep-diagnostics"
+
+        with caplog.at_level(logging.ERROR):
+            outcome = await feature._handle_sleep({"skip_reflection": True})
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
+        record = next(
+            record
+            for record in caplog.records
+            if record.message
+            == "[sleep] agent=did:test:sleep-diagnostics cycle failed"
+        )
+        assert record.exc_info is not None
+        assert "sleep exploded" in str(record.exc_info[1])
+
+    @pytest.mark.asyncio
     async def test_handle_sleep_calls_agent_sleep_skip_export(self):
         """The sleep cron handler runs the agent's sleep cycle with
         skip_export=True (backups own DR) and surfaces the report."""
@@ -660,6 +750,7 @@ class TestSleepCronHandler:
         agent.did = agent.agent_id
         agent.features = {}
         agent.storage = MagicMock()
+        agent.storage.sweep_expired_governed_semantic_artifacts = None
         agent.storage.db = _make_mock_db()
         agent.sleep_hooks = []
         agent._consolidate_memories = AsyncMock(
@@ -669,11 +760,33 @@ class TestSleepCronHandler:
         with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
             await f.initialize()
 
-        payload = json.loads(await f._handle_sleep({"skip_reflection": True}))
+        outcome = await f._handle_sleep({"skip_reflection": True})
 
         agent._consolidate_memories.assert_awaited_once()
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert outcome.pause_schedule is False
+        payload = json.loads(outcome.result_text)
         assert payload["success"] is False
         assert payload["error"] == "consolidation_failed"
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_exception_is_failed_without_pausing_schedule(self):
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(side_effect=RuntimeError("sleep exploded"))
+        agent.storage = MagicMock()
+        agent.storage.db = MagicMock()
+        agent.storage.db.fetchval = AsyncMock(return_value=None)
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        outcome = await f._handle_sleep({"skip_reflection": True})
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert outcome.pause_schedule is False
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
 
     @pytest.mark.asyncio
     async def test_handle_sleep_reflects_when_active(self):
@@ -1342,15 +1455,57 @@ class TestSchedulerRunner:
         """
         db = _make_mock_db()
         db.backend_type = "postgres"
+        base_fetchone = db.fetchone.side_effect
+
+        async def _fetchone(sql, *args):
+            if "FROM pg_constraint con" in sql:
+                return ("scheduler_runtime_status_pkey",)
+            return await base_fetchone(sql, *args)
+
+        async def _fetchall(sql, *args):
+            if "JOIN pg_attribute attribute" in sql:
+                return [("agent_id",), ("owner_id",)]
+            return []
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
                 assert "ADD COLUMN IF NOT EXISTS" in sql
 
+        db.fetchone = AsyncMock(side_effect=_fetchone)
+        db.fetchall = AsyncMock(side_effect=_fetchall)
         db.execute = AsyncMock(side_effect=_exec)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._ensure_tables()
+        assert not any(
+            "LOCK TABLE scheduler_runtime_status" in call.args[0]
+            for call in db.execute.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_arm_rejects_unprepared_protocol_before_database_clock(self):
+        db = _make_mock_db()
+        db.fetchval = AsyncMock(
+            side_effect=AssertionError("database clock must not be queried")
+        )
+        runner = SchedulerRunner(db, "test-agent", AsyncMock(return_value="ok"))
+
+        with pytest.raises(RuntimeError, match="protocol preparation"):
+            await runner.arm()
+
+        db.fetchval.assert_not_awaited()
+        assert runner._arm_requested is False
+
+    def test_database_connectivity_probe_tolerates_protected_backend_wrapper(self):
+        class ProtectedDatabase:
+            @property
+            def backend(self):
+                raise RuntimeError("backend access denied")
+
+        runner = SchedulerRunner(
+            ProtectedDatabase(), "test-agent", AsyncMock(return_value="ok")
+        )
+        assert runner._database_is_connected() is True
 
     @pytest.mark.asyncio
     async def test_ensure_tables_skips_existing_sqlite_columns_before_alter(self):
@@ -1543,6 +1698,15 @@ class TestSchedulerRunner:
             if "UPDATE task_execution_log" in c[0][0]
         )
         assert outcome_call[0][1][0] == "failed"
+
+    def test_failed_outcome_cannot_silently_request_pause(self):
+        """Failed dispatcher results have no structured pause channel."""
+        with pytest.raises(ValueError, match="only valid for blocked"):
+            ScheduledTaskOutcome(
+                status="failed",
+                result_text="failed",
+                pause_schedule=True,
+            )
 
     @pytest.mark.asyncio
     async def test_tick_records_blocked_reason_and_pauses_schedule(self):
@@ -2054,6 +2218,50 @@ class TestTaskExecutor:
         feature.agent.features = {}
         with pytest.raises(ValueError, match="Unknown task"):
             await feature._lookup_and_run_tool("nonexistent_task", {})
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_result_raises_before_scheduler_serialization(
+        self, feature,
+    ):
+        """The production lookup cannot JSON-encode failure into success."""
+        failed_tool = MagicMock()
+        failed_tool.name = "memory_consolidate"
+        failed_tool.execute = AsyncMock(
+            return_value={
+                **ToolResult.failed(
+                    "consolidation deadline expired"
+                ).to_dict(),
+                "tool": "memory_consolidate",
+            }
+        )
+        memory_feature = MagicMock()
+        memory_feature.get_tools = MagicMock(return_value=[failed_tool])
+        feature.agent.features = {"MemoryFeature": memory_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        with pytest.raises(
+            RuntimeError, match="scheduled tool memory_consolidate failed"
+        ):
+            await feature._lookup_and_run_tool("memory_consolidate", {})
+
+    @pytest.mark.asyncio
+    async def test_legacy_tool_exception_envelope_also_raises(self, feature):
+        failed_tool = MagicMock()
+        failed_tool.name = "job"
+        failed_tool.execute = AsyncMock(
+            return_value={
+                "success": False,
+                "error": "job exploded",
+                "tool": "job",
+            }
+        )
+        job_feature = MagicMock()
+        job_feature.get_tools = MagicMock(return_value=[failed_tool])
+        feature.agent.features = {"JobFeature": job_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        with pytest.raises(RuntimeError, match="scheduled tool job failed"):
+            await feature._lookup_and_run_tool("job", {})
 
     @pytest.mark.asyncio
     async def test_builtin_cron_task_skipped_when_feature_not_loaded(

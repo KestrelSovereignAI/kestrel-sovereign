@@ -18,7 +18,11 @@ from datetime import datetime, timezone
 import pytest
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.turn_lifecycle import (
+    TurnLifecycleMixin,
+    bind_turn_session,
+    capture_turn_session_binding,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 
 
@@ -29,6 +33,15 @@ class _StubAgent(TurnLifecycleMixin):
 
     def __init__(self) -> None:
         self._lock_manager = OrderedLockManager()
+
+
+class _PrivateAccessorOnlyAgent(_StubAgent):
+    """Agent shape supported during the public-accessor migration window."""
+
+    get_turn_bound_session_id = None
+
+    def _get_turn_bound_session_id(self):
+        return self._active_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +384,74 @@ async def test_detached_task_does_not_inherit_a_later_turns_session():
 
 
 @pytest.mark.asyncio
+async def test_stale_explicit_binding_vetoes_ambient_turn_authority():
+    """A callback carrying turn A's binding cannot borrow later turn B."""
+    agent = _StubAgent()
+    callback_ready = asyncio.Event()
+    read_now = asyncio.Event()
+
+    async def callback():
+        callback_ready.set()
+        await read_now.wait()
+        captured = capture_turn_session_binding(agent)
+        return agent.get_turn_bound_session_id(), captured.session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        binding = capture_turn_session_binding(agent)
+        with bind_turn_session(binding):
+            # The callback copies turn A's explicit binding but never enters a
+            # turn of its own. It must retain that authority boundary while an
+            # unrelated turn B is live.
+            task = asyncio.create_task(callback())
+            await callback_ready.wait()
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-B"
+        read_now.set()
+        assert await task == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_inherited_binding_is_cleared_when_descendant_owns_new_turn():
+    """A signal task spawned under turn A owns its later wake turn B."""
+    agent = _StubAgent()
+
+    async def woken_turn():
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "wake-session-B"
+            captured = capture_turn_session_binding(agent)
+            return agent.get_turn_bound_session_id(), captured.session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        binding = capture_turn_session_binding(agent)
+        with bind_turn_session(binding):
+            # SignalDispatcher creates its background dispatch task while the
+            # inline tool's binding is active. The task waits for turn A's
+            # conversation lock, then enters and owns wake turn B.
+            task = asyncio.create_task(woken_turn())
+
+    assert await task == ("wake-session-B", "wake-session-B")
+
+
+@pytest.mark.asyncio
+async def test_explicit_unbound_binding_vetoes_matching_ambient_turn():
+    """An off-turn callback stays unbound even on its matching copied turn."""
+    agent = _StubAgent()
+    binding = capture_turn_session_binding(agent)
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "unrelated-chat"
+        with bind_turn_session(binding):
+            nested = capture_turn_session_binding(agent)
+            assert agent.get_turn_bound_session_id() is None
+
+    assert nested.turn_id is None
+    assert nested.session_id is None
+
+
+@pytest.mark.asyncio
 async def test_session_less_and_blank_sessions_resolve_to_none():
     agent = _StubAgent()
     async with agent._turn_lifecycle():
@@ -390,6 +471,19 @@ async def test_private_turn_session_accessor_is_a_compatibility_alias():
                 agent._get_turn_bound_session_id()
                 == agent.get_turn_bound_session_id()
             )
+
+
+@pytest.mark.asyncio
+async def test_capture_supports_private_turn_session_accessor_compatibility():
+    """Cross-task capture matches the direct feature-read compatibility path."""
+    agent = _PrivateAccessorOnlyAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "  chat-compat  "
+        binding = capture_turn_session_binding(agent)
+
+    assert binding.agent is agent
+    assert binding.turn_id is not None
+    assert binding.session_id == "chat-compat"
 
 
 @pytest.mark.asyncio

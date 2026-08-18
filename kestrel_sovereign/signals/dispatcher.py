@@ -3766,7 +3766,10 @@ class SignalDispatcher:
                 registration=registration,
             )
 
-        async with self._locks.acquire(registration.resources):
+        async with self._locks.acquire(
+            registration.resources,
+            label=f"{signal.source} {signal.kind}",
+        ):
             try:
                 if signal.mode == SignalMode.ACTION:
                     assert registration.handler is not None
@@ -4821,6 +4824,11 @@ class SignalDispatcher:
         that is the point of surfacing it.
         """
         return self._log_write_failures
+
+    @property
+    def lock_manager(self) -> OrderedLockManager:
+        """The shared resource-lock manager, for ownership and health checks."""
+        return self._locks
 
     @property
     def last_log_write_failure(self) -> Optional["SignalLogWriteFailure"]:

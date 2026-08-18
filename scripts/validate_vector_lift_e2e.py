@@ -12,10 +12,12 @@ gap this fills: nothing in CI has actually run the PG-specific paths
 (BYTEA → vector(N) backfill, ``CREATE EXTENSION``, HNSW index, ``<=>``
 operator, asyncpg vector return shape) against a real Postgres.
 
-Runs against the local ``pgvector/pgvector:pg15`` container on :5433
-(``frinz-postgres``). Creates a dedicated ``vector_lift_validation``
-database so it never touches the live ``frinz`` or ``kestrel``
-databases. Drops it at the end whether the run succeeds or fails.
+Runs against a local ``pgvector/pgvector:pg16`` container — 16 is the
+repository floor, because the migrations this exercises use
+``pg_input_is_valid()``. ``_create_test_db`` refuses anything older with
+that reason rather than letting schema init fail confusingly. Creates a
+dedicated ``vector_lift_validation`` database so it never touches a live
+one, and drops it at the end whether the run succeeds or fails.
 
 Uses Ollama's ``nomic-embed-text`` (768-dim) for real embeddings —
 verified to be running locally at ``localhost:11434`` before this was
@@ -179,13 +181,35 @@ async def _drop_test_db() -> None:
         await conn.close()
 
 
+#: The repository's PostgreSQL floor. `conversation_history.session_id`'s
+#: backfill guards its cast with ``pg_input_is_valid(x,'jsonb')``, which is
+#: 16+, so a server below this cannot run the migrations this script exists to
+#: exercise. Kept in step with .github/workflows/ci.yml and the devcontainer.
+MINIMUM_PG_MAJOR = 16
+
+
 async def _create_test_db() -> None:
-    """Same identifier-quoting rules as :func:`_drop_test_db`."""
+    """Same identifier-quoting rules as :func:`_drop_test_db`.
+
+    Checks the server major first. Below the floor the migrations fail partway
+    through schema initialization with an error about a missing function, which
+    reads as a bug in the vector-lift chain this script is validating rather
+    than as "your server is too old" — so refuse up front and say which it is.
+    """
     conn = await asyncpg.connect(
         host=PG_HOST, port=PG_PORT, user=PG_USER,
         password=PG_PASSWORD, database=PG_ADMIN_DB,
     )
     try:
+        major = int((await conn.fetchval("SHOW server_version_num")) or 0) // 10000
+        if major < MINIMUM_PG_MAJOR:
+            raise SystemExit(
+                f"refusing to run against PostgreSQL {major}: this repository's "
+                f"floor is {MINIMUM_PG_MAJOR}. The migrations exercised here use "
+                "pg_input_is_valid(), which is 16+, so a lower server fails "
+                "during schema init and looks like a vector-lift defect. Point "
+                "--host/--port at a pgvector/pgvector:pg16 (or newer) container."
+            )
         await conn.execute(f'CREATE DATABASE "{TEST_DB}"')
     finally:
         await conn.close()
