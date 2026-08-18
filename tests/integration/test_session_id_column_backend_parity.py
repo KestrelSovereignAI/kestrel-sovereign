@@ -1694,6 +1694,7 @@ async def test_each_row_event_moves_the_change_stamp_by_exactly_one(db_backend):
 #: Measured — the first spelling of this file did exactly that, and four
 #: mutations of the watched list survived it.
 _WATCHED_COLUMNS = (
+    "id",
     "agent_id",
     "session_id",
     "role",
@@ -1756,6 +1757,11 @@ async def test_writing_any_watched_column_alone_moves_the_change_stamp(
         # A value genuinely different from the one the row holds, so the
         # trigger's IS DISTINCT FROM / IS NOT test really fires.
         replacement = {
+            # A primary key IS writable on both engines — measured, against the
+            # comment that once said otherwise — and the projection stores ids
+            # (`first_user_message_id`), so a rewrite it cannot see leaves a
+            # stored pointer to a row that no longer carries that id.
+            "id": 9_000_001,
             "agent_id": f"did:test:somewhere-else:{uuid4()}",
             "session_id": "3a6c1f0e-2b7d-4c8a-9e10-00000000000f",
             "role": "assistant",

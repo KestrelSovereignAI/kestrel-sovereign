@@ -158,10 +158,13 @@ async def test_a_purged_pre_entry_ledger_does_not_report_a_leak(tmp_path):
     have to be captured at entry, and both entry paths are synchronous, so
     there is no read to capture it with.
 
-    What it CAN do is not certify content it does not hold. The ledger is a
-    monotonic cache-invalidation token; removing it destroys no record and the
-    projection re-derives. So the sweep is reported and is not required, and a
-    clean stint is never audited as a leak on account of it.
+    What it CAN do is not certify content it does not hold — and none of the
+    projection's tables hold any. The ledger is a cache-invalidation token, the
+    watermark is a pair of ids, and `first_user_message_id` is a pointer and
+    never text (the epic's rule). Erasing all three destroys no record: the
+    projection re-derives from `conversation_history`, which is the only source
+    of truth. So the sweep is reported and is not required, and a clean stint is
+    never audited as a leak on account of it.
     """
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:

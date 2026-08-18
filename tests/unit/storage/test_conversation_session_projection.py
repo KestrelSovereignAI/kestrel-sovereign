@@ -2384,3 +2384,101 @@ async def test_the_list_orders_ties_deterministically(tmp_path):
             f"got {ids}. The list must break ties on id so the same history "
             "always groups the same way."
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_rewriting_a_message_id_is_detected(seeded):
+    """A primary key is not immutable, on either engine.
+
+    The watched-column list once omitted ``id`` on the grounds that a primary
+    key "cannot be updated in place". It can: ``UPDATE ... SET id = ?`` was
+    measured to succeed against both SQLite and PostgreSQL. The projection
+    leans on ``id`` for the canonical tie-break, the chunk frontier, and
+    ``first_user_message_id`` — which it *stores* — so an unwatched rewrite
+    leaves a stored pointer to a row that no longer carries that id while the
+    watermark still claims to be current.
+
+    Nothing in this codebase rewrites an id. Maintenance and import SQL is the
+    traffic this exists for, and it is precisely the traffic that never goes
+    through a write path that could have remembered to invalidate.
+    """
+    db, _store, projection = seeded
+    assert not await projection.is_stale(), "the fixture must start current"
+
+    moved = int(await db.fetchval(
+        "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?", (AGENT,)
+    ))
+    await db.execute(
+        "UPDATE conversation_history SET id = ? WHERE id = ?",
+        (moved + 1000, moved),
+    )
+
+    assert await projection.is_stale(), (
+        "a message id was rewritten under the projection and it still reports "
+        "itself current"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_tied_sessions_order_the_same_way_in_both_paths(tmp_path):
+    """A page of sessions must not depend on which path produced it.
+
+    Both used to sort on ``last_message_at`` alone. The list did it in Python,
+    where a stable sort left ties in grouping order; the projection did it in
+    SQL, where ties came back by ``session_id``. Ties are ordinary — SQLite
+    stores history to the second — so with a limit applied the two paths could
+    put a different session on the page, and swapping one for the other in
+    Phase C would have silently reordered the sidebar.
+
+    Here the later-appearing session sorts FIRST lexically, so grouping order
+    and the canonical order genuinely differ and an agreeing answer cannot be
+    an accident of the corpus.
+    """
+    from kestrel_sovereign.storage.session_grouping import (
+        coalesce_sessions_by_session_id,
+        group_messages_into_sessions,
+        sort_sessions,
+    )
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "ties.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {"content": "B first in the transcript", "role": "user",
+                 "created_at": _at(0), "metadata": {"session_id": UUID_B}},
+                {"content": "A second", "role": "user",
+                 "created_at": _at(0), "metadata": {"session_id": UUID_A}},
+            ],
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        grouped = sort_sessions(coalesce_sessions_by_session_id(
+            group_messages_into_sessions(await _live_history(db),
+                                         keep_empty_markers=True)
+        ))
+        reader = [str(session["session_id"]) for session in grouped]
+        projected = [row["session_id"] for row in await projection.list()]
+
+        assert len({s["last_message_at"] for s in grouped}) == 1, (
+            "the sessions stopped tying, so nothing about ties is under test"
+        )
+        # Asserted against the RULE, not against each other. Comparing the two
+        # paths alone is satisfied by them being wrong together: drop the
+        # tie-break and the reader falls back to grouping order while SQLite
+        # returns the projection rows in insertion order — which is the same
+        # grouping order, so they still agree and the mutant lives. The
+        # canonical answer is named instead.
+        canonical = [UUID_A, UUID_B]
+        assert reader == canonical, (
+            f"the list ordered tied sessions {reader}; ties must fall back to "
+            "session_id, not to whatever order grouping emitted"
+        )
+        assert projected == canonical, (
+            f"the projection ordered tied sessions {projected}"
+        )
+    finally:
+        await db.close()

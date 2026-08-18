@@ -410,3 +410,51 @@ def test_coalesce_leaves_distinct_sessions_untouched():
     ]
     coalesced = coalesce_sessions_by_session_id(group_messages_into_sessions(msgs))
     assert [s["session_id"] for s in coalesced] == ["s1", "s2"]
+
+
+def test_an_undatable_row_is_dated_from_the_transcript_not_the_clock():
+    """Grouping must be a function of the rows, not of when it was asked.
+
+    ``now`` used to default to the wall clock, so a row with an unparseable
+    ``created_at`` was dated to the moment of the call. Two consequences, both
+    real: the same transcript grouped one way now and another way an hour
+    later, as the bad row slid forward and kept rejoining whichever session was
+    newest; and the #2959 projection could not cache the result, because a
+    cache has to be reproducible from what it caches.
+
+    The transcript here is historical, so a wall-clock default would date the
+    bad row to today — months past every real stamp — and the gap rule would
+    give it a session of its own. Pinning the newest stamp present keeps it
+    with the run it was found in.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": "not-a-date"},
+        _msg(3, "user", "still here", minutes=5, session_id="s1"),
+    ]
+
+    sessions = group_messages_into_sessions(msgs)
+
+    assert len(sessions) == 1, (
+        "the undatable row was dated far from the transcript and split off "
+        f"into its own session: {[s['started_at'] for s in sessions]}"
+    )
+    assert sessions[0]["last_message_at"] == (BASE + timedelta(minutes=5)).isoformat()
+    assert sessions[0]["message_count"] == 3
+
+
+def test_grouping_an_undatable_row_is_repeatable():
+    """The same transcript, grouped twice, must give the same answer.
+
+    The wall-clock default made this false by construction — only by a few
+    microseconds between two immediate calls, which is why asserting equality
+    of two results catches it only when the value is compared exactly.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": None},
+    ]
+
+    assert group_messages_into_sessions(msgs) == group_messages_into_sessions(msgs)

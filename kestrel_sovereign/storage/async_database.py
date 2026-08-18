@@ -1960,6 +1960,17 @@ class AsyncDatabase:
                 for trigger, ddl in outstanding:
                     await self._backend.execute(ddl)
                     logger.info("created trigger %s (#2959)", trigger)
+                # NOTE (#2998): existence is probed by NAME, so a database that
+                # already carries these triggers keeps the body it was created
+                # with. Changing PROJECTION_INPUT_COLUMNS therefore reaches new
+                # databases only, and an old one goes on watching the old list
+                # while the constant claims otherwise — silently, which is the
+                # one failure mode this projection is built to rule out. It is
+                # not live yet: none of this exists on main, so every database
+                # creates these triggers for the first time from the current
+                # list. It becomes live the moment that list changes after
+                # release, and it has already changed once (round 7 added
+                # ``id``), so it will change again.
 
         # Outside the lock deliberately: the statements have committed, so this
         # reads what the next boot would read, and a raise here is this

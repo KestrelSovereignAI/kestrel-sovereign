@@ -16,7 +16,7 @@ plain dicts, and hands them here.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
@@ -130,6 +130,12 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
     return f"{left} {operator} {right}"
 
 
+#: Substituted for a stamp when a transcript carries no readable one at all.
+#: Any instant would do; what matters is that it is the SAME instant every time,
+#: so two groupings of one transcript agree.
+_GROUPING_EPOCH = datetime(1970, 1, 1)
+
+
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
     gap_minutes: float = SESSION_GAP_MINUTES,
@@ -149,8 +155,15 @@ def group_messages_into_sessions(
               canonical ``session_id``.
             - ``created_at``: datetime or ISO/SQL string.
         gap_minutes: minutes of inactivity that start a new session.
-        now: clock used when a row has an unparseable/missing timestamp;
-            defaults to ``datetime.now()`` (injectable for tests).
+        now: the stamp substituted for a row whose ``created_at`` is missing or
+            unparseable. Defaults to the LATEST stamp the transcript itself
+            carries (or the epoch, if it carries none) — deliberately not the
+            wall clock. A wall clock made grouping a function of *when it was
+            asked*: the same transcript grouped one way now and another way an
+            hour later, because a bad row kept sliding forward and rejoining
+            whichever session was newest. It also made the #2959 projection
+            unable to cache this result, since the projection has to be
+            reproducible from the rows alone. Still injectable for tests.
         keep_empty_markers: when ``True``, a session established solely by a
             ``new_session`` marker row (no real messages yet) is still returned,
             with ``message_count == 0`` (#2222). A freshly-created conversation
@@ -176,6 +189,25 @@ def group_messages_into_sessions(
             and — only when ``collect_messages`` — ``messages``.
         Callers reverse / slice / decorate as needed.
     """
+    # Materialized because the deterministic ``now`` below is a function of the
+    # whole transcript, and because a caller passing a generator would otherwise
+    # have it consumed by that pass.
+    messages = list(messages)
+    if now is None:
+        stamps = [
+            stamp
+            for stamp in (
+                coerce_session_timestamp(message.get("created_at"))
+                for message in messages
+            )
+            if stamp is not None
+        ]
+        # The newest real stamp keeps an undatable row with the run it was
+        # found in, which is where it sits in the transcript; the epoch is for
+        # a transcript with no readable stamp at all, where any choice is
+        # arbitrary and only determinism matters.
+        now = max(stamps) if stamps else _GROUPING_EPOCH
+
     sessions: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
     # Whether ``current`` was established by a ``new_session`` marker row and has
@@ -213,10 +245,13 @@ def group_messages_into_sessions(
         if not isinstance(meta, dict):
             meta = {}
 
+        # No wall-clock arm: ``now`` is resolved above and always readable, so
+        # a third fallback here could only reintroduce the nondeterminism the
+        # second one exists to remove.
         timestamp = (
             coerce_session_timestamp(msg.get("created_at"))
             or coerce_session_timestamp(now)
-            or datetime.now(timezone.utc).replace(tzinfo=None)
+            or _GROUPING_EPOCH
         )
 
         is_new_session_marker = bool(meta.get("new_session"))
@@ -353,6 +388,47 @@ def coalesce_sessions_by_session_id(
     return [merged[sid] for sid in order]
 
 
+#: How a page of sessions is ordered, once. Newest activity first; ``session_id``
+#: breaks ties.
+#:
+#: The tie-break is the point. Every caller used to sort on ``last_message_at``
+#: alone and rely on Python's sort being *stable*, which silently made the
+#: answer "whatever order grouping happened to emit". Ties are ordinary here —
+#: SQLite stores history to the second, and a wake and the turn it triggers are
+#: written in one transaction — so with a limit applied, which session appeared
+#: on the page was decided by an implementation detail of the sort. Worse, that
+#: rule cannot be expressed in SQL, so the #2959 projection could not reproduce
+#: it and would have reordered tied sessions the day it replaced this path
+#: (round-7 review).
+#:
+#: ``(column, descending)`` so the SQL clause and the Python sort are generated
+#: from one declaration rather than written twice in two languages.
+SESSION_ORDER: Tuple[Tuple[str, bool], ...] = (
+    ("last_message_at", True),
+    ("session_id", False),
+)
+
+
+def session_order_sql() -> str:
+    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause."""
+    return "ORDER BY " + ", ".join(
+        f"{column} {'DESC' if descending else 'ASC'}"
+        for column, descending in SESSION_ORDER
+    )
+
+
+def sort_sessions(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Order session dicts by :data:`SESSION_ORDER`, in place.
+
+    Least significant key first, leaning on the sort being stable — which is
+    the standard way to compose a multi-key ordering whose directions differ,
+    and is safe precisely because no key is left implicit.
+    """
+    for column, descending in reversed(SESSION_ORDER):
+        sessions.sort(key=lambda session: session[column], reverse=descending)
+    return sessions
+
+
 def summarize_sessions(
     messages: Iterable[Dict[str, Any]],
     names: Optional[Dict[str, str]] = None,
@@ -383,7 +459,7 @@ def summarize_sessions(
     # Newest-first by last activity. Sorting on last_message_at (not list
     # position) so a conversation resumed past the gap ranks by its latest
     # message, never buried under older threads or dropped by ``limit`` (#2019).
-    grouped.sort(key=lambda s: s["last_message_at"], reverse=True)
+    sort_sessions(grouped)
     sessions = grouped[:limit]
     for session in sessions:
         preview = session.pop("preview_content", None) or ""

@@ -322,6 +322,7 @@ from .session_grouping import (
     coalesce_sessions_by_session_id,
     coerce_session_timestamp,
     group_messages_into_sessions,
+    session_order_sql,
     timestamp_query_param,
 )
 from .session_id_column import SESSION_ID_KEY, is_stampable_session_id
@@ -387,9 +388,20 @@ REPAIR_LOCK_WAIT_MS = 30_000
 #: triggers, because two lists is how a projection starts lying: add a column
 #: here that the trigger does not watch and a rewrite of it is invisible; watch
 #: one the derivation never reads and every write of it forces a needless
-#: rebuild. ``id`` is absent because it is the primary key on both engines and
-#: cannot be updated in place.
+#: rebuild.
+#:
+#: ``id`` is watched. An earlier revision left it out on the grounds that a
+#: primary key "cannot be updated in place" — which is simply false on both
+#: engines, as ``UPDATE ... SET id = ?`` was measured to succeed against SQLite
+#: and PostgreSQL alike. The projection leans on ``id`` in three places (the
+#: canonical tie-break, the chunk frontier, and ``first_user_message_id``, which
+#: is stored), so a rewrite that moved one would leave the ledger untouched and
+#: ``is_stale()`` answering false over a pointer to a row that no longer carries
+#: that id. It costs nothing in practice: nothing in this codebase rewrites an
+#: id, so the added comparison fires for maintenance and import SQL only —
+#: which is exactly the traffic that would otherwise go unseen.
 PROJECTION_INPUT_COLUMNS: Tuple[str, ...] = (
+    "id",
     "agent_id",
     "session_id",
     "role",
@@ -642,16 +654,6 @@ CREATE TABLE IF NOT EXISTS conversation_history_changes (
     changes  BIGINT NOT NULL DEFAULT 0
 )
 """
-
-#: The deterministic stand-in when a transcript holds no parseable timestamp at
-#: all. ``group_messages_into_sessions`` dates an unusable ``created_at`` from
-#: ``now`` — and left to default that is the WALL CLOCK, so re-deriving the same
-#: unchanged rows would persist a different answer every time while the change
-#: stamp never moved. Pinning the newest stamp present covers the ordinary case;
-#: this covers the one where there is no stamp to pin. The value is arbitrary
-#: and its arbitrariness is the point: it is a constant, so the derivation stays
-#: a function of the rows.
-_EPOCH = datetime(1970, 1, 1)
 
 #: The upsert both dialects' triggers perform, parameterized only by which
 #: row's ``agent_id`` is being stamped. Written once so the three SQLite
@@ -1058,20 +1060,18 @@ def project_transcript(
     # The newest stamp present is deterministic, derived only from the rows in
     # hand, and orders such a row last — which is where a row with no time of
     # its own belongs in a sequence read in id order.
-    stamps = [
-        stamp
-        for stamp in (
-            coerce_session_timestamp(message.get("created_at"))
-            for message in messages
-        )
-        if stamp is not None
-    ]
+    # ``now`` is deliberately NOT passed. The deterministic substitute for an
+    # undatable row is the grouper's own rule now, so the read path and this
+    # projection cannot disagree about a legacy row with a malformed
+    # ``created_at`` — which they did while this computed the fallback itself
+    # and `/api/conversations` let the grouper reach for the wall clock (round-7
+    # review). A projection that has to be reproducible from the rows cannot own
+    # half of a rule the reader owns the other half of.
     grouped = coalesce_sessions_by_session_id(
         group_messages_into_sessions(
             messages,
             keep_empty_markers=True,
             collect_messages=True,
-            now=max(stamps) if stamps else _EPOCH,
         )
     )
     if (
@@ -1353,7 +1353,7 @@ class ConversationSessionProjection:
         rows = await self.db.fetchall(
             f"SELECT session_id, {', '.join(PROJECTION_COLUMNS)} "
             "FROM conversation_sessions WHERE agent_id = ? "
-            "ORDER BY last_message_at DESC, session_id ASC",
+            f"{session_order_sql()}",
             (self.agent_id,),
         )
         return [_as_dict(row) for row in rows]
