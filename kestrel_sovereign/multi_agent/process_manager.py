@@ -15,6 +15,7 @@ Remote agents (url-only in config) are ignored — they're not managed by
 this host.
 """
 
+import errno
 import json
 import logging
 import os
@@ -148,10 +149,27 @@ class ProcessManager:
             with socket.socket(family, socktype, proto) as s:
                 if sys.platform != "win32":
                     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    # asyncio sets this before uvicorn binds. Linux defaults an
+                    # AF_INET6 socket to dual-stack, so without it a probe of
+                    # ``::`` collides with any unrelated IPv4 listener on the
+                    # same number and reports a free IPv6 address as occupied.
+                    try:
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except OSError:
+                        pass
                 try:
                     s.bind(sockaddr)
-                except OSError:
-                    return True
+                except OSError as exc:
+                    if exc.errno == errno.EADDRINUSE:
+                        return True
+                    # Anything else is not occupancy. asyncio's create_server
+                    # skips candidates it cannot use (EADDRNOTAVAIL for a
+                    # family the host lacks) and binds the rest, so treating
+                    # them as "taken" would reject a start uvicorn would have
+                    # completed. A genuine misconfiguration still surfaces at
+                    # bind time, where it names the address.
+                    continue
         return False
 
     @staticmethod

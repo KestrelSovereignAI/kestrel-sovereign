@@ -753,6 +753,70 @@ class TestCmdStopReportsOnlyVerifiedStops:
         spare.close()
         assert ProcessManager.is_port_in_use(free_port, "::1") is False
 
+    def test_an_ipv4_listener_does_not_make_the_ipv6_wildcard_look_taken(self):
+        """asyncio sets IPV6_V6ONLY before uvicorn binds, so the probe must too.
+
+        Linux defaults an AF_INET6 socket to dual-stack. Without the option a
+        probe of ``::`` collides with any unrelated IPv4 listener on the same
+        number, and restart/update abort over an IPv6 address uvicorn could
+        have bound immediately.
+        """
+        import socket as _socket
+
+        four = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        four.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        four.bind(("0.0.0.0", 0))
+        port = four.getsockname()[1]
+        four.listen(5)
+        try:
+            assert ProcessManager.is_port_in_use(port, "::") is False
+            # ...while the family that IS taken still reports taken.
+            assert ProcessManager.is_port_in_use(port, "0.0.0.0") is True
+        finally:
+            four.close()
+
+        # The behavioural assertion above can only fail where AF_INET6
+        # defaults to dual-stack, which is Linux — macOS and the BSDs already
+        # default to v6-only, so it would pass there however the probe was
+        # written. Since CI is Linux this is a real check there, but a test
+        # that cannot fail on the machine it was written on is not one to
+        # trust, so the option itself is observed too.
+        options: list[tuple] = []
+        real_socket = _socket.socket
+
+        # The options are recorded as they are set, not read back afterwards:
+        # the probe closes its socket before returning, and getsockopt on a
+        # closed descriptor raises EBADF.
+        class _RecordingSocket(real_socket):
+            def setsockopt(self, level, optname, value, *rest):
+                options.append((level, optname, value))
+                return super().setsockopt(level, optname, value, *rest)
+
+        families: list[int] = []
+
+        def _make(family, *args, **kwargs):
+            families.append(family)
+            return _RecordingSocket(family, *args, **kwargs)
+
+        with patch.object(_socket, "socket", _make):
+            ProcessManager.is_port_in_use(_free_port(), "::1")
+
+        assert _socket.AF_INET6 in families, "no IPv6 socket for an IPv6 bind"
+        assert (
+            _socket.IPPROTO_IPV6,
+            _socket.IPV6_V6ONLY,
+            1,
+        ) in options, "the probe did not mirror asyncio's IPV6_V6ONLY"
+
+    def test_an_address_this_host_cannot_assign_is_not_occupancy(self):
+        """asyncio skips candidates it cannot use and binds the rest.
+
+        Treating EADDRNOTAVAIL as "taken" rejects a start uvicorn would have
+        completed, and reports an incomplete shutdown on a usable port.
+        """
+        # TEST-NET-1: valid, resolvable, and never assigned to this host.
+        assert ProcessManager.is_port_in_use(9998, "192.0.2.1") is False
+
     def test_an_unresolvable_bind_address_is_not_called_occupied(self):
         """A typo is a configuration fault, not another process holding a port.
 
