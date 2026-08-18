@@ -1013,15 +1013,20 @@ class StreamingMixin:
             phrase = phrase_of() if callable(phrase_of) else None
             # A str is the contract; anything else (a test double's
             # auto-attribute, a partially built agent) is not a report.
+            # The closing is chosen WITH the restriction. A shared tail was
+            # wrong for whichever state it was not written for (#2920).
             if isinstance(phrase, str):
                 restriction = phrase
+                closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
+            elif audit_pending and not safe_mode:
+                restriction = "a required startup integrity audit"
+                closing = "Normal cognition resumes once the startup audit completes."
             elif audit_pending:
                 restriction = "a required startup integrity audit"
+                closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
             else:
                 restriction = "an integrity failure"
-            closing = (
-                "%s"
-            ) % ("Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically.",)
+                closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
                 f"The agent cannot process queries due to {restriction}.\n"

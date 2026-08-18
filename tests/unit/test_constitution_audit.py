@@ -1051,9 +1051,11 @@ def test_an_unreadable_state_is_reported_as_availability_not_integrity():
     agent = _agent_with_unreadable_state()
 
     assert agent._safe_mode is True, "must still fail closed"
-    assert agent.constitution_state_failure() == ("TransactionError", "read")
+    # The startup boundary spans a read, a schema init and a row creation,
+    # so it must not name one. "accessed" is what it can honestly say.
+    assert agent.constitution_state_failure() == ("TransactionError", "accessed")
     assert agent.constitution_state_failure_phrase() == (
-        "governance state could not be read (TransactionError)"
+        "governance state could not be accessed (TransactionError)"
     )
 
 
@@ -1089,7 +1091,7 @@ async def test_streamed_banner_names_availability_when_the_state_was_unreadable(
     banner = chunks[0]
     assert "SAFE MODE ACTIVE" in banner
     assert "TransactionError" in banner, "the operator needs the actual cause"
-    assert "could not be read" in banner
+    assert "could not be accessed" in banner
     # The claim that must NOT be made: nothing here says the bytes are wrong.
     assert "due to an integrity failure" not in banner
     # Nor the opposite claim, which the recorded type cannot support.
@@ -1108,7 +1110,7 @@ async def test_safe_mode_command_names_availability_when_the_state_was_unreadabl
     reply = await handler._cmd_safe_mode("!safe-mode")
 
     assert "TransactionError" in reply
-    assert "could not be read" in reply
+    assert "could not be accessed" in reply
     assert "restricted due to integrity failure" not in reply
     assert "!safe-mode exit" in reply, "the only thing that actually clears it"
 
@@ -1136,7 +1138,7 @@ def test_a_malformed_state_row_is_reported_without_an_availability_claim():
         agent, ValueError("unsupported runtime state schema")
     )
 
-    assert agent.constitution_state_failure() == ("ValueError", "read")
+    assert agent.constitution_state_failure() == ("ValueError", "accessed")
 
 
 def test_the_availability_marker_does_not_outlive_its_cause():
@@ -1186,7 +1188,7 @@ async def test_the_availability_banner_does_not_contradict_itself():
 
     banner = [c async for c in agent.process_input_streaming("normal prompt")][0]
 
-    assert "could not be read" in banner
+    assert "could not be accessed" in banner
     assert "once integrity is restored" not in banner
     # Safe Mode does not lift itself when the database frees up.
     assert "!safe-mode exit" in banner
@@ -1221,3 +1223,31 @@ def test_a_failed_write_is_not_reported_as_an_unreadable_state():
     assert agent.constitution_state_failure_phrase() == (
         "governance state could not be written (TransactionError)"
     )
+
+
+@pytest.mark.asyncio
+async def test_an_audit_pending_agent_is_not_told_to_exit_safe_mode():
+    """`!safe-mode exit` answers "Not in safe mode" when no Safe Mode is on.
+
+    A shared closing line was wrong for whichever state it was not written
+    for: an audit-pending agent has `_safe_mode` False, so directing it to an
+    authorized Safe Mode exit names a command that cannot apply. The closing
+    is now chosen with the restriction that selected it.
+    """
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    agent = MagicMock()
+    agent._safe_mode = False
+    agent._constitution_audit_pending = True
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent.constitution_state_failure_phrase = lambda: None
+    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+        agent
+    )
+
+    banner = [c async for c in agent.process_input_streaming("normal prompt")][0]
+
+    assert "startup integrity audit" in banner
+    assert "!safe-mode exit" not in banner
+    assert "startup audit completes" in banner

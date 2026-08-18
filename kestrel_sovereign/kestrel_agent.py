@@ -5073,13 +5073,22 @@ Expected Duration: {expected_duration}
                 # Name what actually failed (#2920) without claiming what it
                 # implies about the constitution's contents.
                 phrase = self.constitution_state_failure_phrase()
+                # The closing is chosen WITH the restriction: an audit-pending
+                # agent is not in Safe Mode, so telling it to run
+                # `!safe-mode exit` names a command that answers "Not in safe
+                # mode" (#2920).
                 if isinstance(phrase, str):
                     restriction = phrase
+                    closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
+                elif audit_pending and not safe_mode:
+                    restriction = "a required startup integrity audit"
+                    closing = "Normal cognition resumes once the startup audit completes."
                 elif audit_pending:
                     restriction = "a required startup integrity audit"
+                    closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
                 else:
                     restriction = "an integrity failure"
-                closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
+                    closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"

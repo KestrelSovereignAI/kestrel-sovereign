@@ -652,7 +652,7 @@ class ConstitutionMixin:
         if not isinstance(name, str):
             return None
         operation = vars(self).get("_constitution_state_failed_operation")
-        return name, (operation if isinstance(operation, str) else "read")
+        return name, (operation if isinstance(operation, str) else "accessed")
 
     def constitution_state_failure_phrase(self):
         """Operator-facing phrase for the failure, or ``None``."""
@@ -663,7 +663,7 @@ class ConstitutionMixin:
         return f"governance state could not be {operation} ({name})"
 
     def _mark_constitution_state_unavailable(
-        self, exc: Exception, *, operation: str = "read"
+        self, exc: Exception, *, operation: str = "accessed"
     ) -> None:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()
@@ -677,7 +677,9 @@ class ConstitutionMixin:
         # failed write and an unreadable row are not the same report, and no
         # later inspection of the exception type can recover the difference —
         # both backends wrap anything raised in a transaction as
-        # TransactionError (#2920).
+        # TransactionError (#2920). The DEFAULT is deliberately vague: the
+        # startup boundary spans a read, a schema init, and a row creation, so
+        # it cannot honestly name one. Only callers that know may be specific.
         self._constitution_state_failed_operation = operation
         self._constitution_audit_pending = False
         logging.critical(
