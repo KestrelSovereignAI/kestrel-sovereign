@@ -595,6 +595,8 @@ class ConstitutionMixin:
             self._last_audit_time = (
                 state.last_successful_audit_at or self._constitution_epoch()
             )
+            # The state loaded: any earlier access failure is over.
+            self._constitution_state_load_error = None
             self._interaction_count = state.interaction_count
             self._constitution_bootstrap_pending = state.bootstrap_pending
             self._constitution_state_migration_pending = (
@@ -647,11 +649,37 @@ class ConstitutionMixin:
         an integrity failure, while ``!verify-constitution`` cheerfully
         confirmed the anchor was intact.
 
-        ``_constitution_state_load_error`` is set only by
-        ``_mark_constitution_state_unavailable``, so its presence is exactly
-        "we could not read the state", never "the state is wrong".
+        The marker is set from a broad ``except Exception``, which also catches
+        a malformed or unsupported state row (``ValueError``) — that IS a
+        statement about the stored governance, so only exception types that are
+        genuinely access failures may carry the "not evidence of alteration"
+        claim. Anything else is reported neutrally.
         """
-        return vars(self).get("_constitution_state_load_error")
+        recorded = vars(self).get("_constitution_state_load_error")
+        return recorded if isinstance(recorded, str) else None
+
+    # Exception type names meaning "the store could not be reached or served",
+    # as opposed to "what it served was wrong". Only these license a banner
+    # telling the operator the constitution was probably not altered.
+    _CONSTITUTION_ACCESS_ERROR_NAMES = frozenset({
+        "TransactionError",
+        "DatabaseError",
+        "OperationalError",
+        "InterfaceError",
+        "ConnectionError",
+        "TimeoutError",
+        "OSError",
+        "IOError",
+        "PermissionError",
+    })
+
+    def constitution_state_access_failed(self) -> bool:
+        """Whether the unreadable state was an ACCESS failure specifically."""
+        recorded = self.constitution_state_unavailable_detail()
+        return (
+            recorded is not None
+            and recorded in ConstitutionMixin._CONSTITUTION_ACCESS_ERROR_NAMES
+        )
 
     def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
         """Keep cognition blocked when authoritative state cannot be trusted."""
@@ -1243,6 +1271,10 @@ class ConstitutionMixin:
 
         now = self._constitution_now()
         was_already_safe = self._safe_mode
+        # A named reason supersedes an earlier "could not read the state": the
+        # marker must never outlive its cause, or a later hash/audit failure
+        # inherits a banner denying anything was altered (#2920).
+        self._constitution_state_load_error = None
         self._safe_mode = True
         self._safe_mode_reason = reason
         self._safe_mode_entered_at = (

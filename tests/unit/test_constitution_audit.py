@@ -298,6 +298,9 @@ class _DurableConstitutionHarness:
     constitution_state_unavailable_detail = (
         KestrelAgent.constitution_state_unavailable_detail
     )
+    constitution_state_access_failed = (
+        KestrelAgent.constitution_state_access_failed
+    )
     _persist_constitution_runtime_state = (
         KestrelAgent._persist_constitution_runtime_state
     )
@@ -1040,6 +1043,9 @@ def _agent_with_unreadable_state():
     agent.constitution_state_unavailable_detail = (
         ConstitutionMixin.constitution_state_unavailable_detail.__get__(agent)
     )
+    agent.constitution_state_access_failed = (
+        ConstitutionMixin.constitution_state_access_failed.__get__(agent)
+    )
     ConstitutionMixin._mark_constitution_state_unavailable(
         agent, TransactionError("database is locked")
     )
@@ -1105,3 +1111,81 @@ async def test_safe_mode_command_names_availability_when_the_state_was_unreadabl
     assert "TransactionError" in reply
     assert "availability failure" in reply
     assert "restricted due to integrity failure" not in reply
+
+
+def test_a_malformed_state_row_is_not_called_an_availability_failure():
+    """Only ACCESS failures may say the constitution was probably not altered.
+
+    The marker is set from a broad ``except Exception``, which also catches a
+    malformed or unsupported runtime-state row (``ValueError``). That IS a
+    statement about the stored governance, so it must not inherit the
+    reassurance built for database contention.
+    """
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock()
+    agent._safe_mode = False
+    agent._safe_mode_entered_at = None
+    agent._safe_mode_reason = None
+    agent.agent_id = "did:example:kestrel"
+    agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
+    for name in ("constitution_state_unavailable_detail",
+                 "constitution_state_access_failed"):
+        setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+
+    ConstitutionMixin._mark_constitution_state_unavailable(
+        agent, ValueError("unsupported runtime state schema")
+    )
+
+    assert agent.constitution_state_unavailable_detail() == "ValueError"
+    assert agent.constitution_state_access_failed() is False
+
+
+def test_the_availability_marker_does_not_outlive_its_cause():
+    """A later integrity stop must not inherit "nothing was altered".
+
+    The marker was only ever reset at construction, so once a transient lock
+    had set it, every subsequent Safe Mode entry in that process would have
+    denied evidence of alteration — a false reassurance, which is worse than
+    the vague message this replaced.
+    """
+    import asyncio
+
+    agent = _agent_with_unreadable_state()
+    assert agent.constitution_state_access_failed() is True
+
+    agent.features = {}
+    agent._constitution_state_persistence_pending = False
+    agent._persist_constitution_runtime_state = AsyncMock(return_value=True)
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    asyncio.run(
+        ConstitutionMixin._enter_safe_mode_locked(agent, "governing bytes changed")
+    )
+
+    assert agent._safe_mode_reason == "governing bytes changed"
+    assert agent.constitution_state_unavailable_detail() is None, (
+        "a named integrity cause must supersede the stale access marker"
+    )
+    assert agent.constitution_state_access_failed() is False
+
+
+@pytest.mark.asyncio
+async def test_the_availability_banner_does_not_contradict_itself():
+    """Saying "not an integrity problem" then "once integrity is restored" is
+    a message that argues with itself in four lines."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    agent = _agent_with_unreadable_state()
+    agent._constitution_audit_pending = False
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+        agent
+    )
+
+    banner = [c async for c in agent.process_input_streaming("normal prompt")][0]
+
+    assert "availability failure" in banner
+    assert "once integrity is restored" not in banner
+    assert "once that state can be read" in banner

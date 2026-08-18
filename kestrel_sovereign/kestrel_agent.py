@@ -5071,7 +5071,7 @@ Expected Duration: {expected_duration}
                     )
             else:
                 unavailable = self.constitution_state_unavailable_detail()
-                if isinstance(unavailable, str):
+                if isinstance(unavailable, str) and self.constitution_state_access_failed():
                     # Availability, not integrity (#2920). Naming the exception
                     # is what lets an operator recognise DB contention rather
                     # than hunting a tampered constitution that is fine.
@@ -5080,15 +5080,23 @@ Expected Duration: {expected_duration}
                         "availability failure, not evidence the constitution "
                         "was altered"
                     )
+                    closing = "Normal operation resumes once that state can be read."
+                elif isinstance(unavailable, str):
+                    # Loaded but unusable — that IS about the stored state, so
+                    # say only what is known.
+                    restriction = f"governance state that could not be loaded ({unavailable})"
+                    closing = "Normal operation resumes once that state can be loaded."
                 elif audit_pending:
                     restriction = "a required startup integrity audit"
+                    closing = "Normal operation will resume once integrity is restored."
                 else:
                     restriction = "an integrity failure"
+                    closing = "Normal operation will resume once integrity is restored."
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
-                    "Normal operation will resume once integrity is restored."
+                    f"{closing}"
                 )
 
         # Everything below this point CAN touch conversation history

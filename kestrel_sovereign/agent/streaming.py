@@ -1011,25 +1011,35 @@ class StreamingMixin:
             # mixin is driven by lightweight harnesses as well as the agent.
             detail = getattr(self, "constitution_state_unavailable_detail", None)
             unavailable = detail() if callable(detail) else None
+            access = getattr(self, "constitution_state_access_failed", None)
+            access_failed = access() is True if callable(access) else False
             # A str is the helper's documented contract; anything else (a test
             # double's auto-attribute, a partially built agent) is not an
             # availability claim and must not be reported as one.
-            if isinstance(unavailable, str):
+            if isinstance(unavailable, str) and access_failed:
                 restriction = (
                     f"unreadable governance state ({unavailable}) — an "
                     "availability failure, not evidence the constitution was "
                     "altered"
                 )
+                closing = "Normal operation resumes once that state can be read."
+            elif isinstance(unavailable, str):
+                # Loaded but unusable — that IS about the stored state, so say
+                # only what is known and claim nothing either way.
+                restriction = f"governance state that could not be loaded ({unavailable})"
+                closing = "Normal operation resumes once that state can be loaded."
             elif audit_pending:
                 restriction = "a required startup integrity audit"
+                closing = "Normal operation will resume once integrity is restored."
             else:
                 restriction = "an integrity failure"
+                closing = "Normal operation will resume once integrity is restored."
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
                 f"The agent cannot process queries due to {restriction}.\n"
                 "Use !safe-mode to check status or !verify-constitution to "
                 "re-verify.\n\n"
-                "Normal operation will resume once integrity is restored."
+                f"{closing}"
             )
             return
 

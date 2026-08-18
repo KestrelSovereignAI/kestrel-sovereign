@@ -517,6 +517,13 @@ class CommandHandler:
                 self.agent, "constitution_state_unavailable_detail", None
             )
             unavailable = detail() if callable(detail) else None
+            access = getattr(self.agent, "constitution_state_access_failed", None)
+            access_failed = access() is True if callable(access) else False
+            if isinstance(unavailable, str) and not access_failed:
+                return (
+                    "🚨 SAFE MODE ACTIVE: governance state could not be loaded "
+                    f"({unavailable})."
+                )
             if isinstance(unavailable, str):
                 # An unreadable state and a wrong state both restrict the
                 # agent, but only one of them is a claim about the
