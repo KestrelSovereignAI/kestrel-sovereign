@@ -47,6 +47,26 @@ router = APIRouter(tags=["features"])
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
 
+#: Serializes the whole snapshot -> install -> resolve sequence.
+#
+# Two overlapping install requests otherwise run it concurrently in worker
+# threads against ONE environment, and both halves break:
+#
+#   * the installs themselves — on a host without uv the fallback is a
+#     multi-pass pip sequence, and concurrent pip writes to one environment are
+#     unsupported and can leave package metadata corrupt;
+#   * the guard — each request snapshots core before its install and compares
+#     after, so B's install lands inside A's window and A reports it as drift,
+#     "repairs" a core nobody moved, and B then sees THAT as drift. Two correct
+#     installs manufacture two spurious CORE_UNSAFE verdicts between them.
+#
+# In-process only, and deliberately named as such: agents share one host
+# process, so this covers agent-vs-agent, which is the reachable case on a
+# multi-agent host where features can self-install. It does NOT serialize
+# against a concurrent `kestrel feature install` in a separate process — that
+# needs a filesystem lock, and is tracked rather than pretended to be handled.
+_INSTALL_LOCK = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -316,30 +336,44 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     from kestrel_sovereign.cli_features import CoreInstallGuard
 
     package_spec = pkg_info.package
-    guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
 
-    install_error: Optional[Tuple[int, str]] = None
-    try:
-        result = await asyncio.to_thread(
-            guard.run, [package_spec], timeout=INSTALL_TIMEOUT_SECONDS,
+    # The snapshot, the install and the resolve are ONE transaction over a
+    # shared environment (see _INSTALL_LOCK). Holding the lock across all three
+    # is the point: snapshotting outside it would let another install land
+    # between the snapshot and the compare, which is the drift this guard would
+    # then report against an environment nobody actually broke.
+    async with _INSTALL_LOCK:
+        guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
+
+        install_error: Optional[Tuple[int, str]] = None
+        try:
+            result = await asyncio.to_thread(
+                guard.run, [package_spec], timeout=INSTALL_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                logger.error(f"pip install failed for {package_spec}: {result.stderr}")
+                install_error = (500, f"Installation failed: {result.stderr[:500]}")
+        except subprocess.TimeoutExpired:
+            install_error = (504, "Installation timed out")
+
+        # Detection half, on EVERY path — a failed or timed-out install is not
+        # a reason to skip it. pip installs dependencies before the requested
+        # package can fail, and a timeout kills the process mid-write, so both
+        # can leave core swapped for an index wheel. Returning the install
+        # error without looking would leave that swap in place, unnamed.
+        #
+        # Bounded, because this repairs by running another installer: an
+        # unbounded one would hang the request the install timeout above exists
+        # to prevent. A repair that hits the bound comes back as an unrepaired
+        # outcome carrying the manual restore command, and the install's own
+        # status still stands.
+        #
+        # Inside the lock with the snapshot and the install: comparing after
+        # releasing it would let another request's install land in the window
+        # and be reported as this one's drift (issue #2949).
+        outcome = await asyncio.to_thread(
+            guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS,
         )
-        if result.returncode != 0:
-            logger.error(f"pip install failed for {package_spec}: {result.stderr}")
-            install_error = (500, f"Installation failed: {result.stderr[:500]}")
-    except subprocess.TimeoutExpired:
-        install_error = (504, "Installation timed out")
-
-    # Detection half, on EVERY path — a failed or timed-out install is not a
-    # reason to skip it. pip installs dependencies before the requested package
-    # can fail, and a timeout kills the process mid-write, so both can leave
-    # core swapped for an index wheel. Returning the install error without
-    # looking would leave that swap in place, unnamed (issue #2949).
-    #
-    # Bounded, because this repairs by running another installer: an unbounded
-    # one would hang the request the install timeout above exists to prevent. A
-    # repair that hits the bound comes back as an unrepaired outcome carrying
-    # the manual restore command, and the install's own status still stands.
-    outcome = await asyncio.to_thread(guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS)
     if outcome.drift is not None:
         logger.error("core install changed during %s install:\n%s", package_spec, outcome.describe())
 

@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from fastapi import FastAPI
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.endpoints.features import router as features_router
@@ -1357,3 +1359,77 @@ class TestGetSkillSchema:
             resp = client.get("/api/skills/nonexistent/schema")
 
         assert resp.status_code == 404
+
+
+class TestConcurrentInstallSerialization:
+    """Two overlapping installs are one transaction each, not two interleaved.
+
+    The endpoint runs snapshot -> install -> resolve in worker threads. Without
+    a lock both halves break: concurrent pip writes to one environment are
+    unsupported (the no-uv fallback is a multi-pass sequence), and each request
+    snapshots core before its own install and compares after — so B's install
+    lands inside A's window, A reports it as drift and "repairs" a core nobody
+    moved, and B then sees THAT as drift. Two correct installs manufacture two
+    spurious CORE_UNSAFE verdicts between them.
+    """
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_installs_do_not_interleave(self, mock_registry, monkeypatch):
+        import asyncio as _asyncio
+        import threading
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+
+        # Record entry/exit of the guarded section from the worker threads. If
+        # the lock holds, the sequence is strictly paired: enter,exit,enter,exit.
+        events: list = []
+        lock = threading.Lock()
+        overlap = threading.Event()
+
+        class _Guard:
+            @classmethod
+            def snapshot(cls, *a, **kw):
+                with lock:
+                    events.append("enter")
+                    if events.count("enter") > events.count("exit") + 1:
+                        overlap.set()
+                return cls()
+
+            def run(self, *a, **kw):
+                # Long enough that a second request would overlap if unlocked.
+                import time
+                time.sleep(0.05)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def resolve(self, *a, **kw):
+                with lock:
+                    events.append("exit")
+                return SimpleNamespace(
+                    drift=None, conforming=True, describe=lambda: "",
+                )
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.cli_features.CoreInstallGuard", _Guard,
+        )
+
+        async def _drive():
+            app = _make_app(_make_agent())
+            import httpx
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://t",
+            ) as client:
+                return await _asyncio.gather(
+                    client.post("/api/features/test-pkg/install"),
+                    client.post("/api/features/test-pkg/install"),
+                    return_exceptions=True,
+                )
+
+        _asyncio.run(_drive())
+
+        assert not overlap.is_set(), f"installs interleaved: {events}"
+        # Strictly paired: no enter follows an enter without an exit between.
+        assert events == ["enter", "exit", "enter", "exit"], events

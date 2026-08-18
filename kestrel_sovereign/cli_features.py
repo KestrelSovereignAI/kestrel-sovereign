@@ -726,16 +726,21 @@ def _load_host_manifest(path: Path) -> list:
             # and so constrains nothing at all. A guard that pins an unrelated
             # package and then reports conformity is worse than no guard,
             # because it reports success (issue #2949).
-            from packaging.specifiers import InvalidSpecifier, SpecifierSet
+            # The GUARD's validator, not `SpecifierSet` directly — they are
+            # deliberately not the same question. `===` parses but carries no
+            # version operand, so it matches nothing: accepted here it becomes
+            # an installer requirement the backend rejects, or a core policy
+            # that can never conform. Validating with a laxer rule than the
+            # consumer applies is how the two sides come to disagree, which is
+            # the defect pattern this whole change exists to remove.
+            from kestrel_sovereign.feature_reconcile import spec_is_valid
 
-            try:
-                SpecifierSet(pypi)
-            except (InvalidSpecifier, ValueError, TypeError) as exc:
+            if not spec_is_valid(pypi):
                 raise ValueError(
-                    f"manifest '{label}': 'pypi' is not a valid PEP 440 version "
-                    f"spec: {pypi!r} ({exc}). Use e.g. \">=0.3,<0.4\", or \"\" "
-                    "for any version from the index."
-                ) from exc
+                    f"manifest '{label}': 'pypi' is not a usable PEP 440 version "
+                    f"spec: {pypi!r}. Use e.g. \">=0.3,<0.4\", or \"\" for any "
+                    "version from the index."
+                )
         if editable is not None and pypi is not None:
             raise ValueError(
                 f"manifest '{label}': 'editable' and 'pypi' are mutually "

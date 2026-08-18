@@ -1893,7 +1893,14 @@ def test_the_manifest_rejects_a_malformed_pypi_spec(tmp_path):
         cli_features._load_host_manifest(manifest)
 
     msg = str(exc.value)
-    assert "not a valid PEP 440" in msg and "banana" in msg
+    assert "not a usable PEP 440" in msg and "banana" in msg
+
+    # `===` parses as a SpecifierSet but carries no version operand, so it
+    # matches nothing. The loader uses the GUARD's validator precisely so the
+    # two cannot disagree about what is usable.
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = "==="\n')
+    with pytest.raises(ValueError, match="not a usable PEP 440"):
+        cli_features._load_host_manifest(manifest)
 
     # The valid forms still load, including "" (any version from the index).
     for spec in (">=0.3,<0.4", "", "==1.2.3"):
