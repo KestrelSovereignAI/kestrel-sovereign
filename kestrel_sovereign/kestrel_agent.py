@@ -5065,33 +5065,21 @@ Expected Duration: {expected_duration}
                 if command not in SAFE_MODE_COMMANDS:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
-                        "The agent is in restricted mode: governance state could not be verified.\\n"
+                        f"The agent is in restricted mode: {self.constitution_state_failure_phrase() or 'governance state could not be verified'}.\n"
                         "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
-                        "Please contact your administrator to resolve the integrity issue."
+                        "Contact your administrator with the reason above."
                     )
             else:
-                unavailable = self.constitution_state_unavailable_detail()
-                if isinstance(unavailable, str) and self.constitution_state_access_failed():
-                    # Availability, not integrity (#2920). Naming the exception
-                    # is what lets an operator recognise DB contention rather
-                    # than hunting a tampered constitution that is fine.
-                    restriction = (
-                        f"unreadable governance state ({unavailable}) — an "
-                        "availability failure, not evidence the constitution "
-                        "was altered"
-                    )
-                    closing = "Normal operation resumes once that state can be read."
-                elif isinstance(unavailable, str):
-                    # Loaded but unusable — that IS about the stored state, so
-                    # say only what is known.
-                    restriction = f"governance state that could not be loaded ({unavailable})"
-                    closing = "Normal operation resumes once that state can be loaded."
+                # Name what actually failed (#2920) without claiming what it
+                # implies about the constitution's contents.
+                phrase = self.constitution_state_failure_phrase()
+                if isinstance(phrase, str):
+                    restriction = phrase
                 elif audit_pending:
                     restriction = "a required startup integrity audit"
-                    closing = "Normal operation will resume once integrity is restored."
                 else:
                     restriction = "an integrity failure"
-                    closing = "Normal operation will resume once integrity is restored."
+                closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
                     f"The agent cannot process queries due to {restriction}.\\n"

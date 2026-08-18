@@ -295,11 +295,9 @@ class _DurableConstitutionHarness:
     _mark_constitution_state_unavailable = (
         KestrelAgent._mark_constitution_state_unavailable
     )
-    constitution_state_unavailable_detail = (
-        KestrelAgent.constitution_state_unavailable_detail
-    )
-    constitution_state_access_failed = (
-        KestrelAgent.constitution_state_access_failed
+    constitution_state_failure = KestrelAgent.constitution_state_failure
+    constitution_state_failure_phrase = (
+        KestrelAgent.constitution_state_failure_phrase
     )
     _persist_constitution_runtime_state = (
         KestrelAgent._persist_constitution_runtime_state
@@ -1040,12 +1038,8 @@ def _agent_with_unreadable_state():
     agent._safe_mode_reason = None
     agent.agent_id = "did:example:kestrel"
     agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
-    agent.constitution_state_unavailable_detail = (
-        ConstitutionMixin.constitution_state_unavailable_detail.__get__(agent)
-    )
-    agent.constitution_state_access_failed = (
-        ConstitutionMixin.constitution_state_access_failed.__get__(agent)
-    )
+    for _name in ("constitution_state_failure", "constitution_state_failure_phrase"):
+        setattr(agent, _name, getattr(ConstitutionMixin, _name).__get__(agent))
     ConstitutionMixin._mark_constitution_state_unavailable(
         agent, TransactionError("database is locked")
     )
@@ -1057,7 +1051,10 @@ def test_an_unreadable_state_is_reported_as_availability_not_integrity():
     agent = _agent_with_unreadable_state()
 
     assert agent._safe_mode is True, "must still fail closed"
-    assert agent.constitution_state_unavailable_detail() == "TransactionError"
+    assert agent.constitution_state_failure() == ("TransactionError", "read")
+    assert agent.constitution_state_failure_phrase() == (
+        "governance state could not be read (TransactionError)"
+    )
 
 
 def test_a_genuine_integrity_stop_still_reports_integrity():
@@ -1066,11 +1063,11 @@ def test_a_genuine_integrity_stop_still_reports_integrity():
 
     agent = MagicMock()
     agent._constitution_state_load_error = None
-    agent.constitution_state_unavailable_detail = (
-        ConstitutionMixin.constitution_state_unavailable_detail.__get__(agent)
+    agent.constitution_state_failure = (
+        ConstitutionMixin.constitution_state_failure.__get__(agent)
     )
 
-    assert agent.constitution_state_unavailable_detail() is None
+    assert agent.constitution_state_failure() is None
 
 
 @pytest.mark.asyncio
@@ -1092,9 +1089,11 @@ async def test_streamed_banner_names_availability_when_the_state_was_unreadable(
     banner = chunks[0]
     assert "SAFE MODE ACTIVE" in banner
     assert "TransactionError" in banner, "the operator needs the actual cause"
-    assert "availability failure" in banner
+    assert "could not be read" in banner
     # The claim that must NOT be made: nothing here says the bytes are wrong.
     assert "due to an integrity failure" not in banner
+    # Nor the opposite claim, which the recorded type cannot support.
+    assert "not evidence" not in banner
 
 
 @pytest.mark.asyncio
@@ -1109,12 +1108,13 @@ async def test_safe_mode_command_names_availability_when_the_state_was_unreadabl
     reply = await handler._cmd_safe_mode("!safe-mode")
 
     assert "TransactionError" in reply
-    assert "availability failure" in reply
+    assert "could not be read" in reply
     assert "restricted due to integrity failure" not in reply
+    assert "!safe-mode exit" in reply, "the only thing that actually clears it"
 
 
-def test_a_malformed_state_row_is_not_called_an_availability_failure():
-    """Only ACCESS failures may say the constitution was probably not altered.
+def test_a_malformed_state_row_is_reported_without_an_availability_claim():
+    """No recorded exception type licenses "the constitution was not altered".
 
     The marker is set from a broad ``except Exception``, which also catches a
     malformed or unsupported runtime-state row (``ValueError``). That IS a
@@ -1129,16 +1129,14 @@ def test_a_malformed_state_row_is_not_called_an_availability_failure():
     agent._safe_mode_reason = None
     agent.agent_id = "did:example:kestrel"
     agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
-    for name in ("constitution_state_unavailable_detail",
-                 "constitution_state_access_failed"):
+    for name in ("constitution_state_failure", "constitution_state_failure_phrase"):
         setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
 
     ConstitutionMixin._mark_constitution_state_unavailable(
         agent, ValueError("unsupported runtime state schema")
     )
 
-    assert agent.constitution_state_unavailable_detail() == "ValueError"
-    assert agent.constitution_state_access_failed() is False
+    assert agent.constitution_state_failure() == ("ValueError", "read")
 
 
 def test_the_availability_marker_does_not_outlive_its_cause():
@@ -1152,7 +1150,7 @@ def test_the_availability_marker_does_not_outlive_its_cause():
     import asyncio
 
     agent = _agent_with_unreadable_state()
-    assert agent.constitution_state_access_failed() is True
+    assert agent.constitution_state_failure() is not None
 
     agent.features = {}
     agent._constitution_state_persistence_pending = False
@@ -1164,16 +1162,18 @@ def test_the_availability_marker_does_not_outlive_its_cause():
     )
 
     assert agent._safe_mode_reason == "governing bytes changed"
-    assert agent.constitution_state_unavailable_detail() is None, (
+    assert agent.constitution_state_failure() is None, (
         "a named integrity cause must supersede the stale access marker"
     )
-    assert agent.constitution_state_access_failed() is False
 
 
 @pytest.mark.asyncio
 async def test_the_availability_banner_does_not_contradict_itself():
-    """Saying "not an integrity problem" then "once integrity is restored" is
-    a message that argues with itself in four lines."""
+    """A banner must not name a recovery that does not exist.
+
+    Safe Mode is durable — ``exit_safe_mode`` requires explicit authority and a
+    fresh audit — so "normal operation resumes once the state can be read" was
+    simply false."""
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
     agent = _agent_with_unreadable_state()
@@ -1186,6 +1186,38 @@ async def test_the_availability_banner_does_not_contradict_itself():
 
     banner = [c async for c in agent.process_input_streaming("normal prompt")][0]
 
-    assert "availability failure" in banner
+    assert "could not be read" in banner
     assert "once integrity is restored" not in banner
-    assert "once that state can be read" in banner
+    # Safe Mode does not lift itself when the database frees up.
+    assert "!safe-mode exit" in banner
+
+
+def test_a_failed_write_is_not_reported_as_an_unreadable_state():
+    """The persist path shares the marker — the report must not share wording.
+
+    `_persist_constitution_runtime_state` marks the state unavailable when a
+    WRITE fails (disk full, read-only DB, write lock). The state was read
+    perfectly well; telling the operator it could not be read sends them to
+    the wrong problem. The operation is recorded where it is known, because no
+    later inspection of the exception type can recover it.
+    """
+    from kestrel_sdk.storage.database.interface import TransactionError
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock()
+    agent._safe_mode = False
+    agent._safe_mode_entered_at = None
+    agent._safe_mode_reason = None
+    agent.agent_id = "did:example:kestrel"
+    agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
+    for name in ("constitution_state_failure", "constitution_state_failure_phrase"):
+        setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+
+    ConstitutionMixin._mark_constitution_state_unavailable(
+        agent, TransactionError("disk is full"), operation="written"
+    )
+
+    assert agent.constitution_state_failure() == ("TransactionError", "written")
+    assert agent.constitution_state_failure_phrase() == (
+        "governance state could not be written (TransactionError)"
+    )

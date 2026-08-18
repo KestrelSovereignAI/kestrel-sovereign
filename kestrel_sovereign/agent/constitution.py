@@ -630,58 +630,41 @@ class ConstitutionMixin:
         except Exception as exc:  # noqa: BLE001 - state failure must fail closed
             self._mark_constitution_state_unavailable(exc)
 
-    def constitution_state_unavailable_detail(self):
-        """The exception type that made governance state unreadable, or ``None``.
+    def constitution_state_failure(self):
+        """``(exception_name, operation)`` for an unreadable/unwritable state.
 
-        Safe Mode is entered for two different reasons that an operator must be
-        able to tell apart. The constitution may be *wrong* — a hash mismatch,
-        a missing identity node, a failed audit — which is an integrity
-        finding. Or the authoritative state may simply be **unreadable**: a
-        ``TransactionError`` because another connection holds the database, an
-        IO error, a DB that has not initialised yet.
+        Safe Mode is entered for two different reasons an operator must be able
+        to tell apart: the constitution may be WRONG (hash mismatch, missing
+        identity node, failed audit), or the authoritative state may simply not
+        be reachable. Both fail closed, correctly. Reporting both as "integrity
+        failure" sent an operator hunting a tampered constitution while
+        ``!verify-constitution`` confirmed the anchor was intact (#2920).
 
-        Both fail closed, correctly — cognition must not run on governance that
-        cannot be verified. But they are not the same claim, and reporting an
-        availability failure as "integrity failure" tells the operator their
-        constitution may have been tampered with when nothing of the kind
-        happened. In #2920 a drift-only inspection opened a second connection
-        to a live agent's database and the agent fell into Safe Mode announcing
-        an integrity failure, while ``!verify-constitution`` cheerfully
-        confirmed the anchor was intact.
-
-        The marker is set from a broad ``except Exception``, which also catches
-        a malformed or unsupported state row (``ValueError``) — that IS a
-        statement about the stored governance, so only exception types that are
-        genuinely access failures may carry the "not evidence of alteration"
-        claim. Anything else is reported neutrally.
+        What this deliberately does NOT do is claim the constitution was not
+        altered. That claim needs to know the failure was an access problem,
+        and the recorded type cannot carry it: ``TransactionError`` is what
+        both backends wrap around ANY exception raised inside a transaction,
+        including a query error against a malformed state row. Naming the
+        operation and the exception is true in every case; the reassurance
+        would not be.
         """
-        recorded = vars(self).get("_constitution_state_load_error")
-        return recorded if isinstance(recorded, str) else None
+        name = vars(self).get("_constitution_state_load_error")
+        if not isinstance(name, str):
+            return None
+        operation = vars(self).get("_constitution_state_failed_operation")
+        return name, (operation if isinstance(operation, str) else "read")
 
-    # Exception type names meaning "the store could not be reached or served",
-    # as opposed to "what it served was wrong". Only these license a banner
-    # telling the operator the constitution was probably not altered.
-    _CONSTITUTION_ACCESS_ERROR_NAMES = frozenset({
-        "TransactionError",
-        "DatabaseError",
-        "OperationalError",
-        "InterfaceError",
-        "ConnectionError",
-        "TimeoutError",
-        "OSError",
-        "IOError",
-        "PermissionError",
-    })
+    def constitution_state_failure_phrase(self):
+        """Operator-facing phrase for the failure, or ``None``."""
+        failure = self.constitution_state_failure()
+        if failure is None:
+            return None
+        name, operation = failure
+        return f"governance state could not be {operation} ({name})"
 
-    def constitution_state_access_failed(self) -> bool:
-        """Whether the unreadable state was an ACCESS failure specifically."""
-        recorded = self.constitution_state_unavailable_detail()
-        return (
-            recorded is not None
-            and recorded in ConstitutionMixin._CONSTITUTION_ACCESS_ERROR_NAMES
-        )
-
-    def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
+    def _mark_constitution_state_unavailable(
+        self, exc: Exception, *, operation: str = "read"
+    ) -> None:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()
         self._safe_mode = True
@@ -690,6 +673,12 @@ class ConstitutionMixin:
             getattr(self, "_safe_mode_entered_at", None) or now
         )
         self._constitution_state_load_error = type(exc).__name__
+        # Recorded HERE, where the caller knows WHICH operation failed. A
+        # failed write and an unreadable row are not the same report, and no
+        # later inspection of the exception type can recover the difference —
+        # both backends wrap anything raised in a transaction as
+        # TransactionError (#2920).
+        self._constitution_state_failed_operation = operation
         self._constitution_audit_pending = False
         logging.critical(
             "CONSTITUTION STATE unavailable; remaining in Safe Mode (%s)",
@@ -743,7 +732,7 @@ class ConstitutionMixin:
             )
             return True
         except Exception as exc:  # noqa: BLE001 - never continue normally
-            self._mark_constitution_state_unavailable(exc)
+            self._mark_constitution_state_unavailable(exc, operation="written")
             return False
 
     async def _record_successful_constitution_audit(
