@@ -6,14 +6,12 @@ env/
 ENV/
 
 # Ignore local env files (contains secrets)
-.env
-.env.*
-.env.local
-.env.*.local
-.secrets
-.secrets.*
-.secrets/
-secrets/
+**/.env
+**/.env.*
+**/.secrets
+**/.secrets.*
+**/.secrets/
+**/secrets/
 
 # Ignore local kestrel.toml (local providers like llama_cpp bleed into cloud).
 # Cloud images get their LLM config from docker/kestrel.cloudrun.toml instead.
@@ -23,14 +21,14 @@ kestrel.toml.backup
 kestrel.toml.backup-*
 
 # Ignore credentials
-credentials/
+**/credentials/
 config/
-*.pem
-*.key
-*credentials*.json
-*service-account*.json
-*-key.json
-*.private.json
+**/*.pem
+**/*.key
+**/*credentials*.json
+**/*service-account*.json
+**/*-key.json
+**/*.private.json
 
 # Ignore database dumps. Every Dockerfile here does `COPY . .`, and
 # docs/deployment/README.md tells operators to write a pre-migration dump into
@@ -39,9 +37,9 @@ config/
 # baked into the next image and pushed. Docker does not read .gitignore, so
 # the matching rules there hide such a file from `git status` while leaving it
 # in the build context; both lists have to carry it.
-*.dump
-*-dump.sql
-*.sql.gz
+**/*.dump
+**/*-dump.sql
+**/*.sql.gz
 
 # Ignore test data
 agent_data/
@@ -75,8 +73,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ipfs/
-.kestrel/
-storage_cache/
+**/.kestrel/
+**/storage_cache/
 archive/
 trained_loras/
 generated_images/
