@@ -517,10 +517,20 @@ class CommandHandler:
                 self.agent, "constitution_state_failure_phrase", None
             )
             phrase = phrase_of() if callable(phrase_of) else None
-            if isinstance(phrase, str):
+            primary = getattr(
+                self.agent, "constitution_state_is_primary_cause", None
+            )
+            if isinstance(phrase, str) and callable(primary) and primary() is True:
                 # Name the failure without claiming what it implies about the
                 # constitution's contents (#2920).
                 return f"🚨 SAFE MODE ACTIVE: {phrase}. Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
+            if isinstance(phrase, str):
+                # Safe Mode is latched for something else; the state failure is
+                # a SECOND fact, reported alongside rather than instead.
+                return (
+                    "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to "
+                    f"integrity failure. Additionally, {phrase}."
+                )
             return "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to integrity failure."
         if getattr(self.agent, "_constitution_audit_pending", False):
             return "🚨 STARTUP AUDIT PENDING: Normal cognition remains restricted."

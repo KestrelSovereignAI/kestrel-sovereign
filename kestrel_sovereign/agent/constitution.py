@@ -30,6 +30,13 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 
 
+# The durable ``safe_mode_reason`` written when Safe Mode was entered because
+# the runtime state itself could not be accessed. It is persisted and restored
+# with the row, which makes it the authoritative PRIMARY cause; the exception
+# type and operation are best-effort detail that only live in memory (#2920).
+STATE_UNAVAILABLE_SAFE_MODE_REASON = "Constitution runtime state unavailable"
+
+
 class ConstitutionMixin:
     """Mixin class providing constitution verification methods."""
 
@@ -654,6 +661,21 @@ class ConstitutionMixin:
         operation = vars(self).get("_constitution_state_failed_operation")
         return name, (operation if isinstance(operation, str) else "accessed")
 
+    def constitution_state_is_primary_cause(self) -> bool:
+        """Whether Safe Mode exists BECAUSE the state could not be accessed.
+
+        A failed write can also be recorded while Safe Mode is already latched
+        for an integrity finding — the audit fails, the transition is written,
+        and the write fails too. The state failure is then a SECOND fact, not
+        the reason. Letting it take the headline would hide the integrity
+        finding that Safe Mode exists to announce, so the durable reason
+        decides and the exception detail is only ever added alongside.
+        """
+        return (
+            vars(self).get("_safe_mode_reason")
+            == STATE_UNAVAILABLE_SAFE_MODE_REASON
+        )
+
     def constitution_state_failure_phrase(self):
         """Operator-facing phrase for the failure, or ``None``."""
         failure = self.constitution_state_failure()
@@ -668,7 +690,7 @@ class ConstitutionMixin:
         """Keep cognition blocked when authoritative state cannot be trusted."""
         now = self._constitution_now()
         self._safe_mode = True
-        self._safe_mode_reason = "Constitution runtime state unavailable"
+        self._safe_mode_reason = STATE_UNAVAILABLE_SAFE_MODE_REASON
         self._safe_mode_entered_at = (
             getattr(self, "_safe_mode_entered_at", None) or now
         )

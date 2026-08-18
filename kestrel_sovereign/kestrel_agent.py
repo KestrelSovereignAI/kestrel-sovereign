@@ -5077,8 +5077,14 @@ Expected Duration: {expected_duration}
                 # agent is not in Safe Mode, so telling it to run
                 # `!safe-mode exit` names a command that answers "Not in safe
                 # mode" (#2920).
-                if isinstance(phrase, str):
+                state_is_primary = self.constitution_state_is_primary_cause()
+                # Detail is APPENDED, never substituted: a write that failed
+                # while Safe Mode was already latched for an integrity finding
+                # must not take the headline from it (#2920).
+                detail = f" ({phrase})" if isinstance(phrase, str) else ""
+                if isinstance(phrase, str) and state_is_primary:
                     restriction = phrase
+                    detail = ""
                     closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
                 elif audit_pending and not safe_mode:
                     restriction = "a required startup integrity audit"
@@ -5091,7 +5097,7 @@ Expected Duration: {expected_duration}
                     closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
-                    f"The agent cannot process queries due to {restriction}.\\n"
+                    f"The agent cannot process queries due to {restriction}.{detail}\\n"
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
                     f"{closing}"
                 )

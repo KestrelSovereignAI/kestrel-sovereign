@@ -299,6 +299,9 @@ class _DurableConstitutionHarness:
     constitution_state_failure_phrase = (
         KestrelAgent.constitution_state_failure_phrase
     )
+    constitution_state_is_primary_cause = (
+        KestrelAgent.constitution_state_is_primary_cause
+    )
     _persist_constitution_runtime_state = (
         KestrelAgent._persist_constitution_runtime_state
     )
@@ -1038,7 +1041,8 @@ def _agent_with_unreadable_state():
     agent._safe_mode_reason = None
     agent.agent_id = "did:example:kestrel"
     agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
-    for _name in ("constitution_state_failure", "constitution_state_failure_phrase"):
+    for _name in ("constitution_state_failure", "constitution_state_failure_phrase",
+                  "constitution_state_is_primary_cause"):
         setattr(agent, _name, getattr(ConstitutionMixin, _name).__get__(agent))
     ConstitutionMixin._mark_constitution_state_unavailable(
         agent, TransactionError("database is locked")
@@ -1131,7 +1135,8 @@ def test_a_malformed_state_row_is_reported_without_an_availability_claim():
     agent._safe_mode_reason = None
     agent.agent_id = "did:example:kestrel"
     agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
-    for name in ("constitution_state_failure", "constitution_state_failure_phrase"):
+    for name in ("constitution_state_failure", "constitution_state_failure_phrase",
+                  "constitution_state_is_primary_cause"):
         setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
 
     ConstitutionMixin._mark_constitution_state_unavailable(
@@ -1212,7 +1217,8 @@ def test_a_failed_write_is_not_reported_as_an_unreadable_state():
     agent._safe_mode_reason = None
     agent.agent_id = "did:example:kestrel"
     agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
-    for name in ("constitution_state_failure", "constitution_state_failure_phrase"):
+    for name in ("constitution_state_failure", "constitution_state_failure_phrase",
+                  "constitution_state_is_primary_cause"):
         setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
 
     ConstitutionMixin._mark_constitution_state_unavailable(
@@ -1251,3 +1257,51 @@ async def test_an_audit_pending_agent_is_not_told_to_exit_safe_mode():
     assert "startup integrity audit" in banner
     assert "!safe-mode exit" not in banner
     assert "startup audit completes" in banner
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_never_hides_the_integrity_finding_that_caused_it():
+    """The audit fails, the transition is written, the write fails too.
+
+    `_persist_constitution_runtime_state` records the state-failure marker
+    AFTER the integrity finding latched Safe Mode. Letting that marker take the
+    headline would report only "could not be written" and hide the integrity
+    failure Safe Mode exists to announce — my own change making a genuine
+    finding invisible, which is worse than the vague message it replaced.
+
+    The durable `safe_mode_reason` decides which cause is primary; it is
+    persisted and restored with the row, so it survives a restart even though
+    the exception detail does not.
+    """
+    from kestrel_sdk.storage.database.interface import TransactionError
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._safe_mode_reason = "governing bytes changed"   # the integrity finding
+    agent._safe_mode_entered_at = datetime(2026, 8, 18, tzinfo=timezone.utc)
+    agent._constitution_audit_pending = False
+    agent.agent_id = "did:example:kestrel"
+    agent._constitution_now = lambda: datetime(2026, 8, 18, tzinfo=timezone.utc)
+    for name in ("constitution_state_failure", "constitution_state_failure_phrase",
+                 "constitution_state_is_primary_cause"):
+        setattr(agent, name, getattr(ConstitutionMixin, name).__get__(agent))
+
+    # The write of that transition fails; the marker lands second.
+    ConstitutionMixin._mark_constitution_state_unavailable(
+        agent, TransactionError("disk is full"), operation="written"
+    )
+    agent._safe_mode_reason = "governing bytes changed"  # persist path leaves it
+
+    assert agent.constitution_state_is_primary_cause() is False
+
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+        agent
+    )
+    banner = [c async for c in agent.process_input_streaming("normal prompt")][0]
+
+    assert "integrity failure" in banner, "the integrity finding must survive"
+    assert "could not be written" in banner, "and the write failure is also true"

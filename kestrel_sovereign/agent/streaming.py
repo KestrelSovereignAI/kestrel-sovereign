@@ -1015,8 +1015,15 @@ class StreamingMixin:
             # auto-attribute, a partially built agent) is not a report.
             # The closing is chosen WITH the restriction. A shared tail was
             # wrong for whichever state it was not written for (#2920).
-            if isinstance(phrase, str):
+            primary = getattr(self, "constitution_state_is_primary_cause", None)
+            state_is_primary = primary() is True if callable(primary) else False
+            # Detail is APPENDED, never substituted: a write that failed while
+            # Safe Mode was already latched for an integrity finding must not
+            # take the headline from it (#2920).
+            detail = f" ({phrase})" if isinstance(phrase, str) else ""
+            if isinstance(phrase, str) and state_is_primary:
                 restriction = phrase
+                detail = ""
                 closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
             elif audit_pending and not safe_mode:
                 restriction = "a required startup integrity audit"
@@ -1029,7 +1036,7 @@ class StreamingMixin:
                 closing = "Safe Mode is durable: it clears only with an authorized !safe-mode exit and a fresh audit, not automatically."
             yield (
                 "🚨 SAFE MODE ACTIVE\n\n"
-                f"The agent cannot process queries due to {restriction}.\n"
+                f"The agent cannot process queries due to {restriction}.{detail}\n"
                 "Use !safe-mode to check status or !verify-constitution to "
                 "re-verify.\n\n"
                 f"{closing}"
