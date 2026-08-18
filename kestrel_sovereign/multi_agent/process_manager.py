@@ -93,10 +93,31 @@ class ProcessManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def is_port_in_use(port: int) -> bool:
-        """Check if a TCP port is already bound."""
+    def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+        """Whether `port` cannot be bound — the question callers actually ask.
+
+        Every caller wants to know whether a server can take this port: the
+        start pre-flight before binding it, and the stop postcondition
+        deciding whether the operator's next start will succeed. So binding is
+        what gets tested, because binding is the operation that will fail.
+
+        The previous probe used ``connect_ex``, which answers a different
+        question — "is something accepting connections right now" — and is
+        wrong in the direction that matters. A listener whose accept backlog
+        is full REFUSES new connections while still owning the port, so a held
+        port read as free. Measured: the same listener probes True, then False
+        once one unaccepted connection fills its backlog, while ``bind`` keeps
+        reporting the port taken.
+        """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(("localhost", port)) == 0
+            # Deliberately no SO_REUSEADDR: that option exists to let a bind
+            # succeed alongside a socket in TIME_WAIT, which is precisely the
+            # "actually still taken" case this must report.
+            try:
+                s.bind((host, port))
+            except OSError:
+                return True
+        return False
 
     @staticmethod
     def find_pids_on_port(port: int) -> list[int]:
@@ -146,7 +167,30 @@ class ProcessManager:
 
     @staticmethod
     def is_process_running(pid: int) -> bool:
-        """Check if a process with the given PID is alive."""
+        """Check if a process with the given PID is alive and can still run.
+
+        A zombie is excluded. It has already exited, holds no port and can
+        never run again, but ``os.kill(pid, 0)`` succeeds for it — so treating
+        PID existence as liveness makes a completed stop look like a failure
+        for as long as nobody reaps the child. ``_reap_if_child`` handles the
+        children this process parented; this covers the ones it did not, such
+        as a container PID 1 that does not reap.
+        """
+        try:
+            import psutil
+
+            try:
+                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                    return False
+            except psutil.NoSuchProcess:
+                return False
+            except psutil.AccessDenied:
+                # Visible but not inspectable: it exists, which is the only
+                # claim being made here.
+                return True
+        except ImportError:
+            pass  # Fall through to the syscall probe below.
+
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -620,6 +664,14 @@ class ProcessManager:
         ap = self._agents.get(name)
         if ap is None:
             return True
+
+        # Reap before asking anything about the process. An agent that exited
+        # on its own is a zombie until this process — its parent, via
+        # ``subprocess.Popen`` — collects it, and a stop that returns early
+        # because the child is already gone must still not leave that corpse
+        # behind for the lifetime of the host.
+        if ap.pid is not None:
+            self._reap_if_child(ap.pid)
 
         if ap.pid is None or not self.is_process_running(ap.pid):
             if ap.pid_file:

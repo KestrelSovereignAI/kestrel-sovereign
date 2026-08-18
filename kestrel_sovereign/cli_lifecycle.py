@@ -433,7 +433,12 @@ def _report_port_still_held(label: str, port: int) -> None:
         f"   {label}: port :{port} is still in use — "
         f"not reporting {label} as stopped"
     )
-    print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
+    # A remediation naming a tool the platform does not ship is not a
+    # remediation. Windows is a supported target and has no lsof.
+    if sys.platform == "win32":
+        print(f"   Identify the owner with: netstat -ano | findstr :{port}")
+    else:
+        print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
 
 
 def cmd_stop(args) -> int:

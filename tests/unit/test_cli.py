@@ -610,58 +610,48 @@ class TestCmdStop:
 # -----------------------------------------------------------------------
 
 @contextmanager
-def _listener_on(port: int, *, discovered_pids=(999_999,)):
-    """Hold a real TCP listener on `port`, with the kill path stubbed out.
+def _listener_on(*, discovered_pids=(999_999,)):
+    """Hold a real TCP listener on a kernel-assigned port, kill path stubbed.
 
-    The stubbing lives in here, not at each call site, and that is deliberate.
-    This process owns the listener, so the real ``find_pids_on_port`` returns
-    pytest's OWN pid and ``kill_process`` would then SIGTERM the test runner —
-    which is exactly what happened when one test took a listener without the
-    guard. Binding the two together means no future test can separate them.
+    Binds :0 and yields the port actually assigned. CI runs the unit suite
+    under ``pytest -n auto``, so fixed ports would have workers binding each
+    other's sockets; taking whatever the kernel hands out and never releasing
+    it makes the allocation race-free rather than merely unlikely.
+
+    The kill stubbing lives in here, not at each call site, and that is
+    deliberate: this process owns the listener, so the real
+    ``find_pids_on_port`` returns pytest's OWN pid and ``kill_process`` would
+    then SIGTERM the test runner — which is exactly what happened when one
+    test took a listener without the guard.
 
     Pass ``discovered_pids=()`` to model a listener whose owner cannot be
     discovered at all (another user's process, or psutil missing).
-
-    A background thread accepts and closes each probe. ``is_port_in_use``
-    connects without ever accepting, so an unattended listener's backlog fills
-    after the first probe and every later probe is refused — the port would
-    read as free while still held, which is the very bug under test.
     """
     import socket as _socket
-    import threading
 
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", port))
-    sock.listen(128)
-
-    def _drain():
-        while True:
-            try:
-                conn, _ = sock.accept()
-            except OSError:
-                return  # listener closed — the block is over
-            conn.close()
-
-    drainer = threading.Thread(target=_drain, daemon=True)
-    drainer.start()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    # Nothing accepts these connections, and nothing needs to: the port probe
+    # binds rather than connects, so no accept backlog is ever involved. A
+    # listener left deliberately unattended is also the case that broke the
+    # old connect-based probe.
     try:
         with patch.object(
             ProcessManager, "find_pids_on_port", return_value=list(discovered_pids)
         ), patch.object(ProcessManager, "kill_process", return_value=False), \
              patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
-            yield sock
+            yield sock.getsockname()[1]
     finally:
         sock.close()
-        drainer.join(timeout=2)
 
 
 @contextmanager
 def _unkillable_orphan(pid: int = 999_999):
     """Pretend `pid` listens on every probed port and ignores every signal.
 
-    For the cases with no real listener bound, where the port genuinely is
-    free and the question is what the code concludes from that.
+    For cases with no real listener bound, where the port genuinely is free
+    and the question is what the code concludes from that.
     """
     with patch.object(ProcessManager, "find_pids_on_port", return_value=[pid]), \
          patch.object(ProcessManager, "kill_process", return_value=False), \
@@ -669,41 +659,90 @@ def _unkillable_orphan(pid: int = 999_999):
         yield
 
 
+def _free_port() -> int:
+    """A port nothing is listening on."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _repoint_ports(env, **ports: int) -> None:
+    """Point the fixture's config at ports this test actually owns."""
+    cfg_path = env / "multi_agent.toml"
+    cfg = toml.load(cfg_path)
+    for name, port in ports.items():
+        if name == "host":
+            cfg["host"]["port"] = port
+        else:
+            cfg["agents"][name]["port"] = port
+    with open(cfg_path, "w") as fh:
+        toml.dump(cfg, fh)
+
+
 class TestCmdStopReportsOnlyVerifiedStops:
     """`stop` may report stopped only when the port was actually released."""
 
+    def test_a_held_port_reads_as_held_however_full_its_backlog(self):
+        """The probe must answer "can this be bound", not "is it accepting".
+
+        A listener with a full accept backlog refuses new connections while
+        still owning the port. The old ``connect_ex`` probe therefore reported
+        a held port as free after a single unaccepted connection — which let
+        `stop` report success over exactly the listener it was checking for.
+        """
+        with _listener_on() as port:
+            assert [ProcessManager.is_port_in_use(port) for _ in range(3)] == [
+                True, True, True
+            ]
+
     def test_reap_returns_still_held_when_port_survives_sigkill(self):
-        with _listener_on(18901):
-            result = _reap_orphans_on_port(18901, "claw", force=False)
+        with _listener_on() as port:
+            result = _reap_orphans_on_port(port, "claw", force=False)
         assert result is PortReapResult.STILL_HELD
 
     def test_reap_returns_released_when_port_is_free_after_signalling(self):
-        # Nothing is bound to 18902, so the port probe sees it released.
         with _unkillable_orphan():
-            result = _reap_orphans_on_port(18902, "claw", force=False)
+            result = _reap_orphans_on_port(_free_port(), "claw", force=False)
         assert result is PortReapResult.RELEASED
 
     def test_reap_returns_nothing_found_when_no_listener(self):
         with patch.object(ProcessManager, "find_pids_on_port", return_value=[]):
-            result = _reap_orphans_on_port(18903, "claw", force=False)
+            result = _reap_orphans_on_port(_free_port(), "claw", force=False)
         assert result is PortReapResult.NOTHING_FOUND
+
+    def test_undiscoverable_listener_is_not_reported_as_absent(self):
+        """`find_pids_on_port` returns [] on ANY discovery failure.
+
+        A listener owned by another user, or a missing psutil, yields an empty
+        list while the port stays bound — exactly the unkillable listener this
+        change exists to catch. Concluding "nothing here" from an empty PID
+        list without asking the port would reintroduce the bug at the
+        discovery step.
+        """
+        with _listener_on(discovered_pids=()) as port:
+            result = _reap_orphans_on_port(port, "claw", force=False)
+        assert result is PortReapResult.STILL_HELD
 
     def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
         """A host port nobody could free must not read as a clean shutdown."""
         parser = build_parser()
         args = parser.parse_args(["stop"])
 
-        with _listener_on(18888), \
-             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
+                           testbot=_free_port())
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_stop(args)
 
         output = capsys.readouterr().out
         assert rc == 1
         assert "MultiAgent stopped" not in output
         assert "stop incomplete" in output
         assert "host" in output
-        # The operator is told how to find the process still holding the port.
-        assert "lsof -nP -iTCP:18888 -sTCP:LISTEN" in output
+        assert f"port :{port}" in output
 
     def test_stop_single_agent_fails_when_its_port_stays_held(
         self, multi_agent_env, capsys
@@ -711,9 +750,11 @@ class TestCmdStopReportsOnlyVerifiedStops:
         parser = build_parser()
         args = parser.parse_args(["stop", "claw"])
 
-        with _listener_on(18801), \
-             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
-            rc = cmd_stop(args)
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, claw=port)
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_stop(args)
 
         output = capsys.readouterr().out
         assert rc == 1
@@ -726,6 +767,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         """The success path still succeeds — nothing is bound to claw's port."""
         parser = build_parser()
         args = parser.parse_args(["stop", "claw"])
+        _repoint_ports(multi_agent_env, claw=_free_port())
 
         with _unkillable_orphan(), \
              patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
@@ -734,19 +776,6 @@ class TestCmdStopReportsOnlyVerifiedStops:
         output = capsys.readouterr().out
         assert rc == 0
         assert "claw stopped (orphan)" in output
-
-    def test_undiscoverable_listener_is_not_reported_as_absent(self):
-        """`find_pids_on_port` returns [] on ANY discovery failure.
-
-        A listener owned by another user, or a missing psutil, yields an empty
-        list while the port stays bound — exactly the unkillable listener this
-        change exists to catch. Concluding "nothing here" from an empty PID
-        list without asking the port would reintroduce the bug at the
-        discovery step.
-        """
-        with _listener_on(18904, discovered_pids=()):
-            result = _reap_orphans_on_port(18904, "claw", force=False)
-        assert result is PortReapResult.STILL_HELD
 
     def test_tracked_agent_with_a_still_bound_port_is_not_reported_stopped(
         self, multi_agent_env, capsys
@@ -759,12 +788,14 @@ class TestCmdStopReportsOnlyVerifiedStops:
         parser = build_parser()
         args = parser.parse_args(["stop", "claw"])
 
-        with _listener_on(18801), \
-             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
-             patch.object(ProcessManager, "stop_agent", return_value=True), \
-             patch.object(ProcessManager, "read_pid", return_value=4242), \
-             patch.object(ProcessManager, "is_process_running", return_value=True):
-            rc = cmd_stop(args)
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, claw=port)
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env), \
+                 patch.object(ProcessManager, "stop_agent", return_value=True), \
+                 patch.object(ProcessManager, "read_pid", return_value=4242), \
+                 patch.object(ProcessManager, "is_process_running", return_value=True):
+                rc = cmd_stop(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
@@ -793,13 +824,14 @@ class TestCmdStopReportsOnlyVerifiedStops:
         # thereafter — the process died, but the port did not come back.
         probes = iter([True])
 
-        def _running(pid):
-            return next(probes, False)
-
-        with _listener_on(18888), \
-             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
-             patch.object(ProcessManager, "is_process_running", side_effect=_running):
-            rc = cmd_stop(args)
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
+                           testbot=_free_port())
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env), \
+                 patch.object(ProcessManager, "is_process_running",
+                              side_effect=lambda pid: next(probes, False)):
+                rc = cmd_stop(args)
 
         output = capsys.readouterr().out
         assert rc == 1, output
