@@ -156,7 +156,7 @@ def create_backend(
 def _create_sqlite_backend(config: Dict[str, Any]) -> SQLiteBackend:
     """Create SQLite backend from config.
 
-    ``read_only`` is honoured only here. PostgreSQL is a server: a second
+    ``cold_read`` is honoured only here. PostgreSQL is a server: a second
     connection to it is ordinary and does not contend for a file lock, so the
     hazard this exists for — an inspection tool taking a write lock on a
     database a running agent holds — is SQLite-specific (#2920).
@@ -165,7 +165,7 @@ def _create_sqlite_backend(config: Dict[str, Any]) -> SQLiteBackend:
         "db_path",
         os.getenv("KESTREL_DB_PATH", "./agent_data/kestrel.db")
     )
-    return SQLiteBackend(db_path, read_only=bool(config.get("read_only", False)))
+    return SQLiteBackend(db_path, cold_read=bool(config.get("cold_read", False)))
 
 
 def _create_postgres_backend(config: Dict[str, Any]) -> DatabaseBackend:

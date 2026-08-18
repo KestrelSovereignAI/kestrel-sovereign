@@ -49,6 +49,16 @@ _SQLITE_BUSY_TIMEOUT_S = 30.0
 _CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
 
 
+class ColdReadUnavailable(RuntimeError):
+    """A cold read was requested for a database that is not quiescent.
+
+    Its own type rather than ``ValueError``: callers distinguish "this store
+    is busy, ask again when the agent is stopped" from a bad argument, and a
+    sibling of a stdlib exception would be caught by handlers that never meant
+    to cover this.
+    """
+
+
 class _CancelledWriteDrainDeadlineExceeded(RuntimeError):
     """A retained rollback is still running after a later writer's budget."""
 
@@ -320,21 +330,33 @@ class SQLiteBackend(DatabaseBackend):
     - Foreign key enforcement
     """
     
-    def __init__(self, db_path: str, *, read_only: bool = False):
+    def __init__(self, db_path: str, *, cold_read: bool = False):
         """
         Initialize SQLite backend.
 
         Args:
             db_path: Path to SQLite database file, or ":memory:" for in-memory
-            read_only: Open with ``mode=ro`` so this connection cannot take a
-                write lock on a file another process may be using. SQLite
-                serialises writers at the FILE level, and the per-connection
-                write-unit lock cannot serialise a *second* connection to the
-                same file — so an inspection that opens read-write can contend
-                with a running agent even though it never writes (#2920).
+            cold_read: Open the database without disturbing it at all, for
+                inspection paths. SQLite serialises writers at the FILE level
+                and the per-connection write-unit lock cannot serialise a
+                *second* connection to the same file, so an inspection that
+                opens read-write can contend with a running agent even though
+                it never writes (#2920).
+
+                Not merely ``mode=ro``: a plain read-only connection opening a
+                WAL database still CREATES the ``-wal``/``-shm`` sidecars and,
+                lacking write access, cannot remove them on close. Those
+                leftovers are read as live WAL state by the cold identity
+                lookup, so a "read-only" inspection would fabricate evidence
+                that the agent is running. This uses the same discipline as
+                ``identity.local_anchor``: refuse when sidecars are present,
+                then open ``immutable=1``, which creates none.
         """
         self.db_path = db_path
-        self.read_only = read_only
+        self.cold_read = cold_read
+        #: Whether the cold-read connection was opened ``immutable=1`` and is
+        #: therefore blind to a WAL that appears while it is open.
+        self._cold_read_ignored_wal = False
         self._connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
         # Serializes operation *units* on the single shared connection. aiosqlite
@@ -436,6 +458,63 @@ class SQLiteBackend(DatabaseBackend):
         """
         return _minimum_close_timeout_s()
     
+    def _wal_sidecars(self) -> tuple[Path, ...]:
+        """The files SQLite creates beside a WAL database while it is in use."""
+        return (Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm"))
+
+    def _has_wal_sidecars(self) -> bool:
+        return any(sidecar.exists() for sidecar in self._wal_sidecars())
+
+    def _cold_read_uri(self) -> str:
+        """Build the cold-read URI, adapted to what is already on disk.
+
+        Neither branch writes, checkpoints, or takes a write lock, so neither
+        can contend with a running agent. They differ only in how they handle
+        a WAL, and each is wrong in the other's situation:
+
+        ``immutable=1`` promises SQLite the file cannot change. That is what
+        stops it creating the ``-wal``/``-shm`` files a plain read-only open
+        leaves behind and cannot remove — but it also makes SQLite ignore WAL
+        content outright, so using it while a WAL exists would report pre-WAL
+        governance state as current.
+
+        A plain ``mode=ro`` reads the WAL truthfully, but on a quiescent
+        database it CREATES the sidecars, which the cold identity lookup then
+        reads as a live agent — an inspection that plants the evidence.
+
+        So: immutable when there is no WAL to miss, plain read-only when there
+        is one, and in both cases the directory is left as it was found.
+        """
+        # ``as_uri()`` percent-escapes the path. Interpolating a bare path
+        # would let a directory named e.g. ``Test?Agent`` end the path early
+        # and swallow the flags that make this read cold — SQLite would fall
+        # back to read-write-create and open a different file, silently
+        # defeating the mechanism.
+        uri = Path(self.db_path).resolve().as_uri()
+        self._cold_read_ignored_wal = not self._has_wal_sidecars()
+        flags = "mode=ro&immutable=1" if self._cold_read_ignored_wal else "mode=ro"
+        return f"{uri}?{flags}"
+
+    def assert_cold_read_still_valid(self) -> None:
+        """Refuse to report on an immutable read that a writer raced.
+
+        Only meaningful for the immutable branch: it was chosen because there
+        was no WAL, and an immutable reader ignores one that appears, so a
+        writer arriving mid-read would leave this connection reporting stale
+        state as current. Detecting it afterwards is the only defence an
+        immutable reader has. Callers must invoke this before acting on what
+        they read — the storage layer cannot know when a read is complete.
+        """
+        if not self.cold_read or self.db_path == ":memory:":
+            return
+        if self._cold_read_ignored_wal and self._has_wal_sidecars():
+            raise ColdReadUnavailable(
+                f"Cannot report on {self.db_path}: SQLite WAL state appeared "
+                "while it was being read, and this connection was opened "
+                "immutable so it has been ignoring that WAL. Stop the agent "
+                "and retry."
+            )
+
     async def connect(self) -> None:
         """Connect to SQLite database."""
         if self.connection_retirement_pending:
@@ -452,17 +531,17 @@ class SQLiteBackend(DatabaseBackend):
             await self.close()
         
         try:
-            # Create directory if needed (unless in-memory). A read-only
+            # Create directory if needed (unless in-memory). A cold-read
             # opener must not bring the database it is inspecting into
             # existence — "there is nothing here" is an answer it has to be
             # able to give.
-            if self.db_path != ":memory:" and not self.read_only:
+            if self.db_path != ":memory:" and not self.cold_read:
                 db_dir = Path(self.db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
 
-            if self.read_only:
+            if self.cold_read:
                 self._connection = await aiosqlite.connect(
-                    f"file:{Path(self.db_path).as_posix()}?mode=ro",
+                    self._cold_read_uri(),
                     uri=True,
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
                 )
@@ -471,11 +550,11 @@ class SQLiteBackend(DatabaseBackend):
                     self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
                 )
 
-            # Enable WAL mode for better concurrency. Skipped when read-only:
+            # Enable WAL mode for better concurrency. Skipped for a cold read:
             # setting the journal mode WRITES to the database header, so this
             # is not merely unnecessary there — it would fail the connection
             # outright, which is the trap in making this path read-only.
-            if not self.read_only:
+            if not self.cold_read:
                 await self._connection.execute("PRAGMA journal_mode=WAL")
             
             # Allow concurrent writers to wait up to 30s for the lock

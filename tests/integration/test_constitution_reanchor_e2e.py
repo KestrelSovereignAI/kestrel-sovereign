@@ -1119,7 +1119,7 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
 
 
 @pytest.mark.asyncio
-async def test_drift_inspection_never_opens_a_writable_connection(tmp_path, monkeypatch):
+async def test_drift_inspection_leaves_the_database_untouched(tmp_path, monkeypatch):
     """Without --force this command is documented as performing no write.
 
     It opened read-write anyway, and SQLite serialises writers at the FILE
@@ -1128,12 +1128,14 @@ async def test_drift_inspection_never_opens_a_writable_connection(tmp_path, monk
     a running agent's database — which is how #2920 dropped a live agent into
     Safe Mode while the caller saw nothing at all.
 
-    This observes what the code actually opened rather than asserting on a
-    state the test arranged: every AsyncStorage construction during the run is
-    recorded, and the read-only flag is read back off those calls.
+    The assertion is the on-disk postcondition, not the arguments any one
+    opener was called with. An earlier version of this test recorded every
+    ``AsyncStorage`` construction and checked its backend flag; it passed while
+    the command still took a writable connection, because target resolution
+    opens the anchor through a direct ``sqlite3.connect`` that never goes
+    through ``AsyncStorage`` at all. Bytes and sidecars catch a write through
+    any door, including doors added later.
     """
-    from kestrel_sovereign.setup import constitution_reanchor as cr
-
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
     import kestrel_sovereign.config as ks_config
@@ -1149,18 +1151,15 @@ async def test_drift_inspection_never_opens_a_writable_connection(tmp_path, monk
     # Drift: the canonical file moves, the anchor does not.
     constitution_path.write_bytes(CONSTITUTION_V2)
 
-    # Record the BACKENDS, not the constructor kwargs. Asserting on what the
-    # caller asked for would pass even if the backend ignored the flag
-    # entirely — the request is not the guarantee.
-    backends: list = []
-    real_init = cr.AsyncStorage.__init__
+    def _tree() -> dict[str, bytes]:
+        return {
+            entry.name: entry.read_bytes()
+            for entry in sorted(agent_dir.iterdir())
+            if entry.is_file()
+        }
 
-    def _record(self, *args, **kwargs):
-        result = real_init(self, *args, **kwargs)
-        backends.append(self._backend)
-        return result
-
-    monkeypatch.setattr(cr.AsyncStorage, "__init__", _record)
+    before = _tree()
+    assert "kestrel_prime.db" in before, before.keys()
 
     result = await reanchor_constitution(
         agent_name="TestAgent",
@@ -1170,9 +1169,26 @@ async def test_drift_inspection_never_opens_a_writable_connection(tmp_path, monk
     )
 
     assert result.drift_unforced, f"expected a drift report: {result}"
-    assert backends, "the inspection must have opened storage at all"
-    effective = [getattr(b, "read_only", None) for b in backends]
-    assert all(e is True for e in effective), (
-        "a --force-less run opened a writable connection: backend read_only "
-        f"was {effective}"
+
+    after = _tree()
+    appeared = sorted(set(after) - set(before))
+    assert not appeared, (
+        "a --force-less run created files beside the database it was only "
+        f"asked to read: {appeared}. A plain mode=ro connection to a WAL "
+        "database creates -wal/-shm sidecars and cannot remove them, and the "
+        "cold identity lookup reads those as a live agent."
+    )
+    changed = sorted(name for name, blob in after.items() if before.get(name) != blob)
+    assert not changed, f"a --force-less run rewrote {changed}"
+
+    # The sidecars are not merely untidy: their presence makes the cold
+    # identity lookup refuse this agent outright. Prove the inspection did not
+    # cost the agent that.
+    from kestrel_sovereign.identity.local_anchor import (
+        AgentDIDLookupMode,
+        read_anchor_agent_did,
+    )
+
+    assert await read_anchor_agent_did(
+        str(agent_dir), mode=AgentDIDLookupMode.COLD_READ_ONLY
     )

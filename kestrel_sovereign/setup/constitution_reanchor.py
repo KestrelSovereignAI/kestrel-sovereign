@@ -135,10 +135,10 @@ class ReanchorTarget:
             return f"sqlite:{self.anchor_path}"
         return f"{self.backend}:{_redacted_dsn(self.dsn)}"
 
-    def open_storage(self, *, read_only: bool = False) -> AsyncStorage:
+    def open_storage(self, *, cold_read: bool = False) -> AsyncStorage:
         """Open the runtime database, bound to this agent.
 
-        ``read_only`` is for the inspection paths. Target resolution and drift
+        ``cold_read`` is for the inspection paths. Target resolution and drift
         detection run BEFORE the ``if not force:`` early return, and this
         command is documented as performing no write without ``--force`` — but
         it opened read-write regardless. SQLite serialises writers at the file
@@ -147,6 +147,12 @@ class ReanchorTarget:
         with a running agent's database. In #2920 that dropped a live agent
         into Safe Mode; the caller saw nothing, because the cost landed on the
         agent (#2920).
+
+        A cold read is stronger than ``mode=ro`` and deliberately so: a plain
+        read-only connection to a WAL database creates sidecars it then cannot
+        remove, and the cold identity lookup reads those as a live agent. An
+        inspection that leaves that behind has not read without disturbing —
+        it has planted evidence.
 
         The backend is passed **explicitly** in both branches. ``AsyncStorage``
         falls back to ``KESTREL_DB_BACKEND`` when it is not, which is how a
@@ -164,13 +170,13 @@ class ReanchorTarget:
                 str(self.anchor_path),
                 backend="sqlite",
                 agent_id=self.agent_did,
-                read_only=read_only,
+                cold_read=cold_read,
             )
         return AsyncStorage(
             backend=self.backend,
             dsn=self.dsn,
             agent_id=self.agent_did,
-            read_only=read_only,
+            cold_read=cold_read,
         )
 
 
@@ -202,6 +208,7 @@ async def resolve_reanchor_target(
     *,
     backend: str | None = None,
     dsn: str | None = None,
+    cold: bool = False,
 ) -> ReanchorTarget:
     """Resolve the database the *runtime* would open for this agent, and the
     tenant it would bind.
@@ -268,19 +275,29 @@ async def resolve_reanchor_target(
         read_anchor_agent_did,
     )
 
+    # The lookup mode follows what the command is about to do.
+    #
+    # INITIALIZATION opens the anchor ``mode=rw`` so SQLite can replay a WAL
+    # before reading. That is a write — it checkpoints the file and clears its
+    # sidecars — during what the caller thinks is a read. A *repair* has to
+    # accept that: COLD_READ_ONLY refuses an anchor with live WAL state, and
+    # leftover sidecars after an unclean stop are ordinary, so refusing there
+    # would brick the #2616 edge repair for exactly the agents most likely to
+    # need it. Checkpointing preserves the record; it only settles how it is
+    # stored.
+    #
+    # A drift-only run repairs nothing — it returns at ``if not force:`` — and
+    # is documented as performing no write, so it inspects rather than
+    # checkpoints. INSPECTION, not COLD_READ_ONLY: a cold authority read
+    # refuses when sidecars are present, and `kestrel doctor` prescribes this
+    # very command after leaving some, so refusing would deny the drift report
+    # exactly when it was asked for.
+    lookup_mode = (
+        AgentDIDLookupMode.INSPECTION if cold
+        else AgentDIDLookupMode.INITIALIZATION
+    )
     try:
-        # INITIALIZATION, which opens the anchor ``mode=rw`` so SQLite can
-        # replay a WAL before reading. That is a write — it checkpoints the
-        # file and clears its sidecars — during what the caller thinks is a
-        # read, and COLD_READ_ONLY would avoid it. But COLD_READ_ONLY *refuses*
-        # an anchor with live WAL state, and leftover sidecars after an unclean
-        # stop are ordinary. Refusing there would brick the #2616 edge repair
-        # for exactly the agents most likely to need it, to protect a
-        # file-mtime property nothing depends on. Checkpointing preserves the
-        # record; it only settles how it is stored.
-        agent_did = await read_anchor_agent_did(
-            str(agent_dir), mode=AgentDIDLookupMode.INITIALIZATION
-        )
+        agent_did = await read_anchor_agent_did(str(agent_dir), mode=lookup_mode)
     except ValueError as exc:
         raise ReanchorTargetError(
             f"Cannot identify the agent in {agent_dir}: {exc}. The local "
@@ -416,6 +433,9 @@ async def reanchor_constitution(
             agent_dir,
             backend=runtime_backend,
             dsn=runtime_dsn,
+            # Without --force this command returns a drift report and writes
+            # nothing, so it must not take a write lock to produce one.
+            cold=not force,
         )
     except ReanchorTargetError as exc:
         return ReanchorResult(
@@ -873,7 +893,7 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
 
     from kestrel_sovereign.identity.birth_record import is_fabricated_placeholder
 
-    async with target.open_storage(read_only=True) as storage:
+    async with target.open_storage(cold_read=True) as storage:
         # Ownership first, because it can veto both of the states below.
         # ``add_node`` refuses a row owned by anyone other than this agent, and
         # refuses one with several owners, so replication cannot land there —
@@ -939,7 +959,7 @@ async def _read_agent_anchor(
     guarantees, and only the second one survives an agent that owns more than
     one agent-typed node.
     """
-    async with target.open_storage(read_only=True) as storage:
+    async with target.open_storage(cold_read=True) as storage:
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
             # Same privileged connection the edge read below uses, and for a

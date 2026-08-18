@@ -128,7 +128,7 @@ class AsyncStorage:
         _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
         semantic_capabilities=None,
         _artifact_clock=None,
-        read_only: bool = False,
+        cold_read: bool = False,
     ):
         """
         Initialize AsyncStorage.
@@ -192,12 +192,12 @@ class AsyncStorage:
             pg_dsn = dsn or os.getenv("KESTREL_DATABASE_URL")
             if pg_dsn:
                 self._backend = create_backend(
-                    {"backend": "postgres", "dsn": pg_dsn, "read_only": read_only}
+                    {"backend": "postgres", "dsn": pg_dsn, "cold_read": cold_read}
                 )
             else:
                 # Fall back to individual env vars
                 self._backend = create_backend(
-                    {"backend": "postgres", "read_only": read_only}
+                    {"backend": "postgres", "cold_read": cold_read}
                 )
         else:
             # Default or explicit SQLite mode.  An explicit backend is an
@@ -212,9 +212,9 @@ class AsyncStorage:
             self.db_path = db_path
             # SQLite serialises writers at the FILE level, so an inspection
             # that opens read-write can contend with a running agent even
-            # though it never writes (#2920). Read-only is refused by SQLite
+            # though it never writes (#2920). A cold read is refused by SQLite
             # itself, not merely by convention.
-            self._backend = SQLiteBackend(db_path, read_only=read_only)
+            self._backend = SQLiteBackend(db_path, cold_read=cold_read)
 
         if _assertion_tenant_capability is not None:
             if type(_assertion_tenant_capability) is not _AssertionTenantCapability:
@@ -227,6 +227,7 @@ class AsyncStorage:
         else:
             self._assertion_tenant_capability = None
 
+        self.cold_read = cold_read
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None
@@ -336,9 +337,23 @@ class AsyncStorage:
                 await previous_db.finalize_retired_sqla_factory()
             await self._backend.connect()
             self.db = AsyncDatabase(self._backend)
-            await self.db._init_schema()
+            # A cold read inspects a database it must not alter, so it runs
+            # neither of the two write-oriented steps a normal open performs:
+            # ``_init_schema`` issues migrations and DDL, and the destructive
+            # audit log CREATES a second database file beside the one being
+            # inspected. On a current schema those would fail against an
+            # immutable connection; the point is that they must not be
+            # attempted at all. A cold reader reads what is already there, and
+            # records nothing — it performs no destructive operation to audit.
+            if not self.cold_read:
+                await self.db._init_schema()
             self.db._initialized = True
-            if self.backend_type == "sqlite" and self.db_path and self.db_path != ":memory:":
+            if (
+                not self.cold_read
+                and self.backend_type == "sqlite"
+                and self.db_path
+                and self.db_path != ":memory:"
+            ):
                 self.destructive_audit = DestructiveAuditLog(audit_db_path_for(self.db_path))
                 await self.destructive_audit.initialize()
             self.files = AsyncFileStore(self.db, agent_id=self.agent_id)
@@ -400,6 +415,24 @@ class AsyncStorage:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+        # Validate the cold read only if the block succeeded. Raising here over
+        # an exception already in flight would replace the real failure with a
+        # complaint about the connection it happened on. Placed in ``__aexit__``
+        # rather than at the end of each caller's block because these blocks
+        # return early in several branches, and a check the caller can skip by
+        # returning is not a check.
+        if exc_type is None:
+            self.assert_cold_read_still_valid()
+
+    def assert_cold_read_still_valid(self) -> None:
+        """Refuse to act on a cold read that a writer raced. No-op otherwise.
+
+        Delegated to the backend, which is the only layer that knows whether
+        this connection was opened blind to a WAL.
+        """
+        checker = getattr(self._backend, "assert_cold_read_still_valid", None)
+        if checker is not None:
+            checker()
 
     @asynccontextmanager
     async def transaction(self):
