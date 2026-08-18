@@ -7,6 +7,7 @@ and log reading — all without spawning real subprocesses.
 
 import json
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -526,6 +527,44 @@ class TestStopAgent:
             survivors = pm.stop_all(timeout=0.01)
 
         assert survivors == ["claw"]
+
+    def test_a_reaped_zombie_child_counts_as_stopped(self, pm, project_dir):
+        """A killed child this process parented is a zombie until waited on.
+
+        ``os.kill(pid, 0)`` succeeds for a zombie, so the post-stop check
+        would call a perfectly successful stop a failure — and keep doing so
+        until the parent exited. ``start_agent`` uses ``subprocess.Popen``, so
+        this process really is the parent; a real zombie is used here because
+        a mocked probe cannot exhibit what ``waitpid`` fixes.
+        """
+        import subprocess
+        import sys as _sys
+
+        child = subprocess.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        child.kill()
+        time.sleep(0.5)
+        # Deliberately not reaped here — that is the condition under test.
+        assert ProcessManager.is_process_running(child.pid) is True, (
+            "setup must produce a zombie the naive probe calls alive"
+        )
+
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        ap = pm.register_agent("claw", cfg)
+        ap.pid = child.pid
+        ProcessManager.write_pid(ap.pid_file, child.pid)
+
+        try:
+            result = pm.stop_agent("claw", timeout=0.01)
+        finally:
+            try:
+                child.wait(timeout=5)
+            except Exception:
+                pass
+
+        assert result is True
+        assert not ap.pid_file.exists()
 
 
 # -----------------------------------------------------------------------

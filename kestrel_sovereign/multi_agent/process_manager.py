@@ -643,6 +643,14 @@ class ProcessManager:
             self.kill_process(ap.pid, force=True)
             time.sleep(0.5)
 
+        # Reap before judging. ``start_agent`` spawns agents with
+        # ``subprocess.Popen``, so this process is their parent, and a killed
+        # child that nobody waits on stays a ZOMBIE — for which
+        # ``os.kill(pid, 0)`` succeeds. Without this, a stop that worked
+        # perfectly would report failure, and keep reporting it until the
+        # parent happened to exit. Measured: state 'Z', probe says alive.
+        self._reap_if_child(ap.pid)
+
         if self.is_process_running(ap.pid):
             logger.error(
                 f"Agent '{name}' (PID {ap.pid}) is still running after SIGKILL; "
@@ -676,6 +684,23 @@ class ProcessManager:
             except RuntimeError as e:
                 logger.error(f"Failed to start agent '{name}': {e}")
         return started
+
+    @staticmethod
+    def _reap_if_child(pid: int) -> None:
+        """Collect `pid`'s exit status if this process is its parent.
+
+        Best effort by design. ``ChildProcessError`` means it is not our
+        child — an agent started by an earlier CLI invocation, say — and
+        there is nothing to reap; the kernel's own init already handles the
+        orphan case. ``waitpid`` is unavailable on Windows, where a killed
+        process leaves no zombie to begin with.
+        """
+        if sys.platform == "win32":
+            return
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
 
     def stop_all(self, timeout: float = 5.0) -> list[str]:
         """Stop all managed agent processes.

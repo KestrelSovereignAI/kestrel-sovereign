@@ -610,14 +610,22 @@ class TestCmdStop:
 # -----------------------------------------------------------------------
 
 @contextmanager
-def _listener_on(port: int):
-    """Hold a real TCP listener on `port` for the duration of the block.
+def _listener_on(port: int, *, discovered_pids=(999_999,)):
+    """Hold a real TCP listener on `port`, with the kill path stubbed out.
+
+    The stubbing lives in here, not at each call site, and that is deliberate.
+    This process owns the listener, so the real ``find_pids_on_port`` returns
+    pytest's OWN pid and ``kill_process`` would then SIGTERM the test runner —
+    which is exactly what happened when one test took a listener without the
+    guard. Binding the two together means no future test can separate them.
+
+    Pass ``discovered_pids=()`` to model a listener whose owner cannot be
+    discovered at all (another user's process, or psutil missing).
 
     A background thread accepts and closes each probe. ``is_port_in_use``
     connects without ever accepting, so an unattended listener's backlog fills
     after the first probe and every later probe is refused — the port would
-    read as free while it is still held, which is precisely the bug under
-    test.
+    read as free while still held, which is the very bug under test.
     """
     import socket as _socket
     import threading
@@ -638,7 +646,11 @@ def _listener_on(port: int):
     drainer = threading.Thread(target=_drain, daemon=True)
     drainer.start()
     try:
-        yield sock
+        with patch.object(
+            ProcessManager, "find_pids_on_port", return_value=list(discovered_pids)
+        ), patch.object(ProcessManager, "kill_process", return_value=False), \
+             patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
+            yield sock
     finally:
         sock.close()
         drainer.join(timeout=2)
@@ -646,7 +658,11 @@ def _listener_on(port: int):
 
 @contextmanager
 def _unkillable_orphan(pid: int = 999_999):
-    """Pretend `pid` listens on every probed port and ignores every signal."""
+    """Pretend `pid` listens on every probed port and ignores every signal.
+
+    For the cases with no real listener bound, where the port genuinely is
+    free and the question is what the code concludes from that.
+    """
     with patch.object(ProcessManager, "find_pids_on_port", return_value=[pid]), \
          patch.object(ProcessManager, "kill_process", return_value=False), \
          patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
@@ -657,7 +673,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
     """`stop` may report stopped only when the port was actually released."""
 
     def test_reap_returns_still_held_when_port_survives_sigkill(self):
-        with _listener_on(18901), _unkillable_orphan():
+        with _listener_on(18901):
             result = _reap_orphans_on_port(18901, "claw", force=False)
         assert result is PortReapResult.STILL_HELD
 
@@ -677,7 +693,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         parser = build_parser()
         args = parser.parse_args(["stop"])
 
-        with _listener_on(18888), _unkillable_orphan(), \
+        with _listener_on(18888), \
              patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_stop(args)
 
@@ -695,14 +711,14 @@ class TestCmdStopReportsOnlyVerifiedStops:
         parser = build_parser()
         args = parser.parse_args(["stop", "claw"])
 
-        with _listener_on(18801), _unkillable_orphan(), \
+        with _listener_on(18801), \
              patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
             rc = cmd_stop(args)
 
         output = capsys.readouterr().out
         assert rc == 1
         assert "claw stopped" not in output
-        assert "still held after SIGKILL" in output
+        assert "still in use" in output
 
     def test_stop_single_agent_reports_orphan_stop_when_port_is_released(
         self, multi_agent_env, capsys
@@ -718,6 +734,80 @@ class TestCmdStopReportsOnlyVerifiedStops:
         output = capsys.readouterr().out
         assert rc == 0
         assert "claw stopped (orphan)" in output
+
+    def test_undiscoverable_listener_is_not_reported_as_absent(self):
+        """`find_pids_on_port` returns [] on ANY discovery failure.
+
+        A listener owned by another user, or a missing psutil, yields an empty
+        list while the port stays bound — exactly the unkillable listener this
+        change exists to catch. Concluding "nothing here" from an empty PID
+        list without asking the port would reintroduce the bug at the
+        discovery step.
+        """
+        with _listener_on(18904, discovered_pids=()):
+            result = _reap_orphans_on_port(18904, "claw", force=False)
+        assert result is PortReapResult.STILL_HELD
+
+    def test_tracked_agent_with_a_still_bound_port_is_not_reported_stopped(
+        self, multi_agent_env, capsys
+    ):
+        """The tracked PID being gone does not mean the port was released.
+
+        A supervisor may already have rebound it under a new PID, and the next
+        `kestrel start` fails on a port this command called free.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+
+        with _listener_on(18801), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch.object(ProcessManager, "stop_agent", return_value=True), \
+             patch.object(ProcessManager, "read_pid", return_value=4242), \
+             patch.object(ProcessManager, "is_process_running", return_value=True):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        assert "still in use" in output
+
+    def test_dead_host_pid_is_cleared_even_when_the_port_stays_held(
+        self, multi_agent_env, capsys
+    ):
+        """A stale PID record is worse than none.
+
+        The PID file is worth keeping only while it names something real. Once
+        that process is gone the number can be reused, and the next lifecycle
+        command would signal an unrelated process — so it is cleared on its
+        own facts, independently of who holds the port.
+        """
+        from kestrel_sovereign.cli_lifecycle import _host_pid_file
+
+        pid_file = _host_pid_file(multi_agent_env)
+        ProcessManager.write_pid(pid_file, 4242)
+        assert pid_file.exists()
+
+        parser = build_parser()
+        args = parser.parse_args(["stop"])
+
+        # Alive on the first probe so the host branch is entered, gone
+        # thereafter — the process died, but the port did not come back.
+        probes = iter([True])
+
+        def _running(pid):
+            return next(probes, False)
+
+        with _listener_on(18888), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch.object(ProcessManager, "is_process_running", side_effect=_running):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        assert "stop incomplete" in output
+        assert not pid_file.exists(), (
+            "a dead host's PID file was kept because the port was still held; "
+            "the number can be reused and signalled by the next command"
+        )
 
 
 # -----------------------------------------------------------------------
