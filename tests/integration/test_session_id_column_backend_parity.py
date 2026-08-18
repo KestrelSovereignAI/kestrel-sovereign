@@ -2764,3 +2764,58 @@ async def test_tied_sessions_page_by_code_point_not_by_locale(postgres_db):
         )
     finally:
         await db.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.timeout(120)
+async def test_a_null_stamped_row_is_not_redated_by_an_append(db_backend, monkeypatch):
+    """An undatable row must sort first on BOTH engines, and stay put.
+
+    The engines disagree by default: `created_at ASC` puts NULL LAST on
+    PostgreSQL and FIRST on SQLite. That is already two orders wearing one name,
+    and it decides something load-bearing — the grouper dates a row with no
+    readable stamp from the row BEFORE it. Ordered last, an ordinary append to
+    an unrelated session becomes that row's new predecessor and re-dates it;
+    `_plan` sees a pure append, folds only the appended session, and records a
+    current watermark over the session that just changed underneath it.
+
+    Ordered first it has no predecessor and cannot acquire one, so its stamp is
+    the epoch and nothing appended later can move it.
+
+    Dual-backend on purpose: the SQLite leg passes either way, which is exactly
+    why the SQLite-only version of this case did not catch it.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:null-stamp:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        store = AsyncConversationStore(db, agent_id=agent_id)
+
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, 'user', 'undatable', ?, ?, NULL)",
+            (agent_id, json.dumps({"session_id": UUID_A}), UUID_A),
+        )
+        projection = ConversationSessionProjection(db, agent_id)
+        assert (await projection.repair()).current
+        before = await projection.get(UUID_A)
+        assert before is not None, "the undatable session was not projected"
+
+        # An ordinary append, to a DIFFERENT session.
+        await store.add_conversation("user", "unrelated later turn", session_id=UUID_B)
+        assert (await projection.repair()).current
+
+        assert await projection.get(UUID_A) == before, (
+            "appending to another session moved the undatable session's stored "
+            "row; on this backend the NULL stamp sorts last, so the append "
+            "became its predecessor"
+        )
+        await _assert_the_projection_agrees_with_the_grouper(
+            db, projection, agent_id
+        )

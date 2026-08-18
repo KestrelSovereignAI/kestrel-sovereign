@@ -564,8 +564,21 @@ def canonical_order(backend_type: str, *, descending: bool = False) -> str:
     own, so :func:`canonical_timestamp_sql` returns it unchanged there.
     """
     direction = "DESC" if descending else "ASC"
+    # NULLs are placed explicitly, and the two directions are exact reverses of
+    # each other so the reader's newest-first page reverses into this order.
+    # The engines disagree by default — measured, `created_at ASC` puts NULL
+    # LAST on PostgreSQL and FIRST on SQLite — which alone would make one
+    # "canonical" order two. It also decides where an undatable row SITS, and
+    # the grouper dates such a row from the row before it: ordered last, an
+    # ordinary append to any session becomes its new predecessor and silently
+    # re-dates it, which an incremental repair (touching only the appended
+    # session) then records as current. Ordered first it has no predecessor and
+    # never can acquire one, so its stamp is the epoch and nothing appended
+    # later can move it. Undatable means "earliest", on both engines, always.
+    nulls = "NULLS LAST" if descending else "NULLS FIRST"
     return "ORDER BY " + ", ".join(
         f"{_canonical_key(backend_type, column)} {direction}"
+        + (f" {nulls}" if column == "created_at" else "")
         for column in CANONICAL_ORDER_COLUMNS
     )
 
@@ -1536,6 +1549,24 @@ class ConversationSessionProjection:
         target — and the next step's equality would be comparing two numbers that
         are no longer about the same instant.
         """
+        # LIMIT (#3001): everything below assumes row ids are POSITIVE and only
+        # ever APPEND. Both hold for every writer here — ``AUTOINCREMENT`` and
+        # ``bigserial`` issue increasing positive ids — and neither is enforced
+        # by the schema, so maintenance or import SQL can break them. Two shapes
+        # this misreads, both reported by round-9 review:
+        #
+        #   * an id rewritten from at-or-below the target to above it bumps the
+        #     stamp once and leaves one row above the target, which is exactly
+        #     an append's signature, so the row is folded into its already
+        #     counted session a second time;
+        #   * a row with an id of zero or less is never selected by the walk,
+        #     which starts at ``through = 0`` and takes ``id > through``.
+        #
+        # Both end with a watermark recorded as current over a projection that
+        # is not. Telling them apart needs the watermark to carry more than
+        # ``max(id)`` — a live row count would separate "one appended" from "one
+        # moved" — which is a change to what a watermark IS, so it is #3001
+        # rather than a guard bolted on here.
         if not accounted.valid:
             return _Plan(REBUILT, observed, 0, await self._max_id(), True)
         if observed == accounted.stamp:

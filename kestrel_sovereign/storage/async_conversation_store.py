@@ -28,6 +28,7 @@ from .session_grouping import (
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    sort_sessions,
     summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
@@ -469,7 +470,11 @@ def search_session_summaries(
             session["match_snippet"] = None
         results.append(session)
 
-    results.sort(key=lambda s: s["last_message_at"], reverse=True)
+    # The same order the list and the #2959 projection page by, not a third
+    # spelling of "newest first". Ties are ordinary and `limit` truncates, so
+    # sorting on `last_message_at` alone let search and the list disagree about
+    # WHICH session made the page (round-8/9 review).
+    sort_sessions(results)
     return results[:limit]
 
 
