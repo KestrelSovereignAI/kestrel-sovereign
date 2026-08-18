@@ -93,26 +93,35 @@ class ProcessManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
-        """Whether `port` cannot be bound — the question callers actually ask.
+    def is_port_in_use(port: int, host: str = "0.0.0.0") -> bool:
+        """Whether a server of ours could NOT bind ``host:port`` right now.
 
-        Every caller wants to know whether a server can take this port: the
-        start pre-flight before binding it, and the stop postcondition
-        deciding whether the operator's next start will succeed. So binding is
-        what gets tested, because binding is the operation that will fail.
+        Every caller is asking one operational question — can the server take
+        this address — so the probe performs the same bind the server will,
+        under the same options, at the same address.
 
-        The previous probe used ``connect_ex``, which answers a different
-        question — "is something accepting connections right now" — and is
-        wrong in the direction that matters. A listener whose accept backlog
-        is full REFUSES new connections while still owning the port, so a held
-        port read as free. Measured: the same listener probes True, then False
-        once one unaccepted connection fills its backlog, while ``bind`` keeps
-        reporting the port taken.
+        Not ``connect_ex``, which asks "is something accepting connections"
+        and is wrong in the direction that matters: a listener whose accept
+        backlog is full REFUSES new connections while still owning the port.
+        Measured — such a listener probes True, then False after a single
+        unaccepted connection, while ``bind`` keeps reporting it taken.
+
+        ``SO_REUSEADDR`` is set because uvicorn's asyncio server sets it
+        (verified on the live loop), and without it a port left in
+        ``TIME_WAIT`` by a clean shutdown reads as occupied. Kestrel would
+        then stop the service and refuse to start it again — `restart` and
+        `update` both abort on a failed stop — over a port uvicorn could have
+        bound immediately. Measured: TIME_WAIT binds fine with the option, and
+        a live listener still fails with ``EADDRINUSE``, so nothing is lost.
+
+        ``host`` matters and must be the address the server is configured to
+        bind. Measured both ways: a listener on ``0.0.0.0`` is invisible to a
+        probe of ``127.0.0.1``, and a listener on ``127.0.0.1`` is invisible
+        to a probe of ``0.0.0.0``. Probing where the server will actually bind
+        makes this succeed exactly when the server's own bind would.
         """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            # Deliberately no SO_REUSEADDR: that option exists to let a bind
-            # succeed alongside a socket in TIME_WAIT, which is precisely the
-            # "actually still taken" case this must report.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind((host, port))
             except OSError:
@@ -526,7 +535,7 @@ class ProcessManager:
             self.clear_pid(pid_file)
 
         # Port check
-        if self.is_port_in_use(config.port):
+        if self.is_port_in_use(config.port, host_bind):
             raise RuntimeError(
                 f"Agent '{name}': port {config.port} already in use"
             )

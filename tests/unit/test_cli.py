@@ -693,23 +693,59 @@ class TestCmdStopReportsOnlyVerifiedStops:
         `stop` report success over exactly the listener it was checking for.
         """
         with _listener_on() as port:
-            assert [ProcessManager.is_port_in_use(port) for _ in range(3)] == [
+            assert [
+                ProcessManager.is_port_in_use(port, "127.0.0.1") for _ in range(3)
+            ] == [
                 True, True, True
             ]
 
+    def test_a_port_left_in_time_wait_reads_as_free(self):
+        """A clean shutdown must not look like a listener that refused to die.
+
+        uvicorn's asyncio server sets SO_REUSEADDR (verified on a live loop),
+        so Kestrel can rebind a TIME_WAIT port immediately. A probe without
+        that option calls it occupied — and since `restart` and `update` both
+        abort on a failed stop, they would stop the service and then refuse to
+        start it again.
+        """
+        import socket as _socket
+
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(5)
+        client = _socket.create_connection(("127.0.0.1", port))
+        conn, _ = srv.accept()
+        # The side that closes first is the side that lingers in TIME_WAIT.
+        conn.close()
+        client.close()
+        srv.close()
+
+        assert ProcessManager.is_port_in_use(port, "127.0.0.1") is False
+
+    def test_a_live_listener_still_reads_as_held(self):
+        """The reuse option must not blind the probe to a real listener."""
+        with _listener_on() as port:
+            assert ProcessManager.is_port_in_use(port, "127.0.0.1") is True
+
     def test_reap_returns_still_held_when_port_survives_sigkill(self):
         with _listener_on() as port:
-            result = _reap_orphans_on_port(port, "claw", force=False)
+            result = _reap_orphans_on_port(port, "claw", force=False, bind="127.0.0.1")
         assert result is PortReapResult.STILL_HELD
 
     def test_reap_returns_released_when_port_is_free_after_signalling(self):
         with _unkillable_orphan():
-            result = _reap_orphans_on_port(_free_port(), "claw", force=False)
+            result = _reap_orphans_on_port(
+                _free_port(), "claw", force=False, bind="127.0.0.1"
+            )
         assert result is PortReapResult.RELEASED
 
     def test_reap_returns_nothing_found_when_no_listener(self):
         with patch.object(ProcessManager, "find_pids_on_port", return_value=[]):
-            result = _reap_orphans_on_port(_free_port(), "claw", force=False)
+            result = _reap_orphans_on_port(
+                _free_port(), "claw", force=False, bind="127.0.0.1"
+            )
         assert result is PortReapResult.NOTHING_FOUND
 
     def test_undiscoverable_listener_is_not_reported_as_absent(self):
@@ -722,7 +758,7 @@ class TestCmdStopReportsOnlyVerifiedStops:
         discovery step.
         """
         with _listener_on(discovered_pids=()) as port:
-            result = _reap_orphans_on_port(port, "claw", force=False)
+            result = _reap_orphans_on_port(port, "claw", force=False, bind="127.0.0.1")
         assert result is PortReapResult.STILL_HELD
 
     def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
