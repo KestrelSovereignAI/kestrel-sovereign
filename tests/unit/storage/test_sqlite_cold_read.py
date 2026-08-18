@@ -207,3 +207,42 @@ async def test_cold_read_via_config_does_not_migrate_the_database(tmp_path):
         assert await storage.db.fetchone("SELECT v FROM t") is not None
         assert storage.destructive_audit is None
     assert _sidecars(db) == []
+
+
+@pytest.mark.asyncio
+async def test_cold_read_of_a_missing_default_store_creates_nothing(tmp_path, monkeypatch):
+    """"There is nothing here" must be answerable without making somewhere.
+
+    The backend already refuses to mkdir; the facade was creating the default
+    agent data directory first, which made that refusal moot.
+    """
+    import kestrel_sovereign.storage.async_storage as async_storage
+
+    absent = tmp_path / "never-created"
+    monkeypatch.setattr(
+        async_storage, "get_default_agent_data_dir", lambda: str(absent)
+    )
+
+    AsyncStorage(backend="sqlite", agent_id="did:test", cold_read=True)
+
+    assert not absent.exists(), (
+        "a cold read brought the store's directory into existence just by "
+        "asking whether it was there"
+    )
+
+
+def test_config_requested_cold_read_survives_a_backend_that_cannot_carry_it():
+    """PostgreSQL has no file lock, so its backend does not carry the flag.
+
+    Falling back to the keyword default would silently upgrade a requested
+    inspection into a writer: `initialize()` would run migrations.
+    """
+    storage = AsyncStorage(
+        config={
+            "backend": "postgres",
+            "dsn": "postgresql://user@localhost/nowhere",
+            "cold_read": True,
+        },
+        agent_id="did:test",
+    )
+    assert storage.cold_read is True

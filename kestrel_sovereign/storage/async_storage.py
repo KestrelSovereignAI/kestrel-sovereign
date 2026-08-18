@@ -207,7 +207,12 @@ class AsyncStorage:
             if db_path is None:
                 agent_data_dir = get_default_agent_data_dir()
                 db_path = os.path.join(agent_data_dir, "kestrel_prime.db")
-                os.makedirs(agent_data_dir, exist_ok=True)
+                # A cold read must be able to answer "there is nothing here"
+                # without bringing the directory into existence to say so. The
+                # backend already refuses to mkdir; the facade was creating it
+                # first and making that refusal moot.
+                if not cold_read:
+                    os.makedirs(agent_data_dir, exist_ok=True)
 
             self.db_path = db_path
             # SQLite serialises writers at the FILE level, so an inspection
@@ -227,12 +232,21 @@ class AsyncStorage:
         else:
             self._assertion_tenant_capability = None
 
-        # Read back off the backend that was actually built, so the facade
-        # and the connection cannot disagree. The ``config=`` path carries
-        # ``cold_read`` in the dict while this keyword keeps its default, and
-        # a facade that thinks it is writable runs migrations against an
-        # immutable connection.
-        self.cold_read = bool(getattr(self._backend, "cold_read", cold_read))
+        # The mode the caller actually asked for, from whichever channel they
+        # used. The ``config=`` path carries ``cold_read`` in the dict while
+        # this keyword keeps its default.
+        requested_cold_read = bool(
+            config.get("cold_read", cold_read) if config is not None else cold_read
+        )
+        # Prefer what the backend reports, so the facade and the connection
+        # cannot disagree — a facade that thinks it is writable runs
+        # migrations against an immutable connection. Backends that do not
+        # carry the flag at all (PostgreSQL, where a second connection is
+        # ordinary and there is no file lock to contend for) fall back to the
+        # request, so an inspection is never silently upgraded to a writer.
+        self.cold_read = bool(
+            getattr(self._backend, "cold_read", requested_cold_read)
+        )
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None
@@ -428,6 +442,11 @@ class AsyncStorage:
         # returning is not a check.
         if exc_type is None:
             self.assert_cold_read_still_valid()
+        # Reported even when the block failed: the operator needs to know the
+        # store was left with WAL state regardless of why the read ended.
+        checker = getattr(self._backend, "warn_if_wal_state_was_stranded", None)
+        if checker is not None:
+            checker()
 
     def assert_cold_read_still_valid(self) -> None:
         """Refuse to act on a cold read that a writer raced. No-op otherwise.

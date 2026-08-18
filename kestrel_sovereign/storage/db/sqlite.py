@@ -537,6 +537,36 @@ class SQLiteBackend(DatabaseBackend):
         flags = "mode=ro&immutable=1" if self._cold_read_ignored_wal else "mode=ro"
         return f"{self._resolved_path.as_uri()}?{flags}"
 
+    def warn_if_wal_state_was_stranded(self) -> None:
+        """Say so when this read may have kept a WAL from being cleaned up.
+
+        Only the plain read-only branch can do this, and it is not avoidable
+        while still reading the WAL truthfully. SQLite lets the LAST connection
+        to close checkpoint and remove the sidecars; a read-only connection
+        cannot perform that cleanup itself, but it does count as a connection.
+        So if the agent exits while this inspection is open, the writer is no
+        longer last, the checkpoint never happens, and the sidecars outlive
+        both — after which a cold identity lookup refuses the agent and a cold
+        wake can be blocked.
+
+        Copying to a snapshot would not fix it: the copy needs a read
+        connection on the original too, which shortens the window rather than
+        closing it. The race is inherent to reading a live WAL database, so it
+        is reported rather than hidden — #2920 was filed because the cost of an
+        inspection landed on the agent while the caller saw nothing at all.
+        """
+        if not self.cold_read or self._cold_read_ignored_wal:
+            return
+        if self._has_wal_sidecars():
+            logger.warning(
+                "cold read of %s finished with SQLite WAL sidecars still "
+                "present. If the agent exited during this inspection they may "
+                "have outlived it, and a cold identity lookup will refuse the "
+                "agent until they are cleared. Starting the agent normally "
+                "checkpoints and removes them.",
+                self.db_path,
+            )
+
     def assert_cold_read_still_valid(self) -> None:
         """Refuse to report on an immutable read that a writer raced.
 
