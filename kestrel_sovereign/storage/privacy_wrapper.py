@@ -4185,7 +4185,7 @@ class PrivacyEnforcingStorage:
             SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            {canonical_order(descending=True)}
+            {canonical_order(self._storage.db.backend_type, descending=True)}
             LIMIT ?
         """, (agent_id, bounded_limit))
 

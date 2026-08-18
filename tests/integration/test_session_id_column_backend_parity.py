@@ -283,7 +283,8 @@ async def _assert_the_projection_agrees_with_the_grouper(
             # and the one case where the two orders differ cannot fail it.
             "SELECT id, role, content, metadata, created_at "
             "FROM conversation_history WHERE agent_id = ? "
-            f"AND deleted_at IS NULL AND archived_at IS NULL {canonical_order()}",
+            f"AND deleted_at IS NULL AND archived_at IS NULL "
+            f"{canonical_order(db.backend_type)}",
             (agent_id,),
         )
     ]
@@ -2687,3 +2688,79 @@ async def test_three_repairs_racing_never_leave_a_projection_that_lies(
         assert (await projection.repair()).current
         assert not await projection.is_stale()
         await _assert_the_projection_agrees_with_the_grouper(db, projection, agent_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_tied_sessions_page_by_code_point_not_by_locale(postgres_db):
+    """SQL and Python must break ties with the SAME comparison.
+
+    `sort_sessions` orders tied sessions with Python's `sorted`, which compares
+    by code point. PostgreSQL clusters are commonly initialised with a
+    locale-aware default collation — this one is `en_US.utf8` — under which case
+    and punctuation are not primary distinctions. Measured on that collation:
+
+        default:  a-1, A-1, A_1, ab1
+        C     :   A-1, A_1, a-1, ab1   <- what Python produces
+
+    Session ids may contain uppercase letters, hyphens and underscores, so with
+    a limit applied the reader and the projection could page a different session
+    unless the ordering names its comparison instead of inheriting whichever one
+    the cluster was created with.
+
+    A PostgreSQL-only case because SQLite's default is already bytewise: there
+    is nothing here it could exhibit.
+    """
+    from kestrel_sovereign.storage.session_grouping import (
+        SESSION_ORDER,
+        session_order_sql,
+        sort_sessions,
+    )
+
+    ids = ["A-1", "A_1", "a-1", "ab1"]
+    db = postgres_db
+    table = f"tie_probe_{uuid4().hex[:10]}"
+    try:
+        collation = await db.fetchval(
+            "SELECT datcollate FROM pg_database WHERE datname = current_database()",
+            (),
+        )
+        assert "C" != str(collation), (
+            f"this cluster's default collation is {collation!r}; on a bytewise "
+            "default the two orderings agree for free and this proves nothing"
+        )
+
+        await db.execute(
+            f"CREATE TABLE {table} (session_id TEXT, last_message_at TEXT)"
+        )
+        for session_id in ids:
+            await db.execute(
+                f"INSERT INTO {table} (session_id, last_message_at) "
+                "VALUES (?, '2026-03-01 09:00:00')",
+                (session_id,),
+            )
+        rows = await db.fetchall(
+            f"SELECT session_id, last_message_at FROM {table} "
+            f"{session_order_sql(db.backend_type)}",
+            (),
+        )
+        in_sql = [row[0] for row in rows]
+
+        in_python = [
+            session["session_id"]
+            for session in sort_sessions(
+                [{"session_id": s, "last_message_at": "2026-03-01 09:00:00"}
+                 for s in ids]
+            )
+        ]
+
+        assert in_sql == in_python, (
+            f"SQL paged tied sessions {in_sql} and Python {in_python}; the "
+            "reader and the projection would disagree about which session is "
+            "on the page"
+        )
+        assert SESSION_ORDER[-1][0] == "session_id", (
+            "the tie-break moved; this case is written about session_id"
+        )
+    finally:
+        await db.execute(f"DROP TABLE IF EXISTS {table}")

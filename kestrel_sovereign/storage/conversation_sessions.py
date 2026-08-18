@@ -319,6 +319,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .session_grouping import (
+    canonical_timestamp_sql,
     coalesce_sessions_by_session_id,
     coerce_session_timestamp,
     group_messages_into_sessions,
@@ -543,19 +544,47 @@ _DERIVED_FROM = "id, role, metadata, created_at, session_id"
 CANONICAL_ORDER_COLUMNS = ("created_at", "id")
 
 
-def canonical_order(*, descending: bool = False) -> str:
+def canonical_order(backend_type: str, *, descending: bool = False) -> str:
     """``ORDER BY`` for the one order sessions are derived in.
 
     ``descending`` is for a newest-first page that will be reversed before
     grouping, which is what ``/api/conversations`` does.
+
+    ``created_at`` is compared through :func:`canonical_timestamp_sql`, never
+    raw. SQLite stores this column as TEXT and its history legitimately mixes
+    the ISO spelling with the SQL one — and ``"T"`` (0x54) sorts after a space
+    (0x20), so ``'2026-03-01T09:00:00'`` compares GREATER than
+    ``'2026-03-01 10:00:00'`` and an hour-earlier row sorts last. Measured: the
+    two orders genuinely invert for that pair, and ``julianday()`` restores
+    chronology. The module already warned about this trap for the fold's
+    monotonicity guard; the first spelling of this function walked into it one
+    definition away, which is what a rule written twice does.
+
+    On PostgreSQL the column is a real timestamp and compares correctly on its
+    own, so :func:`canonical_timestamp_sql` returns it unchanged there.
     """
     direction = "DESC" if descending else "ASC"
     return "ORDER BY " + ", ".join(
-        f"{column} {direction}" for column in CANONICAL_ORDER_COLUMNS
+        f"{_canonical_key(backend_type, column)} {direction}"
+        for column in CANONICAL_ORDER_COLUMNS
     )
 
 
-_CANONICAL_ORDER = canonical_order()
+def _canonical_key(backend_type: str, column: str) -> str:
+    """One ordering key, spelled so both engines compare it the same way.
+
+    Only ``created_at`` needs the treatment. ``id`` is an integer on both
+    engines, so it compares numerically and identically — and PostgreSQL
+    rejects ``COLLATE`` on a non-text type outright, which is how an earlier
+    attempt to apply the bytewise rule uniformly here announced itself.
+    Collation belongs on ``session_id``, in :func:`session_order_sql`.
+    """
+    if column == "created_at":
+        return canonical_timestamp_sql(backend_type, column)
+    return column
+
+
+
 
 #: What one chunk selects: this agent's next live rows, and only those. The rows
 #: a step reads and the rows it folds are the same rows, which is what makes the
@@ -568,33 +597,35 @@ _CHUNK = (
     "ORDER BY id ASC LIMIT ?"
 )
 
-#: What an exact per-session derivation selects: one session's live rows up to
-#: the point a walk has reached. Only reached where a fold would not provably
-#: agree (see the module docstring) and by :meth:`_forget`'s caller, so its cost
-#: is the session's size rather than a per-chunk toll.
-_OWN_ROWS_THROUGH = (
-    f"SELECT {_DERIVED_FROM} FROM conversation_history "
-    "WHERE agent_id = ? AND session_id = ? AND id <= ? "
-    f"AND {_LIVE} "
-    f"{_CANONICAL_ORDER}"
-)
+def _own_rows_through(backend_type: str) -> str:
+    """One session's live rows up to the point a walk has reached.
 
-#: ...and what a transcript repair selects: the same columns over every live row,
-#: in the order a reader would see them, so unstamped rows can be attributed the
-#: way the grouper attributes them.
-_LIVE_ROWS = (
-    f"SELECT {_DERIVED_FROM} FROM conversation_history "
-    f"WHERE agent_id = ? AND {_LIVE} "
-    f"{_CANONICAL_ORDER}"
-)
+    Only reached where a fold would not provably agree (see the module
+    docstring) and by :meth:`_forget`'s caller, so its cost is the session's
+    size rather than a per-chunk toll.
 
-#: :data:`_LIVE_ROWS` bounded to one frontier, for the transcript pass.
-_LIVE_ROWS_THROUGH = (
-    f"SELECT {_DERIVED_FROM} FROM conversation_history "
-    f"WHERE agent_id = ? AND {_LIVE} "
-    "AND id <= ? "
-    f"{_CANONICAL_ORDER}"
-)
+    A function of the backend rather than a constant, because the canonical
+    order is: SQLite needs its TEXT timestamps compared through ``julianday``
+    and PostgreSQL does not.
+    """
+    return (
+        f"SELECT {_DERIVED_FROM} FROM conversation_history "
+        "WHERE agent_id = ? AND session_id = ? AND id <= ? "
+        f"AND {_LIVE} "
+        f"{canonical_order(backend_type)}"
+    )
+
+
+def _live_rows_through(backend_type: str) -> str:
+    """Every live row of this agent's up to one frontier, for the transcript
+    pass — the same columns, in the order a reader would see them, so unstamped
+    rows are attributed the way the grouper attributes them."""
+    return (
+        f"SELECT {_DERIVED_FROM} FROM conversation_history "
+        f"WHERE agent_id = ? AND {_LIVE} "
+        "AND id <= ? "
+        f"{canonical_order(backend_type)}"
+    )
 
 #: :meth:`ConversationSessionProjection.repair` did nothing: the projection had
 #: accounted for every row and the change stamp had not moved.
@@ -1353,7 +1384,7 @@ class ConversationSessionProjection:
         rows = await self.db.fetchall(
             f"SELECT session_id, {', '.join(PROJECTION_COLUMNS)} "
             "FROM conversation_sessions WHERE agent_id = ? "
-            f"{session_order_sql()}",
+            f"{session_order_sql(self.db.backend_type)}",
             (self.agent_id,),
         )
         return [_as_dict(row) for row in rows]
@@ -1626,7 +1657,10 @@ class ConversationSessionProjection:
         # about how MANY rows, never about which: a snapshot must describe one
         # frontier and say which one.
         projections = project_transcript(
-            await self.db.fetchall(_LIVE_ROWS_THROUGH, (self.agent_id, target))
+            await self.db.fetchall(
+                _live_rows_through(self.db.backend_type),
+                (self.agent_id, target),
+            )
         )
 
         written = 0
@@ -1779,7 +1813,16 @@ class ConversationSessionProjection:
         """
         partial = project_transcript(rows, expect=session_id)
         if not partial:
-            return None
+            # Empty means the slice did not group into the session its
+            # ``session_id`` column names — the row's metadata put it somewhere
+            # else. Returning None here would only make the caller FORGET this
+            # session, leaving whichever session the reader actually attributes
+            # the row to standing at its old count, under a watermark recording
+            # the chunk as accounted for. What is wrong is not confined to this
+            # session, so neither is the repair: hand the whole transcript over,
+            # which is the same escalation the monotonicity check below uses and
+            # for the same reason (round-8 review).
+            raise _NeedsTranscript(session_id)
         # The rows handed here are this session's slice of the chunk, with the
         # neighbours that split its clusters already removed by :meth:`_fold`.
         # A slice grouped in isolation yields ONE cluster whose boundaries are
@@ -1833,7 +1876,8 @@ class ConversationSessionProjection:
         """
         projections = project_transcript(
             await self.db.fetchall(
-                _OWN_ROWS_THROUGH, (self.agent_id, session_id, through)
+                _own_rows_through(self.db.backend_type),
+                (self.agent_id, session_id, through),
             ),
             expect=session_id,
         )

@@ -121,6 +121,26 @@ def canonical_timestamp_sql(backend_type: str, expression: str) -> str:
     return expression
 
 
+def bytewise_sql(backend_type: str, expression: str) -> str:
+    """Compare a text expression by code point, as Python's ``sorted`` does.
+
+    PostgreSQL databases are commonly created with a locale-aware default
+    collation — ``en_US.utf8`` here — under which punctuation and case are not
+    primary distinctions. Measured: ``('A-1','a-1','A_1','ab1')`` sorts
+    ``a-1,A-1,A_1,ab1`` under that collation and ``A-1,A_1,a-1,ab1`` under
+    ``"C"``, which is what Python produces. Session ids may contain uppercase
+    letters, hyphens and underscores, so an ordering meant to be shared between
+    a SQL page and a Python sort has to name the comparison rather than inherit
+    whichever one the cluster was initialised with.
+
+    SQLite's default is already bytewise, and it has no ``COLLATE "C"``, so the
+    expression is returned unchanged there.
+    """
+    if backend_type == "postgres":
+        return f'{expression} COLLATE "C"'
+    return expression
+
+
 def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
     """Compare timestamp columns and parameters across supported backends."""
     if operator not in {"<", ">", ">="}:
@@ -156,14 +176,15 @@ def group_messages_into_sessions(
             - ``created_at``: datetime or ISO/SQL string.
         gap_minutes: minutes of inactivity that start a new session.
         now: the stamp substituted for a row whose ``created_at`` is missing or
-            unparseable. Defaults to the LATEST stamp the transcript itself
-            carries (or the epoch, if it carries none) — deliberately not the
-            wall clock. A wall clock made grouping a function of *when it was
-            asked*: the same transcript grouped one way now and another way an
-            hour later, because a bad row kept sliding forward and rejoining
+            unparseable. Defaults to the stamp of the row BEFORE it (the epoch,
+            for a transcript that begins with one) — deliberately not the wall
+            clock. A wall clock made grouping a function of *when it was asked*:
+            the same transcript grouped one way now and another way an hour
+            later, because a bad row kept sliding forward and rejoining
             whichever session was newest. It also made the #2959 projection
-            unable to cache this result, since the projection has to be
-            reproducible from the rows alone. Still injectable for tests.
+            unable to cache this result, since a cache has to be reproducible
+            from what it caches. Still injectable, and an injected value still
+            wins, which is what the tests use.
         keep_empty_markers: when ``True``, a session established solely by a
             ``new_session`` marker row (no real messages yet) is still returned,
             with ``message_count == 0`` (#2222). A freshly-created conversation
@@ -189,24 +210,15 @@ def group_messages_into_sessions(
             and — only when ``collect_messages`` — ``messages``.
         Callers reverse / slice / decorate as needed.
     """
-    # Materialized because the deterministic ``now`` below is a function of the
-    # whole transcript, and because a caller passing a generator would otherwise
-    # have it consumed by that pass.
-    messages = list(messages)
-    if now is None:
-        stamps = [
-            stamp
-            for stamp in (
-                coerce_session_timestamp(message.get("created_at"))
-                for message in messages
-            )
-            if stamp is not None
-        ]
-        # The newest real stamp keeps an undatable row with the run it was
-        # found in, which is where it sits in the transcript; the epoch is for
-        # a transcript with no readable stamp at all, where any choice is
-        # arbitrary and only determinism matters.
-        now = max(stamps) if stamps else _GROUPING_EPOCH
+    # The stamp last used, so an undatable row inherits the one before it.
+    # LOCAL on purpose. An earlier fix made the substitute the transcript's
+    # MAXIMUM stamp, which is deterministic but global: appending a row to one
+    # session then re-dated an undatable row in a different, untouched session,
+    # so an incremental repair that recomputed only the appended session left
+    # the other stale and recorded a current watermark over it. A row-local rule
+    # has no such coupling — a row's stamp depends on what precedes it, and
+    # appending never changes that.
+    previous: Optional[datetime] = None
 
     sessions: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
@@ -245,14 +257,16 @@ def group_messages_into_sessions(
         if not isinstance(meta, dict):
             meta = {}
 
-        # No wall-clock arm: ``now`` is resolved above and always readable, so
-        # a third fallback here could only reintroduce the nondeterminism the
-        # second one exists to remove.
+        # No wall-clock arm anywhere: every fallback here is a function of the
+        # rows (or of a clock the caller injected deliberately), which is what
+        # lets the #2959 projection cache this result at all.
         timestamp = (
             coerce_session_timestamp(msg.get("created_at"))
             or coerce_session_timestamp(now)
+            or previous
             or _GROUPING_EPOCH
         )
+        previous = timestamp
 
         is_new_session_marker = bool(meta.get("new_session"))
         meta_session_id = None
@@ -409,10 +423,17 @@ SESSION_ORDER: Tuple[Tuple[str, bool], ...] = (
 )
 
 
-def session_order_sql() -> str:
-    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause."""
+def session_order_sql(backend_type: str) -> str:
+    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause.
+
+    ``session_id`` is compared through :func:`bytewise_sql` so the SQL page and
+    :func:`sort_sessions` break ties the same way. Without it the two agree only
+    on a cluster whose default collation happens to be bytewise, which is not
+    the common case.
+    """
     return "ORDER BY " + ", ".join(
-        f"{column} {'DESC' if descending else 'ASC'}"
+        f"{bytewise_sql(backend_type, column) if column == 'session_id' else column} "
+        f"{'DESC' if descending else 'ASC'}"
         for column, descending in SESSION_ORDER
     )
 

@@ -149,7 +149,7 @@ async def _live_history(db: AsyncDatabase, agent_id: str = AGENT) -> List[Dict[s
     rows = await db.fetchall(
         "SELECT id, role, content, metadata, created_at FROM conversation_history "
         "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
-        f"{canonical_order()}",
+        f"{canonical_order(db.backend_type)}",
         (agent_id,),
     )
     return [
@@ -1061,8 +1061,8 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     from kestrel_sovereign.storage.conversation_sessions import (
         _CHUNK,
         _DERIVED_FROM,
-        _LIVE_ROWS,
-        _OWN_ROWS_THROUGH,
+        _live_rows_through,
+        _own_rows_through,
         mutation_triggers,
     )
 
@@ -1074,15 +1074,22 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
             )
 
     # ...and nothing the derivation reads is missing from that list. ``id`` is
-    # the primary key on both engines and cannot be updated in place, which is
-    # why it is not watched.
-    read = {"id", *PROJECTION_INPUT_COLUMNS}
+    # in it: a primary key IS writable on both engines (measured), and the
+    # projection stores one.
+    read = set(PROJECTION_INPUT_COLUMNS)
     for column in (name.strip() for name in _DERIVED_FROM.split(",")):
         assert column in read, f"{column} is read but never watched"
     # ...and every statement really does select that list, so the check above is
     # about the SQL rather than about a constant nothing uses.
-    for statement in (_CHUNK, _OWN_ROWS_THROUGH, _LIVE_ROWS):
-        assert statement.split("SELECT ")[1].split(" FROM ")[0] == _DERIVED_FROM
+    for backend in ("sqlite", "postgres"):
+        for statement in (
+            _CHUNK,
+            _own_rows_through(backend),
+            _live_rows_through(backend),
+        ):
+            assert (
+                statement.split("SELECT ")[1].split(" FROM ")[0] == _DERIVED_FROM
+            )
 
 
 def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
@@ -2146,8 +2153,21 @@ async def test_a_row_whose_column_and_metadata_disagree_is_refused_not_guessed(
     Every field is derived by handing rows to the grouper, which reads
     ``metadata.session_id``. If a row's column and metadata name different
     sessions, the rows selected by the column do not group under the column's
-    id, and there is no answer that is not a guess — so the session is refused
-    and logged rather than stored under one of the two candidates.
+    id, and there is no answer that is not a guess — so the session the grouper
+    files that row under is refused and logged rather than stored.
+
+    **Which session is tainted is the point** (round-8 review). The damage is to
+    B, the session the reader attributes the row to — its stored count would
+    otherwise stand as though the row were not there. C, whose column the row
+    claims, keeps its own legitimate rows: they really are session C, and
+    dropping them would lose a real conversation over an unrelated row's
+    corruption.
+
+    This used to come out the other way round. The fold returned "nothing" for
+    C, the caller took that as "forget C", and B — never recomputed, because an
+    incremental chunk only touches the sessions its own rows name — kept a stale
+    count under a watermark recorded as current. Escalating to the transcript is
+    what makes the refusal land on the session that is actually wrong.
 
     Reachable only by writing the divergence by hand, which is exactly why it
     needs a case: it is otherwise a branch no test defends.
@@ -2172,8 +2192,19 @@ async def test_a_row_whose_column_and_metadata_disagree_is_refused_not_guessed(
         "refusing to project a session the transcript does not show" in record.message
         for record in caplog.records
     ), [record.message for record in caplog.records]
-    assert await projection.get(UUID_C) is None, (
-        "a session whose rows the grouper files elsewhere was stored anyway"
+    assert await projection.get(UUID_B) is None, (
+        "the session the grouper files the divergent row under kept a count "
+        "that does not include it, under a watermark claiming to be current"
+    )
+    surviving = await projection.get(UUID_C)
+    assert surviving is not None, (
+        "C's own legitimate rows were dropped because an unrelated row claimed "
+        "its id — a real conversation lost to another row's corruption"
+    )
+    assert surviving["message_count"] == 2, surviving
+    assert not await projection.is_stale(), (
+        "the projection refused a session and then reported itself stale "
+        "forever; a refusal is an answer, not an incomplete repair"
     )
 
 
@@ -2480,5 +2511,96 @@ async def test_tied_sessions_order_the_same_way_in_both_paths(tmp_path):
         assert projected == canonical, (
             f"the projection ordered tied sessions {projected}"
         )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
+    """SQLite history mixes two spellings, and raw text order inverts them.
+
+    ``created_at`` is TEXT on SQLite and legacy rows legitimately hold both the
+    ISO form (``T`` separator) and the SQL form (space). ``"T"`` is 0x54 and a
+    space is 0x20, so ``'2026-03-01T09:00:00'`` compares GREATER than
+    ``'2026-03-01 10:00:00'`` — an hour-earlier row sorts last. Measured: those
+    two rows come back reversed under a raw ``ORDER BY created_at``, and
+    ``julianday()`` restores chronology.
+
+    Asked of ``query_conversations``, because that is where the order is
+    actually consumed: the conversation list pages by it and reverses it before
+    grouping, so getting it wrong reorders the transcript the grouper sees. The
+    projection's ordinary chunk path walks ids and never reaches this clause,
+    which is why an earlier version of this test passed with the fix removed.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    async with AsyncStorage(str(tmp_path / "spellings.db"), agent_id=AGENT) as storage:
+        for content, stamp in (
+            ("earlier, ISO spelling", "2026-03-01T09:00:00"),
+            ("later, SQL spelling", "2026-03-01 10:00:00"),
+        ):
+            await storage.db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, created_at) "
+                "VALUES (?, 'user', ?, NULL, ?)",
+                (AGENT, content, stamp),
+            )
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+        rows = await wrapper.query_conversations(AGENT, limit=10)
+        newest_first = [row[2] for row in rows]
+
+        assert newest_first == ["later, SQL spelling", "earlier, ISO spelling"], (
+            "the list paged these newest-first by TEXT, not by time: the "
+            f"space-spelled 10:00 row sorted below the T-spelled 09:00 one. "
+            f"Got {newest_first}"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_appending_elsewhere_does_not_restale_an_undatable_session(tmp_path):
+    """An undatable row's substitute stamp must not depend on other sessions.
+
+    The substitute is the stamp of the row before it — LOCAL. A previous fix
+    used the transcript's MAXIMUM stamp, which is deterministic but global: a
+    row appended to session B re-dated the undatable row in session A, so A's
+    derived activity time moved while an incremental repair (which only
+    recomputes the sessions its own chunk names) never touched A. The watermark
+    then recorded the chunk as accounted for over a stale A.
+
+    So this appends to B and asks A whether it changed.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "undatable.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {"content": "A datable", "role": "user", "created_at": _at(0),
+                 "metadata": {"session_id": UUID_A}},
+                {"content": "A undatable", "role": "assistant",
+                 "created_at": "not-a-date", "metadata": {"session_id": UUID_A}},
+                {"content": "B datable", "role": "user", "created_at": _at(100),
+                 "metadata": {"session_id": UUID_B}},
+            ],
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        before = await projection.get(UUID_A)
+
+        await _seed(db, [{"content": "B later", "role": "user",
+                          "created_at": _at(10_000),
+                          "metadata": {"session_id": UUID_B}}])
+        assert await projection.is_stale()
+        await projection.repair()
+
+        assert await projection.get(UUID_A) == before, (
+            "appending to another session moved session A's stored row; an "
+            "incremental repair would leave that unnoticed"
+        )
+        await _assert_agrees_with_the_grouper(db, projection)
     finally:
         await db.close()
