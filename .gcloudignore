@@ -1,6 +1,5 @@
 # Cloud Build ignore file
 # Note: This file is used by gcloud builds submit
-
 # Always ignore these
 .venv_kestrel/
 .venv/
@@ -8,7 +7,6 @@
 __pycache__/
 .git/
 .DS_Store
-
 # Development/test artifacts
 playwright-report/
 test-results/
@@ -16,23 +14,47 @@ node_modules/
 *.db
 *.capsule
 agent_data/
-
+# Secrets and credentials. `gcloud builds submit .` uploads this tree to Cloud
+# Build source storage in GCS, and that upload is gated HERE — before Docker
+# ever reads .dockerignore. Excluding a credential from the image is therefore
+# not enough on this path: without these rules the bytes are already in the
+# bucket, which has its own lifecycle and IAM and outlives the image.
+#
+# Spelled `**/` deliberately; see the note in .dockerignore. Kept in step with
+# .dockerignore and .gitignore by tests/unit/test_secret_exclusion_parity.py,
+# which asserts the exclusion of representative PATHS rather than the presence
+# of pattern strings.
+**/.env
+**/.env.*
+**/.secrets
+**/.secrets.*
+**/.secrets/
+**/secrets/
+**/credentials/
+**/storage_cache/
+**/.kestrel/
+# Root-anchored on purpose: a nested `config/` is source (and .dockerignore's
+# bare `config/` is already root-only, since Docker anchors at the context).
+/config/
+**/*.pem
+**/*.key
+**/*credentials*.json
+**/*service-account*.json
+**/*-key.json
+**/*.private.json
 # Database dumps. This list gates what `gcloud builds submit .` UPLOADS to
 # Cloud Build source storage, and it is consulted before Docker ever reads
 # .dockerignore — so excluding a dump from the image is not enough on this
 # path, the bytes are already in GCS. Kept identical to the dump patterns in
 # .gitignore and .dockerignore; tests/unit/test_dump_exclusion_parity.py fails
 # if the three drift apart.
-*.dump
-*-dump.sql
-*.sql.gz
-
+**/*.dump
+**/*-dump.sql
+**/*.sql.gz
 # Archive (historical docs, not needed for builds)
 archive/
-
 # Include files that may be gitignored but needed for build
 !llm_config.toml
-
 # Only uncomment these for LoRA trainer builds which don't need full Kestrel
 # storage/
 # llm/
