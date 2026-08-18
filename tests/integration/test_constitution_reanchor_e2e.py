@@ -1192,3 +1192,69 @@ async def test_drift_inspection_leaves_the_database_untouched(tmp_path, monkeypa
     assert await read_anchor_agent_did(
         str(agent_dir), mode=AgentDIDLookupMode.COLD_READ_ONLY
     )
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_opens_no_writable_connection(tmp_path, monkeypatch):
+    """A --force-less run must not take a write lock on the agent's database.
+
+    Separate from the on-disk test above because the disk cannot show this. A
+    ``mode=rw`` connection to a WAL database creates its sidecars and then, as
+    the last connection to close, checkpoints and REMOVES them — so the write
+    lock is taken and released leaving the directory byte-identical. The cost
+    of that lock lands on a *running* agent (SQLite serialises writers at the
+    file level), which is how #2920 dropped one into Safe Mode; a test that
+    inspects the aftermath of a stopped agent sees nothing at all.
+
+    So this records every connection opened to the anchor during the run and
+    asserts none of them asked for write access. It covers ``sqlite3.connect``
+    as well as ``aiosqlite.connect``: target resolution reaches the same file
+    through the former, without passing through ``AsyncStorage``, which is the
+    door the round-1 test could not see.
+    """
+    import sqlite3
+
+    import aiosqlite
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    opened: list[str] = []
+
+    def _recorder(real):
+        def _record(target, *args, **kwargs):
+            opened.append(str(target))
+            return real(target, *args, **kwargs)
+        return _record
+
+    # Patched on the modules themselves so the record covers the worker thread
+    # target resolution runs its lookup in.
+    monkeypatch.setattr(sqlite3, "connect", _recorder(sqlite3.connect))
+    monkeypatch.setattr(aiosqlite, "connect", _recorder(aiosqlite.connect))
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+    assert result.drift_unforced, f"expected a drift report: {result}"
+
+    anchor_opens = [t for t in opened if "kestrel_prime.db" in t]
+    assert anchor_opens, f"the inspection opened the anchor at all: {opened}"
+    writable = [t for t in anchor_opens if "mode=ro" not in t]
+    assert not writable, (
+        "a --force-less run opened a write-capable connection to the agent's "
+        f"database: {writable}. SQLite serialises writers at the file level, "
+        "so this contends with a running agent even though nothing is written."
+    )

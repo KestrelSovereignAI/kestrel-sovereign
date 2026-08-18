@@ -1,0 +1,115 @@
+"""Cold-read semantics for the SQLite backend (#2920).
+
+A cold read exists so an inspection tool can report on an agent's database
+without disturbing it. "Without disturbing it" has two failure modes that pull
+in opposite directions, and these tests pin both:
+
+  * ``mode=ro`` alone CREATES the ``-wal``/``-shm`` sidecars on a WAL database
+    and cannot remove them again, and the cold identity lookup reads leftover
+    sidecars as a live agent — so a read-only inspection would plant evidence
+    that the agent it inspected was running;
+  * ``immutable=1`` creates no sidecars but makes SQLite ignore WAL content,
+    so it would report pre-WAL state as current.
+"""
+import sqlite3
+
+import pytest
+
+from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+
+def _wal_db(path, *, rows=(("committed",),)):
+    """A WAL-mode database with `rows`, cleanly checkpointed and closed."""
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (v TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def _sidecars(path):
+    return sorted(p.name for p in path.parent.glob(f"{path.name}-*"))
+
+
+@pytest.mark.asyncio
+async def test_cold_read_of_quiescent_db_leaves_no_sidecars(tmp_path):
+    db = tmp_path / "quiet.db"
+    _wal_db(db)
+    assert _sidecars(db) == []
+
+    backend = SQLiteBackend(str(db), cold_read=True)
+    await backend.connect()
+    try:
+        assert await backend.fetch_one("SELECT v FROM t") is not None
+    finally:
+        await backend.close()
+
+    assert _sidecars(db) == [], (
+        "a cold read of a checkpointed database created sidecars it cannot "
+        "remove; the cold identity lookup reads those as a live agent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cold_read_sees_data_that_is_still_only_in_the_wal(tmp_path):
+    """A WAL already exists, so the read must not be blind to it.
+
+    ``immutable=1`` would return the pre-WAL row set and report stale
+    governance state as current — the reason the mode is chosen per-database
+    rather than fixed.
+    """
+    db = tmp_path / "busy.db"
+    _wal_db(db)
+
+    holder = sqlite3.connect(db)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("INSERT INTO t VALUES ('only-in-wal')")
+    holder.commit()
+    assert _sidecars(db), "setup must leave a live WAL"
+
+    backend = SQLiteBackend(str(db), cold_read=True)
+    await backend.connect()
+    try:
+        rows = await backend.fetch_all("SELECT v FROM t ORDER BY v")
+    finally:
+        await backend.close()
+        holder.close()
+
+    values = {tuple(r)[0] for r in rows}
+    assert "only-in-wal" in values, (
+        f"cold read ignored committed WAL content: {values}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cold_read_does_not_migrate_a_database_it_only_inspects(tmp_path):
+    """Opening a cold read must not run schema DDL against the target.
+
+    With a WAL present the connection is a plain read-only one, so any DDL
+    ``_init_schema`` attempted would fail outright with "attempt to write a
+    readonly database". The point is not that it fails gracefully — it is that
+    an inspection does not migrate the database it was asked to report on.
+    """
+    db = tmp_path / "old-schema.db"
+    _wal_db(db)
+    holder = sqlite3.connect(db)
+    holder.execute("INSERT INTO t VALUES ('pending')")
+    holder.commit()
+    assert _sidecars(db), "setup must leave a live WAL"
+
+    try:
+        storage = AsyncStorage(str(db), backend="sqlite", agent_id="did:test", cold_read=True)
+        async with storage:
+            assert await storage.db.fetchone("SELECT v FROM t") is not None
+            # An inspection records nothing, so it has no destructive
+            # operation to audit and must not create the audit database.
+            assert storage.destructive_audit is None
+    finally:
+        holder.close()
+
+    assert not (tmp_path / "kestrel_audit.db").exists(), (
+        "a cold read created the destructive-audit database beside the one "
+        "it was inspecting"
+    )
