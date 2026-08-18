@@ -1116,3 +1116,63 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
     # Edge convergence must not touch the genesis receipt.
     assert post["genesis_audit"] == pre["genesis_audit"]
     assert post["genesis_audit_history"] == pre["genesis_audit_history"]
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_never_opens_a_writable_connection(tmp_path, monkeypatch):
+    """Without --force this command is documented as performing no write.
+
+    It opened read-write anyway, and SQLite serialises writers at the FILE
+    level: the per-connection write-unit lock cannot serialise a SECOND
+    connection to the same file. So a drift-only inspection could contend with
+    a running agent's database — which is how #2920 dropped a live agent into
+    Safe Mode while the caller saw nothing at all.
+
+    This observes what the code actually opened rather than asserting on a
+    state the test arranged: every AsyncStorage construction during the run is
+    recorded, and the read-only flag is read back off those calls.
+    """
+    from kestrel_sovereign.setup import constitution_reanchor as cr
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+
+    # Drift: the canonical file moves, the anchor does not.
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    # Record the BACKENDS, not the constructor kwargs. Asserting on what the
+    # caller asked for would pass even if the backend ignored the flag
+    # entirely — the request is not the guarantee.
+    backends: list = []
+    real_init = cr.AsyncStorage.__init__
+
+    def _record(self, *args, **kwargs):
+        result = real_init(self, *args, **kwargs)
+        backends.append(self._backend)
+        return result
+
+    monkeypatch.setattr(cr.AsyncStorage, "__init__", _record)
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+
+    assert result.drift_unforced, f"expected a drift report: {result}"
+    assert backends, "the inspection must have opened storage at all"
+    effective = [getattr(b, "read_only", None) for b in backends]
+    assert all(e is True for e in effective), (
+        "a --force-less run opened a writable connection: backend read_only "
+        f"was {effective}"
+    )

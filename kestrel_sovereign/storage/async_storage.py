@@ -128,6 +128,7 @@ class AsyncStorage:
         _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
         semantic_capabilities=None,
         _artifact_clock=None,
+        read_only: bool = False,
     ):
         """
         Initialize AsyncStorage.
@@ -190,10 +191,14 @@ class AsyncStorage:
             # PostgreSQL mode
             pg_dsn = dsn or os.getenv("KESTREL_DATABASE_URL")
             if pg_dsn:
-                self._backend = create_backend({"backend": "postgres", "dsn": pg_dsn})
+                self._backend = create_backend(
+                    {"backend": "postgres", "dsn": pg_dsn, "read_only": read_only}
+                )
             else:
                 # Fall back to individual env vars
-                self._backend = create_backend({"backend": "postgres"})
+                self._backend = create_backend(
+                    {"backend": "postgres", "read_only": read_only}
+                )
         else:
             # Default or explicit SQLite mode.  An explicit backend is an
             # ownership boundary: multi-agent hosts use local SQLite identity
@@ -205,7 +210,11 @@ class AsyncStorage:
                 os.makedirs(agent_data_dir, exist_ok=True)
 
             self.db_path = db_path
-            self._backend = SQLiteBackend(db_path)
+            # SQLite serialises writers at the FILE level, so an inspection
+            # that opens read-write can contend with a running agent even
+            # though it never writes (#2920). Read-only is refused by SQLite
+            # itself, not merely by convention.
+            self._backend = SQLiteBackend(db_path, read_only=read_only)
 
         if _assertion_tenant_capability is not None:
             if type(_assertion_tenant_capability) is not _AssertionTenantCapability:

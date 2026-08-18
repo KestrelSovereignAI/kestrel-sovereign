@@ -320,14 +320,21 @@ class SQLiteBackend(DatabaseBackend):
     - Foreign key enforcement
     """
     
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, read_only: bool = False):
         """
         Initialize SQLite backend.
-        
+
         Args:
             db_path: Path to SQLite database file, or ":memory:" for in-memory
+            read_only: Open with ``mode=ro`` so this connection cannot take a
+                write lock on a file another process may be using. SQLite
+                serialises writers at the FILE level, and the per-connection
+                write-unit lock cannot serialise a *second* connection to the
+                same file — so an inspection that opens read-write can contend
+                with a running agent even though it never writes (#2920).
         """
         self.db_path = db_path
+        self.read_only = read_only
         self._connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
         # Serializes operation *units* on the single shared connection. aiosqlite
@@ -445,17 +452,31 @@ class SQLiteBackend(DatabaseBackend):
             await self.close()
         
         try:
-            # Create directory if needed (unless in-memory)
-            if self.db_path != ":memory:":
+            # Create directory if needed (unless in-memory). A read-only
+            # opener must not bring the database it is inspecting into
+            # existence — "there is nothing here" is an answer it has to be
+            # able to give.
+            if self.db_path != ":memory:" and not self.read_only:
                 db_dir = Path(self.db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
-            
-            self._connection = await aiosqlite.connect(
-                self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
-            )
-            
-            # Enable WAL mode for better concurrency
-            await self._connection.execute("PRAGMA journal_mode=WAL")
+
+            if self.read_only:
+                self._connection = await aiosqlite.connect(
+                    f"file:{Path(self.db_path).as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=_SQLITE_BUSY_TIMEOUT_S,
+                )
+            else:
+                self._connection = await aiosqlite.connect(
+                    self.db_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+                )
+
+            # Enable WAL mode for better concurrency. Skipped when read-only:
+            # setting the journal mode WRITES to the database header, so this
+            # is not merely unnecessary there — it would fail the connection
+            # outright, which is the trap in making this path read-only.
+            if not self.read_only:
+                await self._connection.execute("PRAGMA journal_mode=WAL")
             
             # Allow concurrent writers to wait up to 30s for the lock
             await self._connection.execute(

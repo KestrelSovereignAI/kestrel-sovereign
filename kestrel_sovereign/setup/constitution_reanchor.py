@@ -135,8 +135,18 @@ class ReanchorTarget:
             return f"sqlite:{self.anchor_path}"
         return f"{self.backend}:{_redacted_dsn(self.dsn)}"
 
-    def open_storage(self) -> AsyncStorage:
+    def open_storage(self, *, read_only: bool = False) -> AsyncStorage:
         """Open the runtime database, bound to this agent.
+
+        ``read_only`` is for the inspection paths. Target resolution and drift
+        detection run BEFORE the ``if not force:`` early return, and this
+        command is documented as performing no write without ``--force`` — but
+        it opened read-write regardless. SQLite serialises writers at the file
+        level and the per-connection write-unit lock cannot serialise a SECOND
+        connection to the same file, so a drift-only inspection could contend
+        with a running agent's database. In #2920 that dropped a live agent
+        into Safe Mode; the caller saw nothing, because the cost landed on the
+        agent (#2920).
 
         The backend is passed **explicitly** in both branches. ``AsyncStorage``
         falls back to ``KESTREL_DB_BACKEND`` when it is not, which is how a
@@ -151,10 +161,16 @@ class ReanchorTarget:
         """
         if self.writes_to_anchor:
             return AsyncStorage(
-                str(self.anchor_path), backend="sqlite", agent_id=self.agent_did
+                str(self.anchor_path),
+                backend="sqlite",
+                agent_id=self.agent_did,
+                read_only=read_only,
             )
         return AsyncStorage(
-            backend=self.backend, dsn=self.dsn, agent_id=self.agent_did
+            backend=self.backend,
+            dsn=self.dsn,
+            agent_id=self.agent_did,
+            read_only=read_only,
         )
 
 
@@ -857,7 +873,7 @@ async def runtime_record_is_pending(target: ReanchorTarget) -> bool:
 
     from kestrel_sovereign.identity.birth_record import is_fabricated_placeholder
 
-    async with target.open_storage() as storage:
+    async with target.open_storage(read_only=True) as storage:
         # Ownership first, because it can veto both of the states below.
         # ``add_node`` refuses a row owned by anyone other than this agent, and
         # refuses one with several owners, so replication cannot land there —
@@ -923,7 +939,7 @@ async def _read_agent_anchor(
     guarantees, and only the second one survives an agent that owns more than
     one agent-typed node.
     """
-    async with target.open_storage() as storage:
+    async with target.open_storage(read_only=True) as storage:
         agent = await storage.graph.get_node(target.agent_did)
         if agent is None or agent.node_type != "agent":
             # Same privileged connection the edge read below uses, and for a
