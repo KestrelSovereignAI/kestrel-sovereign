@@ -493,17 +493,47 @@ def core_install_constraints(
     return []
 
 
+def version_is_valid(version: Optional[str]) -> bool:
+    """Is *version* a parseable PEP 440 version?
+
+    Asked separately from the spec because BOTH sides of the comparison can be
+    unevaluable, and only checking one leaves the other failing open — which is
+    how a malformed installed version came to satisfy every declared window.
+    """
+    if not version:
+        return False
+    try:
+        from packaging.version import Version
+
+        Version(version)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def spec_is_valid(spec: Optional[str]) -> bool:
-    """Is *spec* an evaluable PEP 440 specifier? Empty counts as valid ("any")."""
+    """Is *spec* a USABLE PEP 440 specifier? Empty counts as valid ("any").
+
+    Stricter than "does packaging parse it", because parsing is not the bar the
+    guard needs. ``===`` parses — it is arbitrary-equality carrying an EMPTY
+    version — and then matches nothing at all. As a declared core window that is
+    not a silent failure but a wedge: no version can ever satisfy it, so the
+    guard reports drift forever and repairs forever. Rendered into a constraint
+    it becomes ``kestrel-sovereign===``, which the installer rejects outright.
+
+    A clause with no version to compare against is a typo, and it is far cheaper
+    to say so at the manifest than to leave an operator with a core that can
+    never conform.
+    """
     if not spec:
         return True
     try:
         from packaging.specifiers import SpecifierSet
 
-        SpecifierSet(spec)
-        return True
+        parsed = SpecifierSet(spec)
     except Exception:  # noqa: BLE001
         return False
+    return all(str(clause.version).strip() for clause in parsed)
 
 
 def version_satisfies(version: Optional[str], spec: Optional[str]) -> bool:
@@ -561,6 +591,14 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             # somewhere that skipped validation — fail closed rather than let
             # `version_satisfies`'s reporting-safe True stand in for a verdict.
             return False
+        if policy.pypi and not version_is_valid(shape.version):
+            # The other half of the same comparison. `Version(version)` raises on
+            # malformed metadata and `version_satisfies` converts that into True,
+            # so a core whose recorded version is garbage sat "inside" every
+            # declared window and was never repaired. Validating only the spec
+            # left this side open — both operands have to be evaluable before a
+            # verdict about them means anything.
+            return False
         return (
             shape.version is not None
             and not shape.is_editable
@@ -580,10 +618,20 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             # asserting only the version here would have reintroduced it inside
             # the policy written to prevent it.
             return shape.provenance.source_id == held.source_id
-        # Genuinely unknown source: version stability is all that can honestly
-        # be asserted. Inventing a verdict about the source would be the
-        # fabrication the guard refuses everywhere else.
-        return True
+        # Genuinely unknown source. Version stability is all that can be
+        # asserted about WHERE it came from — but provenance becoming READABLE
+        # is itself an observable change, and the overwhelmingly likely cause is
+        # that something reinstalled core (a fresh install writes fresh
+        # metadata). Accepting it because the version matched reopened exactly
+        # the silent same-version replacement this guard exists to catch: an
+        # unreadable editable link swapped for the index wheel publishing that
+        # same version read as no drift.
+        #
+        # So the shape must still be unreadable. A transiently-unreadable file
+        # that becomes readable is reported as drift, which is the safe
+        # direction: the cost is a repair nobody needed, and the alternative is
+        # missing a real replacement.
+        return not shape.provenance.known
     return True
 
 

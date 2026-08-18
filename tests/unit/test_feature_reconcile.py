@@ -924,3 +924,171 @@ def test_a_malformed_pypi_spec_fails_closed_rather_than_satisfying_everything():
     assert fr.core_install_constraints(shape, good) == [
         f"{fr.CORE_DISTRIBUTION}>=0.52,<0.54",
     ]
+
+
+def test_a_malformed_installed_version_fails_closed_too():
+    """Both operands of the comparison have to be evaluable.
+
+    `Version(version)` raises on malformed metadata and `version_satisfies`
+    converts that into True, so a core whose recorded version is garbage sat
+    "inside" every declared window and was never repaired. Validating only the
+    SPEC left this side wide open — the same fail-open, one operand over.
+    """
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+
+    assert fr.version_is_valid("0.53.0")
+    assert not fr.version_is_valid("not-a-version")
+    assert not fr.version_is_valid(None)
+
+    assert not fr.core_install_matches(_shape("not-a-version"), policy)
+    assert fr.core_install_matches(_shape("0.53.0"), policy)   # unaffected
+
+
+def test_provenance_becoming_readable_under_a_hold_is_drift():
+    """Unknown → known is an observable change, not a clean bill of health.
+
+    A fresh install writes fresh metadata, so provenance becoming readable
+    almost always means something reinstalled core. Accepting it because the
+    version matched reopened the silent same-version replacement this guard
+    exists to catch: an unreadable editable link swapped for the index wheel
+    publishing that same version read as no drift.
+    """
+    before = _shape("0.53.0", known=False)
+    policy = fr.resolve_core_policy({}, before)
+    assert policy.hold_version == "0.53.0"
+
+    # Still unreadable and unmoved: nothing to report.
+    assert fr.core_install_matches(_shape("0.53.0", known=False), policy)
+    # Now a readable index wheel at the same version — something wrote metadata.
+    assert not fr.core_install_matches(_shape("0.53.0"), policy)
+    # And a readable direct URL at the same version, equally.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", direct_url="git+https://example.invalid/c"), policy,
+    )
+    # A version move is still drift regardless.
+    assert not fr.core_install_matches(_shape("0.54.0", known=False), policy)
+
+
+# --- the malformed-input contract (#2949) -----------------------------------
+#
+# Every unevaluable input this guard consumes, enumerated in one place and
+# asserted to fail CLOSED. Written after four separate review rounds each found
+# one more of these individually — a malformed spec, a malformed version,
+# unreadable provenance, provenance that became readable. They are the same
+# defect wearing different inputs, and finding them one review at a time is a
+# lottery. A guard that reports conformity over something it could not evaluate
+# is worse than no guard: it reports success.
+#
+# The rule these pin: an input the guard cannot evaluate is never evidence that
+# the policy is met. Cost of failing closed is a repair nobody needed; cost of
+# failing open is the defect the whole change exists to remove.
+
+
+_UNEVALUABLE_SPECS = ["banana", "!!", ">=", "1.0", "===", ">>>1"]
+_UNEVALUABLE_VERSIONS = ["not-a-version", "", None, "0.53.0.dev.x", "..", "1.0.0-BAD-!!"]
+
+
+@pytest.mark.parametrize("spec", _UNEVALUABLE_SPECS)
+def test_contract_an_unevaluable_spec_never_conforms(spec):
+    """A declared window we cannot parse is not a window anything is inside."""
+    assert not fr.spec_is_valid(spec)
+    assert not fr.core_install_matches(_shape("0.53.0"), fr.CoreSourcePolicy(pypi=spec))
+
+
+@pytest.mark.parametrize("spec", _UNEVALUABLE_SPECS)
+def test_contract_an_unevaluable_spec_emits_no_constraint(spec):
+    """`<pkg><garbage>` is not a constraint on <pkg> — it names another package
+    entirely, so emitting it is worse than emitting nothing."""
+    assert fr.core_install_constraints(
+        _shape("0.53.0"), fr.CoreSourcePolicy(pypi=spec),
+    ) == []
+
+
+@pytest.mark.parametrize("version", _UNEVALUABLE_VERSIONS)
+def test_contract_an_unevaluable_installed_version_never_conforms(version):
+    """The other operand. Validating only the spec left this side open."""
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert not fr.core_install_matches(_shape(version), policy)
+
+
+@pytest.mark.parametrize("version", _UNEVALUABLE_VERSIONS)
+def test_contract_a_hold_policy_rejects_an_unevaluable_version(version):
+    """A hold asserts only that nothing moved — but 'moved to garbage' moved."""
+    hold = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert not fr.core_install_matches(_shape(version, known=False), hold)
+
+
+def test_contract_unreadable_provenance_never_satisfies_a_declared_source():
+    """Damaged metadata is not evidence of an index install."""
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert not fr.core_install_matches(_shape("0.53.0", known=False), policy)
+
+
+@pytest.mark.parametrize("path", ["", None, "\x00bad", "relative/../x"])
+def test_contract_a_damaged_editable_path_never_satisfies_a_checkout(path):
+    """An editable policy names a specific checkout; anything we cannot resolve
+    to that checkout is not it."""
+    policy = fr.CoreSourcePolicy(editable="/src/core")
+    prov = (
+        fr.Provenance.direct(path, editable=True) if path else fr.Provenance.unknown()
+    )
+    shape = fr.CoreInstallShape(version="0.53.0", provenance=prov)
+    assert not fr.core_install_matches(shape, policy)
+
+
+def test_contract_every_guard_verdict_input_is_covered_here():
+    """The enumeration must keep pace with the guard's inputs.
+
+    Derived from the dataclasses, not from a list written here: a NEW field on
+    CoreInstallShape or CoreSourcePolicy is in scope automatically, which a
+    hardcoded attribute list cannot do — it can only see names someone
+    remembered to add, which is the same maintained-list defect that kept
+    `source_id` incomplete twice.
+
+    Fails when `core_install_matches` starts consuming an input that has no
+    malformed-input case above. Finding the next unevaluable input one review
+    round at a time is what this file exists to stop.
+    """
+    import dataclasses
+    import inspect
+    import re
+
+    src = inspect.getsource(fr.core_install_matches)
+
+    def _members(cls):
+        names = {f.name for f in dataclasses.fields(cls)}
+        names |= {
+            n for n, v in vars(cls).items() if isinstance(v, property)
+        }
+        return names
+
+    scope = {
+        "shape": _members(fr.CoreInstallShape),
+        "policy": _members(fr.CoreSourcePolicy),
+    }
+
+    # Inputs that DO have a malformed case in the contract above, or that
+    # cannot be malformed (a bool is a bool).
+    covered = {
+        "policy.pypi", "policy.editable", "policy.hold_version",
+        "policy.hold_provenance", "policy.guarded", "policy.source_is_verifiable",
+        "shape.version", "shape.provenance", "shape.editable_path",
+        "shape.is_editable", "shape.from_index", "shape.direct_url",
+        "shape.provenance_known",
+    }
+
+    referenced = {
+        f"{obj}.{attr}"
+        for obj, attrs in scope.items()
+        for attr in attrs
+        # Word-boundary, or `shape.editable_path` also registers as
+        # `shape.editable` and the contract reports a gap that is not there.
+        if re.search(rf"\b{obj}\.{attr}\b", src)
+    }
+
+    uncovered = referenced - covered
+    assert not uncovered, (
+        f"core_install_matches consumes {sorted(uncovered)} with no "
+        "malformed-input case in the contract above — add one, or add the name "
+        "to `covered` with a reason it cannot be malformed."
+    )
