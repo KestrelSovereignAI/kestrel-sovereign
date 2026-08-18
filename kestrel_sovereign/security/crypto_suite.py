@@ -465,9 +465,11 @@ class MLDSA65Suite(CryptoSuite):
     Sign/verify failure semantics
     -----------------------------
 
-    pqcrypto's ``verify`` returns ``False`` cleanly for all failure
-    modes — wrong key, tampered data, malformed signature — no
-    exceptions to catch. ``sign`` raises only on truly broken inputs
+    pqcrypto 1.0 signals a bad signature by RAISING
+    ``InvalidSignatureError`` and signals a good one by returning ``None``.
+    A truthiness test on the result therefore reports EVERY signature as
+    invalid, which is why ``verify`` below checks for the exception rather
+    than the value (#2966). ``sign`` raises only on truly broken inputs
     (wrong-length secret key, etc.); this suite wraps those into
     ``CryptoSuiteError`` for uniform error handling.
     """
@@ -487,7 +489,7 @@ class MLDSA65Suite(CryptoSuite):
     def generate_keypair(self) -> Keypair:
         from pqcrypto.sign import ml_dsa_65
         # pqcrypto returns (public, secret) — note the order
-        public_bytes, secret_bytes = ml_dsa_65.generate_keypair()
+        public_bytes, secret_bytes = ml_dsa_65.keygen()
         return Keypair(
             suite_id=self.alg_id,
             private_key=secret_bytes,
@@ -513,7 +515,12 @@ class MLDSA65Suite(CryptoSuite):
         if not isinstance(signature, (bytes, bytearray)):
             return False
         try:
-            return bool(ml_dsa_65.verify(bytes(public_key), data, bytes(signature)))
+            # Returning without raising IS the success signal: 1.0 returns
+            # None. ``bool(None)`` is False, so a truthiness check here would
+            # reject every valid signature — silently, and fail-closed, which
+            # is the worst kind of silent (#2966).
+            ml_dsa_65.verify(bytes(public_key), data, bytes(signature))
+            return True
         except Exception:
             return False
 
@@ -578,12 +585,22 @@ class SLHDSASHA2128sSuite(CryptoSuite):
     Library
     -------
 
-    Backed by ``pqcrypto.sign.sphincs_sha2_128s_simple`` — the FIPS 205
-    "SLH-DSA-SHA2-128s" parameter set is the same as the
-    ``sphincs+-sha2-128s-simple`` algorithm in PQClean's lineage.
-    pqcrypto exposes only the ``_simple`` variants (the FIPS-205-aligned
-    set), not the original SPHINCS+ "robust" variants. Same library
-    family as ML-DSA-65 (#950), no compile-on-deploy.
+    Backed by ``pqcrypto.sign.slh_dsa_sha2_128s``. Same library family as
+    ML-DSA-65 (#950), no compile-on-deploy.
+
+    This module previously used ``sphincs_sha2_128s_simple`` and this
+    docstring claimed the two were the same algorithm. **They are not.**
+    pqcrypto 1.0 drops every SPHINCS+ module and ships FIPS 205 SLH-DSA
+    instead, and a signature produced by the old module does NOT verify
+    under the new one — measured, not inferred, and invisible to any size
+    check because public key (32), secret key (64) and signature (7856)
+    lengths are identical across the change.
+
+    Migrating was therefore an algorithm change, not a rename. It was safe
+    here only because no signature predating it exists to strand (#2966);
+    anything signed by the old module would have become permanently
+    unverifiable, including release manifests checked by
+    ``kestrel release verify``.
 
     Multikey shape
     --------------
@@ -597,10 +614,10 @@ class SLHDSASHA2128sSuite(CryptoSuite):
     Sign/verify failure semantics
     -----------------------------
 
-    Mirrors :class:`MLDSA65Suite`: pqcrypto's verify returns False
-    cleanly for any failure mode; sign raises only on broken inputs
-    (wrong-length secret key, etc.) and we wrap those into
-    :class:`CryptoSuiteError`.
+    Mirrors :class:`MLDSA65Suite`: pqcrypto 1.0's verify returns ``None``
+    on success and raises ``InvalidSignatureError`` on a bad signature;
+    sign raises only on broken inputs (wrong-length secret key, etc.) and
+    we wrap those into :class:`CryptoSuiteError`.
     """
 
     alg_id: ClassVar[str] = ALG_SLH_DSA_SHA2_128S
@@ -615,8 +632,8 @@ class SLHDSASHA2128sSuite(CryptoSuite):
     SIGNATURE_SIZE: ClassVar[int] = 7856
 
     def generate_keypair(self) -> Keypair:
-        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
-        public_bytes, secret_bytes = slh.generate_keypair()
+        from pqcrypto.sign import slh_dsa_sha2_128s as slh
+        public_bytes, secret_bytes = slh.keygen()
         return Keypair(
             suite_id=self.alg_id,
             private_key=secret_bytes,
@@ -624,7 +641,7 @@ class SLHDSASHA2128sSuite(CryptoSuite):
         )
 
     def sign(self, data: bytes, private_key: Any) -> bytes:
-        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+        from pqcrypto.sign import slh_dsa_sha2_128s as slh
         if not isinstance(private_key, (bytes, bytearray)):
             raise CryptoSuiteError(
                 f"slh-dsa-sha2-128s private_key must be bytes "
@@ -637,13 +654,15 @@ class SLHDSASHA2128sSuite(CryptoSuite):
             raise CryptoSuiteError(f"slh-dsa-sha2-128s sign failed: {e}") from e
 
     def verify(self, data: bytes, signature: bytes, public_key: Any) -> bool:
-        from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+        from pqcrypto.sign import slh_dsa_sha2_128s as slh
         if not isinstance(public_key, (bytes, bytearray)):
             return False
         if not isinstance(signature, (bytes, bytearray)):
             return False
         try:
-            return bool(slh.verify(bytes(public_key), data, bytes(signature)))
+            # See MLDSA65Suite.verify: success is "returned without raising".
+            slh.verify(bytes(public_key), data, bytes(signature))
+            return True
         except Exception:
             return False
 
