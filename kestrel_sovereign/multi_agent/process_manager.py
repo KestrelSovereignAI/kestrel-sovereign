@@ -601,7 +601,21 @@ class ProcessManager:
             timeout: Seconds to wait for graceful shutdown before SIGKILL.
 
         Returns:
-            True if agent was stopped (or wasn't running).
+            True only once the agent is confirmed gone (or was never running).
+            False if it is still running after SIGKILL.
+
+        A stop is reported on the strength of the postcondition, never on the
+        strength of having sent a signal: ``kill_process`` cannot signal a
+        process owned by another user at all, and a delivered signal is not
+        proof it was honoured. On failure the PID file is deliberately left in
+        place — it is the only record of a process that outlived the stop, and
+        clearing it would strand a live agent with nothing pointing at it.
+
+        Note:
+            ``is_process_running`` reports False for a live process owned by
+            another user (#2995), so True here is only as strong as that probe.
+            Callers that know the agent's port should confirm the port was
+            released as well.
         """
         ap = self._agents.get(name)
         if ap is None:
@@ -628,6 +642,13 @@ class ProcessManager:
             logger.warning(f"Agent '{name}' didn't stop gracefully, sending SIGKILL")
             self.kill_process(ap.pid, force=True)
             time.sleep(0.5)
+
+        if self.is_process_running(ap.pid):
+            logger.error(
+                f"Agent '{name}' (PID {ap.pid}) is still running after SIGKILL; "
+                "leaving the PID file in place"
+            )
+            return False
 
         if ap.pid_file:
             self.clear_pid(ap.pid_file)
@@ -656,14 +677,23 @@ class ProcessManager:
                 logger.error(f"Failed to start agent '{name}': {e}")
         return started
 
-    def stop_all(self, timeout: float = 5.0) -> None:
+    def stop_all(self, timeout: float = 5.0) -> list[str]:
         """Stop all managed agent processes.
 
         Args:
             timeout: Seconds to wait per agent for graceful shutdown.
+
+        Returns:
+            The names of agents still running after SIGKILL, in the order they
+            were attempted. Empty when every agent stopped. Returned rather
+            than discarded so a caller cannot report a clean shutdown over the
+            top of an agent that outlived it.
         """
+        still_running = []
         for name in list(self._agents):
-            self.stop_agent(name, timeout=timeout)
+            if not self.stop_agent(name, timeout=timeout):
+                still_running.append(name)
+        return still_running
 
     def get_agent_status(self, name: str) -> dict:
         """Get status info for a single agent.

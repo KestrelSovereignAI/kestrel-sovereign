@@ -439,9 +439,11 @@ class TestStopAgent:
         ap = pm.register_agent("claw", cfg)
         ap.pid = 99999  # Fake running PID
 
-        # Call sequence: (1) line 303 check → True, (2) line 315 loop → False (break),
-        # (3) line 320 force-kill check → False (skip)
-        with patch.object(ProcessManager, "is_process_running", side_effect=[True, False, False]), \
+        # Call sequence: (1) initial check → True, (2) graceful-wait loop → False
+        # (break), (3) force-kill check → False (skip), (4) the post-stop
+        # verification that decides the return value → False (confirmed gone).
+        with patch.object(ProcessManager, "is_process_running",
+                          side_effect=[True, False, False, False]), \
              patch.object(ProcessManager, "kill_process") as mock_kill, \
              patch("time.sleep"):
             pm.stop_agent("claw")
@@ -486,6 +488,44 @@ class TestStopAgent:
             pm.stop_agent("claw")
 
         assert not ap.pid_file.exists()
+
+    def test_stop_agent_that_survives_sigkill_reports_failure(self, pm, project_dir):
+        """An agent still running after SIGKILL must not be reported stopped."""
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        ap = pm.register_agent("claw", cfg)
+        ap.pid = 99999
+        ProcessManager.write_pid(ap.pid_file, 99999)
+
+        # The process ignores every signal it is sent.
+        with patch.object(ProcessManager, "is_process_running", return_value=True), \
+             patch.object(ProcessManager, "kill_process"), \
+             patch("time.sleep"):
+            result = pm.stop_agent("claw", timeout=0.01)
+
+        assert result is False
+        # The PID file is the only record of a process that outlived the stop;
+        # clearing it would strand a live agent with nothing pointing at it.
+        assert ap.pid_file.exists()
+        assert ap.pid == 99999
+
+    def test_stop_all_names_the_agents_that_survived(self, pm, project_dir):
+        """stop_all reports which agents outlived the stop rather than dropping it."""
+        for name, port in (("claw", 8801), ("testbot", 8802)):
+            ap = pm.register_agent(name, LocalAgentConfig(
+                data_dir=Path(f"agent_data/{name}"), port=port,
+            ))
+            ap.pid = 99999 if name == "claw" else 99998
+
+        # 'claw' ignores signals; 'testbot' dies on the first check.
+        def _running(pid):
+            return pid == 99999
+
+        with patch.object(ProcessManager, "is_process_running", side_effect=_running), \
+             patch.object(ProcessManager, "kill_process"), \
+             patch("time.sleep"):
+            survivors = pm.stop_all(timeout=0.01)
+
+        assert survivors == ["claw"]
 
 
 # -----------------------------------------------------------------------

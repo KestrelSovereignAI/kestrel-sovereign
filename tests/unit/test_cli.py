@@ -4,6 +4,7 @@ Unit tests for the unified kestrel CLI.
 Tests argument parsing, command dispatch, and individual command handlers.
 """
 
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -30,7 +31,9 @@ from kestrel_sovereign.cli_lifecycle import (
     _REANCHOR_RUNBOOK,
     _diagnose_unready_server,
     _fetch_detailed_health,
+    _reap_orphans_on_port,
     _start_inprocess_mode,
+    PortReapResult,
 )
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 from kestrel_sovereign.multi_agent.process_manager import (
@@ -595,6 +598,126 @@ class TestCmdStop:
         assert rc == 0
         output = capsys.readouterr().out
         assert "MultiAgent stopped" in output
+
+
+# -----------------------------------------------------------------------
+# cmd_stop postcondition tests (#2990)
+#
+# The verdict in every test below is decided by a REAL listening socket, so
+# ``is_port_in_use`` does the same connect() it does in production. Only the
+# kill is stubbed — ``find_pids_on_port`` on a socket this process owns would
+# return the test runner's own PID.
+# -----------------------------------------------------------------------
+
+@contextmanager
+def _listener_on(port: int):
+    """Hold a real TCP listener on `port` for the duration of the block.
+
+    A background thread accepts and closes each probe. ``is_port_in_use``
+    connects without ever accepting, so an unattended listener's backlog fills
+    after the first probe and every later probe is refused — the port would
+    read as free while it is still held, which is precisely the bug under
+    test.
+    """
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", port))
+    sock.listen(128)
+
+    def _drain():
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return  # listener closed — the block is over
+            conn.close()
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    try:
+        yield sock
+    finally:
+        sock.close()
+        drainer.join(timeout=2)
+
+
+@contextmanager
+def _unkillable_orphan(pid: int = 999_999):
+    """Pretend `pid` listens on every probed port and ignores every signal."""
+    with patch.object(ProcessManager, "find_pids_on_port", return_value=[pid]), \
+         patch.object(ProcessManager, "kill_process", return_value=False), \
+         patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
+        yield
+
+
+class TestCmdStopReportsOnlyVerifiedStops:
+    """`stop` may report stopped only when the port was actually released."""
+
+    def test_reap_returns_still_held_when_port_survives_sigkill(self):
+        with _listener_on(18901), _unkillable_orphan():
+            result = _reap_orphans_on_port(18901, "claw", force=False)
+        assert result is PortReapResult.STILL_HELD
+
+    def test_reap_returns_released_when_port_is_free_after_signalling(self):
+        # Nothing is bound to 18902, so the port probe sees it released.
+        with _unkillable_orphan():
+            result = _reap_orphans_on_port(18902, "claw", force=False)
+        assert result is PortReapResult.RELEASED
+
+    def test_reap_returns_nothing_found_when_no_listener(self):
+        with patch.object(ProcessManager, "find_pids_on_port", return_value=[]):
+            result = _reap_orphans_on_port(18903, "claw", force=False)
+        assert result is PortReapResult.NOTHING_FOUND
+
+    def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
+        """A host port nobody could free must not read as a clean shutdown."""
+        parser = build_parser()
+        args = parser.parse_args(["stop"])
+
+        with _listener_on(18888), _unkillable_orphan(), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "MultiAgent stopped" not in output
+        assert "stop incomplete" in output
+        assert "host" in output
+        # The operator is told how to find the process still holding the port.
+        assert "lsof -nP -iTCP:18888 -sTCP:LISTEN" in output
+
+    def test_stop_single_agent_fails_when_its_port_stays_held(
+        self, multi_agent_env, capsys
+    ):
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+
+        with _listener_on(18801), _unkillable_orphan(), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "claw stopped" not in output
+        assert "still held after SIGKILL" in output
+
+    def test_stop_single_agent_reports_orphan_stop_when_port_is_released(
+        self, multi_agent_env, capsys
+    ):
+        """The success path still succeeds — nothing is bound to claw's port."""
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+
+        with _unkillable_orphan(), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "claw stopped (orphan)" in output
 
 
 # -----------------------------------------------------------------------
