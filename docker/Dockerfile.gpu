@@ -1,6 +1,11 @@
 # Dockerfile for Kestrel Agent - GPU-Enabled
 # Includes CUDA support for GPU-accelerated LLM inference
-FROM --platform=linux/amd64 nvidia/cuda:11.8.0-runtime-ubuntu20.04
+#
+# Ubuntu 22.04 (glibc 2.35), not 20.04 (glibc 2.31): pqcrypto 1.0 publishes
+# its Linux x86_64 wheel as manylinux_2_34 only, so on 20.04 uv falls back to
+# the maturin/Rust sdist and `uv pip install .` fails — this image carries no
+# Rust toolchain. CUDA 11.8 is unchanged (#2966).
+FROM --platform=linux/amd64 nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 # Set environment variables
 ENV KESTREL_DB_PATH=/app/agent_data

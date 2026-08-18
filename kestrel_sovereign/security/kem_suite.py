@@ -315,11 +315,12 @@ class MLKEM768Suite(KEMSuite):
     compile-on-deploy; prebuilt wheels for macOS arm64, Linux x86_64,
     Windows.
 
-    pqcrypto's ML-KEM API:
+    pqcrypto's ML-KEM API (1.0; the 0.x names were
+    ``generate_keypair``/``encrypt``/``decrypt`` and are gone — #2966):
 
-    - ``generate_keypair()`` → ``(public_bytes, secret_bytes)``
-    - ``encrypt(public_bytes)`` → ``(ciphertext, shared_secret)``
-    - ``decrypt(secret_bytes, ciphertext)`` → ``shared_secret``
+    - ``keygen()`` → ``(public_bytes, secret_bytes)``
+    - ``encaps(public_bytes)`` → ``(ciphertext, shared_secret)``
+    - ``decaps(secret_bytes, ciphertext)`` → ``shared_secret``
 
     The implementation follows FIPS 203's implicit-rejection rule:
     decapsulating with a wrong key produces a 32-byte secret that
@@ -355,7 +356,7 @@ class MLKEM768Suite(KEMSuite):
 
     def generate_keypair(self) -> KEMKeypair:
         from pqcrypto.kem import ml_kem_768
-        public_bytes, secret_bytes = ml_kem_768.generate_keypair()
+        public_bytes, secret_bytes = ml_kem_768.keygen()
         return KEMKeypair(
             suite_id=self.alg_id,
             private_key=secret_bytes,
@@ -375,7 +376,7 @@ class MLKEM768Suite(KEMSuite):
                 f"got {len(public_key)}"
             )
         try:
-            ct, ss = ml_kem_768.encrypt(bytes(public_key))
+            ct, ss = ml_kem_768.encaps(bytes(public_key))
             return ct, ss
         except Exception as e:
             raise KEMSuiteError(f"ml-kem-768 encapsulate failed: {e}") from e
@@ -398,7 +399,7 @@ class MLKEM768Suite(KEMSuite):
                 f"got {len(ciphertext)}"
             )
         try:
-            return ml_kem_768.decrypt(bytes(private_key), bytes(ciphertext))
+            return ml_kem_768.decaps(bytes(private_key), bytes(ciphertext))
         except Exception as e:
             raise KEMSuiteError(f"ml-kem-768 decapsulate failed: {e}") from e
 

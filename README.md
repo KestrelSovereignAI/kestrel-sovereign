@@ -38,6 +38,11 @@ canonical ownership contract and live in-tree inventory are in
 - Python 3.11-3.14
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
+- **Linux: glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+, RHEL 9+). The
+  post-quantum signing dependency publishes `manylinux_2_34` wheels only, so on
+  an older glibc — Ubuntu 20.04, Debian 11, RHEL 8 — installation falls back to
+  building it from source and requires a Rust toolchain. macOS and Windows are
+  unaffected.
 
 ### Install uv
 
