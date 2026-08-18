@@ -1335,6 +1335,15 @@ class StorePurgeResult:
 
 # Content stores that hold user text. A FAILED sweep of any of these means the
 # "leave no trace" contract cannot be certified, so mode exit must fail closed.
+# The #2959 session projection sweep is likewise NOT required, and that is a
+# correction: it was required while it swept three tables of per-session
+# structure — boundaries, counts, pointers. Narrowed to the change ledger, all
+# it can remove is one monotonic counter, which is a cache-invalidation token
+# and not a record of anything. Requiring it made a harmless delete emit a leak
+# audit: an agent that hard-purged its NORMAL history BEFORE entering EPHEMERAL
+# has an empty history and a legitimate ledger row, so a clean stint would
+# report a leak it did not have. The sweep still runs and is still reported;
+# it just no longer certifies content.
 # The observability sink (F076) holds content-free metrics and is NOT required —
 # a failure there is recorded but never blocks a transition.
 REQUIRED_CONTENT_STORES = frozenset({
@@ -1342,6 +1351,7 @@ REQUIRED_CONTENT_STORES = frozenset({
     "graph_nodes",
     "channel_messages",
 })
+
 
 
 class EphemeralPurgeReport(dict):
@@ -2288,6 +2298,23 @@ class PrivacyEnforcingStorage:
         report.record(await self._sweep_store(
             "channel_messages",
             lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+        ))
+
+        # Last, because the sweeps above fire the projection's change trigger
+        # themselves; clearing first would leave a fresh row naming the very
+        # agent being erased.
+        #
+        # Narrow, because at this phase the ledger is the only projection table
+        # that can hold anything — nothing in production maintains the
+        # projection itself yet (Phase C, #2960, is where that starts, and where
+        # this question has to be asked again against rows that exist). An
+        # earlier revision swept all three tables and needed a leak-detection
+        # condition, an orphan probe and cross-table atomicity to do it safely;
+        # every one of those was a place to be wrong, guarding rows that are
+        # always empty here.
+        report.record(await self._sweep_store(
+            "session_projection",
+            lambda: self._storage.purge_session_change_ledger(reason=reason),
         ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /

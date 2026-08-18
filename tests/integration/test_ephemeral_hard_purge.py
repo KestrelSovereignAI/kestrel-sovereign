@@ -22,6 +22,7 @@ import pytest
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
+    REQUIRED_CONTENT_STORES,
     PrivacyEnforcingStorage,
     PurgeOutcome,
 )
@@ -51,6 +52,7 @@ async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path):
             "conversation_history": 0,
             "graph_nodes": 0,
             "channel_messages": 0,
+            "session_projection": 0,
         }
 
 
@@ -84,6 +86,144 @@ async def test_purge_destroys_conversation_history_leak(tmp_path):
         trash = await storage.conversation.get_full_history_with_ids(only_deleted=True)
         assert live == []
         assert trash == []
+
+
+@pytest.mark.asyncio
+async def test_purge_erases_the_change_ledger_when_no_history_survives(tmp_path):
+    """"Leave no trace" reaches the #2959 change ledger.
+
+    A database trigger bumps that ledger on every write to
+    ``conversation_history``, and a trigger cannot see privacy mode — so a
+    purely EPHEMERAL agent that leaked one turn is left named by a row counting
+    it, after the sweep that erased the turn itself. Content-free, but the
+    contract here is not "no content".
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked turn")
+
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 1, "the trigger must have stamped the ledger, or this proves nothing"
+
+        await wrapper.purge_ephemeral_session(reason="test")
+
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 0, "the ledger still names the EPHEMERAL agent after its purge"
+
+
+@pytest.mark.asyncio
+async def test_purge_keeps_the_ledger_when_legitimate_history_survives(tmp_path):
+    """The scoped-purge contract wins over tidiness.
+
+    An agent with pre-EPHEMERAL history is already recorded by that history, so
+    its ledger row names nothing the database does not already say, and the
+    counter is a change token with no meaning of its own. Deleting it would
+    touch state authored before entry — which the scoped purge forbids — to
+    erase a trace that is not one.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("user", "legitimate, pre-EPHEMERAL")
+        # Past the per-second watermark boundary BEFORE entering, so the row
+        # above is strictly older than the EPHEMERAL entry and the scoped purge
+        # must leave it alone. Without this the "legitimate" row lands in the
+        # same second as entry, is swept as in-window, and the case silently
+        # tests the leak path instead.
+        await asyncio.sleep(1.05)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+
+        result = await wrapper.purge_ephemeral_session(reason="test")
+
+        assert result["session_projection"] == 0
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 1, "a clean stint deleted state authored before EPHEMERAL entry"
+
+
+@pytest.mark.asyncio
+async def test_a_purged_pre_entry_ledger_does_not_report_a_leak(tmp_path):
+    """A clean stint must not be audited as a leak because of a change token.
+
+    An agent that hard-purged its NORMAL history BEFORE entering EPHEMERAL has
+    no surviving history and a legitimate ledger row left by the trigger. The
+    sweep cannot tell that row from one this stint created — provenance would
+    have to be captured at entry, and both entry paths are synchronous, so
+    there is no read to capture it with.
+
+    What it CAN do is not certify content it does not hold. The ledger is a
+    monotonic cache-invalidation token; removing it destroys no record and the
+    projection re-derives. So the sweep is reported and is not required, and a
+    clean stint is never audited as a leak on account of it.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("user", "normal-mode turn")
+        # Hard-purge it while still NORMAL: history is now empty, but the
+        # trigger's ledger row survives and predates EPHEMERAL entirely.
+        await storage.conversation.purge_all_since("1970-01-01", reason="normal-purge")
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) >= 1, "fixture needs a pre-entry ledger row to test anything"
+
+        await asyncio.sleep(1.05)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+
+        report = await wrapper.purge_ephemeral_session(reason="test")
+
+        assert not report.required_sweep_failed, (
+            "a stint that wrote nothing was audited as a failed content sweep"
+        )
+        assert report["conversation_history"] == 0, "no content leaked"
+        assert "session_projection" not in REQUIRED_CONTENT_STORES, (
+            "a change token must not certify content: requiring it turns "
+            "removing a pre-entry counter into a reported leak"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_retry_reaches_the_same_verdict_as_the_first_attempt(tmp_path):
+    """The condition must be durable, not a count of what this attempt deleted.
+
+    If the ledger sweep is the only one that fails, the attempt has already
+    destroyed the leaked history — so a second attempt sweeps zero content rows,
+    not because nothing leaked but because the evidence was removed by the pass
+    that failed to finish. "Does any history survive" asks the database, gets
+    the same answer both times, and is the reason this needs no orphan probe or
+    leak flag.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked turn")
+
+        # The first attempt, stopping after the history sweep.
+        await storage.conversation.purge_all_since("1970-01-01", reason="partial")
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) >= 1, "fixture must leave the ledger standing to test anything"
+
+        result = await wrapper.purge_ephemeral_session(reason="retry")
+
+        assert result["conversation_history"] == 0, "the retry finds no history left"
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 0, (
+            "the retry read zero deleted rows as 'nothing leaked' and left the "
+            "ledger naming the EPHEMERAL agent"
+        )
 
 
 @pytest.mark.asyncio

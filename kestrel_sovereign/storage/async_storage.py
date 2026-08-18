@@ -862,6 +862,60 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all_since(since_iso, reason=reason)
 
+    async def purge_session_change_ledger(
+        self, *, reason: str = "ephemeral-leak",
+    ) -> int:
+        """Erase this agent's row from the #2959 change ledger (EPHEMERAL).
+
+        Narrow on purpose. The projection has three tables, but only this one
+        can hold anything at this phase: ``conversation_sessions`` and
+        ``conversation_session_watermarks`` are written solely by ``repair()``,
+        and nothing in production calls it — Phase C (#2960) is what starts
+        maintaining the projection, and the EPHEMERAL question has to be
+        answered again there, against rows that will actually exist.
+
+        What does accrue is the ledger, because a database trigger bumps it on
+        every write to ``conversation_history`` and a trigger cannot see privacy
+        mode. A purely EPHEMERAL agent that leaked one turn would otherwise
+        leave a row naming it behind after the sweep that erased the turn.
+
+        **Only when no history survives.** That condition is the whole design:
+
+        * It is durable, not a count of what THIS attempt deleted. A retry after
+          a partial failure asks the same question and gets the same answer,
+          where delete counts would read zero and call the residue clean.
+        * It is one row, so it cannot half-apply.
+        * An agent whose legitimate pre-EPHEMERAL history survives is already
+          recorded by that history; its ledger row names nothing the database
+          does not already say, and the counter's value is a change token with
+          no meaning of its own. Deleting it would also breach the scoped-purge
+          contract, which forbids touching anything authored before entry.
+        """
+        if not self._initialized:
+            await self.initialize()
+        if not await self.db.table_exists("conversation_history_changes"):
+            return 0
+        from .async_conversation_store import _rows_affected
+
+        survives = await self.db.fetchval(
+            "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
+            (self.agent_id,),
+        )
+        if survives:
+            return 0
+        purged = _rows_affected(
+            await self.db.execute(
+                "DELETE FROM conversation_history_changes WHERE agent_id = ?",
+                (self.agent_id,),
+            )
+        )
+        if purged:
+            logger.info(
+                "purged the session change ledger for %s (%s)",
+                self.agent_id, reason,
+            )
+        return purged
+
     async def purge_channel_messages_since(
         self, since_iso: str, *, reason: str = "ephemeral-leak",
     ) -> int:
