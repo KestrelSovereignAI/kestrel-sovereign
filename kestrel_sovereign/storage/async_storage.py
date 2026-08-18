@@ -862,57 +862,104 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all_since(since_iso, reason=reason)
 
-    async def purge_session_change_ledger(
+    async def purge_session_projection(
         self, *, reason: str = "ephemeral-leak",
     ) -> int:
-        """Erase this agent's row from the #2959 change ledger (EPHEMERAL).
+        """Erase this agent's #2959 projection state (EPHEMERAL).
 
-        Narrow on purpose. The projection has three tables, but only this one
-        can hold anything at this phase: ``conversation_sessions`` and
-        ``conversation_session_watermarks`` are written solely by ``repair()``,
-        and nothing in production calls it — Phase C (#2960) is what starts
-        maintaining the projection, and the EPHEMERAL question has to be
-        answered again there, against rows that will actually exist.
-
-        What does accrue is the ledger, because a database trigger bumps it on
-        every write to ``conversation_history`` and a trigger cannot see privacy
-        mode. A purely EPHEMERAL agent that leaked one turn would otherwise
-        leave a row naming it behind after the sweep that erased the turn.
-
-        **Only when no history survives.** That condition is the whole design:
+        **Only when no live history survives**, and then from every table the
+        projection owns, in one transaction. That condition is the whole design:
 
         * It is durable, not a count of what THIS attempt deleted. A retry after
           a partial failure asks the same question and gets the same answer,
           where delete counts would read zero and call the residue clean.
-        * It is one row, so it cannot half-apply.
-        * An agent whose legitimate pre-EPHEMERAL history survives is already
-          recorded by that history; its ledger row names nothing the database
-          does not already say, and the counter's value is a change token with
-          no meaning of its own. Deleting it would also breach the scoped-purge
-          contract, which forbids touching anything authored before entry.
+        * When it holds, an EMPTY projection is not merely safe to leave behind
+          — it is the correct value. A projection describes live history, and
+          there is none, so erasing it writes the truth rather than guessing at
+          it. Nothing here has to reason about which rows leaked.
+
+        What accrues without anyone asking is the change ledger, because a
+        database trigger bumps it on every write to ``conversation_history`` and
+        a trigger cannot see privacy mode. A purely EPHEMERAL agent that leaked
+        one turn would otherwise leave a row naming it behind after the sweep
+        that erased the turn.
+
+        **Why the ledger cannot go alone** (round-6 review). ``is_stale()``
+        answers by comparing a stored stamp to the ledger for equality, which is
+        sound only while the ledger is monotonic — the claim
+        ``ConversationSessionProjection.observed_changes()`` makes in its own
+        docstring. Deleting the row breaks that: the trigger's next write is an
+        INSERT of ``1``, so the counter restarts. A projection repaired at stamp
+        N, purged, and then written to N more times reports itself CURRENT while
+        describing history that no longer exists — immediately when N is 1. The
+        stamp is meaningful only against the ledger incarnation it was read
+        from, so the two are erased together or neither is.
+
+        An earlier revision of this sweep did reach all three tables and needed
+        a leak-detection condition, an orphan probe and cross-table atomicity to
+        do it safely. That machinery was for the *scoped* case, where some
+        history survives and the sweep must separate what leaked from what did
+        not. None of it is needed here: this runs only when nothing survives, so
+        the answer for every row is the same one.
+
+        An agent whose legitimate pre-EPHEMERAL history survives is untouched.
+        Its ledger row names nothing the database does not already say, and
+        deleting it would breach the scoped-purge contract, which forbids
+        touching anything authored before entry.
         """
         if not self._initialized:
             await self.initialize()
-        if not await self.db.table_exists("conversation_history_changes"):
-            return 0
         from .async_conversation_store import _rows_affected
+        from .conversation_sessions import projection_tables
 
-        survives = await self.db.fetchval(
-            "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
-            (self.agent_id,),
-        )
-        if survives:
+        ledger = "conversation_history_changes"
+        tables = [
+            table for table, _ddl in projection_tables()
+            if await self.db.table_exists(table)
+        ]
+        if not tables:
             return 0
-        purged = _rows_affected(
-            await self.db.execute(
-                "DELETE FROM conversation_history_changes WHERE agent_id = ?",
+        # The ledger goes LAST, and that ordering is the guarantee — not the
+        # transaction. The state to avoid is a watermark standing beside a
+        # missing ledger, because that is the one where a restarted counter can
+        # match a stale stamp. Deleting the ledger after everything derived from
+        # it makes that state unreachable at every point in the sequence, on any
+        # backend, at any isolation level: while the ledger is still there the
+        # watermark is either present and consistent or already gone, and once
+        # it is gone there is no stamp left to fool. ``projection_tables()``
+        # happens to order it last too, for an unrelated reason — the triggers
+        # reference it — so it is re-established here rather than inherited from
+        # a coincidence a future reordering could quietly take away.
+        tables = [t for t in tables if t != ledger] + [t for t in tables if t == ledger]
+
+        purged = 0
+        # The transaction is what makes the sweep all-or-nothing, and on SQLite
+        # (BEGIN IMMEDIATE) it also holds the writer slot across the test. It is
+        # not load-bearing for the invariant above: under PostgreSQL READ
+        # COMMITTED a row committed after this SELECT is still invisible to it,
+        # so a concurrent write can make the survival test stale. What that
+        # costs is bounded — the projection is erased for an agent that now has
+        # history, which the next repair rebuilds, and the ledger is
+        # content-free — and it is the delete ORDER, not the isolation level,
+        # that keeps a stale stamp from ever reading as current.
+        async with self.db.transaction(immediate=True):
+            survives = await self.db.fetchval(
+                "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
                 (self.agent_id,),
             )
-        )
+            if survives:
+                return 0
+            for table in tables:
+                purged += _rows_affected(
+                    await self.db.execute(
+                        f"DELETE FROM {table} WHERE agent_id = ?",
+                        (self.agent_id,),
+                    )
+                )
         if purged:
             logger.info(
-                "purged the session change ledger for %s (%s)",
-                self.agent_id, reason,
+                "purged the session projection for %s (%s): %d row(s) across %s",
+                self.agent_id, reason, purged, ", ".join(tables),
             )
         return purged
 

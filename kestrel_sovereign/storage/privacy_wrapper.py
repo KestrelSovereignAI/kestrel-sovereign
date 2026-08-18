@@ -2304,17 +2304,23 @@ class PrivacyEnforcingStorage:
         # themselves; clearing first would leave a fresh row naming the very
         # agent being erased.
         #
-        # Narrow, because at this phase the ledger is the only projection table
-        # that can hold anything — nothing in production maintains the
-        # projection itself yet (Phase C, #2960, is where that starts, and where
-        # this question has to be asked again against rows that exist). An
-        # earlier revision swept all three tables and needed a leak-detection
-        # condition, an orphan probe and cross-table atomicity to do it safely;
-        # every one of those was a place to be wrong, guarding rows that are
-        # always empty here.
+        # All of it, not just the ledger. At this phase the ledger is the only
+        # projection table that ordinarily holds anything — nothing in
+        # production maintains the projection yet (Phase C, #2960, is where that
+        # starts, and where this question has to be asked again against rows
+        # that exist). But the ledger cannot be erased on its own: a stored
+        # watermark stamp is only meaningful against the ledger incarnation it
+        # was read from, and deleting the row restarts the counter, so a
+        # surviving watermark can match it again and report a projection of
+        # purged history as CURRENT (round-6 review; see the method).
+        #
+        # This costs none of the machinery an earlier revision needed — the
+        # leak-detection condition, the orphan probe — because that was for the
+        # scoped case. Here nothing survives, so the correct projection is the
+        # empty one and every row gets the same answer.
         report.record(await self._sweep_store(
             "session_projection",
-            lambda: self._storage.purge_session_change_ledger(reason=reason),
+            lambda: self._storage.purge_session_projection(reason=reason),
         ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
@@ -4166,11 +4172,20 @@ class PrivacyEnforcingStorage:
         else:
             archive_clause = "archived_at IS NULL"
 
+        # Newest-first here; `/api/conversations` reverses before grouping, so
+        # the grouper sees `canonical_order()`. Shared with the #2959 projection
+        # rather than restated: the projection is meant to be a faithful cache
+        # of this list, and it cannot be if the two derive from different
+        # orders. `id` is the tie-break — without it equal timestamps came back
+        # in whatever order the backend chose, so the same history could group
+        # two ways on two calls.
+        from .conversation_sessions import canonical_order
+
         return await self._storage.db.fetchall(f"""
             SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            ORDER BY created_at DESC
+            {canonical_order(descending=True)}
             LIMIT ?
         """, (agent_id, bounded_limit))
 

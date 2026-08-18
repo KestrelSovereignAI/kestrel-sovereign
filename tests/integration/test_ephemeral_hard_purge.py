@@ -724,3 +724,57 @@ async def test_clean_sweep_clears_watermark(tmp_path):
 
         assert report.required_sweep_failed is False
         assert wrapper._entered_ephemeral_at is None
+
+
+@pytest.mark.asyncio
+async def test_purge_leaves_no_watermark_that_can_match_a_restarted_ledger(tmp_path):
+    """A stamp must not outlive the ledger incarnation it was read from.
+
+    ``is_stale()`` compares a stored stamp to the change ledger for EQUALITY,
+    which is sound only while that counter rises. Erasing the ledger row on its
+    own breaks it: the trigger's next write is an INSERT of ``1``, so the
+    counter restarts, and a watermark left behind at stamp N matches again as
+    soon as N further row events happen — immediately when N is 1, which is the
+    case a leaked single turn produces. The projection then reports itself
+    CURRENT while describing history that was purged.
+
+    So the purge erases every table the projection owns, together. This test
+    fails if the sweep is narrowed back to the ledger alone.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        ConversationSessionProjection,
+    )
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked turn")
+
+        projection = ConversationSessionProjection(storage.db, AGENT_ID)
+        await projection.repair()
+        assert not await projection.is_stale(), (
+            "the projection must start CURRENT, or the assertion below passes "
+            "for the wrong reason"
+        )
+        stamp = (await projection.accounted()).stamp
+        assert stamp == 1, (
+            f"this test needs the N=1 collision and the stamp is {stamp}; "
+            "the arrangement changed, not the guard"
+        )
+        assert await projection.list(), "nothing was projected to go stale"
+
+        await wrapper.purge_ephemeral_session(reason="test")
+
+        # One more row event brings the restarted ledger back to 1 — the value
+        # the pre-purge stamp recorded.
+        await storage.conversation.add_conversation("user", "after the purge")
+        assert await projection.observed_changes() == stamp, (
+            "the collision this guards against did not occur, so a pass here "
+            "would prove nothing"
+        )
+
+        assert await projection.is_stale(), (
+            "the projection reports itself CURRENT after a purge, while its "
+            "rows describe history that no longer exists"
+        )

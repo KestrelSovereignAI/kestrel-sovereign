@@ -261,6 +261,8 @@ async def _assert_the_projection_agrees_with_the_grouper(
     with the grouper only because it stopped projecting anything would satisfy a
     weaker one — and two spellings of one claim is how they drift apart.
     """
+    from kestrel_sovereign.storage.conversation_sessions import canonical_order
+    from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
     from kestrel_sovereign.storage.session_grouping import (
         coalesce_sessions_by_session_id,
         coerce_session_timestamp,
@@ -275,9 +277,13 @@ async def _assert_the_projection_agrees_with_the_grouper(
             "created_at": row[4],
         }
         for row in await db.fetchall(
+            # `canonical_order()`, not `id` — this must be the order
+            # /api/conversations hands the grouper, or the differential
+            # compares the projection against a read path that does not exist
+            # and the one case where the two orders differ cannot fail it.
             "SELECT id, role, content, metadata, created_at "
             "FROM conversation_history WHERE agent_id = ? "
-            "AND deleted_at IS NULL AND archived_at IS NULL ORDER BY id",
+            f"AND deleted_at IS NULL AND archived_at IS NULL {canonical_order()}",
             (agent_id,),
         )
     ]
@@ -289,7 +295,17 @@ async def _assert_the_projection_agrees_with_the_grouper(
     }
     stored = {row["session_id"]: row for row in await projection.list()}
 
-    assert set(stored) == set(reference)
+    # Every session the grouper finds *whose id the column may hold*. A row
+    # filed under nothing gets a synthetic key from the grouper — a bare row id
+    # — which `session_id` cannot store, so the projection is legitimately
+    # silent about it (Phase A's invariant: silent where it must be, never
+    # wrong). Asserted through `is_stampable_session_id` rather than by listing
+    # the shapes, which is the same rule the unit differential applies; stating
+    # it twice is how the two drifted apart until round 6.
+    assert set(stored) == {
+        session_id for session_id in reference
+        if is_stampable_session_id(session_id)
+    }
     for session_id, row in stored.items():
         expected = reference[session_id]
         # As instants, not spellings: this column comes back as text from
@@ -2381,11 +2397,16 @@ async def test_a_repair_that_loses_a_race_can_only_leave_the_pair_behind(
             db, "the parked repair finishing", asyncio.shield(slow)
         )
 
-        # What UUID_A ends up holding: its surviving reply, the later turn, and
-        # the unlabeled row — a row filed under nothing belongs to the cluster
-        # it fell next to, which is exactly why this agent takes the transcript
-        # derivation at all.
-        settled = 3
+        # What UUID_A ends up holding: its surviving reply and the later turn.
+        # A row filed under nothing belongs to the cluster it fell next to —
+        # and which cluster that is, is decided by the order the transcript is
+        # read in. This one is stamped 2026-03-01 while the rest are written by
+        # the clock, so in `canonical_order()` it stands five months before them
+        # and the gap rule makes it a session of its own. Read in id order it
+        # would instead land beside UUID_A and count as a third message there,
+        # which is what this asserted until round 6 — a merge the conversation
+        # list, which orders by time, would never have shown.
+        settled = 2
 
         accounted = await projection.accounted()
         observed = await projection.observed_changes()

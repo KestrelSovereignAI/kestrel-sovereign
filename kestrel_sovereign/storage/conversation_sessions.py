@@ -512,6 +512,39 @@ _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 #: bodies to maintain an index would be a cost paid on every repair.
 _DERIVED_FROM = "id, role, metadata, created_at, session_id"
 
+#: **Ordered as the conversation list orders.** ``/api/conversations`` selects
+#: ``ORDER BY created_at DESC`` and reverses, so the grouper sees chronological
+#: order; deriving in id order instead would let the two disagree about session
+#: boundaries wherever the two disagree about sequence. PostgreSQL's ``NOW()``
+#: is transaction-start time, so an overlapping writer commits a later id
+#: carrying an earlier timestamp — this is a real case, not a hypothetical one.
+#: ``id`` breaks ties, which the endpoint's own ``ORDER BY`` did not, so equal
+#: timestamps stop being resolved arbitrarily by the backend.
+#: Spelled as SQL rather than sorted in Python so it is the SAME comparison
+#: the endpoint makes, character for character. A backend that orders these
+#: timestamp strings oddly must order both the same odd way; fidelity to the
+#: list is the contract, and a "better" order here would be a disagreement.
+#: The columns that define it, most significant first. Both directions are
+#: built from this one tuple so the list and the projection cannot drift into
+#: ordering by different things — the defect this constant was added for was
+#: exactly two call sites spelling "in order" differently.
+CANONICAL_ORDER_COLUMNS = ("created_at", "id")
+
+
+def canonical_order(*, descending: bool = False) -> str:
+    """``ORDER BY`` for the one order sessions are derived in.
+
+    ``descending`` is for a newest-first page that will be reversed before
+    grouping, which is what ``/api/conversations`` does.
+    """
+    direction = "DESC" if descending else "ASC"
+    return "ORDER BY " + ", ".join(
+        f"{column} {direction}" for column in CANONICAL_ORDER_COLUMNS
+    )
+
+
+_CANONICAL_ORDER = canonical_order()
+
 #: What one chunk selects: this agent's next live rows, and only those. The rows
 #: a step reads and the rows it folds are the same rows, which is what makes the
 #: chunk a bound on work rather than only on ids. Seeded by
@@ -531,7 +564,7 @@ _OWN_ROWS_THROUGH = (
     f"SELECT {_DERIVED_FROM} FROM conversation_history "
     "WHERE agent_id = ? AND session_id = ? AND id <= ? "
     f"AND {_LIVE} "
-    "ORDER BY id ASC"
+    f"{_CANONICAL_ORDER}"
 )
 
 #: ...and what a transcript repair selects: the same columns over every live row,
@@ -540,7 +573,7 @@ _OWN_ROWS_THROUGH = (
 _LIVE_ROWS = (
     f"SELECT {_DERIVED_FROM} FROM conversation_history "
     f"WHERE agent_id = ? AND {_LIVE} "
-    "ORDER BY id ASC"
+    f"{_CANONICAL_ORDER}"
 )
 
 #: :data:`_LIVE_ROWS` bounded to one frontier, for the transcript pass.
@@ -548,7 +581,7 @@ _LIVE_ROWS_THROUGH = (
     f"SELECT {_DERIVED_FROM} FROM conversation_history "
     f"WHERE agent_id = ? AND {_LIVE} "
     "AND id <= ? "
-    "ORDER BY id ASC"
+    f"{_CANONICAL_ORDER}"
 )
 
 #: :meth:`ConversationSessionProjection.repair` did nothing: the projection had
@@ -1153,9 +1186,17 @@ class ConversationSessionProjection:
 
         One primary-key read. A missing row is zero rather than an error: an
         agent whose history has never been touched has had no row events, which
-        is what zero says. The ledger is only ever written by the triggers, and
-        only ever upward, so this can be compared for equality without a window
-        in which it could have gone backwards.
+        is what zero says.
+
+        Within one incarnation of the row the triggers only ever write it
+        upward, which is what lets :meth:`is_stale` compare it for equality
+        rather than for order. The row is not immortal, though: the EPHEMERAL
+        sweep erases it when no history survives, and the trigger's next write
+        is an INSERT of ``1``. So a stamp read from one incarnation says nothing
+        about a later one, and equality across that boundary would be an
+        accident rather than evidence. The sweep is what upholds this — it
+        erases every table this projection owns together, so no stamp outlives
+        the ledger it was read from (``purge_session_projection``).
         """
         value = await self.db.fetchval(
             "SELECT changes FROM conversation_history_changes WHERE agent_id = ?",

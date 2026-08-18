@@ -134,11 +134,22 @@ async def _seed(
 
 
 async def _live_history(db: AsyncDatabase, agent_id: str = AGENT) -> List[Dict[str, Any]]:
-    """The corpus the read path would hand the grouper: live rows, id order."""
+    """The corpus the read path would hand the grouper: live rows, its order.
+
+    ``canonical_order()`` rather than ``id ASC``, because that is what
+    ``/api/conversations`` actually feeds the grouper — it selects newest-first
+    by ``created_at`` and reverses. An earlier version of this helper said
+    ``ORDER BY id ASC``, which made every differential test below compare the
+    projection against a read path that does not exist: both sides were in id
+    order, so the one case where the two orders differ could not fail. Round 6
+    of review found the divergence that this hid.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import canonical_order
+
     rows = await db.fetchall(
         "SELECT id, role, content, metadata, created_at FROM conversation_history "
         "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
-        "ORDER BY id ASC",
+        f"{canonical_order()}",
         (agent_id,),
     )
     return [
@@ -1425,12 +1436,18 @@ async def test_a_session_whose_timestamps_go_backwards_escalates_to_the_transcri
 
     Folding combines a stored row with a chunk's slice through
     ``coalesce_sessions_by_session_id``, which merges boundaries by min/max. A
-    single cluster's boundaries are *positional* — the first and last row in id
-    order — and the two agree only while ``created_at`` does not decrease as
-    ``id`` increases. Every writer produces both from one INSERT, so it holds;
-    but "holds in practice" is the reasoning that stops being true later, and the
-    disagreement would be silent: ``last_message_at`` reading the maximum where
-    the grouper reads the last.
+    single cluster's boundaries are *positional* — the first and last row as the
+    walk sees them — and the walk is bounded by ids while the read path derives
+    in ``canonical_order()``. The two agree only while ``created_at`` does not
+    decrease as ``id`` increases. Every writer produces both from one INSERT, so
+    it holds; but "holds in practice" is the reasoning that stops being true
+    later, and the disagreement would be silent.
+
+    ``minutes`` below inverts, so the last row by id (09:25) is not the last row
+    in time (09:40). Escalating is what makes the stored answer the second one —
+    which is what the conversation list shows, and what it orders by. Until
+    round 6 this asserted the FIRST, because the helper that models the read
+    path claimed id order; both sides were wrong together and agreed.
 
     Every timestamp here stays inside the gap window, so this really is one
     cluster the grouper reads positionally, and not several that coalescing would
@@ -1489,10 +1506,10 @@ async def test_a_session_whose_timestamps_go_backwards_escalates_to_the_transcri
         stored = await projection.get(UUID_A)
         assert stored["message_count"] == len(minutes)
         assert coerce_session_timestamp(stored["last_message_at"]) == (
-            coerce_session_timestamp(_at(minutes[-1]))
+            coerce_session_timestamp(_at(max(minutes)))
         ), (
-            "the fold reported the latest timestamp where the grouper reports "
-            "the last row's"
+            "the session's last message is the latest one, and the transcript "
+            "pass must report it"
         )
         await _assert_agrees_with_the_grouper(db, projection)
     finally:
@@ -2271,3 +2288,99 @@ async def test_a_projection_for_one_agent_never_answers_for_another(tmp_path):
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_the_preview_pointer_follows_the_order_the_list_reads_in(tmp_path):
+    """The projection must pick the preview the conversation list would show.
+
+    ``first_user_message_id`` is what the card shows, and the grouper picks the
+    first eligible user row *in the order it is handed the transcript*.
+    ``/api/conversations`` hands it rows in ``canonical_order()`` — it selects
+    ``created_at DESC`` and reverses — so wherever id order and time order
+    disagree, deriving in id order names a different row and the card shows a
+    different message.
+
+    PostgreSQL makes that disagreement reachable rather than theoretical:
+    ``NOW()`` is transaction-start time, so a writer that began earlier and
+    committed later carries a lower timestamp on a higher id. Here the second
+    row by id is the first in time, so the two orders name different previews
+    and only one of them is the one the user sees.
+
+    Seeded through :func:`_seed` with explicit stamps, because reproducing the
+    inversion through two live overlapping writers would be timing-dependent
+    while the property under test is not.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "inverted.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {"content": "later id, earlier clock", "role": "user",
+                 "created_at": _at(20), "metadata": {"session_id": UUID_A}},
+                {"content": "earlier id, later clock", "role": "user",
+                 "created_at": _at(10), "metadata": {"session_id": UUID_A}},
+                {"content": "reply", "role": "assistant",
+                 "created_at": _at(25), "metadata": {"session_id": UUID_A}},
+            ],
+        )
+        ids = {row["content"]: row["id"] for row in await _live_history(db)}
+        chronologically_first = ids["earlier id, later clock"]
+        assert chronologically_first == max(
+            ids["later id, earlier clock"], ids["earlier id, later clock"]
+        ), "the corpus stopped inverting, so this proves nothing"
+
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        stored = await projection.get(UUID_A)
+        assert stored["first_user_message_id"] == chronologically_first, (
+            "the projection previews the lowest-id user row, but the list "
+            "previews the earliest one — the card would change on the day the "
+            "projection replaced the derivation"
+        )
+        await _assert_agrees_with_the_grouper(db, projection)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_the_list_orders_ties_deterministically(tmp_path):
+    """Equal timestamps must not be resolved by whatever the backend feels like.
+
+    ``/api/conversations`` used to select ``ORDER BY created_at DESC`` with no
+    tie-break. Rows sharing a timestamp are common — a wake and the turn it
+    triggers are written in the same transaction, and SQLite history is stored
+    to the second — so the same history could be handed to the grouper in two
+    different orders on two calls, and a session boundary or a preview could
+    move without anything having changed.
+
+    Asserted through a real database rather than a double: the ordering is
+    decided by SQL, so a mock storage would only prove that the test knows what
+    it wrote.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    async with AsyncStorage(str(tmp_path / "ties.db"), agent_id=AGENT) as storage:
+        for content in ("first", "second", "third"):
+            await storage.db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, created_at) "
+                "VALUES (?, 'user', ?, NULL, ?)",
+                (AGENT, content, _at(0)),
+            )
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+        rows = await wrapper.query_conversations(AGENT, limit=10)
+        ids = [row[0] for row in rows]
+
+        assert len(ids) == 3, "the corpus did not land, so the order proves nothing"
+        assert ids == sorted(ids, reverse=True), (
+            "rows sharing a timestamp came back in an order the backend chose; "
+            f"got {ids}. The list must break ties on id so the same history "
+            "always groups the same way."
+        )
