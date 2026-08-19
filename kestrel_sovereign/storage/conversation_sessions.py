@@ -348,6 +348,7 @@ PROJECTION_COLUMNS: Tuple[str, ...] = (
 WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_valid",
     "accounted_stamp",
+    "accounted_appends",
     "accounted_through",
     "accounted_target",
 )
@@ -687,6 +688,7 @@ CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
     agent_id          TEXT PRIMARY KEY,
     accounted_valid   INTEGER NOT NULL DEFAULT 0,
     accounted_stamp   BIGINT NOT NULL DEFAULT 0,
+    accounted_appends BIGINT NOT NULL DEFAULT 0,
     accounted_through BIGINT NOT NULL DEFAULT 0,
     accounted_target  BIGINT NOT NULL DEFAULT 0
 )
@@ -695,18 +697,34 @@ CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
 _CHANGES_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_history_changes (
     agent_id TEXT PRIMARY KEY,
-    changes  BIGINT NOT NULL DEFAULT 0
+    changes  BIGINT NOT NULL DEFAULT 0,
+    appends  BIGINT NOT NULL DEFAULT 0
 )
 """
 
-#: The upsert both dialects' triggers perform, parameterized only by which
-#: row's ``agent_id`` is being stamped. Written once so the three SQLite
-#: triggers and the one PostgreSQL function cannot count differently.
+#: The upsert both dialects' triggers perform, parameterized by which row's
+#: ``agent_id`` is being stamped and by whether the event APPENDED a row.
+#: Written once so the three SQLite triggers and the one PostgreSQL function
+#: cannot count differently.
+#:
+#: Two counters, because one cannot answer the question :meth:`_plan` asks.
+#: ``changes`` counts every row event; ``appends`` counts only inserts. A walk
+#: may continue from where it stopped exactly when every change since was a row
+#: arriving above its target — and "a row arrived" is indistinguishable from "an
+#: existing row was renumbered above the target" if the only evidence is that
+#: the counter moved by one and one row now stands up there. Both are one event
+#: and one row. They differ in that the renumbering is not an append, so
+#: counting appends separately is what separates them (#3001).
+#: PostgreSQL runs one function for INSERT and UPDATE, so whether the event was
+#: an append is an expression rather than a constant.
+_PG_IS_INSERT = "CASE WHEN TG_OP = 'INSERT' THEN 1 ELSE 0 END"
+
 _BUMP = (
-    "INSERT INTO conversation_history_changes (agent_id, changes) "
-    "VALUES ({row}.agent_id, 1) "
+    "INSERT INTO conversation_history_changes (agent_id, changes, appends) "
+    "VALUES ({row}.agent_id, 1, {appends}) "
     "ON CONFLICT (agent_id) DO UPDATE "
-    "SET changes = conversation_history_changes.changes + 1"
+    "SET changes = conversation_history_changes.changes + 1, "
+    "appends = conversation_history_changes.appends + {appends}"
 )
 
 
@@ -773,13 +791,13 @@ def mutation_trigger_function(backend_type: str) -> Optional[Tuple[str, str]]:
         "RETURNS trigger AS $kestrel$ "
         "BEGIN "
         "  IF (TG_OP = 'DELETE') THEN "
-        f"    {_BUMP.format(row='OLD')}; "
+        f"    {_BUMP.format(row='OLD', appends=0)}; "
         "    RETURN OLD; "
         "  END IF; "
         "  IF (TG_OP = 'UPDATE' AND OLD.agent_id IS DISTINCT FROM NEW.agent_id) THEN "
-        f"    {_BUMP.format(row='OLD')}; "
+        f"    {_BUMP.format(row='OLD', appends=0)}; "
         "  END IF; "
-        f"  {_BUMP.format(row='NEW')}; "
+        f"  {_BUMP.format(row='NEW', appends=_PG_IS_INSERT)}; "
         "  RETURN NEW; "
         "END; "
         "$kestrel$ LANGUAGE plpgsql"
@@ -854,8 +872,8 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
     # unambiguous to its parser.
     watched_is_not = _watched_changed(backend_type, "IS NOT")
     rehomed = (
-        "INSERT INTO conversation_history_changes (agent_id, changes) "
-        "SELECT OLD.agent_id, 1 WHERE OLD.agent_id IS NOT NEW.agent_id "
+        "INSERT INTO conversation_history_changes (agent_id, changes, appends) "
+        "SELECT OLD.agent_id, 1, 0 WHERE OLD.agent_id IS NOT NEW.agent_id "
         "ON CONFLICT (agent_id) DO UPDATE "
         "SET changes = conversation_history_changes.changes + 1"
     )
@@ -864,20 +882,20 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
             "conversation_history_change_insert",
             "CREATE TRIGGER conversation_history_change_insert "
             "AFTER INSERT ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='NEW')}; END",
+            f"{_BUMP.format(row='NEW', appends=1)}; END",
         ),
         (
             "conversation_history_change_update",
             "CREATE TRIGGER conversation_history_change_update "
             "AFTER UPDATE ON conversation_history FOR EACH ROW "
             f"WHEN ({watched_is_not}) BEGIN "
-            f"{_BUMP.format(row='NEW')}; {rehomed}; END",
+            f"{_BUMP.format(row='NEW', appends=0)}; {rehomed}; END",
         ),
         (
             "conversation_history_change_delete",
             "CREATE TRIGGER conversation_history_change_delete "
             "AFTER DELETE ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='OLD')}; END",
+            f"{_BUMP.format(row='OLD', appends=0)}; END",
         ),
     )
 
@@ -905,6 +923,7 @@ class SessionWatermark:
 
     valid: bool = False
     stamp: int = 0
+    appends: int = 0
     through: int = 0
     target: int = 0
 
@@ -919,7 +938,9 @@ class SessionWatermark:
         ``valid`` is bound as an ``int`` because the column is ``INTEGER`` on
         both engines; asyncpg refuses a Python ``bool`` for one.
         """
-        return (int(self.valid), self.stamp, self.through, self.target)
+        return (
+            int(self.valid), self.stamp, self.appends, self.through, self.target,
+        )
 
 
 #: "This projection accounts for nothing." The state before a first repair, and
@@ -996,6 +1017,7 @@ class _Plan:
 
     kind: str
     stamp: int
+    appends: int
     through: int
     target: int
     discard: bool
@@ -1248,6 +1270,20 @@ class ConversationSessionProjection:
         )
         return int(value or 0)
 
+    async def observed_appends(self) -> int:
+        """How many of this agent's row events were INSERTs.
+
+        The other half of the pair :meth:`_plan` needs. Read separately rather
+        than folded into :meth:`observed_changes` so that method keeps meaning
+        exactly one thing — "has anything moved" — which is all
+        :meth:`is_stale` asks.
+        """
+        value = await self.db.fetchval(
+            "SELECT appends FROM conversation_history_changes WHERE agent_id = ?",
+            (self.agent_id,),
+        )
+        return int(value or 0)
+
     async def accounted(self) -> SessionWatermark:
         """The state the projection records having accounted for.
 
@@ -1263,7 +1299,7 @@ class ConversationSessionProjection:
         if row is None:
             return INVALID
         return SessionWatermark(
-            bool(row[0]), int(row[1]), int(row[2]), int(row[3])
+            bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4])
         )
 
     async def is_stale(self) -> bool:
@@ -1309,13 +1345,25 @@ class ConversationSessionProjection:
         **Why the append test is exact.** Each row event moves the stamp by one,
         so over any interval the delta is ``inserts + updates + deletes`` — while
         the number of rows now standing above the recorded ``target`` is
-        ``inserts_above - deletes_above``, no row having stood above it when the
-        stamp was read (``target`` was ``MAX(id)`` at that instant). The second is
-        never larger than the first, and they are equal only when ``updates``,
-        ``deletes`` and ``inserts_below`` are all zero. So the equality is not a
-        heuristic that usually holds: it is false whenever anything at or below
-        the target moved, which is exactly when continuing the walk would be
-        unsound.
+        ``inserts_above - deletes_above - moves_out + moves_in``, no row having
+        stood above it when the stamp was read (``target`` was ``MAX(id)`` at
+        that instant), where a *move* is an ``UPDATE`` that rewrote a row's
+        ``id``.
+
+        Two numbers cannot separate those. One append and one move are each one
+        change leaving one row above the target, and folding the second counts a
+        row this projection has already counted. So a third is read: ``appends``,
+        which only the INSERT trigger raises. Requiring
+        ``delta == appended == rows_above`` makes the test false whenever
+        anything at or below the target moved, whenever anything was rewritten
+        rather than added, and whenever an append landed below the target —
+        which together are exactly the cases where continuing the walk would be
+        unsound (#3001).
+
+        Nothing in this codebase rewrites an id; maintenance and import SQL is
+        the traffic this defends against, and it is precisely the traffic that
+        never passes through a write path that could have invalidated anything
+        on its way.
 
         **Call this outside a transaction of your own.** It is a Python iteration
         pass that re-enters the database per session, so wrapping the whole of it
@@ -1549,46 +1597,46 @@ class ConversationSessionProjection:
         target — and the next step's equality would be comparing two numbers that
         are no longer about the same instant.
         """
-        # LIMIT (#3001): everything below assumes row ids are POSITIVE and only
-        # ever APPEND. Both hold for every writer here — ``AUTOINCREMENT`` and
-        # ``bigserial`` issue increasing positive ids — and neither is enforced
-        # by the schema, so maintenance or import SQL can break them. Two shapes
-        # this misreads, both reported by round-9 review:
-        #
-        #   * an id rewritten from at-or-below the target to above it bumps the
-        #     stamp once and leaves one row above the target, which is exactly
-        #     an append's signature, so the row is folded into its already
-        #     counted session a second time;
-        #   * a row with an id of zero or less is never selected by the walk,
-        #     which starts at ``through = 0`` and takes ``id > through``.
-        #
-        # Both end with a watermark recorded as current over a projection that
-        # is not. Telling them apart needs the watermark to carry more than
-        # ``max(id)`` — a live row count would separate "one appended" from "one
-        # moved" — which is a change to what a watermark IS, so it is #3001
-        # rather than a guard bolted on here.
+        appends = await self.observed_appends()
         if not accounted.valid:
-            return _Plan(REBUILT, observed, 0, await self._max_id(), True)
+            return _Plan(
+                REBUILT, observed, appends, await self._id_floor(), await self._max_id(), True
+            )
         if observed == accounted.stamp:
             if accounted.complete:
                 return None
             return _Plan(
                 INCREMENTAL,
                 accounted.stamp,
+                accounted.appends,
                 accounted.through,
                 accounted.target,
                 False,
             )
         delta = observed - accounted.stamp
-        if delta > 0 and delta == await self._rows_above(accounted.target):
+        appended = appends - accounted.appends
+        # Every change since must have been an append, AND each of those appends
+        # must be standing above the target. Three numbers rather than two,
+        # because two cannot tell a row ARRIVING above the target from an
+        # existing row RENUMBERED above it: both are one change and one row up
+        # there, and folding the second one counts a row this projection has
+        # already counted (#3001). Only the first is also an append.
+        if (
+            delta > 0
+            and delta == appended
+            and delta == await self._rows_above(accounted.target)
+        ):
             return _Plan(
                 INCREMENTAL,
                 observed,
+                appends,
                 accounted.through,
                 await self._max_id(),
                 False,
             )
-        return _Plan(REBUILT, observed, 0, await self._max_id(), True)
+        return _Plan(
+            REBUILT, observed, appends, await self._id_floor(), await self._max_id(), True
+        )
 
     async def _chunk(self, plan: _Plan) -> _Step:
         """Fold the next chunk of history in, inside the caller's transaction.
@@ -1631,7 +1679,9 @@ class ConversationSessionProjection:
         )
         written = await self._fold(rows, through)
         await self._record(
-            SessionWatermark(True, plan.stamp, through, plan.target)
+            SessionWatermark(
+                True, plan.stamp, plan.appends, through, plan.target
+            )
         )
         # Reaching the target IS being finished, and saying so is not cosmetic:
         # a repair whose last permitted step lands exactly on the target would
@@ -1669,6 +1719,7 @@ class ConversationSessionProjection:
         crash costs the pass rather than the projection.
         """
         observed = await self.observed_changes()
+        appends = await self.observed_appends()
         target = await self._max_id()
         # NOT COVERED BY A TEST. Four attempts failed to build one that can
         # observe the defect: an unstamped-row fixture keeps every later repair
@@ -1703,13 +1754,41 @@ class ConversationSessionProjection:
             )
             for projection in projections:
                 written += await self._store(projection)
-            await self._record(SessionWatermark(True, observed, target, target))
+            await self._record(
+                SessionWatermark(True, observed, appends, target, target)
+            )
         # Accounted through == target by construction: this pass derived every
         # live row, not a chunk of them. Reporting otherwise sends the caller
         # back for a step that has nothing left to do.
         return _Step(REBUILT, written, True)
 
     # ── internals ────────────────────────────────────────────────────────
+
+    async def _id_floor(self) -> int:
+        """The frontier a walk that has accounted for NOTHING starts from.
+
+        Not zero. A walk selects ``id > through``, and while every writer here
+        issues positive ids — ``AUTOINCREMENT`` and ``bigserial`` both do — the
+        schema does not require it, so an imported or rewritten row numbered
+        zero or less would sit below a zero frontier and never be folded at all,
+        under a watermark recorded as complete (#3001).
+
+        Read from the data rather than set to a type's minimum. A constant would
+        have to know how wide the column is, and it is not the same width on
+        both engines — ``conversation_history.id`` is ``int4`` on PostgreSQL, so
+        the smallest 64-bit integer is not a value it can even be compared
+        against. One backward index seek on the same index ``_max_id`` uses, and
+        only on the rebuild path.
+
+        An id of exactly the column's minimum would make this underflow and the
+        repair would raise. That is the safe direction: a repair that fails
+        loudly is a repair that has not recorded a false "current".
+        """
+        smallest = await self.db.fetchval(
+            "SELECT MIN(id) FROM conversation_history WHERE agent_id = ?",
+            (self.agent_id,),
+        )
+        return 0 if smallest is None else int(smallest) - 1
 
     async def _max_id(self) -> int:
         """The highest row id this agent has. One backward index step.
@@ -1974,7 +2053,12 @@ class ConversationSessionProjection:
         await self.db.execute(
             "INSERT INTO conversation_session_watermarks "
             f"(agent_id, {', '.join(WATERMARK_COLUMNS)}) "
-            "VALUES (?, ?, ?, ?, ?) "
+            # Placeholders counted from the column list, not written out. A
+            # literal run of "?" is a second statement of how many columns a
+            # watermark has, and adding one to WATERMARK_COLUMNS then fails at
+            # runtime rather than being carried along — which is how adding
+            # `accounted_appends` announced itself.
+            f"VALUES ({', '.join('?' * (len(WATERMARK_COLUMNS) + 1))}) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             + ", ".join(
                 f"{column} = excluded.{column}" for column in WATERMARK_COLUMNS

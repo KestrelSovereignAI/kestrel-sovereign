@@ -2604,3 +2604,90 @@ async def test_appending_elsewhere_does_not_restale_an_undatable_session(tmp_pat
         await _assert_agrees_with_the_grouper(db, projection)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_renumbered_row_is_not_counted_twice(tmp_path):
+    """Moving an existing row's id must not read as a new message arriving.
+
+    The catch-up test is "the change counter moved by exactly the number of
+    rows now standing above the bookmark". An ``UPDATE ... SET id = ?`` that
+    lifts an already-counted row above the bookmark satisfies it exactly — one
+    change, one row above — so the row is folded into its own session a second
+    time and the inflated count is recorded as current.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "renumber.db"))
+    try:
+        await _seed(
+            db,
+            [
+                {"content": "one", "role": "user", "created_at": _at(0),
+                 "metadata": {"session_id": UUID_A}},
+                {"content": "two", "role": "assistant", "created_at": _at(1),
+                 "metadata": {"session_id": UUID_A}},
+            ],
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        assert (await projection.repair()).current
+        assert (await projection.get(UUID_A))["message_count"] == 2
+
+        # The LAST row by id, which is also the latest in time. Moving an
+        # earlier one is caught for free by the fold's monotonicity guard — the
+        # slice would start before the stored row's last message and escalate —
+        # so it would prove nothing about this test's subject.
+        top = int(await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?", (AGENT,)
+        ))
+        await db.execute(
+            "UPDATE conversation_history SET id = ? WHERE id = ?",
+            (top + 100, top),
+        )
+
+        await projection.repair()
+
+        assert (await projection.get(UUID_A))["message_count"] == 2, (
+            "the renumbered row was counted a second time"
+        )
+        await _assert_agrees_with_the_grouper(db, projection)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_nonpositive_id_is_still_walked(tmp_path):
+    """A row numbered zero or below must not be invisible to the walk.
+
+    Every walk selects ``id > through`` and a rebuild starts at ``through = 0``,
+    so a row imported with a nonpositive id is never folded — while the
+    watermark is still recorded complete and ``is_stale()`` answers false. The
+    session it belongs to then carries a permanently understated count.
+
+    Only maintenance or import SQL produces such an id; ``AUTOINCREMENT`` and
+    ``bigserial`` do not. That is why it needs a case rather than a schema
+    assumption.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "nonpositive.db"))
+    try:
+        await _seed(
+            db,
+            [{"content": "ordinary", "role": "user", "created_at": _at(5),
+              "metadata": {"session_id": UUID_A}}],
+        )
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(id, agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, ?, 'user', 'imported below zero', ?, ?, ?)",
+            (-7, AGENT, json.dumps({"session_id": UUID_A}), UUID_A, _at(0)),
+        )
+
+        projection = ConversationSessionProjection(db, AGENT, chunk_rows=1)
+        await projection.repair()
+
+        assert (await projection.get(UUID_A))["message_count"] == 2, (
+            "the row numbered -7 was never walked, so its session undercounts"
+        )
+        await _assert_agrees_with_the_grouper(db, projection)
+    finally:
+        await db.close()
