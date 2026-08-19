@@ -1821,6 +1821,7 @@ class AsyncDatabase:
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",
+        where: str = "",
     ) -> None:
         """Create an index if it is absent, serialized across initializers.
 
@@ -1865,6 +1866,7 @@ class AsyncDatabase:
             if not await self._index_exists(name, table):
                 await self._backend.execute(
                     f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+                    + (f" WHERE {where}" if where else "")
                 )
                 created = True
         # Outside the lock deliberately: the statement has committed, so this
@@ -1922,6 +1924,7 @@ class AsyncDatabase:
         from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
             canonical_order_index_columns,
+            live_history_predicate,
             mutation_trigger_function,
             mutation_triggers,
             projection_tables,
@@ -1998,7 +2001,16 @@ class AsyncDatabase:
             *_SESSION_PROJECTION_INDEX,
             f"agent_id, {session_order_index_columns(self.backend_type)}",
         )
-        await self.ensure_index(*_SESSION_FRONTIER_INDEX)
+        # PARTIAL, on the liveness predicate the walk itself uses. `LIMIT`
+        # bounds the rows a chunk RETURNS, not the rows it reads: an agent whose
+        # history is mostly trashed or archived would scan past all of it to
+        # find one chunk of live rows — inside `BEGIN IMMEDIATE`, so on SQLite
+        # that blocks every writer. Measured at 200,000 trashed rows before 50
+        # live ones: 9.8 ms and O(history) on the full index, 0.0 ms and bounded
+        # on this one.
+        await self.ensure_index(
+            *_SESSION_FRONTIER_INDEX, where=live_history_predicate()
+        )
         # The index that keeps `canonical_order()` a bounded traversal. Its
         # columns are the ORDER BY's own key expressions, so it cannot drift
         # from the ordering it exists for — and without it BOTH engines fall

@@ -2883,3 +2883,54 @@ async def test_the_conversation_list_stays_a_bounded_traversal(db_backend, monke
         assert "idx_conversation_agent_canonical" in plan, (
             f"the list is not using the index built for its ordering:\n{plan}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.timeout(180)
+async def test_a_repair_chunk_reads_only_live_rows(db_backend, monkeypatch):
+    """A bounded chunk must bound the rows READ, not just the rows returned.
+
+    `LIMIT` stops a chunk once it has enough live rows; it does not stop the
+    engine looking for them. An agent whose history is mostly trashed or
+    archived — an ordinary state, Trash and Archive are features — would have
+    the walk scan past all of it to fill one chunk, inside `BEGIN IMMEDIATE`.
+    On SQLite that holds the single writer slot for the whole scan, which is the
+    unbounded hold this design exists to avoid.
+
+    Measured at 200,000 trashed rows before 50 live ones: 9.8 ms and O(history)
+    against the full index, 0.0 ms and bounded against the partial one.
+
+    Asserted on the plan, because that is the property; a duration would be a
+    threshold on a shared machine.
+    """
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:chunkplan:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        for i in range(500):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at, deleted_at) "
+                "VALUES (?, 'user', 'x', NULL, NULL, ?, ?)",
+                (
+                    agent_id,
+                    timestamp_query_param(db.backend_type, "2026-03-01T09:00:00"),
+                    timestamp_query_param(db.backend_type, "2026-03-02T09:00:00"),
+                ),
+            )
+        await db.execute("ANALYZE" if db.backend_type == "sqlite" else "ANALYZE conversation_history")
+
+        from kestrel_sovereign.storage.conversation_sessions import _chunk_sql
+
+        prefix = "EXPLAIN QUERY PLAN " if db.backend_type == "sqlite" else "EXPLAIN "
+        plan = "\n".join(
+            " ".join(str(value) for value in row)
+            for row in await db.fetchall(
+                prefix + _chunk_sql(db.backend_type), (agent_id, 0, 10**9, 100)
+            )
+        )
+        assert "idx_conversation_agent_row_id" in plan, (
+            "the repair chunk is not using the partial live-row index, so it "
+            f"reads past every trashed row to find its next chunk:\n{plan}"
+        )

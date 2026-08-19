@@ -521,6 +521,15 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 #: shape that drifts (Phase A's Finding 4).
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 
+
+def live_history_predicate() -> str:
+    """:data:`_LIVE`, for callers that must index exactly what the walk selects.
+
+    A partial index is only used when its predicate matches the query's, so the
+    two are the same string rather than two that agree today.
+    """
+    return _LIVE
+
 #: The columns a derivation reads. ``content`` is deliberately absent — the
 #: derivation never needs it (see the module docstring), and reading ciphertext
 #: bodies to maintain an index would be a cost paid on every repair.
