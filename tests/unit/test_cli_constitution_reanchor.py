@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -144,11 +145,21 @@ def test_reanchor_rejects_unknown_agent(reanchor_env, capsys):
 def test_reanchor_refuses_when_agent_appears_running(reanchor_env, capsys):
     """SQLite WAL locking would corrupt the DB if the agent is running.
     The CLI must refuse before invoking the helper."""
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    # A real PID record naming a live process, rather than a patched guard.
+    # The guard was patched by name here, and when the call site moved to a
+    # helper that also consults the host record, the patch quietly stopped
+    # applying — the test kept asserting a refusal that no longer happened.
+    ProcessManager.write_pid(
+        ProcessManager.agent_pid_file(reanchor_env / "agent_data" / "Test"),
+        os.getpid(),
+        port=8801,
+    )
+
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     with patch(
         "kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env,
-    ), patch(
-        "kestrel_sovereign.cli._agent_appears_running", return_value=True,
     ), patch(
         "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution"
     ) as mock_reanchor:
@@ -875,3 +886,53 @@ def test_anchor_overlay_targets_the_database_doctor_reads(
     assert seen["runtime_dsn"] == doctors_view["KESTREL_DATABASE_URL"]
     assert seen["runtime_backend"] == doctors_view["KESTREL_DB_BACKEND"]
     assert seen["runtime_dsn"] == "postgresql://from-file/db"
+
+
+def test_the_guard_sees_an_agent_served_by_the_in_process_host(tmp_path, monkeypatch):
+    """In default mode only ``logs/.host.pid`` exists — no per-agent file.
+
+    Every agent runs inside that one host, so a per-agent check finds nothing
+    and reports the agent stopped while the host is serving its SQLite. That
+    is the #2920 guard failure, measured on a live host: four agents up 22h
+    under one shared PID, all four reported "not running".
+    """
+    import os
+
+    from kestrel_sovereign.cli import _agent_holder
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    agent_dir = tmp_path / "agent_data" / "Claw"
+    agent_dir.mkdir(parents=True)
+    cfg = SimpleNamespace(data_dir=Path("agent_data/Claw"))
+
+    # Nothing is holding it yet.
+    assert _agent_holder(tmp_path, "Claw", cfg) is None
+
+    # The in-process host starts: one PID file, no per-agent file.
+    host_pid = tmp_path / "logs" / ".host.pid"
+    ProcessManager.write_pid(host_pid, os.getpid(), port=8888)
+    assert not (agent_dir / "agent.pid").exists()
+
+    holder = _agent_holder(tmp_path, "Claw", cfg)
+    assert holder == "kestrel stop", (
+        "the guard must see the shared host, and must prescribe a command "
+        "that can actually stop it — `kestrel stop Claw` cannot stop an "
+        "agent with no process of its own, so every retry would refuse again"
+    )
+
+
+def test_the_guard_prescribes_the_per_agent_stop_in_subprocess_mode(tmp_path):
+    """With its own process, the agent-scoped stop is the one that works."""
+    import os
+
+    from kestrel_sovereign.cli import _agent_holder
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    agent_dir = tmp_path / "agent_data" / "Claw"
+    agent_dir.mkdir(parents=True)
+    cfg = SimpleNamespace(data_dir=Path("agent_data/Claw"))
+
+    ProcessManager.write_pid(
+        ProcessManager.agent_pid_file(agent_dir), os.getpid(), port=8801
+    )
+    assert _agent_holder(tmp_path, "Claw", cfg) == "kestrel stop Claw"

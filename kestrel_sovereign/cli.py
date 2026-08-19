@@ -1001,10 +1001,11 @@ def cmd_constitution_reanchor(args) -> int:
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
     # than probing the network — same source-of-truth as `kestrel stop`.
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+    holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder:
         print(
             f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            f"Run `{holder}` first to avoid DB corruption.",
             file=sys.stderr,
         )
         return 2
@@ -1147,10 +1148,11 @@ def cmd_constitution_anchor_overlay(args) -> int:
         )
         return 2
 
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+    holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder:
         print(
             f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            f"Run `{holder}` first to avoid DB corruption.",
             file=sys.stderr,
         )
         return 2
@@ -1346,23 +1348,52 @@ def cmd_migrate_encryption(args) -> int:
     return cli_run(args)
 
 
-def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
-    """Best-effort check that the agent process isn't holding the DB."""
+def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
+    """Which process is holding this agent's database, if any.
+
+    Returns the remedy that clears it — the command the caller should print —
+    or None when nothing is holding it.
+
+    Two processes can be serving an agent, and only one of them writes an
+    ``agent.pid``. In the default in-process mode ``kestrel start`` writes
+    ONLY ``logs/.host.pid``: every agent runs inside that one host, so a
+    per-agent check finds no file and reports the agent stopped while the
+    host is actively serving its SQLite. That is the #2920 guard failure,
+    measured on a live host — four agents up 22h under one shared PID, all
+    four reported "not running".
+
+    The remedy differs by mode, which is why this returns the command rather
+    than a bool: ``kestrel stop <agent>`` cannot stop an agent that has no
+    process of its own, so prescribing it in in-process mode gives an
+    operator advice that can never work, and every retry refuses again.
+    """
     try:
         from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        pid_file = ProcessManager.agent_pid_file(resolved_dir)
         # The same verified read ``kestrel stop`` uses, so the guard and the
         # remedy it prescribes cannot disagree about whether an agent is up.
-        # ``is_running`` counts an undecidable legacy record as running: it
-        # names a process that IS alive, and waving a guard past a live agent
-        # is the failure that costs something (#2995).
-        return ProcessManager.read_pid_record(pid_file).is_running
+        # ``is_running`` counts an undecidable record as running: it names a
+        # process that IS alive, and waving a guard past a live agent is the
+        # failure that costs something (#2995).
+        agent_pid = ProcessManager.agent_pid_file(resolved_dir)
+        if ProcessManager.read_pid_record(agent_pid).is_running:
+            return f"kestrel stop {agent_name}"
+
+        host_pid = project_dir / "logs" / ".host.pid"
+        if ProcessManager.read_pid_record(host_pid).is_running:
+            return "kestrel stop"
+
+        return None
     except Exception:
         # If we can't tell, err on the side of letting the user proceed
         # — they get a clear error from the storage layer if it's locked.
-        return False
+        return None
+
+
+def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
+    """Whether anything is holding this agent's database."""
+    return _agent_holder(project_dir, agent_name, agent_cfg) is not None
 
 
 def cmd_setup(args) -> int:

@@ -301,6 +301,50 @@ class TestStaticHelpers:
         assert record.status is PidStatus.LIVE
         assert record.started_at == pytest.approx(recorded)
 
+    def test_a_process_we_cannot_inspect_is_undecidable_not_stale(self, tmp_path):
+        """"Opaque" and "gone" must not collapse into the same answer.
+
+        psutil raises ``AccessDenied`` for a process owned by another account
+        and for anything under a Linux ``hidepid`` mount. Reading that as "no
+        such process" makes the record STALE, after which start clears it,
+        status shows the host offline, and the encryption backfill mutates the
+        database it is serving — every one of those fails open.
+
+        ``AccessDenied`` is raised through a patched ``psutil.Process`` rather
+        than produced for real: this test runs unprivileged on a machine whose
+        kernel lets it read PID 1, so the condition is not reachable here. The
+        exception is the one psutil actually raises, and the branch under test
+        is the handler for it.
+        """
+        import psutil
+
+        pid_file = tmp_path / "opaque.pid"
+        ProcessManager.write_pid(pid_file, os.getpid())
+
+        class _Denied:
+            def __init__(self, pid):
+                pass
+
+            def create_time(self):
+                raise psutil.AccessDenied(pid=1)
+
+            def status(self):
+                raise psutil.AccessDenied(pid=1)
+
+        with patch.object(psutil, "Process", _Denied):
+            record = ProcessManager.read_pid_record(pid_file)
+
+        assert record.status is PidStatus.UNDECIDABLE
+        assert record.is_running is True, (
+            "an inaccessible process must fail closed — a guard that waves "
+            "through a database another process may hold costs more than a "
+            "refusal the operator can clear"
+        )
+        assert record.needs_cleanup is False, (
+            "clearing the record of a process we merely cannot inspect "
+            "destroys the only pointer to a possibly-live host"
+        )
+
     def test_clear_pid_nonexistent(self, tmp_path):
         """Clearing a non-existent PID file should not raise."""
         ProcessManager.clear_pid(tmp_path / "nope.pid")
@@ -633,7 +677,9 @@ class TestStopAgent:
              patch("time.sleep"):
             pm.stop_agent("claw")
 
-        mock_kill.assert_called_once_with(99999, force=False)
+        # The identity is carried into the signal so a PID that changed
+        # hands since registration is not signalled (#2995).
+        mock_kill.assert_called_once_with(99999, force=False, started_at=None)
 
     def test_stop_agent_escalates_to_sigkill(self, pm, project_dir):
         """If agent doesn't stop gracefully, SIGKILL is sent."""
@@ -653,10 +699,10 @@ class TestStopAgent:
         assert mock_kill.call_count >= 2
         # First call: graceful (force=False)
         first_call = mock_kill.call_args_list[0]
-        assert first_call == ((99999,), {"force": False})
+        assert first_call == ((99999,), {"force": False, "started_at": None})
         # Last call: forced (force=True)
         last_call = mock_kill.call_args_list[-1]
-        assert last_call == ((99999,), {"force": True})
+        assert last_call == ((99999,), {"force": True, "started_at": None})
 
     def test_stop_agent_clears_pid(self, pm, project_dir):
         """Stopping an agent clears its PID file."""

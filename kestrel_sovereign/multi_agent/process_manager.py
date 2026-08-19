@@ -136,6 +136,11 @@ class AgentProcess:
     pid: Optional[int] = None
     pid_file: Optional[Path] = None
     log_file: Optional[Path] = None
+    #: The start instant recorded for ``pid``, carried so a stop can prove the
+    #: process it is about to signal is still the one registered. Without it
+    #: the agent paths signalled whatever held the number, while the host path
+    #: was already protected (#2995).
+    started_at: Optional[float] = None
 
 
 class ProcessManager:
@@ -352,21 +357,45 @@ class ProcessManager:
         which blurs exactly the case that matters — a PID recycled moments
         after its file was written.
         """
+        return ProcessManager._probe_process(pid)[1]
+
+    @staticmethod
+    def _probe_process(pid: int) -> tuple[Optional[bool], Optional[float]]:
+        """``(exists, started_at)`` for `pid`, keeping "gone" and "opaque" apart.
+
+        Collapsing them is a fail-open bug: a process owned by another
+        account, or any process under a Linux ``hidepid`` mount, raises
+        ``AccessDenied`` — and reading that as "no such process" would have
+        the record call a live host STALE, after which start clears its
+        record, status shows it offline, and the encryption backfill happily
+        mutates the database it is serving.
+
+        ``exists`` is None when the answer is unknowable, True when the
+        process is there, False when it is not.
+        """
         try:
             import psutil
-
+        except ImportError:
+            return (None, None)
+        try:
             process = psutil.Process(pid)
             create_time = process.create_time()
             # A zombie still has a create time, but it has already exited and
-            # can never run again. Returning it would classify the record LIVE
-            # while ``is_process_running`` calls the same PID stopped — and the
-            # status and guard paths trust the record, so an exited agent would
-            # appear online and block maintenance until someone reaped it.
+            # can never run again. Calling it present would classify the
+            # record LIVE while ``is_process_running`` calls the same PID
+            # stopped — and status and the guard trust the record, so an
+            # exited agent would appear online and block maintenance until
+            # someone reaped it.
             if process.status() == psutil.STATUS_ZOMBIE:
-                return None
-            return create_time
+                return (False, None)
+            return (True, create_time)
+        except psutil.NoSuchProcess:
+            return (False, None)
+        except psutil.AccessDenied:
+            # It is there; what it is cannot be established from here.
+            return (True, None)
         except Exception:
-            return None
+            return (None, None)
 
     @staticmethod
     def read_pid_record(pid_file: Path) -> "PidRecord":
@@ -417,13 +446,27 @@ class ProcessManager:
                 return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} is neither JSON nor a PID")
 
-        live_start = ProcessManager.process_start_time(pid)
-        if live_start is None:
+        exists, live_start = ProcessManager._probe_process(pid)
+        if exists is False:
             # Nothing is running under that number. Whether it once was is not
             # a question this can answer, and does not need to be: there is
             # nothing there to signal or to call running.
             return PidRecord(PidStatus.STALE, pid, root, port,
-                             f"no process is running as PID {pid}")
+                             f"no process is running as PID {pid}",
+                             started_at=recorded_start)
+
+        if live_start is None:
+            # Either something is there but opaque to us (another account, or
+            # hidepid), or psutil could not answer at all. Both are
+            # undecidable, and undecidable counts as running — a guard that
+            # waves through a database another process may be holding costs
+            # more than a refusal the operator can clear.
+            return PidRecord(
+                PidStatus.UNDECIDABLE, pid, root, port,
+                f"PID {pid} exists but its identity cannot be established "
+                f"from this process ({'access denied' if exists else 'no probe available'})",
+                started_at=recorded_start,
+            )
 
         if recorded_start is None:
             # Legacy file: something IS running as that PID, but nothing
@@ -813,6 +856,7 @@ class ProcessManager:
                 pid=existing.pid,
                 pid_file=pid_file,
                 log_file=log_file,
+                started_at=existing.started_at,
             )
             self._agents[name] = ap
             return ap
@@ -933,6 +977,9 @@ class ProcessManager:
             pid=pid,
             pid_file=pid_file,
             log_file=log_file,
+            # Read back from the file just written, so the in-memory handle
+            # and the record on disk name the same instant.
+            started_at=self.read_pid_record(pid_file).started_at,
         )
         self._agents[name] = ap
         return ap
@@ -980,7 +1027,7 @@ class ProcessManager:
             return True
 
         logger.info(f"Stopping agent '{name}' (PID {ap.pid})...")
-        self.kill_process(ap.pid, force=False)
+        self.kill_process(ap.pid, force=False, started_at=ap.started_at)
 
         # Wait for graceful shutdown
         deadline = time.time() + timeout
@@ -992,7 +1039,7 @@ class ProcessManager:
         # Force kill if still running
         if self.is_process_running(ap.pid):
             logger.warning(f"Agent '{name}' didn't stop gracefully, sending SIGKILL")
-            self.kill_process(ap.pid, force=True)
+            self.kill_process(ap.pid, force=True, started_at=ap.started_at)
             time.sleep(0.5)
 
         # Reap before judging. ``start_agent`` spawns agents with
@@ -1143,6 +1190,7 @@ class ProcessManager:
             pid=pid,
             pid_file=pid_file,
             log_file=log_file,
+            started_at=existing.started_at if pid else None,
         )
         self._agents[name] = ap
         return ap
