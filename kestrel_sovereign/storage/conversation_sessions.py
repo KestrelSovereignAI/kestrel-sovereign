@@ -291,9 +291,10 @@ does not decrease as ``id`` increases within a session. Every writer produces
 both from the same INSERT, so it holds; but a fold that quietly assumed it would
 be wrong without saying so, and the assumption is cheap to check. A fold whose
 slice starts before what the stored row already claims is therefore not folded at
-all: that session is derived exactly, from its live rows up to the chunk's end.
-The expensive branch is the *definition*, and the fold is the optimization of it
-that is only taken where it provably agrees.
+all: the whole transcript is derived again, because which cluster a row belongs
+to is not a property of its own session's rows — a neighbour splits them, and
+coalescing merges the pieces. The transcript pass is the *definition*, and the
+fold is the optimization of it that is only taken where it provably agrees.
 
 The one adaptation is ``first_user_message_id``. The grouper reports the
 previewed *text*, not which row it came from, and this table stores the row.
@@ -1446,8 +1447,8 @@ class ConversationSessionProjection:
     async def is_stale(self) -> bool:
         """Whether the projection disagrees with the rows it describes.
 
-        Two primary-key reads, and no scan of history at any size — which is the
-        whole reason the stamp is maintained by the engine. ``False`` is the
+        Three primary-key reads, and no scan of history at any size — which is
+        the whole reason the stamp is maintained by the engine. ``False`` is the
         strong claim and it rests on three things: the watermark is valid, the
         walk that wrote it reached its target, and the stamp has not moved since.
         Every row event moves the stamp, so "has not moved" means "no row this
@@ -1724,16 +1725,35 @@ class ConversationSessionProjection:
         await self.db.execute(
             f"SET LOCAL lock_timeout = {int(REPAIR_LOCK_WAIT_MS)}"
         )
-        await self.db.execute(
+        # ONE statement that locks in both branches, and whose result is
+        # checked. The previous pair — `INSERT ... DO NOTHING` then
+        # `SELECT ... FOR UPDATE` — locks nothing when the row already exists
+        # (the insert is a no-op) and can then find nothing to lock: under READ
+        # COMMITTED the waiter re-evaluates after the holder commits, and two
+        # shipped call sites DELETE this row while holding it — the empty
+        # history branch of `_rebuild_from_transcript` and the EPHEMERAL sweep.
+        # The waiter woke with zero rows and no lock, silently, because nothing
+        # inspected the result. Measured: `INSERT 0 0` then `FOR UPDATE`
+        # returning 0 rows.
+        #
+        # `DO UPDATE` takes the row lock on the conflict path, and PostgreSQL
+        # retries the insert when the conflicting row is deleted underneath it,
+        # so this acquires in both orders. Measured against the same race: the
+        # upsert returns its row.
+        acquired = await self.db.fetchval(
             "INSERT INTO conversation_session_watermarks (agent_id) VALUES (?) "
-            "ON CONFLICT (agent_id) DO NOTHING",
+            "ON CONFLICT (agent_id) DO UPDATE SET agent_id = EXCLUDED.agent_id "
+            "RETURNING agent_id",
             (self.agent_id,),
         )
-        await self.db.fetchval(
-            "SELECT accounted_valid FROM conversation_session_watermarks "
-            "WHERE agent_id = ? FOR UPDATE",
-            (self.agent_id,),
-        )
+        if acquired is None:
+            # Never observed, and not swallowed if it happens: a claim that did
+            # not acquire lets a sweep and a repair write the same tables at
+            # once, which is the one forbidden state this module names.
+            raise RuntimeError(
+                "conversation_sessions: could not claim the repair exclusion "
+                f"for {self.agent_id}; refusing to proceed unserialized"
+            )
 
     async def _plan(
         self, accounted: SessionWatermark, observed: int
@@ -1947,7 +1967,18 @@ class ConversationSessionProjection:
                     (self.agent_id,),
                 )
                 # ...and the watermark row, which `_claim()` INSERTed a moment
-                # ago on PostgreSQL to have something to lock. Leaving it
+                # ago on PostgreSQL to have something to lock.
+                #
+                # This is NOT "an empty history leaves no watermark". The
+                # chunked path records a VALID one over an empty history on
+                # purpose — `accounted_valid` exists to separate "nothing has
+                # ever been accounted for" from "accounted for, and there was
+                # nothing", and collapsing them makes an empty agent re-derive
+                # for ever. The difference is what the two passes KNOW: the
+                # chunked walk looked and found nothing, while this pass derived
+                # a history that was erased underneath it and can vouch for
+                # neither. Recording nothing is the honest answer to that, and
+                # not recording the agent's id is a bonus rather than the rule. Leaving it
                 # commits this agent's id into a table the purge had just
                 # emptied — a no-trace exit undone by the repair that noticed
                 # the purge (round-17 review). Nothing is lost: an absent
@@ -1957,24 +1988,51 @@ class ConversationSessionProjection:
                     (self.agent_id,),
                 )
                 return _Step(REBUILT, 0, True)
+            delta = await self.observed_changes() - observed
+            appended = await self.observed_appends() - appends
             if (
                 await self.observed_generation() != generation
-                or await self.observed_changes() != observed
-                or await self._max_id() != target
+                or delta < 0
+                or delta != appended
+                or delta != await self._rows_above(target)
             ):
-                # The stamp alone is not enough, for the reason the sweep erases
-                # the watermark beside the ledger: a counter that can RESTART
-                # says nothing across the restart. Purge, then N new turns, and
-                # it reads N again — the value this pass is holding. The
-                # frontier does not restart, so it is asked too: ``MAX(id)``
-                # after a purge and refill is not the one the snapshot was taken
-                # at.
+                # The SAME test `_plan` applies, for the same reason: every
+                # change since the derivation must have been a row APPENDED
+                # above the target. The snapshot is bounded at ``id <= target``
+                # (above), so a row arriving beyond it cannot have changed what
+                # was derived — those rows are simply left to the next fold.
                 #
-                # A concurrent append also moves the frontier, and this refuses
-                # to publish then as well. That costs a redo of the transcript
-                # pass, which is the escalation path rather than the hot one —
-                # ordinary appends are folded by the chunked walk and never
-                # arrive here.
+                # An earlier version refused whenever ``MAX(id)`` moved at all,
+                # which is stricter than the invariant needs and does not
+                # terminate: this pass is reached on EVERY repair for an agent
+                # holding rows whose ``session_id`` the column cannot store, so
+                # one message arriving during a whole-history read aborted the
+                # publish, and `repair()` immediately tried again — up to the
+                # step budget, each attempt another full scan holding SQLite's
+                # writer slot.
+                #
+                # The generation is what covers a purge, which is why the
+                # frontier no longer has to: a ledger erased and rebuilt gets a
+                # new one, so a stamp from before it is not comparable at all.
+                #
+                # NOT COVERED BY A FAILING TEST, and said plainly rather than
+                # left to look verified. The arithmetic above subtracts two
+                # readings of the same counters, and after the sweep erases the
+                # ledger the second reading belongs to a row that restarted at
+                # zero — so the difference is across two unrelated sequences.
+                # In the post-upgrade shape they line up exactly: measured,
+                # `delta 3 == appended 3 == rows_above 3` describing a history
+                # this snapshot never saw, admitted by every check but this one.
+                #
+                # What could not be observed is a DIFFERENT outcome. `repair()`
+                # takes the mismatch through `_plan` on its next step and
+                # rebuilds from current history, and `is_stale()` reports the
+                # mismatch too, so the table converges either way — including
+                # with `step_budget=1`. The claim this defends is narrower than
+                # the end state: that rows derived from purged history are never
+                # COMMITTED, not merely corrected afterwards. Relying on the
+                # correction would make a privacy property depend on a later
+                # step running at all.
                 return _Step(REBUILT, 0, False)
             await self.db.execute(
                 "DELETE FROM conversation_sessions WHERE agent_id = ?",
@@ -2121,16 +2179,15 @@ class ConversationSessionProjection:
 
         written = 0
         for session_id in sorted(by_session):
-            projection = await self._folded(
-                session_id, by_session[session_id], through
+            # `_folded` returns a projection or raises `_NeedsTranscript` — it
+            # has no "nothing to store" answer. It had one until the fold began
+            # escalating a session whose rows the transcript files elsewhere,
+            # and the branch that handled it (forgetting the session) outlived
+            # the case by several rounds, looking like live handling of a
+            # Phase A violation that in fact reached the transcript pass.
+            written += await self._store(
+                await self._folded(session_id, by_session[session_id], through)
             )
-            if projection is None:
-                # The rows the column selected are not the ones the transcript
-                # files under it — a Phase A violation, logged by
-                # ``project_transcript``. Absent rather than a guess.
-                await self._forget(session_id)
-            else:
-                written += await self._store(projection)
         return written
 
     async def _folded(
@@ -2138,7 +2195,7 @@ class ConversationSessionProjection:
         session_id: str,
         rows: Sequence[Sequence[Any]],
         through: int,
-    ) -> Optional[SessionProjection]:
+    ) -> SessionProjection:
         """What one session looks like once this chunk's rows are counted in.
 
         The stored row describes that session's live rows up to the previous
@@ -2154,10 +2211,12 @@ class ConversationSessionProjection:
         session, which is true of everything that writes history (both come from
         one INSERT) and is not true by construction. So it is checked, not
         assumed: a slice that starts before what the stored row already claims is
-        not folded at all — that session is derived exactly, from its live rows
-        up to this chunk's end. The same branch catches a stored timestamp that
-        cannot be read back as one, since a value that will not parse cannot be
-        merged with anything.
+        not folded at all — it escalates, and the whole transcript is derived
+        again. Deriving just this session would not do: another session's row
+        between two of its own ENDS a cluster, so its boundaries are not a
+        property of its own rows. The same branch catches a stored timestamp
+        that cannot be read back as one, since a value that will not parse
+        cannot be merged with anything.
         """
         partial = project_transcript(rows, expect=session_id)
         if not partial:
@@ -2216,33 +2275,6 @@ class ConversationSessionProjection:
         )
         return _as_projection(merged[0])
 
-    async def _derive(
-        self, session_id: str, through: int
-    ) -> Optional[SessionProjection]:
-        """One session as its own live rows up to ``through`` describe it.
-
-        The definition a fold is an optimization of, and the branch taken where
-        the optimization would not provably agree with it. Bounded by the
-        session's size rather than by the chunk, which is why it is not the
-        ordinary path.
-        """
-        projections = project_transcript(
-            await self.db.fetchall(
-                _own_rows_through(self.db.backend_type),
-                (self.agent_id, session_id, through),
-            ),
-            expect=session_id,
-        )
-        return projections[0] if projections else None
-
-    async def _forget(self, session_id: str) -> int:
-        """Drop one session's row."""
-        return await self.db.execute(
-            "DELETE FROM conversation_sessions "
-            "WHERE agent_id = ? AND session_id = ?",
-            (self.agent_id, session_id),
-        )
-
     async def _store(self, projection: SessionProjection) -> int:
         """Upsert one session's row.
 
@@ -2255,7 +2287,11 @@ class ConversationSessionProjection:
         await self.db.execute(
             "INSERT INTO conversation_sessions "
             f"(agent_id, session_id, {', '.join(PROJECTION_COLUMNS)}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            # Counted from the column list for the same reason `_record` does:
+            # a literal run of "?" is a second statement of how many columns a
+            # projection row has, and it breaks at runtime rather than being
+            # carried along.
+            f"VALUES ({', '.join('?' * (len(PROJECTION_COLUMNS) + 2))}) "
             "ON CONFLICT (agent_id, session_id) DO UPDATE SET "
             f"{assignments}",
             (

@@ -3088,3 +3088,82 @@ async def test_the_purge_waits_for_a_first_repair_that_has_no_watermark_yet(
             "SELECT COUNT(*) FROM conversation_session_watermarks WHERE agent_id = ?",
             (agent_id,),
         ) == 0, "a watermark naming the agent survived the sweep"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_the_claim_acquires_even_when_the_holder_deletes_the_row(postgres_db):
+    """Claiming must acquire, not merely wait and find nothing.
+
+    The exclusion was `INSERT ... ON CONFLICT DO NOTHING` followed by
+    `SELECT ... FOR UPDATE`. When the row already exists the insert is a no-op
+    that locks nothing, so the `FOR UPDATE` waits — and under READ COMMITTED a
+    waiter re-evaluates its predicate after the holder commits. Two shipped
+    paths DELETE this row while holding it: the empty-history branch of
+    `_rebuild_from_transcript`, and the EPHEMERAL sweep. The waiter then woke
+    with zero rows and no lock, and nothing looked at the result.
+
+    Measured against a raw table: `INSERT 0 0`, then `FOR UPDATE` returning 0
+    rows. The upsert form returns its row in the same race, because PostgreSQL
+    retries the insert once the conflicting row is gone.
+
+    The sibling case covers a claim racing an ABSENT row. This one covers a
+    claim racing its DELETION, which is the interleaving those two call sites
+    actually produce.
+    """
+    agent_id = f"did:test:claim-delete:{uuid4()}"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        projection = ConversationSessionProjection(db, agent_id)
+
+        # The row exists, so the claim's insert is a no-op and it must contend.
+        await db.execute(
+            "INSERT INTO conversation_session_watermarks (agent_id) VALUES (?) "
+            "ON CONFLICT (agent_id) DO NOTHING",
+            (agent_id,),
+        )
+
+        holding = asyncio.Event()
+        deleted = asyncio.Event()
+
+        async def _hold_then_delete():
+            async with db.transaction(immediate=True):
+                await projection.claim_exclusion()
+                holding.set()
+                await asyncio.sleep(0.5)
+                await db.execute(
+                    "DELETE FROM conversation_session_watermarks "
+                    "WHERE agent_id = ?",
+                    (agent_id,),
+                )
+                deleted.set()
+
+        holder = asyncio.create_task(_hold_then_delete())
+        try:
+            await _before_the_budget(db, "the holder claiming", holding.wait())
+
+            async def _claim_behind_it():
+                async with db.transaction(immediate=True):
+                    await projection.claim_exclusion()
+                    # If the claim acquired, this row is ours and present.
+                    return await db.fetchval(
+                        "SELECT COUNT(*) FROM conversation_session_watermarks "
+                        "WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+
+            waiter = asyncio.create_task(_claim_behind_it())
+            held = await _before_the_budget(
+                db, "the second claim acquiring", asyncio.shield(waiter)
+            )
+        finally:
+            await _before_the_budget(
+                db, "the holder finishing", asyncio.shield(holder)
+            )
+
+        assert deleted.is_set(), "the holder never deleted, so nothing raced"
+        assert held == 1, (
+            "the second claim returned without a row to lock — it is running "
+            "unserialized against whatever deleted it, which is how a sweep "
+            "and a repair end up writing the same tables at once"
+        )

@@ -2044,12 +2044,6 @@ class AsyncDatabase:
             canonical_order_index_columns(self.backend_type),
             where=archived_history_predicate(),
         )
-        # The index that keeps `canonical_order()` a bounded traversal. Its
-        # columns are the ORDER BY's own key expressions, so it cannot drift
-        # from the ordering it exists for — and without it BOTH engines fall
-        # back to reading and sorting the agent's whole live history before
-        # applying LIMIT, which is the O(history) cost this epic removes.
-
 
     async def _trigger_exists(self, name: str, table: str) -> bool:
         """Whether ``table`` already carries a trigger called ``name``.

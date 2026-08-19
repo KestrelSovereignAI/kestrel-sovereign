@@ -3011,7 +3011,7 @@ async def test_a_purge_and_refill_does_not_let_a_stale_snapshot_publish(tmp_path
         db.fetchall = real_fetchall
 
         fresh = ConversationSessionProjection(db, AGENT)
-        assert await fresh.get(UUID_A) is None or await fresh.is_stale(), (
+        assert await fresh.get(UUID_A) is None, (
             "a snapshot taken before the purge was published as current over "
             "history that replaced it"
         )
@@ -3165,3 +3165,99 @@ async def test_a_replaced_history_with_reused_ids_is_not_reported_current(tmp_pa
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_the_publish_fence_will_not_subtract_across_a_ledger_reset(tmp_path):
+    """The counters are only comparable within one incarnation of the ledger.
+
+    The fence asks whether every change since the derivation was an append
+    above the target: ``delta == appended == rows_above(target)``. Those are
+    differences between two readings of the SAME counters — and after the sweep
+    erases the ledger they are not. The second reading belongs to a fresh row
+    that started at zero, so subtracting the first from it is arithmetic across
+    two unrelated sequences.
+
+    It lines up exactly in the post-upgrade shape. A first repair derives at
+    stamp 0 (the ledger is created empty beside a full history), the sweep
+    erases everything, and ``k`` new turns arrive: ``delta`` is ``k``,
+    ``appended`` is ``k`` — every event was an insert — and ``rows_above`` the
+    old target is ``k``, because the new ids sit above it. Three agreeing
+    numbers describing a history the snapshot has never seen.
+
+    The generation is what refuses it — measured, the three numbers agree and
+    every other check admits the snapshot.
+
+    **This case pins the scenario, not the guard.** Removing the generation
+    check does not fail it: `repair()` notices the mismatch through `_plan` on a
+    later step, and `is_stale()` reports it as well, so the table converges to
+    the same place with the guard or without. What the guard defends is narrower
+    than any end state a test can read — that rows derived from purged history
+    are never committed at all. The limitation is written at the fix site too,
+    rather than left looking verified.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    import kestrel_sovereign.storage.conversation_sessions as module
+
+    async with AsyncStorage(str(tmp_path / "reset.db"), agent_id=AGENT) as storage:
+        db = storage.db
+        await _seed(db, [
+            {"content": "pre-purge", "role": "user", "created_at": _at(0),
+             "metadata": {"session_id": UUID_A}},
+            {"content": "unstamped", "role": "assistant", "created_at": _at(1),
+             "metadata": {}},
+        ])
+        # Post-upgrade: a full history beside a ledger that has never counted it.
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        # `step_budget=1` so this observes the FENCE, not `repair()`'s loop. A
+        # later step notices the generation mismatch through `_plan` and rebuilds
+        # from current history, which erases the evidence: measured, the fence
+        # without its generation check admits the snapshot (delta 3 == appended
+        # 3 == rows_above 3, all agreeing about a history it never saw) and the
+        # next step then discards it. Asserting the end state proved the loop
+        # self-heals; the claim here is that purged rows are never committed at
+        # all.
+        projection = ConversationSessionProjection(db, AGENT, step_budget=1)
+        assert await projection.observed_changes() == 0
+        assert await projection.observed_generation() == ""
+
+        derived = asyncio.Event()
+        release = asyncio.Event()
+        real_fetchall = db.fetchall
+        transcript_sql = module._live_rows_through(db.backend_type)
+
+        async def _pausing_fetchall(query, params=()):
+            rows = await real_fetchall(query, params)
+            if query == transcript_sql and not derived.is_set():
+                derived.set()
+                await asyncio.wait_for(release.wait(), 30)
+            return rows
+
+        db.fetchall = _pausing_fetchall
+        slow = asyncio.create_task(projection.repair())
+        try:
+            await asyncio.wait_for(derived.wait(), 30)
+            wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+            await storage.conversation.purge_all_since("1970-01-01", reason="test")
+            await wrapper.purge_ephemeral_session(reason="test")
+            for _ in range(3):
+                await _seed(db, [{
+                    "content": "post-purge", "role": "user", "created_at": _at(500),
+                    "metadata": {"session_id": UUID_C},
+                }])
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(slow), 30)
+        db.fetchall = real_fetchall
+
+        fresh = ConversationSessionProjection(db, AGENT)
+        assert await fresh.observed_generation() != "", "the ledger was not rebuilt"
+        assert await fresh.get(UUID_A) is None or await fresh.is_stale(), (
+            "a snapshot derived before the ledger was erased was published as "
+            "current, because its counters were subtracted from a fresh one's"
+        )
