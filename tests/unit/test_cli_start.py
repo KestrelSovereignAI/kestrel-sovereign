@@ -15,6 +15,8 @@ from kestrel_sovereign.multi_agent.config import (
 )
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    PidRecord,
+    PidStatus,
     ProcessManager,
 )
 from kestrel_sovereign.setup.steps.agent import DEFAULT_QUICKSTART_AGENT_NAME
@@ -33,7 +35,11 @@ def _quickstart_config(tmp_path):
 def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
     config = _quickstart_config(tmp_path)
     process_manager = MagicMock(spec=ProcessManager)
-    process_manager.read_pid.return_value = None
+    # A real record, not a MagicMock: ``is_running`` on a mock is truthy, so
+    # start would take the already-running branch and never probe health.
+    process_manager.read_pid_record.return_value = PidRecord(
+        PidStatus.ABSENT, None, None, None, "no PID file"
+    )
     process_manager.is_port_in_use.return_value = False
     process_manager._load_env.return_value = {}
     process_manager.wait_for_health.return_value = True

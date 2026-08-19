@@ -234,24 +234,41 @@ def _make_local_anchor(agent_dir: Path, agent_did: str = AGENT_DID) -> bytes:
 
     Byte-equality after the run asserts the *record* is unchanged, not that
     the file was never opened. It always is: ``resolve_reanchor_target`` reads
-    this agent's DID out of it through ``read_anchor_agent_did(..., INITIALIZATION)``,
-    which opens ``mode=rw`` on every backend so SQLite can replay a WAL. On a
-    WAL anchor that checkpoints — the bytes change while the record does not.
-    This fixture is journal-mode ``delete``, so byte-equality is reachable
-    here; do not read it as a promise about production anchors.
+    this agent's DID out of it, and with ``--force`` that is
+    ``read_anchor_agent_did(..., INITIALIZATION)``, which opens ``mode=rw`` so
+    SQLite can replay a WAL. On a WAL anchor that checkpoints — the bytes
+    change while the record does not. This fixture is journal-mode ``delete``,
+    so byte-equality is reachable here; do not read it as a promise about
+    production anchors. A force-less run takes the INSPECTION path and does
+    not write at all (#2920).
+
+    The schema comes from ``CORE_SCHEMA`` rather than a hand-written subset.
+    A partial anchor is not a smaller version of a real one — it is a database
+    that cannot answer, because every bound read is scoped through
+    ``graph_node_owners`` and the drift decision reads ``graph_edges``. It used
+    to appear to work only because a force-less inspection ran schema
+    migrations against the agent's database on its way past, creating whatever
+    tables it needed as a side effect of reading. That write was the #2920
+    defect; with it gone the fixture supplies what a real anchor has, and
+    taking the runtime's own DDL means it cannot drift out of step again.
     """
     import sqlite3
+
+    from kestrel_sovereign.storage.async_database import CORE_SCHEMA
 
     agent_dir.mkdir(parents=True, exist_ok=True)
     path = agent_dir / "kestrel_prime.db"
     with sqlite3.connect(str(path)) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS graph_nodes "
-            "(node_id TEXT PRIMARY KEY, node_type TEXT, label TEXT, properties TEXT)"
-        )
+        conn.executescript(CORE_SCHEMA)
         conn.execute(
             "INSERT OR REPLACE INTO graph_nodes VALUES (?, 'agent', 'PgTargetAgent', '{}')",
             (agent_did,),
+        )
+        # The ownership witness is part of the record: a bound read returns
+        # nothing without it, which is a different answer from "no such agent".
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_node_owners VALUES (?, ?)",
+            (agent_did, agent_did),
         )
         conn.commit()
     return path.read_bytes()
