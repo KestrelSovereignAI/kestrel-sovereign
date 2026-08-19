@@ -1593,10 +1593,11 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
         await _create_core_tables(db, *_PROJECTION_TABLES)
         for table, _ddl in projection_tables():
             assert await db.table_exists(table) is False, table
-        for name, table, _columns in (
-            _SESSION_PROJECTION_INDEX,
-            _SESSION_FRONTIER_INDEX,
-        ):
+        # `_SESSION_PROJECTION_INDEX` carries name and table only — its columns
+        # are generated per dialect at ensure time — so the entries are not the
+        # same width.
+        for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
+            name, table = entry[0], entry[1]
             assert await db._index_exists(name, table) is False
 
         await db.ensure_session_projection_schema()
@@ -1608,11 +1609,12 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
             assert await db.table_exists(table) is True, table
         for trigger, _ddl in mutation_triggers(db.backend_type):
             assert await db._trigger_exists(trigger, "conversation_history"), trigger
-        for name, table, _columns in (
-            _SESSION_PROJECTION_INDEX,
-            _SESSION_FRONTIER_INDEX,
-        ):
+        for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
+            name, table = entry[0], entry[1]
             assert await db._index_exists(name, table) is True
+        assert await db._index_exists(
+            "idx_conversation_agent_canonical", "conversation_history"
+        ) is True, "the index the conversation list's ordering needs is absent"
 
 
 @pytest.mark.asyncio

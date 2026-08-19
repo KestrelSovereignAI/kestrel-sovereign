@@ -1234,11 +1234,15 @@ async def test_initializing_a_database_wires_the_projections_whole_schema(tmp_pa
 
     db = await AsyncDatabase.sqlite(str(tmp_path / "boot.db"))
     try:
-        for name, table, _columns in (
-            _SESSION_PROJECTION_INDEX,
-            _SESSION_FRONTIER_INDEX,
-        ):
+        # `_SESSION_PROJECTION_INDEX` carries name and table only — its columns
+        # are generated per dialect at ensure time — so take the first two of
+        # each rather than assuming both tuples are the same width.
+        for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
+            name, table = entry[0], entry[1]
             assert await db._index_exists(name, table) is True, name
+        assert await db._index_exists(
+            "idx_conversation_agent_canonical", "conversation_history"
+        ) is True, "the index the conversation list's ordering needs is absent"
         for table, _ddl in projection_tables():
             assert await db.table_exists(table), table
         for trigger, _ddl in mutation_triggers(db.backend_type):
@@ -2923,4 +2927,80 @@ async def test_a_scoped_purge_is_not_undone_by_a_running_repair(tmp_path):
         assert await fresh.get(UUID_B) is None, (
             "the repair republished a row naming the session that leaked during "
             "the EPHEMERAL stint"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_purge_and_refill_does_not_let_a_stale_snapshot_publish(tmp_path):
+    """The stamp can come back to where it was, so it is not enough on its own.
+
+    A repair derives at stamp N. The sweep empties history and erases the
+    ledger, which restarts at 1. N new turns then arrive, and the ledger reads N
+    again — the value the repair is holding. History is not empty, so the
+    emptiness check passes; the stamp matches, so that check passes; and the
+    pre-purge snapshot is published under the OLD target, leaving every newer
+    row unaccounted while ``is_stale()`` answers false.
+
+    This is the same collision that made the sweep erase the watermark
+    alongside the ledger: a counter that can restart says nothing across the
+    restart. The frontier is asked as well, because it does not restart —
+    ``MAX(id)`` after a purge and refill is not the ``MAX(id)`` the snapshot was
+    taken at.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    import kestrel_sovereign.storage.conversation_sessions as module
+
+    async with AsyncStorage(str(tmp_path / "refill.db"), agent_id=AGENT) as storage:
+        db = storage.db
+        await _seed(db, [
+            {"content": "pre-purge turn", "role": "user", "created_at": _at(0),
+             "metadata": {"session_id": UUID_A}},
+            {"content": "unstamped", "role": "assistant", "created_at": _at(1),
+             "metadata": {}},
+        ])
+        projection = ConversationSessionProjection(db, AGENT)
+        stamp_at_derivation = await projection.observed_changes()
+
+        derived = asyncio.Event()
+        release = asyncio.Event()
+        real_fetchall = db.fetchall
+        transcript_sql = module._live_rows_through(db.backend_type)
+
+        async def _pausing_fetchall(query, params=()):
+            rows = await real_fetchall(query, params)
+            if query == transcript_sql and not derived.is_set():
+                derived.set()
+                await asyncio.wait_for(release.wait(), 30)
+            return rows
+
+        db.fetchall = _pausing_fetchall
+        slow = asyncio.create_task(projection.repair())
+        try:
+            await asyncio.wait_for(derived.wait(), 30)
+            wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+            await storage.conversation.purge_all_since("1970-01-01", reason="test")
+            await wrapper.purge_ephemeral_session(reason="test")
+            assert await projection.observed_changes() == 0, "the ledger was not erased"
+            # Refill until the restarted ledger reads exactly what the paused
+            # repair is holding.
+            while await projection.observed_changes() < stamp_at_derivation:
+                await _seed(db, [{
+                    "content": "post-purge turn", "role": "user",
+                    "created_at": _at(500), "metadata": {"session_id": UUID_C},
+                }])
+            assert await projection.observed_changes() == stamp_at_derivation, (
+                "the collision this guards against did not occur"
+            )
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(slow), 30)
+        db.fetchall = real_fetchall
+
+        fresh = ConversationSessionProjection(db, AGENT)
+        assert await fresh.get(UUID_A) is None or await fresh.is_stale(), (
+            "a snapshot taken before the purge was published as current over "
+            "history that replaced it"
         )

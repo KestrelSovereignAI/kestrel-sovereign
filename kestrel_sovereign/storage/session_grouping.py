@@ -438,6 +438,22 @@ def session_order_sql(backend_type: str) -> str:
     )
 
 
+def session_order_index_columns(backend_type: str) -> str:
+    """:data:`SESSION_ORDER` as index columns, directions included.
+
+    An index on the first key alone does not bound a page: ties on
+    ``last_message_at`` are ordinary at second resolution, and the engine must
+    then sort the whole tie group before applying ``LIMIT``. The tie-break is
+    compared bytewise for the same reason the ``ORDER BY`` compares it that way,
+    so the index and the ordering are the same comparison.
+    """
+    return ", ".join(
+        f"{bytewise_sql(backend_type, column) if column == 'session_id' else column} "
+        f"{'DESC' if descending else 'ASC'}"
+        for column, descending in SESSION_ORDER
+    )
+
+
 def sort_sessions(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Order session dicts by :data:`SESSION_ORDER`, in place.
 

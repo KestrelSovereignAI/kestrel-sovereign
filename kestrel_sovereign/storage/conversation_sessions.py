@@ -1461,7 +1461,14 @@ class ConversationSessionProjection:
 
         Zero is a real answer for an agent with no sessions.
         """
-        await self._record(INVALID)
+        # Claimed, so the wait is bounded. `_record` writes the watermark row,
+        # which another PostgreSQL repair may be holding — and waiting on that
+        # lock BEFORE `_claim()` has set `lock_timeout` is an unbounded wait,
+        # which is the shape of Phase A's 23-hour wedge and the one thing this
+        # class promises never to do.
+        async with self.db.transaction(immediate=True):
+            await self._claim()
+            await self._record(INVALID)
         await self.repair()
         return len(await self.list())
 
@@ -1808,7 +1815,23 @@ class ConversationSessionProjection:
                     (self.agent_id,),
                 )
                 return _Step(REBUILT, 0, True)
-            if await self.observed_changes() != observed:
+            if (
+                await self.observed_changes() != observed
+                or await self._max_id() != target
+            ):
+                # The stamp alone is not enough, for the reason the sweep erases
+                # the watermark beside the ledger: a counter that can RESTART
+                # says nothing across the restart. Purge, then N new turns, and
+                # it reads N again — the value this pass is holding. The
+                # frontier does not restart, so it is asked too: ``MAX(id)``
+                # after a purge and refill is not the one the snapshot was taken
+                # at.
+                #
+                # A concurrent append also moves the frontier, and this refuses
+                # to publish then as well. That costs a redo of the transcript
+                # pass, which is the escalation path rather than the hot one —
+                # ordinary appends are folded by the chunked walk and never
+                # arrive here.
                 return _Step(REBUILT, 0, False)
             await self.db.execute(
                 "DELETE FROM conversation_sessions WHERE agent_id = ?",

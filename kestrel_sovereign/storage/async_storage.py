@@ -919,7 +919,19 @@ class AsyncStorage:
         ]
         if not tables:
             return 0
-        # The ledger goes LAST, and that ordering is the guarantee — not the
+        # Watermark FIRST, ledger LAST, sessions in between. Two orderings have
+        # to hold at once and they do not conflict:
+        #
+        #   * The ledger last is the correctness guarantee (below).
+        #   * The watermark first matches the order a REPAIR takes them in —
+        #     `_claim()` locks the watermark row and only then upserts session
+        #     rows. Taking them the other way round here is the classic ABBA
+        #     deadlock: each holds the row the other is waiting for, and
+        #     PostgreSQL resolves it by aborting one. Aborting this sweep would
+        #     leave projection rows standing after an EPHEMERAL exit that
+        #     reported success, because this store is not a required one.
+        #
+        # The ledger goes last, and that ordering is the guarantee — not the
         # transaction. The state to avoid is a watermark standing beside a
         # missing ledger, because that is the one where a restarted counter can
         # match a stale stamp. Deleting the ledger after everything derived from
@@ -930,7 +942,12 @@ class AsyncStorage:
         # happens to order it last too, for an unrelated reason — the triggers
         # reference it — so it is re-established here rather than inherited from
         # a coincidence a future reordering could quietly take away.
-        tables = [t for t in tables if t != ledger] + [t for t in tables if t == ledger]
+        watermark = "conversation_session_watermarks"
+        tables = (
+            [t for t in tables if t == watermark]
+            + [t for t in tables if t not in (watermark, ledger)]
+            + [t for t in tables if t == ledger]
+        )
 
         purged = 0
         # The transaction is what makes the sweep all-or-nothing, and on SQLite

@@ -48,10 +48,13 @@ _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
 #:
 #: One tuple, unpacked into the call and read by the test that races it, so the
 #: declaration a concurrency test exercises is provably the shipped one.
+#: Name and table only — the columns come from ``SESSION_ORDER`` at ensure time,
+#: because they are dialect-dependent (the tie-break is compared bytewise, which
+#: PostgreSQL needs told) and because an index that does not carry every key the
+#: page orders by does not bound the page.
 _SESSION_PROJECTION_INDEX = (
     "idx_conversation_sessions_recent",
     "conversation_sessions",
-    "agent_id, last_message_at",
 )
 
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
@@ -1916,6 +1919,7 @@ class AsyncDatabase:
         contract it implements and the column list the triggers watch. This
         method owns HOW to create things safely; that module owns WHAT.
         """
+        from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
             canonical_order_index_columns,
             mutation_trigger_function,
@@ -1990,7 +1994,10 @@ class AsyncDatabase:
                     "row changed, and would report itself current forever."
                 )
 
-        await self.ensure_index(*_SESSION_PROJECTION_INDEX)
+        await self.ensure_index(
+            *_SESSION_PROJECTION_INDEX,
+            f"agent_id, {session_order_index_columns(self.backend_type)}",
+        )
         await self.ensure_index(*_SESSION_FRONTIER_INDEX)
         # The index that keeps `canonical_order()` a bounded traversal. Its
         # columns are the ORDER BY's own key expressions, so it cannot drift
