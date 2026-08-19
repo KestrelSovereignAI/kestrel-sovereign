@@ -721,6 +721,39 @@ class TestCliExitCode:
         rc = cmd_migrate_encryption(args)
         assert rc == 2
 
+    def test_live_host_pid_in_the_identity_format_blocks_with_exit_2(
+        self, seeded_db, data_key, tmp_path,
+    ):
+        """The guard must read the format the runtime actually writes.
+
+        This module kept its own ``int(pid_file.read_text())``, so the moment
+        PID files began recording instance identity as JSON (#2995) the parse
+        raised, the guard got nothing, and a non-dry-run backfill would have
+        mutated SQLite while the daemon was serving it. The legacy-format test
+        above kept passing throughout, which is why this one exists.
+        """
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+
+        host_logs = seeded_db.parent.parent / "logs"
+        host_logs.mkdir(parents=True, exist_ok=True)
+        host_pid_file = host_logs / ".host.pid"
+        # Written by the runtime's own writer, so the file is whatever the
+        # runtime actually produces rather than a shape this test invented.
+        ProcessManager.write_pid(host_pid_file, os.getpid(), port=8888)
+        assert host_pid_file.read_text().startswith("{"), "expected the identity format"
+
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        assert cmd_migrate_encryption(args) == 2
+
     def test_live_pid_file_blocks_with_exit_2(
         self, seeded_db, data_key, capsys,
     ):
