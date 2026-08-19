@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -318,7 +319,7 @@ def _start_inprocess_mode(
     if existing_host:
         pm.clear_pid(host_pid_file)
 
-    if pm.is_port_in_use(multi_agent.host.port):
+    if pm.is_port_in_use(multi_agent.host.port, multi_agent.host.bind):
         orphans = pm.find_pids_on_port(multi_agent.host.port)
         print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
@@ -371,23 +372,75 @@ def _start_inprocess_mode(
     return 0
 
 
-def _reap_orphans_on_port(port: int, label: str, force: bool) -> bool:
-    """Kill untracked listeners on `port`. Returns True if any were killed."""
+class PortReapResult(Enum):
+    """Outcome of reaping untracked listeners on a port.
+
+    Three outcomes rather than a bool, because the caller asks two different
+    questions — "was anything listening?" and "is the port free now?" — and a
+    single flag can only answer one of them. Collapsing them is what let
+    ``stop`` report a clean shutdown over a listener it never dislodged
+    (#2990).
+    """
+
+    NOTHING_FOUND = "nothing_found"
+    RELEASED = "released"
+    STILL_HELD = "still_held"
+
+
+def _await_port_release(port: int, bind: str, attempts: int = 10) -> bool:
+    """Poll until `bind:port` can be bound, returning whether it was released."""
+    for _ in range(attempts):
+        if not ProcessManager.is_port_in_use(port, bind):
+            return True
+        time.sleep(0.3)
+    return not ProcessManager.is_port_in_use(port, bind)
+
+
+def _reap_orphans_on_port(
+    port: int, label: str, force: bool, bind: str = "0.0.0.0"
+) -> PortReapResult:
+    """Kill untracked listeners on `port` and report whether it was freed.
+
+    The result is decided by re-probing the port, never by the fact that a
+    signal was sent: a listener owned by another user cannot be signalled at
+    all (``os.kill`` raises ``PermissionError``), and a delivered signal is not
+    proof the listener honoured it. The operator's next ``kestrel start`` needs
+    the port, so the port is the postcondition worth checking.
+    """
     orphans = ProcessManager.find_pids_on_port(port)
     if not orphans:
-        return False
+        # An empty list is NOT proof the port is free. ``find_pids_on_port``
+        # returns [] on any discovery failure — psutil absent, a parse error,
+        # or a listener owned by another user this process cannot enumerate —
+        # which is precisely the unkillable listener this function exists to
+        # catch. Ask the port before concluding there was nothing here.
+        if ProcessManager.is_port_in_use(port, bind):
+            return PortReapResult.STILL_HELD
+        return PortReapResult.NOTHING_FOUND
     print(f"   {label}: orphan listener(s) on :{port} {orphans} — killing")
     for opid in orphans:
         ProcessManager.kill_process(opid, force=force)
-    for _ in range(10):
-        if not ProcessManager.is_port_in_use(port):
-            return True
-        time.sleep(0.3)
-    if ProcessManager.is_port_in_use(port):
-        for opid in orphans:
-            ProcessManager.kill_process(opid, force=True)
-        time.sleep(0.3)
-    return True
+    if _await_port_release(port, bind):
+        return PortReapResult.RELEASED
+    for opid in orphans:
+        ProcessManager.kill_process(opid, force=True)
+    if _await_port_release(port, bind):
+        return PortReapResult.RELEASED
+    return PortReapResult.STILL_HELD
+
+
+def _report_port_still_held(label: str, port: int) -> None:
+    """Explain a port that survived SIGKILL, and how to find its owner."""
+    print(
+        f"   {label}: port :{port} is still in use — "
+        f"not reporting {label} as stopped"
+    )
+    # A remediation naming a tool the platform does not ship is not a
+    # remediation. Windows is a supported target and has no lsof.
+    if sys.platform == "win32":
+        print(f"   Identify the owner with: netstat -ano | findstr :{port}")
+    else:
+        print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
 
 
 def cmd_stop(args) -> int:
@@ -409,26 +462,60 @@ def cmd_stop(args) -> int:
         ap = pm._agents.get(args.name)
         if ap and ap.pid:
             print(f"   Stopping {args.name} (PID: {ap.pid})...")
-            pm.stop_agent(args.name)
+            if not pm.stop_agent(args.name):
+                print(
+                    f"   {args.name}: PID {ap.pid} is still running after "
+                    f"SIGKILL — not reporting {args.name} as stopped"
+                )
+                return 1
+            # The tracked PID being gone does not mean the port is free: a
+            # supervisor may already have rebound it under a new PID. Same
+            # two-fact rule the host below uses.
+            if ProcessManager.is_port_in_use(agent_cfg.port, multi_agent.host.bind):
+                _report_port_still_held(args.name, agent_cfg.port)
+                return 1
             print(f"   {args.name} stopped")
-        elif _reap_orphans_on_port(agent_cfg.port, args.name, force):
+            return 0
+
+        reaped = _reap_orphans_on_port(
+            agent_cfg.port, args.name, force, multi_agent.host.bind
+        )
+        if reaped is PortReapResult.RELEASED:
             print(f"   {args.name} stopped (orphan)")
-        else:
+        elif reaped is PortReapResult.NOTHING_FOUND:
             print(f"   {args.name} is not running")
+        else:
+            _report_port_still_held(args.name, agent_cfg.port)
+            return 1
         return 0
 
     # Stop everything: agents first, then host
     print("\U0001F6D1 Stopping Kestrel MultiAgent...")
+
+    # Anything that outlived the stop, named so the summary cannot claim a
+    # clean shutdown over the top of it.
+    unstopped: list[str] = []
 
     for name, cfg in multi_agent.get_local_agents().items():
         pm.register_agent(name, cfg)
         ap = pm._agents.get(name)
         if ap and ap.pid:
             print(f"   Stopping {name} (PID: {ap.pid})...")
-            pm.stop_agent(name)
-            print(f"   {name} stopped")
-        else:
-            _reap_orphans_on_port(cfg.port, name, force)
+            if not pm.stop_agent(name):
+                print(
+                    f"   {name}: PID {ap.pid} is still running after SIGKILL"
+                )
+                unstopped.append(name)
+            elif ProcessManager.is_port_in_use(cfg.port, multi_agent.host.bind):
+                _report_port_still_held(name, cfg.port)
+                unstopped.append(name)
+            else:
+                print(f"   {name} stopped")
+        elif _reap_orphans_on_port(
+            cfg.port, name, force, multi_agent.host.bind
+        ) is PortReapResult.STILL_HELD:
+            _report_port_still_held(name, cfg.port)
+            unstopped.append(name)
 
     # Stop host
     host_pid_file = _host_pid_file(project_dir)
@@ -443,12 +530,47 @@ def cmd_stop(args) -> int:
         if pm.is_process_running(host_pid):
             pm.kill_process(host_pid, force=True)
             time.sleep(0.5)
-        pm.clear_pid(host_pid_file)
-        print("   host stopped")
+        # Two independent facts, both required before claiming a stop: the
+        # process is gone, and the port it served is free. Neither implies the
+        # other — a host that failed to bind leaves the port free while still
+        # running, and ``is_process_running`` cannot see a process owned by
+        # another user (#2995), which the port probe can.
+        host_alive = pm.is_process_running(host_pid)
+        port_held = ProcessManager.is_port_in_use(
+            multi_agent.host.port, multi_agent.host.bind
+        )
+        if not host_alive:
+            # The PID file is worth keeping only while it names something
+            # real. Once that process is gone the record is stale, and a
+            # stale record is worse than none: the PID can be reused, and the
+            # next lifecycle command would signal an unrelated process. Clear
+            # it on its own facts, independent of who holds the port.
+            pm.clear_pid(host_pid_file)
+        if host_alive or port_held:
+            if host_alive:
+                print(
+                    f"   host: PID {host_pid} is still running after SIGKILL"
+                )
+            if port_held:
+                _report_port_still_held("host", multi_agent.host.port)
+            unstopped.append("host")
+        else:
+            print("   host stopped")
     else:
         if host_pid:
             pm.clear_pid(host_pid_file)
-        _reap_orphans_on_port(multi_agent.host.port, "host", force)
+        if _reap_orphans_on_port(
+            multi_agent.host.port, "host", force, multi_agent.host.bind
+        ) is PortReapResult.STILL_HELD:
+            _report_port_still_held("host", multi_agent.host.port)
+            unstopped.append("host")
+
+    if unstopped:
+        print(
+            "\u274c MultiAgent stop incomplete — still running: "
+            + ", ".join(unstopped)
+        )
+        return 1
 
     print("\u2705 MultiAgent stopped")
     return 0

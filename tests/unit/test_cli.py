@@ -4,6 +4,7 @@ Unit tests for the unified kestrel CLI.
 Tests argument parsing, command dispatch, and individual command handlers.
 """
 
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -30,7 +31,9 @@ from kestrel_sovereign.cli_lifecycle import (
     _REANCHOR_RUNBOOK,
     _diagnose_unready_server,
     _fetch_detailed_health,
+    _reap_orphans_on_port,
     _start_inprocess_mode,
+    PortReapResult,
 )
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 from kestrel_sovereign.multi_agent.process_manager import (
@@ -595,6 +598,382 @@ class TestCmdStop:
         assert rc == 0
         output = capsys.readouterr().out
         assert "MultiAgent stopped" in output
+
+
+# -----------------------------------------------------------------------
+# cmd_stop postcondition tests (#2990)
+#
+# The verdict in every test below is decided by a REAL listening socket, so
+# ``is_port_in_use`` does the same connect() it does in production. Only the
+# kill is stubbed — ``find_pids_on_port`` on a socket this process owns would
+# return the test runner's own PID.
+# -----------------------------------------------------------------------
+
+@contextmanager
+def _listener_on(*, discovered_pids=(999_999,)):
+    """Hold a real TCP listener on a kernel-assigned port, kill path stubbed.
+
+    Binds :0 and yields the port actually assigned. CI runs the unit suite
+    under ``pytest -n auto``, so fixed ports would have workers binding each
+    other's sockets; taking whatever the kernel hands out and never releasing
+    it makes the allocation race-free rather than merely unlikely.
+
+    The kill stubbing lives in here, not at each call site, and that is
+    deliberate: this process owns the listener, so the real
+    ``find_pids_on_port`` returns pytest's OWN pid and ``kill_process`` would
+    then SIGTERM the test runner — which is exactly what happened when one
+    test took a listener without the guard.
+
+    Pass ``discovered_pids=()`` to model a listener whose owner cannot be
+    discovered at all (another user's process, or psutil missing).
+    """
+    import socket as _socket
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    # Nothing accepts these connections, and nothing needs to: the port probe
+    # binds rather than connects, so no accept backlog is ever involved. A
+    # listener left deliberately unattended is also the case that broke the
+    # old connect-based probe.
+    try:
+        with patch.object(
+            ProcessManager, "find_pids_on_port", return_value=list(discovered_pids)
+        ), patch.object(ProcessManager, "kill_process", return_value=False), \
+             patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
+            yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+@contextmanager
+def _unkillable_orphan(pid: int = 999_999):
+    """Pretend `pid` listens on every probed port and ignores every signal.
+
+    For cases with no real listener bound, where the port genuinely is free
+    and the question is what the code concludes from that.
+    """
+    with patch.object(ProcessManager, "find_pids_on_port", return_value=[pid]), \
+         patch.object(ProcessManager, "kill_process", return_value=False), \
+         patch("kestrel_sovereign.cli_lifecycle.time.sleep"):
+        yield
+
+
+def _free_port() -> int:
+    """A port nothing is listening on."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _repoint_ports(env, **ports: int) -> None:
+    """Point the fixture's config at ports this test actually owns."""
+    cfg_path = env / "multi_agent.toml"
+    cfg = toml.load(cfg_path)
+    for name, port in ports.items():
+        if name == "host":
+            cfg["host"]["port"] = port
+        else:
+            cfg["agents"][name]["port"] = port
+    with open(cfg_path, "w") as fh:
+        toml.dump(cfg, fh)
+
+
+class TestCmdStopReportsOnlyVerifiedStops:
+    """`stop` may report stopped only when the port was actually released."""
+
+    def test_a_held_port_reads_as_held_however_full_its_backlog(self):
+        """The probe must answer "can this be bound", not "is it accepting".
+
+        A listener with a full accept backlog refuses new connections while
+        still owning the port. The old ``connect_ex`` probe therefore reported
+        a held port as free after a single unaccepted connection — which let
+        `stop` report success over exactly the listener it was checking for.
+        """
+        with _listener_on() as port:
+            assert [
+                ProcessManager.is_port_in_use(port, "127.0.0.1") for _ in range(3)
+            ] == [
+                True, True, True
+            ]
+
+    def test_a_port_left_in_time_wait_reads_as_free(self):
+        """A clean shutdown must not look like a listener that refused to die.
+
+        uvicorn's asyncio server sets SO_REUSEADDR (verified on a live loop),
+        so Kestrel can rebind a TIME_WAIT port immediately. A probe without
+        that option calls it occupied — and since `restart` and `update` both
+        abort on a failed stop, they would stop the service and then refuse to
+        start it again.
+        """
+        import socket as _socket
+
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(5)
+        client = _socket.create_connection(("127.0.0.1", port))
+        conn, _ = srv.accept()
+        # The side that closes first is the side that lingers in TIME_WAIT.
+        conn.close()
+        client.close()
+        srv.close()
+
+        assert ProcessManager.is_port_in_use(port, "127.0.0.1") is False
+
+    def test_a_live_listener_still_reads_as_held(self):
+        """The reuse option must not blind the probe to a real listener."""
+        with _listener_on() as port:
+            assert ProcessManager.is_port_in_use(port, "127.0.0.1") is True
+
+    def test_an_ipv6_bind_address_is_probed_in_its_own_family(self):
+        """`host.bind` may be an IPv6 address, and uvicorn serves it fine.
+
+        Forcing AF_INET made the bind raise, which read as "port held" — so
+        start, stop and restart all failed on a configuration that works.
+        """
+        import socket as _socket
+
+        live = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
+        live.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        live.bind(("::1", 0))
+        held_port = live.getsockname()[1]
+        live.listen(5)
+        try:
+            assert ProcessManager.is_port_in_use(held_port, "::1") is True
+        finally:
+            live.close()
+
+        spare = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
+        spare.bind(("::1", 0))
+        free_port = spare.getsockname()[1]
+        spare.close()
+        assert ProcessManager.is_port_in_use(free_port, "::1") is False
+
+    def test_an_ipv4_listener_does_not_make_the_ipv6_wildcard_look_taken(self):
+        """asyncio sets IPV6_V6ONLY before uvicorn binds, so the probe must too.
+
+        Linux defaults an AF_INET6 socket to dual-stack. Without the option a
+        probe of ``::`` collides with any unrelated IPv4 listener on the same
+        number, and restart/update abort over an IPv6 address uvicorn could
+        have bound immediately.
+        """
+        import socket as _socket
+
+        four = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        four.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        four.bind(("0.0.0.0", 0))
+        port = four.getsockname()[1]
+        four.listen(5)
+        try:
+            assert ProcessManager.is_port_in_use(port, "::") is False
+            # ...while the family that IS taken still reports taken.
+            assert ProcessManager.is_port_in_use(port, "0.0.0.0") is True
+        finally:
+            four.close()
+
+        # The behavioural assertion above can only fail where AF_INET6
+        # defaults to dual-stack, which is Linux — macOS and the BSDs already
+        # default to v6-only, so it would pass there however the probe was
+        # written. Since CI is Linux this is a real check there, but a test
+        # that cannot fail on the machine it was written on is not one to
+        # trust, so the option itself is observed too.
+        options: list[tuple] = []
+        real_socket = _socket.socket
+
+        # The options are recorded as they are set, not read back afterwards:
+        # the probe closes its socket before returning, and getsockopt on a
+        # closed descriptor raises EBADF.
+        class _RecordingSocket(real_socket):
+            def setsockopt(self, level, optname, value, *rest):
+                options.append((level, optname, value))
+                return super().setsockopt(level, optname, value, *rest)
+
+        families: list[int] = []
+
+        def _make(family, *args, **kwargs):
+            families.append(family)
+            return _RecordingSocket(family, *args, **kwargs)
+
+        with patch.object(_socket, "socket", _make):
+            ProcessManager.is_port_in_use(_free_port(), "::1")
+
+        assert _socket.AF_INET6 in families, "no IPv6 socket for an IPv6 bind"
+        assert (
+            _socket.IPPROTO_IPV6,
+            _socket.IPV6_V6ONLY,
+            1,
+        ) in options, "the probe did not mirror asyncio's IPV6_V6ONLY"
+
+    def test_an_address_this_host_cannot_assign_is_not_occupancy(self):
+        """asyncio skips candidates it cannot use and binds the rest.
+
+        Treating EADDRNOTAVAIL as "taken" rejects a start uvicorn would have
+        completed, and reports an incomplete shutdown on a usable port.
+        """
+        # TEST-NET-1: valid, resolvable, and never assigned to this host.
+        assert ProcessManager.is_port_in_use(9998, "192.0.2.1") is False
+
+    def test_an_unresolvable_bind_address_is_not_called_occupied(self):
+        """A typo is a configuration fault, not another process holding a port.
+
+        Claiming occupancy would wedge `stop` into permanent failure; the bind
+        error surfaces at `start`, where it names the address.
+        """
+        assert ProcessManager.is_port_in_use(
+            9999, "not.a.real.host.invalid"
+        ) is False
+
+    def test_reap_returns_still_held_when_port_survives_sigkill(self):
+        with _listener_on() as port:
+            result = _reap_orphans_on_port(port, "claw", force=False, bind="127.0.0.1")
+        assert result is PortReapResult.STILL_HELD
+
+    def test_reap_returns_released_when_port_is_free_after_signalling(self):
+        with _unkillable_orphan():
+            result = _reap_orphans_on_port(
+                _free_port(), "claw", force=False, bind="127.0.0.1"
+            )
+        assert result is PortReapResult.RELEASED
+
+    def test_reap_returns_nothing_found_when_no_listener(self):
+        with patch.object(ProcessManager, "find_pids_on_port", return_value=[]):
+            result = _reap_orphans_on_port(
+                _free_port(), "claw", force=False, bind="127.0.0.1"
+            )
+        assert result is PortReapResult.NOTHING_FOUND
+
+    def test_undiscoverable_listener_is_not_reported_as_absent(self):
+        """`find_pids_on_port` returns [] on ANY discovery failure.
+
+        A listener owned by another user, or a missing psutil, yields an empty
+        list while the port stays bound — exactly the unkillable listener this
+        change exists to catch. Concluding "nothing here" from an empty PID
+        list without asking the port would reintroduce the bug at the
+        discovery step.
+        """
+        with _listener_on(discovered_pids=()) as port:
+            result = _reap_orphans_on_port(port, "claw", force=False, bind="127.0.0.1")
+        assert result is PortReapResult.STILL_HELD
+
+    def test_stop_all_fails_when_host_port_stays_held(self, multi_agent_env, capsys):
+        """A host port nobody could free must not read as a clean shutdown."""
+        parser = build_parser()
+        args = parser.parse_args(["stop"])
+
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
+                           testbot=_free_port())
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "MultiAgent stopped" not in output
+        assert "stop incomplete" in output
+        assert "host" in output
+        assert f"port :{port}" in output
+
+    def test_stop_single_agent_fails_when_its_port_stays_held(
+        self, multi_agent_env, capsys
+    ):
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, claw=port)
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        assert "claw stopped" not in output
+        assert "still in use" in output
+
+    def test_stop_single_agent_reports_orphan_stop_when_port_is_released(
+        self, multi_agent_env, capsys
+    ):
+        """The success path still succeeds — nothing is bound to claw's port."""
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+        _repoint_ports(multi_agent_env, claw=_free_port())
+
+        with _unkillable_orphan(), \
+             patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
+            rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert "claw stopped (orphan)" in output
+
+    def test_tracked_agent_with_a_still_bound_port_is_not_reported_stopped(
+        self, multi_agent_env, capsys
+    ):
+        """The tracked PID being gone does not mean the port was released.
+
+        A supervisor may already have rebound it under a new PID, and the next
+        `kestrel start` fails on a port this command called free.
+        """
+        parser = build_parser()
+        args = parser.parse_args(["stop", "claw"])
+
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, claw=port)
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env), \
+                 patch.object(ProcessManager, "stop_agent", return_value=True), \
+                 patch.object(ProcessManager, "read_pid", return_value=4242), \
+                 patch.object(ProcessManager, "is_process_running", return_value=True):
+                rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        assert "still in use" in output
+
+    def test_dead_host_pid_is_cleared_even_when_the_port_stays_held(
+        self, multi_agent_env, capsys
+    ):
+        """A stale PID record is worse than none.
+
+        The PID file is worth keeping only while it names something real. Once
+        that process is gone the number can be reused, and the next lifecycle
+        command would signal an unrelated process — so it is cleared on its
+        own facts, independently of who holds the port.
+        """
+        from kestrel_sovereign.cli_lifecycle import _host_pid_file
+
+        pid_file = _host_pid_file(multi_agent_env)
+        ProcessManager.write_pid(pid_file, 4242)
+        assert pid_file.exists()
+
+        parser = build_parser()
+        args = parser.parse_args(["stop"])
+
+        # Alive on the first probe so the host branch is entered, gone
+        # thereafter — the process died, but the port did not come back.
+        probes = iter([True])
+
+        with _listener_on() as port:
+            _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
+                           testbot=_free_port())
+            with patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env), \
+                 patch.object(ProcessManager, "is_process_running",
+                              side_effect=lambda pid: next(probes, False)):
+                rc = cmd_stop(args)
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        assert "stop incomplete" in output
+        assert not pid_file.exists(), (
+            "a dead host's PID file was kept because the port was still held; "
+            "the number can be reused and signalled by the next command"
+        )
 
 
 # -----------------------------------------------------------------------

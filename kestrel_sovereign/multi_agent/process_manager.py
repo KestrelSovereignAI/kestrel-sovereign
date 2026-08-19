@@ -15,6 +15,7 @@ Remote agents (url-only in config) are ignored — they're not managed by
 this host.
 """
 
+import errno
 import json
 import logging
 import os
@@ -93,10 +94,83 @@ class ProcessManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def is_port_in_use(port: int) -> bool:
-        """Check if a TCP port is already bound."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(("localhost", port)) == 0
+    def is_port_in_use(port: int, host: str = "0.0.0.0") -> bool:
+        """Whether a server of ours could NOT bind ``host:port`` right now.
+
+        Every caller is asking one operational question — can the server take
+        this address — so the probe performs the same bind the server will,
+        under the same options, at the same address.
+
+        Not ``connect_ex``, which asks "is something accepting connections"
+        and is wrong in the direction that matters: a listener whose accept
+        backlog is full REFUSES new connections while still owning the port.
+        Measured — such a listener probes True, then False after a single
+        unaccepted connection, while ``bind`` keeps reporting it taken.
+
+        ``SO_REUSEADDR`` is set on POSIX because uvicorn's asyncio server sets
+        it there (verified on the live loop), and without it a port left in
+        ``TIME_WAIT`` by a clean shutdown reads as occupied. Kestrel would
+        then stop the service and refuse to start it again — `restart` and
+        `update` both abort on a failed stop — over a port uvicorn could have
+        bound immediately. Measured: TIME_WAIT binds fine with the option, and
+        a live listener still fails with ``EADDRINUSE``, so nothing is lost.
+
+        It is deliberately NOT set on Windows, where asyncio does not enable
+        it either and Winsock's version is far more permissive: there it lets
+        a socket bind a port a live listener already holds, which would invert
+        this answer and let a stop report success over a running server. The
+        option is matched to the platform because the point is to mirror the
+        server, not to apply a flag.
+
+        ``host`` must be the address the server is configured to bind, and the
+        address family is resolved from it rather than assumed. Measured both
+        ways on IPv4: a listener on ``0.0.0.0`` is invisible to a probe of
+        ``127.0.0.1``, and one on ``127.0.0.1`` is invisible to a probe of
+        ``0.0.0.0``. Forcing ``AF_INET`` had the same effect on a configured
+        IPv6 bind such as ``::1`` — the bind raised and a free port read as
+        held, breaking start, stop and restart for a configuration uvicorn
+        serves happily.
+        """
+        try:
+            candidates = socket.getaddrinfo(
+                host or None,
+                port,
+                type=socket.SOCK_STREAM,
+                flags=socket.AI_PASSIVE,
+            )
+        except socket.gaierror:
+            # An address that does not resolve is a configuration fault, not
+            # an occupied port. Claiming occupancy here would wedge `stop`
+            # into permanent failure over a typo; the bind error surfaces at
+            # `start`, where it names the address and is actionable.
+            return False
+
+        for family, socktype, proto, _canonname, sockaddr in candidates:
+            with socket.socket(family, socktype, proto) as s:
+                if sys.platform != "win32":
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    # asyncio sets this before uvicorn binds. Linux defaults an
+                    # AF_INET6 socket to dual-stack, so without it a probe of
+                    # ``::`` collides with any unrelated IPv4 listener on the
+                    # same number and reports a free IPv6 address as occupied.
+                    try:
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except OSError:
+                        pass
+                try:
+                    s.bind(sockaddr)
+                except OSError as exc:
+                    if exc.errno == errno.EADDRINUSE:
+                        return True
+                    # Anything else is not occupancy. asyncio's create_server
+                    # skips candidates it cannot use (EADDRNOTAVAIL for a
+                    # family the host lacks) and binds the rest, so treating
+                    # them as "taken" would reject a start uvicorn would have
+                    # completed. A genuine misconfiguration still surfaces at
+                    # bind time, where it names the address.
+                    continue
+        return False
 
     @staticmethod
     def find_pids_on_port(port: int) -> list[int]:
@@ -146,7 +220,30 @@ class ProcessManager:
 
     @staticmethod
     def is_process_running(pid: int) -> bool:
-        """Check if a process with the given PID is alive."""
+        """Check if a process with the given PID is alive and can still run.
+
+        A zombie is excluded. It has already exited, holds no port and can
+        never run again, but ``os.kill(pid, 0)`` succeeds for it — so treating
+        PID existence as liveness makes a completed stop look like a failure
+        for as long as nobody reaps the child. ``_reap_if_child`` handles the
+        children this process parented; this covers the ones it did not, such
+        as a container PID 1 that does not reap.
+        """
+        try:
+            import psutil
+
+            try:
+                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                    return False
+            except psutil.NoSuchProcess:
+                return False
+            except psutil.AccessDenied:
+                # Visible but not inspectable: it exists, which is the only
+                # claim being made here.
+                return True
+        except ImportError:
+            pass  # Fall through to the syscall probe below.
+
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -482,7 +579,7 @@ class ProcessManager:
             self.clear_pid(pid_file)
 
         # Port check
-        if self.is_port_in_use(config.port):
+        if self.is_port_in_use(config.port, host_bind):
             raise RuntimeError(
                 f"Agent '{name}': port {config.port} already in use"
             )
@@ -601,11 +698,33 @@ class ProcessManager:
             timeout: Seconds to wait for graceful shutdown before SIGKILL.
 
         Returns:
-            True if agent was stopped (or wasn't running).
+            True only once the agent is confirmed gone (or was never running).
+            False if it is still running after SIGKILL.
+
+        A stop is reported on the strength of the postcondition, never on the
+        strength of having sent a signal: ``kill_process`` cannot signal a
+        process owned by another user at all, and a delivered signal is not
+        proof it was honoured. On failure the PID file is deliberately left in
+        place — it is the only record of a process that outlived the stop, and
+        clearing it would strand a live agent with nothing pointing at it.
+
+        Note:
+            ``is_process_running`` reports False for a live process owned by
+            another user (#2995), so True here is only as strong as that probe.
+            Callers that know the agent's port should confirm the port was
+            released as well.
         """
         ap = self._agents.get(name)
         if ap is None:
             return True
+
+        # Reap before asking anything about the process. An agent that exited
+        # on its own is a zombie until this process — its parent, via
+        # ``subprocess.Popen`` — collects it, and a stop that returns early
+        # because the child is already gone must still not leave that corpse
+        # behind for the lifetime of the host.
+        if ap.pid is not None:
+            self._reap_if_child(ap.pid)
 
         if ap.pid is None or not self.is_process_running(ap.pid):
             if ap.pid_file:
@@ -628,6 +747,21 @@ class ProcessManager:
             logger.warning(f"Agent '{name}' didn't stop gracefully, sending SIGKILL")
             self.kill_process(ap.pid, force=True)
             time.sleep(0.5)
+
+        # Reap before judging. ``start_agent`` spawns agents with
+        # ``subprocess.Popen``, so this process is their parent, and a killed
+        # child that nobody waits on stays a ZOMBIE — for which
+        # ``os.kill(pid, 0)`` succeeds. Without this, a stop that worked
+        # perfectly would report failure, and keep reporting it until the
+        # parent happened to exit. Measured: state 'Z', probe says alive.
+        self._reap_if_child(ap.pid)
+
+        if self.is_process_running(ap.pid):
+            logger.error(
+                f"Agent '{name}' (PID {ap.pid}) is still running after SIGKILL; "
+                "leaving the PID file in place"
+            )
+            return False
 
         if ap.pid_file:
             self.clear_pid(ap.pid_file)
@@ -656,14 +790,40 @@ class ProcessManager:
                 logger.error(f"Failed to start agent '{name}': {e}")
         return started
 
-    def stop_all(self, timeout: float = 5.0) -> None:
+    @staticmethod
+    def _reap_if_child(pid: int) -> None:
+        """Collect `pid`'s exit status if this process is its parent.
+
+        Best effort by design. ``ChildProcessError`` means it is not our
+        child — an agent started by an earlier CLI invocation, say — and
+        there is nothing to reap; the kernel's own init already handles the
+        orphan case. ``waitpid`` is unavailable on Windows, where a killed
+        process leaves no zombie to begin with.
+        """
+        if sys.platform == "win32":
+            return
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+
+    def stop_all(self, timeout: float = 5.0) -> list[str]:
         """Stop all managed agent processes.
 
         Args:
             timeout: Seconds to wait per agent for graceful shutdown.
+
+        Returns:
+            The names of agents still running after SIGKILL, in the order they
+            were attempted. Empty when every agent stopped. Returned rather
+            than discarded so a caller cannot report a clean shutdown over the
+            top of an agent that outlived it.
         """
+        still_running = []
         for name in list(self._agents):
-            self.stop_agent(name, timeout=timeout)
+            if not self.stop_agent(name, timeout=timeout):
+                still_running.append(name)
+        return still_running
 
     def get_agent_status(self, name: str) -> dict:
         """Get status info for a single agent.

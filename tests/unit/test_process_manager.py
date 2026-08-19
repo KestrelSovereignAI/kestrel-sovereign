@@ -7,6 +7,8 @@ and log reading — all without spawning real subprocesses.
 
 import json
 import os
+import sys
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -439,9 +441,11 @@ class TestStopAgent:
         ap = pm.register_agent("claw", cfg)
         ap.pid = 99999  # Fake running PID
 
-        # Call sequence: (1) line 303 check → True, (2) line 315 loop → False (break),
-        # (3) line 320 force-kill check → False (skip)
-        with patch.object(ProcessManager, "is_process_running", side_effect=[True, False, False]), \
+        # Call sequence: (1) initial check → True, (2) graceful-wait loop → False
+        # (break), (3) force-kill check → False (skip), (4) the post-stop
+        # verification that decides the return value → False (confirmed gone).
+        with patch.object(ProcessManager, "is_process_running",
+                          side_effect=[True, False, False, False]), \
              patch.object(ProcessManager, "kill_process") as mock_kill, \
              patch("time.sleep"):
             pm.stop_agent("claw")
@@ -486,6 +490,110 @@ class TestStopAgent:
             pm.stop_agent("claw")
 
         assert not ap.pid_file.exists()
+
+    def test_stop_agent_that_survives_sigkill_reports_failure(self, pm, project_dir):
+        """An agent still running after SIGKILL must not be reported stopped."""
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        ap = pm.register_agent("claw", cfg)
+        ap.pid = 99999
+        ProcessManager.write_pid(ap.pid_file, 99999)
+
+        # The process ignores every signal it is sent.
+        with patch.object(ProcessManager, "is_process_running", return_value=True), \
+             patch.object(ProcessManager, "kill_process"), \
+             patch("time.sleep"):
+            result = pm.stop_agent("claw", timeout=0.01)
+
+        assert result is False
+        # The PID file is the only record of a process that outlived the stop;
+        # clearing it would strand a live agent with nothing pointing at it.
+        assert ap.pid_file.exists()
+        assert ap.pid == 99999
+
+    def test_stop_all_names_the_agents_that_survived(self, pm, project_dir):
+        """stop_all reports which agents outlived the stop rather than dropping it."""
+        for name, port in (("claw", 8801), ("testbot", 8802)):
+            ap = pm.register_agent(name, LocalAgentConfig(
+                data_dir=Path(f"agent_data/{name}"), port=port,
+            ))
+            ap.pid = 99999 if name == "claw" else 99998
+
+        # 'claw' ignores signals; 'testbot' dies on the first check.
+        def _running(pid):
+            return pid == 99999
+
+        with patch.object(ProcessManager, "is_process_running", side_effect=_running), \
+             patch.object(ProcessManager, "kill_process"), \
+             patch("time.sleep"):
+            survivors = pm.stop_all(timeout=0.01)
+
+        assert survivors == ["claw"]
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="zombies are a POSIX process state; Windows leaves none to reap",
+    )
+    def test_a_zombie_child_counts_as_stopped_and_is_reaped(self, pm, project_dir):
+        """A killed child this process parented is a zombie until waited on.
+
+        It has already exited, holds no port and can never run again, yet the
+        raw ``os.kill(pid, 0)`` syscall still succeeds for it. Treating that as
+        liveness made a perfectly successful stop report failure — and keep
+        reporting it until the parent exited. ``start_agent`` uses
+        ``subprocess.Popen``, so this process really is the parent; a real
+        zombie is used because a mocked probe cannot exhibit what is being
+        fixed.
+
+        Two layers are asserted, because each covers the other's gap: the
+        probe rejects zombie status (which also covers children this process
+        did not parent, e.g. under a non-reaping container PID 1), and the
+        stop reaps its own children so they do not accumulate.
+        """
+        import subprocess
+        import sys as _sys
+
+        child = subprocess.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        child.kill()
+        time.sleep(0.5)
+        # Deliberately not reaped here — that is the condition under test.
+
+        def _raw_syscall_says_alive() -> bool:
+            try:
+                os.kill(child.pid, 0)
+                return True
+            except OSError:
+                return False
+
+        assert _raw_syscall_says_alive(), "setup must produce an unreaped zombie"
+        assert ProcessManager.is_process_running(child.pid) is False, (
+            "the liveness probe must not count a zombie as running"
+        )
+
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        ap = pm.register_agent("claw", cfg)
+        ap.pid = child.pid
+        ProcessManager.write_pid(ap.pid_file, child.pid)
+
+        try:
+            result = pm.stop_agent("claw", timeout=0.01)
+            # Observed BEFORE the cleanup below. Waiting first would reap the
+            # child itself and the assertion would be checking this test's own
+            # housekeeping rather than the stop's.
+            reaped_by_stop = not _raw_syscall_says_alive()
+        finally:
+            try:
+                child.wait(timeout=5)
+            except Exception:
+                pass
+
+        assert result is True
+        assert not ap.pid_file.exists()
+        assert reaped_by_stop, (
+            "the stop left its own child unreaped; zombies accumulate for the "
+            "lifetime of the parent"
+        )
 
 
 # -----------------------------------------------------------------------
