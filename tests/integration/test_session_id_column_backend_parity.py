@@ -3014,71 +3014,77 @@ async def test_the_purge_waits_for_a_first_repair_that_has_no_watermark_yet(
 
     The sweep deletes the watermark before the session rows, matching the order
     a repair writes them in, which is what keeps the two from deadlocking. It is
-    not enough on its own: a `DELETE` matching no rows locks nothing, so an
-    agent with a ledger row but no watermark yet — the FIRST repair, which is
-    also the rebuild-everything one — can have that repair insert the row after
-    the sweep's delete has already passed over it. The sweep then reports
-    success with a row naming the agent still standing.
+    not enough on its own: on PostgreSQL a `DELETE` matching no rows locks
+    nothing, so an agent with a ledger row but no watermark yet — the FIRST
+    repair, which is also the rebuild-everything one — can have that repair
+    insert the row after the sweep's delete has already passed over it. The
+    sweep then reports success with a row naming the agent still standing.
 
     So the sweep takes the same exclusion a repair does, which inserts the row
     before locking it precisely so there is something to lock. Asserted by
-    holding that exclusion and watching the sweep WAIT for it: on the broken
-    ordering it would sail through, because there is nothing to contend on.
+    holding that exclusion and watching the sweep WAIT for it.
 
-    PostgreSQL only — on SQLite the step's `BEGIN IMMEDIATE` is the exclusion
-    and there is nothing here it could exhibit.
+    PostgreSQL only, and through `_schema_every_task_can_see` rather than
+    `_isolated_schema`: this case runs concurrent TASKS, which take their own
+    connections, and a schema scoped to one transaction's `search_path` is
+    invisible to them. On SQLite the exclusion is the step's `BEGIN IMMEDIATE`
+    and there is nothing here that engine could exhibit.
     """
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 
     _without_embeddings(monkeypatch)
     agent_id = f"did:test:purge-claim:{uuid4()}"
-    db = postgres_db
-    await db.ensure_session_projection_schema()
-    await db.execute(
-        "INSERT INTO conversation_history "
-        "(agent_id, role, content, metadata, session_id, created_at) "
-        "VALUES (?, 'user', 'x', NULL, NULL, ?)",
-        (agent_id, timestamp_query_param(db.backend_type, "2026-03-01T09:00:00")),
-    )
-    await db.execute(
-        "DELETE FROM conversation_session_watermarks WHERE agent_id = ?", (agent_id,)
-    )
-    assert await db.fetchval(
-        "SELECT COUNT(*) FROM conversation_session_watermarks WHERE agent_id = ?",
-        (agent_id,),
-    ) == 0, "the watermark must be ABSENT; that is the case under test"
-
-    holder_has_it = asyncio.Event()
-    release = asyncio.Event()
-
-    async def _hold_the_exclusion():
-        async with db.transaction(immediate=True):
-            await ConversationSessionProjection(db, agent_id).claim_exclusion()
-            holder_has_it.set()
-            await asyncio.wait_for(release.wait(), LOCK_WAIT_BUDGET)
-
-    holder = asyncio.create_task(_hold_the_exclusion())
-    try:
-        await _before_the_budget(db, "the holder claiming", holder_has_it.wait())
-
-        storage = AsyncStorage.__new__(AsyncStorage)
-        storage.db = db
-        storage.agent_id = agent_id
-        storage._initialized = True
-
-        sweep = asyncio.create_task(storage.purge_session_projection(reason="test"))
-        await asyncio.sleep(0.5)
-        assert not sweep.done(), (
-            "the sweep ran straight through while a first repair held the "
-            "exclusion — it is not contending on anything, so that repair can "
-            "insert its watermark after the delete has passed"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, 'user', 'x', NULL, NULL, ?)",
+            (agent_id, timestamp_query_param(db.backend_type, "2026-03-01T09:00:00")),
         )
-    finally:
-        release.set()
-    await _before_the_budget(db, "the holder finishing", asyncio.shield(holder))
-    await _before_the_budget(db, "the sweep finishing", asyncio.shield(sweep))
+        await db.execute(
+            "DELETE FROM conversation_session_watermarks WHERE agent_id = ?",
+            (agent_id,),
+        )
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_session_watermarks WHERE agent_id = ?",
+            (agent_id,),
+        ) == 0, "the watermark must be ABSENT; that is the case under test"
 
-    assert await db.fetchval(
-        "SELECT COUNT(*) FROM conversation_session_watermarks WHERE agent_id = ?",
-        (agent_id,),
-    ) == 0, "a watermark naming the agent survived the sweep"
+        holder_has_it = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold_the_exclusion():
+            async with db.transaction(immediate=True):
+                await ConversationSessionProjection(db, agent_id).claim_exclusion()
+                holder_has_it.set()
+                await asyncio.wait_for(release.wait(), LOCK_WAIT_BUDGET)
+
+        holder = asyncio.create_task(_hold_the_exclusion())
+        sweep = None
+        try:
+            await _before_the_budget(db, "the holder claiming", holder_has_it.wait())
+
+            storage = AsyncStorage.__new__(AsyncStorage)
+            storage.db = db
+            storage.agent_id = agent_id
+            storage._initialized = True
+
+            sweep = asyncio.create_task(
+                storage.purge_session_projection(reason="test")
+            )
+            await asyncio.sleep(0.5)
+            assert not sweep.done(), (
+                "the sweep ran straight through while a first repair held the "
+                "exclusion — it is contending on nothing, so that repair can "
+                "insert its watermark after the delete has passed"
+            )
+        finally:
+            release.set()
+        await _before_the_budget(db, "the holder finishing", asyncio.shield(holder))
+        await _before_the_budget(db, "the sweep finishing", asyncio.shield(sweep))
+
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_session_watermarks WHERE agent_id = ?",
+            (agent_id,),
+        ) == 0, "a watermark naming the agent survived the sweep"

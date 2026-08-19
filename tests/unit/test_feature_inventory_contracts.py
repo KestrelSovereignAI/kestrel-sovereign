@@ -28,6 +28,15 @@ def _mock_agent():
     agent.storage = Mock()
     agent.llm_service = Mock()
     agent.features = {}
+    # Real strings, not Mocks. A bare Mock attribute is truthy but is not a
+    # stable identity, and extracted features that sign or address anything —
+    # `kestrel-feature-eye` and `kestrel-feature-flight` both do — refuse to
+    # construct against one ("requires an agent with a stable agent_id or did").
+    # They are then absent from `discover_features` while entry-point discovery
+    # still lists them, so this contract fails on any host that has them
+    # installed. CI has neither, which is why it never saw it.
+    agent.agent_id = "did:test:feature-inventory"
+    agent.did = "did:test:feature-inventory"
     return agent
 
 
