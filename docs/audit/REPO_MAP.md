@@ -18,7 +18,7 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-18
+**Generated:** 2026-08-19
 **Scope:** 2331 tracked files (1566 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -2824,8 +2824,6 @@ Repo entry points and standard project files.
   - `def test_doctor_reports_ready_when_everything_set(tmp_path)`; `def test_doctor_blocks_on_missing_data_key(tmp_path)`; `def test_doctor_blocks_on_empty_route_priority(tmp_path)`; `def test_doctor_blocks_on_missing_api_key_env(tmp_path)`; `def test_doctor_accepts_openrouter_management_key_only_undeclared_env(tmp_path)`; `def test_doctor_blocks_when_no_agents(tmp_path)`; `def test_doctor_blocks_when_agent_db_missing(tmp_path)`; `def test_format_report_renders_lines(tmp_path)`; `…`
 - **tests/unit/test_doctrine_bundle.py** — Unit tests for kestrel_sovereign.agent.doctrine_bundle.
   - `def test_hash_is_deterministic_for_same_inputs(tmp_path)`; `def test_hash_changes_when_anchored_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_order_changes(tmp_path)`; `def test_missing_anchored_files_are_skipped_not_errors(tmp_path)`; `def test_total_bytes_reflects_only_contributing_content(tmp_path)`; `def test_per_file_sha256_in_section_header(tmp_path)`; `def test_default_paths_are_three_canonical_files()`; `…`
-- **tests/unit/test_dump_exclusion_parity.py** — A database dump must be excluded from every channel that ships the tree.
-  - `def test_every_channel_excludes_every_dump_shape(channel, pattern)`; `def test_the_channels_agree_exactly()`
 - **tests/unit/test_durable_salvage.py** — Tests for the durable-salvage primitive + background worker (C / #1311).
   - `def conv_store()`; `class TestSalvageMessagesSync`; `class TestSyncSalvageThenCrashBeforeEnqueue`; `class TestQueueDepthThresholdExceeded`; `class TestConsolidatorWhileSalvagePending`; `class TestFeatureFlag`; `class TestStateCountsAndBoundary`
 - **tests/unit/test_durable_signal_delivery.py** — Durable signal consumer contract: replay, scoped leasing, and retention.
@@ -3424,6 +3422,8 @@ Repo entry points and standard project files.
   - `class TestTokenizeForSearch`; `class TestNegationGate`; `class TestTechnicalTermsUnregressed`; `class TestTokenMatchScore`; `async def test_broad_query_finds_relevant_row_via_token_fallback()`; `async def test_exact_substring_still_works()`; `async def test_token_fallback_does_not_match_low_overlap()`; `async def test_exact_matches_ranked_before_token_fallback()`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
   - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_observability_summary_breaks_out_metrics_by_name()`; `def test_metric_summary_endpoint_passes_through_store_summary()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_endpoint_refuses_privacy_hidden_modes()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
+- **tests/unit/test_secret_exclusion_parity.py** — A secret must be excluded from every channel that ships the tree.
+  - `def channel_repos(tmp_path_factory)`; `def test_every_channel_excludes_every_secret(channel, path, channel_repos)`; `def test_no_channel_excludes_source_it_must_ship(channel, path, channel_repos)`; `def test_dockerignore_secret_rules_match_at_any_depth(path, channel_repos)`
 - **tests/unit/test_security_endpoint_contracts.py** — Focused contract tests for security endpoints.
   - `def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes()`; `def test_security_permission_mutation_endpoints_validate_levels_and_scope()`; `def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()`; `def test_security_approve_serializes_awaiter_gone_flag()`; `def test_security_global_auto_mode_endpoints_support_scopes()`; `def test_security_global_auto_mode_rejects_invalid_scope()`; `def test_security_endpoints_return_503_when_feature_is_unavailable()`
 - **tests/unit/test_security_feature.py** — Unit Tests for Kestrel Security Feature.
@@ -3549,7 +3549,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sleep_wake_resilience.py** — Unit tests for host sleep/wake (suspend/resume) resilience (#1545).
   - `class TestSuspendGap`; `class TestResumeMonitor`; `class TestResumeMonitorConfig`; `class TestDispatcherReanchor`; `class TestSchedulerMisfireGrace`; `class TestHeartbeatGapAwareness`
 - **tests/unit/test_slhdsa_suite.py** — SLHDSASHA2128sSuite tests — Wave 3 sub-PR 1 (#918).
-  - `def test_pqcrypto_sphincs_installed_and_importable()`; `def test_slhdsa_suite_self_registers()`; `def test_slhdsa_classified_as_post_quantum()`; `def test_slhdsa_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_205_128s()`; `def suite()`; `def keypair(suite)`; `def signed_data(suite, keypair)`; `…`
+  - `def test_pqcrypto_slh_dsa_installed_and_importable()`; `def test_slhdsa_suite_self_registers()`; `def test_slhdsa_classified_as_post_quantum()`; `def test_slhdsa_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_205_128s()`; `def suite()`; `def keypair(suite)`; `def signed_data(suite, keypair)`; `…`
 - **tests/unit/test_soft_delete_analytics_sweep.py** — Soft-deleted conversation content must not feed derived agent state (#2051).
   - `async def store()`; `async def test_personality_responses_exclude_soft_deleted(store)`; `async def test_calibration_examples_exclude_soft_deleted_pair(store)`; `async def test_wellness_content_read_excludes_soft_deleted(store)`; `async def test_salvage_and_next_id_still_see_soft_deleted(store)`
 - **tests/unit/test_sovereign_override_pins.py** — Tests for sovereign override of memory pins.
