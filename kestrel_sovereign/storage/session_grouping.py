@@ -15,6 +15,7 @@ plain dicts, and hands them here.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -78,7 +79,22 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
                 break
             except ValueError:
                 continue
-        if parsed is None:
+        if parsed is None and _EXTENDED_DATE.match(created_at):
+            # Guarded by the extended-form date, because `fromisoformat` on
+            # Python 3.11+ also accepts the BASIC form (`20260101T110000`) —
+            # incidental permissiveness, not a format this codebase writes or
+            # this function documents. Accepting it made the parser's domain
+            # wider than the SQL ordering key's: `julianday` returns NULL for
+            # it, so such a row sorted at the far end of the canonical order and
+            # `LIMIT` could drop it from the conversation list entirely, while
+            # every Python path treated it as a perfectly good 2026 timestamp
+            # (round-18 review).
+            #
+            # Narrowed rather than normalized in SQL: one domain defined by what
+            # the ordering can express beats a normalization kept in step with a
+            # parser, which is how the two came apart in the first place. A
+            # value outside it is undatable in BOTH, and an undatable row has a
+            # defined home — the stamp of the row before it.
             try:
                 parsed = datetime.fromisoformat(
                     created_at[:-1] + "+00:00"
@@ -87,6 +103,8 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
                 )
             except ValueError:
                 return None
+        if parsed is None:
+            return None
     else:
         return None
 
@@ -154,6 +172,10 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
 #: Any instant would do; what matters is that it is the SAME instant every time,
 #: so two groupings of one transcript agree.
 _GROUPING_EPOCH = datetime(1970, 1, 1)
+
+#: An ISO date in EXTENDED form — the separators are what distinguishes it from
+#: the basic form `fromisoformat` also accepts but `julianday` cannot read.
+_EXTENDED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 def group_messages_into_sessions(

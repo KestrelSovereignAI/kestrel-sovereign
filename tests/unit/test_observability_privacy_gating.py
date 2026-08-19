@@ -349,6 +349,13 @@ async def test_purge_ephemeral_session_drives_observability_sweep(tmp_path):
                 # store, masking this clean-path assertion.
                 return 0
 
+            async def purge_session_projection(self, *, reason):
+                # ...and the #2959 projection, for the same reason. It is a
+                # REQUIRED_TRACE_STORE — it holds no content, but its residue
+                # names the agent — so omitting it here fails the mode exit
+                # rather than the assertion this case is about.
+                return 0
+
         # Enter EPHEMERAL first (records the watermark), THEN leak a dispatch
         # row that bypassed the gate — the sweep only scrubs rows since the
         # watermark, so ordering matters.
@@ -433,6 +440,11 @@ async def test_purge_ephemeral_session_records_observability_failure(tmp_path):
                 return 0
 
             async def purge_channel_messages_since(self, since, *, reason):
+                return 0
+
+            async def purge_session_projection(self, *, reason):
+                # A REQUIRED_TRACE_STORE (#2959): omitting it would fail the
+                # mode exit for a reason this case is not about.
                 return 0
 
         backend.execute = _flaky_execute_factory(

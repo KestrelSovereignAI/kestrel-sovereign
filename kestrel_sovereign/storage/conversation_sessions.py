@@ -1664,6 +1664,24 @@ class ConversationSessionProjection:
         # be held across.
         return await self._rebuild_from_transcript()
 
+    async def claim_exclusion(self) -> None:
+        """Take this agent's repair exclusion, for a caller that is not a repair.
+
+        The EPHEMERAL sweep needs it. Ordering its deletes to match a repair's
+        writes is not enough on PostgreSQL: a `DELETE` matching no rows locks
+        nothing, so an agent with a ledger row but no watermark yet — the first
+        repair, which is also the rebuild-everything one — can have that repair
+        insert a watermark AFTER the sweep's delete has passed over it, and the
+        sweep reports success with a row naming the agent still standing
+        (round-18 review).
+
+        :meth:`_claim` already solves exactly that for repairs racing each
+        other, by inserting the row before locking it so there is something to
+        lock. Sharing it is the fix; a second mechanism would be the thing this
+        module keeps having to undo.
+        """
+        await self._claim()
+
     async def _claim(self) -> None:
         """Hold this agent's repair for the rest of the caller's transaction.
 

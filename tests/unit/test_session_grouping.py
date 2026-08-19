@@ -458,3 +458,41 @@ def test_grouping_an_undatable_row_is_repeatable():
     ]
 
     assert group_messages_into_sessions(msgs) == group_messages_into_sessions(msgs)
+
+
+def test_the_parser_accepts_exactly_what_the_ordering_can_express():
+    """One domain, not two that agree by accident.
+
+    The canonical order compares SQLite timestamps through ``julianday``. If the
+    parser accepts a form ``julianday`` cannot read, that row parses as a
+    perfectly good timestamp everywhere in Python while sorting at the far end
+    of the SQL order — where ``LIMIT`` can drop it out of the conversation list
+    altogether.
+
+    ``datetime.fromisoformat`` on Python 3.11+ accepts the BASIC form
+    (``20260101T110000``), which no writer here produces and this function never
+    documented. Accepting it was incidental permissiveness; the two domains are
+    the same set now.
+    """
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    try:
+        for value in (
+            "2026-01-01 10:00:00",
+            "2026-01-01T10:00:00",
+            "2026-01-01 10:00:00.123456",
+            "2026-01-01T11:00:00+00:00",
+            "2026-01-01T11:00:00Z",
+            "20260101T110000",
+            "not-a-date",
+        ):
+            sql = db.execute("SELECT julianday(?)", (value,)).fetchone()[0]
+            python = coerce_session_timestamp(value)
+            assert (sql is None) == (python is None), (
+                f"{value!r}: julianday reads it as {sql!r} and the parser as "
+                f"{python!r}. One of them orders this row and the other dates "
+                "it, so they have to agree about whether it can be read at all."
+            )
+    finally:
+        db.close()

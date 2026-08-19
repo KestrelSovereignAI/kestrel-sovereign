@@ -960,6 +960,16 @@ class AsyncStorage:
         # content-free — and it is the delete ORDER, not the isolation level,
         # that keeps a stale stamp from ever reading as current.
         async with self.db.transaction(immediate=True):
+            # The repair exclusion, taken the way a repair takes it. Ordering
+            # the deletes below to match a repair's write order is necessary but
+            # not sufficient: on PostgreSQL a DELETE matching no rows locks
+            # nothing, so a first-time repair can insert the watermark this
+            # sweep has already passed over.
+            from .conversation_sessions import ConversationSessionProjection
+
+            await ConversationSessionProjection(
+                self.db, self.agent_id
+            ).claim_exclusion()
             survives = await self.db.fetchval(
                 "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
                 (self.agent_id,),
