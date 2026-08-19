@@ -526,6 +526,28 @@ _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 #: bodies to maintain an index would be a cost paid on every repair.
 _DERIVED_FROM = "id, role, metadata, created_at, session_id"
 
+#: Index of the ordering key every derivation selects alongside its columns.
+_ORDER_KEY = 5
+
+
+def _derived_from(backend_type: str) -> str:
+    """The columns a derivation reads, plus the key its ORDER BY sorted on.
+
+    The key travels WITH the row on purpose. The fold has to decide whether id
+    order agrees with canonical order, and re-deriving the answer in Python
+    means two implementations of "what is this timestamp" — which are not the
+    same function. Measured: ``coerce_session_timestamp`` reads basic ISO
+    (``20260101T110000``) and SQLite's ``julianday`` returns NULL for it, so the
+    canonical read sorted that row FIRST while the guard parsed it, saw the
+    stamps rising with id, and folded — storing boundaries and a preview the
+    reader would never show, under a watermark saying current.
+
+    Selecting the key removes the second implementation rather than trying to
+    keep the two in step. Whatever SQL ordered by is what the fold reasons
+    about, including its NULLs.
+    """
+    return f"{_DERIVED_FROM}, {_canonical_key(backend_type, 'created_at')}"
+
 #: **Ordered as the conversation list orders.** ``/api/conversations`` selects
 #: ``ORDER BY created_at DESC`` and reverses, so the grouper sees chronological
 #: order; deriving in id order instead would let the two disagree about session
@@ -640,12 +662,14 @@ def _canonical_key(backend_type: str, column: str) -> str:
 #: a step reads and the rows it folds are the same rows, which is what makes the
 #: chunk a bound on work rather than only on ids. Seeded by
 #: ``idx_conversation_agent_row_id``.
-_CHUNK = (
-    f"SELECT {_DERIVED_FROM} FROM conversation_history "
-    "WHERE agent_id = ? AND id > ? AND id <= ? "
-    f"AND {_LIVE} "
-    "ORDER BY id ASC LIMIT ?"
-)
+def _chunk_sql(backend_type: str) -> str:
+    """One chunk: this agent's next live rows, and only those."""
+    return (
+        f"SELECT {_derived_from(backend_type)} FROM conversation_history "
+        "WHERE agent_id = ? AND id > ? AND id <= ? "
+        f"AND {_LIVE} "
+        "ORDER BY id ASC LIMIT ?"
+    )
 
 def _own_rows_through(backend_type: str) -> str:
     """One session's live rows up to the point a walk has reached.
@@ -659,7 +683,7 @@ def _own_rows_through(backend_type: str) -> str:
     and PostgreSQL does not.
     """
     return (
-        f"SELECT {_DERIVED_FROM} FROM conversation_history "
+        f"SELECT {_derived_from(backend_type)} FROM conversation_history "
         "WHERE agent_id = ? AND session_id = ? AND id <= ? "
         f"AND {_LIVE} "
         f"{canonical_order(backend_type)}"
@@ -671,7 +695,7 @@ def _live_rows_through(backend_type: str) -> str:
     pass — the same columns, in the order a reader would see them, so unstamped
     rows are attributed the way the grouper attributes them."""
     return (
-        f"SELECT {_DERIVED_FROM} FROM conversation_history "
+        f"SELECT {_derived_from(backend_type)} FROM conversation_history "
         f"WHERE agent_id = ? AND {_LIVE} "
         "AND id <= ? "
         f"{canonical_order(backend_type)}"
@@ -1099,7 +1123,7 @@ def project_transcript(
 ) -> List[SessionProjection]:
     """Project every session the grouper finds in ``rows`` and the column may key.
 
-    ``rows`` are ``(id, role, metadata, created_at, session_id)`` ordered by id
+    ``rows`` are ``(id, role, metadata, created_at, session_id, ...)`` ordered by id
     ascending — the order the read path feeds the grouper, so gap arithmetic and
     the attribution of unstamped rows see the same sequence they would there.
 
@@ -1130,7 +1154,10 @@ def project_transcript(
     """
     messages: List[Dict[str, Any]] = []
     stamped: Dict[Any, Any] = {}
-    for row_id, role, metadata, created_at, column in rows:
+    # Trailing columns are ignored here: the derivation also selects the key
+    # its ORDER BY sorted on (see :func:`_derived_from`), which the fold
+    # reads and the grouper has no use for.
+    for row_id, role, metadata, created_at, column in (row[:5] for row in rows):
         stamped[row_id] = column
         messages.append(
             {
@@ -1708,7 +1735,7 @@ class ConversationSessionProjection:
                 (self.agent_id,),
             )
         rows = await self.db.fetchall(
-            _CHUNK,
+            _chunk_sql(self.db.backend_type),
             (self.agent_id, plan.through, plan.target, self.chunk_rows),
         )
         # Short of a full chunk means no further LIVE row of this agent's stands
@@ -2048,13 +2075,17 @@ class ConversationSessionProjection:
         # the row it then stores claims to be current. A stamp that will not
         # parse at all, or is absent, is not evidence of order either: escalate
         # rather than guess (and rather than raise TypeError on None).
-        stamps = []
-        for row in rows:
-            stamp = coerce_session_timestamp(row[3])
-            if stamp is None:
-                raise _NeedsTranscript(session_id)
-            stamps.append(stamp)
-        if any(later < earlier for earlier, later in zip(stamps, stamps[1:])):
+        # The key SQL ordered by, selected with the row — not re-derived here.
+        # Python and SQL do not read the same set of timestamps (basic ISO
+        # parses in one and is NULL in the other), and a guard that answers
+        # "does id order match canonical order" from the wrong one answers a
+        # different question than the one that matters. A NULL key is a value
+        # the canonical order sorts first and cannot compare: not evidence of
+        # order, so escalate rather than guess.
+        keys = [row[_ORDER_KEY] for row in rows]
+        if any(key is None for key in keys):
+            raise _NeedsTranscript(session_id)
+        if any(later < earlier for earlier, later in zip(keys, keys[1:])):
             raise _NeedsTranscript(session_id)
         stored = await self.get(session_id)
         if stored is None:

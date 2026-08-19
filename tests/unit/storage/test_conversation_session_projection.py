@@ -1059,8 +1059,8 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     against, and this holds the generated SQL to it on both dialects.
     """
     from kestrel_sovereign.storage.conversation_sessions import (
-        _CHUNK,
         _DERIVED_FROM,
+        _chunk_sql,
         _live_rows_through,
         _own_rows_through,
         mutation_triggers,
@@ -1083,13 +1083,17 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     # about the SQL rather than about a constant nothing uses.
     for backend in ("sqlite", "postgres"):
         for statement in (
-            _CHUNK,
+            _chunk_sql(backend),
             _own_rows_through(backend),
             _live_rows_through(backend),
         ):
-            assert (
-                statement.split("SELECT ")[1].split(" FROM ")[0] == _DERIVED_FROM
-            )
+            selected = statement.split("SELECT ")[1].split(" FROM ")[0]
+            # Every statement selects the derivation's columns AND the key its
+            # ordering sorts on, so the fold never re-derives that key itself.
+            assert selected.startswith(_DERIVED_FROM), selected
+            assert len(selected.split(", ")) == len(
+                _DERIVED_FROM.split(", ")
+            ) + 1, selected
 
 
 def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
@@ -3004,3 +3008,45 @@ async def test_a_purge_and_refill_does_not_let_a_stale_snapshot_publish(tmp_path
             "a snapshot taken before the purge was published as current over "
             "history that replaced it"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_timestamp_sql_cannot_read_is_not_read_by_the_fold_either(tmp_path):
+    """The ordering key and the fold's guard must accept the same values.
+
+    ``canonical_order()`` orders SQLite by ``julianday(created_at)``, and the
+    fold's monotonicity guard parses the same column with
+    ``coerce_session_timestamp``. Those are two different domains: basic ISO
+    (``20260101T110000``) parses in Python and returns NULL from ``julianday``.
+
+    So the canonical read sorts that row FIRST (NULLs lead), while the guard
+    parses both, sees 10:00 then 11:00 rising with id, and folds happily —
+    producing different boundaries and a different preview from the transcript
+    the reader would see, under a watermark that says current.
+
+    Only an import writes a stamp in that form; every writer here uses
+    ``isoformat()`` or SQLite's ``datetime('now')``. That is exactly why it
+    needs a case: it is a domain mismatch no ordinary write can reach.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "domains.db"))
+    try:
+        await _seed(db, [
+            {"content": "ordinary 10:00", "role": "user",
+             "created_at": "2026-01-01T10:00:00",
+             "metadata": {"session_id": UUID_A}},
+            {"content": "basic ISO 11:00", "role": "user",
+             "created_at": "20260101T110000",
+             "metadata": {"session_id": UUID_A}},
+        ])
+        assert await db.fetchval(
+            "SELECT julianday(created_at) FROM conversation_history "
+            "WHERE content = ?", ("basic ISO 11:00",)
+        ) is None, "julianday now reads this form, so the domains no longer differ"
+
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        await _assert_agrees_with_the_grouper(db, projection)
+    finally:
+        await db.close()
