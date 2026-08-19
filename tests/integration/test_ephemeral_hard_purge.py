@@ -833,3 +833,35 @@ async def test_a_scoped_purge_clears_the_projection_it_derived(tmp_path):
             "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
             (AGENT_ID,),
         ) == 1, "the ledger was erased while history survives"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_projection_sweep_blocks_the_exit(tmp_path, monkeypatch):
+    """A sweep that could not run must not be reported as one that found nothing.
+
+    `session_projection` holds no user content — a pointer and counts, never
+    text — which is why it does not belong in `REQUIRED_CONTENT_STORES`. But the
+    contract is "leave no trace", and the history deletions this sweep follows
+    fire the change trigger themselves: when the projection sweep then FAILS,
+    what is left behind is a row freshly written with this agent's id, after an
+    exit that cleared its retry watermark and reported success.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked turn")
+
+        async def _refuses(*args, **kwargs):
+            raise RuntimeError("lock timeout")
+
+        monkeypatch.setattr(storage, "purge_session_projection", _refuses)
+        report = await wrapper.purge_ephemeral_session(reason="test")
+
+        assert report.store_results["session_projection"].outcome is (
+            PurgeOutcome.FAILED
+        ), report.store_results["session_projection"]
+        assert report.required_sweep_failed, (
+            "the projection sweep failed and the exit was still certified; the "
+            "ledger row naming this agent is standing"
+        )

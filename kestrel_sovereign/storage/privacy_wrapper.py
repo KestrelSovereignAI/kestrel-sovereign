@@ -1352,6 +1352,20 @@ REQUIRED_CONTENT_STORES = frozenset({
     "channel_messages",
 })
 
+#: Stores that hold no user content but whose residue NAMES the agent, and whose
+#: sweep must therefore also be certified before EPHEMERAL exit.
+#:
+#: Kept separate from :data:`REQUIRED_CONTENT_STORES` because the reason differs
+#: and the name should not lie: the #2959 projection stores a pointer and
+#: counts, never text, which is why it does not certify content. But the
+#: contract is "leave no trace", and the history deletions performed by the
+#: sweep immediately before it fire the change trigger — so a projection sweep
+#: that FAILS leaves a freshly written row carrying this agent's id, after an
+#: exit that reported success (round-17 review).
+REQUIRED_TRACE_STORES = frozenset({
+    "session_projection",
+})
+
 
 
 class EphemeralPurgeReport(dict):
@@ -1392,7 +1406,8 @@ class EphemeralPurgeReport(dict):
     def required_sweep_failed(self) -> bool:
         """True if any REQUIRED content sweep failed (outcome unknown)."""
         return any(
-            r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.FAILED
+            r.store in (REQUIRED_CONTENT_STORES | REQUIRED_TRACE_STORES)
+            and r.outcome is PurgeOutcome.FAILED
             for r in self.store_results.values()
         )
 

@@ -1928,6 +1928,16 @@ class ConversationSessionProjection:
                     "DELETE FROM conversation_sessions WHERE agent_id = ?",
                     (self.agent_id,),
                 )
+                # ...and the watermark row, which `_claim()` INSERTed a moment
+                # ago on PostgreSQL to have something to lock. Leaving it
+                # commits this agent's id into a table the purge had just
+                # emptied — a no-trace exit undone by the repair that noticed
+                # the purge (round-17 review). Nothing is lost: an absent
+                # watermark is INVALID, which is what this branch means.
+                await self.db.execute(
+                    "DELETE FROM conversation_session_watermarks WHERE agent_id = ?",
+                    (self.agent_id,),
+                )
                 return _Step(REBUILT, 0, True)
             if (
                 await self.observed_generation() != generation

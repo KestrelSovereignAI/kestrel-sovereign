@@ -2786,6 +2786,13 @@ async def test_a_purge_is_not_undone_by_a_repair_that_was_already_running(tmp_pa
             "purged conversation content is standing in the projection after "
             "an EPHEMERAL exit"
         )
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_session_watermarks "
+            "WHERE agent_id = ?", (AGENT,)
+        ) == 0, (
+            "the repair left a watermark row naming this agent in a table the "
+            "purge had emptied"
+        )
 
 
 @pytest.mark.asyncio
