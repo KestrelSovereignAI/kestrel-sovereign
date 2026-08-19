@@ -3050,3 +3050,49 @@ async def test_a_timestamp_sql_cannot_read_is_not_read_by_the_fold_either(tmp_pa
         await _assert_agrees_with_the_grouper(db, projection)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_negative_row_id_fallback_is_not_projected(tmp_path):
+    """A session keyed by a row id must never be stored, sign included.
+
+    An unstamped row has no ``session_id``, so the grouper keys its cluster by
+    ``str(id)``. Such a key belongs to no session the column can hold, and the
+    projection is meant to stay silent about it — Phase A's invariant, enforced
+    by ``is_stampable_session_id`` rejecting all-digit keys.
+
+    That rejection is a test on the key's SHAPE, and shape is a proxy for the
+    thing that matters: whether the key came from the ``session_id`` column at
+    all. The proxy breaks the moment an id is negative — ``"-1"`` contains a
+    hyphen, so it is not all digits and passes — and #3001 made negative ids a
+    supported shape. The projection would then list a session that
+    ``coerce_persistent_message_id`` refuses, so opening or deleting it fails.
+
+    Asked of the column, not of the key.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "negative.db"))
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(id, agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, ?, 'user', 'imported, unstamped', NULL, NULL, ?)",
+            (-7, AGENT, _at(0)),
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        assert await projection.get("-7") is None, (
+            "a session keyed by a negative row id was projected; nothing can "
+            "resolve it, so the list would show a conversation that cannot be "
+            "opened or deleted"
+        )
+        assert await projection.list() == [], (
+            f"projected {await projection.list()}"
+        )
+        assert not await projection.is_stale(), (
+            "staying silent about a session it cannot key is the contract; "
+            "reporting stale forever is not"
+        )
+    finally:
+        await db.close()

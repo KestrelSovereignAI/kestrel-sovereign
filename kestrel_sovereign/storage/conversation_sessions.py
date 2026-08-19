@@ -1202,18 +1202,6 @@ def project_transcript(
     # for it the moment the user starts typing, and a projection that dropped it
     # could not serve that reader. A reader wanting only sessions with traffic
     # filters on ``message_count``.
-    # ``now`` pinned to the newest parseable stamp rather than left to default.
-    # Unset, the grouper dates a row whose ``created_at`` is NULL or malformed
-    # — which the nullable column and legacy SQLite rows both permit — from the
-    # WALL CLOCK. The projection would persist that instant and mark itself
-    # current, while grouping the same unchanged transcript a minute later
-    # produces different boundaries, with nothing to notice because no row
-    # moved and the change stamp never advanced. A cache that disagrees with
-    # its source on re-derivation, permanently, and silently.
-    #
-    # The newest stamp present is deterministic, derived only from the rows in
-    # hand, and orders such a row last — which is where a row with no time of
-    # its own belongs in a sequence read in id order.
     # ``now`` is deliberately NOT passed. The deterministic substitute for an
     # undatable row is the grouper's own rule now, so the read path and this
     # projection cannot disagree about a legacy row with a malformed
@@ -1241,10 +1229,34 @@ def project_transcript(
         )
         return []
 
+    # Every value the `session_id` COLUMN actually holds in this transcript.
+    # Taken across all rows rather than per session, because a session
+    # established by a `new_session` marker alone (#2222) carries no messages —
+    # the marker is structural and excluded from them — while its own row does
+    # carry the column. A per-session test would have silently stopped
+    # projecting exactly the just-started conversations `keep_empty_markers`
+    # exists to keep.
+    columns_seen = {str(value) for value in stamped.values() if value is not None}
+
     projections: List[SessionProjection] = []
     for session in grouped:
         session_id = str(session["session_id"])
+        # Two questions, and they are not the same one. `is_stampable_session_id`
+        # asks whether the COLUMN could hold this value; the second asks whether
+        # this key came FROM that column at all.
+        #
+        # The second used to be inferred from the first, because a key the
+        # grouper invented is a row id and a row id is all digits. That is a
+        # proxy, and #3001 broke it by making negative ids supported: `"-1"`
+        # contains a hyphen, so it is not all digits and sails through — and the
+        # projection then lists a session `coerce_persistent_message_id`
+        # refuses, which no reader can open and no lifecycle tool can delete.
+        # The rows carry their own `session_id`, so the question is asked of
+        # that instead of reconstructed from the key's shape.
         if not is_stampable_session_id(session_id):
+            continue
+
+        if session_id not in columns_seen:
             continue
         divergent = [
             message["id"]
