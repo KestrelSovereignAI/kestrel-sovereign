@@ -781,3 +781,55 @@ async def test_purge_leaves_no_watermark_that_can_match_a_restarted_ledger(tmp_p
             "the projection reports itself CURRENT after a purge, while its "
             "rows describe history that no longer exists"
         )
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_purge_clears_the_projection_it_derived(tmp_path):
+    """A leak that was projected before the sweep must not survive it.
+
+    The sweep skipped every projection table whenever any history survived —
+    the scoped case, where legitimate pre-entry history stands beside a leaked
+    turn. The reasoning was the scoped-purge contract: do not touch state
+    authored before entry. That is right about SOURCE data and wrong about a
+    CACHE. `conversation_sessions` is rebuildable from `conversation_history`,
+    so clearing it destroys no record — while leaving it keeps the leaked
+    session's id, timestamps, counts and message pointer standing, under a
+    purge that reported success.
+
+    The ledger is a different matter and stays: an agent whose history survives
+    is already named by that history, so its counter names nothing new — and
+    erasing it while history stands is what breaks the monotonicity `is_stale`
+    depends on.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        ConversationSessionProjection,
+    )
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("user", "legitimate, pre-EPHEMERAL")
+        await asyncio.sleep(1.05)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation("user", "leaked turn")
+
+        projection = ConversationSessionProjection(storage.db, AGENT_ID)
+        await projection.repair()
+        before = await projection.list()
+        assert before, "nothing was projected, so nothing can leak through it"
+
+        await wrapper.purge_ephemeral_session(reason="test")
+
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 1, "the scoped purge did not leave the pre-entry row, so this is "\
+                "the full-purge case and proves nothing about the scoped one"
+        assert await projection.list() == [], (
+            "the projection still describes the sessions it derived while the "
+            "leak was present, after a purge that reported success"
+        )
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes WHERE agent_id = ?",
+            (AGENT_ID,),
+        ) == 1, "the ledger was erased while history survives"

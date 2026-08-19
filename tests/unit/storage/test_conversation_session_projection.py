@@ -3096,3 +3096,65 @@ async def test_a_negative_row_id_fallback_is_not_projected(tmp_path):
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_replaced_history_with_reused_ids_is_not_reported_current(tmp_path):
+    """The counters can return to any earlier value; the generation cannot.
+
+    A full purge erases the ledger, and an import that replaces history with the
+    SAME ids and the same number of row events brings back both the stamp and
+    ``MAX(id)``. Every numeric witness agrees, and a snapshot taken before the
+    purge would publish as current over history it does not describe.
+
+    That is the third mechanism this class has broken — the sweep, the
+    publication fence, and the fence's own revalidation — so it is closed at the
+    source: the ledger row carries a value set once when it is created, and a
+    stamp is comparable only to the incarnation it was read from.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "reused.db"))
+    try:
+        await _seed(db, [
+            {"content": "original", "role": "user", "created_at": _at(0),
+             "metadata": {"session_id": UUID_A}},
+        ])
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        assert not await projection.is_stale()
+        first = await projection.accounted()
+        assert first.generation, "the ledger did not record a generation"
+
+        row_id = int(await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?", (AGENT,)
+        ))
+        stamp, appends = first.stamp, first.appends
+
+        # Erase history and the ledger exactly as the sweep does, then put back
+        # the same number of rows under the same ids.
+        await db.execute("DELETE FROM conversation_history WHERE agent_id = ?", (AGENT,))
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(id, agent_id, role, content, metadata, session_id, created_at) "
+            "VALUES (?, ?, 'user', 'replacement', ?, ?, ?)",
+            (row_id, AGENT, json.dumps({"session_id": UUID_C}), UUID_C, _at(0)),
+        )
+        while await projection.observed_changes() < stamp:
+            await _seed(db, [{"content": "filler", "role": "user",
+                              "created_at": _at(0),
+                              "metadata": {"session_id": UUID_C}}])
+
+        assert await projection.observed_changes() == stamp, "stamp did not return"
+        assert int(await db.fetchval(
+            "SELECT MAX(id) FROM conversation_history WHERE agent_id = ?", (AGENT,)
+        )) == row_id, "MAX(id) did not return, so the numeric witnesses differ"
+
+        assert await projection.is_stale(), (
+            "every number matched the pre-purge world, so the projection "
+            "reported itself current over history that replaced it"
+        )
+    finally:
+        await db.close()

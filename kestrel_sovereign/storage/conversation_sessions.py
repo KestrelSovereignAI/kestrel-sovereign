@@ -346,6 +346,7 @@ PROJECTION_COLUMNS: Tuple[str, ...] = (
 #: are written by one statement, in the same transaction as the rows they
 #: describe — which is this module's entire concurrency mechanism.
 WATERMARK_COLUMNS: Tuple[str, ...] = (
+    "accounted_generation",
     "accounted_valid",
     "accounted_stamp",
     "accounted_appends",
@@ -770,7 +771,8 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
 
 _WATERMARKS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
-    agent_id          TEXT PRIMARY KEY,
+    agent_id             TEXT PRIMARY KEY,
+    accounted_generation TEXT NOT NULL DEFAULT '',
     accounted_valid   INTEGER NOT NULL DEFAULT 0,
     accounted_stamp   BIGINT NOT NULL DEFAULT 0,
     accounted_appends BIGINT NOT NULL DEFAULT 0,
@@ -781,9 +783,10 @@ CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
 
 _CHANGES_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_history_changes (
-    agent_id TEXT PRIMARY KEY,
-    changes  BIGINT NOT NULL DEFAULT 0,
-    appends  BIGINT NOT NULL DEFAULT 0
+    agent_id   TEXT PRIMARY KEY,
+    changes    BIGINT NOT NULL DEFAULT 0,
+    appends    BIGINT NOT NULL DEFAULT 0,
+    generation TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -804,9 +807,28 @@ CREATE TABLE IF NOT EXISTS conversation_history_changes (
 #: an append is an expression rather than a constant.
 _PG_IS_INSERT = "CASE WHEN TG_OP = 'INSERT' THEN 1 ELSE 0 END"
 
+
+def _new_generation(backend_type: str) -> str:
+    """SQL for a value no other incarnation of this ledger row will hold.
+
+    Set once, when the row is created, and never touched by the upserts that
+    follow. It is what makes a stamp comparable to the ledger it was read from
+    and to no other — the counters restart at 1 when the privacy sweep erases
+    the row, so on their own they say nothing across that boundary, which has
+    now produced the same defect in three separate mechanisms (the sweep, the
+    publication fence, and the fence's own revalidation).
+
+    Randomness rather than a sequence, because a sequence would have to live
+    somewhere that survives the deletion — which is the thing privacy forbids.
+    """
+    if backend_type == "postgres":
+        return "gen_random_uuid()::text"
+    return "hex(randomblob(16))"
+
 _BUMP = (
-    "INSERT INTO conversation_history_changes (agent_id, changes, appends) "
-    "VALUES ({row}.agent_id, 1, {appends}) "
+    "INSERT INTO conversation_history_changes "
+    "(agent_id, changes, appends, generation) "
+    "VALUES ({row}.agent_id, 1, {appends}, {generation}) "
     "ON CONFLICT (agent_id) DO UPDATE "
     "SET changes = conversation_history_changes.changes + 1, "
     "appends = conversation_history_changes.appends + {appends}"
@@ -876,13 +898,13 @@ def mutation_trigger_function(backend_type: str) -> Optional[Tuple[str, str]]:
         "RETURNS trigger AS $kestrel$ "
         "BEGIN "
         "  IF (TG_OP = 'DELETE') THEN "
-        f"    {_BUMP.format(row='OLD', appends=0)}; "
+        f"    {_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; "
         "    RETURN OLD; "
         "  END IF; "
         "  IF (TG_OP = 'UPDATE' AND OLD.agent_id IS DISTINCT FROM NEW.agent_id) THEN "
-        f"    {_BUMP.format(row='OLD', appends=0)}; "
+        f"    {_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; "
         "  END IF; "
-        f"  {_BUMP.format(row='NEW', appends=_PG_IS_INSERT)}; "
+        f"  {_BUMP.format(row='NEW', appends=_PG_IS_INSERT, generation=_new_generation(backend_type))}; "
         "  RETURN NEW; "
         "END; "
         "$kestrel$ LANGUAGE plpgsql"
@@ -957,8 +979,10 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
     # unambiguous to its parser.
     watched_is_not = _watched_changed(backend_type, "IS NOT")
     rehomed = (
-        "INSERT INTO conversation_history_changes (agent_id, changes, appends) "
-        "SELECT OLD.agent_id, 1, 0 WHERE OLD.agent_id IS NOT NEW.agent_id "
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) "
+        f"SELECT OLD.agent_id, 1, 0, {_new_generation(backend_type)} "
+        "WHERE OLD.agent_id IS NOT NEW.agent_id "
         "ON CONFLICT (agent_id) DO UPDATE "
         "SET changes = conversation_history_changes.changes + 1"
     )
@@ -967,20 +991,20 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
             "conversation_history_change_insert",
             "CREATE TRIGGER conversation_history_change_insert "
             "AFTER INSERT ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='NEW', appends=1)}; END",
+            f"{_BUMP.format(row='NEW', appends=1, generation=_new_generation(backend_type))}; END",
         ),
         (
             "conversation_history_change_update",
             "CREATE TRIGGER conversation_history_change_update "
             "AFTER UPDATE ON conversation_history FOR EACH ROW "
             f"WHEN ({watched_is_not}) BEGIN "
-            f"{_BUMP.format(row='NEW', appends=0)}; {rehomed}; END",
+            f"{_BUMP.format(row='NEW', appends=0, generation=_new_generation(backend_type))}; {rehomed}; END",
         ),
         (
             "conversation_history_change_delete",
             "CREATE TRIGGER conversation_history_change_delete "
             "AFTER DELETE ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='OLD', appends=0)}; END",
+            f"{_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; END",
         ),
     )
 
@@ -1006,6 +1030,7 @@ class SessionWatermark:
     target, and the stamp has not moved since.
     """
 
+    generation: str = ""
     valid: bool = False
     stamp: int = 0
     appends: int = 0
@@ -1024,7 +1049,8 @@ class SessionWatermark:
         both engines; asyncpg refuses a Python ``bool`` for one.
         """
         return (
-            int(self.valid), self.stamp, self.appends, self.through, self.target,
+            self.generation, int(self.valid), self.stamp, self.appends,
+            self.through, self.target,
         )
 
 
@@ -1101,6 +1127,7 @@ class _Plan:
     """
 
     kind: str
+    generation: str
     stamp: int
     appends: int
     through: int
@@ -1384,6 +1411,19 @@ class ConversationSessionProjection:
         )
         return int(value or 0)
 
+    async def observed_generation(self) -> str:
+        """Which incarnation of the ledger row the counters belong to.
+
+        Empty when there is no row. A stamp read from one incarnation is not
+        comparable to another's, and the counters cannot say so themselves —
+        they restart at 1, so they can arrive back at any earlier value.
+        """
+        value = await self.db.fetchval(
+            "SELECT generation FROM conversation_history_changes WHERE agent_id = ?",
+            (self.agent_id,),
+        )
+        return str(value or "")
+
     async def accounted(self) -> SessionWatermark:
         """The state the projection records having accounted for.
 
@@ -1399,7 +1439,8 @@ class ConversationSessionProjection:
         if row is None:
             return INVALID
         return SessionWatermark(
-            bool(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4])
+            str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
+            int(row[5]),
         )
 
     async def is_stale(self) -> bool:
@@ -1417,6 +1458,8 @@ class ConversationSessionProjection:
         """
         accounted = await self.accounted()
         if not accounted.valid or not accounted.complete:
+            return True
+        if accounted.generation != await self.observed_generation():
             return True
         return await self.observed_changes() != accounted.stamp
 
@@ -1705,15 +1748,18 @@ class ConversationSessionProjection:
         are no longer about the same instant.
         """
         appends = await self.observed_appends()
-        if not accounted.valid:
+        generation = await self.observed_generation()
+        if not accounted.valid or accounted.generation != generation:
             return _Plan(
-                REBUILT, observed, appends, await self._id_floor(), await self._max_id(), True
+                REBUILT, generation, observed, appends, await self._id_floor(),
+                await self._max_id(), True
             )
         if observed == accounted.stamp:
             if accounted.complete:
                 return None
             return _Plan(
                 INCREMENTAL,
+                generation,
                 accounted.stamp,
                 accounted.appends,
                 accounted.through,
@@ -1735,6 +1781,7 @@ class ConversationSessionProjection:
         ):
             return _Plan(
                 INCREMENTAL,
+                generation,
                 observed,
                 appends,
                 accounted.through,
@@ -1742,7 +1789,8 @@ class ConversationSessionProjection:
                 False,
             )
         return _Plan(
-            REBUILT, observed, appends, await self._id_floor(), await self._max_id(), True
+            REBUILT, generation, observed, appends, await self._id_floor(),
+                await self._max_id(), True
         )
 
     async def _chunk(self, plan: _Plan) -> _Step:
@@ -1787,7 +1835,8 @@ class ConversationSessionProjection:
         written = await self._fold(rows, through)
         await self._record(
             SessionWatermark(
-                True, plan.stamp, plan.appends, through, plan.target
+                plan.generation, True, plan.stamp, plan.appends, through,
+                plan.target,
             )
         )
         # Reaching the target IS being finished, and saying so is not cosmetic:
@@ -1827,6 +1876,7 @@ class ConversationSessionProjection:
         """
         observed = await self.observed_changes()
         appends = await self.observed_appends()
+        generation = await self.observed_generation()
         target = await self._max_id()
         # NOT COVERED BY A TEST. Four attempts failed to build one that can
         # observe the defect: an unstamped-row fixture keeps every later repair
@@ -1880,7 +1930,8 @@ class ConversationSessionProjection:
                 )
                 return _Step(REBUILT, 0, True)
             if (
-                await self.observed_changes() != observed
+                await self.observed_generation() != generation
+                or await self.observed_changes() != observed
                 or await self._max_id() != target
             ):
                 # The stamp alone is not enough, for the reason the sweep erases
@@ -1904,7 +1955,9 @@ class ConversationSessionProjection:
             for projection in projections:
                 written += await self._store(projection)
             await self._record(
-                SessionWatermark(True, observed, appends, target, target)
+                SessionWatermark(
+                    generation, True, observed, appends, target, target
+                )
             )
         # Accounted through == target by construction: this pass derived every
         # live row, not a chunk of them. Reporting otherwise sends the caller

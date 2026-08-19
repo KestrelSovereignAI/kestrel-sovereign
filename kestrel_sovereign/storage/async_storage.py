@@ -964,9 +964,24 @@ class AsyncStorage:
                 "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
                 (self.agent_id,),
             )
-            if survives:
-                return 0
+            # The CACHE always goes. It is rebuildable from
+            # `conversation_history`, so clearing it destroys no record — while
+            # leaving it keeps the leaked session's id, timestamps, counts and
+            # message pointer standing after a sweep that reported success. An
+            # earlier revision skipped everything whenever any history survived,
+            # reading the scoped-purge contract as covering this too. That
+            # contract is about state authored before entry, and a derived copy
+            # is not authored at all: erasing it costs a rebuild, not data
+            # (round-16 review).
+            #
+            # The LEDGER is the exception, and only while history survives. Such
+            # an agent is already named by that history, so its counter names
+            # nothing new — and erasing it there is exactly what breaks the
+            # monotonicity `is_stale()` rests on, since the trigger's next write
+            # restarts the count.
             for table in tables:
+                if table == ledger and survives:
+                    continue
                 purged += _rows_affected(
                     await self.db.execute(
                         f"DELETE FROM {table} WHERE agent_id = ?",
