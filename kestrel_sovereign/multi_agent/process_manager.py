@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +57,53 @@ logger = logging.getLogger(__name__)
 # one default for every CLI start/restart/update path; callers may still pass a
 # shorter or longer operator-selected timeout explicitly.
 DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
+
+
+#: How far a live process's start time may drift from the recorded one and
+#: still be the same process. ``create_time`` is derived from boot time plus
+#: the kernel's clock ticks, so a value can wobble in the last decimals across
+#: reads; a recycled PID is a whole process launch away, never microseconds.
+_PID_START_TIME_TOLERANCE_S = 0.05
+
+
+class PidStatus(str, Enum):
+    """What a PID file establishes about the process it names.
+
+    Four outcomes, because the questions "is anything there?" and "is it
+    OURS?" have different answers and a nullable integer can carry neither
+    (#2995).
+    """
+
+    #: No PID file. Nothing was started, or a stop cleared it.
+    ABSENT = "absent"
+    #: The recorded process is running and is the one that was recorded.
+    LIVE = "live"
+    #: Nothing runs under that number, or something else does now.
+    STALE = "stale"
+    #: Something runs under that number but nothing proves whose it is —
+    #: a file written before this format. Never treated as LIVE.
+    UNDECIDABLE = "undecidable"
+
+
+@dataclass(frozen=True)
+class PidRecord:
+    """The outcome of a verified PID-file read, and why."""
+
+    status: PidStatus
+    pid: Optional[int]
+    root: Optional[str]
+    port: Optional[int]
+    detail: str
+
+    @property
+    def is_running(self) -> bool:
+        """Whether something is running that this file may be signalling.
+
+        UNDECIDABLE counts: a legacy file names a PID that IS running, and
+        calling that "not running" would have a guard wave through a live
+        agent. It is the *identity* that is unproven, not the existence.
+        """
+        return self.status in (PidStatus.LIVE, PidStatus.UNDECIDABLE)
 
 
 @dataclass
@@ -235,6 +283,12 @@ class ProcessManager:
             try:
                 if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                     return False
+                # It exists and can still run. Answer here rather than falling
+                # through: the syscall probe below cannot see a process owned
+                # by another user — ``os.kill`` raises PermissionError for it,
+                # which read as "not running". Measured: launchd (PID 1) was
+                # reported dead (#2995).
+                return True
             except psutil.NoSuchProcess:
                 return False
             except psutil.AccessDenied:
@@ -263,20 +317,145 @@ class ProcessManager:
                 return False
 
     @staticmethod
-    def read_pid(pid_file: Path) -> Optional[int]:
-        """Read PID from file, return None if missing or invalid."""
-        if not pid_file.exists():
-            return None
+    def process_start_time(pid: int) -> Optional[float]:
+        """When `pid` started, or None if that cannot be established.
+
+        This is what makes PID reuse detectable at all: a recycled number
+        belongs to a process that started LATER than the file naming it, and
+        no amount of matching on command line can see that — two Kestrel
+        checkouts on one machine are identical by argv, which is the normal
+        development shape here.
+
+        ``psutil.create_time()`` rather than ``ps -o lstart=``: it is a core
+        dependency, needs no subprocess, reads processes owned by other users,
+        and carries sub-second precision. ``lstart`` resolves to one second,
+        which blurs exactly the case that matters — a PID recycled moments
+        after its file was written.
+        """
         try:
-            return int(pid_file.read_text().strip())
-        except (ValueError, OSError):
+            import psutil
+
+            return psutil.Process(pid).create_time()
+        except Exception:
             return None
 
     @staticmethod
-    def write_pid(pid_file: Path, pid: int) -> None:
-        """Write PID to file."""
+    def read_pid_record(pid_file: Path) -> "PidRecord":
+        """Read a PID file and say what it actually establishes.
+
+        Four outcomes, not one nullable integer. Collapsing them is what let
+        the same ``None`` mean "no agent here", "the file is unreadable" and
+        "that process is long gone", so callers could not tell a stopped agent
+        from an unanswerable question (#2995).
+        """
+        if not pid_file.exists():
+            return PidRecord(PidStatus.ABSENT, None, None, None,
+                             f"no PID file at {pid_file}")
+        try:
+            raw = pid_file.read_text().strip()
+        except OSError as exc:
+            return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                             f"cannot read {pid_file}: {exc}")
+        if not raw:
+            return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                             f"{pid_file} is empty")
+
+        recorded_start: Optional[float] = None
+        root: Optional[str] = None
+        port: Optional[int] = None
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            try:
+                pid = int(payload["pid"])
+            except (KeyError, TypeError, ValueError):
+                return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                                 f"{pid_file} has no usable pid")
+            start = payload.get("started_at")
+            recorded_start = float(start) if isinstance(start, (int, float)) else None
+            root = payload.get("root") if isinstance(payload.get("root"), str) else None
+            raw_port = payload.get("port")
+            port = int(raw_port) if isinstance(raw_port, int) else None
+        else:
+            # A bare integer, written by a version before this format. The
+            # number is real; the identity behind it is simply not recorded.
+            try:
+                pid = int(raw)
+            except ValueError:
+                return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                                 f"{pid_file} is neither JSON nor a PID")
+
+        live_start = ProcessManager.process_start_time(pid)
+        if live_start is None:
+            # Nothing is running under that number. Whether it once was is not
+            # a question this can answer, and does not need to be: there is
+            # nothing there to signal or to call running.
+            return PidRecord(PidStatus.STALE, pid, root, port,
+                             f"no process is running as PID {pid}")
+
+        if recorded_start is None:
+            # Legacy file: something IS running as that PID, but nothing
+            # recorded says it is ours. Deliberately not called live — the
+            # whole point is that a bare integer cannot make that claim.
+            return PidRecord(PidStatus.UNDECIDABLE, pid, root, port,
+                             f"PID {pid} is running, but {pid_file.name} records "
+                             "no instance identity to check it against "
+                             "(written before #2995)")
+
+        # Same number AND same start instant: it is the process that was
+        # recorded. A recycled PID necessarily started later.
+        if abs(live_start - recorded_start) <= _PID_START_TIME_TOLERANCE_S:
+            return PidRecord(PidStatus.LIVE, pid, root, port,
+                             f"PID {pid} is the process recorded here")
+        return PidRecord(
+            PidStatus.STALE, pid, root, port,
+            f"PID {pid} belongs to a different process than the one recorded "
+            f"(started {live_start:.3f}, file says {recorded_start:.3f})",
+        )
+
+    @staticmethod
+    def read_pid(pid_file: Path) -> Optional[int]:
+        """A PID a caller may act on, or None.
+
+        Returns the number only when it still names something: a PID proven to
+        belong to another process is withheld, because every caller of this
+        went on to probe or signal it. Undecidable legacy files still return
+        the PID — refusing there would strand hosts written by an older
+        version — so callers that must not signal blind take the record.
+        """
+        record = ProcessManager.read_pid_record(pid_file)
+        if record.status in (PidStatus.LIVE, PidStatus.UNDECIDABLE):
+            return record.pid
+        return None
+
+    @staticmethod
+    def write_pid(
+        pid_file: Path,
+        pid: int,
+        *,
+        root: Optional[Path | str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        """Record a PID together with enough identity to verify it later.
+
+        ``started_at`` is the load-bearing field. ``root`` distinguishes two
+        Kestrel checkouts on one machine, and ``port`` records what the
+        instance was serving, so a reader can say which instance it found and
+        not merely that a number was once written down.
+        """
         pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(pid))
+        payload: dict = {"pid": pid}
+        started_at = ProcessManager.process_start_time(pid)
+        if started_at is not None:
+            payload["started_at"] = started_at
+        if root is not None:
+            payload["root"] = str(root)
+        if port is not None:
+            payload["port"] = int(port)
+        pid_file.write_text(json.dumps(payload))
 
     @staticmethod
     def clear_pid(pid_file: Path) -> None:
