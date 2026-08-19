@@ -265,6 +265,26 @@ if delivery is not None:
         )
 ```
 
+When the owning workflow wait reaches a terminal outcome, it must use the
+dispatcher lifecycle boundary rather than reaching into the durable store:
+
+```python
+found = await dispatcher.deactivate_durable_consumer(
+    consumer_id="workflows:wait:run-42"
+)
+```
+
+This agent-scoped call returns `False` only for an unknown consumer; repeating
+it for an existing inactive consumer returns `True`. It atomically marks the
+registration inactive and converts pending, retrying, initially reserved, and
+leased deliveries to retained terminal `failed` evidence. The transition
+serializes with event persistence on the registration's `(agent_id, source)`
+handoff: events committed first leave terminalized evidence, while events
+committed after deactivation create no delivery. Stale ACK/NACK/release or
+initial-reservation capabilities cannot recreate work. Re-registration cannot
+change an inactive consumer back to active; a new workflow wait needs a new
+consumer ID.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a
