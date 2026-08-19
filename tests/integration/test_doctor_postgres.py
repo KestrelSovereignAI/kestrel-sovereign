@@ -36,6 +36,7 @@ import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import diagnose
+from kestrel_sovereign.storage.async_database import CORE_SCHEMA, normalize_schema
 from kestrel_sovereign.multi_agent.config import (
     HostConfig,
     LocalAgentConfig,
@@ -92,35 +93,14 @@ def runtime_db():
     connection = psycopg2.connect(dsn)
     connection.autocommit = True
     with connection.cursor() as cursor:
-        # The real columns (async_database._SCHEMA). A hand-rolled subset
-        # made the bound store raise on a plain get_node, which reads as
-        # "database unreachable" to any caller that fails closed.
-        cursor.execute(
-            "CREATE TABLE graph_nodes ("
-            " node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL,"
-            " label TEXT NOT NULL, properties TEXT)"
-        )
-        cursor.execute(
-            "CREATE TABLE graph_edges ("
-            " source_id TEXT NOT NULL, target_id TEXT NOT NULL,"
-            " label TEXT NOT NULL, properties TEXT,"
-            " PRIMARY KEY (source_id, target_id, label))"
-        )
-        cursor.execute(
-            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
-        )
-        cursor.execute(
-            "CREATE TABLE graph_edge_owners ("
-            " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
-        )
-        # Every real database carries this (CORE_SCHEMA), and one the runtime
-        # has opened has #2649 recorded — which is what makes a *missing*
-        # ownership witness permanent rather than merely pending.
-        cursor.execute(
-            "CREATE TABLE schema_backfills ("
-            " name TEXT PRIMARY KEY,"
-            " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-        )
+        # The runtime's own DDL, through the runtime's own converter, rather
+        # than a hand-rolled subset. The governance blob lives in ``files``,
+        # which the subset did not create, and the reads that need it only
+        # worked because a force-less inspection ran migrations against the
+        # store on its way past — the #2920 write this branch removes.
+        cursor.execute(normalize_schema(CORE_SCHEMA, "postgres"))
+        # A database the runtime has opened has #2649 recorded, which is what
+        # makes a *missing* ownership witness permanent rather than pending.
         cursor.execute(
             "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
         )
@@ -220,34 +200,18 @@ def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
     db_dir.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_dir / "kestrel_prime.db")
     try:
-        connection.execute(
-            "CREATE TABLE graph_nodes ("
-            " node_id TEXT PRIMARY KEY, node_type TEXT,"
-            " label TEXT, properties TEXT)"
-        )
-        # The real columns and the real ownership ledgers. A hand-rolled
-        # subset has bitten three times on this branch: a bound read selects
-        # ``properties`` and joins ``graph_edge_owners``, so a fixture missing
-        # either makes the store raise — which every caller that fails closed
-        # reads as "database unreachable", not as "your fixture is wrong".
-        connection.execute(
-            "CREATE TABLE graph_edges ("
-            " source_id TEXT NOT NULL, target_id TEXT NOT NULL,"
-            " label TEXT NOT NULL, properties TEXT,"
-            " PRIMARY KEY (source_id, target_id, label))"
-        )
-        connection.execute(
-            "CREATE TABLE graph_node_owners (node_id TEXT, agent_id TEXT)"
-        )
-        connection.execute(
-            "CREATE TABLE graph_edge_owners ("
-            " source_id TEXT, target_id TEXT, label TEXT, agent_id TEXT)"
-        )
-        connection.execute(
-            "CREATE TABLE schema_backfills ("
-            " name TEXT PRIMARY KEY,"
-            " completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-        )
+        # The runtime's own DDL, not a hand-rolled subset. The comment this
+        # replaces already recorded that a subset "has bitten three times on
+        # this branch" — and it was still a subset, so it bit again: the
+        # governance blob lives in ``files``, which it did not create.
+        #
+        # It went unnoticed because a force-less inspection used to run schema
+        # migrations against the agent's database on its way past, creating
+        # whatever was missing as a side effect of reading. That write is the
+        # #2920 defect, so with it gone every fixture has to supply what a
+        # real anchor has. Taking CORE_SCHEMA means the list cannot drift out
+        # of step a fourth time.
+        connection.executescript(CORE_SCHEMA)
         connection.execute(
             "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
         )
