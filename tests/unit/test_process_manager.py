@@ -197,6 +197,45 @@ class TestStaticHelpers:
         assert record.is_running is True
         assert ProcessManager.read_pid(pid_file) == os.getpid()
 
+    def test_a_signal_is_withheld_when_the_pid_changed_hands(self):
+        """The gap between reading a PID file and signalling is the hazard.
+
+        After an OOM, a `kill -9` or a reboot the number is free for the OS to
+        reuse, and the old path signalled whatever now held it — so
+        `kestrel stop --force` could SIGKILL an unrelated process (#2987).
+        """
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        time.sleep(0.4)
+        try:
+            actual = ProcessManager.process_start_time(victim.pid)
+            assert actual is not None
+
+            # The identity of a process that held this number earlier.
+            sent = ProcessManager.kill_process(
+                victim.pid, force=True, started_at=actual - 500
+            )
+            time.sleep(0.3)
+            assert sent is False
+            assert ProcessManager.is_process_running(victim.pid), (
+                "a process that was never ours was signalled anyway"
+            )
+
+            # With the identity it actually has, the signal goes through.
+            assert ProcessManager.kill_process(
+                victim.pid, force=True, started_at=actual
+            ) is True
+        finally:
+            victim.kill()
+            victim.wait()
+
+    def test_a_process_owned_by_another_user_is_not_reported_dead(self):
+        """`os.kill(pid, 0)` raises PermissionError for another user's process.
+
+        Every OSError mapped to False, so a live process read as stopped.
+        PID 1 is the deterministic case: always running, never ours.
+        """
+        assert ProcessManager.is_process_running(1) is True
+
     def test_clear_pid_nonexistent(self, tmp_path):
         """Clearing a non-existent PID file should not raise."""
         ProcessManager.clear_pid(tmp_path / "nope.pid")

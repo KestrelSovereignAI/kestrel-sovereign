@@ -1353,10 +1353,12 @@ def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
         pid_file = ProcessManager.agent_pid_file(resolved_dir)
-        pid = ProcessManager.read_pid(pid_file)
-        if pid is None:
-            return False
-        return ProcessManager.is_process_running(pid)
+        # The same verified read ``kestrel stop`` uses, so the guard and the
+        # remedy it prescribes cannot disagree about whether an agent is up.
+        # ``is_running`` counts an undecidable legacy record as running: it
+        # names a process that IS alive, and waving a guard past a live agent
+        # is the failure that costs something (#2995).
+        return ProcessManager.read_pid_record(pid_file).is_running
     except Exception:
         # If we can't tell, err on the side of letting the user proceed
         # — they get a clear error from the storage layer if it's locked.

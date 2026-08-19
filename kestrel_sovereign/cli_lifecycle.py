@@ -1467,17 +1467,20 @@ def cmd_status(args) -> int:
     multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
 
     # Host/server status
-    host_pid = ProcessManager.read_pid(_host_pid_file(project_dir))
-    host_running = host_pid is not None and ProcessManager.is_process_running(host_pid)
+    # Same verified read as ``stop`` and the reanchor guard: status must not
+    # report an agent the stop path cannot see, or vice versa (#2995).
+    host_record = ProcessManager.read_pid_record(_host_pid_file(project_dir))
+    host_running = host_record.is_running
+    host_pid = host_record.pid
     host_pid_str = str(host_pid) if host_running else "-"
     host_uptime = _format_uptime(host_pid) if host_running else "-"
 
     # Detect mode: check if any agent has its own PID file (subprocess mode)
     local_agents = multi_agent.get_local_agents()
     any_agent_pid = any(
-        ProcessManager.read_pid(
+        ProcessManager.read_pid_record(
             ProcessManager.agent_pid_file((project_dir / cfg.data_dir).resolve())
-        ) is not None
+        ).is_running
         for cfg in local_agents.values()
     )
 
@@ -1489,8 +1492,11 @@ def cmd_status(args) -> int:
 
         for name, cfg in local_agents.items():
             resolved_dir = (project_dir / cfg.data_dir).resolve()
-            pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
-            running = pid is not None and ProcessManager.is_process_running(pid)
+            agent_record = ProcessManager.read_pid_record(
+                ProcessManager.agent_pid_file(resolved_dir)
+            )
+            pid = agent_record.pid
+            running = agent_record.is_running
             status_str = "online" if running else "offline"
             pid_str = str(pid) if running else "-"
             uptime = _format_uptime(pid) if running else "-"
