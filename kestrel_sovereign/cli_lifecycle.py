@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    PidStatus,
     ProcessManager,
 )
 
@@ -345,7 +346,9 @@ def _start_inprocess_mode(
     # uvicorn host hit a closed pipe (EPIPE) once the launcher
     # exits and are silently swallowed; host.log appears to freeze
     # after startup and runtime tracebacks vanish. See #1461.
-    pm._spawn_detached(cmd, env, log_file, host_pid_file)
+    pm._spawn_detached(
+        cmd, env, log_file, host_pid_file, port=multi_agent.host.port
+    )
 
     if pm.wait_for_health(multi_agent.host.port, timeout=startup_timeout):
         print("          \u2705")
@@ -519,16 +522,26 @@ def cmd_stop(args) -> int:
 
     # Stop host
     host_pid_file = _host_pid_file(project_dir)
-    host_pid = pm.read_pid(host_pid_file)
-    if host_pid and pm.is_process_running(host_pid):
+    # The verified read, so "nothing is there" and "something else is there
+    # now" are different answers. A number alone could not tell them apart,
+    # and both used to arrive as the same PID (#2995).
+    host_record = pm.read_pid_record(host_pid_file)
+    host_pid = host_record.pid if host_record.is_running else None
+    if host_pid:
         print(f"   Stopping host (PID: {host_pid})...")
-        pm.kill_process(host_pid, force=force)
+        # The recorded start instant is passed so the signal is withheld if
+        # the number changed hands between reading the file and killing.
+        # ``started_at`` is None for a legacy file, which signals as before.
+        started_at = pm.process_start_time(host_pid) if (
+            host_record.status is PidStatus.LIVE
+        ) else None
+        pm.kill_process(host_pid, force=force, started_at=started_at)
         for _ in range(10):
             if not pm.is_process_running(host_pid):
                 break
             time.sleep(0.5)
         if pm.is_process_running(host_pid):
-            pm.kill_process(host_pid, force=True)
+            pm.kill_process(host_pid, force=True, started_at=started_at)
             time.sleep(0.5)
         # Two independent facts, both required before claiming a stop: the
         # process is gone, and the port it served is free. Neither implies the
@@ -557,7 +570,12 @@ def cmd_stop(args) -> int:
         else:
             print("   host stopped")
     else:
-        if host_pid:
+        if host_record.status is PidStatus.STALE:
+            # Known to name a process that is gone, or one that is not the
+            # host. Keeping that record is what lets a later command signal
+            # whatever inherited the number, so it goes now — this is the one
+            # place that can say so with evidence rather than a guess.
+            print(f"   host: clearing stale PID record ({host_record.detail})")
             pm.clear_pid(host_pid_file)
         if _reap_orphans_on_port(
             multi_agent.host.port, "host", force, multi_agent.host.bind

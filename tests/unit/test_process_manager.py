@@ -7,6 +7,7 @@ and log reading — all without spawning real subprocesses.
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,7 +20,11 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     RemoteAgentConfig,
 )
-from kestrel_sovereign.multi_agent.process_manager import ProcessManager, AgentProcess
+from kestrel_sovereign.multi_agent.process_manager import (
+    ProcessManager,
+    AgentProcess,
+    PidStatus,
+)
 from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
@@ -110,21 +115,87 @@ class TestStaticHelpers:
         assert ProcessManager.is_process_running(999999) is False
 
     def test_read_write_clear_pid(self, tmp_path):
-        """PID file round-trip: write, read, clear."""
+        """PID file round-trip: write, read, clear.
+
+        Written for a process that actually exists. A PID file names a running
+        process, and ``read_pid`` deliberately withholds a number that names
+        nothing — so a made-up integer would exercise the stale path rather
+        than the round-trip this is about (#2995).
+        """
         pid_file = tmp_path / "test.pid"
 
         # Not exists
         assert ProcessManager.read_pid(pid_file) is None
 
         # Write and read
-        ProcessManager.write_pid(pid_file, 42)
+        ProcessManager.write_pid(pid_file, os.getpid())
         assert pid_file.exists()
-        assert ProcessManager.read_pid(pid_file) == 42
+        assert ProcessManager.read_pid(pid_file) == os.getpid()
 
         # Clear
         ProcessManager.clear_pid(pid_file)
         assert not pid_file.exists()
         assert ProcessManager.read_pid(pid_file) is None
+
+    def test_a_pid_naming_no_live_process_is_not_handed_back(self, tmp_path):
+        """A number that names nothing must not reach a caller.
+
+        Every caller of ``read_pid`` went on to probe or signal what it
+        returned, so handing back a PID whose process is gone is how a stale
+        file got treated as a running agent — and, after reuse, how an
+        unrelated process got signalled (#2987).
+        """
+        pid_file = tmp_path / "dead.pid"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+
+        ProcessManager.write_pid(pid_file, dead.pid)
+        record = ProcessManager.read_pid_record(pid_file)
+
+        assert record.status is PidStatus.STALE
+        assert record.is_running is False
+        assert ProcessManager.read_pid(pid_file) is None
+        # The file itself is left alone: deciding to remove a record is the
+        # caller's call, not the reader's.
+        assert pid_file.exists()
+
+    def test_a_recycled_pid_is_not_the_process_that_was_recorded(self, tmp_path):
+        """The case no command-line match can catch.
+
+        Two Kestrel checkouts on one machine are identical by argv, and a
+        reused number is identical by number. The start instant is the only
+        thing that differs, and it is why it is recorded.
+        """
+        pid_file = tmp_path / "recycled.pid"
+        ProcessManager.write_pid(pid_file, os.getpid())
+
+        payload = json.loads(pid_file.read_text())
+        assert "started_at" in payload, "the identity field must be recorded"
+        # Same number, but the recorded instant belongs to an earlier process.
+        payload["started_at"] -= 500
+        pid_file.write_text(json.dumps(payload))
+
+        record = ProcessManager.read_pid_record(pid_file)
+        assert record.status is PidStatus.STALE
+        assert ProcessManager.read_pid(pid_file) is None
+
+    def test_a_legacy_bare_integer_is_undecidable_but_still_counts_as_running(
+        self, tmp_path
+    ):
+        """Files written before #2995 record a number and nothing else.
+
+        Something IS running under it, so calling it stopped would wave a
+        guard straight past a live agent; but nothing proves it is ours, so
+        calling it LIVE would license signalling it. Undecidable is the honest
+        answer, and it is not the same as either.
+        """
+        pid_file = tmp_path / "legacy.pid"
+        pid_file.write_text(str(os.getpid()))
+
+        record = ProcessManager.read_pid_record(pid_file)
+        assert record.status is PidStatus.UNDECIDABLE
+        assert record.is_running is True
+        assert ProcessManager.read_pid(pid_file) == os.getpid()
 
     def test_clear_pid_nonexistent(self, tmp_path):
         """Clearing a non-existent PID file should not raise."""
@@ -411,7 +482,15 @@ class TestStartAgent:
 
         agent_dir = (project_dir / "agent_data" / "claw").resolve()
         pid_file = ProcessManager.agent_pid_file(agent_dir)
-        assert ProcessManager.read_pid(pid_file) == 54321
+        # The recorded PID, read straight off the file: 54321 is a mock and
+        # names no process, so ``read_pid`` correctly withholds it.
+        record = ProcessManager.read_pid_record(pid_file)
+        assert record.pid == 54321
+        # The identity that makes the record verifiable is recorded with it.
+        payload = json.loads(pid_file.read_text())
+        assert payload["pid"] == 54321
+        assert payload["root"] == str(pm.project_dir)
+        assert payload["port"] == cfg.port
 
 
 # -----------------------------------------------------------------------

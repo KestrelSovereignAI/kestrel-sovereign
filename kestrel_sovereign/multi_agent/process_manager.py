@@ -473,8 +473,38 @@ class ProcessManager:
         return agent_dir / "agent.log"
 
     @staticmethod
-    def kill_process(pid: int, force: bool = False) -> bool:
-        """Send signal to a process. Returns True if signal sent."""
+    def kill_process(
+        pid: int,
+        force: bool = False,
+        *,
+        started_at: Optional[float] = None,
+    ) -> bool:
+        """Send a signal to a process. Returns True if the signal was sent.
+
+        ``started_at`` is the start instant this PID is expected to have. When
+        given, the process is re-identified immediately before signalling and
+        the signal is withheld if it does not match. Without it this signals
+        whatever now holds the number — which after an OOM, a ``kill -9`` or a
+        reboot may be an unrelated process that inherited it (#2987).
+
+        Checked here rather than only at the call site because the gap between
+        reading a PID file and signalling is precisely where the number can
+        change hands.
+        """
+        if started_at is not None:
+            live_start = ProcessManager.process_start_time(pid)
+            if live_start is None:
+                logger.debug("PID %s is gone; nothing to signal", pid)
+                return False
+            if abs(live_start - started_at) > _PID_START_TIME_TOLERANCE_S:
+                logger.error(
+                    "Refusing to signal PID %s: it belongs to a different "
+                    "process than the one recorded (started %.3f, expected "
+                    "%.3f). The recorded process has exited and its number "
+                    "was reused.",
+                    pid, live_start, started_at,
+                )
+                return False
         try:
             if sys.platform == "win32":
                 subprocess.run(
@@ -534,6 +564,7 @@ class ProcessManager:
         env: dict,
         log_file: Path,
         pid_file: Path,
+        port: Optional[int] = None,
     ) -> int:
         """Spawn a process whose stdout/stderr go DIRECTLY to ``log_file``
         via inherited file descriptors. No pump thread.
@@ -589,7 +620,7 @@ class ProcessManager:
             # inherited copy is what keeps writes flowing.
             os.close(log_fd)
 
-        self.write_pid(pid_file, process.pid)
+        self.write_pid(pid_file, process.pid, root=self.project_dir, port=port)
         return process.pid
 
     def _spawn(
@@ -599,6 +630,7 @@ class ProcessManager:
         log_file: Path,
         pid_file: Path,
         agent_name: Optional[str] = None,
+        port: Optional[int] = None,
     ) -> int:
         """Spawn a background process. Returns PID.
 
@@ -656,7 +688,7 @@ class ProcessManager:
         )
         thread.start()
 
-        self.write_pid(pid_file, process.pid)
+        self.write_pid(pid_file, process.pid, root=self.project_dir, port=port)
         return process.pid
 
     @staticmethod
@@ -855,7 +887,9 @@ class ProcessManager:
             "--host", host_bind, "--port", str(config.port),
         ]
 
-        pid = self._spawn(cmd, env, log_file, pid_file, agent_name=name)
+        pid = self._spawn(
+            cmd, env, log_file, pid_file, agent_name=name, port=config.port
+        )
         logger.info(f"Started agent '{name}' on :{config.port} (PID {pid})")
 
         ap = AgentProcess(

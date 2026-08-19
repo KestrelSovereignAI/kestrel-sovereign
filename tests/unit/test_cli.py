@@ -38,6 +38,7 @@ from kestrel_sovereign.cli_lifecycle import (
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    PidStatus,
     ProcessManager,
 )
 
@@ -945,26 +946,30 @@ class TestCmdStopReportsOnlyVerifiedStops:
         command would signal an unrelated process — so it is cleared on its
         own facts, independently of who holds the port.
         """
+        import subprocess as _subprocess
+        import sys as _sys
+
         from kestrel_sovereign.cli_lifecycle import _host_pid_file
 
+        # A real process that really exits, so the record is genuinely stale
+        # rather than stale by assertion. Nothing about liveness is stubbed
+        # here: the verified read establishes it from the process table.
+        dead = _subprocess.Popen([_sys.executable, "-c", "pass"])
+        dead.wait()
+
         pid_file = _host_pid_file(multi_agent_env)
-        ProcessManager.write_pid(pid_file, 4242)
+        ProcessManager.write_pid(pid_file, dead.pid)
         assert pid_file.exists()
+        assert ProcessManager.read_pid_record(pid_file).status is PidStatus.STALE
 
         parser = build_parser()
         args = parser.parse_args(["stop"])
-
-        # Alive on the first probe so the host branch is entered, gone
-        # thereafter — the process died, but the port did not come back.
-        probes = iter([True])
 
         with _listener_on() as port:
             _repoint_ports(multi_agent_env, host=port, claw=_free_port(),
                            testbot=_free_port())
             with patch("kestrel_sovereign.cli._get_project_dir",
-                       return_value=multi_agent_env), \
-                 patch.object(ProcessManager, "is_process_running",
-                              side_effect=lambda pid: next(probes, False)):
+                       return_value=multi_agent_env):
                 rc = cmd_stop(args)
 
         output = capsys.readouterr().out
