@@ -522,6 +522,22 @@ def _watched_changed(backend_type: str, distinct: str) -> str:
 _LIVE = "deleted_at IS NULL AND archived_at IS NULL"
 
 
+def active_history_predicate() -> str:
+    """What the conversation list's DEFAULT view selects — live, not archived.
+
+    Identical text to :func:`live_history_predicate` today and separate on
+    purpose: one names what a PROJECTION walk describes, the other what a READ
+    filters to, and a partial index is only used when its predicate matches its
+    query's. Collapsing them would tie the two together at the first change.
+    """
+    return _LIVE
+
+
+def archived_history_predicate() -> str:
+    """...and what its archived view selects (#2149), which is not a subset."""
+    return "deleted_at IS NULL AND archived_at IS NOT NULL"
+
+
 def live_history_predicate() -> str:
     """:data:`_LIVE`, for callers that must index exactly what the walk selects.
 

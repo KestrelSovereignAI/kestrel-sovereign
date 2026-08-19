@@ -1923,6 +1923,8 @@ class AsyncDatabase:
         """
         from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
+            active_history_predicate,
+            archived_history_predicate,
             canonical_order_index_columns,
             live_history_predicate,
             mutation_trigger_function,
@@ -2001,25 +2003,46 @@ class AsyncDatabase:
             *_SESSION_PROJECTION_INDEX,
             f"agent_id, {session_order_index_columns(self.backend_type)}",
         )
-        # PARTIAL, on the liveness predicate the walk itself uses. `LIMIT`
+        # FULL, and it stays full. `_max_id()` and `_rows_above()` deliberately
+        # count EVERY row — the watermark's target is `MAX(id)` over all of
+        # history, live or not — so a partial index cannot answer them, and
+        # narrowing this one sent the hot repair path back to scanning the
+        # agent's whole history on PostgreSQL. Added a partial one below rather
+        # than narrowing this one; they serve different queries.
+        await self.ensure_index(*_SESSION_FRONTIER_INDEX)
+        # PARTIAL, for the chunk walk, which asks only about live rows. `LIMIT`
         # bounds the rows a chunk RETURNS, not the rows it reads: an agent whose
         # history is mostly trashed or archived would scan past all of it to
         # find one chunk of live rows — inside `BEGIN IMMEDIATE`, so on SQLite
         # that blocks every writer. Measured at 200,000 trashed rows before 50
-        # live ones: 9.8 ms and O(history) on the full index, 0.0 ms and bounded
-        # on this one.
+        # live ones: 9.8 ms and O(history) on the full index, 0.0 ms here.
         await self.ensure_index(
-            *_SESSION_FRONTIER_INDEX, where=live_history_predicate()
+            "idx_conversation_agent_live_row_id",
+            "conversation_history",
+            "agent_id, id",
+            where=live_history_predicate(),
         )
         # The index that keeps `canonical_order()` a bounded traversal. Its
         # columns are the ORDER BY's own key expressions, so it cannot drift
         # from the ordering it exists for — and without it BOTH engines fall
         # back to reading and sorting the agent's whole live history before
         # applying LIMIT, which is the O(history) cost this epic removes.
+        # One per view, both partial. The list filters on liveness as well as
+        # ordering by the canonical keys, and an index that carries the ordering
+        # but not the filter still walks past every non-matching row before
+        # `LIMIT` is satisfied — page-bounded in the plan's shape but O(history)
+        # in what it reads, for an agent whose newest history is mostly trashed.
         await self.ensure_index(
             "idx_conversation_agent_canonical",
             "conversation_history",
             canonical_order_index_columns(self.backend_type),
+            where=active_history_predicate(),
+        )
+        await self.ensure_index(
+            "idx_conversation_agent_canonical_archived",
+            "conversation_history",
+            canonical_order_index_columns(self.backend_type),
+            where=archived_history_predicate(),
         )
         # The index that keeps `canonical_order()` a bounded traversal. Its
         # columns are the ORDER BY's own key expressions, so it cannot drift

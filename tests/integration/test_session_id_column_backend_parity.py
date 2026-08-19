@@ -2930,7 +2930,76 @@ async def test_a_repair_chunk_reads_only_live_rows(db_backend, monkeypatch):
                 prefix + _chunk_sql(db.backend_type), (agent_id, 0, 10**9, 100)
             )
         )
-        assert "idx_conversation_agent_row_id" in plan, (
+        assert "idx_conversation_agent_live_row_id" in plan, (
             "the repair chunk is not using the partial live-row index, so it "
             f"reads past every trashed row to find its next chunk:\n{plan}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.timeout(180)
+async def test_the_frontier_probes_stay_indexed(db_backend, monkeypatch):
+    """`_max_id` and `_rows_above` count EVERY row, so they need a full index.
+
+    They are the hot path: `is_stale()` and `_plan` run them on every repair,
+    including the ones that turn out to have nothing to do. And they are
+    deliberately unfiltered — the watermark's target is `MAX(id)` over all of
+    history, live or not, which is what makes the append arithmetic exact.
+
+    A partial index cannot answer a query that does not imply its predicate. So
+    when the frontier index was narrowed to live rows for the chunk walk's
+    benefit, these two fell back to scanning the agent's whole history. Both
+    indexes exist now; this pins the one that has no other test, because the
+    regression it guards was introduced by a fix and caught by review rather
+    than by the suite.
+    """
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:frontier:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        for i in range(500):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at, deleted_at) "
+                "VALUES (?, 'user', 'x', NULL, NULL, ?, ?)",
+                (
+                    agent_id,
+                    timestamp_query_param(db.backend_type, "2026-03-01T09:00:00"),
+                    timestamp_query_param(db.backend_type, "2026-03-02T09:00:00"),
+                ),
+            )
+        # A SECOND agent's rows, above this one's, and more of them. Without
+        # them PostgreSQL answers `MAX(id)` by walking the primary key backwards
+        # and filtering — cheap when every row matches, and the assertion below
+        # would then be about which plan the planner happened to like rather
+        # than about whether the work is bounded.
+        other = f"did:test:frontier-other:{uuid4()}"
+        for i in range(2000):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at) "
+                "VALUES (?, 'user', 'x', NULL, NULL, ?)",
+                (other, timestamp_query_param(db.backend_type, "2026-03-03T09:00:00")),
+            )
+        await db.execute("ANALYZE" if db.backend_type == "sqlite" else "ANALYZE conversation_history")
+
+        prefix = "EXPLAIN QUERY PLAN " if db.backend_type == "sqlite" else "EXPLAIN "
+        # `_max_id` only. `_rows_above` counts the rows standing above the
+        # watermark — a quantity this design already bounds, since a large one
+        # sends `_plan` to the rebuild branch — so at any size a test can build,
+        # a sequential scan is a legitimate choice and asserting an index name
+        # there would pin the planner's preference rather than a property.
+        for label, sql, params in (
+            ("_max_id",
+             "SELECT COALESCE(MAX(id), 0) FROM conversation_history WHERE agent_id = ?",
+             (agent_id,)),
+        ):
+            plan = "\n".join(
+                " ".join(str(value) for value in row)
+                for row in await db.fetchall(prefix + sql, params)
+            )
+            assert "idx_conversation_agent_row_id" in plan, (
+                f"{label} is not using the full frontier index, so every repair "
+                f"scans the agent's whole history:\n{plan}"
+            )
