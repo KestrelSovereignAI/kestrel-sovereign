@@ -312,12 +312,18 @@ def _start_inprocess_mode(
     print()
 
     host_pid_file = _host_pid_file(project_dir)
-    existing_host = pm.read_pid(host_pid_file)
-    if existing_host and pm.is_process_running(existing_host):
-        print(f"   Server already running (PID: {existing_host})")
+    existing = pm.read_pid_record(host_pid_file)
+    if existing.is_running:
+        print(f"   Server already running (PID: {existing.pid})")
         return 0
 
-    if existing_host:
+    # Keyed on the status, not on whether a PID came back. ``read_pid``
+    # withholds a stale number by design, so testing its result for
+    # truthiness silently stopped clearing exactly the records that most need
+    # clearing — and a leftover legacy file flips from stale to undecidable
+    # the moment its number is reused, after which stop would signal the
+    # replacement (#2995).
+    if existing.needs_cleanup:
         pm.clear_pid(host_pid_file)
 
     if pm.is_port_in_use(multi_agent.host.port, multi_agent.host.bind):
@@ -529,12 +535,12 @@ def cmd_stop(args) -> int:
     host_pid = host_record.pid if host_record.is_running else None
     if host_pid:
         print(f"   Stopping host (PID: {host_pid})...")
-        # The recorded start instant is passed so the signal is withheld if
-        # the number changed hands between reading the file and killing.
-        # ``started_at`` is None for a legacy file, which signals as before.
-        started_at = pm.process_start_time(host_pid) if (
-            host_record.status is PidStatus.LIVE
-        ) else None
+        # The instant from the FILE, not a fresh lookup. Looking it up again
+        # would read whatever holds the number now, so a PID reused between
+        # the read and the kill would be validated against itself and
+        # signalled — the exact protection being asked for. None for a legacy
+        # record, which signals as before.
+        started_at = host_record.started_at
         pm.kill_process(host_pid, force=force, started_at=started_at)
         for _ in range(10):
             if not pm.is_process_running(host_pid):

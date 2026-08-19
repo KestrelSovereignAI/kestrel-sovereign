@@ -83,6 +83,10 @@ class PidStatus(str, Enum):
     #: Something runs under that number but nothing proves whose it is —
     #: a file written before this format. Never treated as LIVE.
     UNDECIDABLE = "undecidable"
+    #: The file cannot be read or does not contain a PID at all. Distinct
+    #: from UNDECIDABLE, which names a PID that IS running: this establishes
+    #: no process whatsoever, so calling it running would be an invention.
+    UNREADABLE = "unreadable"
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,11 @@ class PidRecord:
     root: Optional[str]
     port: Optional[int]
     detail: str
+    #: The start instant recorded in the FILE, not one looked up later. A
+    #: second lookup would re-read whatever holds the number now, so a PID
+    #: reused between the read and the kill would be validated against
+    #: itself — defeating the check it was meant to satisfy.
+    started_at: Optional[float] = None
 
     @property
     def is_running(self) -> bool:
@@ -104,6 +113,17 @@ class PidRecord:
         agent. It is the *identity* that is unproven, not the existence.
         """
         return self.status in (PidStatus.LIVE, PidStatus.UNDECIDABLE)
+
+    @property
+    def needs_cleanup(self) -> bool:
+        """Whether this record is known to name nothing worth keeping.
+
+        Only STALE qualifies. UNREADABLE is not cleanup-worthy on its own —
+        the file may be unreadable for a reason that has nothing to do with
+        the process it names, and deleting it would destroy the only record
+        of a host that might still be running.
+        """
+        return self.status is PidStatus.STALE
 
 
 @dataclass
@@ -335,7 +355,16 @@ class ProcessManager:
         try:
             import psutil
 
-            return psutil.Process(pid).create_time()
+            process = psutil.Process(pid)
+            create_time = process.create_time()
+            # A zombie still has a create time, but it has already exited and
+            # can never run again. Returning it would classify the record LIVE
+            # while ``is_process_running`` calls the same PID stopped — and the
+            # status and guard paths trust the record, so an exited agent would
+            # appear online and block maintenance until someone reaped it.
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return None
+            return create_time
         except Exception:
             return None
 
@@ -354,10 +383,10 @@ class ProcessManager:
         try:
             raw = pid_file.read_text().strip()
         except OSError as exc:
-            return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+            return PidRecord(PidStatus.UNREADABLE, None, None, None,
                              f"cannot read {pid_file}: {exc}")
         if not raw:
-            return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+            return PidRecord(PidStatus.UNREADABLE, None, None, None,
                              f"{pid_file} is empty")
 
         recorded_start: Optional[float] = None
@@ -372,7 +401,7 @@ class ProcessManager:
             try:
                 pid = int(payload["pid"])
             except (KeyError, TypeError, ValueError):
-                return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} has no usable pid")
             start = payload.get("started_at")
             recorded_start = float(start) if isinstance(start, (int, float)) else None
@@ -385,7 +414,7 @@ class ProcessManager:
             try:
                 pid = int(raw)
             except ValueError:
-                return PidRecord(PidStatus.UNDECIDABLE, None, None, None,
+                return PidRecord(PidStatus.UNREADABLE, None, None, None,
                                  f"{pid_file} is neither JSON nor a PID")
 
         live_start = ProcessManager.process_start_time(pid)
@@ -409,11 +438,13 @@ class ProcessManager:
         # recorded. A recycled PID necessarily started later.
         if abs(live_start - recorded_start) <= _PID_START_TIME_TOLERANCE_S:
             return PidRecord(PidStatus.LIVE, pid, root, port,
-                             f"PID {pid} is the process recorded here")
+                             f"PID {pid} is the process recorded here",
+                             started_at=recorded_start)
         return PidRecord(
             PidStatus.STALE, pid, root, port,
             f"PID {pid} belongs to a different process than the one recorded "
             f"(started {live_start:.3f}, file says {recorded_start:.3f})",
+            started_at=recorded_start,
         )
 
     @staticmethod
@@ -773,20 +804,23 @@ class ProcessManager:
         log_file = self.agent_log_file(resolved_dir)
 
         # Already running?
-        existing_pid = self.read_pid(pid_file)
-        if existing_pid and self.is_process_running(existing_pid):
+        existing = self.read_pid_record(pid_file)
+        if existing.is_running:
             ap = AgentProcess(
                 name=name,
                 port=config.port,
                 data_dir=resolved_dir,
-                pid=existing_pid,
+                pid=existing.pid,
                 pid_file=pid_file,
                 log_file=log_file,
             )
             self._agents[name] = ap
             return ap
 
-        if existing_pid:
+        # Keyed on the status rather than on a returned PID: ``read_pid``
+        # withholds a stale number by design, so a truthiness test silently
+        # stopped clearing the records that most need it (#2995).
+        if existing.needs_cleanup:
             self.clear_pid(pid_file)
 
         # Port check
@@ -1099,10 +1133,8 @@ class ProcessManager:
         pid_file = self.agent_pid_file(resolved_dir)
         log_file = self.agent_log_file(resolved_dir)
 
-        existing_pid = self.read_pid(pid_file)
-        pid = None
-        if existing_pid and self.is_process_running(existing_pid):
-            pid = existing_pid
+        existing = self.read_pid_record(pid_file)
+        pid = existing.pid if existing.is_running else None
 
         ap = AgentProcess(
             name=name,

@@ -228,13 +228,78 @@ class TestStaticHelpers:
             victim.kill()
             victim.wait()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="PID 1 is a POSIX convention; Windows uses 0 and 4 and has no PID 1",
+    )
     def test_a_process_owned_by_another_user_is_not_reported_dead(self):
         """`os.kill(pid, 0)` raises PermissionError for another user's process.
 
         Every OSError mapped to False, so a live process read as stopped.
-        PID 1 is the deterministic case: always running, never ours.
+        PID 1 is the deterministic POSIX case: always running, never ours.
         """
         assert ProcessManager.is_process_running(1) is True
+
+    def test_an_unreaped_zombie_is_not_a_live_record(self, tmp_path):
+        """`create_time()` still answers for a zombie, but it has exited.
+
+        Classifying it LIVE would put the record and ``is_process_running`` in
+        direct disagreement about the same PID, and the status and guard paths
+        trust the record — so an exited agent would read as online and block
+        maintenance until somebody reaped it.
+        """
+        if sys.platform == "win32":
+            pytest.skip("zombies are a POSIX process state")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        time.sleep(0.3)
+        pid_file = tmp_path / "zombie.pid"
+        ProcessManager.write_pid(pid_file, child.pid)
+
+        child.kill()
+        time.sleep(0.5)
+        # Deliberately not reaped: that is the condition under test.
+        try:
+            record = ProcessManager.read_pid_record(pid_file)
+            assert record.status is PidStatus.STALE
+            assert record.is_running is False
+            assert ProcessManager.is_process_running(child.pid) is False
+        finally:
+            child.wait()
+
+    def test_a_file_that_names_no_pid_is_not_reported_running(self, tmp_path):
+        """Unreadable is not the same claim as undecidable.
+
+        Undecidable names a PID that IS alive; an empty or malformed file
+        establishes no process at all. Reporting the latter as running showed
+        an online agent with a PID of ``None``, forced subprocess-mode output,
+        and made the guard refuse while ``read_pid`` returned nothing.
+        """
+        for content in ("", "   ", "not-a-pid", '{"no_pid": true}'):
+            pid_file = tmp_path / "bad.pid"
+            pid_file.write_text(content)
+            record = ProcessManager.read_pid_record(pid_file)
+            assert record.status is PidStatus.UNREADABLE, content
+            assert record.is_running is False, content
+            assert record.pid is None, content
+            assert record.needs_cleanup is False, (
+                "an unreadable file may name a live host; deleting it would "
+                "destroy the only record of it"
+            )
+
+    def test_the_recorded_start_time_is_what_reaches_the_caller(self, tmp_path):
+        """The record must carry the instant from the FILE.
+
+        A caller that looked the value up again would read whatever holds the
+        number now, so a PID reused between the read and the kill would be
+        validated against itself and signalled — defeating the check.
+        """
+        pid_file = tmp_path / "live.pid"
+        ProcessManager.write_pid(pid_file, os.getpid())
+        recorded = json.loads(pid_file.read_text())["started_at"]
+
+        record = ProcessManager.read_pid_record(pid_file)
+        assert record.status is PidStatus.LIVE
+        assert record.started_at == pytest.approx(recorded)
 
     def test_clear_pid_nonexistent(self, tmp_path):
         """Clearing a non-existent PID file should not raise."""

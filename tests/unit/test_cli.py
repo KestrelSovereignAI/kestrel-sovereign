@@ -38,6 +38,7 @@ from kestrel_sovereign.cli_lifecycle import (
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    PidRecord,
     PidStatus,
     ProcessManager,
 )
@@ -1060,7 +1061,11 @@ class TestCmdStart:
     ):
         multi_agent = MultiAgentConfig.load(multi_agent_env / "multi_agent.toml")
         pm = MagicMock(spec=ProcessManager)
-        pm.read_pid.return_value = None
+        # A real record, not a MagicMock: ``is_running`` on a mock is truthy,
+        # which would make start believe a server was already up.
+        pm.read_pid_record.return_value = PidRecord(
+            PidStatus.ABSENT, None, None, None, "no PID file"
+        )
         pm.is_port_in_use.return_value = False
         pm._load_env.return_value = {}
         pm.wait_for_health.return_value = False
@@ -1121,7 +1126,11 @@ class TestCmdStart:
     ):
         multi_agent = MultiAgentConfig.load(multi_agent_env / "multi_agent.toml")
         pm = MagicMock(spec=ProcessManager)
-        pm.read_pid.return_value = None
+        # A real record, not a MagicMock: ``is_running`` on a mock is truthy,
+        # which would make start believe a server was already up.
+        pm.read_pid_record.return_value = PidRecord(
+            PidStatus.ABSENT, None, None, None, "no PID file"
+        )
         pm.is_port_in_use.return_value = False
         pm._load_env.return_value = {}
         pm.wait_for_health.return_value = False
