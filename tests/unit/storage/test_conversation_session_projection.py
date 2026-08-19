@@ -2691,3 +2691,236 @@ async def test_a_nonpositive_id_is_still_walked(tmp_path):
         await _assert_agrees_with_the_grouper(db, projection)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_purge_is_not_undone_by_a_repair_that_was_already_running(tmp_path):
+    """"Leave no trace" has to survive a repair that started before the purge.
+
+    A transcript rebuild derives OUTSIDE the repair lock — it is an unbounded
+    pass and holding a lock across it is the wedge this design refuses. So it
+    can read history, have that history purged underneath it, and then publish
+    rows describing messages that no longer exist.
+
+    The currency half is worse than the privacy half. A first post-upgrade
+    repair reads a stamp of 0, because the ledger is created empty beside a
+    history that is already full. The purge then erases the ledger, which also
+    reads as 0. So the resurrected projection sits under a valid watermark whose
+    stamp matches the ledger exactly, and ``is_stale()`` answers **false**: the
+    projection reports itself a faithful cache of a history that is empty.
+
+    Staged rather than raced: the rebuild is paused between deriving and
+    publishing, which is the window, and a real race would only reach it
+    sometimes.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    async with AsyncStorage(str(tmp_path / "resurrect.db"), agent_id=AGENT) as storage:
+        db = storage.db
+        # History first, projection schema second: the ledger is then empty
+        # beside a full history, which is the post-upgrade shape that makes the
+        # published stamp 0.
+        await _seed(db, [
+            {"content": "secret turn", "role": "user", "created_at": _at(0),
+             "metadata": {"session_id": UUID_A}},
+            # Unstamped, which is what routes the repair through the transcript
+            # derivation rather than the chunked walk. Load-bearing: without it
+            # there is no derive-then-publish window to pause in.
+            {"content": "unstamped reply", "role": "assistant",
+             "created_at": _at(1), "metadata": {}},
+        ])
+        await db.ensure_session_projection_schema()
+
+        derived = asyncio.Event()
+        release = asyncio.Event()
+
+        # Pause between the derivation's READ of history and the transaction
+        # that publishes it — the only window there is. Pausing inside the
+        # transaction would hold SQLite's writer slot and deadlock the purge,
+        # proving only that the two cannot interleave once publishing has
+        # begun. Held at `fetchall` so the production `_rebuild_from_transcript`
+        # runs unaltered: a staged copy of it here would be a test asserting
+        # against its own reimplementation.
+        import kestrel_sovereign.storage.conversation_sessions as module
+
+        real_fetchall = db.fetchall
+        transcript_sql = module._live_rows_through(db.backend_type)
+
+        async def _pausing_fetchall(query, params=()):
+            rows = await real_fetchall(query, params)
+            if query == transcript_sql and not derived.is_set():
+                derived.set()
+                await asyncio.wait_for(release.wait(), 30)
+            return rows
+
+        db.fetchall = _pausing_fetchall
+        projection = ConversationSessionProjection(db, AGENT)
+        slow = asyncio.create_task(projection.repair())
+        try:
+            await asyncio.wait_for(derived.wait(), 30)
+            wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+            await storage.conversation.purge_all_since("1970-01-01", reason="test")
+            await wrapper.purge_ephemeral_session(reason="test")
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(slow), 30)
+        db.fetchall = real_fetchall
+
+        projection = ConversationSessionProjection(db, AGENT)
+        assert await projection.list() == [] or await projection.is_stale(), (
+            "a repair that started before the purge republished the purged "
+            "session, and the projection reports itself current over it"
+        )
+        assert await projection.list() == [], (
+            "purged conversation content is standing in the projection after "
+            "an EPHEMERAL exit"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_purge_is_not_undone_when_the_stamp_cannot_witness_it(tmp_path):
+    """The same race, in the state where the change stamp says nothing.
+
+    The stamp catches an ordinary concurrent mutation, and in the sibling test
+    above it is what does. It cannot catch this one. An upgrade creates the
+    ledger EMPTY beside a ``conversation_history`` that is already full — the
+    module docstring names that state — so a first repair derives at stamp 0.
+    The sweep then erases the ledger, and a missing ledger also reads 0.
+    Unchanged, by a route that changed everything: history is gone and the
+    projection about to be published describes it.
+
+    The empty ledger is arranged by deleting the row, which is precisely the
+    post-upgrade shape rather than a state invented for this test — every row
+    of history is still there, and only the counter that has never seen them is
+    absent.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    import kestrel_sovereign.storage.conversation_sessions as module
+
+    async with AsyncStorage(str(tmp_path / "upgrade.db"), agent_id=AGENT) as storage:
+        db = storage.db
+        await _seed(db, [
+            {"content": "secret turn", "role": "user", "created_at": _at(0),
+             "metadata": {"session_id": UUID_A}},
+            {"content": "unstamped reply", "role": "assistant",
+             "created_at": _at(1), "metadata": {}},
+        ])
+        # The post-upgrade shape: full history, ledger that has never counted it.
+        await db.execute(
+            "DELETE FROM conversation_history_changes WHERE agent_id = ?", (AGENT,)
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        assert await projection.observed_changes() == 0, "the fixture is not post-upgrade"
+
+        derived = asyncio.Event()
+        release = asyncio.Event()
+        real_fetchall = db.fetchall
+        transcript_sql = module._live_rows_through(db.backend_type)
+
+        async def _pausing_fetchall(query, params=()):
+            rows = await real_fetchall(query, params)
+            if query == transcript_sql and not derived.is_set():
+                derived.set()
+                await asyncio.wait_for(release.wait(), 30)
+            return rows
+
+        db.fetchall = _pausing_fetchall
+        slow = asyncio.create_task(projection.repair())
+        try:
+            await asyncio.wait_for(derived.wait(), 30)
+            wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+            await storage.conversation.purge_all_since("1970-01-01", reason="test")
+            await wrapper.purge_ephemeral_session(reason="test")
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(slow), 30)
+        db.fetchall = real_fetchall
+
+        fresh = ConversationSessionProjection(db, AGENT)
+        assert await fresh.observed_changes() == 0, (
+            "the ledger was not erased, so the stamp CAN witness the purge and "
+            "this case proves nothing the sibling test does not"
+        )
+        assert await fresh.list() == [], (
+            "purged history was republished under a stamp that matches the "
+            "erased ledger exactly"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_scoped_purge_is_not_undone_by_a_running_repair(tmp_path):
+    """The case the emptiness check cannot see: history SURVIVES the purge.
+
+    An EPHEMERAL stint that leaks one turn beside legitimate pre-entry history
+    is swept by ``created_at``, so the leak goes and the rest stays. History is
+    therefore not empty when a repair that started earlier publishes, and the
+    "is there any live row" question answers yes — while the snapshot in hand
+    still contains the leaked session.
+
+    What the projection would put back is not message text (it stores a pointer
+    and counts, never content) but a row naming a session that existed, when,
+    and how long it was. "Leave no trace" is about the trace, so the stamp is
+    asked as well: every purge is a row event, so an erased leak moves the
+    ledger, and a snapshot derived before it is refused.
+    """
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    import kestrel_sovereign.storage.conversation_sessions as module
+
+    async with AsyncStorage(str(tmp_path / "scoped.db"), agent_id=AGENT) as storage:
+        db = storage.db
+        await storage.conversation.add_conversation(
+            "user", "legitimate, pre-EPHEMERAL", session_id=UUID_A
+        )
+        # Past the per-second watermark boundary before entering, so the row
+        # above is strictly older than entry and the scoped sweep must keep it.
+        await asyncio.sleep(1.05)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        await storage.conversation.add_conversation(
+            "user", "leaked turn", session_id=UUID_B
+        )
+        # Unstamped, to route the repair through the transcript derivation.
+        await _seed(db, [{"content": "unstamped", "role": "assistant",
+                          "created_at": _at(900), "metadata": {}}])
+
+        projection = ConversationSessionProjection(db, AGENT)
+        derived = asyncio.Event()
+        release = asyncio.Event()
+        real_fetchall = db.fetchall
+        transcript_sql = module._live_rows_through(db.backend_type)
+
+        async def _pausing_fetchall(query, params=()):
+            rows = await real_fetchall(query, params)
+            if query == transcript_sql and not derived.is_set():
+                derived.set()
+                await asyncio.wait_for(release.wait(), 30)
+            return rows
+
+        db.fetchall = _pausing_fetchall
+        slow = asyncio.create_task(projection.repair())
+        try:
+            await asyncio.wait_for(derived.wait(), 30)
+            await wrapper.purge_ephemeral_session(reason="test")
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.shield(slow), 30)
+        db.fetchall = real_fetchall
+
+        fresh = ConversationSessionProjection(db, AGENT)
+        assert await fresh._any_live_row(), (
+            "history was emptied, so the sibling test's check would catch this "
+            "and nothing here is about the stamp"
+        )
+        assert await fresh.get(UUID_B) is None, (
+            "the repair republished a row naming the session that leaked during "
+            "the EPHEMERAL stint"
+        )

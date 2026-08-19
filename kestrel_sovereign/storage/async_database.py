@@ -1917,6 +1917,7 @@ class AsyncDatabase:
         method owns HOW to create things safely; that module owns WHAT.
         """
         from .conversation_sessions import (
+            canonical_order_index_columns,
             mutation_trigger_function,
             mutation_triggers,
             projection_tables,
@@ -1991,6 +1992,22 @@ class AsyncDatabase:
 
         await self.ensure_index(*_SESSION_PROJECTION_INDEX)
         await self.ensure_index(*_SESSION_FRONTIER_INDEX)
+        # The index that keeps `canonical_order()` a bounded traversal. Its
+        # columns are the ORDER BY's own key expressions, so it cannot drift
+        # from the ordering it exists for — and without it BOTH engines fall
+        # back to reading and sorting the agent's whole live history before
+        # applying LIMIT, which is the O(history) cost this epic removes.
+        await self.ensure_index(
+            "idx_conversation_agent_canonical",
+            "conversation_history",
+            canonical_order_index_columns(self.backend_type),
+        )
+        # The index that keeps `canonical_order()` a bounded traversal. Its
+        # columns are the ORDER BY's own key expressions, so it cannot drift
+        # from the ordering it exists for — and without it BOTH engines fall
+        # back to reading and sorting the agent's whole live history before
+        # applying LIMIT, which is the O(history) cost this epic removes.
+
 
     async def _trigger_exists(self, name: str, table: str) -> bool:
         """Whether ``table`` already carries a trigger called ``name``.

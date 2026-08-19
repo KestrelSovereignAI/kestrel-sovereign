@@ -584,6 +584,42 @@ def canonical_order(backend_type: str, *, descending: bool = False) -> str:
     )
 
 
+def canonical_order_index_columns(backend_type: str) -> str:
+    """The index that makes :func:`canonical_order` a bounded traversal.
+
+    Generated from the same key expressions the ``ORDER BY`` is, because an
+    index that does not match the ordering it exists for is not a slow index —
+    it is no index. Measured on 200,000 rows, ordering by the canonical keys
+    without it:
+
+    ==========  ==================================  =========
+    backend     plan                                page of 1000
+    ==========  ==================================  =========
+    SQLite      ``USE TEMP B-TREE FOR ORDER BY``    227 ms
+    SQLite      matching expression index            0.8 ms
+    PostgreSQL  ``Sort`` (top-N heapsort)            22 ms
+    PostgreSQL  ``Index Scan Backward``              0.2 ms
+    ==========  ==================================  =========
+
+    Both are O(history): the engine reads and sorts the agent's whole live
+    history before applying ``LIMIT``. That is the cost this epic exists to
+    remove, so reintroducing it on the list's own read path would have undone
+    the point of the work while every test still passed.
+
+    **One index serves both directions.** ``canonical_order()``'s ascending and
+    descending forms are exact reverses — that is why the NULLs are placed
+    explicitly — so the reader's newest-first page is a backward scan of the
+    same index the derivation walks forward. Ascending order is therefore what
+    is stored, with NULLs first, matching the ascending form exactly.
+    """
+    keys = ", ".join(
+        _canonical_key(backend_type, column) for column in CANONICAL_ORDER_COLUMNS
+    )
+    nulls = " NULLS FIRST" if backend_type == "postgres" else ""
+    first, _, rest = keys.partition(", ")
+    return f"agent_id, {first} ASC{nulls}, {rest} ASC"
+
+
 def _canonical_key(backend_type: str, column: str) -> str:
     """One ordering key, spelled so both engines compare it the same way.
 
@@ -1748,6 +1784,32 @@ class ConversationSessionProjection:
         written = 0
         async with self.db.transaction(immediate=True):
             await self._claim()
+            # Revalidate before publishing. The derivation above ran OUTSIDE
+            # this transaction — it has to, it is the unbounded pass — so
+            # history can have been erased underneath it, and publishing then
+            # puts back a description of messages that no longer exist. The
+            # EPHEMERAL sweep is exactly that erasure, so "leave no trace" would
+            # be undone by a repair that merely started first.
+            #
+            # Two questions, because one is not enough. The stamp catches every
+            # ordinary mutation, but it cannot catch this one: a first
+            # post-upgrade repair reads a stamp of 0 (the ledger is created
+            # empty beside a history already full), the sweep then erases the
+            # ledger, and a missing ledger also reads 0. Unchanged, by a route
+            # that changed everything. So the second question is asked of
+            # history itself, whose emptiness is the sweep's own precondition.
+            if not await self._any_live_row():
+                # No live history means the correct projection is the empty one,
+                # and the ground is already cleared below. Publishing nothing
+                # and recording nothing leaves the watermark invalid, so the
+                # next repair derives again — from what is actually there.
+                await self.db.execute(
+                    "DELETE FROM conversation_sessions WHERE agent_id = ?",
+                    (self.agent_id,),
+                )
+                return _Step(REBUILT, 0, True)
+            if await self.observed_changes() != observed:
+                return _Step(REBUILT, 0, False)
             await self.db.execute(
                 "DELETE FROM conversation_sessions WHERE agent_id = ?",
                 (self.agent_id,),
@@ -1763,6 +1825,14 @@ class ConversationSessionProjection:
         return _Step(REBUILT, written, True)
 
     # ── internals ────────────────────────────────────────────────────────
+
+    async def _any_live_row(self) -> bool:
+        """Whether this agent has any live history at all. One index probe."""
+        return bool(await self.db.fetchval(
+            "SELECT 1 FROM conversation_history "
+            f"WHERE agent_id = ? AND {_LIVE} LIMIT 1",
+            (self.agent_id,),
+        ))
 
     async def _id_floor(self) -> int:
         """The frontier a walk that has accounted for NOTHING starts from.

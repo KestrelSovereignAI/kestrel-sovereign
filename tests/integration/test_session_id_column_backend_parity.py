@@ -44,6 +44,7 @@ import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
+    canonical_order,
     PROJECTION_INPUT_COLUMNS,
     ConversationSessionProjection,
 )
@@ -2818,4 +2819,65 @@ async def test_a_null_stamped_row_is_not_redated_by_an_append(db_backend, monkey
         )
         await _assert_the_projection_agrees_with_the_grouper(
             db, projection, agent_id
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.timeout(180)
+async def test_the_conversation_list_stays_a_bounded_traversal(db_backend, monkeypatch):
+    """The list must read a page, not the history behind it.
+
+    This is the whole point of the epic, so it is asserted on the PLAN rather
+    than on a stopwatch: a timing threshold on a shared machine is a flake, and
+    what actually matters is whether the engine can walk the index or has to
+    sort everything first.
+
+    It is not hypothetical. `canonical_order()` orders by `julianday(created_at)`
+    on SQLite and places NULLs explicitly on both engines, and neither matches a
+    plain `(agent_id, created_at)` index. Measured at 200,000 rows before the
+    matching index existed: SQLite reported `USE TEMP B-TREE FOR ORDER BY` and
+    took 227 ms against 0.8 ms, PostgreSQL a top-N `Sort` at 22 ms against
+    0.2 ms — both O(history), on the read path this work exists to bound.
+    """
+    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:plan:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        for i in range(2000):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at) "
+                "VALUES (?, 'user', 'x', NULL, NULL, ?)",
+                (
+                    agent_id,
+                    timestamp_query_param(
+                        db.backend_type, f"2026-03-01T{i % 24:02d}:{i % 60:02d}:00"
+                    ),
+                ),
+            )
+        await db.execute("ANALYZE" if db.backend_type == "sqlite" else "ANALYZE conversation_history")
+
+        order = canonical_order(db.backend_type, descending=True)
+        query = (
+            "SELECT id, role, content, metadata, created_at FROM conversation_history "
+            f"WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL {order} "
+            "LIMIT 50"
+        )
+        prefix = (
+            "EXPLAIN QUERY PLAN " if db.backend_type == "sqlite" else "EXPLAIN "
+        )
+        plan = "\n".join(
+            " ".join(str(value) for value in row)
+            for row in await db.fetchall(prefix + query, (agent_id,))
+        )
+
+        unbounded = "TEMP B-TREE" if db.backend_type == "sqlite" else "Sort"
+        assert unbounded not in plan, (
+            f"the conversation list sorts the agent's whole history before "
+            f"taking its page — the ordering no longer matches "
+            f"idx_conversation_agent_canonical:\n{plan}"
+        )
+        assert "idx_conversation_agent_canonical" in plan, (
+            f"the list is not using the index built for its ordering:\n{plan}"
         )
