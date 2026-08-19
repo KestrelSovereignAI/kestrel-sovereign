@@ -1306,6 +1306,37 @@ class SignalDispatcher:
             await self.initialize_durable_delivery()
             await self._durable_store.register_consumer(registration)
 
+    async def deactivate_durable_consumer(self, *, consumer_id: str) -> bool:
+        """Deactivate one of this agent's durable consumers.
+
+        This is the public durable-consumer lifecycle boundary.  It returns
+        ``False`` only when this dispatcher has no registration with
+        ``consumer_id``; an already-inactive registration returns ``True``.
+        The durable store atomically preserves its historical rows while
+        terminalizing every live delivery, so no post-deactivation claim or
+        stale executor follow-up can recreate work.
+        """
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            deactivated = await self._durable_store.deactivate_consumer(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+            )
+            if not deactivated:
+                return False
+            # Payload-eliding privacy modes retain a process-local sidecar
+            # until a delivery reaches a terminal state.  The store has just
+            # made this consumer's nonterminal rows terminal, so discard that
+            # no-longer-authorized live payload state too.
+            for delivery_id, handoff in list(self._transient_durable_handoffs.items()):
+                if handoff.consumer_id == consumer_id:
+                    self._discard_transient_durable_handoff(delivery_id)
+            self._started_durable_cognition_consumers.discard(consumer_id)
+            timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
+            if timer is not None:
+                timer.cancel()
+            return True
+
     async def claim_durable_delivery(
         self, *, consumer_id: str, executor_id: str
     ) -> Optional[DurableDelivery]:
