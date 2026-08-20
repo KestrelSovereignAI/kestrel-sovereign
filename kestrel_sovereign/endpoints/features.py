@@ -12,6 +12,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.features.config_validation import (
+    FeatureConfigInvalid,
+    validate_feature_config,
+)
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
@@ -653,70 +657,16 @@ async def update_feature_config(
 
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """JSON Schema validation for feature config, as an HTTP concern.
+
+    The rule itself is transport-neutral and shared with the host's declarative
+    provisioning path (#3008); this converts its error at the HTTP seam so a
+    sibling ValueError from somewhere else cannot masquerade as a 422.
     """
-    JSON Schema validation for feature config.
-
-    Checks required fields, type constraints, minimum/maximum bounds, and
-    enum restrictions from the schema.
-    Raises HTTPException(422) on validation failure.
-    """
-    required = schema.get("required", [])
-    properties = schema.get("properties", {})
-
-    for field_name in required:
-        if field_name not in config:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Missing required config field: '{field_name}'",
-            )
-
-    type_map = {
-        "string": str,
-        "integer": int,
-        "number": (int, float),
-        "boolean": bool,
-        "array": list,
-        "object": dict,
-    }
-
-    for key, value in config.items():
-        if key not in properties:
-            continue
-
-        prop_schema = properties[key]
-
-        # Type check
-        expected_type_name = prop_schema.get("type")
-        if expected_type_name and expected_type_name in type_map:
-            expected = type_map[expected_type_name]
-            if not isinstance(value, expected):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Config field '{key}' must be {expected_type_name}, got {type(value).__name__}",
-                )
-
-        # Minimum / maximum bounds (for integer and number types)
-        if isinstance(value, (int, float)):
-            minimum = prop_schema.get("minimum")
-            if minimum is not None and value < minimum:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Config field '{key}' must be >= {minimum}, got {value}",
-                )
-            maximum = prop_schema.get("maximum")
-            if maximum is not None and value > maximum:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Config field '{key}' must be <= {maximum}, got {value}",
-                )
-
-        # Enum restriction
-        enum_values = prop_schema.get("enum")
-        if enum_values is not None and value not in enum_values:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Config field '{key}' must be one of {enum_values}, got {value!r}",
-            )
+    try:
+        validate_feature_config(config, schema)
+    except FeatureConfigInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

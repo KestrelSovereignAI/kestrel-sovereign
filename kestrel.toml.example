@@ -651,15 +651,34 @@ role = "technical_reviewer"
 # running_agent_source_root = "/srv/kestrel/kestrel-sovereign"
 #
 # NOTE: none of the [talon.*] tables above are read until the FEATURE is told
-# which file to read them from. The feature holds its own small config — a
-# `config_path` naming this file — stored beside the agent's database as
-# `talon_feature_config.toml`. Writing `config_path` into this file cannot work
-# and is not a supported spelling: the feature has to already know where this
-# file is in order to read it. Set it through the feature configuration surface
-# (control panel, or PATCH /api/features/TalonCoordinatorFeature/config).
+# which file holds them, via its own `config_path` setting. Until that is set,
+# every Talon operation fails on unresolved configuration and the tables above
+# are inert — including `[talon.preference]`. See #3008.
 #
-# Until that is set, every Talon operation fails on unresolved configuration
-# and `[talon.preference]` above is inert. See #3008.
+# Two files are involved and they are BOTH called kestrel.toml, which is the
+# easy mistake to make:
+#
+#   * THIS file — the project configuration. It holds `[talon.runtime]` and
+#     `[talon.preference]` above. It is what `config_path` points AT.
+#
+#   * The AGENT's kestrel.toml, beside that agent's database (e.g.
+#     `agent_data/<name>/kestrel.toml`). It holds the pointer:
+#
+#         [features.talon.config]
+#         config_path = "/srv/kestrel/kestrel.toml"
+#
+# Feature configuration is addressed by PACKAGE name — `talon`, the name
+# `kestrel feature enable` uses — not by the feature's class name, which is
+# what the HTTP route keys on. A `[features.TalonCoordinatorFeature.config]`
+# block is never read (the loader logs a warning if it finds one).
+#
+# Putting `[features.talon.config]` in THIS file does nothing: the block is
+# read from the agent's file. And a bare `config_path` under `[talon]` here
+# cannot work at all — the feature would have to already know where this file
+# is in order to read it.
+#
+# Equivalent to the agent-file block, for a running agent, without a restart:
+#   PATCH /api/features/TalonCoordinatorFeature/config
 
 # =============================================================================
 # Amendment VIII: Emancipation (optional, default: dormant)

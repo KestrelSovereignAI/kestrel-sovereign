@@ -44,6 +44,7 @@ from kestrel_sovereign.features import (
     verify_mandatory_feature_set,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.config_validation import validate_feature_config
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
@@ -4274,21 +4275,22 @@ class KestrelAgent(
         safe to be loud instead of fatal here precisely because an unconfigured
         feature now reports itself unconfigured instead of claiming readiness.
         """
-        if getattr(feature, "config_schema", None) is None:
+        schema = getattr(feature, "config_schema", None)
+        if schema is None:
             return
-        declared = self._declared_feature_config(type(feature).__name__)
+        # ``feature.name`` rather than the concrete class: an isolated feature
+        # is loaded as a ProxyFeature and only ``name`` carries the advertised
+        # registry class, so keying on type() would silently skip every
+        # isolated feature — reintroducing the exact silence this closes.
+        declared = self._declared_feature_config(getattr(feature, "name", "") or "")
         if not declared:
             return
-        try:
-            await feature.set_config(dict(declared))
-        except Exception as exc:  # noqa: BLE001 - one feature must not fail boot
-            logging.error(
-                "Feature '%s' was given configuration in %s that it rejected: "
-                "%s. The agent is running with that feature unconfigured.",
-                type(feature).__name__,
-                self._agent_toml_path(),
-                exc,
-            )
+        declared = dict(declared)
+        if isinstance(schema, dict):
+            # The same rule the HTTP configuration route applies. Validating
+            # here means a bad value is refused before any feature persists it.
+            validate_feature_config(declared, schema)
+        await feature.set_config(declared)
 
     def _agent_toml_path(self) -> Optional[Path]:
         """The per-agent TOML, beside the agent's database file."""
@@ -4365,7 +4367,27 @@ class KestrelAgent(
                     "could not initialize",
                 ) from exc
             raise
-        await self._apply_host_feature_config(feature)
+        try:
+            await self._apply_host_feature_config(feature)
+        except Exception as exc:
+            # Deliberately fatal to this feature. A rejected block does NOT
+            # leave the feature unconfigured — a feature that validates before
+            # replacing its active config (Talon does) keeps running its
+            # PREVIOUS configuration, so swallowing this would leave the agent
+            # dispatching with paths and policy the operator did not declare
+            # and believes they replaced. Silent divergence between declared
+            # and running configuration is the whole subject of #3008; it must
+            # not be reintroduced by its own fix.
+            await self._shutdown_failed_feature(feature)
+            logging.error(
+                "Feature '%s' rejected the configuration declared in %s: %s. "
+                "The feature is NOT loaded, so it cannot run with settings "
+                "other than the ones declared.",
+                feature_class_name,
+                self._agent_toml_path(),
+                exc,
+            )
+            raise
         self.features[feature.name] = feature
 
         try:
@@ -4554,6 +4576,10 @@ class KestrelAgent(
             )[0]
         try:
             await feature.initialize()
+            # initialize() can reset config a feature does not persist (a
+            # volatile-privacy host key, for example), so a disable/enable
+            # cycle would otherwise lose the declared value until restart.
+            await self._apply_host_feature_config(feature)
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )
