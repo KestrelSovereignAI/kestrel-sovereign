@@ -4249,6 +4249,96 @@ class KestrelAgent(
                 exc,
             )
 
+    async def _apply_host_feature_config(self, feature: Feature) -> None:
+        """Hand a freshly initialized feature the config the operator declared.
+
+        A feature that declares a ``config_schema`` has, until now, had no
+        declarative way to be given values: the only route was an HTTP call to
+        the configuration endpoint. That is why extracting Talon silently broke
+        it on every existing agent — the package correctly requires the host to
+        supply explicit paths, and the host had no mechanism with which to
+        supply them (#3008). Features that needed configuration either read the
+        agent's TOML themselves, re-deriving a file location per feature, or
+        were simply unconfigurable without a control-panel visit.
+
+        Core cannot know what any feature's configuration means, and must never
+        import a feature package to find out. It does not need to: the registry
+        already maps a feature class to the package that owns it, so the block
+        is addressed by the *operator-facing* package name — ``[features.talon
+        .config]``, the name used by ``kestrel feature enable`` — rather than
+        by the class name, which is an implementation detail that happens to
+        leak through ``self.features``.
+
+        A declared block that will not apply is a capability gap rather than an
+        identity gap: the agent boots and says so, rather than refusing. It is
+        safe to be loud instead of fatal here precisely because an unconfigured
+        feature now reports itself unconfigured instead of claiming readiness.
+        """
+        if getattr(feature, "config_schema", None) is None:
+            return
+        declared = self._declared_feature_config(type(feature).__name__)
+        if not declared:
+            return
+        try:
+            await feature.set_config(dict(declared))
+        except Exception as exc:  # noqa: BLE001 - one feature must not fail boot
+            logging.error(
+                "Feature '%s' was given configuration in %s that it rejected: "
+                "%s. The agent is running with that feature unconfigured.",
+                type(feature).__name__,
+                self._agent_toml_path(),
+                exc,
+            )
+
+    def _agent_toml_path(self) -> Optional[Path]:
+        """The per-agent TOML, beside the agent's database file."""
+        if not self.storage_path:
+            return None
+        return Path(self.storage_path).parent / "kestrel.toml"
+
+    def _declared_feature_config(self, feature_class_name: str) -> Dict[str, Any]:
+        """Read ``[features.<package>.config]`` for one feature class."""
+        path = self._agent_toml_path()
+        if path is None or not path.exists():
+            return {}
+        from kestrel_sovereign.feature_registry import get_package_for_feature
+
+        package = get_package_for_feature(feature_class_name)
+        if package is None:
+            return {}
+        try:
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ImportError:
+                import tomli as tomllib  # type: ignore[import-not-found]
+            with open(path, "rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, ValueError) as exc:
+            logging.warning("Failed to read feature configuration from %s: %s", path, exc)
+            return {}
+        features = data.get("features")
+        if not isinstance(features, dict):
+            return {}
+        entry = features.get(package.name)
+        if not isinstance(entry, dict):
+            # The confusable spelling is the class name, because that is what
+            # the HTTP configuration route and ``self.features`` are keyed by.
+            # A block written there would be silently ignored, which is the
+            # failure this whole mechanism exists to end — so say so.
+            mistaken = features.get(feature_class_name)
+            if isinstance(mistaken, dict) and "config" in mistaken:
+                logging.warning(
+                    "%s declares [features.%s.config], which is never read. "
+                    "Feature configuration is addressed by package name: use "
+                    "[features.%s.config].",
+                    path,
+                    feature_class_name,
+                    package.name,
+                )
+            return {}
+        declared = entry.get("config")
+        return declared if isinstance(declared, dict) else {}
+
     async def _register_feature(
         self,
         feature: Feature,
@@ -4275,6 +4365,7 @@ class KestrelAgent(
                     "could not initialize",
                 ) from exc
             raise
+        await self._apply_host_feature_config(feature)
         self.features[feature.name] = feature
 
         try:
