@@ -1932,6 +1932,7 @@ class AsyncDatabase:
             mutation_trigger_functions,
             mutation_triggers,
             projection_tables,
+            shape_change_invalidation,
         )
 
         tables = projection_tables()
@@ -1984,14 +1985,17 @@ class AsyncDatabase:
                 # window with NO stamp, in which writes land unrecorded and the
                 # projection afterwards reports itself current — the one
                 # outcome this design does not tolerate. Slow beats silent.
+                changed = False
                 for name, ddl in functions:
                     if name not in installed_functions:
                         await self._backend.execute(ddl)
                         logger.info("created function %s (#2959)", name)
+                        changed = True
                 for name, ddl in triggers:
                     if name not in installed_triggers:
                         await self._backend.execute(ddl)
                         logger.info("created trigger %s (#2959)", name)
+                        changed = True
                 for name in sorted(installed_triggers - set(wanted_triggers)):
                     await self._backend.execute(self._drop_trigger_sql(
                         name, "conversation_history"
@@ -2006,6 +2010,36 @@ class AsyncDatabase:
                         f"DROP FUNCTION IF EXISTS {self._quoted(name)}()"
                     )
                     logger.info("retired superseded function %s (#2998)", name)
+                    changed = True
+                if changed:
+                    # LAST, and only when the shape actually moved. Counters
+                    # accumulated under a different definition of "a change"
+                    # cannot be compared to ones accumulated under this
+                    # definition, and a watermark that still matches such a
+                    # counter is a projection reporting itself current about a
+                    # change it was never told of. On a fresh database this
+                    # updates nothing, because there is nothing yet to
+                    # disbelieve.
+                    #
+                    # It is also what makes a MIXED DEPLOYMENT safe rather than
+                    # merely unlikely. Two revisions with different watched
+                    # lists each see the other's objects as superseded, and
+                    # this runs on every `from_pool()`, so the shape flaps —
+                    # but a revision cannot read the projection without first
+                    # passing through here, and every flip retires the
+                    # counters. A write that landed while the narrower shape
+                    # was installed is therefore repaired before the revision
+                    # that cares about it reads anything. The cost is that each
+                    # flip rebuilds every agent, which is why this logs how
+                    # many rather than staying quiet.
+                    retired = await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
+                    logger.info(
+                        "change-stamp shape moved; retired the counters for "
+                        "%s agent(s), which will rebuild (#2998)",
+                        retired,
+                    )
 
         # Outside the lock deliberately: the statements have committed, so this
         # reads what the next boot would read, and a raise here is this

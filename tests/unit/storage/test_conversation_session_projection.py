@@ -2629,6 +2629,88 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(120)
+async def test_a_date_only_sqlite_can_read_escalates_to_the_transcript(tmp_path):
+    """The two readers disagree about which timestamps are readable — both ways.
+
+    The fold decides whether id order agrees with canonical order from the
+    ordering key SQL selected alongside the row, and escalates when that key is
+    NULL. That covers stamps SQL cannot read. It does not cover the opposite,
+    and the opposite exists: ``julianday`` NORMALIZES a day-of-month overflow
+    rather than rejecting it, so ``2023-02-29T12:00:00`` yields a real key
+    pointing at March 1 while ``datetime.fromisoformat`` — which is what the
+    grouper uses — refuses it outright. Measured on sqlite 3.50.4, and
+    ``2023-04-31`` behaves the same way; an impossible MONTH is rejected by
+    both, so the divergence is specific to the day.
+
+    A row like that must take the transcript path. Folded in isolation its
+    undatable fallback looks at whichever row preceded it IN THIS SESSION'S
+    SLICE, while the grouper looks at whichever row preceded it in the whole
+    history — and those differ exactly when another session's row falls
+    between, which is the arrangement seeded here. Getting it wrong stores a
+    ``last_message_at`` the grouper would not produce, under a watermark that
+    reports itself current.
+    """
+    from kestrel_sovereign.storage.session_grouping import (
+        coalesce_sessions_by_session_id,
+        coerce_session_timestamp,
+        group_messages_into_sessions,
+    )
+
+    impossible = "2023-02-29T12:00:00"
+    assert coerce_session_timestamp(impossible) is None, (
+        "the premise died: Python now reads this stamp, so nothing diverges"
+    )
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "impossible.db"))
+    try:
+        assert await db.fetchval("SELECT julianday(?)", (impossible,)) is not None, (
+            "the premise died: SQLite now refuses this stamp too"
+        )
+        await _seed(
+            db,
+            [
+                {"content": "A opens", "role": "user",
+                 "created_at": "2023-02-28T09:00:00",
+                 "metadata": {"session_id": UUID_A}},
+                # B falls BETWEEN A's rows, so A's slice and A's whole-history
+                # neighbourhood have different predecessors for the row below.
+                {"content": "B interposes", "role": "user",
+                 "created_at": "2023-02-28T10:00:00",
+                 "metadata": {"session_id": UUID_B}},
+                {"content": "A continues, undatable to Python", "role": "user",
+                 "created_at": impossible,
+                 "metadata": {"session_id": UUID_A}},
+            ],
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        grouped = coalesce_sessions_by_session_id(
+            group_messages_into_sessions(await _live_history(db),
+                                         keep_empty_markers=True)
+        )
+        reader = {
+            str(session["session_id"]): (
+                session["started_at"], session["last_message_at"]
+            )
+            for session in grouped
+        }
+        projected = {
+            row["session_id"]: (row["started_at"], row["last_message_at"])
+            for row in await projection.list()
+        }
+        assert projected == reader, (
+            "the projection disagrees with the grouper about a session holding "
+            "a stamp only SQLite can read"
+        )
+        assert not await projection.is_stale(), (
+            "the projection agreed but then reported itself behind"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_appending_elsewhere_does_not_restale_an_undatable_session(tmp_path):
     """An undatable row's substitute stamp must not depend on other sessions.
 

@@ -1744,6 +1744,148 @@ async def test_a_superseded_trigger_shape_is_retired_rather_than_left_running(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_a_shape_upgrade_does_not_leave_a_projection_claiming_to_be_current(
+    db_backend,
+):
+    """Widening the watched list retires what was built under the narrow one.
+
+    The trigger shape IS the definition of "a change". Widen it and every event
+    that happened under the old definition was, by the new one, never recorded
+    — the ledger's counter never moved for it and the watermark that matched
+    that counter still matches. So the projection goes on reporting itself
+    current while holding an answer the grouper would not give, which is the
+    single thing this whole design exists to make impossible.
+
+    Reachable on one host with one revision: it is what an ordinary upgrade
+    does. The row archived below is invisible to a shape that does not watch
+    ``archived_at``, and the conversation list hides archived sessions — so the
+    symptom is a session that will not go away.
+    """
+    import kestrel_sovereign.storage.conversation_sessions as cs
+
+    agent_id = "did:kestrel:shape-upgrade"
+    metadata = json.dumps({"session_id": UUID_A})
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+
+        original = cs.PROJECTION_INPUT_COLUMNS
+        try:
+            cs.PROJECTION_INPUT_COLUMNS = tuple(
+                column for column in original if column != "archived_at"
+            )
+            await db.ensure_session_projection_schema()
+            await _seed_one_projected_row(db, agent_id, metadata)
+
+            narrow = ConversationSessionProjection(db, agent_id)
+            assert (await narrow.repair()).current
+            assert not await narrow.is_stale()
+            assert len(await narrow.list()) == 1
+
+            # Archived under the narrow shape, so nothing stamps it.
+            await db.execute(
+                "UPDATE conversation_history SET archived_at = ? "
+                "WHERE agent_id = ?",
+                (
+                    timestamp_query_param(db.backend_type, "2026-03-02T09:00:00"),
+                    agent_id,
+                ),
+            )
+            assert not await narrow.is_stale(), (
+                "the premise died: the narrow shape stamped a column it does "
+                "not watch, so there is no unrecorded change to survive"
+            )
+        finally:
+            cs.PROJECTION_INPUT_COLUMNS = original
+
+        await db.ensure_session_projection_schema()
+
+        projection = ConversationSessionProjection(db, agent_id)
+        assert await projection.is_stale(), (
+            "after widening the watched list the projection still reports "
+            "itself current, so the change it could not see never gets repaired"
+        )
+        assert (await projection.repair()).current
+        assert await projection.list() == [], (
+            "the repair kept a session whose only row is archived"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_two_revisions_fighting_over_the_shape_still_converge(db_backend):
+    """A mixed deployment thrashes. What it must not do is go quietly wrong.
+
+    ``_init_schema`` runs on every ``from_pool()``, so during a rolling
+    deployment two revisions with different watched lists each see the other's
+    objects as superseded and each replaces them. The shape flaps, and a write
+    landing while the NARROWER one is installed is never stamped — yet the
+    wider revision's code believes that column is covered.
+
+    What makes it safe is that a revision cannot read the projection without
+    first passing through the schema check that flips the shape back, and every
+    flip retires the counters. So the unstamped write is not detected when it
+    happens; it is detected the next time the shape moves, which is strictly
+    before the revision that cares about it reads anything.
+
+    The cost is real and is not correctness: every flip rebuilds every agent's
+    projection, so a long-lived mixed deployment rebuilds continuously. That is
+    logged, loudly, naming how many agents were retired.
+    """
+    import kestrel_sovereign.storage.conversation_sessions as cs
+
+    agent_id = "did:kestrel:rolling-deploy"
+    metadata = json.dumps({"session_id": UUID_A})
+    original = cs.PROJECTION_INPUT_COLUMNS
+    narrow = tuple(column for column in original if column != "archived_at")
+
+    async def install(columns):
+        cs.PROJECTION_INPUT_COLUMNS = columns
+        try:
+            await db.ensure_session_projection_schema()
+        finally:
+            cs.PROJECTION_INPUT_COLUMNS = original
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+
+        await install(original)
+        await _seed_one_projected_row(db, agent_id, metadata)
+        projection = ConversationSessionProjection(db, agent_id)
+        assert (await projection.repair()).current
+        assert len(await projection.list()) == 1
+
+        # The older revision serves a request and wins the shape back.
+        await install(narrow)
+        assert (await projection.repair()).current
+
+        # A write only the wider shape watches, landing while the narrower one
+        # is installed. Nothing stamps it.
+        await db.execute(
+            "UPDATE conversation_history SET archived_at = ? WHERE agent_id = ?",
+            (
+                timestamp_query_param(db.backend_type, "2026-03-02T09:00:00"),
+                agent_id,
+            ),
+        )
+        assert not await projection.is_stale(), (
+            "the premise died: the narrow shape stamped a column outside its "
+            "watched list"
+        )
+
+        # The wider revision serves the next request. It cannot read without
+        # passing through this.
+        await install(original)
+        assert await projection.is_stale(), (
+            "the shape flipped back and the projection still claims to be "
+            "current about a write made while it was not watching"
+        )
+        assert (await projection.repair()).current
+        assert await projection.list() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_a_database_built_on_an_older_watched_list_is_converted(db_backend):
     """The #2998 scenario end to end: the column list changes after release.
 

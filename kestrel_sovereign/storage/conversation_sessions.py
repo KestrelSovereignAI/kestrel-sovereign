@@ -558,6 +558,12 @@ _DERIVED_FROM = "id, role, metadata, created_at, session_id"
 #: Index of the ordering key every derivation selects alongside its columns.
 _ORDER_KEY = 5
 
+#: Index of ``created_at`` within :data:`_DERIVED_FROM`. Named because the fold
+#: has to ask the GROUPER's parser about the same stamp the ordering key was
+#: built from, and a bare ``row[3]`` beside a named ``row[_ORDER_KEY]`` reads
+#: like the two are unrelated.
+_CREATED_AT = 3
+
 
 def _derived_from(backend_type: str) -> str:
     """The columns a derivation reads, plus the key its ORDER BY sorted on.
@@ -1015,6 +1021,29 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
     to reinsert it, so this adds a second O(history) allocation to a path that
     had one, in the cheaper medium, while making the statement itself ~35x
     faster.
+
+    What the ledger costs regardless of trigger shape
+    -------------------------------------------------
+
+    One row per agent, upserted inside the writing transaction, means the row
+    lock is held to COMMIT. **Write transactions touching one agent's history
+    are therefore serialized against each other for the length of the longest
+    one.** That is inherent to a per-agent counter, not to the per-statement
+    conversion — the per-row form took the same lock earlier and held it
+    longer.
+
+    Short autocommit statements hold it for microseconds and nobody notices.
+    The paths that do are the long ones: ``_purge_conversation_rows`` wraps its
+    snapshot, its deletes and its lexical cleanup in one transaction, and the
+    restore wraps a whole history. While either runs, an append for that agent
+    waits.
+
+    It is a stall and not a deadlock, and that rests on lock ORDER rather than
+    luck: every path writes history before it takes the lexical advisory lock,
+    never the reverse, so there is no cycle to detect.
+    ``test_concurrent_final_shared_key_purges_reclaim_tokens`` is where this is
+    pinned down — it found the serialization by deadlocking its own harness
+    against it — and it fails if the ledger ever stops serializing.
     """
     generation = _new_generation(backend_type)
     if backend_type == "postgres":
@@ -1209,6 +1238,37 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
         (name, ddl)
         for kind, _role, name, ddl in _mechanism(backend_type)
         if kind == "trigger"
+    )
+
+
+def shape_change_invalidation(backend_type: str) -> str:
+    """SQL retiring every ledger counter, for when the TRIGGERS change.
+
+    The trigger shape is the definition of "a change". Widen it and every event
+    that happened under the narrower one was, by the new definition, never
+    recorded — the counter did not move for it, and the watermark that matched
+    the counter still matches. So the projection reports itself current while
+    holding an answer the grouper would not give, which is the single outcome
+    this design exists to make impossible. Reachable on one host with one
+    revision: it is what an ordinary upgrade does.
+
+    Rotating the generation is not a new mechanism; it is the one already
+    written for exactly this. :meth:`ConversationSessionProjection.is_stale` and
+    :meth:`_plan` both treat a changed generation as "these counters belong to a
+    different incarnation, so equality across them would be an accident", and
+    both answer REBUILD. Invalidating the WATERMARKS instead would have been the
+    more obvious edit and a worse one: a repair already in flight across the
+    migration would go on to publish, having decided what to write under the old
+    definition. The publish fence re-reads the generation, so rotating it stops
+    that repair too.
+
+    Every row, in one statement. Both engines evaluate their generator per row —
+    ``gen_random_uuid()`` and ``randomblob`` are volatile — so the agents do not
+    all land on one value and become comparable to each other.
+    """
+    return (
+        "UPDATE conversation_history_changes SET generation = "
+        + _new_generation(backend_type)
     )
 
 
@@ -2488,6 +2548,28 @@ class ConversationSessionProjection:
         # order, so escalate rather than guess.
         keys = [row[_ORDER_KEY] for row in rows]
         if any(key is None for key in keys):
+            raise _NeedsTranscript(session_id)
+        # ...and the other direction, which a non-NULL key cannot show.
+        # ``julianday`` NORMALIZES a day-of-month overflow rather than
+        # rejecting it: ``2023-02-29T12:00:00`` yields a real key pointing at
+        # March 1, while ``fromisoformat`` — which is what the grouper reads
+        # with — refuses it outright. Measured on sqlite 3.50.4, and
+        # ``2023-04-31`` behaves the same; an impossible MONTH is refused by
+        # both, so the gap is specific to the day.
+        #
+        # Such a row has an ordering key and no parsed stamp, so the fold takes
+        # its undatable fallback — which looks at the predecessor in THIS
+        # SESSION'S SLICE, where the grouper looks at the predecessor in the
+        # whole history. Those differ exactly when another session's row falls
+        # between, and the result is a stored ``last_message_at`` the grouper
+        # would not produce, under a watermark reporting itself current.
+        #
+        # :data:`_JULIANDAY_READABLE` closed the direction where the PARSER was
+        # wider than the key. This is the direction where the KEY is wider than
+        # the parser, and one gate cannot answer both: the regex is a question
+        # about syntax, and whether February has a 29th is a question about the
+        # year.
+        if any(coerce_session_timestamp(row[_CREATED_AT]) is None for row in rows):
             raise _NeedsTranscript(session_id)
         if any(later < earlier for earlier, later in zip(keys, keys[1:])):
             raise _NeedsTranscript(session_id)
