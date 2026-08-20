@@ -72,6 +72,14 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     if isinstance(created_at, datetime):
         parsed = created_at
     elif isinstance(created_at, str):
+        # The gate goes BEFORE every attempt, not just the last one. Both
+        # parsers below read strings the ordering key cannot: `strptime`
+        # compiles its format with `re.IGNORECASE`, so it takes a lowercase
+        # `t` separator that `julianday` rejects, and `fromisoformat` takes
+        # more still. Guarding only the fallback left that one through —
+        # measured, and the reason the first version of this fix was incomplete.
+        if not _JULIANDAY_READABLE.match(created_at):
+            return None
         parsed = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
             try:
@@ -79,9 +87,10 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
                 break
             except ValueError:
                 continue
-        if parsed is None and _EXTENDED_DATE.match(created_at):
-            # Guarded by the extended-form date, because `fromisoformat` on
-            # Python 3.11+ also accepts the BASIC form (`20260101T110000`) —
+        if parsed is None:
+            # Guarded by what the ORDERING can read, because `fromisoformat`
+            # accepts a good deal more than `julianday` does — the basic form
+            # (`20260101T110000`), a `+0500` offset, a lowercase `t` —
             # incidental permissiveness, not a format this codebase writes or
             # this function documents. Accepting it made the parser's domain
             # wider than the SQL ordering key's: `julianday` returns NULL for
@@ -173,9 +182,22 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
 #: so two groupings of one transcript agree.
 _GROUPING_EPOCH = datetime(1970, 1, 1)
 
-#: An ISO date in EXTENDED form — the separators are what distinguishes it from
-#: the basic form `fromisoformat` also accepts but `julianday` cannot read.
-_EXTENDED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+#: Exactly the strings SQLite's ``julianday`` can read, which is what the
+#: canonical order compares. Written as the WHOLE value, not a prefix: the first
+#: version of this guard checked only the date, and the divergence between
+#: Python and ``julianday`` is mostly in the time and the offset. Measured
+#: against sqlite 3.50.4 over a battery of spellings — `+0500`, `-05`, a
+#: lowercase `t`, a seconds-bearing offset, the basic form — this agrees with
+#: the engine on every one, in both directions.
+#:
+#: The engine takes: a date; optionally a time after a space or an UPPERCASE
+#: ``T``; optionally fractional seconds; optionally ``Z`` or ``+/-HH:MM``.
+_JULIANDAY_READABLE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"          # date
+    r"([ T]\d{2}:\d{2}"             # optional time, space or uppercase T
+    r"(:\d{2}(\.\d+)?)?)?"          # optional seconds, optional fraction
+    r"(Z|[+-]\d{2}:\d{2})?$"        # optional UTC marker or +/-HH:MM offset
+)
 
 
 def group_messages_into_sessions(

@@ -479,13 +479,29 @@ def test_the_parser_accepts_exactly_what_the_ordering_can_express():
     db = sqlite3.connect(":memory:")
     try:
         for value in (
+            # Readable by both.
+            "2026-01-01",
+            "2026-01-01 11:00",
             "2026-01-01 10:00:00",
             "2026-01-01T10:00:00",
             "2026-01-01 10:00:00.123456",
             "2026-01-01T11:00:00+00:00",
+            "2026-01-01T11:00:00-05:00",
+            "2026-01-01T11:00:00.123+02:00",
             "2026-01-01T11:00:00Z",
+            # Readable by Python alone, which is the whole point. The first
+            # version of this guard checked only the DATE prefix and let every
+            # one of these through — the divergence lives in the time and the
+            # offset. The lowercase `t` needed the gate moved ahead of
+            # `strptime` too, which compiles its format with `re.IGNORECASE`.
             "20260101T110000",
+            "2026-01-01T11:00:00+0500",
+            "2026-01-01T11:00:00-05",
+            "2026-01-01t11:00:00",
+            "2026-01-01T11:00:00+00:00:30",
+            # Readable by neither.
             "not-a-date",
+            "",
         ):
             sql = db.execute("SELECT julianday(?)", (value,)).fetchone()[0]
             python = coerce_session_timestamp(value)

@@ -1335,15 +1335,14 @@ class StorePurgeResult:
 
 # Content stores that hold user text. A FAILED sweep of any of these means the
 # "leave no trace" contract cannot be certified, so mode exit must fail closed.
-# The #2959 session projection sweep is likewise NOT required, and that is a
-# correction: it was required while it swept three tables of per-session
-# structure — boundaries, counts, pointers. Narrowed to the change ledger, all
-# it can remove is one monotonic counter, which is a cache-invalidation token
-# and not a record of anything. Requiring it made a harmless delete emit a leak
-# audit: an agent that hard-purged its NORMAL history BEFORE entering EPHEMERAL
-# has an empty history and a legitimate ledger row, so a clean stint would
-# report a leak it did not have. The sweep still runs and is still reported;
-# it just no longer certifies content.
+# The #2959 session projection sweep does not certify CONTENT — it stores a
+# pointer and counts, never text — so it is not in this set. It is required
+# nonetheless, through `REQUIRED_TRACE_STORES` below, because its residue names
+# the agent. Only `REQUIRED_CONTENT_STORES` feeds `leaked_rows`, so a clean
+# stint still cannot report a leak it did not have: the case that paragraph
+# once warned about — an agent that hard-purged its NORMAL history before
+# entering EPHEMERAL, leaving an empty history and a legitimate ledger row —
+# is a CLEAN or PURGED outcome, and only a FAILED one closes the exit.
 # The observability sink (F076) holds content-free metrics and is NOT required —
 # a failure there is recorded but never blocks a transition.
 REQUIRED_CONTENT_STORES = frozenset({

@@ -3167,3 +3167,43 @@ async def test_the_claim_acquires_even_when_the_holder_deletes_the_row(postgres_
             "unserialized against whatever deleted it, which is how a sweep "
             "and a repair end up writing the same tables at once"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_a_clean_stint_reports_no_purged_projection_rows(postgres_db):
+    """The sweep must not count the row its own claim created.
+
+    On PostgreSQL the exclusion is acquired by INSERTing the watermark row when
+    it is absent — that is how there comes to be something to lock — and the
+    very next statement of the sweep deletes it. So every EPHEMERAL exit
+    reported one purged row, including a stint that never touched storage, and
+    `PurgeOutcome.PURGED` is documented as "a real leak was found and removed".
+    #2673 exists so a clean zero stays distinguishable from a non-zero.
+
+    PostgreSQL-only because that is where the defect lives: on SQLite `_claim`
+    is a no-op, which is exactly why the two cases asserting
+    `session_projection == 0` — both SQLite — never saw it.
+    """
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+
+    agent_id = f"did:test:clean-stint:{uuid4()}"
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_projection_schema(db)
+        storage = AsyncStorage.__new__(AsyncStorage)
+        storage.db = db
+        storage.agent_id = agent_id
+        storage._initialized = True
+
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        ) == 0, "the stint must be clean; that is the case under test"
+
+        purged = await storage.purge_session_projection(reason="test")
+
+        assert purged == 0, (
+            f"a stint that wrote nothing reported {purged} purged row(s) — the "
+            "watermark the claim inserted to have something to lock, counted "
+            "as a leak"
+        )

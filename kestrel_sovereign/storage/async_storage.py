@@ -933,8 +933,9 @@ class AsyncStorage:
     ) -> int:
         """Erase this agent's #2959 projection state (EPHEMERAL).
 
-        **Only when no live history survives**, and then from every table the
-        projection owns, in one transaction. That condition is the whole design:
+        The CACHE unconditionally; the LEDGER only when no live history
+        survives. One transaction, and the condition on the ledger is the whole
+        design:
 
         * It is durable, not a count of what THIS attempt deleted. A retry after
           a partial failure asks the same question and gets the same answer,
@@ -968,10 +969,12 @@ class AsyncStorage:
         not. None of it is needed here: this runs only when nothing survives, so
         the answer for every row is the same one.
 
-        An agent whose legitimate pre-EPHEMERAL history survives is untouched.
-        Its ledger row names nothing the database does not already say, and
+        An agent whose legitimate pre-EPHEMERAL history survives keeps its
+        LEDGER row: it names nothing the database does not already say, and
         deleting it would breach the scoped-purge contract, which forbids
-        touching anything authored before entry.
+        touching anything authored before entry. Its projection rows go
+        regardless — they are derived, not authored, and the leaked session is
+        described in them.
         """
         if not self._initialized:
             await self.initialize()
@@ -1033,7 +1036,7 @@ class AsyncStorage:
             # sweep has already passed over.
             from .conversation_sessions import ConversationSessionProjection
 
-            await ConversationSessionProjection(
+            claim_created_watermark = await ConversationSessionProjection(
                 self.db, self.agent_id
             ).claim_exclusion()
             survives = await self.db.fetchval(
@@ -1064,6 +1067,17 @@ class AsyncStorage:
                         (self.agent_id,),
                     )
                 )
+        # Do not count the row the CLAIM just made. On PostgreSQL the exclusion
+        # is acquired by inserting the watermark row when it is absent, and the
+        # very next statement here deletes it — so every clean stint reported
+        # one purged row, and `PurgeOutcome.PURGED` means "a real leak was found
+        # and removed". Measured: a stint that never touched storage returned 1.
+        # SQLite never saw it, because the claim is a no-op there — which is
+        # also why the cases asserting `session_projection == 0` did not catch
+        # it (round-20 review).
+
+        if claim_created_watermark and purged:
+            purged -= 1
         if purged:
             logger.info(
                 "purged the session projection for %s (%s): %d row(s) across %s",

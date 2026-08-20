@@ -1665,7 +1665,7 @@ class ConversationSessionProjection:
         # be held across.
         return await self._rebuild_from_transcript()
 
-    async def claim_exclusion(self) -> None:
+    async def claim_exclusion(self) -> bool:
         """Take this agent's repair exclusion, for a caller that is not a repair.
 
         The EPHEMERAL sweep needs it. Ordering its deletes to match a repair's
@@ -1680,8 +1680,15 @@ class ConversationSessionProjection:
         other, by inserting the row before locking it so there is something to
         lock. Sharing it is the fix; a second mechanism would be the thing this
         module keeps having to undo.
+
+        Returns whether the claim CREATED the watermark row, which the sweep
+        needs: it deletes that row a statement later and reports how many it
+        removed, and a row this claim made to have something to lock is not a
+        leak.
         """
+        self._claim_created_the_row = False
         await self._claim()
+        return self._claim_created_the_row
 
     async def _claim(self) -> None:
         """Hold this agent's repair for the rest of the caller's transaction.
@@ -1740,12 +1747,17 @@ class ConversationSessionProjection:
         # retries the insert when the conflicting row is deleted underneath it,
         # so this acquires in both orders. Measured against the same race: the
         # upsert returns its row.
+        # ``xmax = 0`` is true only on the INSERT path of an upsert, so this
+        # says whether the row was CREATED here — which the caller needs when
+        # it is about to delete it and count what it removed. A row this claim
+        # made to have something to lock is not a leak.
         acquired = await self.db.fetchval(
             "INSERT INTO conversation_session_watermarks (agent_id) VALUES (?) "
             "ON CONFLICT (agent_id) DO UPDATE SET agent_id = EXCLUDED.agent_id "
-            "RETURNING agent_id",
+            "RETURNING (xmax = 0)",
             (self.agent_id,),
         )
+        self._claim_created_the_row = bool(acquired)
         if acquired is None:
             # Never observed, and not swallowed if it happens: a claim that did
             # not acquire lets a sweep and a repair write the same tables at
