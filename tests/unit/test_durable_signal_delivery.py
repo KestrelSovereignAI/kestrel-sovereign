@@ -31,6 +31,7 @@ from kestrel_sovereign.signals import (
     TERMINAL_ACKABLE,
     DurableAdmissionDisposition,
     DurableConsumerRegistration,
+    DurableSourceBoundary,
     DurableSignalStore,
     OrderedLockManager,
     SignalDispatcher,
@@ -48,6 +49,7 @@ from kestrel_sovereign.signals.sources.channels import (
     build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db.interface import QueryError
 
 
 class _Agent:
@@ -237,6 +239,8 @@ async def _assert_late_durable_calls_fail_safely(
     with pytest.raises(RuntimeError, match="shutting down"):
         await dispatcher.register_durable_consumer(consumer)
     with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.capture_durable_source_boundary(source=consumer.source)
+    with pytest.raises(RuntimeError, match="shutting down"):
         await dispatcher.claim_durable_delivery(
             consumer_id=consumer.consumer_id, executor_id="late-worker"
         )
@@ -298,6 +302,7 @@ async def test_committed_signal_replays_after_restart_with_normalized_payload(tm
     assert delivery is not None
     assert delivery.status == LEASED
     assert delivery.event.payload == {"message": "hello", "workflow": "wf-1"}
+    assert delivery.source_sequence == delivery.event.source_sequence == 1
     assert delivery.event.causation_chain[-1]["signal_id"] == result.signal_id
     assert await dispatcher2.ack_durable_delivery(
         consumer_id="workflow-wait",
@@ -306,6 +311,233 @@ async def test_committed_signal_replays_after_restart_with_normalized_payload(tm
     )
     assert (await dispatcher2.list_durable_deliveries())[0].status == ACKNOWLEDGED
     await _close(backend2, agent2)
+
+
+@pytest.mark.asyncio
+async def test_public_source_boundary_orders_ingress_without_timestamps(tmp_path):
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "source-boundary.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent.did,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        before = await dispatcher.capture_durable_source_boundary(
+            source=consumer.source
+        )
+        assert isinstance(before, DurableSourceBoundary)
+        assert (before.agent_id, before.source, before.sequence) == (
+            agent.did,
+            consumer.source,
+            0,
+        )
+
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did), source_event_id="boundary:first"
+        )
+        first = (await dispatcher.list_durable_deliveries())[0]
+        assert first.source_sequence == 1
+        assert before.is_event_eligible(first.event)
+
+        between = await dispatcher.capture_durable_source_boundary(
+            source=consumer.source
+        )
+        assert between.sequence == first.source_sequence
+        assert not between.is_event_eligible(first.event)
+
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="second"),
+            source_event_id="boundary:second",
+        )
+        second = (await dispatcher.list_durable_deliveries())[-1]
+        assert second.source_sequence == 2
+        assert between.is_event_eligible(second.event)
+
+        # Deliberately skewing the process clock cannot affect eligibility.
+        skewed_first = replace(first.event, committed_at=second.event.committed_at)
+        skewed_second = replace(second.event, committed_at=first.event.committed_at)
+        assert not between.is_event_eligible(skewed_first)
+        assert between.is_event_eligible(skewed_second)
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_source_sequences_are_isolated_by_source_and_dispatcher_agent(tmp_path):
+    path = tmp_path / "source-boundary-scope.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:a")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:b")
+    dispatcher_a._registry.register(_registration(agent_a, "provider.other"))
+    try:
+        await dispatcher_a.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="agent-a-message",
+                source="provider.message",
+                agent_id=agent_a.did,
+            )
+        )
+        await dispatcher_a.dispatch_signal(
+            _signal(agent_id=agent_a.did), source_event_id="scope:a"
+        )
+        delivery = (await dispatcher_a.list_durable_deliveries())[0]
+
+        assert (
+            await dispatcher_a.capture_durable_source_boundary(
+                source="provider.message"
+            )
+        ).sequence == 1
+        assert (
+            await dispatcher_a.capture_durable_source_boundary(
+                source="provider.other"
+            )
+        ).sequence == 0
+        boundary_b = await dispatcher_b.capture_durable_source_boundary(
+            source="provider.message"
+        )
+        assert boundary_b.sequence == 0
+        with pytest.raises(ValueError, match="same agent_id and source"):
+            boundary_b.is_event_eligible(delivery.event)
+    finally:
+        await dispatcher_a.shutdown_durable_delivery()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_registration_backfill_retains_committed_source_sequences(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-backfill.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:backfill"
+    try:
+        persisted = [
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"event-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"backfill:{index}",
+                retention_days=7,
+            )
+            for index in range(2)
+        ]
+        assert [item.source_sequence for item in persisted] == [1, 2]
+        boundary = await store.capture_source_boundary(
+            agent_id=agent_id, source="provider.message"
+        )
+
+        registration = DurableConsumerRegistration(
+            consumer_id="late-workflow",
+            source="provider.message",
+            agent_id=agent_id,
+        )
+        await store.register_consumer(registration)
+        first_backfill = await store.list_deliveries(
+            agent_id=agent_id, consumer_id=registration.consumer_id
+        )
+        await store.register_consumer(registration)
+        second_backfill = await store.list_deliveries(
+            agent_id=agent_id, consumer_id=registration.consumer_id
+        )
+        assert sorted(item.source_sequence for item in first_backfill) == [1, 2]
+        assert sorted(item.source_sequence for item in second_backfill) == [1, 2]
+        assert all(not boundary.is_event_eligible(item.event) for item in first_backfill)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_additive_migration_backfills_existing_rows_without_rewriting_them(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-migration.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:migration"
+    try:
+        event_ids = []
+        for index in range(2):
+            persisted = await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"legacy-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"legacy:{index}",
+                retention_days=7,
+            )
+            event_ids.append(persisted.event_id)
+
+        # Recreate the pre-0.53.3 additive shape without touching any event
+        # payload, identity, delivery, or timestamp column.
+        await backend.execute(
+            "DROP INDEX idx_durable_signal_events_scope_sequence"
+        )
+        await backend.execute(
+            "DROP TRIGGER durable_signal_events_require_source_sequence_insert"
+        )
+        await backend.execute(
+            "DROP TRIGGER durable_signal_events_require_source_sequence_update"
+        )
+        await backend.execute(
+            "ALTER TABLE durable_signal_events DROP COLUMN source_sequence"
+        )
+        await backend.execute("DROP TABLE durable_signal_source_sequences")
+
+        migrated = DurableSignalStore(backend)
+        await migrated.initialize()
+        rows = await backend.fetch_all(
+            "SELECT event_id, source_sequence FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
+            (agent_id, "provider.message"),
+        )
+        assert [row[0] for row in rows] == sorted(event_ids)
+        assert [int(row[1]) for row in rows] == [1, 2]
+        assert (
+            await migrated.capture_source_boundary(
+                agent_id=agent_id, source="provider.message"
+            )
+        ).sequence == 2
+
+        # Bootstrap is idempotent: a later process observes the same durable
+        # assignments instead of resequencing history.
+        await DurableSignalStore(backend).initialize()
+        assert await backend.fetch_all(
+            "SELECT event_id, source_sequence FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
+            (agent_id, "provider.message"),
+        ) == rows
+
+        # The completed additive migration is also a mixed-version fence: an
+        # older writer that omits the new column must fail, never create a row
+        # whose later backfill could move it across an already-captured bound.
+        with pytest.raises(QueryError, match="source sequence is required"):
+            await backend.execute(
+                """
+                INSERT OR IGNORE INTO durable_signal_events (
+                    event_id, source_event_id, agent_id, target_agent, source,
+                    kind, mode, payload, session_id, caller_identity,
+                    visibility, urgency, dedupe_key, causation_chain,
+                    arrived_at, committed_at, retention_until
+                )
+                SELECT ?, ?, agent_id, target_agent, source, kind, mode,
+                       payload, session_id, caller_identity, visibility,
+                       urgency, dedupe_key, causation_chain, arrived_at,
+                       committed_at, retention_until
+                FROM durable_signal_events
+                WHERE event_id = ?
+                """,
+                ("legacy-writer-event", "legacy-writer-source-event", event_ids[0]),
+            )
+        assert (
+            await backend.fetch_val(
+                "SELECT COUNT(*) FROM durable_signal_events "
+                "WHERE event_id = 'legacy-writer-event'"
+            )
+            == 0
+        )
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -330,6 +562,10 @@ async def test_source_event_dedup_prevents_duplicate_delivery_and_side_effect(tm
     deliveries = await dispatcher.list_durable_deliveries()
     assert len(deliveries) == 1
     assert deliveries[0].event.event_id == first.signal_id
+    assert deliveries[0].source_sequence == 1
+    assert (
+        await dispatcher.capture_durable_source_boundary(source="provider.message")
+    ).sequence == 1
     await _close(backend, agent)
 
 
@@ -4098,6 +4334,44 @@ async def test_postgres_registration_handoff_uses_a_transaction_scoped_scope_loc
         "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
         ("durable-signal:did:agent:one:provider.message",),
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_boundary_locks_handoff_before_sampling_source_row():
+    """Pin the post-wait FOR UPDATE sample used by multi-replica capture."""
+
+    calls: list[str] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(self):
+            calls.append("transaction")
+            yield
+
+        async def fetch_val(self, query, params=()):
+            assert "pg_advisory_xact_lock" in query
+            calls.append("handoff")
+
+        async def execute(self, query, params=()):
+            assert calls[-1] == "handoff"
+            assert "durable_signal_source_sequences" in query
+            calls.append("ensure-row")
+            return 0
+
+        async def fetch_one(self, query, params=()):
+            assert calls[-1] == "ensure-row"
+            assert query.rstrip().endswith("FOR UPDATE")
+            calls.append("sample-row")
+            return (7,)
+
+    boundary = await DurableSignalStore(_PostgresBackend()).capture_source_boundary(
+        agent_id="did:agent:one", source="provider.message"
+    )
+
+    assert calls == ["transaction", "handoff", "ensure-row", "sample-row"]
+    assert boundary.sequence == 7
 
 
 @pytest.mark.asyncio

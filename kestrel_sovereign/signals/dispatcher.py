@@ -137,6 +137,7 @@ from kestrel_sovereign.signals.durable import (
     TERMINAL_ACKABLE,
     DurableConsumerRegistration,
     DurableDelivery,
+    DurableSourceBoundary,
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
@@ -1305,6 +1306,24 @@ class SignalDispatcher:
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             await self._durable_store.register_consumer(registration)
+
+    async def capture_durable_source_boundary(
+        self, *, source: str
+    ) -> DurableSourceBoundary:
+        """Capture this agent's current durable commit boundary for ``source``.
+
+        Call immediately before dispatching an external effect whose later
+        workflow wake must exclude previously committed history.  The API has
+        no ``agent_id`` argument by design: dispatcher ownership is the tenant
+        authority, and A2A identity is a separate boundary.
+        """
+
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.capture_source_boundary(
+                agent_id=self._agent.did,
+                source=source,
+            )
 
     async def deactivate_durable_consumer(self, *, consumer_id: str) -> bool:
         """Deactivate one of this agent's durable consumers.

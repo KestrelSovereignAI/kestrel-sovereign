@@ -265,6 +265,57 @@ if delivery is not None:
         )
 ```
 
+#### Atomic source boundaries for external effects
+
+An external workflow that starts an effect and later waits for a matching
+signal must capture the source boundary immediately before dispatching that
+effect:
+
+```python
+boundary = await dispatcher.capture_durable_source_boundary(
+    source="channel.message"
+)
+await dispatch_external_effect()
+
+delivery = await dispatcher.claim_durable_delivery(
+    consumer_id="workflows:wait:run-42",
+    executor_id="workflows-worker-1",
+)
+if delivery is not None and boundary.is_event_eligible(delivery.event):
+    await resume_workflow(delivery.event)
+```
+
+Core persists a positive, monotonically increasing `source_sequence` for each
+exact `(agent_id, source)` scope. Boundary capture and event sequencing acquire
+the same source handoff lock in the same database transaction domain. Their
+linearization invariant is exact: **an event is eligible for a captured
+boundary if and only if its committed `source_sequence` is strictly greater
+than the boundary's `sequence`.** This holds whether ingress committed before
+or after consumer registration and whether a later registration materialized
+the delivery through backfill.
+
+`DurableSignalEvent.source_sequence` and `DurableDelivery.source_sequence`
+expose that evidence. `committed_at` remains audit metadata and must never be
+used for boundary eligibility: it can reflect an ingress host's clock, while
+the source sequence is committed by the database ordering domain. Delivery
+IDs, registration timestamps, and row insertion order are likewise not
+boundary evidence.
+
+The dispatcher capture API intentionally accepts only `source`; it always uses
+the dispatcher's own agent DID. A `DurableSourceBoundary` rejects comparisons
+against another agent or source. This is a user-agent tenant boundary, not A2A
+authority. The additive migration assigns stable positive sequences to legacy
+events before the first boundary is returned and retains the source counter
+after event-retention cleanup, so sequences never move backward or get reused.
+Bootstrap owns the event-table DDL lock (PostgreSQL) or reserved writer
+(SQLite) while assigning that history and does not acquire source locks in the
+opposite order. It then makes an unsequenced event write invalid. Consequently,
+a pre-boundary Core replica may finish an already-running commit before the
+migration lock is acquired, but once migration commits its later inserts fail
+closed instead of creating ambiguous history. Upgrade every durable-ingress
+replica promptly; an old replica rejected by this fence is unavailable for
+ingress, never silently compatible.
+
 When the owning workflow wait reaches a terminal outcome, it must use the
 dispatcher lifecycle boundary rather than reaching into the durable store:
 

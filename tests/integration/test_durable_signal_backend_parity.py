@@ -26,6 +26,7 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.features.channels.route_ownership import ChannelRouteOwnershipStore
+from kestrel_sovereign.storage.db.interface import QueryError
 
 
 def _signal(agent_id: str) -> Signal:
@@ -321,6 +322,366 @@ async def test_registration_backfill_clock_follows_contended_scope_handoff_on_bo
         release_lock.set()
         await _cancel_and_drain(blocker)
         await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    "first",
+    ("capture", "persistence"),
+    ids=("capture-first", "persistence-first"),
+)
+async def test_source_boundary_and_ingress_share_one_cross_connection_order(
+    db_backend, monkeypatch, first
+):
+    """The source handoff winner alone decides strict boundary eligibility."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:source-boundary-race:{uuid4()}"
+    source = "provider.message"
+    first_owned = asyncio.Event()
+    release_first = asyncio.Event()
+    contender_entered = asyncio.Event()
+    capture_task = None
+    persistence_task = None
+    try:
+        if first == "capture":
+            original_sample = store._source_sequence_locked
+
+            async def pause_captured_sample(**kwargs):
+                sequence = await original_sample(**kwargs)
+                first_owned.set()
+                await release_first.wait()
+                return sequence
+
+            monkeypatch.setattr(store, "_source_sequence_locked", pause_captured_sample)
+            capture_task = asyncio.create_task(
+                store.capture_source_boundary(agent_id=agent_id, source=source)
+            )
+            await asyncio.wait_for(first_owned.wait(), timeout=5)
+
+            original_handoff = peer_store._lock_scope_handoff
+
+            async def observe_contending_persistence(**kwargs):
+                contender_entered.set()
+                await original_handoff(**kwargs)
+
+            monkeypatch.setattr(
+                peer_store, "_lock_scope_handoff", observe_contending_persistence
+            )
+            persistence_task = asyncio.create_task(
+                peer_store.persist_signal(
+                    _signal(agent_id),
+                    agent_id=agent_id,
+                    source_event_id=f"boundary-race:{uuid4()}",
+                    retention_days=7,
+                )
+            )
+        else:
+            original_advance = store._advance_source_sequence_locked
+
+            async def pause_advanced_sequence(**kwargs):
+                sequence = await original_advance(**kwargs)
+                first_owned.set()
+                await release_first.wait()
+                return sequence
+
+            monkeypatch.setattr(
+                store, "_advance_source_sequence_locked", pause_advanced_sequence
+            )
+            persistence_task = asyncio.create_task(
+                store.persist_signal(
+                    _signal(agent_id),
+                    agent_id=agent_id,
+                    source_event_id=f"boundary-race:{uuid4()}",
+                    retention_days=7,
+                )
+            )
+            await asyncio.wait_for(first_owned.wait(), timeout=5)
+
+            original_handoff = peer_store._lock_scope_handoff
+
+            async def observe_contending_capture(**kwargs):
+                contender_entered.set()
+                await original_handoff(**kwargs)
+
+            monkeypatch.setattr(
+                peer_store, "_lock_scope_handoff", observe_contending_capture
+            )
+            capture_task = asyncio.create_task(
+                peer_store.capture_source_boundary(agent_id=agent_id, source=source)
+            )
+
+        await asyncio.wait_for(contender_entered.wait(), timeout=5)
+        assert capture_task is not None and persistence_task is not None
+        contender = persistence_task if first == "capture" else capture_task
+        assert not contender.done()
+        release_first.set()
+        boundary, persisted = await asyncio.wait_for(
+            asyncio.gather(capture_task, persistence_task), timeout=5
+        )
+        assert persisted.source_sequence == 1
+        assert boundary.sequence == (0 if first == "capture" else 1)
+
+        registration = DurableConsumerRegistration(
+            consumer_id="late-workflow",
+            source=source,
+            agent_id=agent_id,
+        )
+        await store.register_consumer(registration)
+        delivery = (
+            await store.list_deliveries(
+                agent_id=agent_id, consumer_id=registration.consumer_id
+            )
+        )[0]
+        assert boundary.is_event_eligible(delivery.event) is (first == "capture")
+    finally:
+        release_first.set()
+        await _cancel_and_drain(capture_task, persistence_task)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_boundary_samples_sequence_after_waiting_for_source_writer(
+    db_backend, monkeypatch
+):
+    """A blocked capture observes the commit that held its handoff lock."""
+
+    peer_backend = await _independent_backend(db_backend)
+    store = DurableSignalStore(db_backend)
+    peer_store = DurableSignalStore(peer_backend)
+    await store.initialize()
+    await peer_store.initialize()
+    agent_id = f"did:test:source-boundary-post-lock:{uuid4()}"
+    source = "provider.message"
+    writer_sequenced = asyncio.Event()
+    release_writer = asyncio.Event()
+    capture_entered = asyncio.Event()
+    holder = None
+    capture_task = None
+    try:
+        async def hold_uncommitted_event() -> None:
+            async with peer_backend.transaction():
+                persisted = await peer_store.persist_signal(
+                    _signal(agent_id),
+                    agent_id=agent_id,
+                    source_event_id=f"post-lock:{uuid4()}",
+                    retention_days=7,
+                )
+                assert persisted.source_sequence == 1
+                writer_sequenced.set()
+                await release_writer.wait()
+
+        holder = asyncio.create_task(hold_uncommitted_event())
+        await asyncio.wait_for(writer_sequenced.wait(), timeout=5)
+
+        original_handoff = store._lock_scope_handoff
+
+        async def observe_capture_handoff(**kwargs):
+            capture_entered.set()
+            await original_handoff(**kwargs)
+
+        monkeypatch.setattr(store, "_lock_scope_handoff", observe_capture_handoff)
+        capture_task = asyncio.create_task(
+            store.capture_source_boundary(agent_id=agent_id, source=source)
+        )
+        await asyncio.wait_for(capture_entered.wait(), timeout=5)
+        assert not capture_task.done()
+
+        release_writer.set()
+        boundary = await asyncio.wait_for(capture_task, timeout=5)
+        await asyncio.wait_for(holder, timeout=5)
+        assert boundary.sequence == 1
+    finally:
+        release_writer.set()
+        await _cancel_and_drain(holder, capture_task)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_existing_unsequenced_rows_are_backfilled_additively_on_postgres(
+    db_backend
+):
+    """Upgrade preserves legacy events and installs a stable current boundary."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("SQLite legacy-column migration is covered by the unit suite")
+
+    store = DurableSignalStore(db_backend)
+    await store.initialize()
+    agent_id = f"did:test:source-boundary-migration:{uuid4()}"
+    source = "provider.message"
+    persisted = [
+        await store.persist_signal(
+            _signal(agent_id),
+            agent_id=agent_id,
+            source_event_id=f"migration:{uuid4()}",
+            retention_days=7,
+        )
+        for _ in range(2)
+    ]
+    event_ids = {item.event_id for item in persisted}
+
+    # Model rows written by the pre-boundary PostgreSQL schema. The migration
+    # re-establishes NOT NULL after assigning stable historical sequences.
+    await db_backend.execute(
+        "ALTER TABLE durable_signal_events "
+        "ALTER COLUMN source_sequence DROP NOT NULL"
+    )
+    await db_backend.execute(
+        "UPDATE durable_signal_events SET source_sequence = NULL "
+        "WHERE agent_id = ? AND source = ?",
+        (agent_id, source),
+    )
+    await db_backend.execute(
+        "DELETE FROM durable_signal_source_sequences "
+        "WHERE agent_id = ? AND source = ?",
+        (agent_id, source),
+    )
+
+    migrated = DurableSignalStore(db_backend)
+    await migrated.initialize()
+    rows = await db_backend.fetch_all(
+        "SELECT event_id, source_sequence FROM durable_signal_events "
+        "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
+        (agent_id, source),
+    )
+    assert {row[0] for row in rows} == event_ids
+    assert [int(row[1]) for row in rows] == [1, 2]
+    assert (
+        await migrated.capture_source_boundary(agent_id=agent_id, source=source)
+    ).sequence == 2
+
+    nullable = await db_backend.fetch_val(
+        """
+        SELECT is_nullable = 'YES'
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'durable_signal_events'
+          AND column_name = 'source_sequence'
+        """
+    )
+    assert nullable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_schema_upgrade_does_not_invert_source_handoff_lock(
+    db_backend, monkeypatch
+):
+    """DDL-owning bootstrap never waits for an ingress-owned source lock."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL advisory/table lock ordering regression")
+
+    peer_backend = await _independent_backend(db_backend)
+    seed_store = DurableSignalStore(db_backend)
+    writer_store = DurableSignalStore(peer_backend)
+    await seed_store.initialize()
+    agent_id = f"did:test:source-boundary-upgrade-race:{uuid4()}"
+    source_event_id = f"upgrade-race-seed:{uuid4()}"
+    await seed_store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=source_event_id,
+        retention_days=7,
+    )
+
+    migrating_store = DurableSignalStore(db_backend)
+    ddl_owned = asyncio.Event()
+    release_migration = asyncio.Event()
+    writer_owns_handoff = asyncio.Event()
+    migration_task = None
+    writer_task = None
+    original_ensure = migrating_store._ensure_source_sequence_column
+    original_handoff = writer_store._lock_scope_handoff
+
+    async def pause_after_event_table_ddl():
+        await original_ensure()
+        ddl_owned.set()
+        await release_migration.wait()
+
+    async def observe_owned_handoff(**kwargs):
+        await original_handoff(**kwargs)
+        writer_owns_handoff.set()
+
+    monkeypatch.setattr(
+        migrating_store, "_ensure_source_sequence_column", pause_after_event_table_ddl
+    )
+    monkeypatch.setattr(writer_store, "_lock_scope_handoff", observe_owned_handoff)
+    try:
+        migration_task = asyncio.create_task(migrating_store.initialize())
+        await asyncio.wait_for(ddl_owned.wait(), timeout=5)
+        writer_task = asyncio.create_task(
+            writer_store.persist_signal(
+                _signal(agent_id),
+                agent_id=agent_id,
+                source_event_id=f"upgrade-race-live:{uuid4()}",
+                retention_days=7,
+            )
+        )
+        await asyncio.wait_for(writer_owns_handoff.wait(), timeout=5)
+
+        # The writer now owns the exact source advisory lock and is waiting on
+        # the migration's event-table DDL lock. Bootstrap must finish without
+        # asking for that source lock, after which the writer commits sequence 2.
+        release_migration.set()
+        _, persisted = await asyncio.wait_for(
+            asyncio.gather(migration_task, writer_task), timeout=10
+        )
+        assert persisted.source_sequence == 2
+    finally:
+        release_migration.set()
+        await _cancel_and_drain(migration_task, writer_task)
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_completed_migration_rejects_legacy_unsequenced_writers(db_backend):
+    """An old replica cannot create ambiguous post-boundary history."""
+
+    store = DurableSignalStore(db_backend)
+    await store.initialize()
+    agent_id = f"did:test:source-boundary-legacy-fence:{uuid4()}"
+    seed = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"legacy-fence-seed:{uuid4()}",
+        retention_days=7,
+    )
+    legacy_event_id = str(uuid4())
+    with pytest.raises(QueryError, match="source_sequence|source sequence"):
+        await db_backend.execute(
+            """
+            INSERT OR IGNORE INTO durable_signal_events (
+                event_id, source_event_id, agent_id, target_agent, source,
+                kind, mode, payload, session_id, caller_identity,
+                visibility, urgency, dedupe_key, causation_chain,
+                arrived_at, committed_at, retention_until
+            )
+            SELECT ?, ?, agent_id, target_agent, source, kind, mode, payload,
+                   session_id, caller_identity, visibility, urgency,
+                   dedupe_key, causation_chain, arrived_at, committed_at,
+                   retention_until
+            FROM durable_signal_events
+            WHERE event_id = ?
+            """,
+            (legacy_event_id, f"legacy-fence:{uuid4()}", seed.event_id),
+        )
+    assert (
+        await db_backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events WHERE event_id = ?",
+            (legacy_event_id,),
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

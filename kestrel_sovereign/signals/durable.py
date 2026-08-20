@@ -59,6 +59,7 @@ _PERSISTED_PAYLOAD = object()
 # recently registered dispatcher must not lose a lease simply because a
 # polling caller has no dispatcher instance from which to obtain that policy.
 _DEFAULT_RUNTIME_OWNER_STALE_AFTER = timedelta(minutes=2)
+_MAX_SOURCE_SEQUENCE = (1 << 63) - 1
 
 
 @runtime_checkable
@@ -119,6 +120,53 @@ class DurableSignalEvent:
     arrived_at: datetime
     committed_at: datetime
     retention_until: datetime
+    # Monotonic only within this event's exact ``(agent_id, source)`` scope.
+    # Unlike ``committed_at``, this is safe evidence for effect-boundary
+    # eligibility across hosts and database backends.
+    source_sequence: int = 0
+
+
+@dataclass(frozen=True)
+class DurableSourceBoundary:
+    """A durable linearization boundary for one agent-owned signal source.
+
+    An event is after this boundary exactly when it has the same ``agent_id``
+    and ``source`` and its committed ``source_sequence`` is strictly greater.
+    Comparing a different tenant or source is an error rather than a false
+    result that could hide an authority mix-up.
+    """
+
+    agent_id: str
+    source: str
+    sequence: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.agent_id, str) or not self.agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("source must be a non-empty string")
+        if (
+            not isinstance(self.sequence, int)
+            or isinstance(self.sequence, bool)
+            or not 0 <= self.sequence <= _MAX_SOURCE_SEQUENCE
+        ):
+            raise ValueError("sequence must be a non-negative 64-bit integer")
+
+    def is_event_eligible(self, event: DurableSignalEvent) -> bool:
+        """Return whether ``event`` committed strictly after this boundary."""
+
+        if event.agent_id != self.agent_id or event.source != self.source:
+            raise ValueError(
+                "Durable source boundaries can compare only events from the "
+                "same agent_id and source"
+            )
+        if (
+            not isinstance(event.source_sequence, int)
+            or isinstance(event.source_sequence, bool)
+            or not 1 <= event.source_sequence <= _MAX_SOURCE_SEQUENCE
+        ):
+            raise ValueError("event has no valid committed source sequence")
+        return event.source_sequence > self.sequence
 
 
 @dataclass(frozen=True)
@@ -141,6 +189,7 @@ class DurableEventPersistence:
     delivery_ids: tuple[str, ...] = ()
     retention_until: Optional[datetime] = None
     initial_reservations: tuple["DurableInitialDeliveryReservation", ...] = ()
+    source_sequence: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +230,12 @@ class DurableDelivery:
     updated_at: datetime
     event: DurableSignalEvent
 
+    @property
+    def source_sequence(self) -> int:
+        """The event's committed sequence in its agent/source scope."""
+
+        return self.event.source_sequence
+
 
 def _json_dump(value: Any) -> str:
     return json.dumps(value, default=_json_default, ensure_ascii=False, sort_keys=True)
@@ -211,6 +266,9 @@ class DurableSignalStore(UnifiedStoreBase):
     CONSUMERS = "durable_signal_consumers"
     DELIVERIES = "durable_signal_deliveries"
     RUNTIME_OWNERS = "durable_signal_runtime_owners"
+    SOURCE_SEQUENCES = "durable_signal_source_sequences"
+    SOURCE_SEQUENCE_INSERT_GUARD = "durable_signal_events_require_source_sequence_insert"
+    SOURCE_SEQUENCE_UPDATE_GUARD = "durable_signal_events_require_source_sequence_update"
     # Payload-eliding privacy modes cannot retain their canonical input in the
     # event row. This side table stores only a fixed-width integrity binding.
     EVENT_INTEGRITY = "durable_signal_event_integrity"
@@ -264,7 +322,17 @@ class DurableSignalStore(UnifiedStoreBase):
                 arrived_at {ts_type} NOT NULL,
                 committed_at {ts_type} {ts_default},
                 retention_until {ts_type} NOT NULL,
+                source_sequence BIGINT NOT NULL,
                 UNIQUE (agent_id, source, source_event_id)
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.SOURCE_SEQUENCES} (
+                agent_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                current_sequence BIGINT NOT NULL,
+                PRIMARY KEY (agent_id, source),
+                CHECK (current_sequence >= 0)
             )
             """,
             f"""
@@ -335,9 +403,16 @@ class DurableSignalStore(UnifiedStoreBase):
             # lack it and are rejected for caller-bearing replay rather than
             # silently accepting an unbound live caller.
             await self._ensure_caller_identity_column()
+            await self._ensure_source_sequence_column()
+            await self._backfill_source_sequences()
+            await self._enforce_source_sequence_required()
             await self._backend.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self.EVENTS}_scope_retention "
                 f"ON {self.EVENTS}(agent_id, source, retention_until)"
+            )
+            await self._backend.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{self.EVENTS}_scope_sequence "
+                f"ON {self.EVENTS}(agent_id, source, source_sequence)"
             )
             await self._backend.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_claim "
@@ -394,7 +469,7 @@ class DurableSignalStore(UnifiedStoreBase):
             ) from exc
 
     async def _ensure_caller_identity_column(self) -> None:
-        """Apply the sole additive event-table migration under the schema lock."""
+        """Apply the additive caller-identity migration under the schema lock."""
 
         if self.is_postgres:
             await self._backend.execute(
@@ -407,9 +482,158 @@ class DurableSignalStore(UnifiedStoreBase):
                 f"ALTER TABLE {self.EVENTS} ADD COLUMN caller_identity TEXT"
             )
 
+    async def _ensure_source_sequence_column(self) -> None:
+        """Add the nullable staging column used by the sequence backfill."""
+
+        if self.is_postgres:
+            await self._backend.execute(
+                f"ALTER TABLE {self.EVENTS} "
+                "ADD COLUMN IF NOT EXISTS source_sequence BIGINT"
+            )
+            return
+        columns = await self._backend.fetch_all(f"PRAGMA table_info({self.EVENTS})")
+        if not any(row[1] == "source_sequence" for row in columns):
+            await self._backend.execute(
+                f"ALTER TABLE {self.EVENTS} ADD COLUMN source_sequence BIGINT"
+            )
+
+    async def _backfill_source_sequences(self) -> None:
+        """Assign stable sequences to rows created before this contract.
+
+        Bootstrap owns PostgreSQL's event-table DDL lock (or SQLite's reserved
+        writer) for this whole operation.  It deliberately does *not* acquire
+        a source handoff lock: ingress takes the source lock before touching
+        the event table, so doing both here in the reverse order would deadlock
+        a live replica during upgrade.  No boundary-capable dispatcher serves
+        before its initialization completes, while the table/writer lock keeps
+        legacy event writes out of the backfill.
+
+        Legacy rows are ordered by immutable event ID, not by process-clock
+        timestamps.  Since no source boundary existed before this migration,
+        every migrated row is necessarily at or below the first capturable
+        boundary regardless of the order chosen within that history.
+        """
+
+        scopes = await self._backend.fetch_all(
+            f"SELECT DISTINCT agent_id, source FROM {self.EVENTS} "
+            "ORDER BY agent_id, source"
+        )
+        for agent_id, source in scopes:
+            current = await self._source_sequence_locked(
+                agent_id=agent_id, source=source
+            )
+            maximum = await self._backend.fetch_val(
+                f"SELECT MAX(source_sequence) FROM {self.EVENTS} "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, source),
+            )
+            if maximum is not None:
+                maximum = int(maximum)
+                if maximum < 1 or maximum > _MAX_SOURCE_SEQUENCE:
+                    raise RuntimeError(
+                        "Durable signal event has an invalid source sequence"
+                    )
+                current = max(current, maximum)
+
+            legacy_rows = await self._backend.fetch_all(
+                f"SELECT event_id FROM {self.EVENTS} "
+                "WHERE agent_id = ? AND source = ? AND source_sequence IS NULL "
+                "ORDER BY event_id",
+                (agent_id, source),
+            )
+            for (event_id,) in legacy_rows:
+                if current >= _MAX_SOURCE_SEQUENCE:
+                    raise OverflowError("Durable signal source sequence exhausted")
+                current += 1
+                updated = await self._backend.execute(
+                    f"UPDATE {self.EVENTS} SET source_sequence = ? "
+                    "WHERE event_id = ? AND agent_id = ? AND source = ? "
+                    "AND source_sequence IS NULL",
+                    (current, event_id, agent_id, source),
+                )
+                if updated != 1:
+                    raise RuntimeError(
+                        "Durable signal source-sequence backfill lost its locked row"
+                    )
+            await self._set_source_sequence_locked(
+                agent_id=agent_id, source=source, sequence=current
+            )
+        incomplete = await self._backend.fetch_val(
+            f"SELECT COUNT(*) FROM {self.EVENTS} "
+            "WHERE source_sequence IS NULL OR source_sequence < 1"
+        )
+        if int(incomplete or 0) != 0:
+            raise RuntimeError("Durable signal source-sequence backfill is incomplete")
+
+    async def _enforce_source_sequence_required(self) -> None:
+        """Reject every post-migration event write that lacks a sequence.
+
+        This is the mixed-version rollout fence.  A pre-boundary Core replica
+        omits source_sequence from its insert; after bootstrap commits that
+        write must fail rather than enter history with ambiguous eligibility.
+        PostgreSQL can strengthen the additive column in place.  SQLite keeps
+        the additive table shape and installs equivalent insert/update guards.
+        """
+
+        if self.is_postgres:
+            await self._backend.execute(
+                f"ALTER TABLE {self.EVENTS} "
+                "ALTER COLUMN source_sequence SET NOT NULL"
+            )
+            return
+        if self.is_sqlite:
+            await self._backend.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {self.SOURCE_SEQUENCE_INSERT_GUARD}
+                BEFORE INSERT ON {self.EVENTS}
+                WHEN NEW.source_sequence IS NULL OR NEW.source_sequence < 1
+                BEGIN
+                    SELECT RAISE(ABORT, 'durable signal source sequence is required');
+                END
+                """
+            )
+            await self._backend.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {self.SOURCE_SEQUENCE_UPDATE_GUARD}
+                BEFORE UPDATE OF source_sequence ON {self.EVENTS}
+                WHEN NEW.source_sequence IS NULL OR NEW.source_sequence < 1
+                BEGIN
+                    SELECT RAISE(ABORT, 'durable signal source sequence is required');
+                END
+                """
+            )
+            return
+        raise RuntimeError(
+            "Durable signal source-sequence enforcement supports only sqlite or postgres"
+        )
+
     # ------------------------------------------------------------------
     # Subscription registration and event persistence
     # ------------------------------------------------------------------
+
+    async def capture_source_boundary(
+        self, *, agent_id: str, source: str
+    ) -> DurableSourceBoundary:
+        """Capture the current sequence for one exact tenant/source scope.
+
+        Capture and event persistence take the same source handoff lock inside
+        their database transaction.  The returned value is therefore ordered
+        against every event commit in that scope even across processes and
+        PostgreSQL hosts; no process or database timestamp participates.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("source", source)
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=source)
+            sequence = await self._source_sequence_locked(
+                agent_id=agent_id, source=source
+            )
+        return DurableSourceBoundary(
+            agent_id=agent_id,
+            source=source,
+            sequence=sequence,
+        )
 
     async def register_consumer(
         self, registration: DurableConsumerRegistration
@@ -630,19 +854,36 @@ class DurableSignalStore(UnifiedStoreBase):
         try:
             async with self._backend.transaction():
                 await self._lock_scope_handoff(agent_id=agent_id, source=signal.source)
+                existing = await self._existing_event_id_locked(
+                    agent_id, signal, source_event_id
+                )
+                if existing is not None:
+                    existing_sequence = await self._event_source_sequence_locked(
+                        event_id=existing,
+                        agent_id=agent_id,
+                        source=signal.source,
+                    )
+                    return DurableEventPersistence(
+                        event_id=existing,
+                        created=False,
+                        source_sequence=existing_sequence,
+                    )
                 # The transaction may have waited behind the cross-instance
                 # handoff lock. Start persisted event timing only after that
                 # contention has cleared, never from method entry.
                 now = self.now_utc()
                 retention_until = now + timedelta(days=retention_days)
+                source_sequence = await self._advance_source_sequence_locked(
+                    agent_id=agent_id, source=signal.source
+                )
                 inserted = await self._backend.execute(
                     f"""
                     INSERT OR IGNORE INTO {self.EVENTS} (
                         event_id, source_event_id, agent_id, target_agent, source, kind, mode,
                         payload, session_id, caller_identity, visibility, urgency,
                         dedupe_key, causation_chain, arrived_at, committed_at,
-                        retention_until
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        retention_until, source_sequence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal.id,
@@ -662,13 +903,21 @@ class DurableSignalStore(UnifiedStoreBase):
                         self.to_timestamp_param(signal.arrived_at),
                         self.to_timestamp_param(now),
                         self.to_timestamp_param(retention_until),
+                        source_sequence,
                     ),
                 )
                 if inserted == 0:
+                    # The source-scoped identity was absent after acquiring the
+                    # handoff lock.  Any later conflict is a global event-ID
+                    # collision or a writer that bypassed the lock.  Abort so
+                    # the source counter increment rolls back with the insert.
                     existing = await self._find_existing_event_locked(
                         agent_id, signal, source_event_id
                     )
-                    return DurableEventPersistence(event_id=existing, created=False)
+                    raise RuntimeError(
+                        "durable event identity appeared outside its source "
+                        f"handoff lock: {existing}"
+                    )
 
                 if caller_identity_factory is not None:
                     caller_identity = caller_identity_factory()
@@ -709,6 +958,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     caller_identity=caller_identity,
                     committed_at=now,
                     retention_until=retention_until,
+                    source_sequence=source_sequence,
                 )
                 selector_event = (
                     event
@@ -749,6 +999,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     delivery_ids=tuple(delivery_ids),
                     retention_until=retention_until,
                     initial_reservations=tuple(initial_reservations),
+                    source_sequence=source_sequence,
                 )
                 if before_commit is not None:
                     before_commit(persistence)
@@ -806,7 +1057,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 f"""
                 SELECT event_id, source_event_id, agent_id, target_agent, source, kind, mode, payload,
                        session_id, caller_identity, visibility, urgency, dedupe_key,
-                       causation_chain, arrived_at, committed_at, retention_until
+                       causation_chain, arrived_at, committed_at, retention_until,
+                       source_sequence
                 FROM {self.EVENTS}
                 WHERE event_id = ? AND agent_id = ? AND source = ?
                 """,
@@ -1956,6 +2208,16 @@ class DurableSignalStore(UnifiedStoreBase):
     async def _find_existing_event_locked(
         self, agent_id: str, signal: Signal, source_event_id: Optional[str]
     ) -> str:
+        existing = await self._existing_event_id_locked(
+            agent_id, signal, source_event_id
+        )
+        if existing is None:
+            raise RuntimeError("durable event insert conflicted without an existing event")
+        return existing
+
+    async def _existing_event_id_locked(
+        self, agent_id: str, signal: Signal, source_event_id: Optional[str]
+    ) -> Optional[str]:
         if source_event_id is not None:
             row = await self._backend.fetch_one(
                 f"""
@@ -1965,14 +2227,33 @@ class DurableSignalStore(UnifiedStoreBase):
                 (agent_id, signal.source, source_event_id),
             )
             if row is not None:
-                return row[0]
+                return str(row[0])
         row = await self._backend.fetch_one(
             f"SELECT event_id FROM {self.EVENTS} WHERE event_id = ?",
             (signal.id,),
         )
+        return str(row[0]) if row is not None else None
+
+    async def _event_source_sequence_locked(
+        self, *, event_id: str, agent_id: str, source: str
+    ) -> int:
+        """Return a previously committed event's sequence in this scope."""
+
+        row = await self._backend.fetch_one(
+            f"SELECT source_sequence FROM {self.EVENTS} "
+            "WHERE event_id = ? AND agent_id = ? AND source = ?",
+            (event_id, agent_id, source),
+        )
         if row is None:
-            raise RuntimeError("durable event insert conflicted without an existing event")
-        return row[0]
+            raise RuntimeError(
+                "durable event insert conflicted with a different agent/source scope"
+            )
+        if row[0] is None:
+            raise RuntimeError("durable event is missing its committed source sequence")
+        sequence = int(row[0])
+        if sequence < 1 or sequence > _MAX_SOURCE_SEQUENCE:
+            raise RuntimeError("durable event source sequence is out of range")
+        return sequence
 
     @staticmethod
     def _legacy_event_matches_redelivery(
@@ -2026,6 +2307,70 @@ class DurableSignalStore(UnifiedStoreBase):
             "Durable signal handoff serialization does not support backend "
             f"{self._backend.backend_type!r}"
         )
+
+    async def _source_sequence_locked(self, *, agent_id: str, source: str) -> int:
+        """Read one source sequence after locking its durable state row.
+
+        Normal callers must already own ``_lock_scope_handoff`` in the current
+        transaction. Schema backfill instead owns the event-table DDL lock or
+        SQLite writer reservation and runs before a boundary-capable dispatcher
+        serves. PostgreSQL deliberately acquires ``FOR UPDATE`` only after the
+        normal caller's potentially blocking advisory lock, so capture samples
+        the committed state that won the handoff rather than a pre-wait snapshot.
+        """
+
+        await self._backend.execute(
+            f"""
+            INSERT OR IGNORE INTO {self.SOURCE_SEQUENCES} (
+                agent_id, source, current_sequence
+            ) VALUES (?, ?, 0)
+            """,
+            (agent_id, source),
+        )
+        lock_clause = " FOR UPDATE" if self.is_postgres else ""
+        row = await self._backend.fetch_one(
+            f"SELECT current_sequence FROM {self.SOURCE_SEQUENCES} "
+            f"WHERE agent_id = ? AND source = ?{lock_clause}",
+            (agent_id, source),
+        )
+        if row is None:
+            raise RuntimeError("Durable signal source sequence row disappeared")
+        sequence = int(row[0])
+        if sequence < 0 or sequence > _MAX_SOURCE_SEQUENCE:
+            raise RuntimeError("Durable signal source sequence is out of range")
+        return sequence
+
+    async def _set_source_sequence_locked(
+        self, *, agent_id: str, source: str, sequence: int
+    ) -> None:
+        """Persist a nondecreasing value while the source state row is locked."""
+
+        if sequence < 0 or sequence > _MAX_SOURCE_SEQUENCE:
+            raise ValueError("source sequence is out of range")
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.SOURCE_SEQUENCES}
+            SET current_sequence = ?
+            WHERE agent_id = ? AND source = ? AND current_sequence <= ?
+            """,
+            (sequence, agent_id, source, sequence),
+        )
+        if updated != 1:
+            raise RuntimeError("Durable signal source sequence moved backwards")
+
+    async def _advance_source_sequence_locked(
+        self, *, agent_id: str, source: str
+    ) -> int:
+        """Advance and return one scope's sequence in the owning transaction."""
+
+        current = await self._source_sequence_locked(agent_id=agent_id, source=source)
+        if current >= _MAX_SOURCE_SEQUENCE:
+            raise OverflowError("Durable signal source sequence exhausted")
+        sequence = current + 1
+        await self._set_source_sequence_locked(
+            agent_id=agent_id, source=source, sequence=sequence
+        )
+        return sequence
 
     async def _lock_runtime_owner_scope(self, *, agent_id: str) -> None:
         """Serialize liveness heartbeats and recovery for one tenant.
@@ -2236,7 +2581,8 @@ class DurableSignalStore(UnifiedStoreBase):
             f"""
             SELECT event_id, source_event_id, agent_id, target_agent, source, kind, mode, payload,
                    session_id, caller_identity, visibility, urgency, dedupe_key,
-                   causation_chain, arrived_at, committed_at, retention_until
+                   causation_chain, arrived_at, committed_at, retention_until,
+                   source_sequence
             FROM {self.EVENTS}
             WHERE agent_id = ? AND source = ? AND retention_until >= ?
             """,
@@ -2307,6 +2653,7 @@ class DurableSignalStore(UnifiedStoreBase):
         caller_identity: Optional[str],
         committed_at: datetime,
         retention_until: datetime,
+        source_sequence: int,
     ) -> DurableSignalEvent:
         return DurableSignalEvent(
             event_id=signal.id,
@@ -2326,6 +2673,7 @@ class DurableSignalStore(UnifiedStoreBase):
             arrived_at=_as_utc(signal.arrived_at),
             committed_at=committed_at,
             retention_until=retention_until,
+            source_sequence=source_sequence,
         )
 
     def _row_to_event(self, row: tuple[Any, ...]) -> DurableSignalEvent:
@@ -2347,6 +2695,7 @@ class DurableSignalStore(UnifiedStoreBase):
             arrived_at=_as_utc(self.from_timestamp_field(row[14])),
             committed_at=_as_utc(self.from_timestamp_field(row[15])),
             retention_until=_as_utc(self.from_timestamp_field(row[16])),
+            source_sequence=int(row[17]),
         )
 
     @staticmethod
@@ -2384,7 +2733,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 e.source, e.kind, e.mode, e.payload, e.session_id,
                 e.caller_identity, e.visibility, e.urgency, e.dedupe_key,
                 e.causation_chain,
-                e.arrived_at, e.committed_at, e.retention_until
+                e.arrived_at, e.committed_at, e.retention_until,
+                e.source_sequence
             FROM {self.DELIVERIES} d
             JOIN {self.EVENTS} e ON e.event_id = d.event_id
             WHERE {where}
@@ -2448,5 +2798,6 @@ __all__ = [
     "DurableEventPersistence",
     "DurableInitialDeliveryReservation",
     "DurableSignalEvent",
+    "DurableSourceBoundary",
     "DurableSignalStore",
 ]

@@ -58,6 +58,7 @@ def _durable_backend_double() -> MagicMock:
     backend.execute = AsyncMock(return_value=1)
     backend.fetch_one = AsyncMock(return_value=None)
     backend.fetch_all = AsyncMock(return_value=[])
+    backend.fetch_val = AsyncMock(return_value=None)
 
     @contextlib.asynccontextmanager
     async def transaction(*, immediate: bool = False):
