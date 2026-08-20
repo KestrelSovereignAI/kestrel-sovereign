@@ -1433,3 +1433,52 @@ class TestConcurrentInstallSerialization:
         assert not overlap.is_set(), f"installs interleaved: {events}"
         # Strictly paired: no enter follows an enter without an exit between.
         assert events == ["enter", "exit", "enter", "exit"], events
+
+    def test_a_cancelled_request_does_not_release_the_lock_early(self, monkeypatch):
+        """Cancelling the request must not hand the venv to the next install.
+
+        Cancelling an `asyncio.to_thread` await does NOT stop the worker thread
+        or the installer subprocess it is running. Inline, a cancelled request
+        unwinds `async with` and frees the lock immediately while that abandoned
+        installer keeps writing — so the next request snapshots a venv still
+        being mutated. The work is shielded precisely so the lock outlives the
+        request that started it.
+        """
+        import asyncio as _asyncio
+        import threading
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        released_while_running = threading.Event()
+        finished = threading.Event()
+        started = _asyncio.Event()
+
+        async def _slow_guarded():
+            async with features_ep._INSTALL_LOCK:
+                started.set()
+                await _asyncio.sleep(0.15)   # the "installer" still running
+                finished.set()
+
+        async def _drive():
+            inner = _asyncio.create_task(_slow_guarded())
+            task = _asyncio.ensure_future(_asyncio.shield(inner))
+            await started.wait()
+            task.cancel()                     # client hangs up mid-install
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+            # The shielded work is still going; the lock must still be held.
+            if not features_ep._INSTALL_LOCK.locked() and not finished.is_set():
+                released_while_running.set()
+            # Let the shielded task finish so the lock is released by IT.
+            await _asyncio.sleep(0.25)
+            return features_ep._INSTALL_LOCK.locked()
+
+        still_locked_after = _asyncio.run(_drive())
+
+        assert not released_while_running.is_set(), (
+            "lock was released while the abandoned worker was still running"
+        )
+        assert finished.is_set(), "shielded work did not run to completion"
+        assert not still_locked_after, "lock was never released by the task itself"

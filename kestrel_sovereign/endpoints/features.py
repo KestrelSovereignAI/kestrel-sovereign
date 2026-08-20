@@ -342,38 +342,54 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     # is the point: snapshotting outside it would let another install land
     # between the snapshot and the compare, which is the drift this guard would
     # then report against an environment nobody actually broke.
-    async with _INSTALL_LOCK:
-        guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
+    #
+    # Run as a shielded task rather than inline, because cancelling an
+    # `asyncio.to_thread` await does NOT stop the worker thread or the installer
+    # subprocess it is running. Inline, a cancelled request unwinds `async with`
+    # and releases the lock immediately while that abandoned installer keeps
+    # writing — so the next request snapshots a venv still being mutated, which
+    # is exactly the concurrent-write and false-drift pair the lock exists to
+    # prevent. Shielding keeps the task alive to its own terminal state, and the
+    # lock is released by the task itself, so the guarantee survives a client
+    # that hangs up mid-install.
+    async def _guarded_install():
+        async with _INSTALL_LOCK:
+            guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
 
-        install_error: Optional[Tuple[int, str]] = None
-        try:
-            result = await asyncio.to_thread(
-                guard.run, [package_spec], timeout=INSTALL_TIMEOUT_SECONDS,
+            install_error: Optional[Tuple[int, str]] = None
+            try:
+                result = await asyncio.to_thread(
+                    guard.run, [package_spec], timeout=INSTALL_TIMEOUT_SECONDS,
+                )
+                if result.returncode != 0:
+                    logger.error(
+                        f"pip install failed for {package_spec}: {result.stderr}"
+                    )
+                    install_error = (500, f"Installation failed: {result.stderr[:500]}")
+            except subprocess.TimeoutExpired:
+                install_error = (504, "Installation timed out")
+
+            # Detection half, on EVERY path — a failed or timed-out install is
+            # not a reason to skip it. pip installs dependencies before the
+            # requested package can fail, and a timeout kills the process
+            # mid-write, so both can leave core swapped for an index wheel.
+            # Returning the install error without looking would leave that swap
+            # in place, unnamed.
+            #
+            # Bounded, because this repairs by running another installer: an
+            # unbounded one would hang the request the install timeout above
+            # exists to prevent. A repair that hits the bound comes back as an
+            # unrepaired outcome carrying the manual restore command, and the
+            # install's own status still stands.
+            outcome = await asyncio.to_thread(
+                guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS,
             )
-            if result.returncode != 0:
-                logger.error(f"pip install failed for {package_spec}: {result.stderr}")
-                install_error = (500, f"Installation failed: {result.stderr[:500]}")
-        except subprocess.TimeoutExpired:
-            install_error = (504, "Installation timed out")
+            return install_error, outcome
 
-        # Detection half, on EVERY path — a failed or timed-out install is not
-        # a reason to skip it. pip installs dependencies before the requested
-        # package can fail, and a timeout kills the process mid-write, so both
-        # can leave core swapped for an index wheel. Returning the install
-        # error without looking would leave that swap in place, unnamed.
-        #
-        # Bounded, because this repairs by running another installer: an
-        # unbounded one would hang the request the install timeout above exists
-        # to prevent. A repair that hits the bound comes back as an unrepaired
-        # outcome carrying the manual restore command, and the install's own
-        # status still stands.
-        #
-        # Inside the lock with the snapshot and the install: comparing after
-        # releasing it would let another request's install land in the window
-        # and be reported as this one's drift (issue #2949).
-        outcome = await asyncio.to_thread(
-            guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS,
-        )
+    install_error, outcome = await asyncio.shield(
+        asyncio.create_task(_guarded_install())
+    )
+
     if outcome.drift is not None:
         logger.error("core install changed during %s install:\n%s", package_spec, outcome.describe())
 

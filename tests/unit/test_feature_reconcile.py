@@ -1092,3 +1092,42 @@ def test_contract_every_guard_verdict_input_is_covered_here():
         "malformed-input case in the contract above — add one, or add the name "
         "to `covered` with a reason it cannot be malformed."
     )
+
+
+def test_a_direct_url_core_without_version_metadata_is_still_guarded():
+    """A missing version must not cost the guard entirely.
+
+    METADATA can omit or empty `Version`. Requiring one before holding meant a
+    damaged direct-URL core fell through to NO policy — unguarded, despite
+    positive evidence it did not come from an index — so a feature install could
+    replace it with an index wheel and nothing would ever report it.
+
+    Detection does not need a version; only the version PIN does. Losing the pin
+    is not a reason to lose the check.
+    """
+    url = "git+https://example.invalid/core@abc"
+    for missing in (None, ""):
+        shape = fr.CoreInstallShape(
+            version=missing, provenance=fr.Provenance.direct(url),
+        )
+        policy = fr.resolve_core_policy({}, shape)
+
+        assert policy.guarded, missing
+        assert not policy.source_is_verifiable      # nothing declared to restore from
+        assert policy.hold_version is None          # no pin is possible...
+        assert policy.hold_provenance.url == url    # ...but the source is held
+
+        # Unmoved: fine. Swapped to the index wheel: caught.
+        assert fr.core_install_matches(shape, policy)
+        assert not fr.core_install_matches(
+            fr.CoreInstallShape(
+                version=missing, provenance=fr.Provenance.from_index_install(),
+            ),
+            policy,
+        )
+
+    # A KNOWN index wheel with no version is still nothing to protect.
+    plain = fr.CoreInstallShape(
+        version=None, provenance=fr.Provenance.from_index_install(),
+    )
+    assert not fr.resolve_core_policy({}, plain).guarded

@@ -350,6 +350,7 @@ class CoreSourcePolicy:
             bool(self.editable)
             or self.pypi is not None
             or self.hold_version is not None
+            or self.hold_provenance is not None
         )
 
     @property
@@ -361,7 +362,7 @@ class CoreSourcePolicy:
         there is no declared source to reinstall from, and guessing one is how
         an operator's core gets retargeted.
         """
-        return self.hold_version is None
+        return self.hold_version is None and self.hold_provenance is None
 
     def describe_expected(self) -> str:
         if self.editable:
@@ -419,7 +420,7 @@ def resolve_core_policy(
             return CoreSourcePolicy(pypi=src.pypi)
     if shape.editable_path:
         return CoreSourcePolicy(editable=shape.editable_path)
-    if shape.version and not shape.from_index:
+    if not shape.from_index:
         # Core did not come from an index, and nothing declared where it should
         # come from. One rule covers both remaining cases, because the relevant
         # fact is the same: this core was NOT resolved from an index, so it is
@@ -434,8 +435,14 @@ def resolve_core_policy(
         # Splitting these on `provenance_known` guarded the second and let the
         # first fall through unguarded, which is the same fail-open one branch
         # further along.
+        # `hold_version` may be None: METADATA can omit or empty `Version`, and
+        # requiring one to guard at all meant a damaged direct-URL core fell
+        # through to NO policy — unguarded, despite positive evidence it did not
+        # come from an index. Detection does not need a version; only the
+        # version PIN does, and losing the pin is not a reason to lose the check
+        # as well.
         return CoreSourcePolicy(
-            hold_version=shape.version, hold_provenance=shape.provenance,
+            hold_version=shape.version or None, hold_provenance=shape.provenance,
         )
     return CoreSourcePolicy()
 
@@ -605,11 +612,13 @@ def core_install_matches(shape: "CoreInstallShape", policy: "CoreSourcePolicy") 
             and shape.from_index
             and version_satisfies(shape.version, policy.pypi)
         )
-    if policy.hold_version is not None:
-        if shape.version != policy.hold_version:
+    if policy.hold_version is not None or policy.hold_provenance is not None:
+        if policy.hold_version is not None and shape.version != policy.hold_version:
             return False
         held = policy.hold_provenance
-        if held is not None and held.known:
+        if held is None:
+            return True
+        if held.known:
             # The source WAS readable when the batch started, so it can be
             # checked — and must be. A version pin cannot see a same-version
             # swap: replacing a git-installed core with the index wheel that
