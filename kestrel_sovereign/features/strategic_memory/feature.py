@@ -23,6 +23,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
+from .decision_index import decision_entries, project_decisions
 from .issue_selection import pick_top_issue
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
@@ -186,6 +187,33 @@ class StrategicMemoryFeature(Feature):
         except Exception as e:
             logger.error(f"Failed to load strategic memory: {e}")
 
+        # Rebuild the graph index from what YAML says (#2851). Doing it at load
+        # is what makes the index genuinely derived: an agent whose database was
+        # lost, or whose STRATEGY.yaml was edited by hand or pulled from git,
+        # gets a correct index on next start with no migration step. It is also
+        # how decisions recorded before this existed become reachable at all.
+        await self._reindex_decisions()
+
+    async def _reindex_decisions(self) -> Dict[str, Any]:
+        """Project STRATEGY.yaml decisions into the graph.
+
+        Never raises and never touches YAML: the canonical record is already on
+        disk, so a graph failure must not turn into a strategic-memory failure.
+        """
+        entries = decision_entries(self._data)
+        if not entries:
+            return {"projected": 0, "skipped": 0, "failed": 0}
+        try:
+            storage = getattr(self.agent, "storage", None)
+            graph_store = getattr(storage, "graph", None) if storage else None
+            report = await project_decisions(graph_store, self.agent_id, entries)
+        except Exception as e:  # noqa: BLE001 - the index is best-effort
+            logger.warning("decision index projection failed: %s", e)
+            return {"projected": 0, "skipped": 0, "failed": len(entries)}
+        if report.get("failed") or report.get("skipped_reason"):
+            logger.info("decision index: %s", report)
+        return report
+
     def _save(self) -> _SaveOutcome:
         """Persist strategic memory back to STRATEGY.yaml.
 
@@ -336,10 +364,16 @@ class StrategicMemoryFeature(Feature):
             "impact": impact,
         }
         self._data["decisions"].append(entry)
-        return self._persisted_result(
+        result = self._persisted_result(
             confirmation=f"Decision recorded: {decision}",
             data={"recorded": True, "decision": entry},
         )
+        # Index it so recall_decisions and mark_superseded can see it. YAML is
+        # already written at this point, so the projection is deliberately not
+        # allowed to change the outcome — a decision that reached disk was
+        # recorded whether or not its index entry landed (#2851).
+        await self._reindex_decisions()
+        return result
 
     @tool(
         name="strategy_add_blocker",
