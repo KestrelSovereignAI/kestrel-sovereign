@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .db import (
     ConnectionError,
@@ -1923,30 +1923,43 @@ class AsyncDatabase:
         """
         from .session_grouping import session_order_index_columns
         from .conversation_sessions import (
+            FUNCTION_NAME_PREFIX,
+            TRIGGER_NAME_PREFIX,
             active_history_predicate,
             archived_history_predicate,
             canonical_order_index_columns,
             live_history_predicate,
-            mutation_trigger_function,
+            mutation_trigger_functions,
             mutation_triggers,
             projection_tables,
         )
 
         tables = projection_tables()
         triggers = mutation_triggers(self.backend_type)
-        function = mutation_trigger_function(self.backend_type)
+        functions = mutation_trigger_functions(self.backend_type)
+        wanted_triggers = {name: ddl for name, ddl in triggers}
+        wanted_functions = {name: ddl for name, ddl in functions}
 
         missing_tables = [
             (table, ddl)
             for table, ddl in tables
             if not await self.table_exists(table)
         ]
-        missing_triggers = [
-            (trigger, ddl)
-            for trigger, ddl in triggers
-            if not await self._trigger_exists(trigger, "conversation_history")
-        ]
-        if missing_tables or missing_triggers:
+        # Set equality, not "are the ones I want present". The names carry the
+        # mechanism's fingerprint, so a database running a SUPERSEDED shape has
+        # names this run has never heard of — and that database is exactly the
+        # one that used to be missed (#2998).
+        installed_triggers = await self._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        )
+        installed_functions = await self._trigger_function_family(
+            FUNCTION_NAME_PREFIX
+        )
+        if (
+            missing_tables
+            or installed_triggers != set(wanted_triggers)
+            or installed_functions != set(wanted_functions)
+        ):
             async with self.migration_lock("conversation_sessions_2959"):
                 # Re-probed under the lock: a concurrent initializer may have
                 # created every one of these while this one waited.
@@ -1956,31 +1969,43 @@ class AsyncDatabase:
                             normalize_schema(ddl, self.backend_type)
                         )
                         logger.info("created %s (#2959)", table)
-                outstanding = []
-                for trigger, ddl in triggers:
-                    if not await self._trigger_exists(
-                        trigger, "conversation_history"
-                    ):
-                        outstanding.append((trigger, ddl))
-                if outstanding and function is not None:
-                    # CREATE OR REPLACE, so no probe: replacing an identical
-                    # body is a no-op and replacing an older one is the point.
-                    # Unlocked it would collide on pg_proc's unique index.
-                    await self._backend.execute(function[1])
-                for trigger, ddl in outstanding:
-                    await self._backend.execute(ddl)
-                    logger.info("created trigger %s (#2959)", trigger)
-                # NOTE (#2998): existence is probed by NAME, so a database that
-                # already carries these triggers keeps the body it was created
-                # with. Changing PROJECTION_INPUT_COLUMNS therefore reaches new
-                # databases only, and an old one goes on watching the old list
-                # while the constant claims otherwise — silently, which is the
-                # one failure mode this projection is built to rule out. It is
-                # not live yet: none of this exists on main, so every database
-                # creates these triggers for the first time from the current
-                # list. It becomes live the moment that list changes after
-                # release, and it has already changed once (round 7 added
-                # ``id``), so it will change again.
+                installed_triggers = await self._trigger_family(
+                    TRIGGER_NAME_PREFIX, "conversation_history"
+                )
+                installed_functions = await self._trigger_function_family(
+                    FUNCTION_NAME_PREFIX
+                )
+                # CREATE BEFORE DROP, and the order is the whole safety
+                # argument. Between the two there is a moment when the old
+                # shape and the new one are both installed, and every row
+                # event is counted twice. That is survivable: a doubled delta
+                # fails the equality `_plan` requires, and a failed equality
+                # costs a full rebuild. Dropping first would instead leave a
+                # window with NO stamp, in which writes land unrecorded and the
+                # projection afterwards reports itself current — the one
+                # outcome this design does not tolerate. Slow beats silent.
+                for name, ddl in functions:
+                    if name not in installed_functions:
+                        await self._backend.execute(ddl)
+                        logger.info("created function %s (#2959)", name)
+                for name, ddl in triggers:
+                    if name not in installed_triggers:
+                        await self._backend.execute(ddl)
+                        logger.info("created trigger %s (#2959)", name)
+                for name in sorted(installed_triggers - set(wanted_triggers)):
+                    await self._backend.execute(self._drop_trigger_sql(
+                        name, "conversation_history"
+                    ))
+                    logger.info("retired superseded trigger %s (#2998)", name)
+                # Functions last: PostgreSQL refuses to drop one a trigger
+                # still uses, and the triggers that used these are gone by now.
+                # No CASCADE, so a dependency we failed to account for raises
+                # here rather than taking a live trigger down with it.
+                for name in sorted(installed_functions - set(wanted_functions)):
+                    await self._backend.execute(
+                        f"DROP FUNCTION IF EXISTS {self._quoted(name)}()"
+                    )
+                    logger.info("retired superseded function %s (#2998)", name)
 
         # Outside the lock deliberately: the statements have committed, so this
         # reads what the next boot would read, and a raise here is this
@@ -1991,13 +2016,19 @@ class AsyncDatabase:
                     f"{table} was not created; the #2959 session projection "
                     "cannot be maintained without it"
                 )
-        for trigger, _ddl in triggers:
-            if not await self._trigger_exists(trigger, "conversation_history"):
-                raise RuntimeError(
-                    f"conversation_history: trigger {trigger} was not created. "
-                    "Without it the session projection cannot detect that a "
-                    "row changed, and would report itself current forever."
-                )
+        final_triggers = await self._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        )
+        if final_triggers != set(wanted_triggers):
+            missing = sorted(set(wanted_triggers) - final_triggers)
+            stray = sorted(final_triggers - set(wanted_triggers))
+            raise RuntimeError(
+                "conversation_history: the change-stamp triggers are not the "
+                f"ones this build defines (missing: {missing or 'none'}; "
+                f"superseded and still installed: {stray or 'none'}). Without "
+                "the right ones the session projection cannot detect that a "
+                "row changed, and would report itself current forever."
+            )
 
         await self.ensure_index(
             *_SESSION_PROJECTION_INDEX,
@@ -2045,10 +2076,44 @@ class AsyncDatabase:
             where=archived_history_predicate(),
         )
 
-    async def _trigger_exists(self, name: str, table: str) -> bool:
-        """Whether ``table`` already carries a trigger called ``name``.
+    @staticmethod
+    def _quoted(name: str) -> str:
+        """``name`` as a quoted SQL identifier, for the DROPs below.
 
-        Asked of the TABLE, never of the trigger name alone, for the reason
+        Object names cannot be bound as parameters, so they have to be
+        interpolated. The names being dropped are read back OUT of the
+        catalogue rather than assembled here, and quoting rather than
+        validating is the difference between a database that can be swept and
+        one that cannot: a stray object whose name this build would never
+        produce is exactly the thing the sweep exists to remove, so refusing to
+        spell it would wedge every boot with the mess still installed.
+
+        Both dialects quote with ``"`` and escape an embedded one by doubling,
+        so one spelling serves.
+        """
+        return '"' + str(name).replace('"', '""') + '"'
+
+    def _drop_trigger_sql(self, name: str, table: str) -> str:
+        """``DROP TRIGGER`` in this engine's dialect.
+
+        PostgreSQL scopes a trigger to its table and demands ``ON``; SQLite
+        scopes it to the database and rejects the clause.
+        """
+        dropped = self._quoted(name)
+        if self.backend_type == "postgres":
+            return f"DROP TRIGGER IF EXISTS {dropped} ON {self._quoted(table)}"
+        return f"DROP TRIGGER IF EXISTS {dropped}"
+
+    async def _trigger_family(self, prefix: str, table: str) -> Set[str]:
+        """Every trigger on ``table`` whose name begins with ``prefix``.
+
+        Enumerating rather than probing one name at a time is what makes a
+        SUPERSEDED shape visible. The names carry a fingerprint of the
+        mechanism, so the question worth asking is not "is the trigger I want
+        here" — it is "what is here", answered against the set this build
+        defines (#2998).
+
+        Asked of the TABLE, never of the prefix alone, for the reason
         :meth:`_index_exists` spells out: on PostgreSQL a trigger name is unique
         only per table, and on SQLite only per database — so the name-only
         question has a different answer from the one the ``CREATE TRIGGER`` will
@@ -2059,19 +2124,48 @@ class AsyncDatabase:
         an unrelated constraint's trigger answer for one of ours.
         """
         if self.backend_type == "postgres":
-            row = await self._backend.fetch_one(
-                "SELECT COUNT(*) FROM pg_trigger "
-                "WHERE tgrelid = to_regclass(?) AND tgname = ? "
-                "AND NOT tgisinternal",
-                (table, name),
+            rows = await self._backend.fetch_all(
+                "SELECT tgname FROM pg_trigger "
+                "WHERE tgrelid = to_regclass(?) AND NOT tgisinternal",
+                (table,),
             )
         else:
-            row = await self._backend.fetch_one(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type = 'trigger' AND name = ? AND tbl_name = ?",
-                (name, table),
+            rows = await self._backend.fetch_all(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = ?",
+                (table,),
             )
-        return bool(row and row[0])
+        # Filtered here rather than in SQL: the two dialects disagree about how
+        # a literal underscore is escaped inside LIKE, and both prefixes are
+        # mostly underscores.
+        return {row[0] for row in (rows or []) if str(row[0]).startswith(prefix)}
+
+    async def _trigger_function_family(self, prefix: str) -> Set[str]:
+        """Every zero-argument trigger function named with ``prefix``.
+
+        Empty on SQLite, which has no function objects — its trigger bodies are
+        the statements themselves, so a trigger's shape is wholly described by
+        the trigger.
+
+        Narrowed to ``returns trigger`` and ``pronargs = 0`` so that the DROP
+        this feeds needs no argument list to be unambiguous, and so an unrelated
+        function that happens to share the prefix is not swept up by it.
+
+        ``current_schema()`` because that is where an unqualified ``CREATE
+        FUNCTION`` puts it — the same schema the triggers will resolve the name
+        in.
+        """
+        if self.backend_type != "postgres":
+            return set()
+        rows = await self._backend.fetch_all(
+            "SELECT p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = current_schema() "
+            "AND p.prorettype = 'pg_catalog.trigger'::regtype "
+            "AND p.pronargs = 0",
+            (),
+        )
+        return {row[0] for row in (rows or []) if str(row[0]).startswith(prefix)}
 
     async def _index_name_owner(self, name: str, table: str) -> Optional[str]:
         """Which relation already holds the index name ``name``, if any.

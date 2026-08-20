@@ -313,8 +313,10 @@ entirely: a repair never reads ciphertext, at any size of session.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -791,10 +793,11 @@ CREATE TABLE IF NOT EXISTS conversation_history_changes (
 )
 """
 
-#: The upsert both dialects' triggers perform, parameterized by which row's
+#: The upsert a PER-ROW trigger performs, parameterized by which row's
 #: ``agent_id`` is being stamped and by whether the event APPENDED a row.
-#: Written once so the three SQLite triggers and the one PostgreSQL function
-#: cannot count differently.
+#: Written once so SQLite's three triggers and PostgreSQL's UPDATE function
+#: cannot count differently. :func:`_statement_bump` is its per-statement
+#: counterpart and must add the same total.
 #:
 #: Two counters, because one cannot answer the question :meth:`_plan` asks.
 #: ``changes`` counts every row event; ``appends`` counts only inserts. A walk
@@ -804,9 +807,20 @@ CREATE TABLE IF NOT EXISTS conversation_history_changes (
 #: the counter moved by one and one row now stands up there. Both are one event
 #: and one row. They differ in that the renumbering is not an append, so
 #: counting appends separately is what separates them (#3001).
-#: PostgreSQL runs one function for INSERT and UPDATE, so whether the event was
-#: an append is an expression rather than a constant.
-_PG_IS_INSERT = "CASE WHEN TG_OP = 'INSERT' THEN 1 ELSE 0 END"
+
+#: Every trigger and function installed by this module is named
+#: ``<prefix><role>_<fingerprint>``, and these are the two prefixes. They are
+#: what lets an initializer enumerate the mechanism a database is *currently*
+#: carrying — not merely ask whether one expected name is present — so that a
+#: superseded shape is found and retired rather than left running (#2998).
+TRIGGER_NAME_PREFIX = "conversation_history_change_"
+FUNCTION_NAME_PREFIX = "kestrel_conversation_history_"
+
+#: What a name may contain once assembled. These are interpolated into DDL,
+#: which no parameter can carry, so the guarantee is asserted rather than
+#: assumed — the parts are this module's own constants and a hex digest, and
+#: this is the check that keeps that true if a role is ever renamed.
+_SAFE_NAME = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 
 
 def _new_generation(backend_type: str) -> str:
@@ -879,41 +893,285 @@ def projection_tables() -> Tuple[Tuple[str, str], ...]:
     )
 
 
-def mutation_trigger_function(backend_type: str) -> Optional[Tuple[str, str]]:
-    """``(name, DDL)`` of the PL/pgSQL function the PostgreSQL triggers call.
+def _placeholder(kind: str, role: str) -> str:
+    """The brace name a template uses to refer to one object of the mechanism."""
+    return ("fn_" if kind == "function" else "trg_") + role
 
-    ``None`` on SQLite, which has no separate function object — its trigger
-    bodies are the statements themselves.
 
-    ``CREATE OR REPLACE`` rather than a probe: it is run under the same
-    migration lock as the triggers, and an unconditional replace cannot leave a
-    trigger pointing at an older body. What it must not do is run *unlocked* —
-    two concurrent initializers replacing one function collide on
-    ``pg_proc``'s unique index, and the loser's whole ``from_pool()`` raises.
+def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
+    """A short digest of the whole mechanism's DDL, names excluded.
+
+    Names are excluded because they are derived FROM this — the templates carry
+    ``{fn_appended}``-style placeholders and are resolved afterwards, which is
+    what stops the definition from depending on its own digest.
     """
-    if backend_type != "postgres":
-        return None
+    material = "\n".join((backend_type, *templates)).encode("utf-8")
+    return hashlib.blake2s(material, digest_size=4).hexdigest()
+
+
+def _statement_bump(source: str, appends: str, generation: str) -> str:
+    """One ledger row per agent for a whole statement, counting rows touched.
+
+    ``source`` is a transition table. ``count(*)`` per ``agent_id`` is exactly
+    what N row-level bumps would have added, so the arithmetic
+    :meth:`ConversationSessionProjection._plan` performs is unchanged — this is
+    the same number arrived at in one statement instead of N.
+
+    ``GROUP BY`` is not only for the multi-agent case: it is what makes the
+    ``ON CONFLICT`` legal. PostgreSQL refuses an upsert whose source offers the
+    same conflict key twice ("cannot affect row a second time"), and a bulk
+    insert for one agent offers it once per row.
+    """
     return (
-        "kestrel_conversation_history_change",
-        "CREATE OR REPLACE FUNCTION kestrel_conversation_history_change() "
-        "RETURNS trigger AS $kestrel$ "
-        "BEGIN "
-        "  IF (TG_OP = 'DELETE') THEN "
-        f"    {_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; "
-        "    RETURN OLD; "
-        "  END IF; "
-        "  IF (TG_OP = 'UPDATE' AND OLD.agent_id IS DISTINCT FROM NEW.agent_id) THEN "
-        f"    {_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; "
-        "  END IF; "
-        f"  {_BUMP.format(row='NEW', appends=_PG_IS_INSERT, generation=_new_generation(backend_type))}; "
-        "  RETURN NEW; "
-        "END; "
-        "$kestrel$ LANGUAGE plpgsql"
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) "
+        f"SELECT agent_id, count(*), {appends}, {generation} "
+        f"FROM {source} GROUP BY agent_id "
+        "ON CONFLICT (agent_id) DO UPDATE "
+        "SET changes = conversation_history_changes.changes + EXCLUDED.changes, "
+        "appends = conversation_history_changes.appends + EXCLUDED.appends"
+    )
+
+
+def _pg_function(placeholder: str, body: str) -> str:
+    """A trigger function around ``body``, named by ``placeholder``."""
+    return (
+        "CREATE OR REPLACE FUNCTION {"
+        + placeholder
+        + "}() RETURNS trigger AS $kestrel$ BEGIN "
+        + body
+        + "; RETURN NULL; END; $kestrel$ LANGUAGE plpgsql"
+    )
+
+
+def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
+    """``(kind, role, DDL-with-name-placeholders)``, functions before triggers.
+
+    **INSERT and DELETE are statement-level on PostgreSQL; UPDATE is not.**
+    That split is measured rather than stylistic. A row-level trigger that
+    upserts a single counter row is a read-modify-write per affected row,
+    holding that row's lock until COMMIT, and on PostgreSQL 16 with 50,000 rows
+    for one agent it cost:
+
+    ==============  ============  ===========
+    statement       triggers off  triggers on
+    ==============  ============  ===========
+    bulk ``INSERT``       793 ms    11,334 ms
+    bulk ``DELETE``        17 ms    10,769 ms
+    ==============  ============  ===========
+
+    — 14x and 633x, plus 50,617 dead tuples in a table that holds one row per
+    agent. Those are live write paths the moment this projection ships:
+    ``purge_all_since``, the full-history restore in ``sovereign_adapter``, the
+    #2012 relink, the encryption backfill.
+
+    INSERT and DELETE convert exactly, because ``count(*)`` over the transition
+    table is arithmetically the same number N row-level bumps produce; there is
+    no case where they differ. UPDATE does not, and the reason is that a
+    transition table does not PAIR its rows: ``OLD`` and ``NEW`` arrive as two
+    unordered tuplestores, so "which rows changed a watched column" cannot be
+    asked of them without a join key — and ``id``, the only candidate, is itself
+    a watched column precisely because it can be rewritten (round 7). Comparing
+    the two as multisets would answer a *different* question, and answering it
+    would over-count an ordinary update by 2x and under-count a permutation to
+    zero. So UPDATE keeps the per-row form, where the question is exact.
+
+    That is affordable where the others were not, and for a reason particular to
+    UPDATE: it carries a ``WHEN`` clause. Statement-level triggers cannot have
+    one, which is the other half of why the split falls here. The bulk updates
+    this repo actually runs — the encryption backfill, the #1402
+    canonical/transport rewrite, ``atomic_increment_metadata_counter`` on every
+    recall — touch nothing the projection reads, so ``WHEN`` is false and the
+    function is never entered. What remains is the #2012 relink, which is a
+    one-time migration.
+
+    SQLite keeps all three row-level: it has no transition tables, so there is
+    nothing to convert to. **The two engines therefore no longer share one
+    trigger shape**, and that is worth saying plainly rather than leaving to be
+    discovered. What they do still share is the arithmetic — the ledger moves by
+    one per row event on both — and that, not the DDL, is what
+    :meth:`ConversationSessionProjection._plan` depends on.
+
+    What this costs instead
+    -----------------------
+
+    A transition table is a tuplestore of WHOLE tuples, built for the duration
+    of the statement and spilling past ``work_mem``. Measured on the same
+    PostgreSQL 16, 200,000 rows of roughly 1 KB each inserted and then deleted
+    in one statement apiece: **412 MB across 3 temp files**, and the delete
+    itself 316 ms. PostgreSQL offers no way to narrow it to the one column this
+    reads.
+
+    That is a real price and it is the right one to pay here. It is transient —
+    released when the statement ends — where the row-level form's 50,617 dead
+    tuples were not, and it is disk where the row-level form's cost was a row
+    lock held to COMMIT that every other writer for that agent queued behind.
+
+    It is also bounded in practice by the callers. ``_purge_conversation_rows``
+    already batches its deletes at 500 ids per statement, so every purge path
+    is bounded by construction. The exception is the full-history restore in
+    ``sovereign_adapter``, which deletes an agent's whole history in one
+    statement — and that path already holds the entire history in Python memory
+    to reinsert it, so this adds a second O(history) allocation to a path that
+    had one, in the cheaper medium, while making the statement itself ~35x
+    faster.
+    """
+    generation = _new_generation(backend_type)
+    if backend_type == "postgres":
+        bump_new = _BUMP.format(row="NEW", appends=0, generation=generation)
+        bump_old = _BUMP.format(row="OLD", appends=0, generation=generation)
+        watched = _watched_changed(backend_type, "IS DISTINCT FROM")
+        return (
+            (
+                "function",
+                "appended",
+                _pg_function(
+                    "fn_appended",
+                    _statement_bump("kestrel_appended", "count(*)", generation),
+                ),
+            ),
+            (
+                "function",
+                "updated",
+                _pg_function(
+                    "fn_updated",
+                    "IF (OLD.agent_id IS DISTINCT FROM NEW.agent_id) THEN "
+                    f"{bump_old}; END IF; {bump_new}",
+                ),
+            ),
+            (
+                "function",
+                "removed",
+                _pg_function(
+                    "fn_removed",
+                    _statement_bump("kestrel_removed", "0", generation),
+                ),
+            ),
+            (
+                "trigger",
+                "insert",
+                "CREATE TRIGGER {trg_insert} "
+                "AFTER INSERT ON conversation_history "
+                "REFERENCING NEW TABLE AS kestrel_appended "
+                "FOR EACH STATEMENT EXECUTE FUNCTION {fn_appended}()",
+            ),
+            (
+                "trigger",
+                "update",
+                "CREATE TRIGGER {trg_update} "
+                "AFTER UPDATE ON conversation_history FOR EACH ROW "
+                f"WHEN ({watched}) "
+                "EXECUTE FUNCTION {fn_updated}()",
+            ),
+            (
+                "trigger",
+                "delete",
+                "CREATE TRIGGER {trg_delete} "
+                "AFTER DELETE ON conversation_history "
+                "REFERENCING OLD TABLE AS kestrel_removed "
+                "FOR EACH STATEMENT EXECUTE FUNCTION {fn_removed}()",
+            ),
+        )
+    # SQLite spells null-safe inequality ``IS NOT`` and has no trigger
+    # functions, so each body carries the upsert directly. The conditional
+    # second stamp is an ``INSERT ... SELECT ... WHERE``: SQLite's own answer to
+    # "an upsert I want to skip", and the form that keeps the ON CONFLICT clause
+    # unambiguous to its parser.
+    watched_is_not = _watched_changed(backend_type, "IS NOT")
+    rehomed = (
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) "
+        f"SELECT OLD.agent_id, 1, 0, {generation} "
+        "WHERE OLD.agent_id IS NOT NEW.agent_id "
+        "ON CONFLICT (agent_id) DO UPDATE "
+        "SET changes = conversation_history_changes.changes + 1"
+    )
+    return (
+        (
+            "trigger",
+            "insert",
+            "CREATE TRIGGER {trg_insert} "
+            "AFTER INSERT ON conversation_history FOR EACH ROW BEGIN "
+            f"{_BUMP.format(row='NEW', appends=1, generation=generation)}; END",
+        ),
+        (
+            "trigger",
+            "update",
+            "CREATE TRIGGER {trg_update} "
+            "AFTER UPDATE ON conversation_history FOR EACH ROW "
+            f"WHEN ({watched_is_not}) BEGIN "
+            f"{_BUMP.format(row='NEW', appends=0, generation=generation)}; "
+            f"{rehomed}; END",
+        ),
+        (
+            "trigger",
+            "delete",
+            "CREATE TRIGGER {trg_delete} "
+            "AFTER DELETE ON conversation_history FOR EACH ROW BEGIN "
+            f"{_BUMP.format(row='OLD', appends=0, generation=generation)}; END",
+        ),
+    )
+
+
+def _mechanism(backend_type: str) -> Tuple[Tuple[str, str, str, str], ...]:
+    """``(kind, role, name, DDL)`` for the whole mechanism, names resolved.
+
+    Every name ends in :func:`_fingerprint` of the mechanism it belongs to, so
+    the objects installed in a database ARE their definition and a name probe
+    answers the question it was always meant to ask (#2998).
+
+    The fingerprint covers the functions as well as the triggers, and covers all
+    of them together. A PostgreSQL trigger's behaviour is its function's body:
+    editing :func:`watched_metadata_sql` leaves every ``CREATE TRIGGER``
+    character-for-character identical, and something has to notice. Fingerprinting
+    the mechanism as a whole makes one edit rename all six, which is coarser than
+    strictly necessary and is the point — the objects are installed and retired
+    as a set, so there is no state in which half of one shape is live beside half
+    of another.
+    """
+    templates = _mechanism_templates(backend_type)
+    stamp = _fingerprint(backend_type, [ddl for _kind, _role, ddl in templates])
+    names = {
+        _placeholder(kind, role): (
+            (FUNCTION_NAME_PREFIX if kind == "function" else TRIGGER_NAME_PREFIX)
+            + role
+            + "_"
+            + stamp
+        )
+        for kind, role, _ddl in templates
+    }
+    for name in names.values():
+        if not _SAFE_NAME.match(name):
+            raise ValueError(f"unusable SQL identifier for the change stamp: {name!r}")
+    return tuple(
+        (kind, role, names[_placeholder(kind, role)], ddl.format(**names))
+        for kind, role, ddl in templates
+    )
+
+
+def mutation_trigger_functions(backend_type: str) -> Tuple[Tuple[str, str], ...]:
+    """``(name, DDL)`` of every PL/pgSQL function the triggers call.
+
+    Empty on SQLite, which has no separate function object — its trigger bodies
+    are the statements themselves.
+
+    ``CREATE OR REPLACE`` rather than a probe, and the replace cannot surprise a
+    live trigger: the name carries the shape, so a changed body is a changed
+    name and the statement targets a function nothing points at yet. Retiring
+    the superseded one is the sweep's job, and the sweep runs after the triggers
+    that used it are gone. What this must not do is run *unlocked* — two
+    concurrent initializers creating one function collide on ``pg_proc``'s
+    unique index, and the loser's whole ``from_pool()`` raises.
+    """
+    return tuple(
+        (name, ddl)
+        for kind, _role, name, ddl in _mechanism(backend_type)
+        if kind == "function"
     )
 
 
 def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
-    """``(trigger, DDL)`` for the change stamp, in this engine's dialect.
+    """``(name, DDL)`` for the change stamp, in this engine's dialect.
 
     Three triggers, not one, and the split is the arithmetic in
     :meth:`ConversationSessionProjection._plan`: **each row event moves the
@@ -944,70 +1202,27 @@ def mutation_triggers(backend_type: str) -> Tuple[Tuple[str, str], ...]:
     recall rebuilt the whole projection. :func:`watched_metadata_sql` is what
     each side is compared through.
 
-    Row-level on both engines rather than PostgreSQL's statement-level
-    transition tables, because one shape that is provably identical on the two
-    engines is worth more here than a bulk-delete optimization on one of them:
-    the price is N updates of a single row inside a statement that is already
-    updating N rows, all in the same transaction.
+    Which of these are per-row and which are per-statement is
+    :func:`_mechanism_templates`' subject.
     """
-    watched_is_distinct = _watched_changed(backend_type, "IS DISTINCT FROM")
-    if backend_type == "postgres":
-        return (
-            (
-                "conversation_history_change_insert",
-                "CREATE TRIGGER conversation_history_change_insert "
-                "AFTER INSERT ON conversation_history FOR EACH ROW "
-                "EXECUTE FUNCTION kestrel_conversation_history_change()",
-            ),
-            (
-                "conversation_history_change_update",
-                "CREATE TRIGGER conversation_history_change_update "
-                "AFTER UPDATE ON conversation_history FOR EACH ROW "
-                f"WHEN ({watched_is_distinct}) "
-                "EXECUTE FUNCTION kestrel_conversation_history_change()",
-            ),
-            (
-                "conversation_history_change_delete",
-                "CREATE TRIGGER conversation_history_change_delete "
-                "AFTER DELETE ON conversation_history FOR EACH ROW "
-                "EXECUTE FUNCTION kestrel_conversation_history_change()",
-            ),
-        )
-    # SQLite spells null-safe inequality ``IS NOT`` and has no trigger
-    # functions, so each body carries the upsert directly. The conditional
-    # second stamp is an ``INSERT ... SELECT ... WHERE``: SQLite's own answer to
-    # "an upsert I want to skip", and the form that keeps the ON CONFLICT clause
-    # unambiguous to its parser.
-    watched_is_not = _watched_changed(backend_type, "IS NOT")
-    rehomed = (
-        "INSERT INTO conversation_history_changes "
-        "(agent_id, changes, appends, generation) "
-        f"SELECT OLD.agent_id, 1, 0, {_new_generation(backend_type)} "
-        "WHERE OLD.agent_id IS NOT NEW.agent_id "
-        "ON CONFLICT (agent_id) DO UPDATE "
-        "SET changes = conversation_history_changes.changes + 1"
+    return tuple(
+        (name, ddl)
+        for kind, _role, name, ddl in _mechanism(backend_type)
+        if kind == "trigger"
     )
-    return (
-        (
-            "conversation_history_change_insert",
-            "CREATE TRIGGER conversation_history_change_insert "
-            "AFTER INSERT ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='NEW', appends=1, generation=_new_generation(backend_type))}; END",
-        ),
-        (
-            "conversation_history_change_update",
-            "CREATE TRIGGER conversation_history_change_update "
-            "AFTER UPDATE ON conversation_history FOR EACH ROW "
-            f"WHEN ({watched_is_not}) BEGIN "
-            f"{_BUMP.format(row='NEW', appends=0, generation=_new_generation(backend_type))}; {rehomed}; END",
-        ),
-        (
-            "conversation_history_change_delete",
-            "CREATE TRIGGER conversation_history_change_delete "
-            "AFTER DELETE ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='OLD', appends=0, generation=_new_generation(backend_type))}; END",
-        ),
-    )
+
+
+def mutation_trigger(backend_type: str, role: str) -> Tuple[str, str]:
+    """One trigger's ``(name, DDL)`` by role — ``insert``/``update``/``delete``.
+
+    Callers that want a particular trigger ask for it by the job it does, since
+    the name is a derived value now and spelling it out would embed a
+    fingerprint that changes whenever the mechanism does.
+    """
+    for kind, this_role, name, ddl in _mechanism(backend_type):
+        if kind == "trigger" and this_role == role:
+            return (name, ddl)
+    raise KeyError(f"no {role} trigger for backend {backend_type}")
 
 
 @dataclass(frozen=True, slots=True)

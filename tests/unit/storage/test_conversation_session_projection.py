@@ -1063,11 +1063,13 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
         _chunk_sql,
         _live_rows_through,
         _own_rows_through,
-        mutation_triggers,
+        mutation_trigger,
     )
 
     for backend in ("sqlite", "postgres"):
-        update = dict(mutation_triggers(backend))["conversation_history_change_update"]
+        # Asked for by ROLE: the name carries a fingerprint of the mechanism now,
+        # so spelling it here would pin this case to one revision of it.
+        _name, update = mutation_trigger(backend, "update")
         for column in PROJECTION_INPUT_COLUMNS:
             assert f"OLD.{column}" in update and f"NEW.{column}" in update, (
                 f"{backend}: the update trigger does not watch {column}"
@@ -1094,6 +1096,59 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
             assert len(selected.split(", ")) == len(
                 _DERIVED_FROM.split(", ")
             ) + 1, selected
+
+
+def test_changing_what_the_triggers_watch_changes_what_they_are_called():
+    """The name has to move when the mechanism does, or the probe is blind.
+
+    This is #2998 stated as an equality. Installation asks the database which
+    objects of this family it carries and compares that set against the one this
+    build defines. That question is only worth asking if a changed definition
+    produces a changed name — otherwise a database keeps the body it was created
+    with forever, watching an older column list while the constant claims
+    otherwise, and nothing anywhere reports it.
+
+    Both directions are asserted. A changed watched-column list must rename, and
+    a changed *function body* must rename too even though it leaves every
+    ``CREATE TRIGGER`` character-for-character identical — on PostgreSQL a
+    trigger's behaviour is its function's, so a fingerprint over the triggers
+    alone would miss the edits most likely to happen here.
+    """
+    import kestrel_sovereign.storage.conversation_sessions as cs
+
+    baseline = {
+        backend: (
+            [name for name, _ddl in cs.mutation_triggers(backend)],
+            [name for name, _ddl in cs.mutation_trigger_functions(backend)],
+        )
+        for backend in ("sqlite", "postgres")
+    }
+
+    original_columns = cs.PROJECTION_INPUT_COLUMNS
+    original_keys = cs.PROJECTION_METADATA_KEYS
+    try:
+        cs.PROJECTION_INPUT_COLUMNS = original_columns + ("provider",)
+        for backend in ("sqlite", "postgres"):
+            widened = [name for name, _ddl in cs.mutation_triggers(backend)]
+            assert widened != baseline[backend][0], (
+                f"{backend}: widening the watched columns left every trigger "
+                "name unchanged, so an existing database would never be told"
+            )
+        cs.PROJECTION_INPUT_COLUMNS = original_columns
+
+        # Metadata keys are read only inside the function body on PostgreSQL,
+        # which is the case a trigger-only fingerprint would not catch.
+        cs.PROJECTION_METADATA_KEYS = original_keys + ("some_new_key",)
+        functions = [name for name, _ddl in cs.mutation_trigger_functions("postgres")]
+        assert functions != baseline["postgres"][1]
+    finally:
+        cs.PROJECTION_INPUT_COLUMNS = original_columns
+        cs.PROJECTION_METADATA_KEYS = original_keys
+
+    for backend in ("sqlite", "postgres"):
+        assert [name for name, _ddl in cs.mutation_triggers(backend)] == baseline[
+            backend
+        ][0], f"{backend}: the fingerprint did not settle back"
 
 
 def test_the_watched_metadata_keys_are_the_ones_the_grouper_consults():
@@ -1232,6 +1287,7 @@ async def test_initializing_a_database_wires_the_projections_whole_schema(tmp_pa
         _SESSION_PROJECTION_INDEX,
     )
     from kestrel_sovereign.storage.conversation_sessions import (
+        TRIGGER_NAME_PREFIX,
         mutation_triggers,
         projection_tables,
     )
@@ -1249,8 +1305,11 @@ async def test_initializing_a_database_wires_the_projections_whole_schema(tmp_pa
         ) is True, "the index the conversation list's ordering needs is absent"
         for table, _ddl in projection_tables():
             assert await db.table_exists(table), table
-        for trigger, _ddl in mutation_triggers(db.backend_type):
-            assert await db._trigger_exists(trigger, "conversation_history"), trigger
+        # Set equality, so a superseded trigger left behind beside the wanted
+        # ones fails here rather than going on counting alongside them.
+        assert await db._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        ) == {name for name, _ddl in mutation_triggers(db.backend_type)}
         assert await db.fetchval(
             "SELECT COUNT(*) FROM schema_backfills WHERE name LIKE ?",
             ("%conversation_sessions%",),

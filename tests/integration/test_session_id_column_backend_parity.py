@@ -1561,6 +1561,241 @@ async def _create_projection_schema(db: AsyncDatabase) -> None:
     await db.ensure_session_projection_schema()
 
 
+async def _ledger(db: AsyncDatabase) -> dict:
+    """``{agent_id: (changes, appends)}`` — what the triggers have counted."""
+    rows = await db.fetchall(
+        "SELECT agent_id, changes, appends FROM conversation_history_changes"
+    )
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+async def _append(db: AsyncDatabase, rows) -> None:
+    """One INSERT statement carrying every row in ``rows``.
+
+    One statement, not a loop, because the thing under test is what a
+    STATEMENT-level trigger counts: a loop of single-row inserts would exercise
+    the per-row path on both engines and prove nothing about the conversion.
+    """
+    values = ", ".join(["(?, ?, ?, ?, ?)"] * len(rows))
+    await db.execute(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, session_id) VALUES " + values,
+        tuple(
+            field
+            for agent, session in rows
+            for field in (agent, "user", "hello", "{}", session)
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_one_statement_touching_many_agents_counts_each_of_them(db_backend):
+    """The ledger moves by the rows a statement touched, per agent, on both.
+
+    This is the whole parity claim of the statement-level conversion. On
+    PostgreSQL an INSERT or DELETE now fires ONE trigger for the entire
+    statement and derives the movement from ``count(*)`` over a transition
+    table; on SQLite it still fires once per row. The two spellings have to
+    agree on the number, because ``_plan``'s arithmetic — delta equals appends
+    equals the rows now standing above the target — is stated in that number
+    and in nothing else.
+
+    Many agents in one statement, because that is where a per-statement count
+    could plausibly go wrong in a way a single-agent case would never show: the
+    ``GROUP BY`` is what keeps one agent's rows from being credited to another,
+    and is also what keeps the upsert legal (PostgreSQL refuses a source that
+    offers the same conflict key twice).
+    """
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+
+        await _append(db, [("alice", "s1")] * 5 + [("bob", "s1")] * 3 + [("carol", "s2")])
+        assert await _ledger(db) == {
+            "alice": (5, 5),
+            "bob": (3, 3),
+            "carol": (1, 1),
+        }
+
+        # One DELETE removing two agents' rows: changes move, appends do not.
+        await db.execute(
+            "DELETE FROM conversation_history WHERE agent_id IN (?, ?)",
+            ("alice", "carol"),
+        )
+        assert await _ledger(db) == {
+            "alice": (10, 5),
+            "bob": (3, 3),
+            "carol": (2, 1),
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_a_statement_that_touches_no_row_moves_nothing(db_backend):
+    """A statement-level trigger fires even when the statement matched nothing.
+
+    PostgreSQL runs an ``AFTER ... FOR EACH STATEMENT`` trigger once per
+    statement whether or not any row qualified, so unlike the per-row form there
+    IS a body to execute here — and it must add zero. A ledger that crept
+    forward on a no-op DELETE would make ``_plan`` see a change it cannot
+    attribute to any row, which costs a full rebuild of the projection every
+    time a purge finds nothing to purge.
+    """
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        await _append(db, [("alice", "s1")])
+        before = await _ledger(db)
+
+        await db.execute(
+            "DELETE FROM conversation_history WHERE agent_id = ?", ("nobody",)
+        )
+        await db.execute(
+            "UPDATE conversation_history SET session_id = ? WHERE agent_id = ?",
+            ("s9", "nobody"),
+        )
+        assert await _ledger(db) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_a_bulk_update_of_unwatched_columns_still_moves_nothing(db_backend):
+    """UPDATE stayed per-row, so the narrowing it carries has to still hold.
+
+    The statement-level conversion deliberately left UPDATE alone — a transition
+    table does not pair its rows, so "which of these changed a watched column"
+    cannot be asked of one. What makes that affordable is the ``WHEN`` clause a
+    per-row trigger can carry and a per-statement trigger cannot, and this is
+    the case that says the clause survived the rewrite: the bulk updates this
+    repo actually runs (the encryption backfill, the #1402 rewrite, the counter
+    bump on every recall) touch none of the columns the projection reads.
+    """
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        await _append(db, [("alice", "s1")] * 4)
+        before = await _ledger(db)
+
+        await db.execute(
+            "UPDATE conversation_history SET content = ?, model = ? WHERE agent_id = ?",
+            ("rewritten", "some-model", "alice"),
+        )
+        assert await _ledger(db) == before
+
+        # ...and a watched column in the same shape still moves it once per row.
+        await db.execute(
+            "UPDATE conversation_history SET session_id = ? WHERE agent_id = ?",
+            ("s2", "alice"),
+        )
+        assert await _ledger(db) == {"alice": (before["alice"][0] + 4, before["alice"][1])}
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_a_superseded_trigger_shape_is_retired_rather_than_left_running(
+    db_backend,
+):
+    """A database carrying an older shape is upgraded, not silently skipped.
+
+    Before #2998 existence was probed by NAME against a fixed name, so a
+    database that already had ``conversation_history_change_insert`` kept
+    whatever body it was created with forever: changing the watched-column list
+    reached new databases only, while an old one went on watching the old list
+    and the constant claimed otherwise. Names carry the mechanism's fingerprint
+    now, so the superseded shape is a name this build has never heard of — and
+    that is the whole point, because it is findable.
+
+    The stray here is created with the current DDL under a *previous-generation*
+    name. That keeps the case about identity rather than about whether some
+    hand-written body happens to compile on both engines.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        FUNCTION_NAME_PREFIX,
+        TRIGGER_NAME_PREFIX,
+        mutation_trigger,
+        mutation_trigger_functions,
+        mutation_triggers,
+    )
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+
+        wanted = {name for name, _ddl in mutation_triggers(db.backend_type)}
+        current, ddl = mutation_trigger(db.backend_type, "insert")
+        stray = TRIGGER_NAME_PREFIX + "insert_0000dead"
+        assert stray not in wanted
+        await db.execute(ddl.replace(current, stray))
+        assert stray in await db._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        )
+
+        await db.ensure_session_projection_schema()
+
+        assert await db._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        ) == wanted, "the superseded trigger was left installed beside the current one"
+        assert await db._trigger_function_family(FUNCTION_NAME_PREFIX) == {
+            name for name, _ddl in mutation_trigger_functions(db.backend_type)
+        }
+
+        # And the survivor still counts: a sweep that dropped the wrong one
+        # would leave a history nothing stamps.
+        await _append(db, [("alice", "s1")] * 2)
+        assert (await _ledger(db))["alice"] == (2, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_the_new_shape_is_installed_before_the_old_one_is_dropped(db_backend):
+    """Ordering, because the two mistakes here are not equally bad.
+
+    Between installing a new shape and retiring the old one there is a window,
+    and which window it is decides what a concurrent write costs. Both installed
+    means every row event is counted twice — a doubled delta fails the equality
+    ``_plan`` requires, which costs a full rebuild and nothing else. NEITHER
+    installed means writes land unstamped, and a projection that never learns of
+    them reports itself current forever. So the create must precede the drop,
+    and this asserts the DDL actually went out in that order rather than
+    trusting the comment that says so.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        TRIGGER_NAME_PREFIX,
+        mutation_trigger,
+    )
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_projection_schema(db)
+        current, ddl = mutation_trigger(db.backend_type, "insert")
+        await db.execute(ddl.replace(current, TRIGGER_NAME_PREFIX + "insert_0000dead"))
+        await db.execute(db._drop_trigger_sql(current, "conversation_history"))
+
+        issued = []
+        original = db._backend.execute
+
+        async def recording(query, params=()):
+            issued.append(" ".join(str(query).split()))
+            return await original(query, params)
+
+        db._backend.execute = recording
+        try:
+            await db.ensure_session_projection_schema()
+        finally:
+            db._backend.execute = original
+
+        creates = [i for i, sql in enumerate(issued) if sql.startswith("CREATE TRIGGER")]
+        drops = [i for i, sql in enumerate(issued) if sql.startswith("DROP TRIGGER")]
+        assert creates and drops, issued
+        assert max(creates) < min(drops), (
+            "a superseded trigger was dropped before its replacement existed, "
+            "leaving a window in which writes are not stamped"
+        )
+        if db.backend_type == "postgres":
+            functions = [
+                i for i, sql in enumerate(issued) if sql.startswith("DROP FUNCTION")
+            ]
+            assert not functions or min(functions) > max(drops), (
+                "a function was dropped while a trigger could still call it"
+            )
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
@@ -1585,6 +1820,9 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
         _SESSION_PROJECTION_INDEX,
     )
     from kestrel_sovereign.storage.conversation_sessions import (
+        FUNCTION_NAME_PREFIX,
+        TRIGGER_NAME_PREFIX,
+        mutation_trigger_functions,
         mutation_triggers,
         projection_tables,
     )
@@ -1607,8 +1845,12 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
 
         for table, _ddl in projection_tables():
             assert await db.table_exists(table) is True, table
-        for trigger, _ddl in mutation_triggers(db.backend_type):
-            assert await db._trigger_exists(trigger, "conversation_history"), trigger
+        assert await db._trigger_family(
+            TRIGGER_NAME_PREFIX, "conversation_history"
+        ) == {name for name, _ddl in mutation_triggers(db.backend_type)}
+        assert await db._trigger_function_family(
+            FUNCTION_NAME_PREFIX
+        ) == {name for name, _ddl in mutation_trigger_functions(db.backend_type)}
         for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
             name, table = entry[0], entry[1]
             assert await db._index_exists(name, table) is True
