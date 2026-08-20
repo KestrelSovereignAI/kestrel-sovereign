@@ -792,12 +792,52 @@ CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
 
 _CHANGES_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_history_changes (
-    agent_id   TEXT PRIMARY KEY,
+    agent_id   TEXT NOT NULL,
+    slot       BIGINT NOT NULL DEFAULT 0,
     changes    BIGINT NOT NULL DEFAULT 0,
     appends    BIGINT NOT NULL DEFAULT 0,
-    generation TEXT NOT NULL DEFAULT ''
+    generation TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (agent_id, slot)
 )
 """
+
+#: Which row of the ledger a writer adds to (#3005).
+#:
+#: One row per agent made every write transaction touching that agent's history
+#: queue behind every other, for the length of the longest — the upsert takes a
+#: row lock held to COMMIT, so a purge or a restore stalled ordinary appends.
+#: Measured: two connections upserting one row block; two upserting different
+#: rows do not.
+#:
+#: ``pg_backend_pid()`` makes non-collision a GUARANTEE rather than a
+#: probability, which a modulus would not. A backend can only be inside one
+#: transaction at a time, so no two CONCURRENT transactions can ever address
+#: the same slot, and a lock on one can never be waited on by another. Slots
+#: accumulate as pool connections churn; they are tiny, and folding them is
+#: :meth:`repair`'s business once #2960 gives the projection a reader.
+#:
+#: SQLite has one writer by construction, so it has nothing to shard and stays
+#: on slot 0.
+def _slot(backend_type: str) -> str:
+    if backend_type == "postgres":
+        return "pg_backend_pid()"
+    return "0"
+
+
+#: Slot 0 is not a writer's slot; it is where the agent's ``generation`` lives.
+#:
+#: The generation identifies an INCARNATION of the ledger and so must be one
+#: value per agent, which a sharded counter has nowhere to put. Reserving a
+#: slot no ``pg_backend_pid()`` can return (pids start at 1) gives it a home
+#: without a second table.
+#:
+#: ``DO NOTHING`` is what keeps that home from becoming the contention the
+#: sharding just removed: measured, an ``ON CONFLICT DO NOTHING`` against an
+#: already-committed row takes no lock a second writer waits on. It DOES wait
+#: when the row is being created in-flight by another transaction — so an
+#: agent's very first two concurrent writes can still serialize, once, ever.
+#: That is measured rather than assumed, and it is the honest bound.
+_ANCHOR_COLUMNS = "(agent_id, slot, changes, appends, generation)"
 
 #: The upsert a PER-ROW trigger performs, parameterized by which row's
 #: ``agent_id`` is being stamped and by whether the event APPENDED a row.
@@ -848,12 +888,46 @@ def _new_generation(backend_type: str) -> str:
 
 _BUMP = (
     "INSERT INTO conversation_history_changes "
-    "(agent_id, changes, appends, generation) "
-    "VALUES ({row}.agent_id, 1, {appends}, {generation}) "
-    "ON CONFLICT (agent_id) DO UPDATE "
+    "(agent_id, slot, changes, appends) "
+    "VALUES ({row}.agent_id, {slot}, 1, {appends}) "
+    "ON CONFLICT (agent_id, slot) DO UPDATE "
     "SET changes = conversation_history_changes.changes + 1, "
     "appends = conversation_history_changes.appends + {appends}"
 )
+
+#: Creates the agent's slot-0 row and its generation, once, and never touches
+#: either again. Runs BEFORE the bump in every trigger body: on SQLite the bump
+#: also addresses slot 0, so a bump landing first would create the row with an
+#: empty generation that this could no longer fill in.
+def _anchor(generation: str, *, row: str = "", agents: str = "", where: str = "") -> str:
+    """Create the agent's slot-0 row, generation and all, if it is not there.
+
+    ``row`` names a per-row trigger's ``NEW``/``OLD``; ``agents`` is a subquery
+    yielding one ``agent_id`` per agent for a per-statement trigger. Exactly one
+    is given.
+
+    The de-duplication in ``agents`` has to happen in a SUBQUERY rather than as
+    ``SELECT DISTINCT`` beside the constants: the generation expression is
+    volatile, so every projected row would differ and ``DISTINCT`` would dedupe
+    nothing — one row per row written, and one uuid generated per row of a bulk
+    insert.
+    """
+    values = (
+        f"VALUES ({row}.agent_id, 0, 0, 0, {generation})" if row
+        else f"SELECT agent_id, 0, 0, 0, {generation} FROM ({agents}) AS kestrel_agents"
+    )
+    if where:
+        # The conditional form has to be a SELECT: SQLite has no way to put a
+        # predicate on VALUES, and this is its own answer to "an upsert I want
+        # to skip" (the shape the rehoming stamp already uses).
+        values = f"SELECT {row}.agent_id, 0, 0, 0, {generation} {where}"
+    return (
+        "INSERT INTO conversation_history_changes "
+        + _ANCHOR_COLUMNS
+        + " "
+        + values
+        + " ON CONFLICT (agent_id, slot) DO NOTHING"
+    )
 
 
 def projection_tables() -> Tuple[Tuple[str, str], ...]:
@@ -915,7 +989,9 @@ def _fingerprint(backend_type: str, templates: Sequence[str]) -> str:
     return hashlib.blake2s(material, digest_size=4).hexdigest()
 
 
-def _statement_bump(source: str, appends: str, generation: str) -> str:
+def _statement_bump(
+    source: str, appends: str, generation: str, slot: str
+) -> str:
     """One ledger row per agent for a whole statement, counting rows touched.
 
     ``source`` is a transition table. ``count(*)`` per ``agent_id`` is exactly
@@ -929,11 +1005,13 @@ def _statement_bump(source: str, appends: str, generation: str) -> str:
     insert for one agent offers it once per row.
     """
     return (
-        "INSERT INTO conversation_history_changes "
-        "(agent_id, changes, appends, generation) "
-        f"SELECT agent_id, count(*), {appends}, {generation} "
+        _anchor(generation, agents=f"SELECT DISTINCT agent_id FROM {source}")
+        + "; "
+        + "INSERT INTO conversation_history_changes "
+        "(agent_id, slot, changes, appends) "
+        f"SELECT agent_id, {slot}, count(*), {appends} "
         f"FROM {source} GROUP BY agent_id "
-        "ON CONFLICT (agent_id) DO UPDATE "
+        "ON CONFLICT (agent_id, slot) DO UPDATE "
         "SET changes = conversation_history_changes.changes + EXCLUDED.changes, "
         "appends = conversation_history_changes.appends + EXCLUDED.appends"
     )
@@ -1015,12 +1093,20 @@ def _update_statement_bump(
         ") AS kestrel_net WHERE kestrel_lost > 0"
     )
     return (
-        "INSERT INTO conversation_history_changes "
-        "(agent_id, changes, appends, generation) "
-        f"SELECT agent_id, SUM(kestrel_n)::bigint, 0, {generation} "
+        _anchor(
+            generation,
+            agents=(
+                f"SELECT agent_id FROM {before} "
+                f"UNION SELECT agent_id FROM {after}"
+            ),
+        )
+        + "; "
+        + "INSERT INTO conversation_history_changes "
+        "(agent_id, slot, changes, appends) "
+        f"SELECT agent_id, {_slot(backend_type)}, SUM(kestrel_n)::bigint, 0 "
         f"FROM ({changed} UNION ALL {departed}) AS kestrel_moved "
         "GROUP BY agent_id "
-        "ON CONFLICT (agent_id) DO UPDATE "
+        "ON CONFLICT (agent_id, slot) DO UPDATE "
         "SET changes = conversation_history_changes.changes + EXCLUDED.changes, "
         "appends = conversation_history_changes.appends + EXCLUDED.appends"
     )
@@ -1122,28 +1208,41 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
     had one, in the cheaper medium, while making the statement itself ~35x
     faster.
 
-    What the ledger costs regardless of trigger shape
-    -------------------------------------------------
+    What the ledger used to cost, and why it is sharded
+    ---------------------------------------------------
 
-    One row per agent, upserted inside the writing transaction, means the row
-    lock is held to COMMIT. **Write transactions touching one agent's history
-    are therefore serialized against each other for the length of the longest
-    one.** That is inherent to a per-agent counter, not to the per-statement
-    conversion — the per-row form took the same lock earlier and held it
-    longer.
+    One row per agent, upserted inside the writing transaction, held that row's
+    lock to COMMIT — so every write transaction touching one agent's history
+    was serialized against every other for the length of the longest. Short
+    autocommit appends never noticed. The long ones did:
+    ``_purge_conversation_rows`` wraps its snapshot, its deletes and its
+    lexical cleanup in one transaction, and the restore wraps a whole history,
+    so an ordinary append for that agent waited on either.
 
-    Short autocommit statements hold it for microseconds and nobody notices.
-    The paths that do are the long ones: ``_purge_conversation_rows`` wraps its
-    snapshot, its deletes and its lexical cleanup in one transaction, and the
-    restore wraps a whole history. While either runs, an append for that agent
-    waits.
+    That was never inherent to the per-statement conversion — the per-row form
+    took the same lock earlier and held it longer — but it WAS inherent to a
+    single counter row, which is why the row is not single any more.
+    :func:`_slot` gives each writer its own, keyed on ``pg_backend_pid()``, and
+    the choice of key is the whole argument: a backend can only be inside one
+    transaction at a time, so two CONCURRENT transactions can never address the
+    same slot. A modulus would have made collision unlikely instead of
+    impossible, and an intermittent stall is worse to diagnose than a reliable
+    one.
 
-    It is a stall and not a deadlock, and that rests on lock ORDER rather than
+    Measured, two connections, the second appending while the first holds a
+    transaction that wrote the same agent's history: **blocked** before,
+    **not blocked** after. One exception, measured rather than reasoned about:
+    an agent's first-ever write creates its slot-0 anchor, and a second writer
+    arriving while that INSERT is still in flight does wait for it. Once per
+    agent per incarnation of the ledger.
+
+    None of it was ever a deadlock, and that rests on lock ORDER rather than
     luck: every path writes history before it takes the lexical advisory lock,
-    never the reverse, so there is no cycle to detect.
-    ``test_concurrent_final_shared_key_purges_reclaim_tokens`` is where this is
-    pinned down — it found the serialization by deadlocking its own harness
-    against it — and it fails if the ledger ever stops serializing.
+    never the reverse, so there was no cycle to detect.
+    ``test_concurrent_final_shared_key_purges_reclaim_tokens`` is where this
+    lives — it found the serialization by deadlocking its own harness against
+    it, and now asserts that both parties reach the key boundary, so it fails
+    again if anything upstream starts serializing them.
     """
     generation = _new_generation(backend_type)
     if backend_type == "postgres":
@@ -1153,7 +1252,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
                 "appended",
                 _pg_function(
                     "fn_appended",
-                    _statement_bump("kestrel_appended", "count(*)", generation),
+                    _statement_bump(
+                        "kestrel_appended", "count(*)", generation,
+                        _slot(backend_type),
+                    ),
                 ),
             ),
             (
@@ -1172,7 +1274,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
                 "removed",
                 _pg_function(
                     "fn_removed",
-                    _statement_bump("kestrel_removed", "0", generation),
+                    _statement_bump(
+                        "kestrel_removed", "0", generation,
+                        _slot(backend_type),
+                    ),
                 ),
             ),
             (
@@ -1207,21 +1312,28 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
     # "an upsert I want to skip", and the form that keeps the ON CONFLICT clause
     # unambiguous to its parser.
     watched_is_not = _watched_changed(backend_type, "IS NOT")
+    slot = _slot(backend_type)
+
+    def anchor(row: str, only_when: str = "") -> str:
+        return _anchor(generation, row=row, where=only_when)
+
     rehomed = (
         "INSERT INTO conversation_history_changes "
-        "(agent_id, changes, appends, generation) "
-        f"SELECT OLD.agent_id, 1, 0, {generation} "
+        "(agent_id, slot, changes, appends) "
+        f"SELECT OLD.agent_id, {slot}, 1, 0 "
         "WHERE OLD.agent_id IS NOT NEW.agent_id "
-        "ON CONFLICT (agent_id) DO UPDATE "
+        "ON CONFLICT (agent_id, slot) DO UPDATE "
         "SET changes = conversation_history_changes.changes + 1"
     )
+    departed = " WHERE OLD.agent_id IS NOT NEW.agent_id"
     return (
         (
             "trigger",
             "insert",
             "CREATE TRIGGER {trg_insert} "
             "AFTER INSERT ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='NEW', appends=1, generation=generation)}; END",
+            f"{anchor('NEW')}; "
+            f"{_BUMP.format(row='NEW', appends=1, slot=slot)}; END",
         ),
         (
             "trigger",
@@ -1229,15 +1341,17 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
             "CREATE TRIGGER {trg_update} "
             "AFTER UPDATE ON conversation_history FOR EACH ROW "
             f"WHEN ({watched_is_not}) BEGIN "
-            f"{_BUMP.format(row='NEW', appends=0, generation=generation)}; "
-            f"{rehomed}; END",
+            f"{anchor('NEW')}; "
+            f"{_BUMP.format(row='NEW', appends=0, slot=slot)}; "
+            f"{anchor('OLD', departed)}; {rehomed}; END",
         ),
         (
             "trigger",
             "delete",
             "CREATE TRIGGER {trg_delete} "
             "AFTER DELETE ON conversation_history FOR EACH ROW BEGIN "
-            f"{_BUMP.format(row='OLD', appends=0, generation=generation)}; END",
+            f"{anchor('OLD')}; "
+            f"{_BUMP.format(row='OLD', appends=0, slot=slot)}; END",
         ),
     )
 
@@ -1369,6 +1483,9 @@ def shape_change_invalidation(backend_type: str) -> str:
     return (
         "UPDATE conversation_history_changes SET generation = "
         + _new_generation(backend_type)
+        # Slot 0 only: it is the one row that carries a generation, and the
+        # writers' slots hold the empty string by construction (#3005).
+        + " WHERE slot = 0"
     )
 
 
@@ -1768,7 +1885,8 @@ class ConversationSessionProjection:
         the ledger it was read from (``purge_session_projection``).
         """
         value = await self.db.fetchval(
-            "SELECT changes FROM conversation_history_changes WHERE agent_id = ?",
+            "SELECT COALESCE(SUM(changes), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?",
             (self.agent_id,),
         )
         return int(value or 0)
@@ -1782,7 +1900,8 @@ class ConversationSessionProjection:
         :meth:`is_stale` asks.
         """
         value = await self.db.fetchval(
-            "SELECT appends FROM conversation_history_changes WHERE agent_id = ?",
+            "SELECT COALESCE(SUM(appends), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?",
             (self.agent_id,),
         )
         return int(value or 0)
@@ -1795,7 +1914,8 @@ class ConversationSessionProjection:
         they restart at 1, so they can arrive back at any earlier value.
         """
         value = await self.db.fetchval(
-            "SELECT generation FROM conversation_history_changes WHERE agent_id = ?",
+            "SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0",
             (self.agent_id,),
         )
         return str(value or "")

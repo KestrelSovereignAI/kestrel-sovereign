@@ -121,28 +121,22 @@ async def _cancel_and_observe(task: asyncio.Task[Any] | None) -> None:
 class _TwoPartyCleanupGate:
     """Drive two transactions to one key boundary and expose lock overlap.
 
-    ``both_reach_the_boundary`` says which of two arrangements is under test,
-    and the distinction is #2959's change ledger. That ledger holds one row per
-    agent, and the trigger maintaining it upserts that row inside the writing
-    transaction — so the row lock is held to COMMIT and any second transaction
-    writing a WATCHED column for the same agent parks at its own write, which
-    happens before this boundary.
+    The barrier is load-bearing and was briefly wrong. While #2959's change
+    ledger held one row per agent, the trigger maintaining it upserted that row
+    inside the writing transaction — so the second purge parked at its own
+    DELETE, before this boundary, and the leading party waited here forever for
+    a party stuck behind it. The ledger is sharded per writer now (#3005), so
+    two purges for one agent reach this point concurrently again and the
+    advisory lock is once more the only thing that serializes them, which is
+    what this case exists to check.
 
-    Whether that applies is decided by the column, not by the caller. A purge
-    DELETEs history, which the ledger always counts, so the second purge never
-    arrives. A backfill rewrites ``lexical_index_id``, which is not in
-    ``PROJECTION_INPUT_COLUMNS`` — the trigger's ``WHEN`` is false, no ledger
-    row is touched, and both parties genuinely arrive.
-
-    The barrier exists for the second arrangement only. Applying it to the
-    first makes the leading party wait for a party parked behind it: a deadlock
-    manufactured by the harness, which is how this was found. Exclusivity is
-    asserted either way, and in the purge arrangement it is the stronger
-    claim — the second party cannot even reach the boundary.
+    That episode is why ``arrivals`` is asserted and not merely counted: if
+    anything upstream ever serializes these two again, the exclusivity below
+    would hold vacuously — one arrival can hardly race itself — and this would
+    keep passing while testing nothing.
     """
 
-    def __init__(self, *, both_reach_the_boundary: bool) -> None:
-        self.both_reach_the_boundary = both_reach_the_boundary
+    def __init__(self) -> None:
         self.arrivals = 0
         self.all_arrived = asyncio.Event()
         self.first_acquired = asyncio.Event()
@@ -156,10 +150,9 @@ class _TwoPartyCleanupGate:
         @asynccontextmanager
         async def wrapper(keys):
             self.arrivals += 1
-            if self.both_reach_the_boundary:
-                if self.arrivals == 2:
-                    self.all_arrived.set()
-                await self.all_arrived.wait()
+            if self.arrivals == 2:
+                self.all_arrived.set()
+            await self.all_arrived.wait()
             async with original(keys) as ordered_keys:
                 self.acquired.append(label)
                 if len(self.acquired) == 1:
@@ -176,12 +169,11 @@ class _TwoPartyCleanupGate:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(self.second_acquired.wait(), timeout=0.5)
         assert len(self.acquired) == 1
-        if not self.both_reach_the_boundary:
-            assert self.arrivals == 1, (
-                "the second writer reached the shared-key boundary while the "
-                "first still held its transaction open — the #2959 change "
-                "ledger no longer serializes same-agent history writes"
-            )
+        assert self.arrivals == 2, (
+            "only one party reached the shared-key boundary, so the exclusivity "
+            "asserted above is vacuous — something upstream serialized these "
+            "two transactions before they got here"
+        )
 
 
 async def _assert_destroyed(db: AsyncDatabase, message: _IndexedMessage) -> None:
@@ -335,7 +327,7 @@ async def test_concurrent_final_shared_key_purges_reclaim_tokens(
         second_audit = _PausingAudit(None)
         first_store._destructive_audit = first_audit
         second_store._destructive_audit = second_audit
-        cleanup_gate = _TwoPartyCleanupGate(both_reach_the_boundary=False)
+        cleanup_gate = _TwoPartyCleanupGate()
 
         monkeypatch.setattr(
             first_store._lexical_index,
@@ -842,7 +834,7 @@ async def test_concurrent_backfills_reclaim_the_final_shared_key(
 
     cleanup_gate: _TwoPartyCleanupGate | None = None
     if storage.db.backend_type == "postgres":
-        cleanup_gate = _TwoPartyCleanupGate(both_reach_the_boundary=True)
+        cleanup_gate = _TwoPartyCleanupGate()
         monkeypatch.setattr(
             first_index,
             "serialized_token_cleanup",

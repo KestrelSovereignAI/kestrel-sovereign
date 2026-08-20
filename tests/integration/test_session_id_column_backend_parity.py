@@ -2569,9 +2569,29 @@ async def test_a_watermark_wider_than_int4_is_storable(postgres_db):
             (agent_id,),
         ))
         changes = _INT4_MAX + 7
+        # The ledger is SHARDED (#3005), so an agent's stamp is the sum across
+        # its slots and "set the counter" is not one row's business any more.
+        # Driving the total from slot 0 and clearing the writers' slots is the
+        # narrowest way to say it; writing every slot instead would have set
+        # the value twice over and read back double, which is how this was
+        # noticed.
         await db.execute(
-            "UPDATE conversation_history_changes SET changes = ? WHERE agent_id = ?",
+            "UPDATE conversation_history_changes SET changes = 0 "
+            "WHERE agent_id = ? AND slot <> 0",
+            (agent_id,),
+        )
+        await db.execute(
+            "UPDATE conversation_history_changes SET changes = ? "
+            "WHERE agent_id = ? AND slot = 0",
             (changes, agent_id),
+        )
+        assert await db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot <> 0",
+            (agent_id,),
+        ) > 0, (
+            "no writer slot was created, so this case would pass on an "
+            "unsharded ledger and prove nothing about the sum"
         )
 
         projection = ConversationSessionProjection(db, agent_id)
