@@ -182,6 +182,23 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
 #: so two groupings of one transcript agree.
 _GROUPING_EPOCH = datetime(1970, 1, 1)
 
+#: The same constant, for the OTHER implementation of session membership.
+#:
+#: ``AsyncConversationStore._filter_session_rows`` re-derives the gap rules for
+#: reads and lifecycle snapshots, and it used to date an unreadable timestamp
+#: with ``datetime.now()`` — as this function did, which is why the two agreed.
+#: They stopped agreeing when this one became a function of the rows, which the
+#: #2959 projection requires: a grouping that consults a clock cannot be cached,
+#: because re-deriving it later gives a different answer.
+#:
+#: Sharing the constant does not make the two agree about WHICH session an
+#: unreadable row joins — this one inherits its predecessor and the other cannot
+#: always see one. What it does remove is the part that made the answer depend
+#: on when you asked. The disagreement that remains is one mechanism with two
+#: implementations, which is #2961's subject and not something a shared constant
+#: can fix.
+UNDATABLE_ROW_FALLBACK = _GROUPING_EPOCH
+
 #: Exactly the strings SQLite's ``julianday`` can read, which is what the
 #: canonical order compares. Written as the WHOLE value, not a prefix: the first
 #: version of this guard checked only the date, and the divergence between
