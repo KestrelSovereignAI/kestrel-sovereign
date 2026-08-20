@@ -62,21 +62,21 @@ def test_class_name_spelling_is_not_read_but_is_reported(tmp_path, caplog):
         declared = _agent(tmp_path)._declared_feature_config(
             "TalonCoordinatorFeature"
         )
-    assert declared == {}
+    assert declared is None
     assert "is never read" in caplog.text
     assert "[features.talon.config]" in caplog.text
 
 
 def test_absent_file_and_absent_block_are_not_errors(tmp_path):
     agent = _agent(tmp_path)
-    assert agent._declared_feature_config("TalonCoordinatorFeature") == {}
+    assert agent._declared_feature_config("TalonCoordinatorFeature") is None
     _write_agent_toml(tmp_path, '[llm]\nallow_paid_fallback = false\n')
-    assert agent._declared_feature_config("TalonCoordinatorFeature") == {}
+    assert agent._declared_feature_config("TalonCoordinatorFeature") is None
 
 
 def test_unknown_feature_class_resolves_to_no_package(tmp_path):
     _write_agent_toml(tmp_path, '[features.talon.config]\nconfig_path = "/x"\n')
-    assert _agent(tmp_path)._declared_feature_config("NotAFeature") == {}
+    assert _agent(tmp_path)._declared_feature_config("NotAFeature") is None
 
 
 @pytest.mark.asyncio
@@ -218,4 +218,87 @@ async def test_registration_fails_when_declared_config_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="config_path"):
         await agent._register_feature(feature)
 
+    assert "TalonCoordinatorFeature" not in agent.features
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_empty_block_is_applied_not_ignored(tmp_path):
+    """Emptying the table means "clear it", not "I said nothing"."""
+    _write_agent_toml(tmp_path, "[features.talon.config]\n")
+    feature = TalonCoordinatorFeature()
+
+    await _agent(tmp_path)._apply_host_feature_config(feature)
+
+    assert feature.applied == {}
+
+
+def test_an_unreadable_agent_toml_fails_closed(tmp_path):
+    """A malformed file is not an absent one.
+
+    Degrading to "no declaration" would let an initialized feature keep the
+    configuration the operator believes they replaced.
+    """
+    from kestrel_sovereign.kestrel_agent import HostFeatureConfigError
+
+    _write_agent_toml(tmp_path, "[features.talon.config\nconfig_path = ")
+
+    with pytest.raises(HostFeatureConfigError, match="could not be read"):
+        _agent(tmp_path)._declared_feature_config("TalonCoordinatorFeature")
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_config_application_tears_the_feature_down(
+    tmp_path,
+):
+    """CancelledError is a BaseException and bypasses ``except Exception``.
+
+    initialize() has already run and the feature is not yet in agent.features,
+    so boot rollback cannot find it — its tasks would outlive the failed boot.
+    """
+    import asyncio
+
+    from kestrel_sovereign.features.base import Feature
+    from kestrel_sovereign.signals.registry import SourceRegistry
+    from kestrel_sovereign.waits import WaitRegistry
+
+    _write_agent_toml(
+        tmp_path, '[features.talon.config]\nconfig_path = "/srv/k.toml"\n'
+    )
+
+    class TalonCoordinatorFeature(Feature):
+        name = "TalonCoordinatorFeature"
+        config_schema = {"type": "object"}
+
+        @property
+        def tool_description(self) -> str:
+            return "test double"
+
+        async def initialize(self) -> None:
+            return None
+
+        async def set_config(self, config):
+            raise asyncio.CancelledError()
+
+    agent = KestrelAgent(
+        did="did:test:cancel", storage_path=str(tmp_path / "kestrel_prime.db")
+    )
+    agent.task_manager = _RegistrationTaskManager()
+    agent.signal_registry = SourceRegistry()
+    agent.wait_registry = WaitRegistry()
+    agent.features = {}
+
+    torn_down = []
+    original = agent._shutdown_failed_feature
+
+    async def _record(f):
+        torn_down.append(f)
+        await original(f)
+
+    agent._shutdown_failed_feature = _record
+
+    feature = TalonCoordinatorFeature(agent)
+    with pytest.raises(asyncio.CancelledError):
+        await agent._register_feature(feature)
+
+    assert torn_down == [feature]
     assert "TalonCoordinatorFeature" not in agent.features

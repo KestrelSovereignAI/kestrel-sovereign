@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import math
@@ -45,6 +46,10 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.config_validation import validate_feature_config
+
+
+class HostFeatureConfigError(RuntimeError):
+    """The host could not read the feature configuration it was asked to apply."""
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
@@ -4283,8 +4288,13 @@ class KestrelAgent(
         # registry class, so keying on type() would silently skip every
         # isolated feature — reintroducing the exact silence this closes.
         declared = self._declared_feature_config(getattr(feature, "name", "") or "")
-        if not declared:
+        if declared is None:
             return
+        # An explicitly empty [features.X.config] means "clear it", which is a
+        # different instruction from "no block". Treating them alike would let
+        # an operator who deliberately emptied the table keep running the
+        # settings they just removed — and would skip required-field
+        # validation on the way past.
         declared = dict(declared)
         if isinstance(schema, dict):
             # The same rule the HTTP configuration route applies. Validating
@@ -4298,16 +4308,22 @@ class KestrelAgent(
             return None
         return Path(self.storage_path).parent / "kestrel.toml"
 
-    def _declared_feature_config(self, feature_class_name: str) -> Dict[str, Any]:
-        """Read ``[features.<package>.config]`` for one feature class."""
+    def _declared_feature_config(
+        self, feature_class_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read ``[features.<package>.config]`` for one feature class.
+
+        Returns ``None`` when no block is declared, and a (possibly empty)
+        mapping when one is — the distinction is load-bearing.
+        """
         path = self._agent_toml_path()
         if path is None or not path.exists():
-            return {}
+            return None
         from kestrel_sovereign.feature_registry import get_package_for_feature
 
         package = get_package_for_feature(feature_class_name)
         if package is None:
-            return {}
+            return None
         try:
             try:
                 import tomllib  # type: ignore[import-not-found]
@@ -4316,11 +4332,16 @@ class KestrelAgent(
             with open(path, "rb") as handle:
                 data = tomllib.load(handle)
         except (OSError, ValueError) as exc:
-            logging.warning("Failed to read feature configuration from %s: %s", path, exc)
-            return {}
+            # Do NOT degrade to "no declaration". A malformed file is not an
+            # absent one: reporting it as absent lets an initialized feature
+            # keep configuration the operator believes they replaced, which is
+            # the silent divergence this mechanism exists to end.
+            raise HostFeatureConfigError(
+                f"Feature configuration in {path} could not be read: {exc}"
+            ) from exc
         features = data.get("features")
         if not isinstance(features, dict):
-            return {}
+            return None
         entry = features.get(package.name)
         if not isinstance(entry, dict):
             # The confusable spelling is the class name, because that is what
@@ -4337,9 +4358,9 @@ class KestrelAgent(
                     feature_class_name,
                     package.name,
                 )
-            return {}
+            return None
         declared = entry.get("config")
-        return declared if isinstance(declared, dict) else {}
+        return declared if isinstance(declared, dict) else None
 
     async def _register_feature(
         self,
@@ -4369,6 +4390,15 @@ class KestrelAgent(
             raise
         try:
             await self._apply_host_feature_config(feature)
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so the handler below never
+            # sees it. initialize() has already run at this point and the
+            # feature is not yet in self.features, so boot rollback cannot
+            # find it — its tasks and signal sources would outlive the failed
+            # boot. Tear down, then let the cancellation continue.
+            with contextlib.suppress(Exception):
+                await self._shutdown_failed_feature(feature)
+            raise
         except Exception as exc:
             # Deliberately fatal to this feature. A rejected block does NOT
             # leave the feature unconfigured — a feature that validates before

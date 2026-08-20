@@ -655,27 +655,34 @@ role = "technical_reviewer"
 # every Talon operation fails on unresolved configuration and the tables above
 # are inert — including `[talon.preference]`. See #3008.
 #
-# Two files are involved and they are BOTH called kestrel.toml, which is the
-# easy mistake to make:
+# The pointer lives beside the AGENT's database, in the kestrel.toml next to
+# `kestrel_prime.db`:
 #
-#   * THIS file — the project configuration. It holds `[talon.runtime]` and
-#     `[talon.preference]` above. It is what `config_path` points AT.
+#     [features.talon.config]
+#     config_path = "/srv/kestrel/kestrel.toml"
 #
-#   * The AGENT's kestrel.toml, beside that agent's database (e.g.
-#     `agent_data/<name>/kestrel.toml`). It holds the pointer:
+# Whether that is a different file from this one depends on the deployment,
+# and this is the easy mistake to make:
 #
-#         [features.talon.config]
-#         config_path = "/srv/kestrel/kestrel.toml"
+#   * Multi-agent, or any host with a separate agent data directory: the two
+#     are DIFFERENT files, both called kestrel.toml. The block above goes in
+#     `agent_data/<name>/kestrel.toml`; `[talon.runtime]` stays here, in the
+#     file `config_path` points AT.
+#
+#   * Default single-agent: the database is placed in `$KESTREL_DB_PATH` or
+#     the current directory, so when that is the project root they are the
+#     SAME file — and the block above belongs here, alongside
+#     `[talon.runtime]`.
 #
 # Feature configuration is addressed by PACKAGE name — `talon`, the name
 # `kestrel feature enable` uses — not by the feature's class name, which is
 # what the HTTP route keys on. A `[features.TalonCoordinatorFeature.config]`
 # block is never read (the loader logs a warning if it finds one).
 #
-# Putting `[features.talon.config]` in THIS file does nothing: the block is
-# read from the agent's file. And a bare `config_path` under `[talon]` here
-# cannot work at all — the feature would have to already know where this file
-# is in order to read it.
+# A bare `config_path` under `[talon]` cannot work in either layout — the
+# feature would have to already know where this file is in order to read it.
+# The pointer is always `[features.talon.config]`, in whichever kestrel.toml
+# sits beside the agent's database.
 #
 # Equivalent to the agent-file block, for a running agent, without a restart:
 #   PATCH /api/features/TalonCoordinatorFeature/config
