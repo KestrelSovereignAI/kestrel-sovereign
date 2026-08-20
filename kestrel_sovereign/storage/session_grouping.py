@@ -195,8 +195,14 @@ _GROUPING_EPOCH = datetime(1970, 1, 1)
 _JULIANDAY_READABLE = re.compile(
     r"^\d{4}-\d{2}-\d{2}"          # date
     r"([ T]\d{2}:\d{2}"             # optional time, space or uppercase T
-    r"(:\d{2}(\.\d+)?)?)?"          # optional seconds, optional fraction
-    r"(Z|[+-]\d{2}:\d{2})?$"        # optional UTC marker or +/-HH:MM offset
+    r"(:\d{2}(\.\d+)?)?"           # optional seconds, optional fraction
+    # NESTED inside the time, not beside it. Spelled as a sibling the two were
+    # independently optional, so `2026-01-01Z` and `2026-01-01+01:00` matched —
+    # and `julianday` returns NULL for a date carrying an offset but no time,
+    # while the parser below dates them happily. That is exactly the
+    # divergence this expression exists to close, reintroduced by where a
+    # bracket fell.
+    r"(Z|[+-]\d{2}:\d{2})?)?$"      # optional UTC marker or +/-HH:MM offset
 )
 
 

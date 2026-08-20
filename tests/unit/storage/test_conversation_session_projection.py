@@ -1058,22 +1058,48 @@ def test_the_triggers_watch_exactly_what_the_derivation_reads():
     trigger DDL is generated from the same constant the derivation is written
     against, and this holds the generated SQL to it on both dialects.
     """
+    import re
+
     from kestrel_sovereign.storage.conversation_sessions import (
         _DERIVED_FROM,
         _chunk_sql,
         _live_rows_through,
         _own_rows_through,
+        _watched_projection,
         mutation_trigger,
+        mutation_trigger_functions,
     )
 
     for backend in ("sqlite", "postgres"):
-        # Asked for by ROLE: the name carries a fingerprint of the mechanism now,
-        # so spelling it here would pin this case to one revision of it.
-        _name, update = mutation_trigger(backend, "update")
+        # The whole MECHANISM, not the trigger alone. On PostgreSQL the
+        # comparison moved into the function when UPDATE became per-statement,
+        # and a case that reads only the ``CREATE TRIGGER`` would have gone on
+        # passing while watching nothing — it reported the columns present
+        # right up until they were not there.
+        _name, mechanism = mutation_trigger(backend, "update")
+        mechanism += " " + " ".join(
+            ddl for name, ddl in mutation_trigger_functions(backend)
+            if "updated" in name
+        )
         for column in PROJECTION_INPUT_COLUMNS:
-            assert f"OLD.{column}" in update and f"NEW.{column}" in update, (
-                f"{backend}: the update trigger does not watch {column}"
+            # Standalone token: ``\b`` does not fire between ``_`` and a
+            # letter, so ``id`` cannot be satisfied by ``agent_id``.
+            hits = len(re.findall(rf"\b{re.escape(column)}\b", mechanism))
+            assert hits >= 2, (
+                f"{backend}: the update mechanism names {column} {hits} time(s); "
+                "a comparison needs it on both sides"
             )
+
+    # On PostgreSQL the two sides are one generated select list used twice, so
+    # they cannot drift apart into watching different things.
+    _name, updated = next(
+        (name, ddl) for name, ddl in mutation_trigger_functions("postgres")
+        if "updated" in name
+    )
+    assert updated.count(_watched_projection("postgres")) == 2, (
+        "the before and after sides of the update comparison are no longer the "
+        "same column list, so one of them watches something the other does not"
+    )
 
     # ...and nothing the derivation reads is missing from that list. ``id`` is
     # in it: a primary key IS writable on both engines (measured), and the

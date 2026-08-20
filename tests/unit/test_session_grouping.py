@@ -474,11 +474,31 @@ def test_the_parser_accepts_exactly_what_the_ordering_can_express():
     documented. Accepting it was incidental permissiveness; the two domains are
     the same set now.
     """
+    import itertools
     import sqlite3
+
+    # GENERATED, not listed. The curated list below is still here for the
+    # oddities no product of parts would produce, but the parts themselves are
+    # enumerated — because the gap that got through was not an exotic spelling,
+    # it was an ordinary date carrying an ordinary offset and no time, and no
+    # hand-written corpus happened to contain one. A list can only fail to
+    # include something; a product cannot.
+    generated = [
+        date + time + zone
+        for date, time, zone in itertools.product(
+            ("2026-01-01",),
+            ("", " 11:00", "T11:00", " 11:00:00", "T11:00:00", "T11:00:00.123456"),
+            ("", "Z", "+01:00", "-05:00"),
+        )
+    ]
+    assert "2026-01-01+01:00" in generated and "2026-01-01Z" in generated, (
+        "the product stopped covering a bare date with an offset, which is the "
+        "form this case was extended for"
+    )
 
     db = sqlite3.connect(":memory:")
     try:
-        for value in (
+        for value in generated + [
             # Readable by both.
             "2026-01-01",
             "2026-01-01 11:00",
@@ -502,7 +522,7 @@ def test_the_parser_accepts_exactly_what_the_ordering_can_express():
             # Readable by neither.
             "not-a-date",
             "",
-        ):
+        ]:
             sql = db.execute("SELECT julianday(?)", (value,)).fetchone()[0]
             python = coerce_session_timestamp(value)
             assert (sql is None) == (python is None), (

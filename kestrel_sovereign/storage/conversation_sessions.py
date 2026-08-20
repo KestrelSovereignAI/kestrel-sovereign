@@ -939,6 +939,93 @@ def _statement_bump(source: str, appends: str, generation: str) -> str:
     )
 
 
+def _watched_projection(backend_type: str) -> str:
+    """:data:`PROJECTION_INPUT_COLUMNS` as a select list, metadata narrowed.
+
+    Built from the constant rather than spelled out, so a column added to what
+    the projection reads is a column this compares — the alternative is two
+    lists that agree until one is edited.
+
+    Unqualified, because each side of the comparison selects from one
+    transition table at a time.
+    """
+    return ", ".join(
+        watched_metadata_sql(backend_type, column) if column == "metadata"
+        else column
+        for column in PROJECTION_INPUT_COLUMNS
+    )
+
+
+def _update_statement_bump(
+    before: str, after: str, backend_type: str, generation: str
+) -> str:
+    """One ledger update for a whole UPDATE statement, counting as rows do.
+
+    A transition table does not PAIR its rows — ``OLD`` and ``NEW`` arrive as
+    two unordered tuplestores — so "which rows changed a watched column" cannot
+    be asked of them the way a per-row trigger asks it, and ``id``, the only
+    candidate join key, is itself watched precisely because it can be rewritten.
+    Two comparisons get there without a pairing, and together they add exactly
+    what the per-row form adds:
+
+    1. **What changed**, credited to the agent that now holds it: the multiset
+       difference ``after EXCEPT ALL before`` over the watched tuple. One row
+       per row whose watched columns moved, and — this is the property that
+       keeps ordinary recall free — empty when they did not.
+       ``atomic_increment_metadata_counter`` rewrites the metadata document on
+       every retrieval, and comparing only the watched keys inside it is what
+       makes that write invisible here.
+
+    2. **What departed**, credited to the agent that lost it: per agent, how
+       many rows it held before minus how many it holds now, when positive. A
+       same-agent update leaves those counts equal and contributes nothing; a
+       row changing hands leaves the old agent one short.
+
+    Worked against the per-row form, which stamps ``NEW.agent_id`` once per
+    changed row and ``OLD.agent_id`` once more only when the row changed hands.
+    Two rows of agent A edited in place and a third moved from A to B: (1)
+    gives A two and B one, (2) gives A one; total A three, B one — which is
+    what three per-row stamps on A and one on B come to. The invariant that
+    each row event moves the stamp by exactly one survives the conversion,
+    which matters because it is what lets a repair prove a movement was
+    entirely appends.
+
+    ``EXCEPT ALL`` compares NULLs as equal, the same null-safe semantics the
+    per-row form spells ``IS DISTINCT FROM``.
+
+    The outer ``GROUP BY`` is not decoration: the two comparisons can each name
+    the same agent, and PostgreSQL refuses an upsert whose source offers one
+    conflict key twice. Summing them first is also what makes the pair behave
+    as one addition rather than two.
+    """
+    watched = _watched_projection(backend_type)
+    changed = (
+        f"SELECT agent_id, count(*) AS kestrel_n FROM "
+        f"(SELECT {watched} FROM {after} "
+        f"EXCEPT ALL SELECT {watched} FROM {before}) AS kestrel_changed "
+        "GROUP BY agent_id"
+    )
+    departed = (
+        "SELECT agent_id, kestrel_lost AS kestrel_n FROM ("
+        "SELECT agent_id, kestrel_was - COALESCE(kestrel_is, 0) AS kestrel_lost "
+        f"FROM (SELECT agent_id, count(*) AS kestrel_was FROM {before} "
+        "GROUP BY agent_id) AS kestrel_old "
+        f"LEFT JOIN (SELECT agent_id, count(*) AS kestrel_is FROM {after} "
+        "GROUP BY agent_id) AS kestrel_new USING (agent_id)"
+        ") AS kestrel_net WHERE kestrel_lost > 0"
+    )
+    return (
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) "
+        f"SELECT agent_id, SUM(kestrel_n)::bigint, 0, {generation} "
+        f"FROM ({changed} UNION ALL {departed}) AS kestrel_moved "
+        "GROUP BY agent_id "
+        "ON CONFLICT (agent_id) DO UPDATE "
+        "SET changes = conversation_history_changes.changes + EXCLUDED.changes, "
+        "appends = conversation_history_changes.appends + EXCLUDED.appends"
+    )
+
+
 def _pg_function(placeholder: str, body: str) -> str:
     """A trigger function around ``body``, named by ``placeholder``."""
     return (
@@ -972,27 +1059,40 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
     #2012 relink, the encryption backfill.
 
     INSERT and DELETE convert exactly, because ``count(*)`` over the transition
-    table is arithmetically the same number N row-level bumps produce; there is
-    no case where they differ. UPDATE does not, and the reason is that a
-    transition table does not PAIR its rows: ``OLD`` and ``NEW`` arrive as two
-    unordered tuplestores, so "which rows changed a watched column" cannot be
-    asked of them without a join key — and ``id``, the only candidate, is itself
-    a watched column precisely because it can be rewritten (round 7). Comparing
-    the two as multisets would answer a *different* question, and answering it
-    would over-count an ordinary update by 2x and under-count a permutation to
-    zero. So UPDATE keeps the per-row form, where the question is exact.
+    table is arithmetically the same number N row-level bumps produce. UPDATE
+    converts too, by the two comparisons :func:`_update_statement_bump`
+    describes — a transition table does not PAIR its rows, but the pairing was
+    never what the arithmetic needed.
 
-    That is affordable where the others were not, and for a reason particular to
-    UPDATE: it carries a ``WHEN`` clause. Statement-level triggers cannot have
-    one, which is the other half of why the split falls here. The bulk updates
-    this repo actually runs — the encryption backfill, the #1402
-    canonical/transport rewrite, ``atomic_increment_metadata_counter`` on every
-    recall — touch nothing the projection reads, so ``WHEN`` is false and the
-    function is never entered. What remains is the #2012 relink, which is a
-    one-time migration.
+    **UPDATE was left per-row at first, on a premise that was wrong.** The
+    claim was that the bulk updates this repo runs touch nothing the projection
+    reads, so the ``WHEN`` clause a per-row trigger carries would keep them
+    free. That is true of the REWRITE paths it was checked against — the
+    encryption backfill, the #1402 canonical/transport split,
+    ``atomic_increment_metadata_counter`` on every recall — and false of the
+    LIFECYCLE ones, which were not:
+
+    * ``clear_history`` sets ``deleted_at`` on **every live message in one
+      unbounded statement**;
+    * ``delete_conversation_session``, ``archive_conversation_session`` and
+      their restores set ``deleted_at``/``archived_at`` across a whole session.
+
+    Those are precisely the watched columns. Measured on 50,000 rows, the
+    ``clear_history`` shape cost **12,655 ms** per-row against **906 ms**
+    per-statement, with 50,000 dead tuples against none — the same 14x, on a
+    path a user reaches from a button.
+
+    What the conversion costs in exchange is that a statement-level trigger
+    cannot carry a ``WHEN`` clause, so the transition tables are built even for
+    an update touching nothing watched. Measured on the same 50,000 rows, a
+    bulk rewrite of ``content`` went from 1,005 ms to 1,289 ms and the counter
+    correctly did not move. That is 28% on the rare case to save 93% on the
+    common one.
 
     SQLite keeps all three row-level: it has no transition tables, so there is
-    nothing to convert to. **The two engines therefore no longer share one
+    nothing to convert to. Its ``WHEN`` clause therefore still does the
+    narrowing, and its bulk lifecycle updates still pay per row — cheaply, on
+    an engine with one writer and no dead tuples to leave behind. **The two engines therefore no longer share one
     trigger shape**, and that is worth saying plainly rather than leaving to be
     discovered. What they do still share is the arithmetic — the ledger moves by
     one per row event on both — and that, not the DDL, is what
@@ -1047,9 +1147,6 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
     """
     generation = _new_generation(backend_type)
     if backend_type == "postgres":
-        bump_new = _BUMP.format(row="NEW", appends=0, generation=generation)
-        bump_old = _BUMP.format(row="OLD", appends=0, generation=generation)
-        watched = _watched_changed(backend_type, "IS DISTINCT FROM")
         return (
             (
                 "function",
@@ -1064,8 +1161,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
                 "updated",
                 _pg_function(
                     "fn_updated",
-                    "IF (OLD.agent_id IS DISTINCT FROM NEW.agent_id) THEN "
-                    f"{bump_old}; END IF; {bump_new}",
+                    _update_statement_bump(
+                        "kestrel_before", "kestrel_after",
+                        backend_type, generation,
+                    ),
                 ),
             ),
             (
@@ -1088,9 +1187,10 @@ def _mechanism_templates(backend_type: str) -> Tuple[Tuple[str, str, str], ...]:
                 "trigger",
                 "update",
                 "CREATE TRIGGER {trg_update} "
-                "AFTER UPDATE ON conversation_history FOR EACH ROW "
-                f"WHEN ({watched}) "
-                "EXECUTE FUNCTION {fn_updated}()",
+                "AFTER UPDATE ON conversation_history "
+                "REFERENCING OLD TABLE AS kestrel_before "
+                "NEW TABLE AS kestrel_after "
+                "FOR EACH STATEMENT EXECUTE FUNCTION {fn_updated}()",
             ),
             (
                 "trigger",
