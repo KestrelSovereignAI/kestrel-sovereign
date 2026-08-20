@@ -1287,6 +1287,23 @@ class CoreInstallGuard:
         self._constraints = self._derive(shape)
         return shape
 
+    def conforms_now(self) -> bool:
+        """Is core on its declared source at this moment? Non-mutating.
+
+        A deliberate exception to :meth:`_check`'s privacy, and narrow: this
+        answers a BATCH-CONTROL question — "may the rest of these installs run
+        against this core?" — not a detection question. Detection is unaffected;
+        :meth:`verify` still runs unconditionally at the end of the batch and is
+        still the only thing that reports and repairs.
+
+        Needed because "the core action failed" and "core is off its declared
+        source" are not the same thing. A conforming core that declares extras
+        yields an `ensure` action, and a failed optional extra says nothing
+        about core's source — treating that as a failed transition skipped every
+        remaining entry in the batch.
+        """
+        return self._check() is None
+
     def _check(self) -> Optional[str]:
         """Describe how core drifted from the policy, or None if it conforms.
 
@@ -1745,11 +1762,22 @@ def cmd_feature_sync(args) -> int:
                 from kestrel_sovereign import cli_lifecycle
 
                 rc_pull, out_pull = cli_lifecycle._editable_git_pull(
-                    checkout, allow_dirty=False,
+                    checkout, allow_dirty=getattr(args, "allow_dirty", False),
                 )
                 for line in (out_pull or "").strip().splitlines():
                     print(f"      {line}")
                 if rc_pull != 0:
+                    # Reported AND non-zero. Linking an unpulled checkout is
+                    # still the right end state — refusing over local edits
+                    # would be hostile, and a dirty core checkout is an ordinary
+                    # dev state — but `kestrel update` must not then restart and
+                    # return SUCCESS over code that never moved. The operator
+                    # asked for an update; they got a link. Those are different
+                    # outcomes and the exit status has to say so.
+                    #
+                    # `--allow-dirty` is honoured above, so the operator who
+                    # means "link over my edits" has a way to say it.
+                    rc = 1
                     print(
                         f"      note: {target} was linked but NOT updated — the "
                         "checkout above is what will run after a restart."
@@ -1820,8 +1848,14 @@ def cmd_feature_sync(args) -> int:
                     "this is a version conflict, move core to a version the "
                     "feature accepts — do not remove the pin."
                 )
-            if is_core:
-                # A failed CORE action stops the batch. `install_core` has
+            # A failed core action stops the batch only when core is ACTUALLY
+            # off its declared source. `_resolve_manifest_action` returns
+            # `ensure` for a conforming core that declares extras, and a failed
+            # optional extra says nothing about core's source — treating it as a
+            # failed transition skipped every remaining manifest entry, so
+            # `--continue-on-error` restarted with packages still pruned.
+            if is_core and not guard.conforms_now():
+                # `install_core` has
                 # already refreshed the guard from whatever core is NOW — the
                 # old version, or a partial write — so every remaining feature
                 # would resolve and pin against a core the manifest says is

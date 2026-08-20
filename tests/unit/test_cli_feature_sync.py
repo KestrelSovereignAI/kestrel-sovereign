@@ -1685,7 +1685,10 @@ def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
     rc = cli.cmd_feature_sync(_args(manifest))
 
     out = capsys.readouterr().out
-    assert rc == 0  # the link is still correct, so the sync is not failed
+    # Non-zero: the link is still the right end state, but `kestrel update`
+    # must not restart and report SUCCESS over code that never moved. The
+    # operator asked for an update and got a link — different outcomes.
+    assert rc == 1
     assert "REFUSED" in out
     assert "NOT updated" in out  # the staleness is named
     assert venv.editable.get(CORE) == str(checkout)
@@ -1906,3 +1909,53 @@ def test_the_manifest_rejects_a_malformed_pypi_spec(tmp_path):
     for spec in (">=0.3,<0.4", "", "==1.2.3"):
         manifest.write_text(f'[[feature]]\nname = "voice"\npypi = "{spec}"\n')
         assert cli_features._load_host_manifest(manifest)[0]["pypi"] == spec
+
+
+def test_a_failed_core_extras_ensure_does_not_skip_the_rest_of_the_batch(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """"The core action failed" and "core is off its source" are not the same.
+
+    A core entry that already conforms but declares extras yields an `ensure`
+    action. A failed optional extra says nothing about where core came from —
+    but the batch-stop treated ANY core failure as a failed source transition
+    and skipped every remaining manifest entry, so `--continue-on-error`
+    restarted with packages still pruned by the preceding `uv sync`.
+
+    The core install is failed at the guard seam rather than through a FakeUv
+    knob: the knobs that fail an install also govern the guard's own repair, so
+    they would move the very core state this asserts is untouched.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "{CHECKOUT}"\nextras = ["local"]\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    # Core already editable at CHECKOUT, so it conforms. `feature_requires` is
+    # relaxed so the following entry is genuinely installable against this core
+    # — otherwise the pin blocks it for a legitimate version reason and the test
+    # would pass without proving the batch continued.
+    venv = FakeUv(feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+
+    real_install_core = cli_features.CoreInstallGuard.install_core
+
+    def _failing_install_core(self, pip_args, **kw):
+        # Nonzero, and the venv is left exactly as it was: the extra did not
+        # install, core did not move.
+        return subprocess.CompletedProcess(
+            ["uv", "pip", "install", *pip_args], 1, stdout="", stderr="no such extra",
+        )
+
+    monkeypatch.setattr(
+        cli_features.CoreInstallGuard, "install_core", _failing_install_core,
+    )
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc != 0                                   # the extra really did fail
+    assert "rest of this batch is skipped" not in out
+    assert venv.editable[CORE] == CHECKOUT           # core never moved
+    # ...so the entry after it was still restored.
+    assert venv.installed.get("kestrel-feature-voice") == "0.4.0", venv.commands

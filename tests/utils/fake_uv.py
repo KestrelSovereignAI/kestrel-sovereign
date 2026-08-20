@@ -443,5 +443,17 @@ def use_fake_uv(monkeypatch, venv):
     monkeypatch.setattr(md, "version", venv.version)
     monkeypatch.setattr(cli, "_editable_install_path", venv.editable_path)
     monkeypatch.setattr(cli, "_direct_url_provenance", venv.direct_url_provenance)
+    # The modelled host's declared checkouts EXIST — that is what makes them
+    # declared. Without this the real `_editable_git_pull` runs against paths
+    # like `/src/kestrel-sovereign` that are not on disk, fails "checkout does
+    # not exist", and every test with an editable core entry inherits a failure
+    # about the double rather than about the code. A test that wants a failing
+    # pull patches this itself.
+    from kestrel_sovereign import cli_lifecycle
+
+    monkeypatch.setattr(
+        cli_lifecycle, "_editable_git_pull",
+        lambda checkout, allow_dirty: (0, "Already up to date."),
+    )
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(cli.subprocess, "run", venv.run)
