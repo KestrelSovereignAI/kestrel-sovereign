@@ -1116,3 +1116,145 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
     # Edge convergence must not touch the genesis receipt.
     assert post["genesis_audit"] == pre["genesis_audit"]
     assert post["genesis_audit_history"] == pre["genesis_audit_history"]
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_leaves_the_database_untouched(tmp_path, monkeypatch):
+    """Without --force this command is documented as performing no write.
+
+    It opened read-write anyway, and SQLite serialises writers at the FILE
+    level: the per-connection write-unit lock cannot serialise a SECOND
+    connection to the same file. So a drift-only inspection could contend with
+    a running agent's database — which is how #2920 dropped a live agent into
+    Safe Mode while the caller saw nothing at all.
+
+    The assertion is the on-disk postcondition, not the arguments any one
+    opener was called with. An earlier version of this test recorded every
+    ``AsyncStorage`` construction and checked its backend flag; it passed while
+    the command still took a writable connection, because target resolution
+    opens the anchor through a direct ``sqlite3.connect`` that never goes
+    through ``AsyncStorage`` at all. Bytes and sidecars catch a write through
+    any door, including doors added later.
+    """
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+
+    # Drift: the canonical file moves, the anchor does not.
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    def _tree() -> dict[str, bytes]:
+        return {
+            entry.name: entry.read_bytes()
+            for entry in sorted(agent_dir.iterdir())
+            if entry.is_file()
+        }
+
+    before = _tree()
+    assert "kestrel_prime.db" in before, before.keys()
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+
+    assert result.drift_unforced, f"expected a drift report: {result}"
+
+    after = _tree()
+    appeared = sorted(set(after) - set(before))
+    assert not appeared, (
+        "a --force-less run created files beside the database it was only "
+        f"asked to read: {appeared}. A plain mode=ro connection to a WAL "
+        "database creates -wal/-shm sidecars and cannot remove them, and the "
+        "cold identity lookup reads those as a live agent."
+    )
+    changed = sorted(name for name, blob in after.items() if before.get(name) != blob)
+    assert not changed, f"a --force-less run rewrote {changed}"
+
+    # The sidecars are not merely untidy: their presence makes the cold
+    # identity lookup refuse this agent outright. Prove the inspection did not
+    # cost the agent that.
+    from kestrel_sovereign.identity.local_anchor import (
+        AgentDIDLookupMode,
+        read_anchor_agent_did,
+    )
+
+    assert await read_anchor_agent_did(
+        str(agent_dir), mode=AgentDIDLookupMode.COLD_READ_ONLY
+    )
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_opens_no_writable_connection(tmp_path, monkeypatch):
+    """A --force-less run must not take a write lock on the agent's database.
+
+    Separate from the on-disk test above because the disk cannot show this. A
+    ``mode=rw`` connection to a WAL database creates its sidecars and then, as
+    the last connection to close, checkpoints and REMOVES them — so the write
+    lock is taken and released leaving the directory byte-identical. The cost
+    of that lock lands on a *running* agent (SQLite serialises writers at the
+    file level), which is how #2920 dropped one into Safe Mode; a test that
+    inspects the aftermath of a stopped agent sees nothing at all.
+
+    So this records every connection opened to the anchor during the run and
+    asserts none of them asked for write access. It covers ``sqlite3.connect``
+    as well as ``aiosqlite.connect``: target resolution reaches the same file
+    through the former, without passing through ``AsyncStorage``, which is the
+    door the round-1 test could not see.
+    """
+    import sqlite3
+
+    import aiosqlite
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    opened: list[str] = []
+
+    def _recorder(real):
+        def _record(target, *args, **kwargs):
+            opened.append(str(target))
+            return real(target, *args, **kwargs)
+        return _record
+
+    # Patched on the modules themselves so the record covers the worker thread
+    # target resolution runs its lookup in.
+    monkeypatch.setattr(sqlite3, "connect", _recorder(sqlite3.connect))
+    monkeypatch.setattr(aiosqlite, "connect", _recorder(aiosqlite.connect))
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+    assert result.drift_unforced, f"expected a drift report: {result}"
+
+    anchor_opens = [t for t in opened if "kestrel_prime.db" in t]
+    assert anchor_opens, f"the inspection opened the anchor at all: {opened}"
+    writable = [t for t in anchor_opens if "mode=ro" not in t]
+    assert not writable, (
+        "a --force-less run opened a write-capable connection to the agent's "
+        f"database: {writable}. SQLite serialises writers at the file level, "
+        "so this contends with a running agent even though nothing is written."
+    )

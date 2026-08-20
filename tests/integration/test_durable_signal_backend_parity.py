@@ -441,6 +441,182 @@ async def test_durable_retry_and_lease_expiry_transitions_work_on_both_backends(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_durable_consumer_deactivation_has_backend_parity(db_backend):
+    """The store retains evidence while eliminating future claimable work."""
+    store = DurableSignalStore(db_backend)
+    await store.initialize()
+    agent_id = f"did:test:durable-deactivate:{uuid4()}"
+    consumer_id = "workflow-wait"
+    await store.register_consumer(
+        DurableConsumerRegistration(
+            consumer_id=consumer_id,
+            source="provider.message",
+            agent_id=agent_id,
+        )
+    )
+    before = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"before-deactivate:{uuid4()}",
+        retention_days=7,
+    )
+    assert before.delivery_ids
+    assert await store.deactivate_consumer(
+        agent_id=agent_id, consumer_id=consumer_id
+    )
+    assert await store.deactivate_consumer(
+        agent_id=agent_id, consumer_id=consumer_id
+    )
+    assert not await store.deactivate_consumer(
+        agent_id=f"{agent_id}:other", consumer_id=consumer_id
+    )
+
+    retained = await store.get_delivery_for_event(
+        agent_id=agent_id, consumer_id=consumer_id, event_id=before.event_id
+    )
+    assert retained is not None
+    assert retained.status == "failed"
+    assert retained.last_error == "durable consumer deactivated"
+    assert retained.terminal_at is not None
+    assert await store.claim_delivery(
+        agent_id=agent_id, consumer_id=consumer_id, executor_id="late-worker"
+    ) is None
+
+    after = await store.persist_signal(
+        _signal(agent_id),
+        agent_id=agent_id,
+        source_event_id=f"after-deactivate:{uuid4()}",
+        retention_days=7,
+    )
+    assert after.created
+    assert after.delivery_ids == ()
+    assert await store.get_delivery_for_event(
+        agent_id=agent_id, consumer_id=consumer_id, event_id=after.event_id
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    "first", ("persistence", "deactivation"), ids=("event-first", "deactivate-first")
+)
+async def test_deactivation_and_event_persistence_share_a_serialized_handoff(
+    db_backend, first, monkeypatch
+):
+    """The handoff order decides whether evidence is terminalized or absent."""
+    peer_backend = await _independent_backend(db_backend)
+    try:
+        persistence_backend, deactivation_backend = (
+            (db_backend, peer_backend)
+            if first == "persistence"
+            else (peer_backend, db_backend)
+        )
+        persistence_store = DurableSignalStore(persistence_backend)
+        deactivation_store = DurableSignalStore(deactivation_backend)
+        await persistence_store.initialize()
+        await deactivation_store.initialize()
+        agent_id = f"did:test:durable-deactivate-handoff:{uuid4()}"
+        consumer = DurableConsumerRegistration(
+            consumer_id="workflow-wait",
+            source="provider.message",
+            agent_id=agent_id,
+        )
+        await persistence_store.register_consumer(consumer)
+        event = _signal(agent_id)
+        handoff_owned = asyncio.Event()
+        release_handoff = asyncio.Event()
+
+        if first == "persistence":
+            original_fetch_all = persistence_backend.fetch_all
+
+            async def pause_persistence_consumer_lookup(query, params=()):
+                rows = await original_fetch_all(query, params)
+                if (
+                    f"FROM {DurableSignalStore.CONSUMERS}" in query
+                    and "max_attempts" in query
+                ):
+                    handoff_owned.set()
+                    await release_handoff.wait()
+                return rows
+
+            monkeypatch.setattr(
+                persistence_backend, "fetch_all", pause_persistence_consumer_lookup
+            )
+            first_task = asyncio.create_task(
+                persistence_store.persist_signal(
+                    event,
+                    agent_id=agent_id,
+                    source_event_id=f"handoff:{uuid4()}",
+                    retention_days=7,
+                )
+            )
+        else:
+            original_handoff = deactivation_store._lock_scope_handoff
+
+            async def pause_deactivation_after_handoff(**kwargs):
+                await original_handoff(**kwargs)
+                handoff_owned.set()
+                await release_handoff.wait()
+
+            monkeypatch.setattr(
+                deactivation_store,
+                "_lock_scope_handoff",
+                pause_deactivation_after_handoff,
+            )
+            first_task = asyncio.create_task(
+                deactivation_store.deactivate_consumer(
+                    agent_id=agent_id, consumer_id=consumer.consumer_id
+                )
+            )
+
+        await asyncio.wait_for(handoff_owned.wait(), timeout=5)
+        if first == "persistence":
+            second_task = asyncio.create_task(
+                deactivation_store.deactivate_consumer(
+                    agent_id=agent_id, consumer_id=consumer.consumer_id
+                )
+            )
+        else:
+            second_task = asyncio.create_task(
+                persistence_store.persist_signal(
+                    event,
+                    agent_id=agent_id,
+                    source_event_id=f"handoff:{uuid4()}",
+                    retention_days=7,
+                )
+            )
+        await asyncio.sleep(0)
+        assert not second_task.done()
+        release_handoff.set()
+        first_result, second_result = await asyncio.wait_for(
+            asyncio.gather(first_task, second_task), timeout=5
+        )
+
+        if first == "persistence":
+            assert first_result.created
+            assert second_result is True
+            delivery = await persistence_store.get_delivery_for_event(
+                agent_id=agent_id,
+                consumer_id=consumer.consumer_id,
+                event_id=event.id,
+            )
+            assert delivery is not None and delivery.status == "failed"
+        else:
+            assert first_result is True
+            assert second_result.created
+            assert second_result.delivery_ids == ()
+            assert await persistence_store.get_delivery_for_event(
+                agent_id=agent_id,
+                consumer_id=consumer.consumer_id,
+                event_id=event.id,
+            ) is None
+    finally:
+        release_handoff.set()
+        await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_backend):
     """The initial live owner is established before a marker event is visible."""
     peer_backend = await _independent_backend(db_backend)

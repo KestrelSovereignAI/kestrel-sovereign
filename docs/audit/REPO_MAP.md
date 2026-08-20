@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-08-18
-**Scope:** 2331 tracked files (1566 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-08-20
+**Scope:** 2332 tracked files (1567 `.py`, 344 `.md`, 421 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -232,7 +232,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/cli_ipfs.py** — ``kestrel ipfs {build,deploy,pin}`` CLI command — sub-PR 4 of epic #1050 (bash-to-Python port of ``scripts/ipfs/{build,deploy, pin_agents}.sh``).
   - `def add_ipfs_subcommand(subparsers)`; `def cmd_ipfs(args)`
 - **kestrel_sovereign/cli_lifecycle.py** — Kestrel CLI — host/agent lifecycle commands.
-  - `def cmd_start(args)`; `def cmd_stop(args)`; `def cmd_restart(args)`; `def cmd_update(args)`; `def cmd_status(args)`; `def cmd_logs(args)`; `def add_lifecycle_subparsers(subparsers)`
+  - `def cmd_start(args)`; `class PortReapResult`; `def cmd_stop(args)`; `def cmd_restart(args)`; `def cmd_update(args)`; `def cmd_status(args)`; `def cmd_logs(args)`; `def add_lifecycle_subparsers(subparsers)`
 - **kestrel_sovereign/cli_release.py** — ``kestrel release`` CLI commands — Wave 5 sub-PR 2 of Quantum Hardening (#920).
   - `def add_release_subcommands(subparsers)`; `def cmd_release(args)`; `def cmd_release_sign(args)`; `def cmd_release_verify(args)`
 - **kestrel_sovereign/cli_runpod.py** — ``kestrel runpod {deploy,status,stop,kill}`` CLI command - sub-PR 4 of epic #1050 (bash-to-Python port of ``scripts/runpod/deploy_lora_trainer.sh``).
@@ -939,7 +939,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
   - `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
 - **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
-  - `class AgentProcess`; `class ProcessManager`
+  - `class PidStatus`; `class PidRecord`; `class AgentProcess`; `class ProcessManager`
 - **kestrel_sovereign/multi_agent/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
   - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/operator/__init__.py** — Generic runtime support for SDK operator contracts.
@@ -1255,7 +1255,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/db/postgres.py** — PostgreSQL Database Backend
   - `class PostgresBackend`
 - **kestrel_sovereign/storage/db/sqlite.py** — SQLite Database Backend
-  - `class SQLiteBackend`
+  - `class ColdReadUnavailable`; `class SQLiteBackend`
 - **kestrel_sovereign/storage/db/timestamp.py** — Explicit timestamp bind intent shared by unified stores and PostgreSQL.
   - `class TimestamptzParameter`
 - **kestrel_sovereign/storage/db/write_audit.py** — Task-local database write audit hooks.
@@ -2166,7 +2166,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_doctor_postgres.py** — #2892 — ``kestrel doctor`` against a PostgreSQL runtime.
   - `def runtime_db()`; `def canonical(tmp_path, monkeypatch)`; `def test_doctor_reads_the_database_the_agent_is_governed_by(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_doctor_agrees_with_the_runtime_after_a_reanchor(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_doctor_does_not_answer_about_a_neighbouring_agent(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_the_project_env_alone_is_enough_to_reach_postgres(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_explicit_dsn_parameters_outrank_project_pg_environment(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_asyncpg_search_path_is_applied_to_doctors_session(tmp_path, monkeypatch, canonical, runtime_db)`; `…`
 - **tests/integration/test_durable_signal_backend_parity.py** — SQLite/PostgreSQL parity for the durable signal delivery ledger.
-  - `async def test_schema_bootstrap_is_safe_under_independent_backend_contention(db_backend)`; `async def test_implicit_claim_clock_follows_contended_scope_handoff_on_both_backends(db_backend, monkeypatch, exact_event_claim)`; `async def test_registration_backfill_clock_follows_contended_scope_handoff_on_both_backends(db_backend, monkeypatch)`; `async def test_durable_delivery_claim_is_scoped_and_single_owner_on_both_backends(db_backend)`; `async def test_durable_retry_and_lease_expiry_transitions_work_on_both_backends(db_backend)`; `async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_backend)`; `async def test_unactivated_reservation_survives_a_long_paused_commit_and_owner_activation_wins(db_backend)`; `async def test_startup_recovers_only_a_stale_unactivated_owner_as_marker_work(db_backend)`; `…`
+  - `async def test_schema_bootstrap_is_safe_under_independent_backend_contention(db_backend)`; `async def test_implicit_claim_clock_follows_contended_scope_handoff_on_both_backends(db_backend, monkeypatch, exact_event_claim)`; `async def test_registration_backfill_clock_follows_contended_scope_handoff_on_both_backends(db_backend, monkeypatch)`; `async def test_durable_delivery_claim_is_scoped_and_single_owner_on_both_backends(db_backend)`; `async def test_durable_retry_and_lease_expiry_transitions_work_on_both_backends(db_backend)`; `async def test_durable_consumer_deactivation_has_backend_parity(db_backend)`; `async def test_deactivation_and_event_persistence_share_a_serialized_handoff(db_backend, first, monkeypatch)`; `async def test_initial_volatile_reservation_blocks_a_peer_on_both_backends(db_backend)`; `…`
 - **tests/integration/test_dynamic_features.py** — —
   - `async def kestrel_agent(temp_db)`; `async def test_feature_registration(kestrel_agent)`; `async def test_sovereignty_feature_execution(kestrel_agent)`; `async def test_mcp_feature_execution(kestrel_agent)`; `async def test_model_feature_execution(kestrel_agent)`
 - **tests/integration/test_dynamic_tool_loading_e2e.py** — Integration tests for dynamic tool loading.
@@ -2376,6 +2376,8 @@ Repo entry points and standard project files.
   - `def test_the_rule_classifies_each_value(label, value, stampable)`; `def test_the_column_never_disagrees_with_session_grouping(label, value, stampable)`; `def test_no_stampable_value_is_ignored_as_a_bare_integer_by_the_grouper()`; `def test_metadata_is_accepted_parsed_or_exactly_as_stored()`; `def test_metadata_without_a_usable_session_id_yields_none(metadata)`; `def test_a_duplicated_key_is_refused_rather_than_arbitrated(label, metadata, expected)`; `def test_the_duplicate_a_dict_cannot_carry_is_only_a_question_for_stored_text()`; `def test_the_generated_character_classes_denote_the_authored_set()`; `…`
 - **tests/unit/storage/test_session_id_write_paths.py** — #2958: every writer of ``conversation_history`` stamps the derived column.
   - `async def test_a_salvage_marker_is_filed_in_the_session_it_salvaged(tmp_path)`; `async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp_path)`; `async def test_the_counter_api_declines_the_session_key_rather_than_desyncing(tmp_path, field)`; `async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path)`
+- **tests/unit/storage/test_sqlite_cold_read.py** — Cold-read semantics for the SQLite backend (#2920).
+  - `async def test_cold_read_of_quiescent_db_leaves_no_sidecars(tmp_path)`; `async def test_cold_read_sees_data_that_is_still_only_in_the_wal(tmp_path)`; `async def test_cold_read_does_not_migrate_a_database_it_only_inspects(tmp_path)`; `async def test_cold_read_follows_a_symlink_to_where_the_sidecars_really_are(tmp_path)`; `async def test_cold_read_refuses_to_report_after_a_writer_came_and_went(tmp_path)`; `async def test_cold_read_via_config_does_not_migrate_the_database(tmp_path)`; `async def test_cold_read_of_a_missing_default_store_creates_nothing(tmp_path, monkeypatch)`; `def test_config_requested_cold_read_survives_a_backend_that_cannot_carry_it()`
 - **tests/unit/test_a2a_did_registry.py** — A2A verification-document lookup and signed-envelope verification.
   - `def test_resolves_known_hybrid_agent_to_doc_with_vms()`; `def test_unknown_did_resolves_none()`; `def test_legacy_non_hybrid_agent_not_resolvable()`; `def test_install_injects_distinct_verification_resolver_per_agent()`; `def test_federated_fallback_off_by_default_returns_none()`; `def test_resolver_is_document_lookup_not_peer_authorization()`; `def test_resolver_composes_with_envelope_verifier_end_to_end()`; `def test_tampered_envelope_rejected_through_resolver()`; `…`
 - **tests/unit/test_a2a_envelope_signing.py** — A2A signed-sender envelope contract (#1673).
@@ -2824,8 +2826,6 @@ Repo entry points and standard project files.
   - `def test_doctor_reports_ready_when_everything_set(tmp_path)`; `def test_doctor_blocks_on_missing_data_key(tmp_path)`; `def test_doctor_blocks_on_empty_route_priority(tmp_path)`; `def test_doctor_blocks_on_missing_api_key_env(tmp_path)`; `def test_doctor_accepts_openrouter_management_key_only_undeclared_env(tmp_path)`; `def test_doctor_blocks_when_no_agents(tmp_path)`; `def test_doctor_blocks_when_agent_db_missing(tmp_path)`; `def test_format_report_renders_lines(tmp_path)`; `…`
 - **tests/unit/test_doctrine_bundle.py** — Unit tests for kestrel_sovereign.agent.doctrine_bundle.
   - `def test_hash_is_deterministic_for_same_inputs(tmp_path)`; `def test_hash_changes_when_anchored_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_order_changes(tmp_path)`; `def test_missing_anchored_files_are_skipped_not_errors(tmp_path)`; `def test_total_bytes_reflects_only_contributing_content(tmp_path)`; `def test_per_file_sha256_in_section_header(tmp_path)`; `def test_default_paths_are_three_canonical_files()`; `…`
-- **tests/unit/test_dump_exclusion_parity.py** — A database dump must be excluded from every channel that ships the tree.
-  - `def test_every_channel_excludes_every_dump_shape(channel, pattern)`; `def test_the_channels_agree_exactly()`
 - **tests/unit/test_durable_salvage.py** — Tests for the durable-salvage primitive + background worker (C / #1311).
   - `def conv_store()`; `class TestSalvageMessagesSync`; `class TestSyncSalvageThenCrashBeforeEnqueue`; `class TestQueueDepthThresholdExceeded`; `class TestConsolidatorWhileSalvagePending`; `class TestFeatureFlag`; `class TestStateCountsAndBoundary`
 - **tests/unit/test_durable_signal_delivery.py** — Durable signal consumer contract: replay, scoped leasing, and retention.
@@ -3424,6 +3424,8 @@ Repo entry points and standard project files.
   - `class TestTokenizeForSearch`; `class TestNegationGate`; `class TestTechnicalTermsUnregressed`; `class TestTokenMatchScore`; `async def test_broad_query_finds_relevant_row_via_token_fallback()`; `async def test_exact_substring_still_works()`; `async def test_token_fallback_does_not_match_low_overlap()`; `async def test_exact_matches_ranked_before_token_fallback()`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
   - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_observability_summary_breaks_out_metrics_by_name()`; `def test_metric_summary_endpoint_passes_through_store_summary()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_endpoint_refuses_privacy_hidden_modes()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
+- **tests/unit/test_secret_exclusion_parity.py** — A secret must be excluded from every channel that ships the tree.
+  - `def channel_repos(tmp_path_factory)`; `def test_every_channel_excludes_every_secret(channel, path, channel_repos)`; `def test_no_channel_excludes_source_it_must_ship(channel, path, channel_repos)`; `def test_dockerignore_secret_rules_match_at_any_depth(path, channel_repos)`
 - **tests/unit/test_security_endpoint_contracts.py** — Focused contract tests for security endpoints.
   - `def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes()`; `def test_security_permission_mutation_endpoints_validate_levels_and_scope()`; `def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()`; `def test_security_approve_serializes_awaiter_gone_flag()`; `def test_security_global_auto_mode_endpoints_support_scopes()`; `def test_security_global_auto_mode_rejects_invalid_scope()`; `def test_security_endpoints_return_503_when_feature_is_unavailable()`
 - **tests/unit/test_security_feature.py** — Unit Tests for Kestrel Security Feature.
@@ -3549,7 +3551,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sleep_wake_resilience.py** — Unit tests for host sleep/wake (suspend/resume) resilience (#1545).
   - `class TestSuspendGap`; `class TestResumeMonitor`; `class TestResumeMonitorConfig`; `class TestDispatcherReanchor`; `class TestSchedulerMisfireGrace`; `class TestHeartbeatGapAwareness`
 - **tests/unit/test_slhdsa_suite.py** — SLHDSASHA2128sSuite tests — Wave 3 sub-PR 1 (#918).
-  - `def test_pqcrypto_sphincs_installed_and_importable()`; `def test_slhdsa_suite_self_registers()`; `def test_slhdsa_classified_as_post_quantum()`; `def test_slhdsa_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_205_128s()`; `def suite()`; `def keypair(suite)`; `def signed_data(suite, keypair)`; `…`
+  - `def test_pqcrypto_slh_dsa_installed_and_importable()`; `def test_slhdsa_suite_self_registers()`; `def test_slhdsa_classified_as_post_quantum()`; `def test_slhdsa_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_205_128s()`; `def suite()`; `def keypair(suite)`; `def signed_data(suite, keypair)`; `…`
 - **tests/unit/test_soft_delete_analytics_sweep.py** — Soft-deleted conversation content must not feed derived agent state (#2051).
   - `async def store()`; `async def test_personality_responses_exclude_soft_deleted(store)`; `async def test_calibration_examples_exclude_soft_deleted_pair(store)`; `async def test_wellness_content_read_excludes_soft_deleted(store)`; `async def test_salvage_and_next_id_still_see_soft_deleted(store)`
 - **tests/unit/test_sovereign_override_pins.py** — Tests for sovereign override of memory pins.

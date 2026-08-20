@@ -51,6 +51,7 @@ FAILED = "failed"
 TERMINAL_ACKABLE = "terminal_ackable"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
+_DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
 # Callers that own a managed dispatcher normally supply their configured
@@ -486,6 +487,77 @@ class DurableSignalStore(UnifiedStoreBase):
             if registration.active:
                 await self._backfill_consumer(registration, now=now)
 
+    async def deactivate_consumer(self, *, agent_id: str, consumer_id: str) -> bool:
+        """Deactivate one existing consumer and terminalize its live work.
+
+        ``False`` means this agent/tenant has no such consumer.  A present
+        consumer is successful even when it was already inactive.  The
+        transition shares the source handoff lock with registration and event
+        persistence: an event committed before this transaction can have a
+        delivery, but that delivery is terminalized here; an event committed
+        after it observes the inactive consumer and materializes nothing.
+
+        Historical registration and delivery rows remain auditable.  Pending,
+        retrying, initially reserved, and leased rows become terminal
+        ``failed`` rows, with their ownership capabilities cleared, so a stale
+        worker cannot acknowledge, retry, release, or reactivate the work.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        # Read only the immutable source before beginning a SQLite write
+        # transaction.  Starting that transaction with a read then waiting for
+        # another writer would pin a stale SQLite snapshot and make the later
+        # lifecycle update fail instead of serializing behind the handoff.
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        if consumer is None:
+            return False
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=str(consumer[0]))
+            consumer = await self._get_consumer(agent_id, consumer_id)
+            if consumer is None:
+                return False
+            # Source is immutable after registration.  This common lock is
+            # the durable linearization point for event materialization and
+            # consumer lifecycle changes on both supported backends.
+            now = self.now_utc()
+            transitioned = await self._backend.execute(
+                f"""
+                UPDATE {self.CONSUMERS}
+                SET active = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND active = ?
+                """,
+                (
+                    self.to_bool_param(False),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    consumer_id,
+                    self.to_bool_param(True),
+                ),
+            )
+            if transitioned == 0:
+                # The row still exists (checked above), so another caller has
+                # already committed this idempotent lifecycle transition.
+                return True
+            await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, next_attempt_at = NULL,
+                    last_error = ?, terminal_at = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ?
+                  AND status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}')
+                """,
+                (
+                    FAILED,
+                    _DEACTIVATED_CONSUMER_ERROR,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    consumer_id,
+                ),
+            )
+        return True
+
     async def persist_signal(
         self,
         signal: Signal,
@@ -847,6 +919,12 @@ class DurableSignalStore(UnifiedStoreBase):
         # row below before it observes an implicit lease clock.
         async with self._backend.transaction():
             await self._lock_scope_handoff(agent_id=agent_id, source=registration.source)
+            # ``consumer`` was read before acquiring the source handoff lock.
+            # Re-read it here so a deactivation that committed while this
+            # claimant waited cannot backfill or lease historical work.
+            consumer = await self._get_consumer(agent_id, consumer_id)
+            if consumer is None or not consumer[4]:
+                return None
             recovery_now = explicit_now or self.now_utc()
             await self._recover_expired_leases(
                 agent_id=agent_id,
@@ -933,6 +1011,12 @@ class DurableSignalStore(UnifiedStoreBase):
             return None
         async with self._backend.transaction():
             await self._lock_scope_handoff(agent_id=agent_id, source=consumer[0])
+            # See ``claim_delivery``: the first read is only enough to find
+            # this immutable source scope.  Lifecycle state must be observed
+            # after this transaction owns the shared handoff lock.
+            consumer = await self._get_consumer(agent_id, consumer_id)
+            if consumer is None or not consumer[4]:
+                return None
             recovery_now = explicit_now or self.now_utc()
             await self._recover_expired_leases(
                 agent_id=agent_id,
@@ -1144,6 +1228,12 @@ class DurableSignalStore(UnifiedStoreBase):
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status = ? AND lease_owner = ? AND lease_token = ?
                   AND lease_expires_at > ?
+                  AND EXISTS (
+                      SELECT 1 FROM {self.CONSUMERS} consumer
+                      WHERE consumer.agent_id = {self.DELIVERIES}.agent_id
+                        AND consumer.consumer_id = {self.DELIVERIES}.consumer_id
+                        AND consumer.active = ?
+                  )
                 """,
                 (
                     executor_id,
@@ -1157,6 +1247,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     initial_lease_owner,
                     initial_lease_token,
                     self.to_timestamp_param(transfer_now),
+                    self.to_bool_param(True),
                 ),
             )
         if updated == 0:
@@ -1219,6 +1310,12 @@ class DurableSignalStore(UnifiedStoreBase):
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status = ? AND lease_owner = ? AND lease_token = ?
                   AND lease_expires_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM {self.CONSUMERS} consumer
+                      WHERE consumer.agent_id = {self.DELIVERIES}.agent_id
+                        AND consumer.consumer_id = {self.DELIVERIES}.consumer_id
+                        AND consumer.active = ?
+                  )
                 """,
                 (
                     LEASED,
@@ -1230,6 +1327,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     INITIAL_RESERVED,
                     initial_lease_owner,
                     initial_lease_token,
+                    self.to_bool_param(True),
                 ),
             )
         if updated == 0:

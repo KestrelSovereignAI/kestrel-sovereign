@@ -22,10 +22,28 @@ from pathlib import Path
 
 
 class AgentDIDLookupMode(str, Enum):
-    """Whether identity lookup is cold scheduler discovery or real startup."""
+    """What the caller is about to do, which decides how the anchor is opened.
+
+    Three intents, because two of them cannot share an answer about a WAL:
+
+    ``COLD_READ_ONLY`` is an authority decision (scheduler discovery). It must
+    neither write nor act on uncertain identity state, so live WAL state is a
+    refusal.
+
+    ``INITIALIZATION`` is real agent startup. It opens read/write precisely so
+    SQLite can recover a legitimately interrupted WAL before the agent's own
+    storage opens.
+
+    ``INSPECTION`` reports on an agent it must not disturb. It never writes and
+    never checkpoints, but unlike a cold authority read it must not refuse over
+    leftover sidecars: an unclean stop leaves those routinely, and the drift
+    report is exactly what an operator needs then — `kestrel doctor` prescribes
+    the reanchor command that would refuse (#2920).
+    """
 
     COLD_READ_ONLY = "cold_read_only"
     INITIALIZATION = "initialization"
+    INSPECTION = "inspection"
 
 
 class AnchorAbsent(ValueError):
@@ -63,7 +81,10 @@ async def read_anchor_agent_did(
     """
     if not isinstance(mode, AgentDIDLookupMode):
         raise ValueError(f"Unknown agent identity lookup mode: {mode!r}")
-    db_path = Path(storage_dir) / "kestrel_prime.db"
+    # Resolved up front: SQLite places -wal/-shm beside the RESOLVED target,
+    # so checking sidecars beside a symlinked alias while opening the target
+    # would pick the immutable path and ignore committed WAL data.
+    db_path = (Path(storage_dir) / "kestrel_prime.db").resolve()
 
     def _lookup() -> str:
         if not db_path.is_file():
@@ -77,6 +98,13 @@ async def read_anchor_agent_did(
             Path(f"{db_path}-shm"),
         )
         cold_read_only = mode is AgentDIDLookupMode.COLD_READ_ONLY
+        inspection = mode is AgentDIDLookupMode.INSPECTION
+        # An inspection reads the WAL rather than ignoring or replaying it, so
+        # it only takes the immutable path when there is no WAL to miss. Either
+        # way it writes nothing and leaves no file that was not already there.
+        inspection_ignores_wal = inspection and not any(
+            sidecar.exists() for sidecar in sidecars
+        )
         # A normal ``mode=ro`` connection can still create SQLite's shared
         # memory and WAL sidecars when it opens a WAL-mode database.  Besides
         # violating a cold lookup's read-only contract, ``immutable=1`` would
@@ -96,9 +124,14 @@ async def read_anchor_agent_did(
             # sidecars; normal initialization opens an existing DB read/write
             # so SQLite can recover its own WAL state. ``mode=rw`` still
             # refuses an unincepted/missing database.
-            uri_flags = "mode=ro&immutable=1" if cold_read_only else "mode=rw"
+            if cold_read_only or inspection_ignores_wal:
+                uri_flags = "mode=ro&immutable=1"
+            elif inspection:
+                uri_flags = "mode=ro"
+            else:
+                uri_flags = "mode=rw"
             connection = sqlite3.connect(
-                f"{db_path.resolve().as_uri()}?{uri_flags}",
+                f"{db_path.as_uri()}?{uri_flags}",
                 uri=True,
             )
             rows = connection.execute(
@@ -118,7 +151,9 @@ async def read_anchor_agent_did(
         # immutable reader deliberately ignores WAL data, so returning a DID
         # after this transition would be a stale-identity authorization
         # decision. Startup has deliberately consumed the normal SQLite path.
-        if cold_read_only and any(sidecar.exists() for sidecar in sidecars):
+        if (cold_read_only or inspection_ignores_wal) and any(
+            sidecar.exists() for sidecar in sidecars
+        ):
             raise ValueError(
                 f"Could not safely read local agent identity from {storage_dir}: "
                 "SQLite WAL state appeared during lookup"

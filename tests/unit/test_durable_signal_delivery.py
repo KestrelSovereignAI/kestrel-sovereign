@@ -25,6 +25,7 @@ from kestrel_sdk.signals import (
 from kestrel_sovereign.signals import (
     ACKNOWLEDGED,
     FAILED,
+    INITIAL_RESERVED,
     LEASED,
     RETRY,
     TERMINAL_ACKABLE,
@@ -3077,6 +3078,213 @@ async def test_agent_scope_is_enforced_for_registration_selection_and_ack(tmp_pa
     )
     await _close(backend_a, agent_a)
     await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_deactivate_durable_consumer_terminalizes_live_work_and_survives_restart(
+    tmp_path,
+):
+    """The dispatcher lifecycle boundary cannot leave a work item revivable."""
+    path = tmp_path / "durable-consumer-deactivation.db"
+    backend, agent, dispatcher = await _dispatcher(path, "did:agent:one")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    leased = None
+    initial_reservation = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        registered_consumer = await backend.fetch_one(
+            "SELECT active, updated_at FROM durable_signal_consumers "
+            "WHERE agent_id = ? AND consumer_id = ?",
+            (agent.did, consumer.consumer_id),
+        )
+        assert registered_consumer is not None and registered_consumer[0] == 1
+
+        pending_signal = _signal(agent_id=agent.did, message="pending")
+        assert (
+            await dispatcher.dispatch_signal(
+                pending_signal, source_event_id="deactivation-pending"
+            )
+        ).status is Status.OK
+
+        retry_signal = _signal(agent_id=agent.did, message="retry")
+        assert (
+            await dispatcher.dispatch_signal(
+                retry_signal, source_event_id="deactivation-retry"
+            )
+        ).status is Status.OK
+        retrying = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=retry_signal.id,
+            executor_id="retry-worker",
+        )
+        assert retrying is not None
+        assert (
+            await dispatcher.nack_durable_delivery(
+                consumer_id=consumer.consumer_id,
+                delivery_id=retrying.delivery_id,
+                lease_token=retrying.lease_token,
+                error="retry later",
+                retry_delay=timedelta(days=1),
+            )
+        ).status == RETRY
+
+        leased_signal = _signal(agent_id=agent.did, message="leased")
+        assert (
+            await dispatcher.dispatch_signal(
+                leased_signal, source_event_id="deactivation-leased"
+            )
+        ).status is Status.OK
+        leased = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=leased_signal.id,
+            executor_id=dispatcher._durable_delivery_owner,
+        )
+        assert leased is not None and leased.status == LEASED
+
+        initial_signal = _signal(agent_id=agent.did, message="initial-reservation")
+        initial = await dispatcher._durable_store.persist_signal(
+            initial_signal,
+            agent_id=agent.did,
+            source_event_id="deactivation-initial",
+            retention_days=7,
+            initial_lease_owner=dispatcher._durable_delivery_owner,
+        )
+        initial_reservation = initial.initial_reservations[0]
+        reserved = await dispatcher.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=initial_signal.id,
+        )
+        assert reserved is not None and reserved.status == INITIAL_RESERVED
+
+        assert await dispatcher.deactivate_durable_consumer(
+            consumer_id=consumer.consumer_id
+        )
+        deactivated_consumer = await backend.fetch_one(
+            "SELECT active, updated_at FROM durable_signal_consumers "
+            "WHERE agent_id = ? AND consumer_id = ?",
+            (agent.did, consumer.consumer_id),
+        )
+        assert deactivated_consumer is not None and deactivated_consumer[0] == 0
+        assert deactivated_consumer[1] != registered_consumer[1]
+        # Existing inactive consumers are a successful idempotent lifecycle
+        # call, while an unknown ID is distinguishable from that success.
+        assert await dispatcher.deactivate_durable_consumer(
+            consumer_id=consumer.consumer_id
+        )
+        assert not await dispatcher.deactivate_durable_consumer(
+            consumer_id="missing-workflow-wait"
+        )
+
+        deliveries = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id, limit=10
+        )
+        assert len(deliveries) == 4
+        assert {delivery.status for delivery in deliveries} == {FAILED}
+        assert {
+            delivery.last_error for delivery in deliveries
+        } == {"durable consumer deactivated"}
+        assert all(delivery.lease_token is None for delivery in deliveries)
+        assert all(delivery.terminal_at is not None for delivery in deliveries)
+
+        # The lease and initial-reservation capabilities were both invalidated
+        # atomically with deactivation.  No stale completion can revive work.
+        assert leased is not None
+        assert not await dispatcher.ack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=leased.delivery_id,
+            lease_token=leased.lease_token,
+        )
+        assert await dispatcher.nack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=leased.delivery_id,
+            lease_token=leased.lease_token,
+            error="stale executor",
+        ) is None
+        assert await dispatcher.release_durable_delivery_after_task(
+            consumer_id=consumer.consumer_id,
+            delivery_id=leased.delivery_id,
+            lease_token=leased.lease_token,
+            error="stale managed executor",
+        ) is None
+        assert await dispatcher.renew_durable_delivery_lease(
+            consumer_id=consumer.consumer_id,
+            delivery_id=leased.delivery_id,
+            lease_token=leased.lease_token,
+        ) is None
+        assert initial_reservation is not None
+        assert await dispatcher._durable_store.activate_initial_delivery(
+            agent_id=agent.did,
+            consumer_id=consumer.consumer_id,
+            delivery_id=initial_reservation.delivery_id,
+            initial_lease_owner=dispatcher._durable_delivery_owner,
+            initial_lease_token=initial_reservation.reservation_token,
+        ) is None
+
+        # A post-deactivation signal still runs through normal signal routing,
+        # but it cannot materialize a durable delivery for this consumer.
+        assert (
+            await dispatcher.dispatch_signal(
+                _signal(agent_id=agent.did, message="after-deactivation"),
+                source_event_id="deactivation-after",
+            )
+        ).status is Status.OK
+        assert await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        ) is None
+        assert len(
+            await dispatcher.list_durable_deliveries(
+                consumer_id=consumer.consumer_id, limit=10
+            )
+        ) == 4
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+    restarted_backend, restarted_agent, restarted = await _dispatcher(path, agent.did)
+    try:
+        # Claim normally performs restart backfill.  The retained inactive
+        # registration makes that a no-op and leaves the terminal evidence.
+        assert await restarted.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="restart-worker"
+        ) is None
+        restarted_deliveries = await restarted.list_durable_deliveries(
+            consumer_id=consumer.consumer_id, limit=10
+        )
+        assert len(restarted_deliveries) == 4
+        assert {delivery.status for delivery in restarted_deliveries} == {FAILED}
+    finally:
+        await restarted.shutdown_durable_delivery()
+        await _close(restarted_backend, restarted_agent)
+
+
+@pytest.mark.asyncio
+async def test_deactivate_durable_consumer_cannot_cross_agent_scope(tmp_path):
+    path = tmp_path / "durable-consumer-deactivation-scope.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:a")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:b")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent_a.did
+    )
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        assert not await dispatcher_b.deactivate_durable_consumer(
+            consumer_id=consumer.consumer_id
+        )
+        assert (
+            await dispatcher_a.dispatch_signal(
+                _signal(agent_id=agent_a.did), source_event_id="scope-still-active"
+            )
+        ).status is Status.OK
+        assert await dispatcher_a.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="agent-a-worker"
+        ) is not None
+    finally:
+        await dispatcher_a.shutdown_durable_delivery()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
 
 
 @pytest.mark.asyncio
