@@ -638,6 +638,28 @@ role = "technical_reviewer"
 # max_turns = 50
 # skip_clarification = true
 # self_review = true
+#
+# Runtime paths (REQUIRED since Talon moved to the kestrel-feature-talon
+# package). The in-tree version derived these from its own installed location;
+# the extracted package deliberately does not — it consults no environment
+# variable and no package location for project paths, so an unset value is an
+# error rather than a guess.
+#
+# [talon.runtime]
+# engine_executable = "/opt/kestrel/bin/kestrel-talon"
+# project_parent = "/srv/kestrel/projects"
+# running_agent_source_root = "/srv/kestrel/kestrel-sovereign"
+#
+# NOTE: none of the [talon.*] tables above are read until the FEATURE is told
+# which file to read them from. The feature holds its own small config — a
+# `config_path` naming this file — stored beside the agent's database as
+# `talon_feature_config.toml`. Writing `config_path` into this file cannot work
+# and is not a supported spelling: the feature has to already know where this
+# file is in order to read it. Set it through the feature configuration surface
+# (control panel, or PATCH /api/features/TalonCoordinatorFeature/config).
+#
+# Until that is set, every Talon operation fails on unresolved configuration
+# and `[talon.preference]` above is inert. See #3008.
 
 # =============================================================================
 # Amendment VIII: Emancipation (optional, default: dormant)
