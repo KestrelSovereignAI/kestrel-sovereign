@@ -1744,6 +1744,73 @@ async def test_a_superseded_trigger_shape_is_retired_rather_than_left_running(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_a_database_built_on_an_older_watched_list_is_converted(db_backend):
+    """The #2998 scenario end to end: the column list changes after release.
+
+    The case above installs a stray under a made-up name, which proves the
+    sweep can find something. This one proves the sweep finds the thing it
+    exists for. The "previous generation" here is not hand-written DDL — it is
+    the shipped generator run against a NARROWER watched list, which is exactly
+    what a database provisioned before the list widened would be carrying. It
+    therefore compiles on both engines for the same reason the current one does,
+    and it differs in the way a real predecessor differs.
+
+    Convergence is asserted twice over: the objects installed afterwards are the
+    ones this build defines, and the ledger then counts a write ONCE. The second
+    half is not redundant. A sweep that created the new shape and failed to
+    retire the old would leave both firing, and the only visible symptom is a
+    number that moves by two.
+    """
+    import kestrel_sovereign.storage.conversation_sessions as cs
+
+    async with _isolated_schema(db_backend) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+
+        original = cs.PROJECTION_INPUT_COLUMNS
+        try:
+            cs.PROJECTION_INPUT_COLUMNS = tuple(
+                column for column in original if column != "archived_at"
+            )
+            assert cs.PROJECTION_INPUT_COLUMNS != original
+            await db.ensure_session_projection_schema()
+            previous = await db._trigger_family(
+                cs.TRIGGER_NAME_PREFIX, "conversation_history"
+            )
+        finally:
+            cs.PROJECTION_INPUT_COLUMNS = original
+
+        wanted = {name for name, _ddl in cs.mutation_triggers(db.backend_type)}
+        assert previous and previous.isdisjoint(wanted), (
+            "the narrower watched list produced the same names as the current "
+            "one, so this case cannot show a conversion"
+        )
+
+        await db.ensure_session_projection_schema()
+
+        assert await db._trigger_family(
+            cs.TRIGGER_NAME_PREFIX, "conversation_history"
+        ) == wanted
+        assert await db._trigger_function_family(cs.FUNCTION_NAME_PREFIX) == {
+            name for name, _ddl in cs.mutation_trigger_functions(db.backend_type)
+        }
+
+        await _append(db, [("alice", "s1")] * 3)
+        assert (await _ledger(db))["alice"] == (3, 3), (
+            "the ledger moved by more than the rows written — the superseded "
+            "triggers are still firing beside the current ones"
+        )
+
+        # And the widened column is watched now, which is what the conversion
+        # was FOR: under the previous shape this update moved nothing.
+        await db.execute(
+            "UPDATE conversation_history SET archived_at = ? WHERE agent_id = ?",
+            (timestamp_query_param(db.backend_type, "2026-01-01T00:00:00"), "alice"),
+        )
+        assert (await _ledger(db))["alice"] == (6, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_the_new_shape_is_installed_before_the_old_one_is_dropped(db_backend):
     """Ordering, because the two mistakes here are not equally bad.
 
