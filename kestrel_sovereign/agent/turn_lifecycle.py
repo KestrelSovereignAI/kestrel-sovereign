@@ -20,8 +20,10 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+import warnings
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from typing import AsyncIterator, Iterator, Optional
 from uuid import uuid4
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
@@ -50,6 +52,83 @@ _CURRENT_CHAIN: contextvars.ContextVar[list[CausationFrame]] = (
 _CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("kestrel_agent_current_turn_id", default=None)
 )
+
+
+@dataclass(frozen=True)
+class _TurnSessionBinding:
+    """A turn/session pair explicitly carried across a task boundary."""
+
+    agent: object
+    turn_id: Optional[str]
+    session_id: Optional[str]
+
+
+_BOUND_TURN_SESSION: contextvars.ContextVar[Optional[_TurnSessionBinding]] = (
+    contextvars.ContextVar("kestrel_agent_bound_turn_session", default=None)
+)
+
+
+def _normalize_session_id(session_id: object) -> Optional[str]:
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
+    """Capture ``agent``'s authoritative live-turn session for later binding.
+
+    Context variables are copied when a task is created.  Long-lived transport
+    readers therefore cannot see a turn that began after the reader task.  A
+    caller on the owning turn uses this helper while building its callback,
+    then :func:`bind_turn_session` re-presents the captured pair while the
+    callback runs on the reader task.
+
+    The capture never derives authority from an arbitrary transport argument,
+    logging context, or the agent-global session alone.  It either preserves an
+    already-bound live pair (for nested task boundaries) or asks the lifecycle
+    accessor while the calling task owns the live turn.  An explicit binding
+    for this agent takes precedence even when it is unbound or stale: callback
+    code must not replace its captured authority with an ambient turn copied
+    into the task that happens to invoke it.  Entering a new turn clears any
+    inherited binding, because the task then owns that turn outright.  An
+    out-of-turn or session-less capture is represented explicitly as unbound.
+    """
+    live_turn_id = getattr(agent, "_live_turn_id", None)
+    propagated = _BOUND_TURN_SESSION.get()
+    if propagated is not None and propagated.agent is agent:
+        if propagated.turn_id and propagated.turn_id == live_turn_id:
+            return propagated
+        return _TurnSessionBinding(agent, None, None)
+
+    turn_id = _CURRENT_TURN_ID.get()
+    if turn_id and turn_id == live_turn_id:
+        resolve = getattr(agent, "get_turn_bound_session_id", None)
+        if not callable(resolve):
+            # Compatibility for agent shapes from the 0.53 -> 0.54 migration
+            # window. Keep capture aligned with Feature._turn_session_id's
+            # direct-read resolution until the private alias is removed.
+            resolve = getattr(agent, "_get_turn_bound_session_id", None)
+        try:
+            session_id = resolve() if callable(resolve) else None
+        except Exception:  # noqa: BLE001 - unknown host shapes stay unbound
+            session_id = None
+        return _TurnSessionBinding(
+            agent, turn_id, _normalize_session_id(session_id)
+        )
+
+    return _TurnSessionBinding(agent, None, None)
+
+
+@contextmanager
+def bind_turn_session(
+    binding: _TurnSessionBinding,
+) -> Iterator[None]:
+    """Temporarily expose a captured lifecycle binding in the current task."""
+    token = _BOUND_TURN_SESSION.set(binding)
+    try:
+        yield
+    finally:
+        _BOUND_TURN_SESSION.reset(token)
 
 
 class TurnLifecycleMixin:
@@ -100,7 +179,7 @@ class TurnLifecycleMixin:
         """Return the current agent turn id for per-turn observability."""
         return _CURRENT_TURN_ID.get()
 
-    def _get_turn_bound_session_id(self) -> Optional[str]:
+    def get_turn_bound_session_id(self) -> Optional[str]:
         """The chat session of the turn the CALLING task belongs to, or None.
 
         The one honest answer to "which chat window is this code running for",
@@ -121,21 +200,51 @@ class TurnLifecycleMixin:
         Pairing them closes both: `_live_turn_id` is the agent-scoped mirror of
         *which turn holds the CONVERSATION lock right now*, so requiring the
         task-local id to equal it means the caller owns the live turn and the
-        session it is reading is that turn's own. The detached task from turn A
-        sees `A != B` while turn B runs, and `None` after A ended — both fall
-        through to None, i.e. "no chat window", which callers treat as
+        session it is reading is that turn's own. A transport callback may also
+        explicitly carry a pair captured through this accessor across a known
+        task boundary; the pair is accepted only while that exact turn remains
+        live. When present, that explicit binding is authoritative even if it
+        is unbound or stale; an executor captured off-turn cannot borrow an
+        unrelated ambient turn merely because its reader task copied that
+        turn's ContextVar. A task that enters `_turn_lifecycle` clears any
+        inherited binding and owns the new turn outright. The detached task
+        from turn A sees `A != B` while turn B runs, and `None` after A ended —
+        both resolve to None, i.e. "no chat window", which callers treat as
         system-initiated.
 
         Returns None outside a turn, for a session-less turn, and for any task
         that merely inherited a finished turn's context.
         """
-        turn_id = _CURRENT_TURN_ID.get()
-        if not turn_id or turn_id != getattr(self, "_live_turn_id", None):
+        live_turn_id = getattr(self, "_live_turn_id", None)
+        propagated = _BOUND_TURN_SESSION.get()
+        if propagated is not None and propagated.agent is self:
+            if propagated.turn_id and propagated.turn_id == live_turn_id:
+                return _normalize_session_id(propagated.session_id)
             return None
-        session_id = getattr(self, "_active_session_id", None)
-        if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
+
+        turn_id = _CURRENT_TURN_ID.get()
+        if turn_id and turn_id == live_turn_id:
+            return _normalize_session_id(
+                getattr(self, "_active_session_id", None)
+            )
         return None
+
+    def _get_turn_bound_session_id(self) -> Optional[str]:
+        """Compatibility alias for :meth:`get_turn_bound_session_id`.
+
+        Deprecated in Sovereign 0.53.0 and planned for removal in 0.54.0.
+        Feature packages must use the public accessor. The private name remains
+        for one compatibility release so older packages and agent doubles can
+        migrate without silently losing turn attribution.
+        """
+        warnings.warn(
+            "_get_turn_bound_session_id() is deprecated since Sovereign "
+            "0.53.0 and will be removed in 0.54.0; use "
+            "get_turn_bound_session_id() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_turn_bound_session_id()
 
     def _set_current_chain(
         self, chain: Optional[list[CausationFrame]]
@@ -198,13 +307,22 @@ class TurnLifecycleMixin:
             # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
             # holds the CONVERSATION lock and therefore owns the value of
             # `_active_session_id`. Set and cleared inside the lock, so at most
-            # one turn is ever live. `_get_turn_bound_session_id` compares it
+            # one turn is ever live. `get_turn_bound_session_id` compares it
             # against the task-local id to tell a caller that owns the turn
             # from one that merely inherited its ContextVar (#2877).
             self._live_turn_id = turn_id
+            # A background task created inside an explicitly-bound callback
+            # inherits that binding. If it later enters its own cognition turn
+            # (the signal-dispatch wake path), turn entry is the unambiguous
+            # ownership boundary: the new turn's lifecycle/session authority
+            # supersedes the callback binding it inherited. Passive callbacks
+            # never enter this boundary, so their explicit stale/unbound veto
+            # remains intact (#2928 review P1).
+            bound_token = _BOUND_TURN_SESSION.set(None)
             try:
                 yield turn_id
             finally:
+                _BOUND_TURN_SESSION.reset(bound_token)
                 _CURRENT_TURN_ID.reset(token)
                 self._live_turn_id = None
                 # Clear the per-turn active session on exit so an out-of-turn

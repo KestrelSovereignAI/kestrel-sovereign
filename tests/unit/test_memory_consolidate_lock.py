@@ -15,10 +15,12 @@ class _LockProbe:
 
     def __init__(self):
         self.acquired_with = None
+        self.label = None
         self.held = False
 
-    def acquire(self, names):
+    def acquire(self, names, *, label=None):
         self.acquired_with = list(names)
+        self.label = label
         probe = self
 
         class _CM:
@@ -32,11 +34,15 @@ class _LockProbe:
 
         return _CM()
 
+    def is_owned_by_current_task(self, _name):
+        return False
+
 
 def _make_memory_feature(*, dispatcher):
     from kestrel_sovereign.features.memory.feature import MemoryFeature
 
     agent = MagicMock()
+    agent.agent_name = "Claw"
     agent.memory_system = MagicMock()
     agent.dispatcher = dispatcher
     return MemoryFeature(agent), agent
@@ -46,7 +52,7 @@ def _make_memory_feature(*, dispatcher):
 async def test_manual_consolidate_holds_memory_lock():
     probe = _LockProbe()
     dispatcher = MagicMock()
-    dispatcher._locks = probe
+    dispatcher.lock_manager = probe
     feature, agent = _make_memory_feature(dispatcher=dispatcher)
 
     async def _consolidate():
@@ -59,8 +65,29 @@ async def test_manual_consolidate_holds_memory_lock():
     result = await feature.memory_consolidate()
 
     assert probe.acquired_with == [ResourceLock.MEMORY]
+    assert probe.label == "Claw MemoryFeature.memory_consolidate"
     assert probe.held is False  # released after
     assert result.data.get("episodes_created") == 1
+
+
+@pytest.mark.asyncio
+async def test_non_boolean_ownership_probe_does_not_skip_lock():
+    """Mock/duck-typed ownership answers cannot disable serialization."""
+    probe = _LockProbe()
+    probe.is_owned_by_current_task = MagicMock(return_value=MagicMock())
+    dispatcher = MagicMock()
+    dispatcher.lock_manager = probe
+    feature, agent = _make_memory_feature(dispatcher=dispatcher)
+
+    async def _consolidate():
+        assert probe.held
+        return {"episodes_created": 0}
+
+    agent.memory_system.consolidate = AsyncMock(side_effect=_consolidate)
+
+    await feature.memory_consolidate()
+
+    assert probe.acquired_with == [ResourceLock.MEMORY]
 
 
 @pytest.mark.asyncio

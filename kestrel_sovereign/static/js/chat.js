@@ -243,6 +243,29 @@ function buildToolSegmentsByPos(content, cards) {
     let cursor = 0;
     let i = 0;
     const clamp = (p) => Math.max(0, Math.min(len, p == null ? len : p));
+    const snapAwayFromWordInterior = (rawPos) => {
+        const pos = clamp(rawPos);
+        const isWordCharacter = (char) => (
+            char !== undefined && /[\p{L}\p{N}]/u.test(char)
+        );
+        if (
+            pos === 0
+            || pos === len
+            || !isWordCharacter(text[pos - 1])
+            || !isWordCharacter(text[pos])
+        ) {
+            return pos;
+        }
+        // Defense in depth for stale persisted offsets inside a word. Preserve
+        // valid punctuation boundaries (for example, "." followed by "The").
+        // Keep the correction local so a badly wrong offset does not jump across
+        // unrelated prose; if no whitespace is nearby, retain the raw position.
+        const searchStart = Math.max(0, pos - 32);
+        for (let j = pos - 1; j >= searchStart; j -= 1) {
+            if (/\s/.test(text[j])) return j + 1;
+        }
+        return pos;
+    };
     // Prose that opens right after a tools batch leads with the orchestrator's
     // `\n---\n` wire delimiter (still emitted for multi-iteration turns). It is
     // protocol, not content — drop it (and surrounding blank lines) without
@@ -257,15 +280,18 @@ function buildToolSegmentsByPos(content, cards) {
         if (t.trim()) segments.push({ kind: 'prose', text: t });
     };
     while (i < sorted.length) {
-        const pos = clamp(sorted[i].pos);
+        // Form the batch from the original coordinate before snapping. Cards
+        // sharing a persisted position must remain together and in wire order.
+        const rawPos = clamp(sorted[i].pos);
+        const batch = [];
+        while (i < sorted.length && clamp(sorted[i].pos) === rawPos) {
+            batch.push(sorted[i]);
+            i += 1;
+        }
+        const pos = snapAwayFromWordInterior(rawPos);
         if (pos > cursor) {
             pushProse(text.slice(cursor, pos));
             cursor = pos;
-        }
-        const batch = [];
-        while (i < sorted.length && clamp(sorted[i].pos) === pos) {
-            batch.push(sorted[i]);
-            i += 1;
         }
         segments.push({ kind: 'tools', cards: batch });
     }
@@ -2187,6 +2213,7 @@ export function renderSignalWakeChip(msg, target = null) {
 // State → accent colour for the restart-status bubble's left border.
 const RESTART_STATE_ACCENTS = {
     pending: 'rgba(59, 130, 246, 0.8)',    // blue — filed / deferred
+    escalated: 'rgba(239, 68, 68, 0.95)',  // red — busy bound overridden
     updating: 'rgba(168, 85, 247, 0.8)',   // purple — update profile running
     executing: 'rgba(245, 158, 11, 0.9)',  // amber — restart dispatched
     completed: 'rgba(34, 197, 94, 0.9)',   // green — landed
@@ -2383,6 +2410,33 @@ function renderRestartStatusBody(div, payload) {
         rows.push(['Requested by', requestedByName || requestedByAgent]);
     }
     if (payload.reason) rows.push(['Reason', String(payload.reason)]);
+    const rawRequestAge = payload.request_age_seconds;
+    const requestAge = Number(rawRequestAge);
+    if (rawRequestAge !== null && rawRequestAge !== undefined
+        && Number.isFinite(requestAge) && requestAge >= 0) {
+        rows.push(['Request age', `${Math.round(requestAge)}s`]);
+    }
+    const rawDeferralAge = payload.deferral_age_seconds;
+    const deferralAge = Number(rawDeferralAge);
+    if (rawDeferralAge !== null && rawDeferralAge !== undefined
+        && Number.isFinite(deferralAge) && deferralAge >= 0) {
+        rows.push(['Continuous deferral', `${Math.round(deferralAge)}s`]);
+    }
+    const blocker = payload.blocker && typeof payload.blocker === 'object'
+        ? payload.blocker : null;
+    if (blocker) {
+        if (blocker.kind) rows.push(['Blocker kind', String(blocker.kind)]);
+        if (blocker.count !== null && blocker.count !== undefined) {
+            rows.push(['Blocker count', String(blocker.count)]);
+        }
+        const rawOldestAge = blocker.oldest_age_seconds;
+        const oldestAge = Number(rawOldestAge);
+        if (rawOldestAge !== null && rawOldestAge !== undefined
+            && Number.isFinite(oldestAge) && oldestAge >= 0) {
+            rows.push(['Blocker oldest', `${Math.round(oldestAge)}s`]);
+        }
+    }
+    if (payload.escalated) rows.push(['Escalation', 'busy deferral bound reached']);
     if (deferralReason) rows.push(['Deferred', deferralReason]);
     else if (statusReason) rows.push(['Detail', statusReason]);
 

@@ -45,6 +45,11 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.command_policy import (
+    BOOTSTRAP_ALLOWED_COMMANDS,
+    SAFE_MODE_COMMANDS,
+    prefixed_command_token,
+)
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.a2a.stores import (
     SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
@@ -1242,7 +1247,7 @@ class KestrelAgent(
         # ContextVar so a caller can tell "I own the live turn" from "my task
         # inherited a finished turn's context" — the check that keeps a
         # detached task from reading a concurrent turn's `_active_session_id`
-        # (#2877). Read via `_get_turn_bound_session_id`, not directly.
+        # (#2877). Read via `get_turn_bound_session_id`, not directly.
         self._live_turn_id: Optional[str] = None
 
         # TaskManager for A2A unified routing
@@ -2197,6 +2202,8 @@ class KestrelAgent(
         #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
         #   a2a.question_answered— send_a2a_question resumption rail (#1444)
         #   wait.complete        — generic wait reconciler rail (#1860)
+        #   workflow rescue      — the six generic sources named by the
+        #                          Workflows built-in stalled_work_rescue
         from kestrel_sovereign.signals import RegistrationPolicy
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
@@ -2213,6 +2220,9 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.workflow_rescue import (
+            build_workflow_rescue_registrations,
+        )
 
         core_source_registrations = [
             build_a2a_task_complete_registration(),
@@ -2220,6 +2230,12 @@ class KestrelAgent(
             build_stripe_deposit_registration(),
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),
+            # Core hosts these provider-neutral registrations because the
+            # Workflows built-in names them.  The sweep is deliberately the
+            # echo-only implementation: an installed domain feature may feed
+            # explicit candidates into a run, but it does not replace or own
+            # the generic registration lifecycle.
+            *build_workflow_rescue_registrations(),
         ]
         core_source_names = [reg.name for reg in core_source_registrations]
         self.signal_registry.register_batch(
@@ -4414,8 +4430,7 @@ class KestrelAgent(
         performed, on the SAME feature instance, so a soft-disabled feature is
         restored end to end:
 
-        * ``initialize()`` — re-registers the feature's owned **signal sources**
-          (talon registers ``talon.job_complete`` etc. here);
+        * ``initialize()`` — re-registers the feature's owned **signal sources**;
         * contributed permission defaults through SecurityFeature, before any
           callable surface is exposed;
         * hooks from ``get_hooks()`` (via :meth:`_wire_feature_hooks`);
@@ -4424,15 +4439,15 @@ class KestrelAgent(
         * startup-promoted **dynamic tools** (mirrors
           :meth:`_promote_startup_feature_tools`);
         * ``post_all_features_loaded()`` — re-registers the feature's owned
-          **wait providers** (``task:`` / ``talon:``);
+          **wait providers**;
         * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
           services are live (RestartCoordinator's post-restart wake sweep runs
           here, #1809). Runtime re-enable must fire it too or a re-enabled
           feature silently skips its ready work.
 
         Precondition: ``feature.initialize()`` must be idempotent — it is re-run
-        to restore signal sources a disable detached (talon / tasks are, and
-        document it). Atomic: on any failure BEFORE the commit, the partial
+        to restore signal sources a disable detached. Atomic: on any failure
+        BEFORE the commit, the partial
         activation is torn back down *softly* (``unload=False`` — the instance
         stays re-enable-able) and the error re-raised, so a failed enable never
         leaves half-registered state. ``on_agent_ready`` runs AFTER the commit
@@ -5045,14 +5060,13 @@ Expected Duration: {expected_duration}
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if safe_mode or audit_pending:
-            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
-            if user_input.startswith("!"):
-                cmd = user_input.split()[0]
-                if cmd not in safe_mode_commands:
+            command = prefixed_command_token(user_input)
+            if command is not None:
+                if command not in SAFE_MODE_COMMANDS:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
                         "The agent has detected an integrity issue and is operating in restricted mode.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status\\n\\n"
+                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
@@ -5087,10 +5101,23 @@ Expected Duration: {expected_duration}
 
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-                # Allow bootstrap commands to pass through
-                bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
-                if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
+                command = prefixed_command_token(user_input)
+                if command in BOOTSTRAP_ALLOWED_COMMANDS:
                     pass  # Let command handler process these
+                elif command is not None:
+                    # Never feed command text into discovery. Bootstrap may
+                    # persist its input and response or even complete before it
+                    # returns, which would leave the operator's transcript out
+                    # of sync with durable state when we replace that response.
+                    logging.info(
+                        "[BOOTSTRAP] Command %s unavailable until onboarding completes",
+                        command,
+                    )
+                    return (
+                        f"❌ Command unavailable during bootstrap: {command}\n\n"
+                        "Complete onboarding first, or use !skip-discovery to "
+                        "finish bootstrap with the default personality."
+                    )
                 else:
                     bootstrap_response = await self._handle_bootstrap(
                         user_input, session_id,

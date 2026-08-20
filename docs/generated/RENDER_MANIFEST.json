@@ -114,7 +114,6 @@
         "kestrel_sovereign/features/security/approval_queue.py",
         "kestrel_sovereign/features/security/hooks.py",
         "kestrel_sovereign/features/security/permissions.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
         "kestrel_sovereign/llm/codex_adapter.py",
         "kestrel_sovereign/llm/codex_app_server.py",
         "kestrel_sovereign/security/auto_approve.py"
@@ -1572,8 +1571,6 @@
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/features/talon/coordinator.py",
-        "kestrel_sovereign/features/talon/verification.py",
         "run_tests.py"
       ],
       "findings": [
@@ -2498,12 +2495,15 @@
         "README.md",
         "kestrel_sovereign/data/feature_registry.toml",
         "kestrel_sovereign/features/__init__.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
         "pyproject.toml",
         "tests/unit/test_extracted_feature_boundary_contracts.py"
       ],
-      "findings": [],
-      "missing_code_refs": [],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "kestrel_sovereign/features/talon/coordinator.py"
+      ],
       "missing_links": [],
       "path": "docs/audit/documentation-2026-05/reports/package_boundaries_report.md",
       "privacy": "public",
@@ -2531,8 +2531,6 @@
         "kestrel_sovereign/data/feature_registry.toml",
         "kestrel_sovereign/features/channels/feature.py",
         "kestrel_sovereign/features/scheduler/feature.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
-        "kestrel_sovereign/features/talon/runtime.py",
         "kestrel_sovereign/kestrel_agent.py",
         "kestrel_sovereign/signals/dispatcher.py",
         "kestrel_sovereign/signals/sources/scheduler.py",
@@ -2542,6 +2540,8 @@
         "missing_code_refs"
       ],
       "missing_code_refs": [
+        "kestrel_sovereign/features/talon/coordinator.py",
+        "kestrel_sovereign/features/talon/runtime.py",
         "kestrel_sovereign/features/workflows/models.py"
       ],
       "missing_links": [],

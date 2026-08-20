@@ -46,6 +46,10 @@ class CountingExecutor:
     def __init__(self):
         self.calls = 0
 
+    @property
+    def is_available(self):
+        return True
+
     def supports_language(self, language):
         return True
 
@@ -506,6 +510,7 @@ class TestToolEnumSelfDocumentation:
             assert executor in desc
         # Discovery hint + availability caveat.
         assert "get_compute_capabilities" in desc
+        assert "venv or virtualenv" in desc
         assert "KESTREL_ALLOW_LOCAL_COMPUTE" in desc
 
     def test_list_scripts_description_advertises_all_states(self):

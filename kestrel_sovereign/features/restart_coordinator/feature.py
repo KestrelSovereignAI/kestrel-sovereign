@@ -1,6 +1,7 @@
 """RestartCoordinatorFeature — durable, host-mediated restart requests.
 
-Three @tool entry points (request / list / cancel) plus an ACTION-mode
+Four agent-facing @tool entry points (request / list / cancel / escalation
+acknowledgement) plus an ACTION-mode
 ``restart_coordinator`` cron entry that scans the durable table and
 spawns a detached subprocess to actually restart Kestrel once safety
 checks pass. After restart, ``initialize`` sweeps any in-flight
@@ -8,11 +9,10 @@ checks pass. After restart, ``initialize`` sweeps any in-flight
 ``restart.completed`` signal so the requesting agent wakes.
 
 The feature owns NO direct dependency on Talon or any other feature.
-The safety checks are best-effort introspections of the agent's
-existing public surfaces (``dispatcher.has_in_flight_signals``-style
-checks gracefully degrade to "assume idle" if those surfaces aren't
-present). The actual restart command is spawned via the CLI entry
-point (``kestrel restart``) so the executor doesn't need to know the
+The safety checks conservatively introspect the agent's existing public
+surfaces (``dispatcher.has_in_flight_signals``-style checks treat missing
+idleness evidence as busy). The actual restart command is spawned via the CLI
+entry point (``kestrel restart``) so the executor doesn't need to know the
 runtime layout.
 """
 
@@ -38,6 +38,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.storage.database_clock import database_clock
 
 from .event_store import (
     ensure_restart_status_events_table,
@@ -51,11 +52,14 @@ from .store import (
     KNOWN_STATUSES,
     KNOWN_URGENCIES,
     PENDING_STATES,
+    acknowledge_escalation,
+    clear_deferral_started,
     ensure_restart_requests_table,
     get_request,
     insert_request,
     list_requests,
     list_requests_needing_wake,
+    mark_deferral_started,
     mark_wake_delivered,
     mark_wake_dispatched,
     record_update_log,
@@ -79,6 +83,13 @@ _OUTPUT_TAIL_CHARS = 2000
 # any real turn yet breaks the deadlock well inside the ~20 min window
 # observed in #1558.
 STALE_ACTIVE_REQUEST_SECONDS = 900
+
+# ``idle_agents_only`` remains the cautious default, but it is bounded.  A
+# request that has been continuously blocked for this long advances with an
+# explicit escalation event carrying the blocker evidence.  This prevents a
+# busy marker or continuously-active requester from starving the only
+# coordinator capable of applying its restart forever.
+MAX_IDLE_ONLY_DEFERRAL_SECONDS = 1800
 
 # How long to wait after spawning the detached restart before concluding the
 # dispatch failed. A real restart kills this process well inside the window;
@@ -475,8 +486,9 @@ class RestartCoordinatorFeature(Feature):
             "'emergency'→critical). Higher urgency is executed first.\n"
             "policy: one of idle_agents_only|allow_busy_after_timeout|"
             "manual_only (default 'idle_agents_only'):\n"
-            "  - idle_agents_only: execute only while this agent is idle "
-            "(no in-flight cognition turns or real background work).\n"
+            "  - idle_agents_only: wait for every co-hosted agent to become "
+            "idle; after a bounded continuous deferral, emit an audited "
+            "escalation and proceed so one blocker cannot starve the host.\n"
             "  - allow_busy_after_timeout: prefer idle, but execute anyway "
             "once the request has aged past the busy timeout even if the "
             "agent is still busy.\n"
@@ -583,20 +595,14 @@ class RestartCoordinatorFeature(Feature):
             getattr(self.agent, "_current_request_id", "") or ""
         )
         # Capture the chat session this request was filed from so the
-        # post-restart wake lands in the SAME window (#1809). Prefer the agent's
-        # authoritative per-turn ``_active_session_id`` (set by both the
-        # streaming and non-streaming turn bodies from the effective session,
-        # incl. the JSON-body session the primary chat path uses). Fall back to
-        # the logging ``session_id_var`` (set only from a query param / header).
-        # Empty for CLI/system-filed requests with no session — those wake
-        # system-initiated, as before.
-        origin_session_id = getattr(self.agent, "_active_session_id", "") or ""
-        if not origin_session_id:
-            try:
-                from kestrel_sovereign.logging_config import session_id_var
-                origin_session_id = session_id_var.get() or ""
-            except Exception:
-                origin_session_id = ""
+        # post-restart wake lands in the SAME window (#1809, #2928). The
+        # lifecycle accessor proves the calling task owns the live turn before
+        # exposing its effective session. Reading the agent-global
+        # ``_active_session_id`` directly can cross-wire unattended work into a
+        # concurrent chat, while the logging ContextVar only covers an optional
+        # query/header value and is not the turn's routing authority.
+        # CLI/system/session-less requests remain explicitly unbound.
+        origin_session_id = self._turn_session_id() or ""
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),
@@ -705,6 +711,55 @@ class RestartCoordinatorFeature(Feature):
                 "count": len(rows),
                 "events": [e.to_public_dict() for e in rows],
             },
+        )
+
+    @tool(
+        name="acknowledge_restart_escalation",
+        description=(
+            "Acknowledge the bounded host-wide escalation policy for one "
+            "pending restart request migrated from an older release. This "
+            "is required once for legacy rows before a continuous busy "
+            "deferral may override fleet quiescence. Pass request_id from "
+            "list_restart_requests."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!restart acknowledge-escalation",
+    )
+    async def acknowledge_restart_escalation(self, request_id: str) -> ToolResult:
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"acknowledged": False},
+            )
+        normalized = (request_id or "").strip()
+        if not normalized:
+            return ToolResult.failed(
+                "request_id is required",
+                data={"acknowledged": False},
+            )
+        row = await get_request(self._db, normalized)
+        if row is None:
+            return ToolResult.failed(
+                f"No restart request with id {request_id!r}",
+                data={"acknowledged": False, "request_id": normalized},
+            )
+        if row.status not in PENDING_STATES:
+            return ToolResult.failed(
+                f"Cannot acknowledge a request in state {row.status!r}",
+                data={
+                    "acknowledged": False,
+                    "request_id": normalized,
+                    "current_status": row.status,
+                },
+            )
+        if not await acknowledge_escalation(self._db, normalized):
+            return ToolResult.failed(
+                "Escalation acknowledgement did not land",
+                data={"acknowledged": False, "request_id": normalized},
+            )
+        return ToolResult.ok(
+            confirmation=f"Acknowledged bounded escalation for {normalized}",
+            data={"acknowledged": True, "request_id": normalized},
         )
 
     @tool(
@@ -833,17 +888,25 @@ class RestartCoordinatorFeature(Feature):
         executed: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
         for req in candidates:
-            decision = self._evaluate_safety(req)
+            req, decision = await self._evaluate_and_track_safety(req)
             if not decision["safe"]:
                 if decision.get("deferable", True):
                     deferred.append({
                         "request_id": req.id,
                         "reason": decision["reason"],
+                        "request_age_seconds": decision.get("request_age_seconds"),
+                        "deferral_age_seconds": decision.get("deferral_age_seconds"),
+                        "blocker": decision.get("blocker"),
                     })
+                    if decision.get("lost_race"):
+                        continue
                     # Surface the deferred attempt + its reason (#1551).
                     await self._emit_status_event(
                         req, state="pending",
                         deferral_reason=decision["reason"],
+                        blocker=decision.get("blocker"),
+                        request_age_seconds=decision.get("request_age_seconds"),
+                        deferral_age_seconds=decision.get("deferral_age_seconds"),
                     )
                     continue
                 # Hard reject.
@@ -906,6 +969,18 @@ class RestartCoordinatorFeature(Feature):
                     "reason": "lost race against another transition",
                 })
                 continue
+            req.status = initial_state
+
+            if decision.get("escalated"):
+                await self._emit_status_event(
+                    req,
+                    state="escalated",
+                    deferral_reason=decision["reason"],
+                    blocker=decision.get("blocker"),
+                    request_age_seconds=decision.get("request_age_seconds"),
+                    deferral_age_seconds=decision.get("deferral_age_seconds"),
+                    escalated=True,
+                )
 
             # Surface the transition out of pending — ``updating`` (update
             # profile running) or ``executing`` (restart dispatched) (#1551).
@@ -939,8 +1014,14 @@ class RestartCoordinatorFeature(Feature):
                     continue
                 # Re-run the safety gate before the restart now that the
                 # (possibly slow) update has completed.
-                decision = self._evaluate_safety(req)
+                req, decision = await self._evaluate_and_track_safety(req)
                 if not decision["safe"]:
+                    if decision.get("lost_race"):
+                        deferred.append({
+                            "request_id": req.id,
+                            "reason": decision["reason"],
+                        })
+                        continue
                     await update_status(
                         self._db, req.id,
                         status="pending",
@@ -956,6 +1037,9 @@ class RestartCoordinatorFeature(Feature):
                             "update ok; restart deferred — "
                             f"{decision['reason']}"
                         ),
+                        "request_age_seconds": decision.get("request_age_seconds"),
+                        "deferral_age_seconds": decision.get("deferral_age_seconds"),
+                        "blocker": decision.get("blocker"),
                     })
                     await self._emit_status_event(
                         req, state="pending",
@@ -963,6 +1047,9 @@ class RestartCoordinatorFeature(Feature):
                             "update ok; restart deferred — "
                             f"{decision['reason']}"
                         ),
+                        blocker=decision.get("blocker"),
+                        request_age_seconds=decision.get("request_age_seconds"),
+                        deferral_age_seconds=decision.get("deferral_age_seconds"),
                     )
                     continue
                 # Update done and still safe — NOW cross into ``executing``
@@ -985,6 +1072,17 @@ class RestartCoordinatorFeature(Feature):
                         "reason": "lost race after update before restart",
                     })
                     continue
+                req.status = "executing"
+                if decision.get("escalated"):
+                    await self._emit_status_event(
+                        req,
+                        state="escalated",
+                        deferral_reason=decision["reason"],
+                        blocker=decision.get("blocker"),
+                        request_age_seconds=decision.get("request_age_seconds"),
+                        deferral_age_seconds=decision.get("deferral_age_seconds"),
+                        escalated=True,
+                    )
                 await self._emit_status_event(req, state="executing")
 
             try:
@@ -1042,6 +1140,10 @@ class RestartCoordinatorFeature(Feature):
         state: str,
         deferral_reason: str = "",
         status_reason: str = "",
+        blocker: Optional[Dict[str, Any]] = None,
+        request_age_seconds: Optional[float] = None,
+        deferral_age_seconds: Optional[float] = None,
+        escalated: bool = False,
     ) -> None:
         """Surface a chat-visible ``restart_status`` event (#1551).
 
@@ -1070,6 +1172,10 @@ class RestartCoordinatorFeature(Feature):
             requested_by_agent_name=self._resolve_requesting_agent_name(
                 requested_by_agent
             ),
+            blocker=blocker,
+            request_age_seconds=request_age_seconds,
+            deferral_age_seconds=deferral_age_seconds,
+            escalated=escalated,
         )
 
         # Audit row first. If the persist fails AND a DB is available,
@@ -1161,7 +1267,65 @@ class RestartCoordinatorFeature(Feature):
                 return name
         return ""
 
-    def _evaluate_safety(self, req) -> Dict[str, Any]:
+    async def _evaluate_and_track_safety(self, req):
+        """Evaluate safety while maintaining the durable busy interval."""
+
+        database_now = await database_clock(self._db)
+        decision = self._evaluate_safety(req, database_now=database_now)
+        if (
+            not decision["safe"]
+            and decision.get("deferable", True)
+            and req.policy == "idle_agents_only"
+            and not getattr(req, "first_blocked_at", "")
+        ):
+            original_status = req.status
+            refreshed = await mark_deferral_started(
+                self._db,
+                req.id,
+                expected_current_status=original_status,
+            )
+            if refreshed is None or refreshed.status != original_status:
+                current_status = (
+                    refreshed.status if refreshed is not None else "missing"
+                )
+                return req, {
+                    "safe": False,
+                    "deferable": True,
+                    "lost_race": True,
+                    "reason": (
+                        "lost race while recording restart deferral: "
+                        f"expected {original_status!r}, found {current_status!r}"
+                    ),
+                    "blocker": None,
+                    "request_age_seconds": self._request_age_seconds(
+                        req, database_now
+                    ),
+                    "deferral_age_seconds": self._deferral_age_seconds(
+                        req, database_now
+                    ),
+                }
+            req = refreshed
+            database_now = await database_clock(self._db)
+            decision = self._evaluate_safety(req, database_now=database_now)
+        elif (
+            decision["safe"]
+            and not decision.get("escalated")
+            and getattr(req, "first_blocked_at", "")
+        ):
+            # A genuinely idle observation breaks the continuous-deferral
+            # interval. An escalation that proceeds while busy deliberately
+            # retains its evidence if dispatch later fails and the row retries.
+            if await clear_deferral_started(
+                self._db,
+                req.id,
+                expected_current_status=req.status,
+            ):
+                req.first_blocked_at = ""
+        return req, decision
+
+    def _evaluate_safety(
+        self, req, *, database_now: datetime,
+    ) -> Dict[str, Any]:
         """Return ``{safe, reason, deferable}`` for one request.
 
         ``deferable=True`` means "try again next poll"; ``False`` means
@@ -1174,46 +1338,113 @@ class RestartCoordinatorFeature(Feature):
                 "safe": False,
                 "deferable": False,
                 "reason": f"unknown policy {policy!r}",
+                "blocker": None,
+                "request_age_seconds": self._request_age_seconds(
+                    req, database_now
+                ),
+                "deferral_age_seconds": self._deferral_age_seconds(
+                    req, database_now
+                ),
+                "escalated": False,
             }
         if policy == "manual_only":
             return {
                 "safe": False,
                 "deferable": True,
                 "reason": "policy=manual_only; awaiting explicit dispatch",
+                "blocker": None,
+                "request_age_seconds": self._request_age_seconds(
+                    req, database_now
+                ),
+                "deferral_age_seconds": self._deferral_age_seconds(
+                    req, database_now
+                ),
+                "escalated": False,
             }
 
-        # The chat/agent turn that filed this request is itself an active
-        # request marker. It must NOT block the restart it requested when
-        # it is the only thing in flight — ignore the requester's own
-        # marker for this specific row (#1561). Other active requests are
-        # still respected so a busy agent stays protected.
+        # The dispatched command is ``kestrel restart`` with no agent name, so
+        # it stops every agent in this host process. Normal dispatch therefore
+        # requires whole-fleet quiescence (#F235). The requesting turn's own
+        # marker is still excluded only on its owning agent (#1561).
         idle = self._fleet_idle(
             ignore_request_id=getattr(req, "requester_request_id", "") or "",
         )
+        request_age = self._request_age_seconds(req, database_now)
+        deferral_age = self._deferral_age_seconds(req, database_now)
         if idle["idle"]:
-            return {"safe": True, "deferable": True, "reason": ""}
+            return {
+                "safe": True,
+                "deferable": True,
+                "reason": "",
+                "blocker": None,
+                "request_age_seconds": request_age,
+                "deferral_age_seconds": deferral_age,
+                "escalated": False,
+            }
 
         if policy == "allow_busy_after_timeout":
-            if self._request_aged_past_timeout(req):
+            if self._request_aged_past_timeout(req, database_now):
                 return {
                     "safe": True,
                     "deferable": True,
                     "reason": "timeout policy expired",
+                    "blocker": idle.get("blocker"),
+                    "request_age_seconds": request_age,
+                    "deferral_age_seconds": deferral_age,
+                    "escalated": False,
                 }
             return {
                 "safe": False,
                 "deferable": True,
                 "reason": (
-                    f"agent busy ({idle['reason']}); waiting for "
+                    f"host busy ({idle['reason']}); waiting for "
                     f"timeout to elapse"
                 ),
+                "blocker": idle.get("blocker"),
+                "request_age_seconds": request_age,
+                "deferral_age_seconds": deferral_age,
+                "escalated": False,
             }
 
         # idle_agents_only
+        if (
+            deferral_age is not None
+            and deferral_age >= MAX_IDLE_ONLY_DEFERRAL_SECONDS
+        ):
+            if not bool(getattr(req, "escalation_acknowledged", False)):
+                return {
+                    "safe": False,
+                    "deferable": True,
+                    "reason": (
+                        "idle_agents_only deferral limit reached for a "
+                        "pre-upgrade request; explicit escalation "
+                        "acknowledgement required"
+                    ),
+                    "blocker": idle.get("blocker"),
+                    "request_age_seconds": request_age,
+                    "deferral_age_seconds": deferral_age,
+                    "escalated": False,
+                }
+            return {
+                "safe": True,
+                "deferable": True,
+                "reason": (
+                    "idle_agents_only deferral limit reached; escalating with "
+                    f"host blocker ({idle['reason']})"
+                ),
+                "blocker": idle.get("blocker"),
+                "request_age_seconds": request_age,
+                "deferral_age_seconds": deferral_age,
+                "escalated": True,
+            }
         return {
             "safe": False,
             "deferable": True,
-            "reason": f"agent busy ({idle['reason']})",
+            "reason": f"host busy ({idle['reason']})",
+            "blocker": idle.get("blocker"),
+            "request_age_seconds": request_age,
+            "deferral_age_seconds": deferral_age,
+            "escalated": False,
         }
 
     def _resolve_cohosted_agents(self) -> Optional[List[Any]]:
@@ -1243,12 +1474,7 @@ class RestartCoordinatorFeature(Feature):
         return None
 
     def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
-        """Idleness across ALL agents co-hosted in this process (#F235).
-
-        A whole-host restart kills every agent in the process, so
-        ``idle_agents_only`` must require the WHOLE FLEET idle — not just the
-        requester. Previously it checked only ``self.agent``, so a sibling
-        agent mid-turn was silently killed with its partial output lost.
+        """Idleness across all agents before a whole-host restart (#F235).
 
         The multi-agent host installs ``agent._cohosted_agents_provider`` (a
         callable returning every co-hosted agent) at load time. When absent
@@ -1278,11 +1504,17 @@ class RestartCoordinatorFeature(Feature):
             )
             if not state["idle"]:
                 name = getattr(other, "name", None) or getattr(other, "did", "?")
+                blocker = dict(state.get("blocker") or {})
+                blocker["scope"] = (
+                    "requesting_agent" if other is self.agent
+                    else "cohosted_agent"
+                )
                 return {
                     "idle": False,
                     "reason": f"co-hosted agent {name} busy ({state['reason']})",
+                    "blocker": blocker,
                 }
-        return {"idle": True, "reason": ""}
+        return {"idle": True, "reason": "", "blocker": None}
 
     def _agent_appears_idle(
         self, ignore_request_id: str = "", agent: Any = None,
@@ -1330,7 +1562,22 @@ class RestartCoordinatorFeature(Feature):
                         if val:
                             return {
                                 "idle": False,
-                                "reason": f"dispatcher reports {attr}={val}",
+                                "reason": (
+                                    f"dispatcher reports {attr}={val}"
+                                    if name_tasks
+                                    else "dispatcher reports work in flight"
+                                ),
+                                "blocker": {
+                                    "scope": "requesting_agent",
+                                    "kind": "dispatcher",
+                                    "surface": attr if name_tasks else None,
+                                    "count": (
+                                        int(val)
+                                        if name_tasks and isinstance(val, int)
+                                        else None
+                                    ),
+                                    "oldest_age_seconds": None,
+                                },
                             }
                     except Exception:
                         # Treat introspection failure as "unknown" —
@@ -1375,12 +1622,35 @@ class RestartCoordinatorFeature(Feature):
             except TypeError:
                 n = 0
             if n:
+                ages_fn = getattr(agent, "active_request_ages", None)
+                blocker_ages: Dict[str, float] = {}
+                if name_tasks and callable(ages_fn):
+                    try:
+                        blocker_ages = {
+                            str(rid): float(age)
+                            for rid, age in ages_fn().items()
+                            if rid != ignore_request_id
+                        }
+                    except (AttributeError, TypeError, ValueError):
+                        blocker_ages = {}
                 return {
                     "idle": False,
                     "reason": (
-                        f"{n} active request id(s)"
-                        f"{self._active_request_age_suffix(ignore_request_id, agent=agent)}"
+                        (
+                            f"{n} active request id(s)"
+                            f"{self._active_request_age_suffix(ignore_request_id, agent=agent)}"
+                        )
+                        if name_tasks
+                        else "active request(s) in flight"
                     ),
+                    "blocker": {
+                        "scope": "requesting_agent",
+                        "kind": "active_requests",
+                        "count": n if name_tasks else None,
+                        "oldest_age_seconds": (
+                            max(blocker_ages.values()) if blocker_ages else None
+                        ),
+                    },
                 }
 
         bg_tasks = getattr(agent, "_background_tasks", None)
@@ -1400,6 +1670,12 @@ class RestartCoordinatorFeature(Feature):
             except (TypeError, AttributeError):
                 alive = []
             if alive:
+                ages = [
+                    age for age in (
+                        _task_age_seconds(task, time.monotonic()) for task in alive
+                    )
+                    if age is not None
+                ]
                 detail = (
                     f": {_describe_background_tasks(alive)}"
                     if name_tasks else ""
@@ -1408,7 +1684,21 @@ class RestartCoordinatorFeature(Feature):
                     "idle": False,
                     "reason": (
                         f"{len(alive)} background task(s) in flight{detail}"
+                        if name_tasks
+                        else "background task(s) in flight"
                     ),
+                    "blocker": {
+                        "scope": "requesting_agent",
+                        "kind": "background_tasks",
+                        "count": len(alive) if name_tasks else None,
+                        "oldest_age_seconds": (
+                            max(ages) if name_tasks and ages else None
+                        ),
+                        "summary": (
+                            _describe_background_tasks(alive)
+                            if name_tasks else None
+                        ),
+                    },
                 }
 
         if not any_surface_seen:
@@ -1418,8 +1708,14 @@ class RestartCoordinatorFeature(Feature):
             return {
                 "idle": False,
                 "reason": "no idleness introspection on agent",
+                "blocker": {
+                    "scope": "requesting_agent",
+                    "kind": "unknown",
+                    "count": None,
+                    "oldest_age_seconds": None,
+                },
             }
-        return {"idle": True, "reason": ""}
+        return {"idle": True, "reason": "", "blocker": None}
 
     def _active_request_age_suffix(
         self, ignore_request_id: str = "", agent: Any = None,
@@ -1453,15 +1749,44 @@ class RestartCoordinatorFeature(Feature):
             f"{STALE_ACTIVE_REQUEST_SECONDS}s stale window"
         )
 
-    @staticmethod
-    def _request_aged_past_timeout(req) -> bool:
+    @classmethod
+    def _request_aged_past_timeout(
+        cls, req, database_now: datetime,
+    ) -> bool:
         """Has the request sat in pending/approved longer than 5 min?"""
+
+        age = cls._request_age_seconds(req, database_now)
+        return age is not None and age > 300
+
+    @staticmethod
+    def _age_seconds(value: Any, database_now: datetime) -> Optional[float]:
+        """Return a non-negative UTC age for one persisted ISO timestamp."""
+
         try:
-            requested = datetime.fromisoformat(req.requested_at)
-        except ValueError:
-            return False
-        now = datetime.now(timezone.utc)
-        return (now - requested).total_seconds() > 300
+            requested = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        if requested.tzinfo is None:
+            requested = requested.replace(tzinfo=timezone.utc)
+        return max(0.0, (database_now - requested).total_seconds())
+
+    @classmethod
+    def _request_age_seconds(
+        cls, req, database_now: datetime,
+    ) -> Optional[float]:
+        """Age since the restart request was filed."""
+
+        return cls._age_seconds(getattr(req, "requested_at", ""), database_now)
+
+    @classmethod
+    def _deferral_age_seconds(
+        cls, req, database_now: datetime,
+    ) -> Optional[float]:
+        """Age of the current uninterrupted busy interval, if one exists."""
+
+        return cls._age_seconds(
+            getattr(req, "first_blocked_at", ""), database_now
+        )
 
     async def _handle_update_then_restart(
         self, req,

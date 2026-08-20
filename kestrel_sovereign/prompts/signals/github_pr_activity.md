@@ -15,7 +15,7 @@ Link: {payload[html_url]}
 
   * `state` — the PR/issue opened/closed transition. If it closed without merging, decide whether re-opening or a follow-up issue is warranted.
   * `merge` — the PR merged. Close the loop: summarize, file any follow-up, or do nothing if the merge already finished the work.
-  * `comments` — new (review) comments arrived. Read them; a reviewer may be asking for a revision. If a change is requested, dispatch the revision (e.g. `talon iterate --pr`) or reply.
+  * `comments` — new (review) comments arrived. Read them; a reviewer may be asking for a revision. If a change is requested, route it through an enabled coding/workflow provider or reply.
   * `checks` — CI/check status changed. If it turned red, diagnose and decide whether to push a fix. If green on a PR awaiting merge, it may be ready.
 
 Only the categories listed in this watch's `triggers` woke you; a bare timestamp bump does not. If nothing actionable is needed, acknowledge and move on — you do not have to act on every poll.

@@ -43,6 +43,7 @@ from kestrel_sovereign.constitution.amendment_artifact import (
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 
 CONSTITUTION_V1 = b"""# Kestrel Constitution (Test V1)
@@ -167,6 +168,24 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
         did_document=_ROOT_DID_DOCUMENT,
     )
 
+    # Give the agent a prior anchoring's receipt, so the reanchor below is a
+    # SUPERSEDING one. #2963's regression — the writer assigning where it
+    # documented appending — is invisible on a first reanchor, because there is
+    # nothing yet to destroy. The runtime writer has its own coverage in
+    # tests/unit/test_reanchor_constitution.py; this pins the setup writer.
+    prior_receipt = {
+        "timestamp": "2026-04-05T00:00:00Z",
+        "old_hash": "0" * 64,
+        "new_hash": v1_hash,
+        "source_path": str(constitution_path),
+        "authorization": "prior-integration-test",
+        "signed_artifact_hash": "1" * 64,
+    }
+    async with AsyncStorage(str(db_path)) as seed_storage:
+        seed_agent = await seed_storage.graph.get_node(agent_did)
+        seed_agent.properties["constitution_reanchor"] = prior_receipt
+        await seed_storage.graph.add_node(seed_agent)
+
     # ---- 4. Reanchor with force ----
     result = await reanchor_constitution(
         agent_name="TestAgent",
@@ -212,6 +231,12 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     assert post["genesis_audit_history"][-1]["receipt"][
         "constitution_hash"
     ] == v1_hash
+    # The receipt this reanchor replaced is retained verbatim (#2963).
+    reanchor_history = post["agent_properties"]["constitution_reanchor_history"]
+    assert len(reanchor_history) == 1
+    assert reanchor_history[0]["receipt"] == prior_receipt
+    assert reanchor_history[0]["superseded_by_constitution_hash"] == v2_hash
+    assert reanchor_history[0]["provenance"] == "setup:constitution_reanchor"
 
     # 2. governed_by edge: now points at v2 only.
     assert v2_hash in post["governed_by_targets"]
@@ -514,7 +539,24 @@ async def test_doctor_edge_drift_repaired_by_same_hash_reanchor(
     # Recreate the legacy pre-atomic-reanchor state: repoint the edge at an
     # ancient anchor while property + blob stay current.
     ancient = hashlib.sha256(b"ancient governing text").hexdigest()
-    async with AsyncStorage(str(db_path)) as storage:
+    # Bound to the agent, because the agent is what wrote this edge in the
+    # incident being recreated. An *unbound* ``AsyncStorage`` lays the row down
+    # with no ``graph_edge_owners`` witness, and a bound reader — the runtime,
+    # its integrity audit, and now doctor — cannot see such a row at all. The
+    # unbound seed was staging a state no agent can actually reach, then
+    # asserting what doctor says about it.
+    #
+    # The ancient document node has to exist and be owned, too: a stale
+    # ``governed_by`` points at the constitution this agent *used* to be
+    # governed by, which it necessarily owned. A bound writer refuses an edge
+    # to an unowned endpoint, so seeding only the edge cannot happen either.
+    async with AsyncStorage(str(db_path), agent_id=agent_did) as storage:
+        await storage.graph.add_node(GraphNode(
+            node_id=ancient,
+            node_type="document",
+            label="KESTREL_CONSTITUTION",
+            properties={"hash": ancient, "type": "Constitution"},
+        ))
         await storage.graph.add_edge(agent_did, ancient, "governed_by")
         await storage.graph.delete_edge(agent_did, v1_hash, "governed_by")
 
@@ -650,19 +692,19 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
     )
 
     # Boom: make the last write inside the transaction raise.
-    # `_now_iso` is called three times in `_write_reanchor` — for the
-    # new document node, the signed artifact node, and finally the audit
-    # record's `timestamp` (right before the final agent-node update).
-    # Using a side_effect that succeeds twice and raises on the third
-    # targets the *last* mutation specifically — so all
-    # earlier writes have happened and rollback has real work to do.
+    # `_now_iso` is called twice in `_write_reanchor` — for the new document
+    # node, and finally the audit record's `timestamp` (right before the final
+    # agent-node update). The signed artifact node no longer stamps an
+    # `anchored_at`: that is a per-agent fact and the node is shared across a
+    # fleet (#2893). Succeeding once and raising on the second call targets the
+    # *last* mutation specifically, so every earlier write has happened and
+    # rollback has real work to do.
     real_now = __import__(
         "kestrel_sovereign.setup.constitution_reanchor",
         fromlist=["_now_iso"],
     )._now_iso
     boom = mock.Mock(
         side_effect=[
-            real_now(),
             real_now(),
             RuntimeError("simulated mid-write failure"),
         ]
@@ -694,79 +736,6 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
         "Mid-write failure must roll back the entire reanchor "
         f"transaction. Diff: pre={pre} vs post={post}"
     )
-
-
-@pytest.mark.asyncio
-async def test_artifact_ownership_check_failure_is_an_error_not_a_traceback(
-    tmp_path, monkeypatch
-):
-    """A dropped connection during the #2893 ownership check must surface as a
-    result error, not escape the helper as a traceback.
-
-    That check opens its *own* connection to the runtime database, after the
-    anchor read has already closed one. On a PostgreSQL host the two are
-    separate round trips, so the database can go away in between — which is
-    exactly the round-1 defect (an unreachable host escaping as a traceback),
-    on a path added after round 1 fixed it.
-
-    The setup is a real forced reanchor with a real signed artifact, so the
-    call is genuinely reached: the ``calls`` assertion is the anti-vacuity
-    check. An earlier attempt at this test used a stub artifact and passed for
-    the wrong reason — verification rejected it before the check ever ran.
-    """
-    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
-    constitution_path.write_bytes(CONSTITUTION_V1)
-    import kestrel_sovereign.config as ks_config
-
-    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
-    agent_dir = tmp_path / "agent_data" / "TestAgent"
-    creds = await create_kestrel_identity_async(
-        output_dir=str(agent_dir),
-        constitution_path=str(constitution_path),
-        agent_name="TestAgent",
-    )
-    db_path = agent_dir / "kestrel_prime.db"
-
-    constitution_path.write_bytes(CONSTITUTION_V2)
-    pre = await _snapshot(db_path, creds.agent_did)
-    artifact_path, trust_root_path = _write_authority_files(
-        tmp_path,
-        CONSTITUTION_V2,
-        did_document=_ROOT_DID_DOCUMENT,
-    )
-
-    calls: list[str] = []
-
-    async def _connection_dropped(target, artifact_hash):
-        calls.append(artifact_hash)
-        raise OSError("connection reset by peer")
-
-    monkeypatch.setattr(
-        "kestrel_sovereign.setup.constitution_reanchor._foreign_artifact_owner",
-        _connection_dropped,
-    )
-
-    result = await reanchor_constitution(
-        agent_name="TestAgent",
-        agent_dir=agent_dir,
-        canonical_path=constitution_path,
-        force=True,
-        amendment_artifact_path=artifact_path,
-        sovereign_trust_root_path=trust_root_path,
-    )
-
-    # Reached — verification passed and the check really ran, keyed on the
-    # hash of the artifact bytes rather than of the constitution.
-    assert calls == [hashlib.sha256(artifact_path.read_bytes()).hexdigest()]
-
-    assert result.error is not None
-    assert "connection reset by peer" in result.error
-    assert "Nothing was written." in result.error
-    assert result.reanchored is False
-
-    # And nothing was: the check runs *before* the write, so the claim the
-    # error makes about the database has to hold.
-    assert await _snapshot(db_path, creds.agent_did) == pre
 
 
 @pytest.mark.asyncio
@@ -1147,3 +1116,145 @@ async def test_runtime_unchanged_cleanup_preserves_document_node(
     # Edge convergence must not touch the genesis receipt.
     assert post["genesis_audit"] == pre["genesis_audit"]
     assert post["genesis_audit_history"] == pre["genesis_audit_history"]
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_leaves_the_database_untouched(tmp_path, monkeypatch):
+    """Without --force this command is documented as performing no write.
+
+    It opened read-write anyway, and SQLite serialises writers at the FILE
+    level: the per-connection write-unit lock cannot serialise a SECOND
+    connection to the same file. So a drift-only inspection could contend with
+    a running agent's database — which is how #2920 dropped a live agent into
+    Safe Mode while the caller saw nothing at all.
+
+    The assertion is the on-disk postcondition, not the arguments any one
+    opener was called with. An earlier version of this test recorded every
+    ``AsyncStorage`` construction and checked its backend flag; it passed while
+    the command still took a writable connection, because target resolution
+    opens the anchor through a direct ``sqlite3.connect`` that never goes
+    through ``AsyncStorage`` at all. Bytes and sidecars catch a write through
+    any door, including doors added later.
+    """
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+
+    # Drift: the canonical file moves, the anchor does not.
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    def _tree() -> dict[str, bytes]:
+        return {
+            entry.name: entry.read_bytes()
+            for entry in sorted(agent_dir.iterdir())
+            if entry.is_file()
+        }
+
+    before = _tree()
+    assert "kestrel_prime.db" in before, before.keys()
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+
+    assert result.drift_unforced, f"expected a drift report: {result}"
+
+    after = _tree()
+    appeared = sorted(set(after) - set(before))
+    assert not appeared, (
+        "a --force-less run created files beside the database it was only "
+        f"asked to read: {appeared}. A plain mode=ro connection to a WAL "
+        "database creates -wal/-shm sidecars and cannot remove them, and the "
+        "cold identity lookup reads those as a live agent."
+    )
+    changed = sorted(name for name, blob in after.items() if before.get(name) != blob)
+    assert not changed, f"a --force-less run rewrote {changed}"
+
+    # The sidecars are not merely untidy: their presence makes the cold
+    # identity lookup refuse this agent outright. Prove the inspection did not
+    # cost the agent that.
+    from kestrel_sovereign.identity.local_anchor import (
+        AgentDIDLookupMode,
+        read_anchor_agent_did,
+    )
+
+    assert await read_anchor_agent_did(
+        str(agent_dir), mode=AgentDIDLookupMode.COLD_READ_ONLY
+    )
+
+
+@pytest.mark.asyncio
+async def test_drift_inspection_opens_no_writable_connection(tmp_path, monkeypatch):
+    """A --force-less run must not take a write lock on the agent's database.
+
+    Separate from the on-disk test above because the disk cannot show this. A
+    ``mode=rw`` connection to a WAL database creates its sidecars and then, as
+    the last connection to close, checkpoints and REMOVES them — so the write
+    lock is taken and released leaving the directory byte-identical. The cost
+    of that lock lands on a *running* agent (SQLite serialises writers at the
+    file level), which is how #2920 dropped one into Safe Mode; a test that
+    inspects the aftermath of a stopped agent sees nothing at all.
+
+    So this records every connection opened to the anchor during the run and
+    asserts none of them asked for write access. It covers ``sqlite3.connect``
+    as well as ``aiosqlite.connect``: target resolution reaches the same file
+    through the former, without passing through ``AsyncStorage``, which is the
+    door the round-1 test could not see.
+    """
+    import sqlite3
+
+    import aiosqlite
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    opened: list[str] = []
+
+    def _recorder(real):
+        def _record(target, *args, **kwargs):
+            opened.append(str(target))
+            return real(target, *args, **kwargs)
+        return _record
+
+    # Patched on the modules themselves so the record covers the worker thread
+    # target resolution runs its lookup in.
+    monkeypatch.setattr(sqlite3, "connect", _recorder(sqlite3.connect))
+    monkeypatch.setattr(aiosqlite, "connect", _recorder(aiosqlite.connect))
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+    assert result.drift_unforced, f"expected a drift report: {result}"
+
+    anchor_opens = [t for t in opened if "kestrel_prime.db" in t]
+    assert anchor_opens, f"the inspection opened the anchor at all: {opened}"
+    writable = [t for t in anchor_opens if "mode=ro" not in t]
+    assert not writable, (
+        "a --force-less run opened a write-capable connection to the agent's "
+        f"database: {writable}. SQLite serialises writers at the file level, "
+        "so this contends with a running agent even though nothing is written."
+    )

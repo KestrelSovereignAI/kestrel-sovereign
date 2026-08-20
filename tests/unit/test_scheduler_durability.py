@@ -30,6 +30,10 @@ from kestrel_sovereign.features.scheduler.runner import (
     ScheduledTask,
     get_current_scheduler_execution,
 )
+from kestrel_sovereign.features.scheduler.status import (
+    RUNTIME_STATUS_RETENTION_SECONDS,
+    scheduler_status,
+)
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -235,7 +239,6 @@ async def test_file_sqlite_concurrent_builtin_seeders_insert_each_default_once(
         assert defaults == [
             ("backup_snapshot", 1, "scheduler:builtin:v1:backup_snapshot"),
             ("morning_signal", 1, "scheduler:builtin:v1:morning_signal"),
-            ("signal_dispatch", 1, "scheduler:builtin:v1:signal_dispatch"),
             ("trash_retention", 1, "scheduler:builtin:v1:trash_retention"),
             ("wait_reconcile", 1, "scheduler:builtin:v1:wait_reconcile"),
         ]
@@ -1004,7 +1007,6 @@ async def test_dynamic_registration_post_load_adopts_other_owner_builtins(
         ) == [
             ("backup_snapshot",),
             ("morning_signal",),
-            ("signal_dispatch",),
             ("trash_retention",),
             ("wait_reconcile",),
         ]
@@ -3712,6 +3714,135 @@ async def test_host_lifecycle_runner_claims_and_wakes_a_cold_agent(monkeypatch, 
         assert storage_instances[0].closed is False
     finally:
         await server._shutdown_host_scheduler(app)
+
+
+@pytest.mark.asyncio
+async def test_shared_host_runner_owners_do_not_collide_for_pid_one_replicas(
+    monkeypatch,
+    tmp_path,
+):
+    """Host restarts keep peer telemetry independent even when every PID is 1."""
+
+    database_path = tmp_path / "shared-host-runtime-status.db"
+
+    class HostStorage:
+        def __init__(self, *, backend, dsn):
+            assert backend == "postgres"
+            assert dsn == "postgresql://scheduler-test"
+            self.db = None
+
+        async def initialize(self):
+            self.db = await _database(database_path)
+
+        async def close(self):
+            if self.db is not None:
+                await self.db.close()
+                self.db = None
+
+    manager = SimpleNamespace(
+        local_agent_configs_by_did=AsyncMock(
+            return_value={"agent-1": ("Cold", object())}
+        ),
+        list_agents=lambda: {},
+    )
+    apps = [FastAPI(), FastAPI(), FastAPI()]
+    started_apps = []
+
+    async def wait_for_initial_tick(app):
+        while app.state.host_scheduler_runner._last_tick_completed_at is None:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
+    monkeypatch.setattr(server.os, "getpid", lambda: 1)
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.async_storage.AsyncStorage", HostStorage
+    )
+
+    try:
+        for app in apps[:2]:
+            await server._start_host_scheduler(app, manager, object())
+            started_apps.append(app)
+            await asyncio.wait_for(wait_for_initial_tick(app), timeout=2)
+
+        first = apps[0].state.host_scheduler_runner
+        peer = apps[1].state.host_scheduler_runner
+        assert first._owner_id != peer._owner_id
+        assert first._owner_id.startswith("scheduler:")
+        assert peer._owner_id.startswith("scheduler:")
+        assert "agent-1" not in first._owner_id
+        assert "agent-1" not in peer._owner_id
+
+        await first._publish_runtime_status("running")
+        await peer._publish_runtime_status("running")
+        shared_db = peer._db
+        assert await shared_db.fetchall(
+            "SELECT owner_id, worker_state FROM scheduler_runtime_status "
+            "WHERE agent_id = ? ORDER BY owner_id",
+            ("agent-1",),
+        ) == sorted(
+            [
+                (first._owner_id, "running"),
+                (peer._owner_id, "running"),
+            ]
+        )
+        aggregate = await scheduler_status(
+            shared_db,
+            agent_id="agent-1",
+            poll_interval=first._poll_interval,
+        )
+        assert aggregate["status"] == "pass"
+        assert aggregate["fresh_worker_count"] == 2
+        assert aggregate["running_worker_count"] == 2
+
+        stopped_owner = first._owner_id
+        await server._shutdown_host_scheduler(apps[0])
+        stopped_peer = await scheduler_status(
+            shared_db,
+            agent_id="agent-1",
+            poll_interval=peer._poll_interval,
+        )
+        assert stopped_peer["status"] == "pass"
+        assert stopped_peer["owner_id"] == peer._owner_id
+        assert stopped_peer["fresh_worker_count"] == 2
+        assert stopped_peer["running_worker_count"] == 1
+
+        await server._start_host_scheduler(apps[2], manager, object())
+        started_apps.append(apps[2])
+        await asyncio.wait_for(wait_for_initial_tick(apps[2]), timeout=2)
+        replacement = apps[2].state.host_scheduler_runner
+        assert replacement._owner_id not in {stopped_owner, peer._owner_id}
+        await replacement._publish_runtime_status("running")
+
+        restarted = await scheduler_status(
+            replacement._db,
+            agent_id="agent-1",
+            poll_interval=replacement._poll_interval,
+        )
+        assert restarted["status"] == "pass"
+        assert restarted["fresh_worker_count"] == 3
+        assert restarted["running_worker_count"] == 2
+
+        expired = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=RUNTIME_STATUS_RETENTION_SECONDS + 1)
+        ).isoformat()
+        await replacement._db.execute(
+            "UPDATE scheduler_runtime_status SET reported_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (expired, "agent-1", stopped_owner),
+        )
+        await replacement._publish_runtime_status("running")
+        assert await replacement._db.fetchall(
+            "SELECT owner_id FROM scheduler_runtime_status "
+            "WHERE agent_id = ? ORDER BY owner_id",
+            ("agent-1",),
+        ) == sorted(
+            [(peer._owner_id,), (replacement._owner_id,)]
+        )
+    finally:
+        for app in reversed(started_apps):
+            await server._shutdown_host_scheduler(app)
 
 
 @pytest.mark.asyncio

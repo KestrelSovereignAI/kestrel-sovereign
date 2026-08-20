@@ -41,6 +41,10 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
+from kestrel_sovereign.agent.turn_lifecycle import (
+    bind_turn_session,
+    capture_turn_session_binding,
+)
 from kestrel_sovereign.storage.privacy_wrapper import (
     bind_transition_lock_reentry,
 )
@@ -670,6 +674,14 @@ class OrchestratorEngineMixin:
         # when no lock is held (anthropic path runs the tool on the turn task, so
         # reentry is by task identity and needs no token).
         transition_reentry_token = self._capture_transition_reentry_token()
+        # Capture the authoritative lifecycle binding on the OWNING turn task.
+        # The codex app-server reader was spawned before this turn and therefore
+        # carries a frozen pre-turn ContextVar snapshot. Re-presenting this exact
+        # turn/session pair inside the callback lets lifecycle-only consumers
+        # such as ``request_restart`` preserve wake routing without trusting the
+        # transport parameter, logging context, or agent-global session. The
+        # binding is explicitly empty when this executor was built off-turn.
+        turn_session_binding = capture_turn_session_binding(self)
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -678,7 +690,8 @@ class OrchestratorEngineMixin:
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
             with bind_part_collector(turn_part_collector), \
-                    bind_transition_lock_reentry(transition_reentry_token):
+                    bind_transition_lock_reentry(transition_reentry_token), \
+                    bind_turn_session(turn_session_binding):
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,

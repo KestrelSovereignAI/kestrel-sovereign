@@ -8,6 +8,7 @@ import logging
 from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.storage.session_grouping import (
+    autonomous_wake_preview,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
 )
@@ -103,9 +104,16 @@ async def list_conversations(
             # plus its metadata dict; the UI layer decrypts + unwraps it here.
             preview_content = session.pop("preview_content", None)
             meta = session.pop("preview_metadata", None) or {}
+            wake_source = session.pop("preview_wake_source", None)
             session.setdefault("messages", [])
             if preview_content is None:
-                session["preview"] = ""
+                # A session whose only user rows were autonomous signal wakes
+                # has no human turn to preview. Name it for the work it ran
+                # instead of letting the card fall back to "New conversation"
+                # (#2947) — the agent-facing twin applies the same label.
+                session["preview"] = (
+                    autonomous_wake_preview(wake_source) if wake_source else ""
+                )
                 return
 
             is_encrypted = False
@@ -148,6 +156,7 @@ async def list_conversations(
                 if redact:
                     session.pop("preview_content", None)
                     session.pop("preview_metadata", None)
+                    session.pop("preview_wake_source", None)
                     session.setdefault("messages", [])
                     session["preview"] = ""
                     session["preview_encrypted"] = True

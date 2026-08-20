@@ -1,9 +1,15 @@
 """Focused lifecycle tests for the built-in compute executors."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import signal
+import subprocess
+import sys
+import venv
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -16,9 +22,10 @@ from kestrel_sovereign.features.compute.executors import (
     LocalExecutor,
     UvExecutor,
 )
-from kestrel_sovereign.features.compute.executors import base as executor_base
 from kestrel_sovereign.features.compute.executors import (
+    base as executor_base,
     docker_executor as docker_executor_module,
+    uv_executor as uv_executor_module,
 )
 from kestrel_sovereign.features.compute.models import ComputeScript, ExecutionRecord
 
@@ -201,6 +208,11 @@ def _make_executor(monkeypatch: pytest.MonkeyPatch, name: str, max_bytes: int = 
     if name == "uv":
         executor = UvExecutor(max_output_bytes=max_bytes)
         monkeypatch.setattr(executor, "_get_uv_path", lambda: "/fake/uv")
+        monkeypatch.setattr(
+            executor,
+            "_get_base_python_path",
+            lambda: "/fake/base/python",
+        )
         return executor
     if name == "docker":
         executor = DockerExecutor(max_output_bytes=max_bytes)
@@ -245,10 +257,388 @@ def _is_docker_command(command: tuple[object, ...], action: str) -> bool:
     return len(command) > 1 and command[1] == action
 
 
+def _write_test_wheel(
+    wheel_dir: Path,
+    distribution: str,
+    module: str,
+    value: str,
+) -> Path:
+    """Create a minimal local wheel without invoking a package index."""
+    wheel_dir.mkdir(parents=True, exist_ok=True)
+    normalized = distribution.replace("-", "_")
+    wheel_path = wheel_dir / f"{normalized}-1.0.0-py3-none-any.whl"
+    dist_info = f"{normalized}-1.0.0.dist-info"
+    with zipfile.ZipFile(wheel_path, "w") as wheel:
+        wheel.writestr(f"{module}.py", f"VALUE = {value!r}\n")
+        wheel.writestr(
+            f"{dist_info}/METADATA",
+            "Metadata-Version: 2.1\n"
+            f"Name: {distribution}\n"
+            "Version: 1.0.0\n",
+        )
+        wheel.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\n"
+            "Generator: kestrel-test\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n",
+        )
+        wheel.writestr(
+            f"{dist_info}/RECORD",
+            f"{module}.py,,\n"
+            f"{dist_info}/METADATA,,\n"
+            f"{dist_info}/WHEEL,,\n"
+            f"{dist_info}/RECORD,,\n",
+        )
+    return wheel_path
+
+
+def _tree_manifest(root: Path) -> list[tuple[str, str]]:
+    """Capture paths and content to detect writes to a synthetic host venv."""
+    manifest: list[tuple[str, str]] = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            manifest.append((relative, f"link:{os.readlink(path)}"))
+        elif path.is_file():
+            with path.open("rb") as file:
+                digest = hashlib.file_digest(file, "sha256").hexdigest()
+            manifest.append((relative, f"file:{digest}"))
+        else:
+            manifest.append((relative, "dir"))
+    return manifest
+
+
 def test_base_executor_preserves_no_argument_subclass_construction() -> None:
     executor = _CompatibilityExecutor()
 
     assert executor._max_output_bytes == 1024 * 1024
+
+
+def test_uv_base_python_prefers_canonical_base_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_prefix = tmp_path / "runtime venv"
+    base_prefix = tmp_path / "base install"
+    executable_name = "python.exe" if os.name == "nt" else "python3.14"
+    base_executable = tmp_path / "nonstandard bin" / executable_name
+    base_executable.parent.mkdir()
+    base_executable.write_text("")
+    base_executable.chmod(0o700)
+
+    monkeypatch.setattr(uv_executor_module.sys, "prefix", str(runtime_prefix))
+    monkeypatch.setattr(uv_executor_module.sys, "base_prefix", str(base_prefix))
+    monkeypatch.setattr(
+        uv_executor_module.sys,
+        "_base_executable",
+        str(base_executable),
+    )
+
+    assert UvExecutor._get_base_python_path() == str(base_executable.resolve())
+
+
+def test_uv_base_python_falls_back_to_versioned_posix_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX executable layout test")
+
+    runtime_prefix = tmp_path / "runtime venv"
+    base_prefix = tmp_path / "base install"
+    base_executable = (
+        base_prefix
+        / "bin"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    )
+    base_executable.parent.mkdir(parents=True)
+    base_executable.write_text("")
+    base_executable.chmod(0o700)
+
+    monkeypatch.setattr(uv_executor_module.sys, "prefix", str(runtime_prefix))
+    monkeypatch.setattr(uv_executor_module.sys, "base_prefix", str(base_prefix))
+    monkeypatch.delattr(uv_executor_module.sys, "_base_executable", raising=False)
+
+    assert UvExecutor._get_base_python_path() == str(base_executable.resolve())
+
+
+def test_uv_base_python_fails_closed_outside_supported_virtual_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(uv_executor_module.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(uv_executor_module.sys, "base_prefix", str(tmp_path))
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="requires Kestrel to run inside a Python venv or virtualenv",
+    ) as exc_info:
+        UvExecutor._get_base_python_path()
+
+    assert "Conda environment alone is not sufficient" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(monkeypatch, "uv", max_bytes=128)
+    created = _track_temp_dirs(monkeypatch, tmp_path)
+    process = _SuccessfulProcess(b"ok", b"")
+    command: tuple[object, ...] = ()
+    subprocess_options: dict[str, object] = {}
+
+    async def create_subprocess(*args: object, **kwargs: object):
+        nonlocal command
+        command = args
+        subprocess_options.update(kwargs)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/host/project/.venv")
+    monkeypatch.setenv("UV_INDEX_URL", "https://host-index.invalid/simple")
+    script = _script(
+        environment={
+            "PYTHONPATH": "/caller/ambient/site-packages",
+            "UV_OFFLINE": "1",
+        }
+    )
+    script.requirements = ["declared-one==1.0", "/path with spaces/two.whl"]
+
+    record = await executor.execute(script, working_dir=str(tmp_path / "nested cwd"))
+
+    script_path = str(created[0] / "script.py")
+    assert command == (
+        "/fake/uv",
+        "run",
+        "--isolated",
+        "--no-project",
+        "--python",
+        "/fake/base/python",
+        "--with",
+        "declared-one==1.0",
+        "--with",
+        "/path with spaces/two.whl",
+        script_path,
+    )
+    child_env = subprocess_options["env"]
+    assert isinstance(child_env, dict)
+    assert "PYTHONPATH" not in child_env
+    assert "UV_PROJECT_ENVIRONMENT" not in child_env
+    assert "UV_INDEX_URL" not in child_env
+    assert child_env["UV_OFFLINE"] == "1"
+    assert child_env["UV_CACHE_DIR"] == str(created[0] / ".uv-cache")
+    assert record.stdout == "ok"
+    assert record.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_uv_real_process_isolated_from_nested_host_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = UvExecutor(max_output_bytes=64 * 1024)
+    if not executor.is_available:
+        pytest.skip("uv executor requires uv and a virtualized Kestrel runtime")
+
+    workspace = tmp_path / "synthetic host workspace with spaces"
+    member = workspace / "host member project"
+    nested_working_dir = member / "nested working directory"
+    wheel_dir = workspace / "local wheel files"
+    nested_working_dir.mkdir(parents=True)
+    ambient_wheel = _write_test_wheel(
+        wheel_dir,
+        "ambient-dependency",
+        "ambient_dependency",
+        "host-project-only",
+    )
+    explicit_wheel = _write_test_wheel(
+        wheel_dir,
+        "explicit-dependency",
+        "explicit_dependency",
+        "declared-requirement",
+    )
+
+    (workspace / "pyproject.toml").write_text(
+        '[tool.uv.workspace]\nmembers = ["host member project"]\n'
+    )
+    member_pyproject = (
+        "[project]\n"
+        'name = "synthetic-host-member"\n'
+        'version = "1.0.0"\n'
+        f'dependencies = ["ambient-dependency @ {ambient_wheel.resolve().as_uri()}"]\n'
+        "\n[tool.uv]\n"
+        "package = false\n"
+    )
+    (member / "pyproject.toml").write_text(member_pyproject)
+
+    host_venv = workspace / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(host_venv)
+    host_python = host_venv / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    site_result = subprocess.run(
+        [
+            str(host_python),
+            "-c",
+            "import site; print(site.getsitepackages()[0])",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert site_result.returncode == 0, site_result.stderr
+    site_packages = Path(site_result.stdout.strip())
+    (site_packages / "ambient_dependency.py").write_text(
+        "VALUE = 'host-project-only'\n"
+    )
+    (site_packages / "base_only_dependency.py").write_text(
+        "VALUE = 'pinned-interpreter-only'\n"
+    )
+    assert subprocess.run(
+        [
+            str(host_python),
+            "-c",
+            "import ambient_dependency; print(ambient_dependency.VALUE)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "host-project-only"
+    assert subprocess.run(
+        [
+            str(host_python),
+            "-c",
+            "import base_only_dependency; print(base_only_dependency.VALUE)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "pinned-interpreter-only"
+
+    host_venv_before = _tree_manifest(host_venv)
+    workspace_pyproject_before = (workspace / "pyproject.toml").read_bytes()
+    member_pyproject_before = (member / "pyproject.toml").read_bytes()
+    execution_dir = workspace / "executor temporary directory with spaces"
+
+    def make_temp_dir(*, prefix: str) -> str:
+        assert prefix == "kestrel_compute_"
+        execution_dir.mkdir()
+        return str(execution_dir)
+
+    monkeypatch.setattr(executor_base.tempfile, "mkdtemp", make_temp_dir)
+    monkeypatch.setenv("VIRTUAL_ENV", str(host_venv))
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(host_venv))
+    monkeypatch.setenv("UV_INDEX_URL", "https://host-index.invalid/simple")
+    monkeypatch.setenv("PYTHONPATH", str(site_packages))
+    monkeypatch.setattr(
+        executor,
+        "_get_base_python_path",
+        lambda: str(host_python),
+    )
+
+    script = ComputeScript(
+        id="uv-real-isolation-test",
+        name="uv real isolation",
+        language="python",
+        content=(
+            "import json, sys\n"
+            "try:\n"
+            "    import ambient_dependency\n"
+            "except ImportError:\n"
+            "    ambient_visible = False\n"
+            "else:\n"
+            "    ambient_visible = ambient_dependency.VALUE\n"
+            "try:\n"
+            "    import base_only_dependency\n"
+            "except ImportError:\n"
+            "    base_visible = False\n"
+            "else:\n"
+            "    base_visible = base_only_dependency.VALUE\n"
+            "import explicit_dependency\n"
+            "print(json.dumps({\n"
+            "    'ambient_visible': ambient_visible,\n"
+            "    'base_visible': base_visible,\n"
+            "    'explicit_value': explicit_dependency.VALUE,\n"
+            "    'prefix': sys.prefix,\n"
+            "}))\n"
+        ),
+        purpose="prove the uv project and interpreter boundary",
+        requirements=[str(explicit_wheel)],
+        environment={"UV_OFFLINE": "1"},
+    )
+
+    record = await executor.execute(script, working_dir=str(nested_working_dir))
+
+    assert _tree_manifest(host_venv) == host_venv_before
+    assert (workspace / "pyproject.toml").read_bytes() == workspace_pyproject_before
+    assert (member / "pyproject.toml").read_bytes() == member_pyproject_before
+    assert not (workspace / "uv.lock").exists()
+    assert not execution_dir.exists()
+    if (
+        sys.platform == "darwin"
+        and record.exit_code == 101
+        and "system-configuration" in record.stderr
+        and "Attempted to create a NULL object" in record.stderr
+    ):
+        pytest.skip("uv cannot access the macOS Dynamic Store in this sandbox")
+    assert record.exit_code == 0, record.stderr
+    output = json.loads(record.stdout.strip())
+    assert output["ambient_visible"] is False
+    assert output["base_visible"] is False
+    assert output["explicit_value"] == "declared-requirement"
+    assert Path(output["prefix"]).resolve().is_relative_to(
+        (execution_dir / ".uv-cache").resolve()
+    )
+
+    no_requirements_script = ComputeScript(
+        id="uv-real-isolation-no-requirements-test",
+        name="uv real isolation without requirements",
+        language="python",
+        content=(
+            "import json, sys\n"
+            "visible = {}\n"
+            "for module in ('ambient_dependency', 'base_only_dependency'):\n"
+            "    try:\n"
+            "        __import__(module)\n"
+            "    except ImportError:\n"
+            "        visible[module] = False\n"
+            "    else:\n"
+            "        visible[module] = True\n"
+            "print(json.dumps({'visible': visible, 'prefix': sys.prefix}))\n"
+        ),
+        purpose="prove a dependency-free run still receives a fresh environment",
+        requirements=[],
+        environment={"UV_OFFLINE": "1"},
+    )
+
+    no_requirements_record = await executor.execute(
+        no_requirements_script,
+        working_dir=str(nested_working_dir),
+    )
+
+    assert _tree_manifest(host_venv) == host_venv_before
+    assert (workspace / "pyproject.toml").read_bytes() == workspace_pyproject_before
+    assert (member / "pyproject.toml").read_bytes() == member_pyproject_before
+    assert not (workspace / "uv.lock").exists()
+    assert not execution_dir.exists()
+    if (
+        sys.platform == "darwin"
+        and no_requirements_record.exit_code == 101
+        and "system-configuration" in no_requirements_record.stderr
+        and "Attempted to create a NULL object" in no_requirements_record.stderr
+    ):
+        pytest.skip("uv cannot access the macOS Dynamic Store in this sandbox")
+    assert no_requirements_record.exit_code == 0, no_requirements_record.stderr
+    no_requirements_output = json.loads(no_requirements_record.stdout.strip())
+    assert no_requirements_output["visible"] == {
+        "ambient_dependency": False,
+        "base_only_dependency": False,
+    }
+    assert Path(no_requirements_output["prefix"]).resolve().is_relative_to(
+        (execution_dir / ".uv-cache").resolve()
+    )
 
 
 @pytest.mark.asyncio

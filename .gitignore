@@ -2,17 +2,17 @@
 .ipfs/
 
 # Environment and secrets
-.env
-.env.*
-!.env.example
-!.env.test.example
-.secrets
-.secrets.*
-.secrets/
-secrets/
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.test.example
+**/.secrets
+**/.secrets.*
+**/.secrets/
+**/secrets/
 
 # Credentials
-credentials/
+**/credentials/
 *.json
 !package.json
 !package-lock.json
@@ -24,8 +24,8 @@ credentials/
 !kestrel_sovereign/data/semantic/profiles/*.json
 !kestrel_sovereign/data/semantic/rules/
 !kestrel_sovereign/data/semantic/rules/*.json
-*.pem
-*.key
+**/*.pem
+**/*.key
 
 # Python
 __pycache__/
@@ -95,7 +95,7 @@ config/
 agent_data/
 agent_data_test/
 agent_dbs/
-storage_cache/
+**/storage_cache/
 trained_loras/
 generated_images/
 logs/
@@ -114,7 +114,7 @@ feedback/
 *.pid
 *.log
 /phoenix/
-.kestrel/
+**/.kestrel/
 trusted_agents/
 
 # Build artifacts
@@ -216,3 +216,10 @@ tests/e2e/simpletuner/playwright.config.cjs
 serve_models.toml
 site/
 site.staging/
+
+# Database dumps — never commit or ship these; the repo root is a Docker build
+# context and several Dockerfiles COPY . .  A cluster dump carries conversation
+# data and role password hashes.
+**/*-dump.sql
+**/*.dump
+**/*.sql.gz

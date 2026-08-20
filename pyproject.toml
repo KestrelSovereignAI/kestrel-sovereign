@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.52.1"
+version = "0.53.2"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -224,7 +224,17 @@ dependencies = [
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
-    "pqcrypto>=0.4.0",
+    # Floor at 1.0: 0.x used ml_dsa_65.generate_keypair() and a verify()
+    # returning True/False, exposed SPHINCS+ rather than FIPS 205 SLH-DSA, and
+    # used encrypt/decrypt rather than encaps/decaps for ML-KEM. None of those
+    # are interchangeable — see crypto_suite.py, kem_suite.py and #2966 — so
+    # this must not be relaxed back across the 1.0 boundary.
+    #
+    # PLATFORM FLOOR: 1.0 ships Linux wheels as manylinux_2_34 ONLY, so this
+    # pin sets a glibc >= 2.34 requirement (Ubuntu 22.04+, Debian 12+, RHEL 9+).
+    # Below that, install builds from an sdist and needs a Rust toolchain.
+    # Documented in README Prerequisites; accepted deliberately (#2966).
+    "pqcrypto>=1.0,<2.0",
     "kestrel-llms[all]==0.1.8",
 ]
 

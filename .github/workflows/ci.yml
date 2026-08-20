@@ -444,7 +444,13 @@ jobs:
       && needs.lint-and-imports.outputs.run_expensive != 'false'
     services:
       postgres:
-        image: pgvector/pgvector:pg15
+        # PostgreSQL 16 is the floor, not a preference: the #2958
+        # conversation_history.session_id backfill guards its cast with
+        # `pg_input_is_valid(metadata,'jsonb')`, which is 16+. `IS JSON` is
+        # not a substitute — it returns true for a NUL escape and for a lone
+        # surrogate, both of which `::jsonb` then rejects, and a raise there
+        # aborts the migration and the boot.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: kestrel_user
           POSTGRES_PASSWORD: kestrel_password

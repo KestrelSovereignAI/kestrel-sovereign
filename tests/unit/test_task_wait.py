@@ -62,6 +62,13 @@ async def _register_task_provider(agent, *, status="completed"):
 
 
 class TestGenericWaitSleep:
+    def test_tool_help_is_provider_neutral(self):
+        feature = WaitFeature(_StubAgent())
+        wait_tool = next(tool for tool in feature.get_tools() if tool.name == "wait")
+
+        assert "talon" not in wait_tool.schema.description.lower()
+        assert "workflow:run_42" in WaitFeature.wait.__doc__
+
     @pytest.mark.asyncio
     async def test_zero_duration_returns_immediately(self):
         result = await _wait_feature().wait(duration_seconds=0, reason="probe")

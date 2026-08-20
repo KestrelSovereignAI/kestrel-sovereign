@@ -75,7 +75,7 @@ The existing `emit_event` / `add_event_listener` ([agent/event_manager.py:15-33]
 
 | Mode | Definition | LLM involvement | Enters conversation history | Implementation contract | Examples |
 |---|---|---|---|---|---|
-| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `signal_dispatch` |
+| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `wait_reconcile` |
 | **ARTIFACT** | Produces an artifact (text, JSON, etc.); does not enter a turn. May internally fetch data, mutate feature state, make one or more LLM calls. | Maybe (handler decides) | No | `artifact_handler(signal) -> ArtifactResult` | `morning_signal`, `reflect`, `memory_consolidate` |
 | **COGNITION** | Full agent turn — enters conversation history, may invoke tools, may emit further signals | Yes | Yes | Renders `prompt_template` → `process_input` (or streaming variant) | Heartbeat tick, A2A task-complete, webhook-driven decisions |
 
@@ -96,7 +96,6 @@ async def template_artifact_handler(template_path: Path) -> ArtifactHandler:
 | Heartbeat tick | COGNITION | Already a turn |
 | Cron `morning_signal` | ARTIFACT | Feature workflow; returns briefing text |
 | Cron `reflect` | ARTIFACT | LLM-authored, no follow-up cognition |
-| Cron `signal_dispatch` | ACTION | Existing side-effect tool |
 | Cron `trash_retention` | ACTION | Pure ops |
 | Cron `backup_snapshot` | ACTION | Pure ops |
 | Cron `memory_consolidate` | ARTIFACT (likely) | Feature owner confirms during migration |
@@ -265,6 +264,26 @@ if delivery is not None:
             lease_token=delivery.lease_token,
         )
 ```
+
+When the owning workflow wait reaches a terminal outcome, it must use the
+dispatcher lifecycle boundary rather than reaching into the durable store:
+
+```python
+found = await dispatcher.deactivate_durable_consumer(
+    consumer_id="workflows:wait:run-42"
+)
+```
+
+This agent-scoped call returns `False` only for an unknown consumer; repeating
+it for an existing inactive consumer returns `True`. It atomically marks the
+registration inactive and converts pending, retrying, initially reserved, and
+leased deliveries to retained terminal `failed` evidence. The transition
+serializes with event persistence on the registration's `(agent_id, source)`
+handoff: events committed first leave terminalized evidence, while events
+committed after deactivation create no delivery. Stale ACK/NACK/release or
+initial-reservation capabilities cannot recreate work. Re-registration cannot
+change an inactive consumer back to active; a new workflow wait needs a new
+consumer ID.
 
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by

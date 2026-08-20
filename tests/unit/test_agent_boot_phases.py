@@ -17,6 +17,7 @@ uses) and assert the #2522 boot-state-machine contract end to end:
 
 import asyncio
 import contextlib
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -71,10 +72,13 @@ def _boot_mocks():
     """Patch the heavy boot collaborators; yield handles for leak assertions.
 
     Mirrors the doubles the existing ``TestInitialize`` tests rely on: real
-    ``initialize()`` runs, but storage / memory / task-manager are mocks so
-    the whole sequence completes without a live DB or LLM. ``close`` /
+    ``initialize()`` runs, but storage / memory / task-manager are mocks and
+    ambient remote-service configuration is cleared so the boot phases neither
+    cold-restore from remote storage nor mint live provider credentials.
+    ``close`` /
     ``shutdown`` are ``AsyncMock``s so a rollback's teardown calls are
-    observable.
+    observable. Constructor-time LLM disk-cache isolation lives in
+    ``_make_agent`` because construction precedes this context manager.
     """
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.kestrel_agent.discover_features", return_value=[]
@@ -82,7 +86,15 @@ def _boot_mocks():
         "kestrel_sovereign.kestrel_agent.MemorySystem"
     ) as MockMemorySystem, patch(
         "kestrel_sovereign.kestrel_agent.TaskManager"
-    ) as MockTaskManager:
+    ) as MockTaskManager, patch.dict(
+        os.environ,
+        {
+            "GCS_BACKUP_BUCKET": "",
+            "LIGHTHOUSE_API_KEY": "",
+            "OPENROUTER_MANAGEMENT_API_KEY": "",
+            "SOVEREIGN_IPFS_URL": "",
+        },
+    ):
         storage = AsyncMock()
         storage.initialize = AsyncMock()
         storage.get_node = AsyncMock(return_value=None)
@@ -130,9 +142,76 @@ async def _cleanup(agent: KestrelAgent) -> None:
 
 
 def _make_agent(tmp_path) -> KestrelAgent:
-    # No llm_service → the default LLMService is created, which passes the
-    # phase-6 provider-reachability check (same as the existing init tests).
-    return KestrelAgent(did="did:test:boot", storage_path=str(tmp_path / "boot.db"))
+    # Keep the real default LLMService used by the phase-6 readiness check, but
+    # prevent its constructor (which runs before _boot_mocks) from reading the
+    # operator's process-wide on-disk model catalog. Model discovery itself is
+    # lazy and is not called by these boot phases.
+    with patch(
+        "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
+        return_value=False,
+    ) as load_disk_cache:
+        agent = KestrelAgent(
+            did="did:test:boot",
+            storage_path=str(tmp_path / "boot.db"),
+            db_backend="sqlite",
+            sync_enabled=True,
+        )
+    load_disk_cache.assert_called_once_with()
+    return agent
+
+
+async def _wait_for_boot_phase_start(
+    agent: KestrelAgent,
+    boot_task: asyncio.Task,
+    started: asyncio.Event,
+    phase_name: str,
+    *,
+    guard_seconds: float = 10.0,
+) -> None:
+    """Wait for an instrumented phase with actionable deadlock diagnostics.
+
+    The timeout is a deadlock guard over locally mocked boot work, not a
+    performance budget over network I/O. If the phase is not reached, report
+    the boot state and committed phase journal and cancel the boot task before
+    failing so the test cannot leak an in-progress initializer.
+    """
+    started_task = asyncio.create_task(started.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {started_task, boot_task},
+            timeout=guard_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if started_task in done:
+            return
+
+        ctx = agent._boot_context
+        state = agent._boot_state.value
+        committed = list(ctx.committed_phases) if ctx is not None else []
+        if boot_task in done:
+            if boot_task.cancelled():
+                outcome = "was cancelled"
+            else:
+                error = boot_task.exception()
+                outcome = f"raised {error!r}" if error is not None else "completed"
+            pytest.fail(
+                f"boot {outcome} before entering phase {phase_name!r}; "
+                f"state={state}, committed={committed}"
+            )
+
+        boot_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await boot_task
+        pytest.fail(
+            f"boot did not enter phase {phase_name!r} within the "
+            f"{guard_seconds:g}s deadlock guard; "
+            f"state={state}, committed={committed}"
+        )
+    finally:
+        if not started_task.done():
+            started_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await started_task
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +240,11 @@ async def test_clean_boot_reaches_ready(tmp_path):
         with _boot_mocks():
             await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+        from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+        # The Workflows built-in is registrable without Talon or any other
+        # domain feature: core hosts its six provider-neutral source contracts.
+        assert all(name in agent.signal_registry for name in SOURCE_NAMES)
     finally:
         await _cleanup(agent)
 
@@ -730,8 +814,15 @@ async def test_feature_source_unregistered_when_its_own_init_fails_after_registe
 
 @pytest.mark.asyncio
 async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
+    """Cancellation rolls back local resources, including an active sync worker."""
     agent = _make_agent(tmp_path)
     started = asyncio.Event()
+    sync_service = MagicMock()
+    sync_service.has_work = True
+    sync_service.is_running = True
+    sync_service.add_remote_target = MagicMock(return_value=True)
+    sync_service.start = AsyncMock()
+    sync_service.stop = AsyncMock()
 
     async def hang(ctx: BootContext) -> None:
         started.set()
@@ -739,12 +830,24 @@ async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
 
     try:
         with _boot_mocks() as mocks:
-            # Hang in the final phase, AFTER storage/a2a/memory committed.
-            with patch.object(
+            # Exercise sync rollback without constructing a real GCS client or
+            # allowing cleanup to upload a snapshot. _boot_mocks deliberately
+            # blanks every ambient remote target for all other boot tests.
+            with patch.dict(
+                os.environ, {"GCS_BACKUP_BUCKET": "unit-test-bucket"}
+            ), patch(
+                "kestrel_sovereign.storage.sync.service.SyncService",
+                return_value=sync_service,
+            ), patch.object(
                 agent, "_boot_phase_periodic_services_readiness", hang
             ):
-                task = asyncio.ensure_future(agent.initialize())
-                await asyncio.wait_for(started.wait(), timeout=3.0)
+                # Hang in the final phase, AFTER storage/a2a/sync/memory
+                # committed. The guard below observes that named phase and
+                # reports the phase journal if deterministic boot work wedges.
+                task = asyncio.create_task(agent.initialize())
+                await _wait_for_boot_phase_start(
+                    agent, task, started, "periodic_services_readiness"
+                )
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -754,8 +857,12 @@ async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
             mocks.storage.close.assert_awaited()
             mocks.task_manager.close.assert_awaited()
             mocks.memory.shutdown.assert_awaited()
+            sync_service.add_remote_target.assert_called_once()
+            sync_service.start.assert_awaited_once()
+            sync_service.stop.assert_awaited_once()
             assert agent._raw_storage is None
             assert agent.task_manager is None
+            assert agent._sync_service is None
 
             # Retry refused after a cancelled/partial boot.
             with pytest.raises(AgentBootError):
@@ -781,8 +888,10 @@ async def test_concurrent_initialize_is_refused(tmp_path):
     first = None
     try:
         with patch.object(agent, "_boot_phase_storage_privacy", hang_storage):
-            first = asyncio.ensure_future(agent.initialize())
-            await asyncio.wait_for(entered.wait(), timeout=3.0)
+            first = asyncio.create_task(agent.initialize())
+            await _wait_for_boot_phase_start(
+                agent, first, entered, "storage_privacy"
+            )
             assert agent._boot_state is BootPhaseState.IN_PROGRESS
             # A second concurrent call while the first is IN_PROGRESS is refused.
             with pytest.raises(AgentBootError, match="already in progress"):

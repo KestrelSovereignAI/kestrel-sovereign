@@ -68,7 +68,6 @@ SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
     "observability fleet": ">=0.36.0,<0.37",
 }
 
-
 def _pyproject() -> dict:
     with open(REPO_ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)
@@ -206,6 +205,26 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
     assert any(package["name"] == "tzdata" for package in _lock()["package"])
 
 
+def test_asyncpg_runtime_probe_supports_current_minor_releases():
+    """Doctor uses asyncpg's public connection path, not a pinned parser shape."""
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "asyncpg"
+    ]
+    assert len(direct) == 1
+    assert Version("0.30") in direct[0].specifier
+    assert Version("0.31") in direct[0].specifier
+
+    root = _locked_root_package(_lock())
+    locked_metadata = [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "asyncpg"
+    ]
+    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
+
+
 def _sdk_contract_requirement(raw_requirements, *, extras):
     requirements = [
         Requirement(raw)
@@ -277,6 +296,5 @@ def test_sdk_036_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.36.0") <= version < Version("0.37.0")
-        for version in sdk_versions
+        Version("0.36.0") <= version < Version("0.37.0") for version in sdk_versions
     )

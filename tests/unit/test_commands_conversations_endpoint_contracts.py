@@ -154,6 +154,70 @@ def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
         _restore_app(app, original)
 
 
+def _wake_meta(session_id, source="talon.job_complete"):
+    return json.dumps({
+        "session_id": session_id,
+        "signal_wake": {"source": source, "mode": "cognition"},
+    })
+
+
+def test_conversations_endpoint_skips_signal_wake_for_card_preview():
+    """#2947: a COGNITION signal wake persists as role="user" so it replays in
+    history, but it must not become the conversation card's title — the first
+    real user turn does."""
+    now = datetime(2026, 8, 10, 21, 0, 0)
+    rows = [
+        (3, "assistant", "sunny", json.dumps({"session_id": "s1"}), now + timedelta(minutes=2)),
+        (2, "user", "what's the weather", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
+        (1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert len(sessions) == 1
+        assert sessions[0]["preview"] == "what's the weather"
+    finally:
+        _restore_app(app, original)
+
+
+def test_conversations_endpoint_labels_a_wake_only_session_autonomous():
+    """#2947: unattended dispatch and heartbeat-born sessions have a wake as
+    their only user row. Skipping it must not leave an empty preview — the UI
+    would render that as 'New conversation', a lie about a session that ran
+    autonomous work."""
+    now = datetime(2026, 8, 10, 21, 20, 0)
+    rows = [
+        (2, "assistant", "reviewed the PR", json.dumps({"session_id": "s1"}), now + timedelta(minutes=1)),
+        (1, "user", "[TALON_JOB_COMPLETE] Background Talon job ...", _wake_meta("s1"), now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert len(sessions) == 1
+        assert sessions[0]["preview"] == "Autonomous wake — talon.job_complete"
+        # Raw picker fields are consumed by the decorator, never serialized.
+        assert "preview_wake_source" not in sessions[0]
+        assert "preview_content" not in sessions[0]
+    finally:
+        _restore_app(app, original)
+
+
 def test_conversations_endpoint_exposes_marker_uuid_as_session_id():
     """#2012: the list identifier must be the session's canonical UUID
     (metadata.session_id on the new_session marker), NOT the message

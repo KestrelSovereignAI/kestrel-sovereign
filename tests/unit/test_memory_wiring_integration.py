@@ -19,6 +19,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,6 +39,11 @@ class TestMemoryConsolidateEndToEnd:
         # Build a feature with a mocked agent that has a working memory_system
         feature = MemoryFeature.__new__(MemoryFeature)
         feature.agent = MagicMock()
+        feature.agent.agent_name = "scheduled-test"
+        from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+        feature.agent.dispatcher = SimpleNamespace(
+            lock_manager=OrderedLockManager()
+        )
         feature.disabled_skills = set()  # required by Feature.get_tools()
         feature.agent.memory_system = MagicMock()
         # The tool now goes through MemorySystem.consolidate() facade

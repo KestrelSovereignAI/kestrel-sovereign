@@ -215,15 +215,15 @@ graph LR
 ```mermaid
 graph TD
     subgraph executors["Available Executors"]
-        UV["🐍 UvExecutor<br/>Python with uv run --isolated"]
+        UV["🐍 UvExecutor<br/>uv run --isolated --no-project"]
         DOCKER["🐳 DockerExecutor<br/>Full container sandbox"]
         LOCAL["⚠️ LocalExecutor<br/>Development only"]
     end
 
     subgraph uv["UvExecutor Features"]
-        UV1["Isolated virtual env"]
-        UV2["Pip packages allowed"]
-        UV3["No system access"]
+        UV1["No project/workspace discovery"]
+        UV2["Only declared --with packages"]
+        UV3["Pinned base interpreter"]
     end
 
     subgraph docker["DockerExecutor Features"]

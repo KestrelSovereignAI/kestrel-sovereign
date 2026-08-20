@@ -870,6 +870,9 @@ class SleepMixin:
         """
         import time
         from kestrel_sovereign.filecoin_adapter import StorageTier
+        from kestrel_sovereign.storage.memory_system import (
+            MemoryConsolidationTimeoutError,
+        )
 
         report = SleepReport(success=False)
         reflection_start = time.time()
@@ -940,10 +943,32 @@ class SleepMixin:
                     # zero-valued counters masquerade as a completed sleep
                     # cycle, and do not surface provider or memory content in
                     # this operator-facing report.
-                    report.error = unavailability_reason
+                    if report.error:
+                        report.error += f"; {unavailability_reason}"
+                    else:
+                        report.error = unavailability_reason
+            except MemoryConsolidationTimeoutError:
+                logger.error("Consolidation timed out", exc_info=True)
+                if report.error:
+                    report.error += "; consolidation_failed"
+                else:
+                    report.error = "consolidation_failed"
+                report.consolidation_ms = int((time.time() - start) * 1000)
+                report.reflection_ms = (
+                    int((time.time() - reflection_start) * 1000)
+                    - report.consolidation_ms
+                )
+                # A cancelled aiosqlite statement can still be draining in its
+                # worker thread. Every later database access is fenced behind
+                # that cleanup, so continuing into hooks or export would put
+                # the dispatcher-owned MEMORY lock back on an unbounded wait.
+                return report
             except Exception:
-                logger.error("Consolidation failed")
-                report.error = "consolidation_failed"
+                logger.error("Consolidation failed", exc_info=True)
+                if report.error:
+                    report.error += "; consolidation_failed"
+                else:
+                    report.error = "consolidation_failed"
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)
 

@@ -699,9 +699,8 @@ def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
     for selection in discover_feature_selections().values():
         feature_class = selection.feature_class
         # Bundled discovery may intentionally happen through a public
-        # re-export module (for example ``features.talon`` re-exports the
-        # class implemented by ``features.talon.coordinator``).  That public
-        # module owns the historic shorthand.  External entry points cannot
+        # re-export module whose class is implemented by a nested module. That
+        # public module owns the historic shorthand. External entry points cannot
         # trust their entry-point name/value as an alias, so they continue to
         # derive aliases from the loaded implementation module.
         alias_module = (

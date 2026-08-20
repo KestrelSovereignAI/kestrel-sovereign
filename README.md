@@ -21,9 +21,9 @@ Package ownership has four distinct runtime forms:
 | Boundary | Ownership and install behavior |
 |---|---|
 | **Bundled Feature** | A Feature lifecycle class discovered from `kestrel_sovereign/features/`; it ships in `kestrel-sovereign` and needs no separate install. |
-| **Extracted Feature package** | A separate distribution, such as voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
+| **Extracted Feature package** | A separate distribution, such as Talon, voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
 | **Provider package** | A separate backend distribution, such as RunPod, Vast.ai, GCP Compute, a voice cloud backend, or a storage backend, that implements a provider contract through a provider-specific entry point. It is not a Feature lifecycle package. |
-| **Standalone tool** | An independent control surface. `kestrel-talon`, for example, is installed separately; the bundled `TalonCoordinatorFeature` is only its in-agent coordinator. |
+| **Standalone tool** | An independent control surface. `kestrel-talon` is the standalone coding engine and is modeled separately from its independently installed `kestrel-feature-talon` coordinator. |
 
 The base install also contains runtime components that are not Feature
 lifecycle classes—for example, `PrivacyAgent`. The registry calls these
@@ -38,6 +38,11 @@ canonical ownership contract and live in-tree inventory are in
 - Python 3.11-3.14
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
+- **Linux: glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+, RHEL 9+). The
+  post-quantum signing dependency publishes `manylinux_2_34` wheels only, so on
+  an older glibc — Ubuntu 20.04, Debian 11, RHEL 8 — installation falls back to
+  building it from source and requires a Rust toolchain. macOS and Windows are
+  unaffected.
 
 ### Install uv
 
@@ -157,7 +162,7 @@ The Quick Start above clones the repo so you have demos, examples, and the `kest
 ```bash
 # 1. Install the CLI (uv tool install is preferred — `kestrel`
 #    lands on PATH in an isolated venv. Plain `pip install
-#    kestrel-sovereign` works too, into whichever venv is active.)
+#    kestrel-sovereign` works too, inside an activated venv.)
 uv tool install kestrel-sovereign
 
 # 2. Pick where Kestrel keeps your data. Either set KESTREL_HOME
@@ -170,6 +175,17 @@ export KESTREL_HOME="$HOME/kestrel-data"
 kestrel setup --quickstart
 kestrel start
 ```
+
+The default uv compute executor requires the Kestrel process itself to run
+inside a Python `venv` or `virtualenv`. This lets it pin an interpreter outside
+Kestrel's runtime while `uv run --isolated --no-project` creates a fresh,
+project-free script environment, so scripts cannot inherit Kestrel's installed
+packages. `uv tool install` and the source checkout's `uv sync` satisfy this
+automatically. For a plain pip installation, create and activate a Python
+virtual environment first. A system or `--user` install can run Kestrel, but
+the uv compute executor deliberately reports unavailable. A Conda environment
+alone is also insufficient because it does not provide the distinct
+`sys.prefix`/`sys.base_prefix` boundary this executor validates.
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 

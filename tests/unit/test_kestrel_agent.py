@@ -2877,6 +2877,29 @@ class TestLifecycle:
         # Total internal budget never exceeds the outer deadline.
         assert prefix + reserve <= float(SHUTDOWN_TIMEOUT) + 1e-9
 
+    def test_sqlite_close_reservation_preserves_prefix_budget_split(self):
+        """One shared SQLite close window must not silently squeeze prefix work."""
+        from kestrel_sovereign import kestrel_agent as ka
+        from kestrel_sovereign.storage.db import sqlite as sqlite_backend
+
+        backend = sqlite_backend.SQLiteBackend(":memory:")
+        with patch.object(
+            sqlite_backend, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 1.0
+        ), patch.object(
+            ka, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 5.0
+        ), patch.object(
+            ka, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 1.0
+        ), patch.object(
+            ka, "KESTREL_SHUTDOWN_TAIL_MIN_STEP_S", 0.5
+        ):
+            storage_close = backend.minimum_close_timeout_s
+            prefix, reserve = ka._resolve_shutdown_budget(
+                storage_close + ka.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S
+            )
+
+        assert storage_close == pytest.approx(1.01)
+        assert (prefix, reserve) == pytest.approx((3.49, 1.51))
+
 
 # =============================================================================
 # Tests for Error Handling

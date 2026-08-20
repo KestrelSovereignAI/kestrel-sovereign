@@ -26,7 +26,7 @@ Closes #1582. Reference for operators and future agents on the three independent
 | Path | Triggered by | Auto-mode covers? | Audit surface |
 |---|---|---|---|
 | **1. Codex-native sandbox shell** | LLM uses codex's built-in `shell` tool | **Yes** (since #1575 / PR #1583) | `codex_decline_events` (since #1581 / PR #1588), `security_audit_log` via the bridge's queue |
-| **2. Kestrel internal `computer_use` gate** | A direct `cu.shell()` method call from inside a feature (e.g., `talon_file_and_claim`) | Yes — by **both** the global auto-mode short-circuit AND the scoped `[[security.auto_approve.shell]]` allowlist (see flow below) | `auto_approve_audit` (scoped path) + `security_audit_log` (auto-mode path) |
+| **2. Kestrel internal `computer_use` gate** | A direct `cu.shell()` method call from inside a feature | Yes — by **both** the global auto-mode short-circuit AND the scoped `[[security.auto_approve.shell]]` allowlist (see flow below) | `auto_approve_audit` (scoped path) + `security_audit_log` (auto-mode path) |
 | **3. Kestrel LLM tool call (`ComputerUseFeature.shell`)** | LLM advertises and calls the `ComputerUseFeature.shell` tool | Yes — `PermissionLevel.AUTO` via auto-mode | `SecurityHook` PRE_TOOL_USE → `security_audit_log` |
 
 If a tool call doesn't go through one of these three, no kestrel-side audit will surface it. There is no fourth path today.
@@ -73,7 +73,8 @@ When an audit agent is attached, the `mcpServer/elicitation/request` decline IS 
 
 ## Path 2: Kestrel internal `computer_use` gate
 
-**Entry point:** a feature calls `cu.shell(...)` directly as a Python method (NOT as an LLM tool). The chief example is `talon_file_and_claim` ([`kestrel_sovereign/features/talon/coordinator.py`](../../kestrel_sovereign/features/talon/coordinator.py)) for `gh issue create`.
+**Entry point:** a feature calls `cu.shell(...)` directly as a Python method
+(NOT as an LLM tool), for example to run a policy-scoped project command.
 
 **Flow:**
 

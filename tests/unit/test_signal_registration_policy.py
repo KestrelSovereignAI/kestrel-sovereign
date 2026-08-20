@@ -17,7 +17,6 @@ the issue asks for.
 """
 
 import logging
-from types import SimpleNamespace
 
 import pytest
 
@@ -35,20 +34,11 @@ from kestrel_sovereign.signals import (
     RegistrationState,
     SourceRegistry,
 )
-from kestrel_sovereign.signals.sources.fleet_coding_pipeline import (
-    FLEET_CODING_APPROVAL,
-    register_fleet_coding_pipeline_sources,
-)
-from kestrel_sovereign.signals.sources.talon_pipeline import (
-    SOURCE_NAME as TALON_PIPELINE_SOURCE,
-    register_talon_pipeline_source,
-)
 from kestrel_sovereign.signals.sources.workflow_rescue import (
     FLEET_STALLED_SWEEP,
     SOURCE_NAMES as RESCUE_SOURCE_NAMES,
     register_workflow_rescue_sources,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -402,54 +392,24 @@ def test_registration_outcome_ok_property():
 
 
 # ---------------------------------------------------------------------------
-# The feature-family helpers now register under the explicit OPTIONAL policy
-# (#2522). These pin the defect fix at the call sites the issue named: a
-# same-name source with a DIFFERENT contract is *reported*, not silently
-# skipped-and-equated as the old precheck-by-name loops did — while an
-# equivalent re-registration stays a benign no-op and nothing ever raises.
+# The provider-neutral helper remains tolerant for embedders that register
+# richer source implementations before core.  Core boot itself registers the
+# default batch as MANDATORY and therefore fails atomically on a mismatch.
 # ---------------------------------------------------------------------------
 
 
 def test_workflow_rescue_helper_reports_mismatch_not_silent_skip(caplog):
     reg = SourceRegistry()
-    # A host pre-registered fleet_stalled_sweep with a DIFFERENT contract.
     reg.register(_action_reg(FLEET_STALLED_SWEEP, trust=Trust.UNTRUSTED))
     with caplog.at_level(logging.ERROR):
         newly = register_workflow_rescue_sources(reg)
-    # The mismatch is NOT silently equated: excluded from the newly-registered
-    # set, the host's version KEPT, and the clash reported. The other sources
-    # still register (one bad source does not abort the rest).
     assert FLEET_STALLED_SWEEP not in newly
     assert set(newly) == set(RESCUE_SOURCE_NAMES) - {FLEET_STALLED_SWEEP}
     assert reg.get(FLEET_STALLED_SWEEP).trust is Trust.UNTRUSTED
     assert "DIFFERENT contract" in caplog.text
 
 
-def test_fleet_coding_helper_reports_mismatch_not_silent_skip(caplog):
+def test_workflow_rescue_helper_is_idempotent_when_equivalent():
     reg = SourceRegistry()
-    reg.register(_action_reg(FLEET_CODING_APPROVAL, trust=Trust.UNTRUSTED))
-    with caplog.at_level(logging.ERROR):
-        newly = register_fleet_coding_pipeline_sources(reg)
-    assert FLEET_CODING_APPROVAL not in newly
-    assert reg.get(FLEET_CODING_APPROVAL).trust is Trust.UNTRUSTED
-    assert "DIFFERENT contract" in caplog.text
-
-
-def test_talon_pipeline_helper_reports_mismatch_not_silent_skip(caplog):
-    reg = SourceRegistry()
-    reg.register(_action_reg(TALON_PIPELINE_SOURCE, trust=Trust.UNTRUSTED))
-    with caplog.at_level(logging.ERROR):
-        result = register_talon_pipeline_source(reg, SimpleNamespace())
-    # A non-equivalent existing source: not newly registered, host version kept,
-    # the clash reported — never raised.
-    assert result is False
-    assert reg.get(TALON_PIPELINE_SOURCE).trust is Trust.UNTRUSTED
-    assert "DIFFERENT contract" in caplog.text
-
-
-def test_feature_helpers_are_idempotent_when_equivalent():
-    reg = SourceRegistry()
-    # First registration lands the whole rescue set.
     assert set(register_workflow_rescue_sources(reg)) == set(RESCUE_SOURCE_NAMES)
-    # A second, contract-equivalent call registers nothing new and never raises.
     assert register_workflow_rescue_sources(reg) == []

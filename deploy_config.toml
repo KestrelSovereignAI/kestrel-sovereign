@@ -88,12 +88,13 @@ GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 #
 # What does NOT survive is scheduled work. ``SchedulerFeature`` polls
 # in-process, so while no container exists nothing fires. This deployment seeds
-# seven builtin schedules — ``wait_reconcile`` (every minute),
+# six builtin schedules — ``wait_reconcile`` (every minute),
 # ``backup_snapshot`` (4h), ``trash_retention`` (6h), ``sleep``,
-# ``morning_signal``, ``signal_dispatch`` — whose ``next_run_at`` values pass
-# unhonoured while the service is idle. That is an accepted tradeoff for a
-# demo/testing deployment with no users; it is NOT evidence that scaling to
-# zero is free of consequences.
+# ``morning_signal``, and ``restart_coordinator`` — whose ``next_run_at`` values
+# pass unhonoured while the service is idle. ``signal_dispatch`` remains
+# user-schedulable but is not a core auto-seed. That is an accepted tradeoff
+# for a demo/testing deployment with no users; it is NOT evidence that scaling
+# to zero is free of consequences.
 #
 # An external wake ping does not rescue it: honouring a ``* * * * *`` schedule
 # needs a ping every minute, which keeps the container permanently warm and

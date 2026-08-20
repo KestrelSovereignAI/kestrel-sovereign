@@ -215,12 +215,12 @@ class TestAllowlistDerivation:
         github = _make_feature(
             "github", [_make_tool("get_github_issue"), _make_tool("create_github_issue")]
         )
-        talon = _make_feature(
-            "talon_coordinator_feature", [_make_tool("talon_status")]
+        external = _make_feature(
+            "external_observer", [_make_tool("external_job_status")]
         )
-        agent.features = {"GitHubFeature": github, "TalonCoordinatorFeature": talon}
+        agent.features = {"GitHubFeature": github, "ExternalObserverFeature": external}
         agent._register_explored_feature_tools(github)
-        agent._tool_context_hidden_features = {"talon_coordinator_feature"}
+        agent._tool_context_hidden_features = {"external_observer"}
 
         expected = set(agent._direct_tools)
         for feature in agent.features.values():

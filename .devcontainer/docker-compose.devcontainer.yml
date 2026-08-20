@@ -34,9 +34,12 @@ services:
     command: sleep infinity
     user: vscode
 
-  # PostgreSQL with pgvector
+  # PostgreSQL with pgvector. 16 is the floor: the #2958 session_id backfill
+  # needs `pg_input_is_valid(metadata,'jsonb')` (16+) to skip metadata it
+  # cannot cast, rather than raising on it mid-migration. Keep this in step
+  # with .github/workflows/ci.yml.
   postgres:
-    image: pgvector/pgvector:pg15
+    image: pgvector/pgvector:pg16
     container_name: kestrel-dev-postgres
     environment:
       POSTGRES_DB: kestrel
@@ -44,7 +47,17 @@ services:
       POSTGRES_PASSWORD: kestrel_password
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # Versioned with the major, because a data directory is NOT portable
+      # across one. PostgreSQL refuses to start on a cluster initialized by a
+      # different major ("database files are incompatible with server"), and a
+      # container rebuild does not remove a named volume — so pointing pg16 at
+      # the pg15 `postgres-data` would wedge every existing devcontainer:
+      # postgres never becomes healthy, and `app` waits on that health forever.
+      # A new name lets pg16 initdb fresh while the pg15 volume stays on disk,
+      # so nothing is destroyed and the old data can still be dumped. Bump this
+      # name in step with the image whenever the major moves; see
+      # .devcontainer/README.md for what to do with the volume left behind.
+      - postgres16-data:/var/lib/postgresql/data
       - ../kestrel/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5433:5432"
@@ -111,7 +124,7 @@ volumes:
     driver: local
   kestrel-logs:
     driver: local
-  postgres-data:
+  postgres16-data:
     driver: local
   redis-data:
     driver: local

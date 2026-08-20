@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 LIFECYCLE_STATES = (
     "pending",
     "deferred",
+    "escalated",
     "updating",
     "executing",
     "completed",

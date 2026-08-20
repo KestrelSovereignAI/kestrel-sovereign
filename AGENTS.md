@@ -59,7 +59,12 @@ Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
 
 ## Kestrel Talon (GitHub Issue Processor)
 
-Autonomous GitHub issue processing is handled by the standalone [`kestrel-talon`](https://github.com/KestrelSovereignAI/kestrel-talon) package. It is installed **independently** (out-of-tree) and is deliberately *not* a dependency of kestrel-sovereign — listing it would invert the open-core dependency direction (framework → feature instead of feature → framework; see the comment in `pyproject.toml`). Install it separately to use the `kestrel-talon` CLI shown below.
+The in-agent control surface is owned by the independently installed
+[`kestrel-feature-talon`](https://github.com/KestrelSovereignAI/kestrel-feature-talon)
+package. Its companion coding engine is the separately installed
+[`kestrel-talon`](https://github.com/KestrelSovereignAI/kestrel-talon) CLI.
+Neither package is a dependency of `kestrel-sovereign`; core boots cleanly when
+they are absent and has no bundled coordinator fallback.
 
 ### Quick Start
 
@@ -74,7 +79,7 @@ kestrel-talon claim --repo owner/repo --issue 42 --backend codex --codex-model g
 kestrel-talon batch --prd prd.json
 ```
 
-Kestrel's in-agent Talon feature has its own runtime control surface. Use
+The external Talon feature has its own runtime control surface. Use
 `talon_get_config` / `talon_set_config` to manage mutable Talon preferences
 such as default backend/model, while operator policy remains in
 `[talon.policy]`. Talon runtime is intentionally separate from Kestrel chat
@@ -106,7 +111,8 @@ loop has three gates owned by three layers:
 Restart/update (RestartCoordinator) is **not** part of this — it is only
 the deployment primitive. Full runbook:
 [`docs/architecture/testing/TEST_EVIDENCE_GATES.md`](docs/architecture/testing/TEST_EVIDENCE_GATES.md).
-Verification layer: `kestrel_sovereign/features/talon/verification.py`.
+Verification layer:
+[`kestrel_feature_talon/verification.py`](https://github.com/KestrelSovereignAI/kestrel-feature-talon/blob/main/kestrel_feature_talon/verification.py).
 
 ### Closing issues from a PR
 
@@ -161,7 +167,7 @@ Any step's failure short-circuits the rest — a half-applied update never reach
 ### Modifying agent behavior
 1. Check `kestrel_sovereign/agent.py`
 2. Review constitutional protections in `kestrel_sovereign/constitution.py`
-3. Run constitution-verifier tests
+3. Run the constitution tests: `pytest tests/unit -k constitution`
 
 ### Working with signals (anything that wakes the bird)
 
@@ -184,7 +190,7 @@ fails every tick with `Unknown task`. A valid task name is one of:
 
 - a **built-in cron source** in
   [`signals/sources/scheduler.py`](kestrel_sovereign/signals/sources/scheduler.py)
-  `CRON_TASKS` — e.g. `memory_consolidate`, `talon_monitor`,
+  `CRON_TASKS` — e.g. `memory_consolidate`, `wait_reconcile`,
   `restart_coordinator`, `trash_retention`, `github_pr_watch`; or
 - a **tool exposed by a loaded feature** (its `get_tools()` name).
 
@@ -195,42 +201,15 @@ COGNITION signal only when a watched field changes (state, merge,
 comments, checks) — args travel in the scheduled task's `args_json`
 (`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
 
-#### Recurring `stalled_work_rescue` — enable it *safely* (#2200)
+#### Coding workflows and provider ownership
 
-The built-in `stalled_work_rescue` workflow (detect stalled work → govern
-intent → dispatch repairs → verify evidence → close resolved) is
-schedulable through the workflows feature's `workflow_run` tool. But
-`dispatch_repairs` and `close_resolved` are **irreversible /
-evidence-gated**, so a recurring schedule must never carry a blanket
-approval marker or pre-seed repair targets/evidence — those are supplied
-**per-run, with fresh consent**.
-
-Use `talon_schedule_work_rescue` (or, by hand,
-`build_recurring_schedule_request()` in
-[`signals/sources/workflow_rescue.py`](kestrel_sovereign/signals/sources/workflow_rescue.py))
-rather than crafting the `schedule_add` args yourself:
-
-```text
-!talon schedule-rescue                    # every 6h (built-in cadence)
-!talon schedule-rescue cron="0 3 * * *"   # custom cron
-```
-
-This schedules `workflow_run` against `stalled_work_rescue` with
-**observation-only** params (`{stale_days, recurring: true}`). Each tick
-detects stalled work and requests fresh consent at the `govern_intent`
-gate; dispatch/close only proceed once that per-run approval and its
-evidence land — so the loop runs unattended without ever auto-dispatching
-or auto-closing. `assert_safe_recurring_params()` **fails closed** on any
-attempt to bake in `repairs`/`repair_targets`/`resolved_todos`/`evidence`
-or a standing approval marker (`approved`, `approved_by`, `consent`, …).
-
-Each tick's `fleet_stalled_sweep` observation surveys **live** stalled Talon
-jobs (still `dispatched`/`running` past `stale_days`) via the coordinator's
-`_survey_stalled_talon_jobs`, so a recurring loop discovers real work without
-pre-seeded candidates. Detected `stalled_items` are strictly observational:
-`a2a_repair_dispatch` requires **explicit** `repairs`/`repair_targets` and
-refuses to dispatch the survey's `stalled_items` — "detected" never becomes
-"dispatched" without a per-run approval selecting the target.
+Core retains the provider-neutral `stalled_work_rescue` workflow registrations
+used by the Workflows feature. Talon-specific signals, pipeline definitions,
+wait providers, and safe recurring-schedule helpers are owned by
+`kestrel-feature-talon`. Consult that package's runbook before enabling recurring
+coding work. Core's generic scheduler and workflow dispatch surfaces do not
+provide a direct coding fallback; irreversible dispatch and closure still
+require the feature-owned consent and evidence gates.
 
 ### Working with LLM providers
 1. Config in the `[llm]` section of `kestrel.toml`. Legacy standalone `llm_config.toml` was retired in epic #938 — run `kestrel migrate-llm-config` to fold a legacy file in.

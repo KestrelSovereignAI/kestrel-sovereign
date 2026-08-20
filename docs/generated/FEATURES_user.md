@@ -24,7 +24,7 @@ regenerate: uv run python scripts/generate_feature_docs.py --audience user
 These ownership statements are normative and must remain intact in every
 audience-specific derivative:
 
-<!-- NON_BUNDLED_SURFACE_ALIASES: voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
+<!-- NON_BUNDLED_SURFACE_ALIASES: talon feature|talon coordinator; voice; mcp; github integration|github app; wallet; observability; council; visual identity; legal feature; code editing|code edit; parametric self; whatsapp; runpod; vast.ai|vastai; gcp compute; elevenlabs; deepgram; kestrel-talon -->
 
 - **Bundled Feature lifecycle modules:** Feature subclasses discovered from
   `kestrel_sovereign/features/` ship in the `kestrel-sovereign` distribution.
@@ -34,9 +34,10 @@ audience-specific derivative:
   as `PrivacyAgent`, are shipped by `kestrel-sovereign` but are not Feature
   lifecycle classes. The registry labels these `bundled-component` rather than
   putting them in its `features` field.
-- **Not bundled — extracted Feature packages:** Voice, MCP, GitHub integration,
-  wallet, observability, reflection, council, visual identity, legal, code
-  editing, parametric self, and WhatsApp transport are separate install targets.
+- **Not bundled — extracted Feature packages:** Talon, Voice, MCP, GitHub
+  integration, wallet, observability, reflection, council, visual identity,
+  legal, code editing, parametric self, and WhatsApp transport are separate
+  install targets.
   They register Feature subclasses through the `kestrel_sovereign.features`
   entry-point group.
 - **Not bundled — provider packages:** ElevenLabs, Deepgram, OpenAI voice, xAI
@@ -44,9 +45,9 @@ audience-specific derivative:
   implement provider contracts. They use provider-specific entry-point groups;
   installing one does not make that provider a Feature lifecycle class.
 - **Not bundled — standalone tool:** `kestrel-talon` is an independently
-  installed command-line issue processor. The in-tree `TalonCoordinatorFeature`
-  is only its bundled Kestrel control surface; the coordinator and the
-  standalone executable are separately named registry rows.
+  installed command-line issue processor. Its `TalonCoordinatorFeature` control
+  surface is also external, owned by `kestrel-feature-talon`; the feature and
+  standalone executable are separately named companion registry rows.
 
 The runtime catalog at `kestrel_sovereign/data/feature_registry.toml` encodes
 these distinctions in `boundary`. Its `package` field is always the owning
@@ -226,7 +227,7 @@ packages. Here is what your agent can do when the named capability is installed.
 ### Cloud and Deployment
 
 - **GCP Compute, RunPod, Vast.ai (optional provider packages).** Your agent can work with these cloud compute backends after the corresponding provider is installed.
-- **Talon coordination.** The in-tree coordinator can dispatch complex issue-processing work after the standalone `kestrel-talon` tool is installed.
+- **Talon coordination (optional Feature package).** Install `kestrel-feature-talon` for the in-agent control surface and its separately packaged `kestrel-talon` coding engine.
 - **IPFS status.** Your agent is aware of its decentralised storage status and can report on it.
 
 ---

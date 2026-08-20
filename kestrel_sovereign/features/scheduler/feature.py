@@ -13,7 +13,6 @@ silently failing every tick with "Unknown task".
 
 Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     backup_snapshot       -- snapshot the agent's data via the sync service
-    signal_dispatch       -- dispatch queued work to Talon
     trash_retention       -- hard-purge soft-deleted conversation rows
                              past their per-agent retention window (#764)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
@@ -56,6 +55,7 @@ Tools:
 
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -64,7 +64,7 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
-from kestrel_sovereign.features.base import Feature, _serialize_tool_result, tool
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
     CronParseError,
     get_timezone,
@@ -72,6 +72,7 @@ from kestrel_sovereign.features.scheduler.cron import (
     parse,
 )
 from kestrel_sovereign.features.scheduler.runner import (
+    ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_STATE_QUIESCING,
     SchedulerProtocolVersionIncompatible,
@@ -94,16 +95,25 @@ _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
 
-# Crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3). These names are also
-# valid TOOLS a user could schedule, so they are NOT blanket-retired; only rows
-# matching the exact prior core auto-seed (cron + args) are removed on startup,
-# mapped name -> (cron_expression, parsed_args). See post_all_features_loaded.
+# Stable namespace used to distinguish core-owned schedule rows from user rows.
+_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
+
+# Obsolete core registrations whose task names remain valid user-schedulable
+# tools. Match their durable built-in identity, never their cron/args: a user is
+# allowed to choose the exact same cadence and payload. Mapped task name -> the
+# idempotency key persisted by ``_ensure_builtin_schedule``.
+_SUPERSEDED_BUILTIN_SCHEDULE_KEYS = {
+    "signal_dispatch": (
+        f"{_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX}signal_dispatch"
+    ),
+}
+
+# The existing legacy migration for memory-maintenance seeds remains
+# signature-based and scoped to those two names. Mapped name -> (cron, args).
 _SUPERSEDED_AUTOSEEDS = {
     "memory_consolidate": ("0 4 * * *", {}),
     "reflect": ("0 */4 * * *", {"scope": "all", "depth": "normal"}),
 }
-
-_BUILTIN_SCHEDULE_IDEMPOTENCY_PREFIX = "scheduler:builtin:v1:"
 
 
 class SchedulerFeature(Feature):
@@ -164,6 +174,7 @@ class SchedulerFeature(Feature):
         self._db = None
         self._agent_id = ""
         self._runner: Optional[SchedulerRunner] = None
+        self._initialized_monotonic = time.monotonic()
         self._polling_managed_by_host = (
             getattr(self.agent, "_scheduler_polling_managed_by_host", False)
             is True
@@ -199,7 +210,7 @@ class SchedulerFeature(Feature):
         registry = getattr(self.agent, "signal_registry", None)
         if registry is not None:
             cron_registrations = build_cron_registrations(
-                tool_lookup=self._lookup_and_run_tool,
+                tool_lookup=self._lookup_raw_tool_result,
                 builtin_handlers={
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
@@ -356,6 +367,22 @@ class SchedulerFeature(Feature):
             )
             return DEFAULT_LEASE_SECONDS
 
+    @staticmethod
+    def _legacy_ecosystem_discovery_watch(task: Dict[str, Any]) -> bool:
+        """Whether a persisted watch depended on the removed provider default.
+
+        Current watches name a concrete feature-owned discovery tool. The
+        pre-extraction schema omitted that field and implicitly selected a
+        bundled provider. Empty/whitespace values are equally non-actionable.
+        """
+
+        if task.get("task_name") != "ecosystem_discovery_watch":
+            return False
+        args = task.get("args")
+        if not isinstance(args, dict):
+            return True
+        return not str(args.get("tool") or "").strip()
+
     async def post_all_features_loaded(self, agent):
         """Register default scheduled tasks after all features are loaded.
 
@@ -404,12 +431,71 @@ class SchedulerFeature(Feature):
                 )
         existing_names -= retired
 
-        # Cutover for crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3):
-        # memory_consolidate + reflect are still valid TOOLS (a user may schedule
-        # them), so we can't blanket-retire by name. Instead remove ONLY rows
-        # that exactly match what core used to AUTO-SEED (name + cron + args) —
-        # leaving any user-customized schedule intact. Without this, an upgraded
-        # agent would run both the old crons AND `sleep`, double-touching memory.
+        # Provider-ownership cutover for ecosystem discovery (#2281 / Talon
+        # extraction). Older rows relied on core's implicit
+        # ``scan_stale_work`` default and therefore carry no ``args.tool``.
+        # Core can no longer choose a concrete feature provider on their
+        # behalf. Pause only those legacy rows; explicitly configured watches
+        # remain untouched. Keeping the row (rather than deleting it) preserves
+        # its cadence/filter arguments so an operator can recreate it with an
+        # enabled feature-owned discovery tool after reading the diagnostic.
+        for task in existing_tasks:
+            if not self._legacy_ecosystem_discovery_watch(task):
+                continue
+            # ``schedule_list`` exposes the durable enabled bit. A prior boot
+            # may already have completed this cutover; do not re-run the pause
+            # transaction or repeat its warning on every subsequent boot.
+            if task.get("enabled") is False:
+                continue
+            task_id = task["id"]
+            paused = await self.schedule_pause(task_id)
+            if paused.status is ToolResultStatus.OK:
+                logger.warning(
+                    "Paused legacy ecosystem_discovery_watch schedule id=%s: "
+                    "core no longer supplies an implicit discovery tool. "
+                    "Recreate this watch with the same cron/filter arguments "
+                    "and args_json containing an explicit enabled "
+                    "feature-owned tool (for example "
+                    "{\"tool\":\"<discovery-tool>\",\"tool_args\":{...}}), "
+                    "then remove the paused legacy row.",
+                    str(task_id),
+                )
+            else:
+                logger.error(
+                    "Legacy ecosystem_discovery_watch schedule id=%s lacks "
+                    "required args.tool and could not be paused: %s. Remove "
+                    "or pause it manually, then recreate it with an explicit "
+                    "feature-owned discovery tool.",
+                    str(task_id),
+                    paused.error or "unknown scheduler error",
+                )
+
+        # Remove the former signal_dispatch auto-seed by its exact durable core
+        # identity. Cron and args are deliberately irrelevant: users may create
+        # their own signal_dispatch row at 08:05 with {} and it must survive.
+        # Once the identified row is removed it is absent from later snapshots,
+        # making this naturally one-time without a second migration marker.
+        for task in existing_tasks:
+            expected_key = _SUPERSEDED_BUILTIN_SCHEDULE_KEYS.get(
+                task["task_name"]
+            )
+            if expected_key is None:
+                continue
+            if task.get("idempotency_key") != expected_key:
+                continue
+            await self.schedule_remove(task["id"])
+            existing_names.discard(task["task_name"])
+            logger.info(
+                "Removed obsolete core schedule '%s' (id=%s, key=%s)",
+                task["task_name"],
+                str(task["id"])[:8],
+                expected_key,
+            )
+
+        # Cutover for legacy memory-maintenance auto-seeds whose task names are
+        # still valid tools. Never blanket-retire these names: remove only rows
+        # matching their former core signature, leaving customized schedules
+        # intact so the old defaults cannot duplicate nightly sleep.
         for task in existing_tasks:
             seed = _SUPERSEDED_AUTOSEEDS.get(task["task_name"])
             if seed is None:
@@ -419,8 +505,8 @@ class SchedulerFeature(Feature):
                 await self.schedule_remove(task["id"])
                 existing_names.discard(task["task_name"])
                 logger.info(
-                    "Removed auto-seeded '%s' (superseded by nightly sleep, "
-                    "id=%s)", task["task_name"], str(task["id"])[:8],
+                    "Removed obsolete core auto-seed '%s' (id=%s)",
+                    task["task_name"], str(task["id"])[:8],
                 )
 
         # Reflection-dependent schedules only if ReflectionFeature is loaded
@@ -433,7 +519,6 @@ class SchedulerFeature(Feature):
         defaults = [
             ("backup_snapshot", "0 */4 * * *", "{}"),
             ("morning_signal", "0 8 * * *", "{}"),
-            ("signal_dispatch", "5 8 * * *", "{}"),
             # Trash retention sweep (#764). Hard-purges soft-deleted
             # conversation rows past the per-agent retention window.
             # Operators tune frequency via `!schedule` and the window
@@ -464,8 +549,8 @@ class SchedulerFeature(Feature):
             )
 
         # Generic wait reconciler (Wave 2 of #1860) — the core, always-on
-        # successor to the talon-specific talon_monitor. Cheap (no LLM,
-        # just polling each MonitorableWaitable provider's in-flight
+        # monitor for all provider-owned waits. Cheap (no LLM, just polling
+        # each MonitorableWaitable provider's in-flight
         # handles) so 1/min cadence is fine. Emits one COGNITION signal
         # per terminal-state transition (provider-specific source when the
         # provider declares one, else wait.complete). Unconditional — the
@@ -614,10 +699,13 @@ class SchedulerFeature(Feature):
 
     async def shutdown(self):
         """Stop the background runner."""
-        if self._runner:
-            await self._runner.stop()
-        # Unregister the cron / pr-watch / discovery sources (base #2522 P2).
-        await super().shutdown()
+        try:
+            if self._runner:
+                await self._runner.stop()
+        finally:
+            # Source ownership must unwind even when runner cancellation is
+            # propagated through the feature's bounded shutdown slice.
+            await super().shutdown()
 
     # ------------------------------------------------------------------
     # Task executor — dispatches via SignalDispatcher (Phase 4 of #889)
@@ -920,6 +1008,23 @@ class SchedulerFeature(Feature):
         return bool(getattr(feature, "enabled", True))
 
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
+        """Run a tool directly through the canonical scheduler result boundary.
+
+        Source-registered tasks call :meth:`_lookup_raw_tool_result` and let the
+        source factory apply this same preparation. Direct fallback/custom-tool
+        paths use this wrapper so validation and JSON serialization still have
+        exactly one owner per invocation.
+        """
+        from kestrel_sovereign.signals.sources.scheduler import (
+            _prepare_scheduled_tool_result,
+        )
+
+        return _prepare_scheduled_tool_result(
+            task_name,
+            await self._lookup_raw_tool_result(task_name, args),
+        )
+
+    async def _lookup_raw_tool_result(self, task_name: str, args: dict) -> Any:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
         tool-search logic, lifted out so the source registrations can
@@ -934,6 +1039,7 @@ class SchedulerFeature(Feature):
             if blocked is not None:
                 return blocked
         features = getattr(self.agent, "features", {})
+
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
                 continue
@@ -947,14 +1053,7 @@ class SchedulerFeature(Feature):
                     result = await self._run_tool_hook_gated(
                         type(feature).__name__, agent_tool, args,
                     )
-                    if isinstance(result, ScheduledTaskOutcome):
-                        return result
-                    # Preserve the legacy JSON-encode contract for
-                    # downstream consumers (task_execution_log.result_text,
-                    # endpoints/agent.py history view).
-                    if isinstance(result, str):
-                        return result
-                    return json.dumps(_serialize_tool_result(result), default=str)
+                    return result
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
@@ -963,11 +1062,7 @@ class SchedulerFeature(Feature):
                 result = await self._run_tool_hook_gated(
                     type(self).__name__, agent_tool, args,
                 )
-                if isinstance(result, ScheduledTaskOutcome):
-                    return result
-                if isinstance(result, str):
-                    return result
-                return json.dumps(_serialize_tool_result(result), default=str)
+                return result
 
         # A persisted schedule that names a tool owned by a NOW-disabled feature
         # must not execute it. Skip benignly (like the startup-order race below)
@@ -1139,13 +1234,36 @@ class SchedulerFeature(Feature):
         if sync:
             snap = getattr(sync, "snapshot_if_changed", None) or sync.force_snapshot
             results = await snap()
-            return json.dumps(
-                {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
-                default=str,
+            targets = {
+                target: {
+                    "success": result.success,
+                    "bytes": result.bytes_synced,
+                }
+                for target, result in results.items()
+            }
+            if not targets:
+                return json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": "no sync targets configured",
+                    }
+                )
+            success = all(
+                target["success"] is True for target in targets.values()
             )
-        return json.dumps({"error": "no sync service configured"})
+            payload: dict[str, Any] = {
+                "success": success,
+                "targets": targets,
+            }
+            if not success:
+                payload["error"] = "backup_snapshot_failed"
+            return json.dumps(payload, default=str)
+        return json.dumps({
+            "skipped": True,
+            "reason": "no sync service configured",
+        })
 
-    async def _handle_sleep(self, args: dict) -> str:
+    async def _handle_sleep(self, args: dict) -> str | ScheduledTaskOutcome:
         """Built-in handler for the nightly ``sleep`` cron (#1674 P3).
 
         Runs the agent's single memory-maintenance cycle: reflection (via the
@@ -1165,6 +1283,7 @@ class SchedulerFeature(Feature):
 
         skip_export = bool(args.get("skip_export", True))
         skip_consolidation = bool(args.get("skip_consolidation", False))
+        maintenance_only = skip_consolidation and skip_export
         # Caller can force reflection on/off; otherwise gate it on activity.
         if "skip_reflection" in args:
             skip_reflection = bool(args["skip_reflection"])
@@ -1177,13 +1296,61 @@ class SchedulerFeature(Feature):
                 skip_consolidation=skip_consolidation,
                 skip_reflection=skip_reflection,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[sleep] agent=%s cycle failed: %s", self._agent_id, e)
-            return json.dumps({"error": str(e)})
+        except Exception:  # noqa: BLE001
+            # The local feature log is the trusted diagnostic boundary. The
+            # scheduled result crosses into signal/task audit stores, where it
+            # must remain content-free and bounded.
+            logger.exception("[sleep] agent=%s cycle failed", self._agent_id)
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=json.dumps({"error": "sleep_failed"}),
+                pause_schedule=False,
+            )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
         data["skip_reflection"] = skip_reflection
-        return json.dumps(data, default=str)
+        semantic_maintenance = data.get("semantic_maintenance")
+        semantic_status = (
+            semantic_maintenance.get("status")
+            if isinstance(semantic_maintenance, dict)
+            else None
+        )
+        maintenance_skipped = (
+            maintenance_only
+            and not data.get("error")
+            and semantic_status in {None, "complete", "no_op", "disabled"}
+        )
+        if maintenance_skipped:
+            # ``SleepMixin.sleep`` still performs retention sweeping,
+            # explicitly requested reflection, and semantic maintenance when
+            # consolidation/export are disabled. Those phases do not count as
+            # a completed consolidation/export in ``SleepReport.success``;
+            # after running them successfully, represent that expected verdict
+            # as a non-terminal scheduled skip.
+            data["skipped"] = True
+            data["reason"] = "consolidation and export were both skipped"
+        consolidation_skipped = (
+            data.get("success") is False
+            and data.get("error") == "consolidation_skipped"
+        )
+        if consolidation_skipped:
+            # SleepMixin uses this content-free error token when consolidation
+            # is intentionally inapplicable (for example, a privacy mode that
+            # forbids persistence). Preserve the report's verdict while making
+            # the expected no-op explicit to the scheduler envelope.
+            data["skipped"] = True
+        result_text = json.dumps(data, default=str)
+        if (
+            data.get("success") is False
+            and not consolidation_skipped
+            and not maintenance_skipped
+        ):
+            return ScheduledTaskOutcome(
+                status="failed",
+                result_text=result_text,
+                pause_schedule=False,
+            )
+        return result_text
 
     async def _sleep_had_activity(self) -> bool:
         """Best-effort: has anything happened since the last episode?
@@ -1634,7 +1801,7 @@ class SchedulerFeature(Feature):
         """Run stale-work/red-CI discovery and wake on actionable changes.
 
         Args:
-            tool: discovery tool name, default ``scan_stale_work``.
+            tool: required feature-owned discovery tool name.
             tool_args: kwargs passed to that tool. Any top-level args other
                 than watcher control keys are also forwarded for convenience.
             watch_key: optional dedupe key. Defaults to tool + repo/filter args.
@@ -1642,13 +1809,18 @@ class SchedulerFeature(Feature):
             max_findings: maximum findings included in the cognition payload.
         """
         from kestrel_sovereign.signals.sources.ecosystem_discovery import (
-            DEFAULT_DISCOVERY_TOOL,
             build_signal_for_discovery_findings,
             evaluate_discovery_watch,
             state_to_json,
         )
 
-        tool_name = str(args.get("tool") or DEFAULT_DISCOVERY_TOOL)
+        tool_name = str(args.get("tool") or "").strip()
+        if not tool_name:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "configuration",
+                "error": "ecosystem_discovery_watch requires a non-empty tool",
+            })
         control_keys = {"tool", "tool_args", "watch_key", "notify", "max_findings"}
         tool_args = dict(args.get("tool_args") or {})
         for key, value in args.items():
@@ -1937,13 +2109,15 @@ class SchedulerFeature(Feature):
             return ToolResult.failed("Database not available")
 
         try:
+            schedule_now = await scheduler_database_clock(self._db)
             rows = await self._db.fetchall(
                 """
                 SELECT id, task_name, cron_expression, args_json,
                        enabled, last_run_at, next_run_at, created_at,
                        schedule_kind, run_at, timezone_name, misfire_policy,
                        misfire_grace_seconds, idempotency_key, lease_owner,
-                       lease_expires_at, attempt_count, terminal_status, terminal_at
+                       lease_expires_at, attempt_count, terminal_status, terminal_at,
+                       scheduler_rollout_fenced, scheduler_claim_fenced
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -1999,10 +2173,51 @@ class SchedulerFeature(Feature):
                 "attempt_count": row[16] if len(row) > 16 else 0,
                 "terminal_status": row[17] if len(row) > 17 else None,
                 "terminal_at": row[18] if len(row) > 18 else None,
+                "disablement": self._schedule_disablement(
+                    enabled=bool(row[4]),
+                    schedule_kind=(
+                        row[8] if len(row) > 8 and row[8] else "cron"
+                    ),
+                    terminal_status=row[17] if len(row) > 17 else None,
+                    database_now=schedule_now,
+                    rollout_fenced=bool(row[19]) if len(row) > 19 else False,
+                    claim_fenced=bool(row[20]) if len(row) > 20 else False,
+                    lease_owner=row[14] if len(row) > 14 else None,
+                    lease_expires_at=row[15] if len(row) > 15 else None,
+                ),
             })
 
-        data: Dict[str, Any] = {"tasks": tasks, "count": len(tasks)}
-        confirmation = f"Listed {len(tasks)} scheduled task(s)"
+        try:
+            from kestrel_sovereign.features.scheduler.status import (
+                scheduler_status,
+                scheduler_status_parameters,
+            )
+            liveness = await scheduler_status(
+                self._db,
+                agent_id=self._agent_id,
+                **scheduler_status_parameters(self),
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to inspect scheduler runtime status: %s",
+                type(error).__name__,
+            )
+            liveness = {
+                "state": "inspection_failed",
+                "status": "fail",
+                "enabled_count": None,
+                "telemetry_received": False,
+                "error_type": type(error).__name__,
+            }
+        data: Dict[str, Any] = {
+            "tasks": tasks,
+            "count": len(tasks),
+            "scheduler_status": liveness,
+        }
+        confirmation = (
+            f"Listed {len(tasks)} scheduled task(s); "
+            f"scheduler={liveness['state']} enabled={liveness['enabled_count']}"
+        )
 
         if load_errors:
             data["load_errors"] = load_errors
@@ -2017,6 +2232,29 @@ class SchedulerFeature(Feature):
             )
 
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @staticmethod
+    def _schedule_disablement(
+        *, enabled: bool, schedule_kind: str,
+        terminal_status: Optional[str], database_now: datetime,
+        rollout_fenced: bool, claim_fenced: bool,
+        lease_owner: Optional[str] = None,
+        lease_expires_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from kestrel_sovereign.features.scheduler.status import (
+            classify_disablement,
+        )
+
+        return classify_disablement(
+            enabled=enabled,
+            schedule_kind=schedule_kind,
+            terminal_status=terminal_status,
+            database_now=database_now,
+            rollout_fenced=rollout_fenced,
+            claim_fenced=claim_fenced,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+        )
 
     @tool(
         "schedule_add",
@@ -2396,12 +2634,19 @@ class SchedulerFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!schedule resume",
     )
-    async def schedule_resume(self, task_id: str) -> ToolResult:
+    async def schedule_resume(
+        self,
+        task_id: str,
+        acknowledge_ambiguous_effect: bool = False,
+    ) -> ToolResult:
         """
         Resume a paused scheduled task.
 
         Args:
             task_id: The UUID of the task to resume
+            acknowledge_ambiguous_effect: Confirm that an operator reconciled
+                the possible legacy effect before re-enabling an occurrence
+                disabled during protocol rollout.
         """
         if not self._db:
             return ToolResult.failed("Database not available")
@@ -2448,9 +2693,68 @@ class SchedulerFeature(Feature):
                 run_at = row[4] if len(row) > 4 else None
                 timezone_name = row[5] if len(row) > 5 and row[5] else "UTC"
                 terminal_status = row[6] if len(row) > 6 else None
-                if schedule_kind == "one_shot" and terminal_status:
+                if terminal_status == "invalid_idempotency_key":
                     return ToolResult.failed(
-                        f"Task {task_id} is a terminal one-shot deadline ({terminal_status}) and cannot be resumed"
+                        f"Task {task_id} has an invalid persisted idempotency key; "
+                        "repair or recreate the schedule before enabling it",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recovery_action": (
+                                "repair or recreate the schedule with a valid "
+                                "idempotency key"
+                            ),
+                        },
+                    )
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status == "execution_log_inconsistent"
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} has inconsistent execution history for "
+                        "its one-shot occurrence; reconcile the execution log "
+                        "and recreate the deadline instead of replaying it",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recoverable": False,
+                            "recovery_action": (
+                                "reconcile the execution log and recreate the "
+                                "one-shot schedule"
+                            ),
+                        },
+                    )
+                if (
+                    terminal_status == ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE
+                    and not acknowledge_ambiguous_effect
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} may already have run under the legacy "
+                        "scheduler; reconcile its external effect, then retry "
+                        "with acknowledge_ambiguous_effect=true",
+                        data={
+                            "task_id": task_id,
+                            "disabled_reason": terminal_status,
+                            "recoverable": True,
+                            "recovery_action": (
+                                "verify the legacy occurrence's effect and retry "
+                                "schedule_resume with "
+                                "acknowledge_ambiguous_effect=true"
+                            ),
+                        },
+                    )
+                from kestrel_sovereign.features.scheduler.status import (
+                    SCHEDULER_SAFETY_DISABLEMENT_REASONS,
+                )
+
+                if (
+                    schedule_kind == "one_shot"
+                    and terminal_status
+                    and terminal_status not in SCHEDULER_SAFETY_DISABLEMENT_REASONS
+                ):
+                    return ToolResult.failed(
+                        f"Task {task_id} is a terminal one-shot deadline "
+                        f"({terminal_status}) and cannot be resumed"
                     )
                 cron_now_invalid = False
                 if schedule_kind == "one_shot":
@@ -2499,7 +2803,14 @@ class SchedulerFeature(Feature):
             "task_id": task_id,
             "status": "resumed",
             "next_run_at": next_run_at,
+            "recovered_from": terminal_status,
         }
+
+        if terminal_status == ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE:
+            data["recovery"] = (
+                "operator explicitly re-enabled an occurrence disabled during "
+                "legacy rollout ambiguity"
+            )
 
         # Honesty: a resumed task whose cron expression no longer parses
         # is enabled in the DB but has next_run_at=None — the runner will

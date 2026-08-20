@@ -133,6 +133,55 @@ def load_project_env(home: Path, *, exclude: tuple[str, ...] = ()) -> None:
         os.environ.setdefault(key, value)
 
 
+def spawned_agent_env(project_dir: Path) -> dict:
+    """The environment ``kestrel start`` hands a spawned agent process.
+
+    The launch authority for every agent in ``multi_agent.toml``, factored out
+    of ``multi_agent.process_manager.ProcessManager._load_env`` so that a tool
+    reasoning about a running agent can ask the launcher instead of guessing.
+
+    Note the precedence, which is the **opposite** of :func:`load_project_env`
+    above: the launcher copies ``os.environ`` and then lets the project ``.env``
+    overwrite it, so the file wins. That disagreement is real and predates this
+    function — a spawned agent is configured by the file, while a process that
+    boots through ``load_project_env`` keeps its exported values. Reconciling
+    the two is a boot-semantics change, not something to settle inside a
+    caller; what matters here is that a caller asking "which database do the
+    agents read" gets the launcher's answer, not the other one's.
+
+    Returns a copy. Nothing is exported: the point is to describe a child
+    process, not to become one.
+    """
+    from dotenv import dotenv_values
+
+    env = os.environ.copy()
+    env_file = project_dir / ".env"
+    if env_file.exists():
+        env.update({
+            key: value
+            for key, value in dotenv_values(env_file).items()
+            if value is not None
+        })
+    return env
+
+
+def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
+    """The ``KESTREL_DATA_KEY`` a *named* agent is actually started with.
+
+    ``ProcessManager.start_agent`` applies ``KESTREL_DATA_KEY_<NAME>`` over the
+    fleet-wide key *after* building the environment, so the value in
+    :func:`spawned_agent_env` is the pre-override one. A caller comparing
+    custody against that would reject a correct per-agent key and accept a
+    wrong one — which is worse, because it writes blobs the agent cannot read.
+
+    Kept beside ``spawned_agent_env`` so the pair stays a faithful description
+    of one launch, rather than two half-descriptions that drift apart.
+    """
+    return env.get(f"KESTREL_DATA_KEY_{agent_name.upper()}") or env.get(
+        "KESTREL_DATA_KEY"
+    )
+
+
 def host_data_dir() -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 

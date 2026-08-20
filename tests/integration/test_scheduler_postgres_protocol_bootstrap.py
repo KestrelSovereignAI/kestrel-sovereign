@@ -26,6 +26,9 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerRunner,
     ScheduledTask,
 )
+from kestrel_sovereign.features.scheduler.status import (
+    ensure_runtime_status_table,
+)
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -186,6 +189,79 @@ async def test_bootstrap_keeps_existing_transaction_usable_after_additive_migrat
         # path while the caller's transaction remains open.
         await db.execute("UPDATE scheduled_tasks SET enabled = 1 WHERE 1 = 0")
         assert await db.fetchone("SELECT COUNT(*) FROM scheduled_tasks") == (0,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_runtime_telemetry_primary_key_migrates_on_real_backend(db_backend):
+    """The legacy per-agent PK becomes per-owner without losing its report."""
+
+    async with _isolated_scheduler_schema(db_backend) as db:
+        await db.execute(
+            """
+            CREATE TABLE scheduler_runtime_status (
+                agent_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                worker_state TEXT NOT NULL,
+                reported_at TEXT NOT NULL,
+                last_tick_started_at TEXT,
+                last_tick_completed_at TEXT,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_error_type TEXT,
+                configured_enabled_count INTEGER NOT NULL DEFAULT 0,
+                enabled_count INTEGER NOT NULL DEFAULT 0,
+                executing_count INTEGER NOT NULL DEFAULT 0,
+                disabled_count INTEGER NOT NULL DEFAULT 0,
+                fenced_count INTEGER NOT NULL DEFAULT 0,
+                system_disabled_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """INSERT INTO scheduler_runtime_status
+                   (agent_id, owner_id, worker_state, reported_at)
+               VALUES ('agent-1', 'legacy-owner', 'running', ?)""",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+        await ensure_runtime_status_table(db)
+        await ensure_runtime_status_table(db)
+
+        if db.backend_type == "postgres":
+            key_columns = [
+                str(row[0])
+                for row in await db.fetchall(
+                    """SELECT attribute.attname
+                       FROM pg_constraint con
+                       JOIN unnest(con.conkey) WITH ORDINALITY
+                         AS key_column(attnum, ordinal) ON TRUE
+                       JOIN pg_attribute attribute
+                         ON attribute.attrelid = con.conrelid
+                        AND attribute.attnum = key_column.attnum
+                       WHERE con.conrelid = to_regclass(?)
+                         AND con.contype = 'p'
+                       ORDER BY key_column.ordinal""",
+                    ("scheduler_runtime_status",),
+                )
+            ]
+        else:
+            key_columns = [
+                str(row[1])
+                for row in sorted(
+                    await db.fetchall(
+                        "PRAGMA table_info(scheduler_runtime_status)"
+                    ),
+                    key=lambda row: int(row[5]),
+                )
+                if row[5]
+            ]
+        assert key_columns == ["agent_id", "owner_id"]
+        assert await db.fetchone(
+            "SELECT owner_id, worker_state FROM scheduler_runtime_status "
+            "WHERE agent_id = ?",
+            ("agent-1",),
+        ) == ("legacy-owner", "running")
 
 
 @pytest.mark.asyncio
@@ -1292,7 +1368,6 @@ async def test_postgres_concurrent_builtin_seeders_insert_each_default_once(
         ) == [
             ("backup_snapshot", 1, "scheduler:builtin:v1:backup_snapshot"),
             ("morning_signal", 1, "scheduler:builtin:v1:morning_signal"),
-            ("signal_dispatch", 1, "scheduler:builtin:v1:signal_dispatch"),
             ("trash_retention", 1, "scheduler:builtin:v1:trash_retention"),
             ("wait_reconcile", 1, "scheduler:builtin:v1:wait_reconcile"),
         ]
@@ -1459,12 +1534,10 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             ) == [
                 ("backup_snapshot", 1),
                 ("morning_signal", 1),
-                ("signal_dispatch", 1),
                 ("trash_retention", 1),
                 ("wait_reconcile", 1),
                 ("backup_snapshot", 1),
                 ("morning_signal", 1),
-                ("signal_dispatch", 1),
                 ("trash_retention", 1),
                 ("wait_reconcile", 1),
             ]
@@ -1993,10 +2066,10 @@ async def test_postgres_post_load_adopts_pending_owner_builtins(
             authorized_agent_ids=(agent_id,),
             owner_id="builtin-replica",
         )
-        owner_registration, replica_registration = await asyncio.gather(
-            owner.prepare_tenant_registration(),
-            replica.prepare_tenant_registration(),
-        )
+        # Establish the owner before the replica so the assertions below do
+        # not depend on which concurrent advisory-lock contender wins first.
+        owner_registration = await owner.prepare_tenant_registration()
+        replica_registration = await replica.prepare_tenant_registration()
         assert owner_registration.rollout_preexisting is False
         assert replica_registration.rollout_preexisting is True
         owner_feature, owner_agent = scheduler_feature_for(
@@ -2032,7 +2105,7 @@ async def test_postgres_post_load_adopts_pending_owner_builtins(
 
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM scheduled_tasks WHERE agent_id = ?", (agent_id,)
-        ) == (5,)
+        ) == (4,)
         assert await db_owner.fetchone(
             "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?", (task_id,)
         ) == (1,)

@@ -19,8 +19,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
@@ -288,6 +289,19 @@ class TestSchedulerTools:
         desc = feature.tool_description
         assert "scheduled" in desc.lower() or "schedule" in desc.lower()
 
+    @pytest.mark.asyncio
+    async def test_shutdown_unregisters_sources_when_runner_propagates_cancellation(
+        self, feature,
+    ):
+        feature._runner.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        base_shutdown = AsyncMock()
+
+        with patch.object(Feature, "shutdown", base_shutdown):
+            with pytest.raises(asyncio.CancelledError):
+                await feature.shutdown()
+
+        base_shutdown.assert_awaited_once()
+
 
 # =========================================================================
 # schedule_list
@@ -316,6 +330,39 @@ class TestScheduleList:
         assert result.data["tasks"][0]["task_name"] == "wellness_check"
         assert result.data["tasks"][1]["enabled"] is False
         assert result.data["tasks"][1]["args"] == {"force": True}
+
+    @pytest.mark.asyncio
+    async def test_list_exposes_durable_builtin_identity(self, feature):
+        """Boot migrations can distinguish a core row from a user row."""
+
+        feature._db.fetchall = AsyncMock(return_value=[(
+            "builtin-1",
+            "signal_dispatch",
+            "5 8 * * *",
+            "{}",
+            1,
+            None,
+            "2026-08-14T08:05:00+00:00",
+            "2026-08-13T08:00:00+00:00",
+            "cron",
+            None,
+            "UTC",
+            "skip",
+            None,
+            "scheduler:builtin:v1:signal_dispatch",
+            None,
+            None,
+            0,
+            None,
+            None,
+        )])
+
+        result = await feature.schedule_list()
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["tasks"][0]["idempotency_key"] == (
+            "scheduler:builtin:v1:signal_dispatch"
+        )
 
     @pytest.mark.asyncio
     async def test_list_no_db(self, feature_no_db):
@@ -375,10 +422,8 @@ class TestScheduleList:
 
 class TestRetiredCronCleanup:
     @pytest.mark.asyncio
-    async def test_post_load_removes_orphaned_cognition_retention(self):
-        """An agent upgraded from #1715 has a persisted cognition_retention
-        schedule. After #1674 removed its handler/source, post_all_features_loaded
-        must delete that orphan row so it doesn't fire forever as 'Unknown task'."""
+    async def test_post_load_removes_retired_builtin_schedules(self):
+        """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult
 
         agent = _make_mock_agent()
@@ -401,7 +446,8 @@ class TestRetiredCronCleanup:
         await f.post_all_features_loaded(agent)
 
         # The orphaned built-in was removed by id...
-        f.schedule_remove.assert_awaited_once_with("orphan-1")
+        removed_ids = {call.args[0] for call in f.schedule_remove.await_args_list}
+        assert removed_ids == {"orphan-1"}
         # ...and never re-seeded (it's no longer a default).
         readded = [
             c.kwargs.get("task_name")
@@ -411,6 +457,79 @@ class TestRetiredCronCleanup:
         # Existing defaults still take the authoritative transaction path so
         # a second pending host adopts a first host's registration-owned row.
         assert "backup_snapshot" in readded
+
+    @pytest.mark.asyncio
+    async def test_post_load_pauses_only_legacy_discovery_watches(self, caplog):
+        """Rows from the implicit-provider era cannot keep failing each tick.
+
+        Missing/blank ``args.tool`` rows are paused with an actionable
+        migration diagnostic. A watch that already names a feature-owned tool
+        is left intact.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-missing",
+                    "cron_expression": "*/15 * * * *",
+                    "args": {"repo": "owner/repo"},
+                    "enabled": True,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-blank",
+                    "cron_expression": "*/20 * * * *",
+                    "args": {"tool": "   ", "org": "owner"},
+                    "enabled": True,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "legacy-already-paused",
+                    "cron_expression": "*/25 * * * *",
+                    "args": {"repo": "owner/repo"},
+                    "enabled": False,
+                },
+                {
+                    "task_name": "ecosystem_discovery_watch",
+                    "id": "configured",
+                    "cron_expression": "*/30 * * * *",
+                    "args": {
+                        "tool": "discover_ecosystem",
+                        "tool_args": {"repo": "owner/repo"},
+                    },
+                    "enabled": True,
+                },
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f.schedule_pause = AsyncMock(
+            return_value=ToolResult.ok(confirmation="paused")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await f.post_all_features_loaded(agent)
+
+        paused_ids = {call.args[0] for call in f.schedule_pause.await_args_list}
+        assert paused_ids == {"legacy-missing", "legacy-blank"}
+        assert "legacy-already-paused" not in paused_ids
+        assert "configured" not in paused_ids
+        assert "core no longer supplies an implicit discovery tool" in caplog.text
+        assert 'args_json containing an explicit enabled feature-owned tool' in caplog.text
 
     @pytest.mark.asyncio
     async def test_post_load_removes_autoseeded_consolidate_reflect_keeps_custom(self):
@@ -458,8 +577,141 @@ class TestRetiredCronCleanup:
         assert "memory_consolidate" not in seeded
         assert "reflect" not in seeded
 
+    @pytest.mark.asyncio
+    async def test_post_load_removes_only_builtin_signal_dispatch_identity_once(self):
+        """The former built-in row is removed without retiring the live tool.
+
+        A user-created row at the identical 08:05 cadence and payload has its
+        own durable identity and survives this and repeated boots unchanged.
+        """
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        legacy_builtin = {
+            "task_name": "signal_dispatch",
+            "id": "dispatch-old-autoseed",
+            "cron_expression": "5 8 * * *",
+            "args": {},
+            "idempotency_key": "scheduler:builtin:v1:signal_dispatch",
+        }
+        same_cadence_user_row = {
+            "task_name": "signal_dispatch",
+            "id": "dispatch-user-same-cadence",
+            "cron_expression": "5 8 * * *",
+            "args": {},
+            "idempotency_key": "schedule:user-created-dispatch",
+        }
+        f.schedule_list = AsyncMock(side_effect=[
+            ToolResult.ok(
+                confirmation="first boot",
+                data={"tasks": [legacy_builtin, same_cadence_user_row]},
+            ),
+            ToolResult.ok(
+                confirmation="second boot",
+                data={"tasks": [same_cadence_user_row]},
+            ),
+        ])
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+        await f.post_all_features_loaded(agent)
+
+        f.schedule_remove.assert_awaited_once_with("dispatch-old-autoseed")
+        seeded = {
+            call.kwargs["task_name"]
+            for call in f._ensure_builtin_schedule.await_args_list
+        }
+        assert "signal_dispatch" not in seeded
+
 
 class TestSleepCronHandler:
+    @pytest.mark.asyncio
+    async def test_handle_sleep_runs_maintenance_when_core_work_is_disabled(self):
+        class _Report:
+            def to_dict(self):
+                return {"success": False, "error": None}
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        f = SchedulerFeature(agent)
+
+        out = await f._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": False,
+        })
+
+        assert json.loads(out) == {
+            "success": False,
+            "error": None,
+            "skipped": True,
+            "reason": "consolidation and export were both skipped",
+            "skip_reflection": False,
+        }
+        agent.sleep.assert_awaited_once_with(
+            skip_export=True,
+            skip_consolidation=True,
+            skip_reflection=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_fails_incomplete_maintenance_only_cycle(self):
+        class _Report:
+            def to_dict(self):
+                return {
+                    "success": False,
+                    "error": None,
+                    "semantic_maintenance": {"status": "partial"},
+                }
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        feature = SchedulerFeature(agent)
+
+        outcome = await feature._handle_sleep({
+            "skip_consolidation": True,
+            "skip_reflection": True,
+        })
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert json.loads(outcome.result_text)["semantic_maintenance"] == {
+            "status": "partial"
+        }
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_logs_raised_cycle_locally_with_traceback(
+        self, caplog
+    ):
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(side_effect=RuntimeError("sleep exploded"))
+        feature = SchedulerFeature(agent)
+        feature._agent_id = "did:test:sleep-diagnostics"
+
+        with caplog.at_level(logging.ERROR):
+            outcome = await feature._handle_sleep({"skip_reflection": True})
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
+        record = next(
+            record
+            for record in caplog.records
+            if record.message
+            == "[sleep] agent=did:test:sleep-diagnostics cycle failed"
+        )
+        assert record.exc_info is not None
+        assert "sleep exploded" in str(record.exc_info[1])
+
     @pytest.mark.asyncio
     async def test_handle_sleep_calls_agent_sleep_skip_export(self):
         """The sleep cron handler runs the agent's sleep cycle with
@@ -498,6 +750,7 @@ class TestSleepCronHandler:
         agent.did = agent.agent_id
         agent.features = {}
         agent.storage = MagicMock()
+        agent.storage.sweep_expired_governed_semantic_artifacts = None
         agent.storage.db = _make_mock_db()
         agent.sleep_hooks = []
         agent._consolidate_memories = AsyncMock(
@@ -507,11 +760,33 @@ class TestSleepCronHandler:
         with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
             await f.initialize()
 
-        payload = json.loads(await f._handle_sleep({"skip_reflection": True}))
+        outcome = await f._handle_sleep({"skip_reflection": True})
 
         agent._consolidate_memories.assert_awaited_once()
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert outcome.pause_schedule is False
+        payload = json.loads(outcome.result_text)
         assert payload["success"] is False
         assert payload["error"] == "consolidation_failed"
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_exception_is_failed_without_pausing_schedule(self):
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(side_effect=RuntimeError("sleep exploded"))
+        agent.storage = MagicMock()
+        agent.storage.db = MagicMock()
+        agent.storage.db.fetchval = AsyncMock(return_value=None)
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        outcome = await f._handle_sleep({"skip_reflection": True})
+
+        assert isinstance(outcome, ScheduledTaskOutcome)
+        assert outcome.status == "failed"
+        assert outcome.pause_schedule is False
+        assert json.loads(outcome.result_text) == {"error": "sleep_failed"}
 
     @pytest.mark.asyncio
     async def test_handle_sleep_reflects_when_active(self):
@@ -1180,15 +1455,57 @@ class TestSchedulerRunner:
         """
         db = _make_mock_db()
         db.backend_type = "postgres"
+        base_fetchone = db.fetchone.side_effect
+
+        async def _fetchone(sql, *args):
+            if "FROM pg_constraint con" in sql:
+                return ("scheduler_runtime_status_pkey",)
+            return await base_fetchone(sql, *args)
+
+        async def _fetchall(sql, *args):
+            if "JOIN pg_attribute attribute" in sql:
+                return [("agent_id",), ("owner_id",)]
+            return []
 
         async def _exec(sql, *args):
             if "ALTER TABLE" in sql:
                 assert "ADD COLUMN IF NOT EXISTS" in sql
 
+        db.fetchone = AsyncMock(side_effect=_fetchone)
+        db.fetchall = AsyncMock(side_effect=_fetchall)
         db.execute = AsyncMock(side_effect=_exec)
         executor = AsyncMock(return_value="ok")
         runner = SchedulerRunner(db, "test-agent", executor)
         await runner._ensure_tables()
+        assert not any(
+            "LOCK TABLE scheduler_runtime_status" in call.args[0]
+            for call in db.execute.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_arm_rejects_unprepared_protocol_before_database_clock(self):
+        db = _make_mock_db()
+        db.fetchval = AsyncMock(
+            side_effect=AssertionError("database clock must not be queried")
+        )
+        runner = SchedulerRunner(db, "test-agent", AsyncMock(return_value="ok"))
+
+        with pytest.raises(RuntimeError, match="protocol preparation"):
+            await runner.arm()
+
+        db.fetchval.assert_not_awaited()
+        assert runner._arm_requested is False
+
+    def test_database_connectivity_probe_tolerates_protected_backend_wrapper(self):
+        class ProtectedDatabase:
+            @property
+            def backend(self):
+                raise RuntimeError("backend access denied")
+
+        runner = SchedulerRunner(
+            ProtectedDatabase(), "test-agent", AsyncMock(return_value="ok")
+        )
+        assert runner._database_is_connected() is True
 
     @pytest.mark.asyncio
     async def test_ensure_tables_skips_existing_sqlite_columns_before_alter(self):
@@ -1381,6 +1698,15 @@ class TestSchedulerRunner:
             if "UPDATE task_execution_log" in c[0][0]
         )
         assert outcome_call[0][1][0] == "failed"
+
+    def test_failed_outcome_cannot_silently_request_pause(self):
+        """Failed dispatcher results have no structured pause channel."""
+        with pytest.raises(ValueError, match="only valid for blocked"):
+            ScheduledTaskOutcome(
+                status="failed",
+                result_text="failed",
+                pause_schedule=True,
+            )
 
     @pytest.mark.asyncio
     async def test_tick_records_blocked_reason_and_pauses_schedule(self):
@@ -1770,6 +2096,33 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_custom_signal_dispatch_schedule_routes_through_cron_source(
+        self, feature,
+    ):
+        """The supported source contract is independent of auto-seeding."""
+
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock(
+            return_value=SignalResult(
+                signal_id="sig-dispatch",
+                status=Status.OK,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                action_result="started",
+            )
+        )
+
+        result = await feature._dispatch_scheduled_task(
+            "signal_dispatch", {"mode": "execute"}
+        )
+
+        assert result == "started"
+        signal = feature.agent.dispatcher.dispatch_signal.await_args.args[0]
+        assert signal.source == "cron.signal_dispatch"
+        assert signal.mode is SignalMode.ACTION
+        assert signal.payload == {"mode": "execute"}
+
+    @pytest.mark.asyncio
     async def test_training_cycle_requires_current_durable_semantic_maintenance(
         self, feature,
     ):
@@ -1865,6 +2218,50 @@ class TestTaskExecutor:
         feature.agent.features = {}
         with pytest.raises(ValueError, match="Unknown task"):
             await feature._lookup_and_run_tool("nonexistent_task", {})
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_result_raises_before_scheduler_serialization(
+        self, feature,
+    ):
+        """The production lookup cannot JSON-encode failure into success."""
+        failed_tool = MagicMock()
+        failed_tool.name = "memory_consolidate"
+        failed_tool.execute = AsyncMock(
+            return_value={
+                **ToolResult.failed(
+                    "consolidation deadline expired"
+                ).to_dict(),
+                "tool": "memory_consolidate",
+            }
+        )
+        memory_feature = MagicMock()
+        memory_feature.get_tools = MagicMock(return_value=[failed_tool])
+        feature.agent.features = {"MemoryFeature": memory_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        with pytest.raises(
+            RuntimeError, match="scheduled tool memory_consolidate failed"
+        ):
+            await feature._lookup_and_run_tool("memory_consolidate", {})
+
+    @pytest.mark.asyncio
+    async def test_legacy_tool_exception_envelope_also_raises(self, feature):
+        failed_tool = MagicMock()
+        failed_tool.name = "job"
+        failed_tool.execute = AsyncMock(
+            return_value={
+                "success": False,
+                "error": "job exploded",
+                "tool": "job",
+            }
+        )
+        job_feature = MagicMock()
+        job_feature.get_tools = MagicMock(return_value=[failed_tool])
+        feature.agent.features = {"JobFeature": job_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+
+        with pytest.raises(RuntimeError, match="scheduled tool job failed"):
+            await feature._lookup_and_run_tool("job", {})
 
     @pytest.mark.asyncio
     async def test_builtin_cron_task_skipped_when_feature_not_loaded(
@@ -2023,7 +2420,7 @@ class TestTranslateSignalResult:
             self._make_result(
                 Status.OK, mode=SignalMode.ACTION, action_result="ran-it"
             ),
-            "signal_dispatch",
+            "backup_snapshot",
         )
         assert result == "ran-it"
 
@@ -2071,7 +2468,7 @@ class TestTranslateSignalResult:
                 mode=SignalMode.ACTION,
                 action_result=("dispatched", 0.7),
             ),
-            "signal_dispatch",
+            "backup_snapshot",
         )
         assert result == ("dispatched", 0.7)
 
@@ -2528,12 +2925,23 @@ def _discovery_finding(**overrides):
 class TestEcosystemDiscoveryWatchHandler:
 
     @pytest.mark.asyncio
+    async def test_missing_discovery_tool_fails_closed(self, feature):
+        out = await feature._run_ecosystem_discovery_watch(
+            {"repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "configuration"
+        assert "requires a non-empty tool" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_clean_scan_does_not_signal(self, feature):
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2543,27 +2951,19 @@ class TestEcosystemDiscoveryWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_scan_stale_work_resolves_loaded_talon_tool(self, feature):
-        from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
-
-        talon = TalonCoordinatorFeature(feature.agent)
-        talon._reload_persisted_jobs = MagicMock()
-        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
-        talon._jobs = {
-            "job-1": {
-                "status": "running",
-                "started_at": old,
-                "repo": "owner/name",
-                "issue": 2281,
-            },
-        }
-        feature.agent.features = {"TalonCoordinatorFeature": talon}
+    async def test_explicit_discovery_tool_resolves_external_feature(self, feature):
+        external = _StubJobFeature()
+        external._tool.name = "discover_ecosystem"
+        external._tool.execute = AsyncMock(return_value=_discovery_finding())
+        feature.agent.features = {"ExternalDiscoveryFeature": external}
         feature.agent.hooks_manager = None
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
         feature._save_ecosystem_discovery_state = AsyncMock()
         _wire_watch_dispatcher(feature)
 
-        out = await feature._run_ecosystem_discovery_watch({"repo": "owner/name"})
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
+        )
 
         data = json.loads(out)
         assert data["signaled"] is True
@@ -2572,9 +2972,8 @@ class TestEcosystemDiscoveryWatchHandler:
         signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
         findings = json.loads(signal.payload["findings"])
         assert findings[0]["repo"] == "owner/name"
-        assert findings[0]["kind"] == "talon_job"
+        assert findings[0]["kind"] == "red_ci"
         assert findings[0]["number"] == "2281"
-        assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
 
     @pytest.mark.asyncio
     async def test_roster_args_forwarded_to_scan_tool(self, feature):
@@ -2585,7 +2984,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch({
-            "tool": "scan_stale_work",
+            "tool": "discover_ecosystem",
             "org": "KestrelSovereignAI",
             "repos": ["KestrelSovereignAI/kestrel-feature-*"],
             "repo_prefix": "KestrelSovereignAI/kestrel-",
@@ -2595,7 +2994,7 @@ class TestEcosystemDiscoveryWatchHandler:
         data = json.loads(out)
         assert data["watch_key"] == "ecosystem-roster"
         tool_name, tool_args = feature._lookup_and_run_tool.call_args.args
-        assert tool_name == "scan_stale_work"
+        assert tool_name == "discover_ecosystem"
         assert tool_args["org"] == "KestrelSovereignAI"
         assert tool_args["repos"] == ["KestrelSovereignAI/kestrel-feature-*"]
         assert tool_args["repo_prefix"] == "KestrelSovereignAI/kestrel-"
@@ -2611,7 +3010,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2651,7 +3050,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2677,7 +3076,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2704,7 +3103,7 @@ class TestEcosystemDiscoveryWatchHandler:
         _wire_watch_dispatcher(feature)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
 
         data = json.loads(out)
@@ -2738,7 +3137,7 @@ class TestEcosystemDiscoveryDeliveryGate:
         _wire_watch_dispatcher(feature, handle_factory)
 
         out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         )
         await _settle_watch_deliveries(feature)
         return json.loads(out)
@@ -2822,10 +3221,10 @@ class TestEcosystemDiscoveryDeliveryGate:
         enqueue = _wire_watch_dispatcher(feature, _slow_handle)
 
         first = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
         second = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
 
         assert first["signaled"] is True
@@ -2839,7 +3238,7 @@ class TestEcosystemDiscoveryDeliveryGate:
         feature._save_ecosystem_discovery_state.assert_awaited_once()
         # Settled — the guard released, so a later change can dispatch again.
         third = json.loads(await feature._run_ecosystem_discovery_watch(
-            {"tool": "scan_stale_work", "repo": "owner/name"}
+            {"tool": "discover_ecosystem", "repo": "owner/name"}
         ))
         assert third["signaled"] is True
         assert enqueue.await_count == 2
