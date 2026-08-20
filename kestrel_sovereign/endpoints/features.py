@@ -352,8 +352,26 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     # prevent. Shielding keeps the task alive to its own terminal state, and the
     # lock is released by the task itself, so the guarantee survives a client
     # that hangs up mid-install.
+    # The snapshot, the install and the resolve are ONE transaction over a
+    # shared environment (see _INSTALL_LOCK): snapshotting outside it would let
+    # another install land between the snapshot and the compare, and the guard
+    # would report that as drift against an environment nobody broke.
+    #
+    # The lock is acquired OUTSIDE the shield, deliberately. Shielding the wait
+    # as well meant a request cancelled while QUEUED behind another install
+    # survived its own cancellation, kept waiting, and then installed a package
+    # nobody was asking for any more. Cancellation while waiting MUST prevent
+    # the mutation.
+    #
+    # Once the installer is running, cancellation cannot stop it — cancelling an
+    # `asyncio.to_thread` await does not stop the worker thread or its
+    # subprocess — so that half is shielded and the task releases the lock
+    # itself. Releasing from the awaiting request would free the venv to the
+    # next install while an abandoned installer was still writing.
+    await _INSTALL_LOCK.acquire()
+
     async def _guarded_install():
-        async with _INSTALL_LOCK:
+        try:
             guard = await asyncio.to_thread(CoreInstallGuard.snapshot)
 
             install_error: Optional[Tuple[int, str]] = None
@@ -377,14 +395,15 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
             # in place, unnamed.
             #
             # Bounded, because this repairs by running another installer: an
-            # unbounded one would hang the request the install timeout above
-            # exists to prevent. A repair that hits the bound comes back as an
-            # unrepaired outcome carrying the manual restore command, and the
-            # install's own status still stands.
+            # unbounded one would hang the request the install timeout exists to
+            # prevent. A repair that hits the bound comes back as an unrepaired
+            # outcome carrying the manual restore command.
             outcome = await asyncio.to_thread(
                 guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS,
             )
             return install_error, outcome
+        finally:
+            _INSTALL_LOCK.release()
 
     install_error, outcome = await asyncio.shield(
         asyncio.create_task(_guarded_install())

@@ -302,7 +302,17 @@ class CoreInstallShape:
         return self.provenance.is_from_index
 
     def describe(self) -> str:
-        return f"{self.provenance.describe()} ({self.version or 'not installed'})"
+        # A missing version is not evidence of a missing install: METADATA can
+        # omit `Version` while `direct_url.json` proves the distribution is
+        # right there. Saying "not installed" over provenance that names a
+        # source is a diagnostic that contradicts itself.
+        if self.version:
+            state = self.version
+        elif self.provenance.url or not self.provenance.known:
+            state = "version unavailable"
+        else:
+            state = "not installed"
+        return f"{self.provenance.describe()} ({state})"
 
 
 @dataclass
@@ -369,18 +379,22 @@ class CoreSourcePolicy:
             return f"editable → {self.editable}"
         if self.pypi is not None:
             return f"{CORE_DISTRIBUTION}{self.pypi} from the index (non-editable)"
-        if self.hold_version is not None:
+        if self.hold_version is not None or self.hold_provenance is not None:
             held = self.hold_provenance
+            # The version half may be absent — METADATA can omit `Version` —
+            # and reporting "unconstrained" for a policy that DID reject the
+            # change tells the operator the opposite of what happened.
+            at = (
+                f"unchanged at {self.hold_version}"
+                if self.hold_version is not None
+                else "unchanged (installed version unavailable)"
+            )
             if held is not None and held.known:
                 return (
-                    f"unchanged at {self.hold_version} "
-                    f"({held.describe()}, not an index — no declared source to "
-                    "restore from)"
+                    f"{at} ({held.describe()}, not an index — no declared "
+                    "source to restore from)"
                 )
-            return (
-                f"unchanged at {self.hold_version} "
-                "(source unverifiable — direct_url.json unreadable)"
-            )
+            return f"{at} (source unverifiable — direct_url.json unreadable)"
         return "unconstrained"
 
 

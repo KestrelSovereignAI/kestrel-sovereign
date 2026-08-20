@@ -1131,3 +1131,49 @@ def test_a_direct_url_core_without_version_metadata_is_still_guarded():
         version=None, provenance=fr.Provenance.from_index_install(),
     )
     assert not fr.resolve_core_policy({}, plain).guarded
+
+
+def test_a_provenance_only_hold_does_not_describe_itself_as_unconstrained():
+    """A policy that rejected the change must not report `unconstrained`.
+
+    The version half can be absent — METADATA may omit `Version` — and the
+    describe path keyed only on the version, so a hold that DID guard (and did
+    catch a swap) told the operator it was constraining nothing. A drift error
+    that contradicts the verdict beside it is worse than terse.
+    """
+    url = "git+https://example.invalid/core@abc"
+    shape = fr.CoreInstallShape(version=None, provenance=fr.Provenance.direct(url))
+    policy = fr.resolve_core_policy({}, shape)
+
+    expected = policy.describe_expected()
+    assert "unconstrained" not in expected
+    assert url in expected
+    assert "version unavailable" in expected or "unavailable" in expected
+    # And it really is guarding: the swap it describes is the one it catches.
+    assert not fr.core_install_matches(
+        fr.CoreInstallShape(
+            version=None, provenance=fr.Provenance.from_index_install(),
+        ),
+        policy,
+    )
+
+
+def test_a_missing_version_is_not_reported_as_a_missing_install():
+    """Provenance can prove the distribution is present when the version cannot.
+
+    Inferring "not installed" from an absent version made the guard's recovery
+    diagnostics claim the package was gone while naming the source it came
+    from.
+    """
+    present = fr.CoreInstallShape(
+        version=None,
+        provenance=fr.Provenance.direct("git+https://example.invalid/core@abc"),
+    )
+    assert "not installed" not in present.describe()
+    assert "unavailable" in present.describe()
+
+    # A genuinely absent core still reads as absent.
+    absent = fr.CoreInstallShape(
+        version=None, provenance=fr.Provenance.from_index_install(),
+    )
+    assert "not installed" in absent.describe()

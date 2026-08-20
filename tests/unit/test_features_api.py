@@ -1415,6 +1415,7 @@ class TestConcurrentInstallSerialization:
         )
 
         async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
             app = _make_app(_make_agent())
             import httpx
 
@@ -1460,6 +1461,7 @@ class TestConcurrentInstallSerialization:
                 finished.set()
 
         async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
             inner = _asyncio.create_task(_slow_guarded())
             task = _asyncio.ensure_future(_asyncio.shield(inner))
             await started.wait()
@@ -1482,3 +1484,51 @@ class TestConcurrentInstallSerialization:
         )
         assert finished.is_set(), "shielded work did not run to completion"
         assert not still_locked_after, "lock was never released by the task itself"
+
+    def test_cancelling_while_queued_prevents_the_install_entirely(self):
+        """A request cancelled while WAITING must not install later.
+
+        Shielding the lock wait as well as the transaction meant a request
+        queued behind another install survived its own cancellation, kept
+        waiting, and then installed a package nobody was asking for any more —
+        a mutation with no live request behind it. Cancellation while waiting
+        has to prevent the work; only cancellation once the installer is
+        already running is unstoppable.
+        """
+        import asyncio as _asyncio
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        installed: list = []
+
+        async def _txn(tag):
+            try:
+                installed.append(tag)
+                await _asyncio.sleep(0.05)
+            finally:
+                features_ep._INSTALL_LOCK.release()
+
+        async def _request(tag):
+            # Mirrors the endpoint: acquire OUTSIDE the shield, shield the work.
+            await features_ep._INSTALL_LOCK.acquire()
+            return await _asyncio.shield(_asyncio.create_task(_txn(tag)))
+
+        async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
+            first = _asyncio.create_task(_request("first"))
+            await _asyncio.sleep(0.01)          # first holds the lock
+            second = _asyncio.create_task(_request("second"))
+            await _asyncio.sleep(0.01)          # second is queued on acquire()
+            second.cancel()                     # client hangs up while WAITING
+            try:
+                await second
+            except _asyncio.CancelledError:
+                pass
+            await first
+            await _asyncio.sleep(0.1)           # give a phantom install time to land
+            return list(installed)
+
+        done = _asyncio.run(_drive())
+
+        assert done == ["first"], f"a cancelled-while-queued request installed: {done}"
+        assert not features_ep._INSTALL_LOCK.locked()
