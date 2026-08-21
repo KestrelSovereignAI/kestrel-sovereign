@@ -93,8 +93,11 @@ def _versions(monkeypatch, mapping):
     monkeypatch.setattr(md, "version", fake_version)
 
 
-def _args(manifest, capture=False, dry_run=False):
-    return types.SimpleNamespace(manifest=str(manifest), capture=capture, dry_run=dry_run)
+def _args(manifest, capture=False, dry_run=False, allow_dirty=False):
+    return types.SimpleNamespace(
+        manifest=str(manifest), capture=capture, dry_run=dry_run,
+        allow_dirty=allow_dirty,
+    )
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -1959,3 +1962,67 @@ def test_a_failed_core_extras_ensure_does_not_skip_the_rest_of_the_batch(
     assert venv.editable[CORE] == CHECKOUT           # core never moved
     # ...so the entry after it was still restored.
     assert venv.installed.get("kestrel-feature-voice") == "0.4.0", venv.commands
+
+
+def test_allow_dirty_reaches_the_core_pull(monkeypatch, fake_registry, tmp_path):
+    """The flag has to arrive at the step that honours it.
+
+    Both public routes dropped it: `feature sync` never registered the option,
+    and `cmd_update` omitted it when building sync_args — so the pull was always
+    called with allow_dirty=False while the failure message told the operator to
+    "pass --allow-dirty", a flag one parser rejected and the other ignored.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(f'[[feature]]\nname = "{CORE}"\neditable = "{CHECKOUT}"\n')
+
+    def _run(allow_dirty):
+        # Fresh state each time: the first sync links core, so a second run has
+        # nothing to install and would never reach the pull at all.
+        venv = FakeUv(core_checkout=None, checkouts={CHECKOUT: "0.52.0"})
+        use_fake_uv(monkeypatch, venv)
+        seen: list = []
+        monkeypatch.setattr(
+            "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+            lambda checkout, allow_dirty: seen.append(allow_dirty) or (0, "ok"),
+        )
+        cli.cmd_feature_sync(_args(manifest, allow_dirty=allow_dirty))
+        return seen
+
+    assert _run(True) == [True], "sync dropped --allow-dirty before the pull"
+    assert _run(False) == [False], "sync invented an allow_dirty nobody asked for"
+
+
+def test_update_forwards_allow_dirty_to_feature_sync(tmp_path):
+    """`kestrel update --allow-dirty` must not lose the flag at the sync step."""
+    import argparse
+    from unittest.mock import patch
+
+    from kestrel_sovereign import cli_lifecycle
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "pyproject.toml").touch()
+    # The sync step is gated on the manifest EXISTING — without one, update
+    # skips the restore entirely and the test would pass by never running it.
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    captured: list = []
+
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable", lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda a: manifest), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda a: captured.append(getattr(a, "allow_dirty", "MISSING")) or 0), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0), \
+         patch.object(cli, "cmd_restart", lambda a: 0), \
+         patch.object(cli, "_get_project_dir", lambda: tmp_path), \
+         patch.object(cli, "_resolve_source_checkout", lambda: tmp_path):
+        ns = argparse.Namespace(
+            name=None, pull=False, install=False, features=True, restart=False,
+            allow_dirty=True, no_deps=False, continue_on_error=False,
+            dry_run=False, manifest=None, subprocess=False, force=False,
+            uv_sync=None,
+        )
+        cli.cmd_update(ns)
+
+    assert captured == [True], f"update dropped --allow-dirty: {captured}"

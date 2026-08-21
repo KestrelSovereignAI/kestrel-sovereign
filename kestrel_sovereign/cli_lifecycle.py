@@ -1456,6 +1456,11 @@ def cmd_update(args) -> int:
                 manifest=getattr(args, "manifest", None),
                 capture=False,
                 dry_run=False,
+                # Forwarded, or `kestrel update --allow-dirty` still refuses to
+                # pull a dirty declared core checkout during sync — the flag
+                # advertised on THIS command silently not reaching the step that
+                # honours it.
+                allow_dirty=allow_dirty,
             )
             rc = cli.cmd_feature_sync(sync_args)
             if rc == CORE_UNSAFE:

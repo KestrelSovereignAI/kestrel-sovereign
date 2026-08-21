@@ -2389,6 +2389,14 @@ def add_feature_subparser(subparsers) -> None:
         action="store_true",
         help="Show what would be installed/restored without changing anything",
     )
+    feat_sync.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "Pull a declared editable checkout even when it has modified "
+            "tracked files (same meaning as on `kestrel update`)"
+        ),
+    )
 
     feat_status = feature_sub.add_parser(
         "status",
