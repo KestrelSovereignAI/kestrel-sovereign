@@ -915,3 +915,35 @@ def test_editable_git_pull_recovers_detached_head(tmp_path):
     # And it actually fast-forwarded to origin/main (picked up c2).
     assert git("rev-parse", "HEAD").stdout.strip() == \
         git("rev-parse", "origin/main").stdout.strip()
+
+
+def test_continue_on_error_does_not_restart_on_a_stale_core_checkout(
+    stub_project_dir, capsys,
+):
+    """A failed core pull is not an optional-package failure.
+
+    `--continue-on-error` is documented for a package that would not install.
+    Restarting the fleet onto core code the operator asked to update, and
+    returning success, is not that — and a generic `rc = 1` was silently
+    ignored by exactly that flag.
+    """
+    from kestrel_sovereign import cli_lifecycle
+    from kestrel_sovereign.cli_features import CORE_STALE
+
+    called = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable", lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: called.append("sync") or CORE_STALE), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: called.append("restart") or 0):
+        rc = cli.cmd_update(_ns(continue_on_error=True))
+
+    assert rc == CORE_STALE
+    assert "restart" not in called
+    assert "stale code" in capsys.readouterr().err

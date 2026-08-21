@@ -47,6 +47,50 @@ router = APIRouter(tags=["features"])
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
 
+def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
+    """Describe *package_spec*'s unmet requirement on core, or None.
+
+    Asked after a repair: the restored core may be exactly the version the
+    just-installed package could not accept. Reads the installed metadata rather
+    than the install command, because the requirement that matters is the one
+    the artifact on disk actually declares.
+
+    Any lookup failure returns None — a diagnostic that cannot read the
+    metadata must not manufacture a failure for a package that may be fine.
+    """
+    import importlib.metadata as md
+
+    from kestrel_sovereign.feature_reconcile import (
+        CORE_DISTRIBUTION,
+        canonical_package,
+        version_satisfies,
+    )
+
+    try:
+        from packaging.requirements import Requirement
+
+        name = canonical_package(package_spec.split("[")[0].split("=")[0].strip())
+        requires = md.metadata(name).get_all("Requires-Dist") or []
+        core_version = md.version(CORE_DISTRIBUTION)
+    except Exception:  # noqa: BLE001
+        return None
+
+    for raw in requires:
+        try:
+            req = Requirement(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if canonical_package(req.name) != CORE_DISTRIBUTION:
+            continue
+        spec = str(req.specifier)
+        if spec and not version_satisfies(core_version, spec):
+            return (
+                f"{name} requiring {CORE_DISTRIBUTION}{spec} against the "
+                f"restored {core_version}"
+            )
+    return None
+
+
 #: Serializes the whole snapshot -> install -> resolve sequence.
 #
 # Two overlapping install requests otherwise run it concurrently in worker
@@ -434,6 +478,26 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
             "package": package_spec,
             "message": f"Package '{package_spec}' installed. Restart the agent to load the feature.",
         }
+
+    # Core drifted and was restored — but the package that MOVED core is very
+    # often the reason it moved: a feature requiring core >=0.53 pulls 0.53 in,
+    # the repair puts 0.52 back, and now the freshly installed feature has an
+    # unsatisfied dependency. Telling the UI "installed, restart the agent"
+    # there is a completed-install report over an environment that cannot load
+    # it, which is the shape of failure this whole guard exists to stop.
+    unsatisfied = await asyncio.to_thread(
+        _core_requirement_unsatisfied, package_spec,
+    )
+    if unsatisfied:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Package '{package_spec}' installed and then moved core; core "
+                f"was restored, which leaves {unsatisfied}. The package is "
+                "present but cannot load. Move core to a version it accepts, or "
+                "uninstall the package."
+            ),
+        )
 
     return {
         "status": "installed_with_core_drift",

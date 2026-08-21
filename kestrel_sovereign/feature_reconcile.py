@@ -549,9 +549,17 @@ def spec_is_valid(spec: Optional[str]) -> bool:
     if not spec:
         return True
     try:
+        from packaging.requirements import Requirement
         from packaging.specifiers import SpecifierSet
 
         parsed = SpecifierSet(spec)
+        # `SpecifierSet` silently drops empty clauses, so ",", ",>=1" and
+        # ">=1,,<2" all "parse" — and then the string we RENDER from them is a
+        # requirement pip and uv both reject. Validating the rendered form is
+        # the only check whose bar is the installer's bar; anything lower lets a
+        # manifest typo through here and fails it later, far from the line that
+        # caused it.
+        Requirement(f"{CORE_DISTRIBUTION}{spec}")
     except Exception:  # noqa: BLE001
         return False
     return all(str(clause.version).strip() for clause in parsed)

@@ -1688,10 +1688,11 @@ def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
     rc = cli.cmd_feature_sync(_args(manifest))
 
     out = capsys.readouterr().out
-    # Non-zero: the link is still the right end state, but `kestrel update`
-    # must not restart and report SUCCESS over code that never moved. The
-    # operator asked for an update and got a link — different outcomes.
-    assert rc == 1
+    # CORE_STALE, not the generic 1: the link is still the right end state, but
+    # `kestrel update` must not restart and report SUCCESS over code that never
+    # moved — and `--continue-on-error` ignores 1, so reporting non-zero was not
+    # enough on its own.
+    assert rc == cli_features.CORE_STALE
     assert "REFUSED" in out
     assert "NOT updated" in out  # the staleness is named
     assert venv.editable.get(CORE) == str(checkout)

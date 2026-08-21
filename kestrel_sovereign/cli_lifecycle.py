@@ -1215,7 +1215,7 @@ def cmd_update(args) -> int:
         aborts before the restart, because continuing would bring the
         agents up on a core the manifest does not declare (#2949).
     """
-    from kestrel_sovereign.cli_features import CORE_UNSAFE
+    from kestrel_sovereign.cli_features import CORE_STALE, CORE_UNSAFE
 
     # cli._get_project_dir() returns the RUNTIME data root (honors
     # KESTREL_HOME) which is the wrong place for git pull and
@@ -1463,6 +1463,18 @@ def cmd_update(args) -> int:
                 allow_dirty=allow_dirty,
             )
             rc = cli.cmd_feature_sync(sync_args)
+            if rc == CORE_STALE:
+                # Core is on its declared path but the pull failed, so the code
+                # about to be restarted is not the code the operator asked for.
+                # Not continuable for the same reason CORE_UNSAFE is not.
+                print(
+                    "• features: FAILED — the declared core checkout could not "
+                    "be updated, so a restart would run stale code. Resolve the "
+                    "checkout (or pass --allow-dirty); --continue-on-error does "
+                    "not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_STALE
             if rc == CORE_UNSAFE:
                 # Same rule as reconcile below: an unrepaired core drift is a
                 # safety failure, not an optional-package failure, so

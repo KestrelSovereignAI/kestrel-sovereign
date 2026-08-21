@@ -1532,3 +1532,46 @@ class TestConcurrentInstallSerialization:
 
         assert done == ["first"], f"a cancelled-while-queued request installed: {done}"
         assert not features_ep._INSTALL_LOCK.locked()
+
+
+class TestPostRepairRevalidation:
+    """A restored core can be exactly the version the new package rejected."""
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_orphaned_feature_after_repair_is_not_reported_as_installed(
+        self, mock_registry, monkeypatch,
+    ):
+        """The package that MOVED core is usually the reason it moved.
+
+        A feature requiring core >=0.53 pulls 0.53 in; the repair puts 0.52
+        back; the freshly installed feature now has an unsatisfied dependency
+        and cannot load. Returning 200 "installed, restart the agent" there is a
+        completed-install report over an environment that cannot run it.
+        """
+        import importlib.metadata as md
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        # Core moved and was restored to 0.52.0, which the package rejects.
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({"Requires-Dist": ["kestrel-sovereign>=0.53"]}),
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500, resp.json()
+        detail = resp.json()["detail"]
+        assert "cannot load" in detail
+        assert "0.52.0" in detail

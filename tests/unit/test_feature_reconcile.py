@@ -1177,3 +1177,22 @@ def test_a_missing_version_is_not_reported_as_a_missing_install():
         version=None, provenance=fr.Provenance.from_index_install(),
     )
     assert "not installed" in absent.describe()
+
+
+# NB: a TRAILING comma (">=1,") is normalized away and accepted by the
+# installer, so it is correctly valid — only genuinely empty clauses are not.
+@pytest.mark.parametrize("spec", [",", ",>=1", ">=1,,<2", ",,"])
+def test_contract_a_spec_the_installer_rejects_is_not_valid(spec):
+    """`SpecifierSet` drops empty clauses; the installer does not.
+
+    ",", ",>=1" and ">=1,,<2" all "parse" as specifier sets, and then the string
+    RENDERED from them is a requirement pip and uv both reject — so a manifest
+    typo passed validation here and failed far away, in a constraints file. The
+    only bar worth checking is the installer's, which means validating the
+    rendered requirement.
+    """
+    from packaging.requirements import Requirement
+
+    assert not fr.spec_is_valid(spec)
+    with pytest.raises(Exception):
+        Requirement(f"{fr.CORE_DISTRIBUTION}{spec}")

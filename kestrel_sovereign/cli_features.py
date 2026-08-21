@@ -40,6 +40,14 @@ from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 # never this (issue #2949). See :meth:`CoreInstallGuard.verify`.
 CORE_UNSAFE = 2
 
+# Return code for "core is on its declared path but was NOT updated" — a
+# declared editable checkout whose pull failed. Distinct from CORE_UNSAFE (core
+# is the wrong install) and from a plain package failure, and like CORE_UNSAFE
+# it is NOT continuable: `--continue-on-error` is documented for an optional
+# package that would not install, and restarting the fleet onto stale core code
+# while reporting success is not that (issue #2949).
+CORE_STALE = 3
+
 # A ``file:`` URL path that is really a Windows drive: ``/C:/src`` — or the
 # legacy bar spelling ``/C|/src`` that older tools still emit.
 _DRIVE_URL_PATH = re.compile(r"^/[A-Za-z][:|](/|$)")
@@ -1777,7 +1785,11 @@ def cmd_feature_sync(args) -> int:
                     #
                     # `--allow-dirty` is honoured above, so the operator who
                     # means "link over my edits" has a way to say it.
-                    rc = 1
+                    # CORE_STALE, not the generic 1: `--continue-on-error`
+                    # ignores 1, restarts, and returns success — which is the
+                    # exact outcome this was added to prevent. Reporting is not
+                    # enough if the report is then discarded.
+                    rc = CORE_STALE
                     print(
                         f"      note: {target} was linked but NOT updated — the "
                         "checkout above is what will run after a restart."
