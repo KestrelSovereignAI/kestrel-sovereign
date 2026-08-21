@@ -48,6 +48,32 @@ CORE_UNSAFE = 2
 # while reporting success is not that (issue #2949).
 CORE_STALE = 3
 
+# Exit-code severity, worst first. `max()` on the raw ints is WRONG (CORE_STALE
+# is 3 and CORE_UNSAFE is 2), which is exactly why ranking these by hand at each
+# assignment site kept losing the stronger code.
+_RC_SEVERITY = (CORE_UNSAFE, CORE_STALE, 1, 0)
+
+
+def _worst_rc(*codes: int) -> int:
+    """Fold several exit codes into the most severe one.
+
+    ``cmd_feature_sync`` tracks two INDEPENDENT facts: did some package fail to
+    install, and is core in a state a restart must not proceed over. They shared
+    a single ``rc``, so an optional feature failing *after* a failed core pull
+    overwrote :data:`CORE_STALE` with ``1`` — a code `--continue-on-error`
+    ignores by contract, which restarted the fleet onto stale core code and
+    reported success. That is the very outcome CORE_STALE was added to prevent
+    (issue #2949).
+
+    Two facts get two variables, and the ranking lives in one place so a new
+    assignment site cannot forget it.
+    """
+    for rank in _RC_SEVERITY:
+        if rank in codes:
+            return rank
+    # An unrecognised non-zero code still outranks success.
+    return next((code for code in codes if code), 0)
+
 # A ``file:`` URL path that is really a Windows drive: ``/C:/src`` — or the
 # legacy bar spelling ``/C|/src`` that older tools still emit.
 _DRIVE_URL_PATH = re.compile(r"^/[A-Za-z][:|](/|$)")
@@ -1724,7 +1750,11 @@ def cmd_feature_sync(args) -> int:
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
 
-    rc = 0
+    # Two INDEPENDENT facts, deliberately not sharing one int (see
+    # `_worst_rc`): `package_rc` is "some package failed to install",
+    # `core_state` is "core is in a state a restart must not proceed over".
+    package_rc = 0
+    core_state = 0
     installed = 0
     for entry in entries:
         target, current, action = _resolve_manifest_action(entry, registry)
@@ -1789,7 +1819,7 @@ def cmd_feature_sync(args) -> int:
                     # ignores 1, restarts, and returns success — which is the
                     # exact outcome this was added to prevent. Reporting is not
                     # enough if the report is then discarded.
-                    rc = CORE_STALE
+                    core_state = CORE_STALE
                     print(
                         f"      note: {target} was linked but NOT updated — the "
                         "checkout above is what will run after a restart."
@@ -1849,7 +1879,9 @@ def cmd_feature_sync(args) -> int:
             result = run([git_spec])
 
         if result.returncode != 0:
-            rc = 1
+            # A package failure NEVER touches `core_state`: it must not be able
+            # to downgrade a CORE_STALE recorded earlier in this same batch.
+            package_rc = 1
             print(f"  {target:<34} {current or '-':<10} FAILED")
             for line in (result.stderr or "").strip().splitlines()[-3:]:
                 print(f"      {line}")
@@ -1900,12 +1932,14 @@ def cmd_feature_sync(args) -> int:
         # CORE_UNSAFE is returned verbatim — `kestrel update` gates its restart
         # on this rc under --continue-on-error exactly as reconcile does, so
         # collapsing it into 1 would reopen the same hole one step earlier.
-        core_rc = guard.verify()
-        if core_rc == CORE_UNSAFE:
+        #
+        # `verify()` is a second reading of CORE state, so it is RANKED against
+        # the first rather than assigned over it — a repaired-core `1` must not
+        # erase a CORE_STALE recorded by the pull above.
+        core_state = _worst_rc(core_state, guard.verify())
+        if core_state == CORE_UNSAFE:
             return CORE_UNSAFE
-        if core_rc:
-            rc = 1
-    return rc
+    return _worst_rc(core_state, package_rc)
 
 
 # ---------------------------------------------------------------------------

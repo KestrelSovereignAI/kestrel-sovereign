@@ -1575,3 +1575,101 @@ class TestPostRepairRevalidation:
         detail = resp.json()["detail"]
         assert "cannot load" in detail
         assert "0.52.0" in detail
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_an_inactive_conditional_core_requirement_is_not_reported_unmet(
+        self, mock_registry, monkeypatch,
+    ):
+        """A requirement this interpreter does not have is not an unmet one.
+
+        `Requires-Dist: kestrel-sovereign>=0.60; python_version < "3.10"` says
+        nothing about a 3.13 host. Checking its specifier regardless turned a
+        healthy install into a 500 — the guard inventing the very failure it
+        exists to report.
+        """
+        import importlib.metadata as md
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        # The SAME specifier the test above proves is reported when it applies —
+        # only the marker differs, so the marker is what this test isolates.
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({
+                "Requires-Dist": [
+                    'kestrel-sovereign>=0.53; python_version < "3.10"',
+                ],
+            }),
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200, resp.json()
+        # The drift itself is still reported — only the false unmet-requirement
+        # claim is gone.
+        assert resp.json()["status"] == "installed_with_core_drift"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_core_revalidation_runs_while_the_install_lock_is_held(
+        self, mock_registry, monkeypatch,
+    ):
+        """Reading live core version outside the lock reads a passing state.
+
+        A queued install is waiting to mutate the very environment this reads.
+        Outside the lock, this can observe a core the next request puts up and
+        takes back down, and answer about an environment that never outlived the
+        read. The earlier fix moved snapshot/install/resolve inside the lock;
+        this check was added afterwards and was left outside it.
+        """
+        import importlib.metadata as md
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({"Requires-Dist": ["kestrel-sovereign>=0.53"]}),
+        )
+
+        held = []
+        real = features_ep._core_requirement_unsatisfied
+
+        def _observe(package_spec):
+            # Observed AT THE MOMENT OF THE CALL, not afterwards: the question
+            # is whether this read is inside the critical section.
+            held.append(features_ep._INSTALL_LOCK.locked())
+            return real(package_spec)
+
+        monkeypatch.setattr(
+            features_ep, "_core_requirement_unsatisfied", _observe,
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500, resp.json()   # the check really ran...
+        assert held == [True]                          # ...and ran holding the lock

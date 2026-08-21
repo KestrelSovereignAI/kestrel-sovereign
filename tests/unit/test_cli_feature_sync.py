@@ -109,6 +109,26 @@ def test_pip_spec_renders_extras():
     assert cli._pip_spec("pkg", ["a", "b"]) == "pkg[a,b]"
 
 
+def test_worst_rc_ranks_by_severity_not_by_value():
+    """These exit codes are NOT ordered by their numbers.
+
+    CORE_STALE is 3 and CORE_UNSAFE is 2, so `max()` on the raw ints ranks a
+    stale core above an *undeclared* one and returns the weaker code for the
+    more dangerous state. The ranking is explicit for exactly that reason.
+    """
+    from kestrel_sovereign.cli_features import CORE_STALE, _worst_rc
+
+    assert _worst_rc(0, 0) == 0
+    assert _worst_rc(0, 1) == 1
+    # A core state always outranks an ordinary package failure...
+    assert _worst_rc(1, CORE_STALE) == CORE_STALE
+    assert _worst_rc(1, CORE_UNSAFE) == CORE_UNSAFE
+    # ...and an undeclared core outranks a merely stale one.
+    assert _worst_rc(CORE_STALE, CORE_UNSAFE) == CORE_UNSAFE
+    # The trap this exists to avoid, stated as the fact it is:
+    assert max(CORE_STALE, CORE_UNSAFE) == CORE_STALE
+
+
 def test_extension_install_run_prefers_uv(monkeypatch):
     seen = {}
 
@@ -1696,6 +1716,49 @@ def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
     assert "REFUSED" in out
     assert "NOT updated" in out  # the staleness is named
     assert venv.editable.get(CORE) == str(checkout)
+
+
+def test_a_later_feature_failure_cannot_downgrade_a_stale_core(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """CORE_STALE must survive an ordinary package failure later in the batch.
+
+    Core is synced FIRST, so every optional feature is installed after it. `rc`
+    carried both facts in one int, so a failed optional feature overwrote
+    CORE_STALE with 1 — and `--continue-on-error` ignores 1, restarting the
+    fleet onto the stale checkout and exiting 0. That is precisely the outcome
+    CORE_STALE was added to prevent, reintroduced one step later.
+    """
+    checkout = tmp_path / "core-checkout"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "{checkout}"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    # `feature_requires` that the INSTALLED core already satisfies: the feature
+    # fails on its own build, so nothing here moves core. Any CORE_STALE can
+    # only have come from the refused pull, not from drift the feature caused.
+    venv = FakeUv(
+        core_checkout=None,
+        checkouts={str(checkout): "0.52.0"},
+        feature_requires=">=0.5",
+        feature_install_fails=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+        lambda path, allow_dirty: (2, "REFUSED — checkout has modified tracked files"),
+    )
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    # Both facts are real in this run — the premise of the test, not its claim.
+    assert "NOT updated" in out       # core is stale
+    assert "Failed to build" in out   # and an optional feature genuinely failed
+    # The claim: the stronger code survives the weaker one.
+    assert rc == cli_features.CORE_STALE
 
 
 def test_an_unreadable_direct_url_file_is_unknown_not_an_index_install(
