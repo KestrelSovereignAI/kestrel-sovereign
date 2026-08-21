@@ -827,6 +827,31 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
 """
 
 
+def core_schema_sql(backend_type: str) -> str:
+    """The whole core schema for one backend, in dependency order.
+
+    ``CORE_SCHEMA`` stopped being the whole of it when #3009 moved
+    ``conversation_history`` into ``conversation_created_at``: its CHECK is
+    per-backend, and ``normalize_schema`` strips the column default on the way
+    to SQLite (#3048). Its indexes stayed behind in ``CORE_SCHEMA``, so the
+    table has to come FIRST.
+
+    This exists because three callers build a database out of that text and
+    each was silently left with a schema missing one table — and, because the
+    indexes are still declared, an error rather than a quiet gap. They asked
+    for "the core schema" and should go on getting it; where a table happens to
+    be declared is this module's business, not theirs.
+    """
+    return (
+        conversation_history_ddl(backend_type).replace(
+            "CREATE TABLE {table}",
+            "CREATE TABLE IF NOT EXISTS conversation_history",
+        )
+        + ";\n"
+        + normalize_schema(CORE_SCHEMA, backend_type)
+    )
+
+
 class AsyncDatabase:
     """
     Async database manager supporting SQLite and PostgreSQL.
@@ -945,18 +970,10 @@ class AsyncDatabase:
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
-        # conversation_history first, and not through ``normalize_schema``.
-        # Its shape is genuinely per-backend (the CHECK carrying #3009's rule
-        # reads a spelling only SQLite can get wrong), and the translation that
-        # would otherwise apply strips the column default this table least
-        # wants stripped. CORE_SCHEMA's indexes on it follow immediately below.
-        await self._backend.execute(
-            conversation_history_ddl(self.backend_type).replace(
-                "CREATE TABLE {table}",
-                "CREATE TABLE IF NOT EXISTS conversation_history",
-            )
-        )
-        schema = normalize_schema(CORE_SCHEMA, self.backend_type)
+        # Through the accessor, not CORE_SCHEMA directly: conversation_history
+        # is declared per-backend and has to be created before the indexes
+        # CORE_SCHEMA still carries for it. See ``core_schema_sql``.
+        schema = core_schema_sql(self.backend_type)
 
         # Execute each statement separately for PostgreSQL compatibility
         for statement in schema.split(';'):

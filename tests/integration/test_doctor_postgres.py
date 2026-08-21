@@ -36,7 +36,7 @@ import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import diagnose
-from kestrel_sovereign.storage.async_database import CORE_SCHEMA, normalize_schema
+from kestrel_sovereign.storage.async_database import core_schema_sql
 from kestrel_sovereign.multi_agent.config import (
     HostConfig,
     LocalAgentConfig,
@@ -98,7 +98,7 @@ def runtime_db():
         # which the subset did not create, and the reads that need it only
         # worked because a force-less inspection ran migrations against the
         # store on its way past — the #2920 write this branch removes.
-        cursor.execute(normalize_schema(CORE_SCHEMA, "postgres"))
+        cursor.execute(core_schema_sql("postgres"))
         # A database the runtime has opened has #2649 recorded, which is what
         # makes a *missing* ownership witness permanent rather than pending.
         cursor.execute(
@@ -211,7 +211,7 @@ def _seed_project(tmp_path: Path, anchored_hash: str) -> Path:
         # #2920 defect, so with it gone every fixture has to supply what a
         # real anchor has. Taking CORE_SCHEMA means the list cannot drift out
         # of step a fourth time.
-        connection.executescript(CORE_SCHEMA)
+        connection.executescript(core_schema_sql("sqlite"))
         connection.execute(
             "INSERT INTO schema_backfills (name) VALUES ('ownership_2649')"
         )
