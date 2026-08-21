@@ -103,6 +103,7 @@ class FakeUv:
         repair_hangs_after_restore=False,
         feature_install_fails=False,
         feature_install_times_out=False,
+        feature_install_interrupted=False,
         direct_urls=None,
         unreadable_provenance=None,
     ):
@@ -128,6 +129,7 @@ class FakeUv:
         self.repair_hangs_after_restore = repair_hangs_after_restore
         self.feature_install_fails = feature_install_fails
         self.feature_install_times_out = feature_install_times_out
+        self.feature_install_interrupted = feature_install_interrupted
         # Non-editable direct-URL installs, by dist: a VCS ref, local path or
         # remote archive. Distinct from `editable` (which is also a direct URL,
         # but flagged) and from absent (an index resolution).
@@ -199,6 +201,15 @@ class FakeUv:
             # landed before the timeout.
             self._swap_core_for_index_wheel(pin)
             raise subprocess.TimeoutExpired(cmd, timeout or 0)
+
+        if self.feature_install_interrupted:
+            # Ctrl-C. Same shape as the timeout above and for the same reason —
+            # a killed installer keeps whatever it already wrote — but it
+            # arrives as a BaseException that unwinds the caller instead of a
+            # value it can inspect, which is how the post-check came to be
+            # skipped (issue #2962).
+            self._swap_core_for_index_wheel(pin)
+            raise KeyboardInterrupt()
 
         if self._reinstalls_dependencies(cmd):
             self._reinstall_core_from_index(pin)

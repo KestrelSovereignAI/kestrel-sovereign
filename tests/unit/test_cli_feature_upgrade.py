@@ -465,3 +465,29 @@ def test_host_feature_entry_point_group_is_captured(monkeypatch):
     assert "kestrel-feature-observability-fleet" in names
     fleet = next(d for d in dists if d["dist"] == "kestrel-feature-observability-fleet")
     assert "host_features:fleet" in fleet["entries"]
+
+
+def test_upgrade_reports_core_drift_when_the_install_is_interrupted(
+    monkeypatch, fake_registry, capsys,
+):
+    """`feature upgrade` is the third install path (#2962)."""
+    from tests.utils.fake_uv import CORE, FakeUv, use_fake_uv
+
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("kestrel-feature-voice", "0.1.0")],
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    assert venv.editable.get(CORE) != "/src/core"

@@ -552,3 +552,27 @@ def test_reconcile_source_switch_leaves_the_editable_core_linked(
     assert not any("--force-reinstall" in c for c in venv.commands)
     cmd = venv.commands[0]
     assert cmd[cmd.index("--reinstall-package") + 1] == "kestrel-feature-voice"
+
+
+def test_reconcile_reports_core_drift_when_the_install_is_interrupted(
+    monkeypatch, patched, capsys,
+):
+    """`kestrel update`'s reconcile loop is the fourth install path (#2962).
+
+    All four go through `CoreInstallGuard._install`, so this asserts the wiring
+    holds here rather than re-asserting the report's content.
+    """
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        _reconcile(patched)
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    assert "/src/core" in err          # the declared source to restore to
+    assert venv.editable.get(CORE) != "/src/core"   # left moved: no repair ran

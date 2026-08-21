@@ -1135,6 +1135,11 @@ class CoreGuardOutcome:
     # moved it — a swap, as opposed to a core that never conformed to begin with.
     replaced: bool = False
     repaired: bool = False
+    # Was a repair even ATTEMPTED? An interrupted install is checked but never
+    # repaired — an abort must not start installing — so "we tried and failed"
+    # and "we did not try" are different facts and must not print the same
+    # sentence (issue #2962).
+    attempted: bool = True
     command: Optional[str] = None
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
@@ -1181,6 +1186,14 @@ class CoreGuardOutcome:
                 "no command that could put it back. See the detail above."
             )
         where = f" in {self.shell}" if self.shell else ""
+        if not self.attempted:
+            # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
+            # would report an attempt that never happened, and an operator who
+            # believes a repair ran is exactly the one who will not run this.
+            return (
+                "NOT RESTORED — the install was interrupted, so no repair was "
+                f"attempted. Run `{self.command}`{where} by hand."
+            )
         return f"RESTORE FAILED — run `{self.command}`{where} by hand."
 
     def describe(self) -> str:
@@ -1289,7 +1302,7 @@ class CoreInstallGuard:
         would reinstall core from the index straight through the constraint —
         same version, wheel instead of link.
         """
-        return cli._extension_install_run(
+        return self._install(
             pip_args,
             constraints=self._constraints or None,
             reinstall=reinstall,
@@ -1308,7 +1321,7 @@ class CoreInstallGuard:
         the target here: reinstalling core does not require rebuilding core's
         own dependency tree, and a blanket flag would.
         """
-        result = cli._extension_install_run(
+        result = self._install(
             pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
         )
         self.refresh()
@@ -1352,6 +1365,174 @@ class CoreInstallGuard:
             return None
         return describe_core_change(self.before, cli._core_install_shape(), self.policy)
 
+    def _unrestorable(self, drift, replaced, *, attempted=True):
+        """The outcome for a drift with no declared source to restore from.
+
+        A hold policy means core did not come from an index and NOBODY declared
+        where it should come from. The drift is real and must be reported, but
+        there is no declared source to reinstall from — so refuse to guess one.
+        Reinstalling core from a source nobody declared is the retargeting this
+        guard exists to prevent, and committing it *as the repair* would be the
+        worst possible place.
+
+        The two cases say different things to an operator: one can be told
+        exactly where core came from, the other cannot be told anything.
+
+        Shared by :meth:`resolve` and the interrupt path so both surfaces say it
+        the same way; only *attempted* differs between them.
+        """
+        held = self.policy.hold_provenance
+        cause = (
+            f"core was installed from {held.describe()}, which no manifest "
+            "entry declares"
+            if held is not None and held.known
+            else "core's install source could not be read"
+        )
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=False,
+            attempted=attempted,
+            command="",
+            shell="",
+            output=(
+                f"{cause}, so there is no declared source to restore from. "
+                "Reinstall core yourself, or declare its source in "
+                ".kestrel-host-features.toml."
+            ),
+        )
+
+    def _install(self, pip_args, *, constraints, reinstall, timeout):
+        """Run the installer — the ONE place a subprocess is started.
+
+        Every install this guard performs goes through here (:meth:`run`,
+        :meth:`install_core`, :meth:`_repair`), which is what makes interrupt
+        handling a property of the guard rather than something each of the four
+        CLI paths has to remember (issue #2962).
+
+        A ``KeyboardInterrupt`` never returns, so neither the success nor the
+        failure branch above it runs and the post-check is skipped entirely —
+        while a killed installer can already have replaced core. That is the
+        #2949 failure with nobody told. Report what moved, then let the
+        interrupt continue on its way.
+        """
+        try:
+            return cli._extension_install_run(
+                pip_args,
+                constraints=constraints,
+                reinstall=reinstall,
+                timeout=timeout,
+            )
+        except KeyboardInterrupt:
+            self._report_interrupt()
+            raise
+
+    def _interrupt_outcome(self):
+        """Non-mutating counterpart to :meth:`resolve`: describe, never repair.
+
+        Returns None when core still conforms — an interrupt is not by itself
+        evidence that anything moved.
+        """
+        from kestrel_sovereign.feature_reconcile import core_install_matches
+
+        drift = self._check()
+        if drift is None:
+            return None
+        replaced = core_install_matches(self._baseline, self.policy)
+        if not self.policy.source_is_verifiable:
+            return self._unrestorable(drift, replaced, attempted=False)
+        _, _, rendered, shell = self._restore_plan()
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=False,
+            attempted=False,
+            command=rendered,
+            shell=shell,
+        )
+
+    def _report_interrupt(self) -> None:
+        """Name any drift an interrupted installer left behind. REPORTS ONLY.
+
+        Deliberately does not repair. A repair runs another installer, and an
+        abort must not start unbounded work: the operator's second Ctrl-C would
+        land inside it, and a repair that hangs turns an abort into a wedge.
+        Everything here is a metadata read, so it is bounded by construction —
+        which is why this is the one place allowed to ask :meth:`_check` without
+        also acting on the answer.
+
+        Never raises. A diagnostic that fails must not replace the interrupt
+        with its own traceback — the operator pressed Ctrl-C and is entitled to
+        get Ctrl-C. ``KeyboardInterrupt`` is a ``BaseException``, so a SECOND
+        one passes straight through this handler rather than being swallowed.
+        """
+        if not self.policy.guarded:
+            return
+        try:
+            outcome = self._interrupt_outcome()
+        except Exception:  # noqa: BLE001 - see docstring: never mask the interrupt
+            return
+        if outcome is None:
+            return
+        print(
+            f"• core: INTERRUPTED — {outcome.headline}.",
+            file=sys.stderr,
+        )
+        for line in (outcome.drift or "").splitlines():
+            print(f"    {line}", file=sys.stderr)
+        print(f"    {outcome.restore_instruction}", file=sys.stderr)
+        for line in outcome.output.splitlines()[-3:]:
+            print(f"      {line}", file=sys.stderr)
+
+    def _restore_plan(self):
+        """The exact install that would put core back — rendered, NOT run.
+
+        Returns ``(pip_args, reinstall, rendered, shell)``.
+
+        One derivation with two consumers: :meth:`_repair` runs it, and the
+        interrupt path prints it without running anything (issue #2962).
+        Deriving it twice is how a printed restore command starts describing a
+        different install than the one the guard would actually perform — the
+        precise failure :meth:`_repair` already documents for the *rendering*,
+        now true of the argv as well.
+        """
+        if self.policy.editable:
+            checkout = str(Path(self.policy.editable).expanduser())
+            pip_args = ["-e", checkout]
+            # Installing from a local path replaces whatever holds the name, so
+            # the link comes back without forcing anything.
+            reinstall = None
+        else:
+            # Declared from the index. A reinstall is needed to displace any
+            # install the resolver would otherwise consider done: an editable
+            # link, and equally a non-editable direct-URL copy (VCS, local path,
+            # archive) whose version already satisfies the spec — pip and uv
+            # judge "already satisfied" by VERSION, so re-resolving the spec is
+            # a no-op and the wrong source survives.
+            #
+            # Detection and repair must ask the SAME question. Asking only
+            # "is it editable?" here while _check() asks "is it from an index?"
+            # makes a drift this guard now names one it can never fix: a
+            # permanent CORE_UNSAFE, plus a printed manual command that no-ops
+            # for the operator exactly as the automatic repair did.
+            #
+            # A version outside the window is still fixed by resolving the spec
+            # again. Scoped to core, never blanket: a repair that reinstalls
+            # "everything resolved" would drop an editable SDK (or any other
+            # editable dependency of core) for an index wheel — issue #2949
+            # committed by the code that exists to undo it.
+            spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
+            pip_args = [spec]
+            reinstall = (
+                None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
+            )
+        return (
+            pip_args,
+            reinstall,
+            _render_commands(_install_commands(pip_args, reinstall=reinstall)),
+            _render_shell(),
+        )
+
     def _repair(self, *, timeout=None):
         """Reinstall core from its declared source.
 
@@ -1386,41 +1567,9 @@ class CoreInstallGuard:
         restore command, and the caller still needs to report whatever brought
         it here.
         """
-        if self.policy.editable:
-            checkout = str(Path(self.policy.editable).expanduser())
-            pip_args = ["-e", checkout]
-            # Installing from a local path replaces whatever holds the name, so
-            # the link comes back without forcing anything.
-            reinstall = None
-        else:
-            # Declared from the index. A reinstall is needed to displace any
-            # install the resolver would otherwise consider done: an editable
-            # link, and equally a non-editable direct-URL copy (VCS, local path,
-            # archive) whose version already satisfies the spec — pip and uv
-            # judge "already satisfied" by VERSION, so re-resolving the spec is
-            # a no-op and the wrong source survives.
-            #
-            # Detection and repair must ask the SAME question. Asking only
-            # "is it editable?" here while _check() asks "is it from an index?"
-            # makes a drift this guard now names one it can never fix: a
-            # permanent CORE_UNSAFE, plus a printed manual command that no-ops
-            # for the operator exactly as the automatic repair did.
-            #
-            # A version outside the window is still fixed by resolving the spec
-            # again. Scoped to core, never blanket: a repair that reinstalls
-            # "everything resolved" would drop an editable SDK (or any other
-            # editable dependency of core) for an index wheel — issue #2949
-            # committed by the code that exists to undo it.
-            spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
-            pip_args = [spec]
-            reinstall = (
-                None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
-            )
-        rendered = _render_commands(
-            _install_commands(pip_args, reinstall=reinstall),
-        )
+        pip_args, reinstall, rendered, shell = self._restore_plan()
         try:
-            result = cli._extension_install_run(
+            result = self._install(
                 pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
             )
         except subprocess.TimeoutExpired as expired:
@@ -1430,7 +1579,7 @@ class CoreInstallGuard:
             # Core is where the policy wants it: that is the state this batch
             # now measures later drift against.
             self.refresh()
-        return ok, rendered, _render_shell(), result
+        return ok, rendered, shell, result
 
     def resolve(self, *, timeout=None) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
@@ -1469,34 +1618,7 @@ class CoreInstallGuard:
         replaced = core_install_matches(self._baseline, self.policy)
 
         if not self.policy.source_is_verifiable:
-            # A hold policy means core did not come from an index and NOBODY
-            # declared where it should come from. The drift is real and must be
-            # reported, but there is no declared source to reinstall from — so
-            # refuse to guess one. Reinstalling core from a source nobody
-            # declared is the retargeting this guard exists to prevent, and
-            # committing it *as the repair* would be the worst possible place.
-            #
-            # The two cases say different things to an operator: one can be told
-            # exactly where core came from, the other cannot be told anything.
-            held = self.policy.hold_provenance
-            cause = (
-                f"core was installed from {held.describe()}, which no manifest "
-                "entry declares"
-                if held is not None and held.known
-                else "core's install source could not be read"
-            )
-            return CoreGuardOutcome(
-                drift=drift,
-                replaced=replaced,
-                repaired=False,
-                command="",
-                shell="",
-                output=(
-                    f"{cause}, so there is no declared source to restore from. "
-                    "Reinstall core yourself, or declare its source in "
-                    ".kestrel-host-features.toml."
-                ),
-            )
+            return self._unrestorable(drift, replaced)
 
         repaired, rendered, shell, result = self._repair(timeout=timeout)
         return CoreGuardOutcome(

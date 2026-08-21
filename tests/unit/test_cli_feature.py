@@ -671,3 +671,29 @@ class TestBuildParser:
         assert args.command == "skills"
         assert args.skills_command == "search"
         assert args.query == "gpu"
+
+
+def test_feature_install_reports_core_drift_when_interrupted(monkeypatch, capsys):
+    """`feature install` is the first of the four install paths (#2962).
+
+    Ctrl-C never returns, so the post-check that proves core survived is
+    skipped — while the installer may already have replaced it.
+    """
+    from kestrel_sovereign.cli import cmd_feature_install
+    from tests.utils.fake_uv import CORE, FakeUv, use_fake_uv
+
+    with patch("kestrel_sovereign.feature_registry.load_registry") as mock_load:
+        mock_load.return_value = _make_registry()
+        venv = FakeUv(
+            core_checkout="/src/core",
+            honours_constraints=False,
+            feature_install_interrupted=True,
+        )
+        use_fake_uv(monkeypatch, venv)
+
+        with pytest.raises(KeyboardInterrupt):
+            cmd_feature_install(_make_args(name="voice"))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    assert venv.editable.get(CORE) != "/src/core"
