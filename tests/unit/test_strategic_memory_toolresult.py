@@ -25,10 +25,19 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.strategic_memory import StrategicMemoryFeature
 from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
+from kestrel_sovereign.features.strategic_memory.ledger import (
+    BLOCKERS_KEY,
+    PATTERNS_KEY,
+    StrategyLedger,
+)
 
 
 def _make_feature(
-    data: dict | None = None, *, agent=None
+    data: dict | None = None,
+    *,
+    agent=None,
+    blockers: list | None = None,
+    patterns: list | None = None,
 ) -> StrategicMemoryFeature:
     feat = StrategicMemoryFeature(agent=agent if agent is not None else MagicMock())
     feat._data = data if data is not None else {}
@@ -37,6 +46,13 @@ def _make_feature(
     # exercising the no-path / write-failure edges (F291) override these.
     feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
     feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))
+    # Blockers and patterns live in STRATEGY_LEDGER.yaml (#2954), which has
+    # its own path and its own write. Stub it the same way.
+    feat._ledger = StrategyLedger(Path("/tmp/kestrel-test/STRATEGY_LEDGER.yaml"))
+    feat._ledger.data[BLOCKERS_KEY] = list(blockers or [])
+    feat._ledger.data[PATTERNS_KEY] = list(patterns or [])
+    feat._ledger.normalize()
+    feat._ledger.save = MagicMock(return_value=None)
     return feat
 
 
@@ -88,7 +104,7 @@ async def test_strategy_view_vision_present():
 
 @pytest.mark.asyncio
 async def test_resolve_blocker_missing_returns_error():
-    feat = _make_feature({"blockers": [{"issue": "OTHER"}]})
+    feat = _make_feature(blockers=[{"issue": "OTHER"}])
     result = await feat.strategy_resolve_blocker(issue="GONE")
     assert result.status is ToolResultStatus.ERROR
     assert "GONE" in result.error
@@ -96,7 +112,7 @@ async def test_resolve_blocker_missing_returns_error():
 
 @pytest.mark.asyncio
 async def test_resolve_blocker_present_returns_ok():
-    feat = _make_feature({"blockers": [{"issue": "X-1", "title": "fix"}]})
+    feat = _make_feature(blockers=[{"issue": "X-1", "title": "fix"}])
     result = await feat.strategy_resolve_blocker(issue="X-1")
     assert result.status is ToolResultStatus.OK
     assert result.data["removed_count"] == 1
@@ -359,7 +375,7 @@ async def test_strategy_add_blocker_invalid_severity_rejected():
     assert result.status is ToolResultStatus.ERROR
     assert "Must be one of: low, medium, high, critical" in result.error
     # Nothing persisted on rejection.
-    assert not feat._data.get("blockers")
+    assert not feat._ledger.blockers
 
 
 @pytest.mark.asyncio
@@ -367,7 +383,7 @@ async def test_strategy_add_blocker_severity_normalized():
     feat = _make_feature({})
     result = await feat.strategy_add_blocker(issue="42", title="x", severity="HIGH")
     assert result.status is ToolResultStatus.OK
-    assert feat._data["blockers"][-1]["severity"] == "high"
+    assert feat._ledger.blockers[-1]["severity"] == "high"
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +409,13 @@ async def test_mutating_tools_no_strategy_path_return_error():
     """No strategy path configured -> feature is not active. Persisting is
     impossible, so a mutating tool must ERROR, never report OK."""
     for name, _ in _mutating_calls(None):
-        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        feat = _make_feature(blockers=[{"issue": "42", "title": "x"}])
         # No path AND the real _save so it detects the no-path condition.
         feat._strategy_path = None
         del feat._save  # drop the stub; use the real method
+        # Same for the ledger: no path means nothing could be persisted.
+        feat._ledger.path = None
+        del feat._ledger.save
         call = dict(_mutating_calls(feat))[name]
         result = await call()
         assert result.status is ToolResultStatus.ERROR, name
@@ -408,10 +427,11 @@ async def test_mutating_tools_write_failure_return_partial():
     """When the write raises, the in-memory update stands but nothing was
     persisted -> PARTIAL with the error surfaced, never OK."""
     for name, _ in _mutating_calls(None):
-        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        feat = _make_feature(blockers=[{"issue": "42", "title": "x"}])
         feat._save = MagicMock(
             return_value=_SaveOutcome(persisted=False, error="disk full")
         )
+        feat._ledger.save = MagicMock(return_value="disk full")
         call = dict(_mutating_calls(feat))[name]
         result = await call()
         assert result.status is ToolResultStatus.PARTIAL, name
@@ -423,7 +443,7 @@ async def test_mutating_tools_write_failure_return_partial():
 async def test_mutating_tools_happy_path_return_ok():
     """Path present + write succeeds -> OK, persisted flag true."""
     for name, _ in _mutating_calls(None):
-        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        feat = _make_feature(blockers=[{"issue": "42", "title": "x"}])
         call = dict(_mutating_calls(feat))[name]
         result = await call()
         assert result.status is ToolResultStatus.OK, name

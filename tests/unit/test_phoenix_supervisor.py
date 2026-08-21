@@ -173,7 +173,11 @@ def test_explicit_working_dir_override_does_not_restrict_parent_or_migrate(
     legacy.mkdir(parents=True)
     (legacy / "phoenix.db").write_text("legacy")
     shared_parent = tmp_path / "shared-volume"
-    shared_parent.mkdir(mode=0o755)
+    shared_parent.mkdir()
+    # chmod, not mkdir(mode=...): mkdir's mode is masked by the process umask,
+    # so under a 0o077 umask this deliberately-loose parent was created 0o700
+    # and the closing assertion failed against the test's own setup.
+    shared_parent.chmod(0o755)
     override = shared_parent / "phoenix"
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.setenv(ps.PHOENIX_WORKING_DIR_ENV, str(override))
