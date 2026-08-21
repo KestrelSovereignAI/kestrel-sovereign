@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import UserList
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
@@ -414,6 +414,47 @@ def test_postgres_from_pool_explicit_advisory_dsn_ignores_pool_connect_kwargs():
         "record_class": object,
         "server_settings": {"search_path": "scheduler"},
     }
+
+
+@pytest.mark.asyncio
+async def test_postgres_polled_advisory_lock_finishes_each_failed_try_before_sleep():
+    """Concurrent-DDL waiters poll without retaining a blocked SQL snapshot."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Connection:
+        def __init__(self):
+            self.fetchval = AsyncMock(side_effect=[False, False, True, True])
+            self.terminate = Mock()
+
+    class _Acquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    connection = _Connection()
+    advisory_pool = Mock()
+    advisory_pool.acquire.return_value = _Acquire(connection)
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._ensure_advisory_pool = AsyncMock(return_value=advisory_pool)
+
+    with patch("kestrel_sovereign.storage.db.postgres.asyncio.sleep", AsyncMock()) as sleep:
+        async with backend.polled_advisory_lock((11, 22)):
+            pass
+
+    assert connection.fetchval.await_args_list == [
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_advisory_unlock($1, $2)", 11, 22),
+    ]
+    assert sleep.await_count == 2
+    connection.terminate.assert_not_called()
 
 
 def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():

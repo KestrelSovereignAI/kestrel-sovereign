@@ -31,6 +31,7 @@ from kestrel_sovereign.signals import (
     TERMINAL_ACKABLE,
     DurableAdmissionDisposition,
     DurableConsumerRegistration,
+    DurableSourceBoundary,
     DurableSignalStore,
     OrderedLockManager,
     SignalDispatcher,
@@ -48,6 +49,7 @@ from kestrel_sovereign.signals.sources.channels import (
     build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
 
 class _Agent:
@@ -130,6 +132,31 @@ async def _close(backend, agent: _Agent) -> None:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     await backend.close()
+
+
+async def _remove_sqlite_source_sequence_contract(backend: SQLiteBackend) -> None:
+    """Restore the pre-#3006 event shape without touching event history."""
+
+    await backend.execute(
+        "DROP INDEX IF EXISTS idx_durable_signal_events_scope_sequence"
+    )
+    triggers = await backend.fetch_all(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )
+    for (name,) in triggers:
+        if str(name).startswith(
+            DurableSignalStore.SOURCE_SEQUENCE_GUARD_PREFIX
+        ):
+            quoted = '"' + str(name).replace('"', '""') + '"'
+            await backend.execute(f"DROP TRIGGER {quoted}")
+    await backend.execute(
+        "ALTER TABLE durable_signal_events DROP COLUMN source_sequence"
+    )
+    await backend.execute("DROP TABLE durable_signal_source_sequences")
+    await backend.execute("DROP TABLE durable_signal_source_sequence_recovery")
+    await backend.execute("DROP TABLE durable_signal_source_sequence_high_water")
+    await backend.execute("DROP TABLE durable_signal_source_sequence_seen")
+    await backend.execute("DROP TABLE durable_signal_source_sequence_state")
 
 
 def _channel_signal(agent_id: str, message_id: str) -> Signal:
@@ -237,6 +264,8 @@ async def _assert_late_durable_calls_fail_safely(
     with pytest.raises(RuntimeError, match="shutting down"):
         await dispatcher.register_durable_consumer(consumer)
     with pytest.raises(RuntimeError, match="shutting down"):
+        await dispatcher.capture_durable_source_boundary(source=consumer.source)
+    with pytest.raises(RuntimeError, match="shutting down"):
         await dispatcher.claim_durable_delivery(
             consumer_id=consumer.consumer_id, executor_id="late-worker"
         )
@@ -298,6 +327,7 @@ async def test_committed_signal_replays_after_restart_with_normalized_payload(tm
     assert delivery is not None
     assert delivery.status == LEASED
     assert delivery.event.payload == {"message": "hello", "workflow": "wf-1"}
+    assert delivery.source_sequence == delivery.event.source_sequence == 1
     assert delivery.event.causation_chain[-1]["signal_id"] == result.signal_id
     assert await dispatcher2.ack_durable_delivery(
         consumer_id="workflow-wait",
@@ -306,6 +336,1333 @@ async def test_committed_signal_replays_after_restart_with_normalized_payload(tm
     )
     assert (await dispatcher2.list_durable_deliveries())[0].status == ACKNOWLEDGED
     await _close(backend2, agent2)
+
+
+@pytest.mark.asyncio
+async def test_public_source_boundary_orders_ingress_without_timestamps(tmp_path):
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "source-boundary.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait",
+        source="provider.message",
+        agent_id=agent.did,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        before = await dispatcher.capture_durable_source_boundary(
+            source=consumer.source
+        )
+        assert isinstance(before, DurableSourceBoundary)
+        assert (before.agent_id, before.source, before.sequence) == (
+            agent.did,
+            consumer.source,
+            0,
+        )
+
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did), source_event_id="boundary:first"
+        )
+        first = (await dispatcher.list_durable_deliveries())[0]
+        assert first.source_sequence == 1
+        assert before.is_event_eligible(first.event)
+
+        between = await dispatcher.capture_durable_source_boundary(
+            source=consumer.source
+        )
+        assert between.sequence == first.source_sequence
+        assert not between.is_event_eligible(first.event)
+
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="second"),
+            source_event_id="boundary:second",
+        )
+        second = (await dispatcher.list_durable_deliveries())[-1]
+        assert second.source_sequence == 2
+        assert between.is_event_eligible(second.event)
+
+        # Deliberately skewing the process clock cannot affect eligibility.
+        skewed_first = replace(first.event, committed_at=second.event.committed_at)
+        skewed_second = replace(second.event, committed_at=first.event.committed_at)
+        assert not between.is_event_eligible(skewed_first)
+        assert between.is_event_eligible(skewed_second)
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+def test_source_boundary_record_round_trips_through_json_and_rejects_drift():
+    """Workflow storage can rehydrate the full authority-scoped boundary."""
+
+    boundary = DurableSourceBoundary(
+        agent_id="did:agent:boundary-record",
+        source="provider.message",
+        sequence=17,
+    )
+    rehydrated = DurableSourceBoundary.from_dict(
+        json.loads(json.dumps(boundary.to_dict()))
+    )
+    assert rehydrated == boundary
+
+    with pytest.raises(ValueError, match="unsupported"):
+        DurableSourceBoundary.from_dict(
+            {
+                "version": 2,
+                "agent_id": boundary.agent_id,
+                "source": boundary.source,
+                "sequence": boundary.sequence,
+            }
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        DurableSourceBoundary.from_dict(
+            {
+                "version": 1,
+                "agent_id": boundary.agent_id,
+                "source": boundary.source,
+                "sequence": boundary.sequence,
+                "unexpected": True,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_high_water_survives_newest_purge_and_exact_row_loss(tmp_path):
+    """The exact review ordering cannot repair to retained max and reuse 3."""
+
+    path = tmp_path / "source-boundary-independent-high-water.db"
+    backend = SQLiteBackend(str(path))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:independent-high-water"
+    source = "provider.message"
+    persisted = [
+        await store.persist_signal(
+            _signal(agent_id=agent_id, message=f"event-{index}"),
+            agent_id=agent_id,
+            source_event_id=f"independent-high-water:{index}",
+            retention_days=7,
+        )
+        for index in range(3)
+    ]
+    assert [item.source_sequence for item in persisted] == [1, 2, 3]
+
+    await backend.execute(
+        "UPDATE durable_signal_events SET retention_until = ? WHERE event_id = ?",
+        (
+            store.to_timestamp_param(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ),
+            persisted[2].event_id,
+        ),
+    )
+    assert await store.purge_expired(agent_id=agent_id) == 1
+    for relation in (
+        store.SOURCE_SEQUENCE_SEEN,
+        store.SOURCE_SEQUENCES,
+        store.SOURCE_SEQUENCE_RECOVERY,
+    ):
+        await backend.execute(
+            f"DELETE FROM {relation} WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+    assert await backend.fetch_val(
+        "SELECT high_water_sequence "
+        "FROM durable_signal_source_sequence_high_water "
+        "WHERE agent_id = ? AND source = ?",
+        (agent_id, source),
+    ) == 3
+    await backend.close()
+
+    restarted_backend = SQLiteBackend(str(path))
+    await restarted_backend.connect()
+    restarted = DurableSignalStore(restarted_backend)
+    try:
+        await restarted.initialize()
+        assert (
+            await restarted.capture_source_boundary(
+                agent_id=agent_id, source=source
+            )
+        ).sequence == 3
+        assert (
+            await restarted.persist_signal(
+                _signal(agent_id=agent_id, message="must-be-four"),
+                agent_id=agent_id,
+                source_event_id="independent-high-water:after-restart",
+                retention_days=7,
+            )
+        ).source_sequence == 4
+        assert (
+            await restarted.capture_source_boundary(
+                agent_id="did:agent:other", source=source
+            )
+        ).sequence == 0
+    finally:
+        await restarted_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_fails_closed_when_all_exact_evidence_is_lost(tmp_path):
+    """Retained maximum 2 cannot prove that purged sequence 3 never existed."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-all-exact-loss.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:all-exact-loss"
+    source = "provider.message"
+    try:
+        persisted = [
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"event-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"all-exact-loss:{index}",
+                retention_days=7,
+            )
+            for index in range(3)
+        ]
+        await backend.execute(
+            "UPDATE durable_signal_events SET retention_until = ? "
+            "WHERE event_id = ?",
+            (
+                store.to_timestamp_param(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ),
+                persisted[2].event_id,
+            ),
+        )
+        assert await store.purge_expired(agent_id=agent_id) == 1
+        for relation in (
+            store.SOURCE_SEQUENCE_SEEN,
+            store.SOURCE_SEQUENCES,
+            store.SOURCE_SEQUENCE_RECOVERY,
+            store.SOURCE_SEQUENCE_HIGH_WATER,
+        ):
+            await backend.execute(
+                f"DELETE FROM {relation} WHERE agent_id = ? AND source = ?",
+                (agent_id, source),
+            )
+
+        with pytest.raises(
+            TransactionError,
+            match="retained history exceeds every independent high-water",
+        ):
+            await store.capture_source_boundary(agent_id=agent_id, source=source)
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_source_sequences "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 0
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_source_sequences_are_isolated_by_source_and_dispatcher_agent(tmp_path):
+    path = tmp_path / "source-boundary-scope.db"
+    backend_a, agent_a, dispatcher_a = await _dispatcher(path, "did:agent:a")
+    backend_b, agent_b, dispatcher_b = await _dispatcher(path, "did:agent:b")
+    dispatcher_a._registry.register(_registration(agent_a, "provider.other"))
+    try:
+        await dispatcher_a.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="agent-a-message",
+                source="provider.message",
+                agent_id=agent_a.did,
+            )
+        )
+        await dispatcher_a.dispatch_signal(
+            _signal(agent_id=agent_a.did), source_event_id="scope:a"
+        )
+        delivery = (await dispatcher_a.list_durable_deliveries())[0]
+
+        assert (
+            await dispatcher_a.capture_durable_source_boundary(
+                source="provider.message"
+            )
+        ).sequence == 1
+        assert (
+            await dispatcher_a.capture_durable_source_boundary(
+                source="provider.other"
+            )
+        ).sequence == 0
+        boundary_b = await dispatcher_b.capture_durable_source_boundary(
+            source="provider.message"
+        )
+        assert boundary_b.sequence == 0
+        with pytest.raises(ValueError, match="same agent_id and source"):
+            boundary_b.is_event_eligible(delivery.event)
+    finally:
+        await dispatcher_a.shutdown_durable_delivery()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_registration_backfill_retains_committed_source_sequences(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-backfill.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:backfill"
+    try:
+        persisted = [
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"event-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"backfill:{index}",
+                retention_days=7,
+            )
+            for index in range(2)
+        ]
+        assert [item.source_sequence for item in persisted] == [1, 2]
+        boundary = await store.capture_source_boundary(
+            agent_id=agent_id, source="provider.message"
+        )
+
+        registration = DurableConsumerRegistration(
+            consumer_id="late-workflow",
+            source="provider.message",
+            agent_id=agent_id,
+        )
+        await store.register_consumer(registration)
+        first_backfill = await store.list_deliveries(
+            agent_id=agent_id, consumer_id=registration.consumer_id
+        )
+        await store.register_consumer(registration)
+        second_backfill = await store.list_deliveries(
+            agent_id=agent_id, consumer_id=registration.consumer_id
+        )
+        assert sorted(item.source_sequence for item in first_backfill) == [1, 2]
+        assert sorted(item.source_sequence for item in second_backfill) == [1, 2]
+        assert all(not boundary.is_event_eligible(item.event) for item in first_backfill)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_additive_migration_backfills_existing_rows_without_rewriting_them(
+    tmp_path, monkeypatch
+):
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-migration.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:migration"
+    try:
+        event_ids = []
+        for index in range(2):
+            persisted = await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"legacy-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"legacy:{index}",
+                retention_days=7,
+            )
+            event_ids.append(persisted.event_id)
+
+        # Recreate the pre-0.53.3 additive shape without touching any event
+        # payload, identity, delivery, or timestamp column.
+        await _remove_sqlite_source_sequence_contract(backend)
+
+        migrated = DurableSignalStore(backend)
+        await migrated.initialize()
+        rows = await backend.fetch_all(
+            "SELECT event_id, source_sequence FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
+            (agent_id, "provider.message"),
+        )
+        assert [row[0] for row in rows] == sorted(event_ids)
+        assert [int(row[1]) for row in rows] == [1, 2]
+        assert (
+            await migrated.capture_source_boundary(
+                agent_id=agent_id, source="provider.message"
+            )
+        ).sequence == 2
+
+        # Bootstrap is idempotent: the two SQLite triggers are durable schema
+        # evidence that the nullable additive column was fully backfilled. A
+        # later process takes the catalog fast path without scanning history.
+        second_boot = DurableSignalStore(backend)
+        forbidden_backfill = AsyncMock(
+            side_effect=AssertionError("completed SQLite migration rescanned history")
+        )
+        monkeypatch.setattr(
+            second_boot, "_backfill_source_sequences", forbidden_backfill
+        )
+        await second_boot.initialize()
+        forbidden_backfill.assert_not_awaited()
+        second_state = await second_boot._source_sequence_schema_state()
+        assert second_state.enforced and second_state.fence_exists
+        assert await backend.fetch_all(
+            "SELECT event_id, source_sequence FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? ORDER BY source_sequence",
+            (agent_id, "provider.message"),
+        ) == rows
+
+        # The completed additive migration is also a mixed-version fence: an
+        # older writer that omits the new column must fail, never create a row
+        # whose later backfill could move it across an already-captured bound.
+        with pytest.raises(QueryError, match="source sequence is required"):
+            await backend.execute(
+                """
+                INSERT OR IGNORE INTO durable_signal_events (
+                    event_id, source_event_id, agent_id, target_agent, source,
+                    kind, mode, payload, session_id, caller_identity,
+                    visibility, urgency, dedupe_key, causation_chain,
+                    arrived_at, committed_at, retention_until
+                )
+                SELECT ?, ?, agent_id, target_agent, source, kind, mode,
+                       payload, session_id, caller_identity, visibility,
+                       urgency, dedupe_key, causation_chain, arrived_at,
+                       committed_at, retention_until
+                FROM durable_signal_events
+                WHERE event_id = ?
+                """,
+                ("legacy-writer-event", "legacy-writer-source-event", event_ids[0]),
+            )
+        assert (
+            await backend.fetch_val(
+                "SELECT COUNT(*) FROM durable_signal_events "
+                "WHERE event_id = 'legacy-writer-event'"
+            )
+            == 0
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_migration_uses_set_backfill_and_repairs_scope_maxima(
+    tmp_path, monkeypatch
+):
+    """Migration repairs max(counter, history) without per-event writes."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-partial.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_a = "did:agent:migration-a"
+    agent_b = "did:agent:migration-b"
+    source = "provider.message"
+    other_source = "provider.other"
+    dispatcher = None
+    dispatcher_agent = None
+    try:
+        agent_a_events = [
+            await store.persist_signal(
+                _signal(agent_id=agent_a, message=f"legacy-a-{index}"),
+                agent_id=agent_a,
+                source_event_id=f"legacy-a:{index}",
+                retention_days=7,
+            )
+            for index in range(3)
+        ]
+        agent_b_event = await store.persist_signal(
+            _signal(agent_id=agent_b, message="legacy-b"),
+            agent_id=agent_b,
+            source_event_id="legacy-b:0",
+            retention_days=7,
+        )
+        other_source_event = await store.persist_signal(
+            _signal(agent_id=agent_a, source=other_source, message="legacy-other"),
+            agent_id=agent_a,
+            source_event_id="legacy-other:0",
+            retention_days=7,
+        )
+        await _remove_sqlite_source_sequence_contract(backend)
+
+        # Persist a real partially migrated schema: the nullable column and
+        # counter table exist, one scope has historical sequence evidence, and
+        # two counters disagree with history in opposite directions.
+        await backend.execute(
+            "ALTER TABLE durable_signal_events ADD COLUMN source_sequence BIGINT"
+        )
+        await backend.execute(
+            """
+            CREATE TABLE durable_signal_source_sequences (
+                agent_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                current_sequence BIGINT NOT NULL,
+                PRIMARY KEY (agent_id, source),
+                CHECK (current_sequence >= 0)
+            )
+            """
+        )
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = 7 "
+            "WHERE event_id = ?",
+            (min(item.event_id for item in agent_a_events),),
+        )
+        await backend.execute(
+            "INSERT INTO durable_signal_source_sequences "
+            "(agent_id, source, current_sequence) VALUES (?, ?, ?)",
+            (agent_a, source, 3),
+        )
+        await backend.execute(
+            "INSERT INTO durable_signal_source_sequences "
+            "(agent_id, source, current_sequence) VALUES (?, ?, ?)",
+            (agent_a, other_source, 11),
+        )
+
+        original_execute = backend.execute
+        executed_sql: list[str] = []
+
+        async def recording_execute(query, params=()):
+            executed_sql.append(query)
+            return await original_execute(query, params)
+
+        monkeypatch.setattr(backend, "execute", recording_execute)
+        # Exercise the same construction and initialization path used by a
+        # running agent, rather than calling the migration helper directly.
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher_agent = _Agent(agent_a)
+        registry = SourceRegistry()
+        registry.register(_registration(dispatcher_agent))
+        dispatcher = SignalDispatcher(
+            agent=dispatcher_agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        await dispatcher.initialize_durable_delivery()
+        migrated = DurableSignalStore(backend)
+
+        rows = await backend.fetch_all(
+            "SELECT event_id, agent_id, source, source_sequence "
+            "FROM durable_signal_events ORDER BY agent_id, source, event_id"
+        )
+        sequences = {(row[0], row[1], row[2]): int(row[3]) for row in rows}
+        ordered_a_ids = sorted(item.event_id for item in agent_a_events)
+        assert [sequences[(event_id, agent_a, source)] for event_id in ordered_a_ids] == [
+            7,
+            8,
+            9,
+        ]
+        assert sequences[(agent_b_event.event_id, agent_b, source)] == 1
+        assert sequences[(other_source_event.event_id, agent_a, other_source)] == 12
+
+        assert (
+            await dispatcher.capture_durable_source_boundary(source=source)
+        ).sequence == 9
+        assert (
+            await dispatcher.capture_durable_source_boundary(source=other_source)
+        ).sequence == 12
+        assert (
+            await migrated.capture_source_boundary(agent_id=agent_b, source=source)
+        ).sequence == 1
+
+        next_a = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent_a, message="post-migration"),
+            source_event_id="post-migration:a",
+        )
+        assert next_a.status is Status.OK
+        assert (
+            await dispatcher.capture_durable_source_boundary(source=source)
+        ).sequence == 10
+
+        set_updates = [
+            sql
+            for sql in executed_sql
+            if "WITH ranked_source_events AS" in sql
+        ]
+        assert len(set_updates) == 3  # one per scope, not one per legacy row
+        assert all("ROW_NUMBER() OVER (ORDER BY event_id)" in sql for sql in set_updates)
+    finally:
+        if dispatcher is not None:
+            await dispatcher.shutdown_durable_delivery()
+        if dispatcher_agent is not None:
+            await _close(backend, dispatcher_agent)
+        else:
+            await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_source_schema_fast_path_does_not_scan_history(
+    tmp_path, monkeypatch
+):
+    """A normal boot uses schema metadata and never enters the backfill SQL."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-fast-path.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    try:
+        await store.persist_signal(
+            _signal(agent_id="did:agent:fast-path"),
+            agent_id="did:agent:fast-path",
+            source_event_id="fast-path:0",
+            retention_days=7,
+        )
+        plan = await backend.fetch_all(
+            "EXPLAIN QUERY PLAN "
+            "SELECT source_sequence FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? "
+            "AND source_sequence IS NOT NULL "
+            "ORDER BY source_sequence DESC LIMIT 1",
+            ("did:agent:fast-path", "provider.message"),
+        )
+        assert any(
+            "idx_durable_signal_events_scope_sequence" in str(row[-1])
+            for row in plan
+        )
+        observed_sql: list[str] = []
+        originals = {
+            name: getattr(backend, name)
+            for name in ("execute", "fetch_one", "fetch_all", "fetch_val")
+        }
+
+        def recorder(name):
+            async def record(query, params=()):
+                observed_sql.append(query)
+                return await originals[name](query, params)
+
+            return record
+
+        for name in originals:
+            monkeypatch.setattr(backend, name, recorder(name))
+
+        await DurableSignalStore(backend).initialize()
+        normalized = "\n".join(" ".join(sql.split()) for sql in observed_sql)
+        assert "SELECT DISTINCT agent_id, source" not in normalized
+        assert "ROW_NUMBER() OVER" not in normalized
+        assert "WHERE source_sequence IS NULL" not in normalized
+        assert "ALTER TABLE durable_signal_events ADD COLUMN source_sequence" not in normalized
+        assert "CREATE TRIGGER durable_signal_events_require" not in normalized
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_index_ddl",
+    (
+        "CREATE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(target_agent)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(agent_id, source_sequence, source)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(agent_id, source, source_sequence, event_id)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(lower(agent_id), source, source_sequence)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(agent_id COLLATE NOCASE, source, source_sequence)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(agent_id, source, source_sequence DESC)",
+        "CREATE UNIQUE INDEX idx_durable_signal_events_scope_sequence "
+        "ON durable_signal_events(agent_id, source, source_sequence) "
+        "WHERE source_sequence > 0",
+    ),
+    ids=(
+        "non-unique-wrong-column",
+        "wrong-order",
+        "extra-key",
+        "expression-key",
+        "wrong-collation",
+        "descending-key",
+        "partial",
+    ),
+)
+async def test_sqlite_bootstrap_repairs_every_malformed_owned_index_shape(
+    tmp_path, malformed_index_ddl
+):
+    """The owned name is proof only when both SQLite PRAGMAs are exact."""
+
+    backend = SQLiteBackend(str(tmp_path / "malformed-source-index.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    try:
+        await backend.execute(
+            f"DROP INDEX {store.SOURCE_SEQUENCE_SCOPE_INDEX}"
+        )
+        await backend.execute(malformed_index_ddl)
+
+        repaired = DurableSignalStore(backend)
+        await repaired.initialize()
+        catalog = await repaired._sqlite_source_sequence_index_catalog()
+        assert repaired._sqlite_source_sequence_index_catalog_valid(catalog)
+
+        first = await repaired.persist_signal(
+            _signal(agent_id="did:agent:index-repair"),
+            agent_id="did:agent:index-repair",
+            source_event_id="index-repair:1",
+            retention_days=7,
+        )
+        second = await repaired.persist_signal(
+            _signal(agent_id="did:agent:index-repair"),
+            agent_id="did:agent:index-repair",
+            source_event_id="index-repair:2",
+            retention_days=7,
+        )
+        with pytest.raises(QueryError, match="UNIQUE constraint failed"):
+            await backend.execute(
+                "UPDATE durable_signal_events SET source_sequence = ? "
+                "WHERE event_id = ?",
+                (first.source_sequence, second.event_id),
+            )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_valid_source_sequence_index_is_preserved(tmp_path):
+    """An exact index is a metadata-only fast path, not drop/recreate churn."""
+
+    backend = SQLiteBackend(str(tmp_path / "valid-source-index.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    try:
+        # Triggers occupy a separate SQLite namespace and may legally share
+        # the index name. Catalog lookup must select the index row explicitly.
+        await backend.execute(
+            "CREATE TRIGGER idx_durable_signal_events_scope_sequence "
+            "AFTER UPDATE OF urgency ON durable_signal_events "
+            "BEGIN SELECT 1; END"
+        )
+        before = await backend.fetch_one(
+            "SELECT rootpage, sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = ?",
+            (store.SOURCE_SEQUENCE_SCOPE_INDEX,),
+        )
+        schema_version = await backend.fetch_val("PRAGMA schema_version")
+
+        async with store._schema_bootstrap_transaction():
+            await store._ensure_source_sequence_index()
+
+        assert await backend.fetch_one(
+            "SELECT rootpage, sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = ?",
+            (store.SOURCE_SEQUENCE_SCOPE_INDEX,),
+        ) == before
+        assert await backend.fetch_val("PRAGMA schema_version") == schema_version
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_malformed_index_repair_rolls_back_on_existing_duplicates(
+    tmp_path,
+):
+    """A failed unique build restores the old index and is restart-safe."""
+
+    backend = SQLiteBackend(str(tmp_path / "duplicate-source-index.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    try:
+        first = await store.persist_signal(
+            _signal(agent_id="did:agent:index-corruption"),
+            agent_id="did:agent:index-corruption",
+            source_event_id="index-corruption:1",
+            retention_days=7,
+        )
+        second = await store.persist_signal(
+            _signal(agent_id="did:agent:index-corruption"),
+            agent_id="did:agent:index-corruption",
+            source_event_id="index-corruption:2",
+            retention_days=7,
+        )
+        await backend.execute(
+            f"DROP INDEX {store.SOURCE_SEQUENCE_SCOPE_INDEX}"
+        )
+        malformed_ddl = (
+            "CREATE INDEX idx_durable_signal_events_scope_sequence "
+            "ON durable_signal_events(target_agent)"
+        )
+        await backend.execute(malformed_ddl)
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = ? "
+            "WHERE event_id = ?",
+            (first.source_sequence, second.event_id),
+        )
+
+        with pytest.raises(TransactionError, match="UNIQUE constraint failed"):
+            await DurableSignalStore(backend).initialize()
+
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ? AND source_sequence = ?",
+            (
+                "did:agent:index-corruption",
+                "provider.message",
+                first.source_sequence,
+            ),
+        ) == 2
+        assert await backend.fetch_val(
+            "SELECT sql = ? FROM sqlite_master "
+            "WHERE type = 'index' AND name = ?",
+            (malformed_ddl, store.SOURCE_SEQUENCE_SCOPE_INDEX),
+        ) == 1
+
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = ? "
+            "WHERE event_id = ?",
+            (second.source_sequence, second.event_id),
+        )
+        restarted = DurableSignalStore(backend)
+        await restarted.initialize()
+        assert restarted._sqlite_source_sequence_index_catalog_valid(
+            await restarted._sqlite_source_sequence_index_catalog()
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_malformed_index_repair_serializes_across_connections(tmp_path):
+    """Two restarting processes converge one malformed index without a race."""
+
+    path = tmp_path / "concurrent-source-index.db"
+    first_backend = SQLiteBackend(str(path))
+    second_backend = SQLiteBackend(str(path))
+    await first_backend.connect()
+    await second_backend.connect()
+    first = DurableSignalStore(first_backend)
+    second = DurableSignalStore(second_backend)
+    try:
+        await first.initialize()
+        await first_backend.execute(
+            f"DROP INDEX {first.SOURCE_SEQUENCE_SCOPE_INDEX}"
+        )
+        await first_backend.execute(
+            "CREATE INDEX idx_durable_signal_events_scope_sequence "
+            "ON durable_signal_events(target_agent)"
+        )
+
+        await asyncio.wait_for(
+            asyncio.gather(first.initialize(), second.initialize()),
+            timeout=10,
+        )
+        assert first._sqlite_source_sequence_index_catalog_valid(
+            await first._sqlite_source_sequence_index_catalog()
+        )
+
+        schema_version = await first_backend.fetch_val("PRAGMA schema_version")
+        await DurableSignalStore(second_backend).initialize()
+        assert (
+            await first_backend.fetch_val("PRAGMA schema_version")
+            == schema_version
+        )
+    finally:
+        await second_backend.close()
+        await first_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_legacy_source_schema_completes_before_first_boundary(tmp_path):
+    """An empty pre-#3006 ledger still installs a durable mixed-version fence."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-empty-migration.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    try:
+        await _remove_sqlite_source_sequence_contract(backend)
+        migrated = DurableSignalStore(backend)
+        await migrated.initialize()
+        state = await migrated._source_sequence_schema_state()
+        assert state.column_exists and state.enforced and state.fence_exists
+        assert (
+            await migrated.capture_source_boundary(
+                agent_id="did:agent:empty-migration", source="provider.message"
+            )
+        ).sequence == 0
+        persisted = await migrated.persist_signal(
+            _signal(agent_id="did:agent:empty-migration"),
+            agent_id="did:agent:empty-migration",
+            source_event_id="empty-migration:first",
+            retention_days=7,
+        )
+        assert persisted.source_sequence == 1
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_malformed_and_superseded_guard_family_is_replaced(tmp_path):
+    """Trigger names alone cannot claim that a nullable migration completed."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-stale-guards.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:stale-guard"
+    source = "provider.message"
+    try:
+        persisted = await store.persist_signal(
+            _signal(agent_id=agent_id),
+            agent_id=agent_id,
+            source_event_id="stale-guard:legacy",
+            retention_days=7,
+        )
+        await _remove_sqlite_source_sequence_contract(backend)
+        await backend.execute(
+            "ALTER TABLE durable_signal_events ADD COLUMN source_sequence BIGINT"
+        )
+
+        # Occupy both desired, fingerprinted names with definitions that do
+        # not guard anything, and leave a superseded family member beside them.
+        await backend.execute(
+            f"""
+            CREATE TRIGGER {DurableSignalStore.SOURCE_SEQUENCE_INSERT_GUARD}
+            BEFORE INSERT ON durable_signal_events
+            BEGIN SELECT 1; END
+            """
+        )
+        await backend.execute(
+            f"""
+            CREATE TRIGGER {DurableSignalStore.SOURCE_SEQUENCE_UPDATE_GUARD}
+            BEFORE UPDATE OF source_sequence ON durable_signal_events
+            BEGIN SELECT 1; END
+            """
+        )
+        stale_name = (
+            DurableSignalStore.SOURCE_SEQUENCE_GUARD_PREFIX + "insert_deadbeef"
+        )
+        await backend.execute(
+            f"""
+            CREATE TRIGGER {stale_name}
+            BEFORE INSERT ON durable_signal_events
+            BEGIN SELECT 1; END
+            """
+        )
+
+        before = await DurableSignalStore(backend)._source_sequence_schema_state()
+        assert not before.column_not_null
+        assert not before.enforced
+        assert not before.fence_definition_valid
+
+        # The malformed pair can admit a nonpositive value. Bootstrap must not
+        # install the desired names and then mistake the existing bad history
+        # for a completed migration; the entire shape repair rolls back.
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = 0 "
+            "WHERE event_id = ?",
+            (persisted.event_id,),
+        )
+        with pytest.raises(TransactionError, match="out of range"):
+            await DurableSignalStore(backend).initialize()
+        rolled_back = await DurableSignalStore(
+            backend
+        )._sqlite_source_sequence_guard_family()
+        assert stale_name in rolled_back
+
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = NULL "
+            "WHERE event_id = ?",
+            (persisted.event_id,),
+        )
+
+        migrated = DurableSignalStore(backend)
+        await migrated.initialize()
+        state = await migrated._source_sequence_schema_state()
+        assert state.enforced and state.fence_exists
+        assert state.fence_definition_valid and state.fence_validated
+        family = await migrated._sqlite_source_sequence_guard_family()
+        assert set(family) == {
+            DurableSignalStore.SOURCE_SEQUENCE_INSERT_GUARD,
+            DurableSignalStore.SOURCE_SEQUENCE_UPDATE_GUARD,
+        }
+        assert await backend.fetch_val(
+            "SELECT source_sequence FROM durable_signal_events WHERE event_id = ?",
+            (persisted.event_id,),
+        ) == 1
+
+        with pytest.raises(QueryError, match="source sequence is required"):
+            await backend.execute(
+                "UPDATE durable_signal_events SET source_sequence = 0 "
+                "WHERE event_id = ?",
+                (persisted.event_id,),
+            )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "family",
+    ("event_guard", "counter_fence"),
+)
+async def test_sqlite_case_variant_malformed_owned_trigger_family_repairs_under_contention(
+    tmp_path, family
+):
+    """SQLite's case-insensitive trigger namespace is discovered and replaced."""
+
+    path = tmp_path / f"case-variant-{family}.db"
+    first_backend = SQLiteBackend(str(path))
+    second_backend = SQLiteBackend(str(path))
+    await first_backend.connect()
+    await second_backend.connect()
+    store = DurableSignalStore(first_backend)
+    await store.initialize()
+    agent_id = f"did:agent:case-variant:{family}"
+    source = "provider.message"
+    try:
+        persisted = await store.persist_signal(
+            _signal(agent_id=agent_id),
+            agent_id=agent_id,
+            source_event_id=f"case-variant:{family}:seed",
+            retention_days=7,
+        )
+        if family == "event_guard":
+            prefix = store.SOURCE_SEQUENCE_GUARD_PREFIX
+            definitions = store.SOURCE_SEQUENCE_GUARDS
+            relation = store.EVENTS
+            malformed_event = "BEFORE INSERT"
+        else:
+            prefix = store.SOURCE_SEQUENCE_COUNTER_FENCE_PREFIX
+            definitions = store.SOURCE_SEQUENCE_COUNTER_FENCES
+            relation = store.SOURCE_SEQUENCES
+            malformed_event = "BEFORE INSERT"
+
+        desired_name = definitions[0][0]
+        case_variant = desired_name.upper()
+        await first_backend.execute(
+            f'DROP TRIGGER "{desired_name}"'
+        )
+        await first_backend.execute(
+            f'CREATE TRIGGER "{case_variant}" {malformed_event} ON {relation} '
+            "BEGIN SELECT 1; END"
+        )
+
+        discovered = await store._sqlite_trigger_family(prefix)
+        assert case_variant in discovered
+        await asyncio.wait_for(
+            asyncio.gather(
+                DurableSignalStore(first_backend).initialize(),
+                DurableSignalStore(second_backend).initialize(),
+            ),
+            timeout=10,
+        )
+
+        repaired = await store._sqlite_trigger_family(prefix)
+        assert set(repaired) == {name for name, _ddl in definitions}
+        assert all(name == name.casefold() for name in repaired)
+
+        if family == "event_guard":
+            with pytest.raises(QueryError, match="source sequence is required"):
+                await first_backend.execute(
+                    "UPDATE durable_signal_events SET source_sequence = 0 "
+                    "WHERE event_id = ?",
+                    (persisted.event_id,),
+                )
+        else:
+            await first_backend.execute(
+                "DELETE FROM durable_signal_source_sequence_recovery "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, source),
+            )
+            await first_backend.execute(
+                "DELETE FROM durable_signal_source_sequence_high_water "
+                "WHERE agent_id = ? AND source = ?",
+                (agent_id, source),
+            )
+            with pytest.raises(QueryError, match="both exact counter copies"):
+                await first_backend.execute(
+                    "UPDATE durable_signal_source_sequences "
+                    "SET current_sequence = current_sequence "
+                    "WHERE agent_id = ? AND source = ?",
+                    (agent_id, source),
+                )
+
+        schema_version = await first_backend.fetch_val("PRAGMA schema_version")
+        await DurableSignalStore(second_backend).initialize()
+        assert await first_backend.fetch_val("PRAGMA schema_version") == schema_version
+    finally:
+        await second_backend.close()
+        await first_backend.close()
+
+
+@pytest.mark.asyncio
+async def test_source_sequence_repair_preserves_maximum_and_overflow(tmp_path):
+    """Repair never lowers a counter and ingress cannot wrap signed BIGINT."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-overflow.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:source-overflow"
+    source = "provider.message"
+    try:
+        persisted = await store.persist_signal(
+            _signal(agent_id=agent_id),
+            agent_id=agent_id,
+            source_event_id="overflow:first",
+            retention_days=7,
+        )
+        await backend.execute(
+            "UPDATE durable_signal_events SET source_sequence = ? "
+            "WHERE event_id = ?",
+            ((1 << 63) - 1, persisted.event_id),
+        )
+        await backend.execute(
+            "UPDATE durable_signal_source_sequences SET current_sequence = 0 "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+
+        assert (
+            await store.capture_source_boundary(agent_id=agent_id, source=source)
+        ).sequence == (1 << 63) - 1
+        with pytest.raises(TransactionError, match="source sequence exhausted") as exc:
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message="must-not-wrap"),
+                agent_id=agent_id,
+                source_event_id="overflow:second",
+                retention_days=7,
+            )
+        assert isinstance(exc.value.__cause__, OverflowError)
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 1
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_mixed_writer_mirrors_a_sequence_newer_than_retained_maximum(
+    tmp_path,
+):
+    """The database mirror covers rolling writers and non-prefix retention."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-recovery-mirror.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:source-recovery-mirror"
+    source = "provider.message"
+    try:
+        first = await store.persist_signal(
+            _signal(agent_id=agent_id),
+            agent_id=agent_id,
+            source_event_id="recovery-mirror:first",
+            retention_days=7,
+        )
+        second_event_id = "recovery-mirror-event-two"
+        async with backend.transaction():
+            # Model the pre-recovery implementation: it advances only the
+            # primary counter, then inserts the event in the same transaction.
+            await backend.execute(
+                "UPDATE durable_signal_source_sequences "
+                "SET current_sequence = 2 WHERE agent_id = ? AND source = ?",
+                (agent_id, source),
+            )
+            await backend.execute(
+                """
+                INSERT INTO durable_signal_events (
+                    event_id, source_event_id, agent_id, target_agent, source,
+                    kind, mode, payload, session_id, caller_identity,
+                    visibility, urgency, dedupe_key, causation_chain,
+                    arrived_at, committed_at, retention_until, source_sequence
+                )
+                SELECT ?, ?, agent_id, target_agent, source, kind, mode,
+                       payload, session_id, caller_identity, visibility,
+                       urgency, dedupe_key, causation_chain, arrived_at,
+                       committed_at, retention_until, 2
+                FROM durable_signal_events WHERE event_id = ?
+                """,
+                (second_event_id, "recovery-mirror:second", first.event_id),
+            )
+        assert await backend.fetch_val(
+            "SELECT recovery_sequence "
+            "FROM durable_signal_source_sequence_recovery "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 2
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_source_sequence_seen "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 1
+
+        # Purge only the newer event, making the retained maximum 1 while the
+        # exact committed boundary is still 2.
+        await backend.execute(
+            "UPDATE durable_signal_events SET retention_until = ? "
+            "WHERE event_id = ?",
+            (
+                store.to_timestamp_param(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ),
+                second_event_id,
+            ),
+        )
+        assert await store.purge_expired(agent_id=agent_id) == 1
+        await backend.execute("DROP TABLE durable_signal_source_sequences")
+
+        recovered = DurableSignalStore(backend)
+        await recovered.initialize()
+        assert (
+            await recovered.capture_source_boundary(
+                agent_id=agent_id, source=source
+            )
+        ).sequence == 2
+        assert (
+            await recovered.persist_signal(
+                _signal(agent_id=agent_id, message="after recovery"),
+                agent_id=agent_id,
+                source_event_id="recovery-mirror:third",
+                retention_days=7,
+            )
+        ).source_sequence == 3
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_positive_exact_counters_repair_missing_seen_before_history_loss(
+    tmp_path,
+):
+    """The boundary fast path restores loss evidence even without counter drift."""
+
+    backend = SQLiteBackend(str(tmp_path / "source-boundary-seen-repair.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:seen-repair"
+    source = "provider.message"
+    try:
+        persisted = await store.persist_signal(
+            _signal(agent_id=agent_id),
+            agent_id=agent_id,
+            source_event_id="seen-repair:first",
+            retention_days=7,
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequence_seen "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+
+        assert (
+            await store.capture_source_boundary(agent_id=agent_id, source=source)
+        ).sequence == 1
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_source_sequence_seen "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 1
+
+        await backend.execute(
+            "UPDATE durable_signal_events SET retention_until = ? "
+            "WHERE event_id = ?",
+            (
+                store.to_timestamp_param(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ),
+                persisted.event_id,
+            ),
+        )
+        assert await store.purge_expired(agent_id=agent_id) == 1
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequences "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequence_recovery "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequence_high_water "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+
+        with pytest.raises(
+            TransactionError,
+            match="both exact counter copies were lost for a previously seen scope",
+        ):
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message="must-not-reuse-one"),
+                agent_id=agent_id,
+                source_event_id="seen-repair:second",
+                retention_days=7,
+            )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "purged_indices",
+    ((0, 1, 2), (1,)),
+    ids=("complete-retention-purge", "non-prefix-retention-purge"),
+)
+async def test_seen_scope_refuses_loss_of_both_exact_rows_after_any_retention_shape(
+    tmp_path, purged_indices
+):
+    """Retained rows are never treated as exact after both counters disappear."""
+
+    backend = SQLiteBackend(str(tmp_path / f"seen-loss-{len(purged_indices)}.db"))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    agent_id = "did:agent:seen-loss"
+    source = "provider.message"
+    try:
+        persisted = [
+            await store.persist_signal(
+                _signal(agent_id=agent_id, message=f"seen-{index}"),
+                agent_id=agent_id,
+                source_event_id=f"seen-loss:{index}",
+                retention_days=7,
+            )
+            for index in range(3)
+        ]
+        expired = store.to_timestamp_param(
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+        for index in purged_indices:
+            await backend.execute(
+                "UPDATE durable_signal_events SET retention_until = ? "
+                "WHERE event_id = ?",
+                (expired, persisted[index].event_id),
+            )
+        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequences "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequence_recovery "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+        await backend.execute(
+            "DELETE FROM durable_signal_source_sequence_high_water "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        )
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_source_sequence_seen "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 1
+
+        with pytest.raises(
+            TransactionError,
+            match="both exact counter copies were lost for a previously seen scope",
+        ):
+            await store.capture_source_boundary(agent_id=agent_id, source=source)
+
+        # The marker is scoped, not a singleton poison bit: an actually fresh
+        # source in the same tenant still creates two zero rows and starts at 0.
+        assert (
+            await store.capture_source_boundary(
+                agent_id=agent_id, source="provider.fresh"
+            )
+        ).sequence == 0
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -330,6 +1687,10 @@ async def test_source_event_dedup_prevents_duplicate_delivery_and_side_effect(tm
     deliveries = await dispatcher.list_durable_deliveries()
     assert len(deliveries) == 1
     assert deliveries[0].event.event_id == first.signal_id
+    assert deliveries[0].source_sequence == 1
+    assert (
+        await dispatcher.capture_durable_source_boundary(source="provider.message")
+    ).sequence == 1
     await _close(backend, agent)
 
 
@@ -3653,6 +5014,66 @@ async def test_dispatcher_retention_sweep_preserves_other_agents_history(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_retention_preserves_source_counter_monotonicity(tmp_path):
+    """The production dispatch/purge APIs retain a scope's durable counter."""
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "source-counter-retention.db", "did:agent:retention-counter"
+    )
+    try:
+        before = await dispatcher.capture_durable_source_boundary(
+            source="provider.message"
+        )
+        assert before.sequence == 0
+        first = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did), source_event_id="retention-counter:first"
+        )
+        assert first.status is Status.OK
+        assert (
+            await dispatcher.capture_durable_source_boundary(
+                source="provider.message"
+            )
+        ).sequence == 1
+
+        await backend.execute(
+            "UPDATE durable_signal_events SET retention_until = ? "
+            "WHERE agent_id = ? AND source = ?",
+            (
+                datetime.now(timezone.utc) - timedelta(seconds=1),
+                agent.did,
+                "provider.message",
+            ),
+        )
+        assert await dispatcher.purge_expired_durable_deliveries() == 1
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ?",
+            (agent.did, "provider.message"),
+        ) == 0
+        # Only the production boundary API observes this counter; no retained
+        # event remains from which it could re-derive the value.
+        assert (
+            await dispatcher.capture_durable_source_boundary(
+                source="provider.message"
+            )
+        ).sequence == 1
+
+        second = await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did, message="second"),
+            source_event_id="retention-counter:second",
+        )
+        assert second.status is Status.OK
+        assert (
+            await dispatcher.capture_durable_source_boundary(
+                source="provider.message"
+            )
+        ).sequence == 2
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("privacy_preset", "storage_marker"),
     (
@@ -4101,6 +5522,141 @@ async def test_postgres_registration_handoff_uses_a_transaction_scoped_scope_loc
 
 
 @pytest.mark.asyncio
+async def test_postgres_boundary_locks_handoff_before_sampling_source_row():
+    """Pin the post-wait FOR UPDATE sample used by multi-replica capture."""
+
+    calls: list[str] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(self):
+            calls.append("transaction")
+            yield
+
+        async def fetch_val(self, query, params=()):
+            if "pg_advisory_xact_lock" in query:
+                calls.append("handoff")
+                return None
+            if "backfill_completed" in query:
+                assert calls[-1] == "handoff"
+                calls.append("completion")
+                return True
+            if "durable_signal_source_sequence_seen" in query:
+                assert calls[-1] == "sample-high-water"
+                calls.append("sample-seen")
+                return None
+            assert "ORDER BY source_sequence DESC LIMIT 1" in query
+            assert calls[-1] == "sample-seen"
+            calls.append("retained-max")
+            return 7
+
+        async def execute(self, query, params=()):
+            if "durable_signal_source_sequences" in query:
+                assert calls[-1] == "completion"
+                calls.append("ensure-primary")
+            elif "durable_signal_source_sequence_high_water" in query:
+                assert calls[-1] == "sample-recovery"
+                calls.append("ensure-high-water")
+            elif "durable_signal_source_sequence_seen" in query:
+                assert calls[-1] == "retained-max"
+                calls.append("repair-seen")
+            else:
+                assert "durable_signal_source_sequence_recovery" in query
+                assert calls[-1] == "sample-primary"
+                calls.append("ensure-recovery")
+            return 0
+
+        async def fetch_one(self, query, params=()):
+            assert query.rstrip().endswith("FOR UPDATE")
+            if "durable_signal_source_sequences" in query:
+                assert calls[-1] == "ensure-primary"
+                calls.append("sample-primary")
+            elif "durable_signal_source_sequence_high_water" in query:
+                assert calls[-1] == "ensure-high-water"
+                calls.append("sample-high-water")
+            else:
+                assert "durable_signal_source_sequence_recovery" in query
+                assert calls[-1] == "ensure-recovery"
+                calls.append("sample-recovery")
+            return (7,)
+
+    boundary = await DurableSignalStore(_PostgresBackend()).capture_source_boundary(
+        agent_id="did:agent:one", source="provider.message"
+    )
+
+    assert calls == [
+        "transaction",
+        "handoff",
+        "completion",
+        "ensure-primary",
+        "sample-primary",
+        "ensure-recovery",
+        "sample-recovery",
+        "ensure-high-water",
+        "sample-high-water",
+        "sample-seen",
+        "retained-max",
+        "repair-seen",
+    ]
+    assert boundary.sequence == 7
+
+
+@pytest.mark.asyncio
+async def test_postgres_recovery_adoption_locks_all_primaries_before_recovery():
+    """Migration preserves deterministic exact-ledger relation/row ordering."""
+
+    calls: list[str] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        async def fetch_all(self, query, params=()):
+            normalized = " ".join(query.split())
+            if "FROM durable_signal_source_sequences" in normalized:
+                assert normalized.endswith("ORDER BY agent_id, source FOR UPDATE")
+                calls.append("lock-all-primary")
+                return [("agent-a", "source-a", 2), ("agent-b", "source-b", 0)]
+            if "FROM durable_signal_source_sequence_recovery" in normalized:
+                assert calls[-1] == "merge-high-water:agent-b:source-b"
+                assert normalized.endswith("ORDER BY agent_id, source FOR UPDATE")
+                calls.append("lock-all-recovery")
+                return [("agent-a", "source-a", 2), ("agent-b", "source-b", 0)]
+            assert "FROM durable_signal_source_sequence_high_water" in normalized
+            assert calls[-1] == "merge-high-water:agent-b:source-b"
+            assert normalized.endswith("ORDER BY agent_id, source FOR UPDATE")
+            calls.append("lock-all-high-water")
+            return [("agent-a", "source-a", 2), ("agent-b", "source-b", 0)]
+
+        async def execute(self, query, params=()):
+            if "durable_signal_source_sequence_recovery" in query:
+                assert calls and calls[0] == "lock-all-primary"
+                calls.append(f"adopt-recovery:{params[0]}:{params[1]}")
+            elif "durable_signal_source_sequence_high_water" in query:
+                calls.append(f"merge-high-water:{params[0]}:{params[1]}")
+            else:
+                assert "durable_signal_source_sequence_seen" in query
+                assert calls[-1] == "lock-all-high-water"
+                calls.append(f"mark-seen:{params[0]}:{params[1]}")
+            return 1
+
+    await DurableSignalStore(_PostgresBackend())._adopt_source_sequence_recovery()
+    assert calls == [
+        "lock-all-primary",
+        "adopt-recovery:agent-a:source-a",
+        "merge-high-water:agent-a:source-a",
+        "adopt-recovery:agent-b:source-b",
+        "merge-high-water:agent-b:source-b",
+        "lock-all-recovery",
+        "merge-high-water:agent-a:source-a",
+        "merge-high-water:agent-b:source-b",
+        "lock-all-high-water",
+        "mark-seen:agent-a:source-a",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_postgres_schema_bootstrap_uses_its_standard_advisory_lock_transaction():
     """PostgreSQL bootstrap retains its ordinary transaction capability."""
 
@@ -4123,6 +5679,568 @@ async def test_postgres_schema_bootstrap_uses_its_standard_advisory_lock_transac
     _PostgresBackend.fetch_val.assert_awaited_once_with(
         "SELECT pg_advisory_xact_lock(hashtext('kestrel.durable_signal.bootstrap'))"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("catalog_row", "expected"),
+    (
+        (None, (False, False, False, False, False, False)),
+        (
+            (False, True, False, "source_sequence IS NOT NULL"),
+            (True, False, True, False, False, False),
+        ),
+        (
+            (
+                False,
+                True,
+                True,
+                "source_sequence IS NOT NULL AND source_sequence >= 1",
+            ),
+            (True, False, True, True, True, False),
+        ),
+        (
+            (
+                True,
+                True,
+                True,
+                "((source_sequence IS NOT NULL) AND (source_sequence >= (1)::bigint))",
+            ),
+            (True, True, True, True, True, True),
+        ),
+    ),
+)
+async def test_postgres_source_sequence_state_uses_catalog_markers(
+    catalog_row, expected
+):
+    """Completion requires NOT NULL plus the validated desired CHECK shape."""
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+        fetch_one = AsyncMock(return_value=catalog_row)
+
+    state = await DurableSignalStore(
+        _PostgresBackend()
+    )._source_sequence_schema_state()
+
+    assert (
+        state.column_exists,
+        state.enforced,
+        state.fence_exists,
+        state.fence_validated,
+        state.fence_definition_valid,
+        state.column_not_null,
+    ) == expected
+    query, params = _PostgresBackend.fetch_one.await_args.args
+    assert "pg_attribute" in query and "pg_constraint" in query
+    assert params == (
+        "durable_signal_events_source_sequence_not_null",
+        "durable_signal_events",
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_replaces_a_stale_named_source_sequence_fence():
+    """The owned name cannot preserve an older non-NULL-only definition."""
+
+    statements: list[str] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        async def execute(self, query, params=()):
+            statements.append(" ".join(query.split()))
+            return 0
+
+    store = DurableSignalStore(_PostgresBackend())
+    await store._install_postgres_source_sequence_fence(
+        SimpleNamespace(
+            column_exists=True,
+            fence_exists=True,
+            fence_definition_valid=False,
+        )
+    )
+
+    assert len(statements) == 2
+    assert statements[0].endswith(
+        "DROP CONSTRAINT durable_signal_events_source_sequence_not_null"
+    )
+    assert (
+        "CHECK (source_sequence IS NOT NULL AND source_sequence >= 1) NOT VALID"
+        in statements[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_recovery_sync_validates_shape_and_repairs_atomically():
+    """The rolling-upgrade mirror converges its four objects as one family."""
+
+    definitions = DurableSignalStore.SOURCE_SEQUENCE_RECOVERY_DEFINITIONS
+
+    def valid_trigger_rows():
+        return [
+            (
+                definition.trigger_name,
+                definition.trigger_type,
+                "O",
+                "",
+                True,
+                True,
+                False,
+                False,
+                definition.transition_table,
+                None,
+                definition.function_name,
+                True,
+                definition.function_body,
+                "plpgsql",
+                0,
+                True,
+                "f",
+                False,
+                False,
+                False,
+                "v",
+                "u",
+                True,
+            )
+            for definition in definitions
+        ]
+
+    def valid_function_rows():
+        return [
+            (
+                definition.function_name,
+                "",
+                definition.function_body,
+                "plpgsql",
+                0,
+                True,
+                "f",
+                False,
+                False,
+                False,
+                "v",
+                "u",
+                True,
+            )
+            for definition in definitions
+        ]
+
+    class _CatalogBackend:
+        backend_type = "postgres"
+
+        def __init__(self):
+            self.statements: list[str] = []
+            self.repaired = False
+
+        async def fetch_all(self, query, params=()):
+            if "FROM pg_trigger" in query:
+                if self.repaired:
+                    return valid_trigger_rows()
+                return [
+                    (
+                        "durable_signal_events_source_sequence_recovery_sync",
+                        21,
+                        "D",
+                        "18",
+                        False,
+                        False,
+                        True,
+                        True,
+                        None,
+                        None,
+                        "kestrel_durable_signal_source_sequence_recovery_sync",
+                        True,
+                        "BEGIN RETURN NEW; END",
+                        "plpgsql",
+                        0,
+                        True,
+                        "f",
+                        False,
+                        False,
+                        False,
+                        "v",
+                        "u",
+                        True,
+                    )
+                ]
+            if self.repaired:
+                return valid_function_rows()
+            return [
+                (
+                    "kestrel_durable_signal_source_sequence_recovery_sync",
+                    "",
+                    "BEGIN RETURN NEW; END",
+                    "plpgsql",
+                    0,
+                    True,
+                    "f",
+                    False,
+                    False,
+                    False,
+                    "v",
+                    "u",
+                    True,
+                )
+            ]
+
+        async def execute(self, query, params=()):
+            self.statements.append(" ".join(query.split()))
+            if len(self.statements) == 6:
+                self.repaired = True
+            return 0
+
+    backend = _CatalogBackend()
+    store = DurableSignalStore(backend)
+    await store._ensure_postgres_source_sequence_recovery_sync()
+
+    assert len(backend.statements) == 6
+    assert backend.statements[0].startswith("DROP TRIGGER IF EXISTS")
+    assert backend.statements[1].startswith("DROP FUNCTION IF EXISTS")
+    assert "CREATE FUNCTION" in backend.statements[2]
+    assert "CREATE FUNCTION" in backend.statements[3]
+    assert "AFTER INSERT ON durable_signal_events REFERENCING NEW TABLE" in backend.statements[4]
+    assert "AFTER UPDATE ON durable_signal_events REFERENCING NEW TABLE" in backend.statements[5]
+    assert all("FOR EACH STATEMENT" in sql for sql in backend.statements[4:])
+
+
+def test_postgres_recovery_family_is_definition_fingerprinted_and_statement_level():
+    """INSERT/UPDATE use legal, distinct transition-table trigger syntax."""
+
+    definitions = DurableSignalStore.SOURCE_SEQUENCE_RECOVERY_DEFINITIONS
+    assert [definition.role for definition in definitions] == ["insert", "update"]
+    fingerprints = {
+        definition.trigger_name.rsplit("_", 1)[-1]
+        for definition in definitions
+    } | {
+        definition.function_name.rsplit("_", 1)[-1]
+        for definition in definitions
+    }
+    assert len(fingerprints) == 1
+    assert all(len(definition.trigger_name) <= 63 for definition in definitions)
+    assert all(len(definition.function_name) <= 63 for definition in definitions)
+    assert "AFTER INSERT ON" in definitions[0].trigger_ddl
+    assert "AFTER UPDATE ON" in definitions[1].trigger_ddl
+    assert all("REFERENCING NEW TABLE AS" in item.trigger_ddl for item in definitions)
+    assert all("FOR EACH STATEMENT" in item.trigger_ddl for item in definitions)
+    assert all("UPDATE OF" not in item.trigger_ddl for item in definitions)
+    assert all("INSERT OR UPDATE" not in item.trigger_ddl for item in definitions)
+    assert all("MAX(source_sequence)" in item.function_body for item in definitions)
+    assert all("GROUP BY agent_id, source" in item.function_body for item in definitions)
+
+
+def test_postgres_counter_fence_is_definition_fingerprinted_and_row_atomic():
+    """The primary legacy API clamps before exposure and mirrors after writes."""
+
+    before, after = DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCE_DEFINITIONS
+    fingerprints = {
+        item.trigger_name.rsplit("_", 1)[-1] for item in (before, after)
+    } | {
+        item.function_name.rsplit("_", 1)[-1] for item in (before, after)
+    }
+    assert len(fingerprints) == 1
+    assert before.role == "before"
+    assert "BEFORE INSERT OR UPDATE" in before.trigger_ddl
+    assert "NEW.current_sequence := recovered" in before.function_body
+    assert "both exact counter copies were lost" in before.function_body
+    assert "recovered < 1" in before.function_body
+    assert after.role == "after"
+    assert "AFTER INSERT OR UPDATE" in after.trigger_ddl
+    assert "GREATEST(" in after.function_body
+    assert all("FOR EACH ROW" in item.trigger_ddl for item in (before, after))
+    assert all(len(item.trigger_name) <= 63 for item in (before, after))
+    assert all(len(item.function_name) <= 63 for item in (before, after))
+
+
+def test_postgres_backfill_is_a_joined_update_not_a_correlated_lookup():
+    """The PostgreSQL target joins one bounded ranked batch without subqueries."""
+
+    backend = SimpleNamespace(backend_type="postgres")
+    sql = " ".join(
+        DurableSignalStore(
+            backend
+        )._postgres_source_sequence_backfill_update_sql().split()
+    )
+    assert "WITH batch_event_ids AS MATERIALIZED" in sql
+    assert "FROM durable_signal_source_sequence_event_work" in sql
+    assert "LIMIT ? FOR UPDATE" in sql
+    assert "UPDATE durable_signal_events AS target" in sql
+    assert "FROM ranked_source_events AS ranked" in sql
+    assert "target.event_id = ranked.event_id" in sql
+    assert "SET source_sequence = ? + ranked.sequence_offset" in sql
+    assert "RETURNING target.source_sequence" in sql
+    assert "DELETE FROM durable_signal_source_sequence_event_work" in sql
+    assert "SELECT COUNT(*) FROM removed_work" in sql
+    assert "SELECT ranked.sequence_offset" not in sql
+    assert "WHERE event_id IN" not in sql
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_sequence_index_catalog_reads_unique_semantics():
+    """Catalog proof includes timing and PostgreSQL 16 NULL equality flags."""
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+        fetch_one = AsyncMock(return_value=None)
+
+    store = DurableSignalStore(_PostgresBackend())
+    assert await store._postgres_source_sequence_index_catalog() is None
+
+    query, params = _PostgresBackend.fetch_one.await_args.args
+    assert "index_row.indimmediate" in query
+    assert "index_row.indnullsnotdistinct" in query
+    assert "constraint_row.conindid = index_relation.oid" in query
+    assert params == (
+        store.SOURCE_SEQUENCE_SCOPE_INDEX,
+        store.EVENTS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("catalog_index", "replacement"),
+    (
+        (15, (101, 100, 0)),
+        (16, (101, 100, 0)),
+        (17, (200, 203, 202)),
+        (18, (200, 203, 202)),
+        (19, False),
+        (20, True),
+    ),
+    ids=(
+        "index-collation",
+        "column-collation",
+        "index-opclass",
+        "default-opclass",
+        "deferred-uniqueness",
+        "nulls-not-distinct",
+    ),
+)
+def test_postgres_source_sequence_index_rejects_nondefault_semantics(
+    catalog_index, replacement
+):
+    """Exact names/keys are insufficient when equality semantics differ."""
+
+    valid = [
+        999,
+        "i",
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+        "btree",
+        3,
+        3,
+        True,
+        True,
+        ("agent_id", "source", "source_sequence"),
+        (0, 0, 0),
+        (100, 100, 0),
+        (100, 100, 0),
+        (200, 201, 202),
+        (200, 201, 202),
+        True,
+        False,
+        None,
+    ]
+    assert DurableSignalStore._postgres_source_sequence_index_catalog_valid(valid)
+
+    malformed = list(valid)
+    malformed[catalog_index] = replacement
+    assert not DurableSignalStore._postgres_source_sequence_index_catalog_valid(
+        malformed
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger_index", "replacement"),
+    (
+        (2, "D"),  # disabled
+        (4, False),  # qualified with WHEN
+        (5, False),  # constraint trigger
+        (6, True),  # deferrable
+        (7, True),  # initially deferred
+        (8, "wrong_transition"),
+        (12, "BEGIN RETURN NULL; END"),
+        (22, False),  # function-local configuration/search_path
+    ),
+)
+async def test_postgres_recovery_catalog_rejects_untrusted_trigger_shapes(
+    trigger_index, replacement
+):
+    """Every operational trigger/function attribute is completion evidence."""
+
+    definitions = DurableSignalStore.SOURCE_SEQUENCE_RECOVERY_DEFINITIONS
+    trigger_rows = []
+    function_rows = []
+    for definition in definitions:
+        trigger_rows.append(
+            (
+                definition.trigger_name,
+                definition.trigger_type,
+                "O",
+                "",
+                True,
+                True,
+                False,
+                False,
+                definition.transition_table,
+                None,
+                definition.function_name,
+                True,
+                definition.function_body,
+                "plpgsql",
+                0,
+                True,
+                "f",
+                False,
+                False,
+                False,
+                "v",
+                "u",
+                True,
+            )
+        )
+        function_rows.append(
+            (
+                definition.function_name,
+                "",
+                definition.function_body,
+                "plpgsql",
+                0,
+                True,
+                "f",
+                False,
+                False,
+                False,
+                "v",
+                "u",
+                True,
+            )
+        )
+    malformed = list(trigger_rows[0])
+    malformed[trigger_index] = replacement
+    trigger_rows[0] = tuple(malformed)
+
+    class _CatalogBackend:
+        backend_type = "postgres"
+
+        async def fetch_all(self, query, params=()):
+            return trigger_rows if "FROM pg_trigger" in query else function_rows
+
+    assert not await DurableSignalStore(
+        _CatalogBackend()
+    )._postgres_source_sequence_recovery_sync_valid()
+
+
+@pytest.mark.asyncio
+async def test_postgres_recovery_catalog_rejects_malformed_and_superseded_functions():
+    """A valid desired pair plus any stale or malformed function is not trusted."""
+
+    definitions = DurableSignalStore.SOURCE_SEQUENCE_RECOVERY_DEFINITIONS
+    trigger_rows = [
+        (
+            item.trigger_name, item.trigger_type, "O", "", True, True,
+            False, False, item.transition_table, None, item.function_name, True,
+            item.function_body, "plpgsql", 0, True, "f", False, False, False,
+            "v", "u", True,
+        )
+        for item in definitions
+    ]
+    function_rows = [
+        (
+            item.function_name, "", item.function_body, "plpgsql", 0, True,
+            "f", False, False, False, "v", "u", True,
+        )
+        for item in definitions
+    ]
+    malformed = list(function_rows[0])
+    malformed[2] = "BEGIN RETURN NULL; END"
+    function_rows[0] = tuple(malformed)
+    function_rows.append(
+        (
+            DurableSignalStore.SOURCE_SEQUENCE_RECOVERY_FUNCTION_PREFIX
+            + "u_deadbeef",
+            "",
+            definitions[1].function_body,
+            "plpgsql",
+            0,
+            True,
+            "f",
+            False,
+            False,
+            False,
+            "v",
+            "u",
+            True,
+        )
+    )
+
+    class _CatalogBackend:
+        backend_type = "postgres"
+
+        async def fetch_all(self, query, params=()):
+            return trigger_rows if "FROM pg_trigger" in query else function_rows
+
+    assert not await DurableSignalStore(
+        _CatalogBackend()
+    )._postgres_source_sequence_recovery_sync_valid()
+
+
+@pytest.mark.asyncio
+async def test_postgres_validation_and_not_null_enforcement_are_separate_phases():
+    """The final ACCESS EXCLUSIVE phase performs only metadata enforcement."""
+
+    statements: list[str] = []
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+
+        async def execute(self, query, params=()):
+            statements.append(" ".join(query.split()))
+            return 0
+
+    store = DurableSignalStore(_PostgresBackend())
+    await store._validate_postgres_source_sequence_fence(
+        SimpleNamespace(fence_validated=False)
+    )
+    await store._enforce_postgres_source_sequence_required(
+        SimpleNamespace(
+            fence_exists=True,
+            fence_definition_valid=True,
+            fence_validated=True,
+            column_not_null=False,
+        )
+    )
+
+    assert len(statements) == 2
+    assert "VALIDATE CONSTRAINT" in statements[0]
+    assert statements[1].endswith("ALTER COLUMN source_sequence SET NOT NULL")
+
+
+@pytest.mark.asyncio
+async def test_postgres_not_null_enforcement_refuses_unvalidated_fence():
+    """Catalog validation cannot be inferred inside the ACCESS EXCLUSIVE phase."""
+
+    class _PostgresBackend:
+        backend_type = "postgres"
+        execute = AsyncMock(return_value=0)
+
+    store = DurableSignalStore(_PostgresBackend())
+    with pytest.raises(RuntimeError, match="requires a validated write fence"):
+        await store._enforce_postgres_source_sequence_required(
+            SimpleNamespace(
+                fence_exists=True,
+                fence_definition_valid=True,
+                fence_validated=False,
+                column_not_null=False,
+            )
+        )
+
+    _PostgresBackend.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

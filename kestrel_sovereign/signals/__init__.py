@@ -66,6 +66,7 @@ from kestrel_sovereign.signals.durable import (
     DurableEventPersistence,
     DurableInitialDeliveryReservation,
     DurableSignalEvent,
+    DurableSourceBoundary,
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
@@ -114,6 +115,7 @@ __all__ = [
     "DurableEventPersistence",
     "DurableInitialDeliveryReservation",
     "DurableSignalEvent",
+    "DurableSourceBoundary",
     "DurableSignalStore",
     "ACKNOWLEDGED",
     "FAILED",
