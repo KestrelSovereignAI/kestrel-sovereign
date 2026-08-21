@@ -193,11 +193,46 @@ def test_timestamp_sql_boundary_normalizes_sqlite_and_preserves_postgres_binds()
     # predicate against it matched nothing before and must go on matching
     # nothing, instead of comparing NULL against every row.
     assert timestamp_query_param("sqlite", "not a date") == "not a date"
-
     postgres_bound = timestamp_query_param("postgres", aware)
     assert postgres_bound == datetime(2026, 6, 29, 12, 0, 0)
     assert postgres_bound.tzinfo is None
     assert timestamp_predicate("postgres", "created_at", ">") == "created_at > ?"
+
+
+def test_a_fractional_boundary_is_not_rounded_into_a_row_it_excludes():
+    """Sub-second precision survives the bind, because a purge compares on it.
+
+    Stored values are whole seconds — no writer produces a fraction and #3009's
+    migration truncates them — but a caller's BOUNDARY may carry one, and the
+    canonical spelling would round it down. ``purge_all_since`` compares
+    ``>=``, so a boundary of ``12:00:00.500`` truncated to ``12:00:00`` starts
+    selecting the row stamped ``12:00:00``, which predates it, and PERMANENTLY
+    deletes it. PostgreSQL keeps the fraction, so the two backends would also
+    disagree about what a purge destroys.
+
+    Asked of the real predicate rather than of the formatting, because it is
+    the comparison that decides which rows die.
+    """
+    import sqlite3
+
+    engine = sqlite3.connect(":memory:")
+    engine.execute("CREATE TABLE t (created_at TEXT)")
+    engine.executemany(
+        "INSERT INTO t VALUES (?)",
+        [("2026-01-01 12:00:00",), ("2026-01-01 12:00:01",)],
+    )
+    predicate = timestamp_predicate("sqlite", "created_at", ">=")
+    doomed = [
+        row[0]
+        for row in engine.execute(
+            f"SELECT created_at FROM t WHERE {predicate}",
+            (timestamp_query_param("sqlite", "2026-01-01 12:00:00.500"),),
+        )
+    ]
+    assert doomed == ["2026-01-01 12:00:01"], (
+        "a row stamped before the boundary was selected for permanent "
+        "deletion, because the boundary was rounded down to meet it"
+    )
 
 
 def test_grouping_safely_mixes_naive_and_aware_timestamp_shapes():

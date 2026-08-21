@@ -104,6 +104,10 @@ UNDATED_TABLE = "conversation_history_undated"
 #: the identical decision.
 UNDATABLE_EPOCH = datetime(1970, 1, 1)
 
+#: The first instant Python's ``datetime`` can represent. SQLite can represent
+#: earlier ones, which is the one direction the CHECK's round trip cannot see.
+_EARLIEST = datetime(1, 1, 1).strftime(CANONICAL_FORMAT)
+
 #: Timestamp formats ``fromisoformat`` does not take. SQLite's
 #: ``CURRENT_TIMESTAMP`` space form is one of them on older Pythons.
 _LEGACY_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S")
@@ -153,6 +157,33 @@ def canonical_created_at(value: Any) -> Optional[str]:
     if parsed is None:
         return None
     return parsed.replace(tzinfo=None).strftime(CANONICAL_FORMAT)
+
+
+def comparable_created_at(value: Any) -> Optional[str]:
+    """``value`` spelled for COMPARISON against the column, not for storage.
+
+    The canonical spelling for the whole-second part, plus whatever fraction
+    the caller supplied. Stored values never carry a fraction — no writer
+    produces one and the migration truncates them — but a *boundary* may, and
+    truncating one moves it.
+
+    That is not cosmetic in a destructive path. ``purge_all_since`` compares
+    ``>=`` against a caller's watermark: truncate ``12:00:00.500`` to
+    ``12:00:00`` and a row stamped ``12:00:00`` — which predates the boundary —
+    is selected and permanently deleted. PostgreSQL keeps the fraction, so the
+    two backends would also disagree about which rows a purge destroys.
+
+    Still sorts correctly against canonical values, which is what lets the
+    comparison be a text one: ``'12:00:00' < '12:00:00.5' < '12:00:01'``.
+    """
+    parsed = parse_stored_timestamp(value)
+    if parsed is None:
+        return None
+    naive_utc = parsed.replace(tzinfo=None)
+    stamp = naive_utc.strftime(CANONICAL_FORMAT)
+    if naive_utc.microsecond:
+        stamp += f".{naive_utc.microsecond:06d}".rstrip("0")
+    return stamp
 
 
 def created_at_bind(backend_type: str, value: Any) -> Any:
@@ -206,16 +237,26 @@ def fill_undatable(values: Sequence[Any]) -> list:
     by looking along it.
     """
     stamps = [canonical_created_at(value) for value in values]
+    # Two carries rather than a scan per row. Slicing backwards and forwards at
+    # each undatable index is quadratic, and the input here is a whole restored
+    # history: a legacy backup whose stamps are largely unreadable would spend
+    # minutes of synchronous event-loop time on it and allocate a copy of the
+    # list per row.
+    successors = [None] * len(stamps)
+    carried = None
+    for index in range(len(stamps) - 1, -1, -1):
+        successors[index] = carried
+        if stamps[index] is not None:
+            carried = stamps[index]
+
     filled = []
+    predecessor = None
     for index, stamp in enumerate(stamps):
         if stamp is not None:
             filled.append((stamp, "stored"))
+            predecessor = stamp
             continue
-        predecessor = next(
-            (s for s in reversed(stamps[:index]) if s is not None), None
-        )
-        successor = next((s for s in stamps[index + 1:] if s is not None), None)
-        filled.append(derived_stamp(predecessor, successor))
+        filled.append(derived_stamp(predecessor, successors[index]))
     return filled
 
 
@@ -228,10 +269,24 @@ def canonical_sql(backend_type: str, expression: str) -> str:
     ``strftime`` returns NULL for text it cannot parse, and on PostgreSQL the
     column is already a ``timestamp``, so the only unreadable value is NULL
     itself and the expression is the column.
+
+    **Through ``julianday``, not over the text.** ``strftime`` alone reformats
+    the FIELDS it was given and hands back an out-of-range one untouched:
+    ``2023-01-01 24:00:01`` round-trips through it as itself, so a check
+    written on it accepts an hour that does not exist and that
+    ``datetime.fromisoformat`` refuses. Converting to a Julian day first forces
+    the value through an actual instant, and the hour comes back normalized to
+    ``2023-01-02 00:00:01`` — different from the input, which is what makes it
+    detectable. Measured on sqlite 3.50.4.
+
+    The float is safe at this granularity: over 4,004 timestamps sampled
+    across years 1 to 9999, the round trip is the identity for every canonical
+    value, and a second is ~1.16e-5 days against a double carrying ~1e-10 days
+    of absolute precision at these magnitudes.
     """
     if backend_type == "postgres":
         return expression
-    return f"strftime('{CANONICAL_FORMAT}', {expression})"
+    return f"strftime('{CANONICAL_FORMAT}', julianday({expression}))"
 
 
 def created_at_check(backend_type: str) -> str:
@@ -248,12 +303,22 @@ def created_at_check(backend_type: str) -> str:
     **passes**: written with ``=`` this constraint accepts ``'not a date'``.
     Measured on sqlite 3.50.4, and the reason the first version of it was
     decorative.
+
+    The year floor is the one bound the round trip cannot express. Julian day 0
+    predates year 1, so ``0000-01-01 00:00:00`` is a perfectly good instant to
+    SQLite and no instant at all to Python, whose ``datetime`` starts at year 1.
+    There is deliberately no matching CEILING: a five-digit year is already
+    refused by the round trip (``strftime`` returns NULL for it), and a
+    lexicographic ``<= '9999-12-31 23:59:59'`` would not have caught one anyway
+    — ``'10000-01-01'`` compares LESS than ``'9999-12-31'``, because ``'1'``
+    sorts before ``'9'``. A bound that reads as obviously correct and is not.
     """
     if backend_type == "postgres":
         return "created_at IS NOT NULL"
     return (
         "created_at IS NOT NULL AND created_at IS "
         + canonical_sql("sqlite", "created_at")
+        + f" AND created_at >= '{_EARLIEST}'"
     )
 
 

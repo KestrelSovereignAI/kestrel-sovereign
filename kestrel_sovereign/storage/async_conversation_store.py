@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
@@ -790,6 +791,19 @@ class AsyncConversationStore:
                     (self.agent_id, *batch),
                 )
                 purged += _rows_affected(affected)
+                # In the SAME statement batch, and for the same reason the
+                # lexical tokens are: ``conversation_history_undated`` has no
+                # cascade either, and it holds the ORIGINAL text of a stamp
+                # #3009's migration could not read. That text came out of the
+                # agent's own history and can be anything at all, so a row left
+                # behind here is exactly the residue this primitive exists to
+                # prevent — a permanent purge that leaves the message's
+                # agent_id and a fragment of its content addressable.
+                await self.db.execute(
+                    f"DELETE FROM {UNDATED_TABLE} "
+                    f"WHERE agent_id = ? AND message_id IN ({placeholders})",
+                    (self.agent_id, *batch),
+                )
 
             # Delete a key only after its selected owners are gone, and only
             # when no surviving row still owns it.  Legacy databases did not

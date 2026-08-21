@@ -2363,10 +2363,24 @@ class AsyncDatabase:
         # rows did a repair have to date from a neighbour" — including "none",
         # which is the answer on every healthy host and still worth being able
         # to ask for. Not routed through ``normalize_schema`` for the same
-        # reason as the table above: it would strip ``recorded_at``'s default
-        # on the way to SQLite (#3048), which its NOT NULL then makes
-        # unsatisfiable.
-        await self.execute(UNDATED_DDL)
+        # reason as conversation_history itself: it would strip
+        # ``recorded_at``'s default on the way to SQLite (#3048), which its NOT
+        # NULL then makes unsatisfiable.
+        #
+        # Probe -> lock -> re-probe, not a bare ``CREATE TABLE IF NOT EXISTS``.
+        # That spelling is idempotent in SEQUENCE and unsafe in PARALLEL, which
+        # is the same trap ``ensure_index`` documents at length: PostgreSQL
+        # evaluates the existence test before taking the lock that would
+        # exclude a peer, so two initializers that pass it together both build
+        # the relation and the loser fails on ``pg_class``'s unique index.
+        # ``_init_schema`` runs on every ``from_pool()`` — frinz calls it per
+        # request — so the first post-upgrade request burst IS the parallel
+        # case, and the loser does not merely skip the table: its whole
+        # initialization raises and the request fails.
+        if not await self.table_exists(UNDATED_TABLE):
+            async with self.migration_lock(f"create_{UNDATED_TABLE}"):
+                if not await self.table_exists(UNDATED_TABLE):
+                    await self.execute(UNDATED_DDL)
         await self.ensure_check_constraint(
             "conversation_history",
             CREATED_AT_CONSTRAINT,

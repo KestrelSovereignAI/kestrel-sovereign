@@ -137,6 +137,12 @@ def timestamp_query_param(backend_type: str, value: Any) -> Any:
     would be the one value in the comparison that still needed converting. So
     it is rendered by the same module the column's CHECK is computed from.
 
+    Sub-second precision is KEPT, which is why this is ``comparable_`` and not
+    the storage spelling. Nothing stores a fraction, but a boundary may carry
+    one, and rounding it down moves the boundary — ``purge_all_since`` compares
+    ``>=`` and would permanently delete a row that predates the watermark it
+    was given.
+
     A value nothing can date is passed through unchanged rather than becoming
     NULL: a predicate against it found nothing before and must go on finding
     nothing, rather than quietly matching every row with a NULL comparison.
@@ -145,9 +151,9 @@ def timestamp_query_param(backend_type: str, value: Any) -> Any:
         parsed = coerce_session_timestamp(value)
         return value if parsed is None else parsed
     if backend_type == "sqlite":
-        from .conversation_created_at import canonical_created_at
+        from .conversation_created_at import comparable_created_at
 
-        return canonical_created_at(value) or value
+        return comparable_created_at(value) or value
     return value
 
 

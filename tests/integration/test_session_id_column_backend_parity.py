@@ -3263,6 +3263,46 @@ async def test_tied_sessions_page_by_code_point_not_by_locale(postgres_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_concurrent_initializers_create_the_undated_table_once(postgres_db):
+    """The same post-upgrade burst, for the table #3009 adds.
+
+    ``_init_schema`` runs on every ``from_pool()``, so the first boot after
+    this ticket ships is genuinely parallel and none of its objects exist yet.
+    A bare ``CREATE TABLE IF NOT EXISTS`` evaluates its existence test before
+    taking the lock that would exclude a peer, so several initializers proceed
+    and the losers die on ``pg_class``'s unique index — not a skipped table, a
+    failed request. This is the case that made the projection's own schema pass
+    go through probe -> lock -> re-probe, and it applies unchanged here.
+
+    PostgreSQL-only, for the reason its neighbour above gives: SQLite
+    serializes writers on one file and cannot exhibit the catalog race, so a
+    dual-backend spelling would contribute a leg that passes whatever the code
+    does.
+
+    Bounded, because a lock test that can hang reports nothing.
+    """
+    from kestrel_sovereign.storage.conversation_created_at import UNDATED_TABLE
+
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+        assert await db.table_exists(UNDATED_TABLE) is False
+
+        outcomes = await _before_the_budget(
+            db,
+            "eight concurrent initializers creating the undated-row record",
+            asyncio.gather(
+                *(db._migrate_conversation_created_at() for _ in range(8)),
+                return_exceptions=True,
+            ),
+            budget=60.0,
+        )
+        raised = [o for o in outcomes if isinstance(o, BaseException)]
+        assert not raised, raised
+        assert await db.table_exists(UNDATED_TABLE) is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.timeout(120)
 async def test_a_database_holding_undatable_rows_is_repaired_on_both_engines(

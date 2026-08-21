@@ -75,8 +75,22 @@ REPAIRABLE = [
     ("20260102T030405", "2026-01-02 03:04:05"),       # basic form, Python only
 ]
 
-#: Values no reading of any kind turns into an instant.
-UNREPAIRABLE = ["not a date", "", "   ", "2026-13-45 99:99:99", None]
+#: Values no reading of any kind turns into an instant. The last two are the
+#: ones that look like dates and are not: SQLite's ``strftime`` reformats the
+#: FIELDS it is given, so an hour of 24 comes back unchanged, and Julian day 0
+#: predates year 1, so a year of 0000 is an instant to SQLite and none at all
+#: to Python. Both were accepted by the first version of the CHECK.
+UNREPAIRABLE = [
+    "not a date", "", "   ", "2026-13-45 99:99:99", None,
+    "0000-01-01 00:00:00",
+]
+
+#: Repairable by the ENGINE only. ``strftime`` reformats the fields it is
+#: given, so an hour of 24 comes back byte-identical and a round-trip test over
+#: the text accepts it; converting to a Julian day first forces it through an
+#: actual instant, which both DETECTS it and repairs it to the instant it
+#: always was. Python refuses it outright, so it cannot join ``REPAIRABLE``.
+ENGINE_ONLY = [("2023-01-01 24:00:01", "2023-01-02 00:00:01")]
 
 
 async def _legacy_database(tmp_path, name, rows, ddl=LEGACY_DDL):
@@ -633,3 +647,115 @@ async def test_after_the_migration_both_readers_can_date_every_row(tmp_path):
             )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_purged_message_takes_its_undated_record_with_it(tmp_path):
+    """A permanent purge may not leave the record of it behind.
+
+    ``original_created_at`` holds text that came out of the agent's own
+    history and can be anything at all — this case puts a secret in it, which
+    is not far-fetched for a column an import or a hand-edit wrote. The table
+    has no cascading foreign key, so unless the purge primitive names it, a
+    hard delete removes the message and leaves its agent id and that text
+    addressable. Same reasoning as ``conversation_lexical_tokens``, which is
+    already deleted there for exactly this reason.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    db = await _legacy_database(
+        tmp_path, "purge.db",
+        [(AGENT, "user", "a secret hiding in a timestamp")],
+    )
+    try:
+        assert await db.fetchall(
+            f"SELECT message_id FROM {UNDATED_TABLE}"
+        ) == [(1,)], "the migration did not record the row this case is about"
+
+        store = AsyncConversationStore(db, agent_id=AGENT)
+        assert await store.purge_message(1)
+
+        assert await db.fetchall("SELECT id FROM conversation_history") == []
+        assert await db.fetchall(f"SELECT * FROM {UNDATED_TABLE}") == [], (
+            "the message was destroyed but the record naming it survived"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_only_sqlite_thinks_is_real_is_treated_as_undatable(
+    tmp_path,
+):
+    """The two values that made the first CHECK a weaker claim than it read as.
+
+    ``strftime`` reformats fields rather than instants, so ``24:00:01`` came
+    back byte-identical and passed a round-trip written over the text; and
+    SQLite's calendar runs earlier than Python's ``datetime``, so year 0000 is
+    a real instant to one and no instant to the other. Both were stored, both
+    were skipped by the migration as already-canonical, and both were undatable
+    to every reader — precisely the state this change exists to make
+    impossible.
+
+    They are settled differently, and the difference is the point. The
+    out-of-range hour IS an instant, so converting through a Julian day repairs
+    it to the one it always was — nothing is derived and nothing is lost. Year
+    0000 is not an instant Python can hold at all, so it has no repair and
+    falls to a neighbour, recorded.
+    """
+    db = await _legacy_database(
+        tmp_path, "outside.db",
+        [
+            (AGENT, "user", "2026-01-02 03:04:05"),
+            (AGENT, "user", ENGINE_ONLY[0][0]),
+            (AGENT, "user", "0000-01-01 00:00:00"),
+        ],
+    )
+    try:
+        stamps = await _stamps(db)
+        assert stamps[:2] == ["2026-01-02 03:04:05", ENGINE_ONLY[0][1]]
+        for stored in stamps:
+            assert coerce_session_timestamp(stored) is not None, (
+                f"{stored!r} survived the migration unreadable to the readers"
+            )
+        recorded = await db.fetchall(
+            f"SELECT original_created_at, derived_from FROM {UNDATED_TABLE}"
+        )
+        assert recorded == [("0000-01-01 00:00:00", "predecessor")], (
+            "the hour SQLite could still place was thrown to a neighbour "
+            "instead of being converted to the instant it names"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.timeout(15)
+def test_a_history_of_undatable_rows_is_filled_in_one_pass():
+    """A restore hands this its whole transcript, so it may not be quadratic.
+
+    A legacy backup can be mostly unreadable stamps, and this runs
+    synchronously on the event loop. Scanning backwards and forwards from each
+    undatable index is O(n**2) with a list copy per row.
+
+    The size and the bound are measured, not guessed, because the first version
+    of this case used 20,000 rows and the quadratic implementation PASSED it in
+    1.7s — a timing test that does not separate the two implementations proves
+    only that the code runs. At 100,000: two carries take 0.41s and the scan
+    takes 40.5s, so a 15s bound sits ~35x above one and ~2.7x below the other.
+    Both scale together on a loaded machine, which is what makes a ratio this
+    wide safe to assert as a threshold.
+    """
+    size = 100_000
+    values = ["junk"] * size
+    values[size // 2] = "2026-01-02T03:04:05"
+    filled = fill_undatable(values)
+
+    assert len(filled) == size
+    assert filled[size // 2] == ("2026-01-02 03:04:05", "stored")
+    # Everything before the one readable row borrows FORWARD from it, and
+    # everything after inherits it. One stamp, whichever side you are on.
+    assert filled[0] == ("2026-01-02 03:04:05", "successor")
+    assert filled[-1] == ("2026-01-02 03:04:05", "predecessor")
+    assert {stamp for stamp, _ in filled} == {"2026-01-02 03:04:05"}
