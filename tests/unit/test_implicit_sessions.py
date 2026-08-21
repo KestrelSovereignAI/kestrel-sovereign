@@ -14,6 +14,10 @@ These tests verify the wiring is real, not aspirational.
 """
 
 import json
+
+from kestrel_sovereign.storage.conversation_created_at import (
+    canonical_created_at,
+)
 import pytest
 import tempfile
 from datetime import datetime, timezone, timedelta
@@ -94,13 +98,22 @@ class TestImplicitSessionDerivation:
 
 
 class TestSessionGapBoundary:
-    """Verify the 30-minute gap actually creates a new session."""
+    """Verify the 30-minute gap actually creates a new session.
+
+    The injected rows are spelled by ``conversation_created_at`` rather than by
+    ``isoformat()``. That is not cosmetic: since #3009 the column carries a
+    CHECK, and an ISO-spelled stamp is refused outright — these cases are about
+    the GAP, and a hand-rolled spelling nothing writes was never part of the
+    claim.
+    """
 
     @pytest.mark.asyncio
     async def test_gap_over_30_min_starts_new_session(self, store):
         """Manually inject an old message and verify a new one starts fresh."""
         # Manually insert a message timestamped 31 minutes ago
-        old_time = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+        old_time = canonical_created_at(
+            datetime.now(timezone.utc) - timedelta(minutes=31)
+        )
         old_meta = {"session_id": "old-session"}
         await store.db.execute_commit(
             "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) "
@@ -123,7 +136,9 @@ class TestSessionGapBoundary:
     @pytest.mark.asyncio
     async def test_gap_under_30_min_reuses_session(self, store):
         """A gap of 5 minutes should still reuse the previous session."""
-        recent_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        recent_time = canonical_created_at(
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        )
         recent_meta = {"session_id": "recent-session"}
         await store.db.execute_commit(
             "INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) "

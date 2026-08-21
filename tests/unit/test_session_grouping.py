@@ -168,13 +168,31 @@ def test_timestamp_coercion_normalizes_iso_offsets_to_naive_utc():
 
 
 def test_timestamp_sql_boundary_normalizes_sqlite_and_preserves_postgres_binds():
+    """Both sides of a timestamp comparison, in the spellings each backend uses.
+
+    The SQLite parameter used to be ``value.isoformat()`` — a ``T`` separator,
+    a ``+00:00`` offset — which was safe only because ``julianday`` was applied
+    to BOTH sides and reads either. Since #3009 the column holds exactly one
+    spelling, and the parameter is rendered in it: a bound value in a different
+    spelling would be the one term in the comparison still needing conversion,
+    which is what has to stop being true before ``julianday`` can come out of
+    the ordering at all.
+    """
     aware = datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
 
     assert canonical_timestamp_sql("sqlite", "created_at") == "julianday(created_at)"
     assert timestamp_predicate("sqlite", "created_at", ">") == (
         "julianday(created_at) > julianday(?)"
     )
-    assert timestamp_query_param("sqlite", aware) == "2026-06-29T12:00:00+00:00"
+    assert timestamp_query_param("sqlite", aware) == "2026-06-29 12:00:00"
+    # The offset is APPLIED on the way, not dropped: 07:00-05:00 is 12:00 UTC.
+    assert timestamp_query_param("sqlite", "2026-06-29T07:00:00-05:00") == (
+        "2026-06-29 12:00:00"
+    )
+    # A value nothing can date is passed through rather than becoming NULL: a
+    # predicate against it matched nothing before and must go on matching
+    # nothing, instead of comparing NULL against every row.
+    assert timestamp_query_param("sqlite", "not a date") == "not a date"
 
     postgres_bound = timestamp_query_param("postgres", aware)
     assert postgres_bound == datetime(2026, 6, 29, 12, 0, 0)

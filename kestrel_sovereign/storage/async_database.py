@@ -209,8 +209,8 @@ CREATE TABLE IF NOT EXISTS schema_backfills (
 -- this schema runs, and NOT from this text. Its CHECK is per-backend, and
 -- ``normalize_schema`` strips ``DEFAULT CURRENT_TIMESTAMP`` on the way to
 -- SQLite (#3048) — the column that has to stop being nullable is the last one
--- that can afford to lose its default. The indexes below still belong here;
--- the table exists by the time they run.
+-- that can afford to lose its default. The indexes below still belong here,
+-- because the table exists by the time they run.
 
 CREATE TABLE IF NOT EXISTS conversation_lexical_tokens (
     agent_id TEXT NOT NULL,
@@ -2356,6 +2356,16 @@ class AsyncDatabase:
         just rewritten underneath it. Reversed, the projection would go on
         claiming to be current for a table it no longer has triggers on.
         """
+        # Created by the migration that writes to it, and OUTSIDE the
+        # constraint probe below, so it exists on every boot rather than only
+        # on the one that retrofits. A database born with the constraint never
+        # reaches the repair, and would otherwise have nowhere to answer "which
+        # rows did a repair have to date from a neighbour" — including "none",
+        # which is the answer on every healthy host and still worth being able
+        # to ask for. Not routed through ``normalize_schema`` for the same
+        # reason as the table above: it would strip ``recorded_at``'s default
+        # on the way to SQLite (#3048), which its NOT NULL then makes
+        # unsatisfiable.
         await self.execute(UNDATED_DDL)
         await self.ensure_check_constraint(
             "conversation_history",
