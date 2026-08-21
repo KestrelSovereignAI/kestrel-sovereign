@@ -47,25 +47,39 @@ def fake_registry(monkeypatch):
 
 
 class _PipSpy:
-    """Records pip invocations and returns a canned success result."""
+    """Records install invocations and returns a canned success result."""
 
-    def __init__(self, installed_line=""):
+    def __init__(self, stdout="", stderr=""):
         self.calls = []
-        self.installed_line = installed_line
+        self.stdout = stdout
+        self.stderr = stderr
 
-    def __call__(self, cmd, capture_output=True, text=True):
+    def __call__(self, cmd, capture_output=True, text=True, timeout=None):
         self.calls.append(cmd)
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=self.installed_line, stderr=""
-        )
+        return subprocess.CompletedProcess(cmd, 0, stdout=self.stdout, stderr=self.stderr)
 
 
-def test_parse_pip_installed_version_extracts_only_matching_package():
-    out = "Successfully installed kestrel-feature-github-0.2.0 httpx-0.27.0"
-    assert cli._parse_pip_installed_version(out, "kestrel-feature-github") == "0.2.0"
-    # underscores/dashes normalise
-    assert cli._parse_pip_installed_version(out, "kestrel_feature_github") == "0.2.0"
-    assert cli._parse_pip_installed_version("Requirement already satisfied", "x") is None
+def _installed_versions(monkeypatch, versions):
+    """Point installed-metadata reads at *versions* — the venv AFTER an install.
+
+    What an upgrade did is read back from the venv (`_installed_version`), not
+    parsed out of the installer's stdout, so this is the double that has to
+    move. Keyed canonically because that is how a distribution is identified
+    (PEP 503), whichever of its spellings the caller happens to hold.
+    """
+    import importlib.metadata as md
+
+    from kestrel_sovereign.feature_reconcile import canonical_package
+
+    canonical = {canonical_package(k): v for k, v in versions.items()}
+
+    def version(name):
+        try:
+            return canonical[canonical_package(name)]
+        except KeyError:
+            raise md.PackageNotFoundError(name) from None
+
+    monkeypatch.setattr(md, "version", version)
 
 
 def test_editable_install_path_reads_direct_url(monkeypatch):
@@ -156,7 +170,8 @@ def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_regist
             _dist("kestrel-feature-voice", "0.1.0", editable_path="/src/voice"),
         ],
     )
-    spy = _PipSpy(installed_line="Successfully installed kestrel-feature-github-0.2.0")
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.2.0"})
+    spy = _PipSpy()
     monkeypatch.setattr(cli.subprocess, "run", spy)
 
     rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
@@ -173,6 +188,98 @@ def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_regist
     assert "kestrel-feature-voice" in out and "skip (editable" in out
 
 
+# --- what an upgrade did is a fact about the venv (#2949) -------------------
+
+
+def test_upgrade_reports_the_version_uv_actually_installed(
+    monkeypatch, fake_registry, capsys
+):
+    """uv is the DEFAULT backend, and it does not write pip's prose.
+
+    `uv pip install` reports an install as `+ pkg==ver` on stderr; pip writes
+    `Successfully installed pkg-ver` on stdout. Reading the new version out of
+    pip's line meant every upgrade on the backend this host actually uses
+    reported "up to date" — and the restart notice, which only prints when
+    something moved, went with it.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("kestrel-feature-github", "0.1.0")],
+    )
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.2.0"})
+    spy = _PipSpy(
+        stderr=(
+            "Resolved 14 packages in 412ms\n"
+            "Installed 1 package in 31ms\n"
+            " + kestrel-feature-github==0.2.0\n"
+        ),
+    )
+    monkeypatch.setattr(cli.subprocess, "run", spy)
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "upgraded -> 0.2.0" in out
+    assert "1 package(s) upgraded" in out
+    assert "Restart the host/agents" in out
+
+
+def test_upgrade_reads_back_a_dotted_distribution_name(
+    monkeypatch, fake_registry, capsys
+):
+    """`Kestrel.Feature.Github` names the same distribution as the registry's.
+
+    PEP 503 folds runs of `.`, `-` and `_` into one separator, so the read-back
+    canonicalizes. Swapping underscores for dashes — the old normalization —
+    leaves the dotted spelling unmatched and calls a real upgrade "up to date".
+    """
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("Kestrel.Feature.Github", "0.1.0")],
+    )
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.2.0"})
+    # pip-shaped output on purpose: the ONLY thing that can go wrong here is
+    # the spelling the version is looked up under.
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        _PipSpy(stdout="Successfully installed kestrel-feature-github-0.2.0"),
+    )
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == 0
+    assert "upgraded -> 0.2.0" in capsys.readouterr().out
+
+
+def test_upgrade_that_moved_nothing_is_not_reported_as_an_upgrade(
+    monkeypatch, fake_registry, capsys
+):
+    """The other direction: an install that resolved to what was already there.
+
+    Reading the venv must not turn every successful exit into an "upgraded"
+    line — the restart notice would then print on runs that changed nothing.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("kestrel-feature-github", "0.1.0")],
+    )
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.1.0"})
+    monkeypatch.setattr(cli.subprocess, "run", _PipSpy())
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "up to date" in out
+    assert "0 package(s) upgraded" in out
+    assert "Restart the host/agents" not in out
+
+
 def test_upgrade_subset_by_name_only_targets_match(monkeypatch, fake_registry, capsys):
     monkeypatch.setattr(
         cli,
@@ -182,7 +289,8 @@ def test_upgrade_subset_by_name_only_targets_match(monkeypatch, fake_registry, c
             _dist("kestrel-feature-voice", "0.1.0"),
         ],
     )
-    spy = _PipSpy(installed_line="Successfully installed kestrel-feature-github-0.2.0")
+    _installed_versions(monkeypatch, {"kestrel-feature-github": "0.2.0"})
+    spy = _PipSpy()
     monkeypatch.setattr(cli.subprocess, "run", spy)
 
     rc = cli.cmd_feature_upgrade(
@@ -192,6 +300,52 @@ def test_upgrade_subset_by_name_only_targets_match(monkeypatch, fake_registry, c
     assert rc == 0
     assert len(spy.calls) == 1
     assert spy.calls[0][-1] == "kestrel-feature-github"
+
+
+def test_upgrade_matches_a_distribution_spelled_differently(
+    monkeypatch, fake_registry, capsys
+):
+    """One distribution, three spellings — the operator's, the registry's, and
+    the one the package's own METADATA wrote.
+
+    `Kestrel_Feature_Voice` is a legal `Name:` for the project the registry
+    calls `kestrel-feature-voice`, and that is what `ep.dist.name` reports.
+    Comparing raw strings declared the installed package missing, refused to
+    upgrade it, and lost its git fallback with it (issue #2949) — PEP 503 says
+    those are the same distribution.
+    """
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("Kestrel_Feature_Voice", "0.1.0")],
+    )
+
+    def flaky_run(cmd, capture_output=True, text=True, timeout=None):
+        calls.append(cmd)
+        if "git+" in cmd[-1]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="Successfully installed kestrel-feature-voice-0.2.0",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="No matching distribution"
+        )
+
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", flaky_run)
+
+    rc = cli.cmd_feature_upgrade(
+        types.SimpleNamespace(names=["voice"], dry_run=False)
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not an installed extension package" not in out
+    # ...and the registry's git URL is still reachable for the fallback.
+    assert len(calls) == 2
+    assert calls[1][-1] == (
+        "git+https://github.com/KestrelSovereignAI/kestrel-feature-voice.git"
+    )
 
 
 def test_upgrade_unmatched_name_is_reported(monkeypatch, fake_registry, capsys):
@@ -221,7 +375,7 @@ def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, ca
 
     calls = []
 
-    def flaky_run(cmd, capture_output=True, text=True):
+    def flaky_run(cmd, capture_output=True, text=True, timeout=None):
         calls.append(cmd)
         # First (PyPI) attempt fails; git fallback succeeds.
         if "git+" in cmd[-1]:
@@ -241,8 +395,6 @@ def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, ca
 
 def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, capsys):
     """upgrade goes through _extension_install_run (uv-aware), not bare python -m pip."""
-    import kestrel_sovereign.cli_features as cli_features
-
     monkeypatch.setattr(
         cli,
         "_installed_extension_distributions",
@@ -251,13 +403,16 @@ def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, caps
 
     calls = []
 
-    def fake_install(pip_args):
+    def fake_install(pip_args, *, constraints=None, reinstall=None, timeout=None):
         calls.append(pip_args)
         return subprocess.CompletedProcess(
             pip_args, 0, stdout="Successfully installed kestrel-feature-github-0.2.0", stderr=""
         )
 
-    monkeypatch.setattr(cli_features, "_extension_install_run", fake_install)
+    # Patch the seam the command actually reaches — `cli._extension_install_run`,
+    # via CoreInstallGuard. Patching the cli_features global instead leaves the
+    # command shelling out to a real `uv pip install`.
+    monkeypatch.setattr(cli, "_extension_install_run", fake_install)
 
     rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
 

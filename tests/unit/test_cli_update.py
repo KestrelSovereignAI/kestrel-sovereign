@@ -318,6 +318,68 @@ def test_continue_on_error_runs_restart_after_sync_failure(stub_project_dir):
     assert called == ["sync", "restart"]
 
 
+def test_continue_on_error_does_not_restart_onto_an_undeclared_core(
+    stub_project_dir, capsys,
+):
+    """``--continue-on-error`` tolerates an optional package that would not
+    install. It must NOT reach an unrepaired core drift.
+
+    Folding that safety failure into the same generic ``1`` as a package
+    failure let the flag restart every agent onto a core the manifest does not
+    declare, and exit 0 — the precise outcome #2949 exists to prevent. The
+    contrast with the test above is the whole point: same flag, same non-zero
+    step, opposite decision, because the two failures do not mean the same
+    thing.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNSAFE
+
+    called = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: called.append("sync") or CORE_UNSAFE), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: called.append("restart") or 0):
+        rc = cli.cmd_update(_ns(continue_on_error=True))
+
+    assert rc == CORE_UNSAFE
+    assert "restart" not in called
+    assert "undeclared core" in capsys.readouterr().err
+
+
+def test_continue_on_error_does_not_restart_when_reconcile_reports_unsafe_core(
+    stub_project_dir, capsys,
+):
+    """The same rule one step later: reconcile is where a feature install
+    actually swaps core, so its unsafe verdict must block the restart too."""
+    from kestrel_sovereign import cli_lifecycle
+    from kestrel_sovereign.cli_features import CORE_UNSAFE
+
+    called = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
+         patch.object(cli, "cmd_feature_sync", lambda args: 0), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile",
+                      lambda *a, **kw: called.append("reconcile") or CORE_UNSAFE), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: called.append("restart") or 0):
+        rc = cli.cmd_update(_ns(continue_on_error=True))
+
+    assert rc == CORE_UNSAFE
+    assert called == ["reconcile"]
+    assert "undeclared core" in capsys.readouterr().err
+
+
 def test_target_agent_flows_to_restart_only(stub_project_dir):
     """A positional ``name`` arg is forwarded to the restart step only;
     the other steps don't accept an agent target."""
@@ -853,3 +915,35 @@ def test_editable_git_pull_recovers_detached_head(tmp_path):
     # And it actually fast-forwarded to origin/main (picked up c2).
     assert git("rev-parse", "HEAD").stdout.strip() == \
         git("rev-parse", "origin/main").stdout.strip()
+
+
+def test_continue_on_error_does_not_restart_on_a_stale_core_checkout(
+    stub_project_dir, capsys,
+):
+    """A failed core pull is not an optional-package failure.
+
+    `--continue-on-error` is documented for a package that would not install.
+    Restarting the fleet onto core code the operator asked to update, and
+    returning success, is not that — and a generic `rc = 1` was silently
+    ignored by exactly that flag.
+    """
+    from kestrel_sovereign import cli_lifecycle
+    from kestrel_sovereign.cli_features import CORE_STALE
+
+    called = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable", lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: called.append("sync") or CORE_STALE), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: called.append("restart") or 0):
+        rc = cli.cmd_update(_ns(continue_on_error=True))
+
+    assert rc == CORE_STALE
+    assert "restart" not in called
+    assert "stale code" in capsys.readouterr().err

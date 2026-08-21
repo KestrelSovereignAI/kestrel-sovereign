@@ -1,10 +1,14 @@
 """Tests for the Feature Store API endpoints (endpoints/features.py)."""
 
+import shlex
+import sys
 from dataclasses import asdict
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from fastapi import FastAPI
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.endpoints.features import router as features_router
@@ -13,6 +17,7 @@ from kestrel_sovereign.feature_registry import (
     FeatureStatus,
     SkillInfo,
 )
+from tests.utils.fake_uv import CORE, FakeUv, use_fake_uv
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +551,210 @@ class TestInstallFeature:
             resp = client.post("/api/features/Unknown/install")
 
         assert resp.status_code == 404
+
+    # -- core install guard (#2949) -----------------------------------------
+    #
+    # Installing from the console is not a safer path than installing from the
+    # CLI: the package depends on kestrel-sovereign, so an unguarded install can
+    # resolve core from the index and replace the running editable core. Same
+    # venv/resolver double as the CLI tests (tests/utils/fake_uv.py) — the two
+    # surfaces claim identical behaviour, so they are held to one model.
+
+    @staticmethod
+    def _venv(monkeypatch, **kw):
+        venv = FakeUv(feature="kestrel-feature-test", core_checkout="/src/core", **kw)
+        use_fake_uv(monkeypatch, venv)
+        return venv
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_pins_core_to_the_editable_checkout(self, mock_registry, monkeypatch):
+        """The regression, over HTTP: a feature requiring core > the checkout's
+        version fails loudly instead of replacing the editable install."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch)  # editable core 0.52.0; feature wants >=0.53
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        assert "No solution found" in resp.json()["detail"]
+        assert venv.pins == ["==0.52.0"]  # the pin reached the resolver
+        assert venv.editable[CORE] == "/src/core"  # link intact
+        assert "kestrel-feature-test" not in venv.installed
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_succeeds_when_the_checkout_satisfies_the_feature(
+        self, mock_registry, monkeypatch
+    ):
+        """The pin must not manufacture failures."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, feature_requires=">=0.52")
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "installed"
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
+        assert venv.editable[CORE] == "/src/core"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
+        """An install that bypassed the pin cannot return a clean 'installed'."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, honours_constraints=False)
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        body = resp.json()
+        assert resp.status_code == 200  # the package really did install...
+        assert body["status"] == "installed_with_core_drift"  # ...but say so
+        assert body["core_restored"] is True
+        assert "expected: editable → /src/core" in body["core_drift"]
+        assert venv.editable[CORE] == "/src/core"  # actually re-linked
+        assert venv.installed[CORE] == "0.52.0"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_failed_install_still_verifies_and_restores_core(
+        self, mock_registry, monkeypatch
+    ):
+        """A non-zero install is not a no-op.
+
+        pip resolves and installs dependencies BEFORE the requested package, so
+        a build failure can leave core already swapped. Returning the install
+        error without checking would leave that swap in place, unnamed.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, feature_install_fails=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "Installation failed" in detail
+        assert "was replaced during the install batch" in detail
+        assert (
+            f"restored: uv pip install --python {shlex.quote(sys.executable)} "
+            "-e /src/core"
+        ) in detail
+        assert venv.editable[CORE] == "/src/core"  # repaired despite the failure
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_timed_out_install_still_verifies_and_restores_core(
+        self, mock_registry, monkeypatch
+    ):
+        """A killed install leaves whatever it had already written — including
+        a swapped core. The timeout response must not skip the check."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, feature_install_times_out=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 504
+        detail = resp.json()["detail"]
+        assert "timed out" in detail
+        assert "was replaced during the install batch" in detail
+        assert venv.editable[CORE] == "/src/core"  # repaired despite the timeout
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_install_fails_closed_when_core_cannot_be_restored(
+        self, mock_registry, monkeypatch
+    ):
+        """The worst case: the package installed, core was replaced, and the
+        re-link failed. The host is running a core nobody declared — that is
+        not a 2xx, whatever happened to the package."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch, honours_constraints=False, repair_fails=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "was replaced during the install batch" in detail
+        # The operator's command, verbatim — the response is the only place
+        # they will see it.
+        assert (
+            "RESTORE FAILED — run `uv pip install --python "
+            f"{shlex.quote(sys.executable)} -e /src/core` by hand."
+        ) in detail
+        assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_hung_repair_is_bounded_not_a_wedged_request(
+        self, mock_registry, monkeypatch
+    ):
+        """The repair runs a SECOND installer, and it must be bounded too.
+
+        The endpoint caps the install so a hung resolve becomes a 504. The
+        repair that follows a swap resolves against the same index through the
+        same resolver, so whatever hung the install hangs it as well — left
+        unbounded it holds the request open forever and the 504 never arrives.
+        ``FakeUv(repair_hangs=True)`` refuses to fake a return for an unbounded
+        call (``UnboundedInstall``), so this fails loudly if the bound is lost.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(
+            monkeypatch,
+            honours_constraints=False,
+            feature_install_times_out=True,
+            repair_hangs=True,
+        )
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        # The install's own verdict still stands...
+        assert resp.status_code == 504
+        detail = resp.json()["detail"]
+        assert "Installation timed out" in detail
+        # ...and the core it left swapped is named, with the manual command,
+        # because the automatic restore did not finish either.
+        assert "was replaced during the install batch" in detail
+        assert (
+            "RESTORE FAILED — run `uv pip install --python "
+            f"{shlex.quote(sys.executable)} -e /src/core` by hand."
+        ) in detail
+        assert "timed out after 300s" in detail  # why the repair's tail stops
+        assert venv.editable.get(CORE) is None  # still swapped — reported, not hidden
+
+    def test_the_cli_repair_stays_unbounded(self, monkeypatch):
+        """The bound is the HTTP surface's, not a new default.
+
+        An operator watching a terminal can interrupt a slow install; capping
+        the CLI's restore would abandon a genuinely slow-but-working reinstall
+        of core, which is worse than waiting. So the guard's default must stay
+        unlimited — asserted here rather than left to whoever reads the
+        signature next.
+        """
+        from kestrel_sovereign.cli_features import CoreInstallGuard
+
+        venv = FakeUv(core_checkout="/src/core")
+        use_fake_uv(monkeypatch, venv)
+        guard = CoreInstallGuard.snapshot()
+        venv.editable.pop(CORE)  # something swapped core out from under us
+        seen = []
+        real_run = venv.run
+
+        def record(cmd, **kw):
+            seen.append(kw.get("timeout"))
+            return real_run(cmd, **kw)
+
+        monkeypatch.setattr("kestrel_sovereign.cli.subprocess.run", record)
+
+        assert guard.verify() == 1  # drift reported...
+        assert venv.editable[CORE] == "/src/core"  # ...and repaired
+        assert seen == [None]
 
 
 # ---------------------------------------------------------------------------
@@ -1150,3 +1359,317 @@ class TestGetSkillSchema:
             resp = client.get("/api/skills/nonexistent/schema")
 
         assert resp.status_code == 404
+
+
+class TestConcurrentInstallSerialization:
+    """Two overlapping installs are one transaction each, not two interleaved.
+
+    The endpoint runs snapshot -> install -> resolve in worker threads. Without
+    a lock both halves break: concurrent pip writes to one environment are
+    unsupported (the no-uv fallback is a multi-pass sequence), and each request
+    snapshots core before its own install and compares after — so B's install
+    lands inside A's window, A reports it as drift and "repairs" a core nobody
+    moved, and B then sees THAT as drift. Two correct installs manufacture two
+    spurious CORE_UNSAFE verdicts between them.
+    """
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_installs_do_not_interleave(self, mock_registry, monkeypatch):
+        import asyncio as _asyncio
+        import threading
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+
+        # Record entry/exit of the guarded section from the worker threads. If
+        # the lock holds, the sequence is strictly paired: enter,exit,enter,exit.
+        events: list = []
+        lock = threading.Lock()
+        overlap = threading.Event()
+
+        class _Guard:
+            @classmethod
+            def snapshot(cls, *a, **kw):
+                with lock:
+                    events.append("enter")
+                    if events.count("enter") > events.count("exit") + 1:
+                        overlap.set()
+                return cls()
+
+            def run(self, *a, **kw):
+                # Long enough that a second request would overlap if unlocked.
+                import time
+                time.sleep(0.05)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def resolve(self, *a, **kw):
+                with lock:
+                    events.append("exit")
+                return SimpleNamespace(
+                    drift=None, conforming=True, describe=lambda: "",
+                )
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.cli_features.CoreInstallGuard", _Guard,
+        )
+
+        async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
+            app = _make_app(_make_agent())
+            import httpx
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://t",
+            ) as client:
+                return await _asyncio.gather(
+                    client.post("/api/features/test-pkg/install"),
+                    client.post("/api/features/test-pkg/install"),
+                    return_exceptions=True,
+                )
+
+        _asyncio.run(_drive())
+
+        assert not overlap.is_set(), f"installs interleaved: {events}"
+        # Strictly paired: no enter follows an enter without an exit between.
+        assert events == ["enter", "exit", "enter", "exit"], events
+
+    def test_a_cancelled_request_does_not_release_the_lock_early(self, monkeypatch):
+        """Cancelling the request must not hand the venv to the next install.
+
+        Cancelling an `asyncio.to_thread` await does NOT stop the worker thread
+        or the installer subprocess it is running. Inline, a cancelled request
+        unwinds `async with` and frees the lock immediately while that abandoned
+        installer keeps writing — so the next request snapshots a venv still
+        being mutated. The work is shielded precisely so the lock outlives the
+        request that started it.
+        """
+        import asyncio as _asyncio
+        import threading
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        released_while_running = threading.Event()
+        finished = threading.Event()
+        started = _asyncio.Event()
+
+        async def _slow_guarded():
+            async with features_ep._INSTALL_LOCK:
+                started.set()
+                await _asyncio.sleep(0.15)   # the "installer" still running
+                finished.set()
+
+        async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
+            inner = _asyncio.create_task(_slow_guarded())
+            task = _asyncio.ensure_future(_asyncio.shield(inner))
+            await started.wait()
+            task.cancel()                     # client hangs up mid-install
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+            # The shielded work is still going; the lock must still be held.
+            if not features_ep._INSTALL_LOCK.locked() and not finished.is_set():
+                released_while_running.set()
+            # Let the shielded task finish so the lock is released by IT.
+            await _asyncio.sleep(0.25)
+            return features_ep._INSTALL_LOCK.locked()
+
+        still_locked_after = _asyncio.run(_drive())
+
+        assert not released_while_running.is_set(), (
+            "lock was released while the abandoned worker was still running"
+        )
+        assert finished.is_set(), "shielded work did not run to completion"
+        assert not still_locked_after, "lock was never released by the task itself"
+
+    def test_cancelling_while_queued_prevents_the_install_entirely(self):
+        """A request cancelled while WAITING must not install later.
+
+        Shielding the lock wait as well as the transaction meant a request
+        queued behind another install survived its own cancellation, kept
+        waiting, and then installed a package nobody was asking for any more —
+        a mutation with no live request behind it. Cancellation while waiting
+        has to prevent the work; only cancellation once the installer is
+        already running is unstoppable.
+        """
+        import asyncio as _asyncio
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        installed: list = []
+
+        async def _txn(tag):
+            try:
+                installed.append(tag)
+                await _asyncio.sleep(0.05)
+            finally:
+                features_ep._INSTALL_LOCK.release()
+
+        async def _request(tag):
+            # Mirrors the endpoint: acquire OUTSIDE the shield, shield the work.
+            await features_ep._INSTALL_LOCK.acquire()
+            return await _asyncio.shield(_asyncio.create_task(_txn(tag)))
+
+        async def _drive():
+            features_ep._INSTALL_LOCK = _asyncio.Lock()
+            first = _asyncio.create_task(_request("first"))
+            await _asyncio.sleep(0.01)          # first holds the lock
+            second = _asyncio.create_task(_request("second"))
+            await _asyncio.sleep(0.01)          # second is queued on acquire()
+            second.cancel()                     # client hangs up while WAITING
+            try:
+                await second
+            except _asyncio.CancelledError:
+                pass
+            await first
+            await _asyncio.sleep(0.1)           # give a phantom install time to land
+            return list(installed)
+
+        done = _asyncio.run(_drive())
+
+        assert done == ["first"], f"a cancelled-while-queued request installed: {done}"
+        assert not features_ep._INSTALL_LOCK.locked()
+
+
+class TestPostRepairRevalidation:
+    """A restored core can be exactly the version the new package rejected."""
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_orphaned_feature_after_repair_is_not_reported_as_installed(
+        self, mock_registry, monkeypatch,
+    ):
+        """The package that MOVED core is usually the reason it moved.
+
+        A feature requiring core >=0.53 pulls 0.53 in; the repair puts 0.52
+        back; the freshly installed feature now has an unsatisfied dependency
+        and cannot load. Returning 200 "installed, restart the agent" there is a
+        completed-install report over an environment that cannot run it.
+        """
+        import importlib.metadata as md
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        # Core moved and was restored to 0.52.0, which the package rejects.
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({"Requires-Dist": ["kestrel-sovereign>=0.53"]}),
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500, resp.json()
+        detail = resp.json()["detail"]
+        assert "cannot load" in detail
+        assert "0.52.0" in detail
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_an_inactive_conditional_core_requirement_is_not_reported_unmet(
+        self, mock_registry, monkeypatch,
+    ):
+        """A requirement this interpreter does not have is not an unmet one.
+
+        `Requires-Dist: kestrel-sovereign>=0.60; python_version < "3.10"` says
+        nothing about a 3.13 host. Checking its specifier regardless turned a
+        healthy install into a 500 — the guard inventing the very failure it
+        exists to report.
+        """
+        import importlib.metadata as md
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        # The SAME specifier the test above proves is reported when it applies —
+        # only the marker differs, so the marker is what this test isolates.
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({
+                "Requires-Dist": [
+                    'kestrel-sovereign>=0.53; python_version < "3.10"',
+                ],
+            }),
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200, resp.json()
+        # The drift itself is still reported — only the false unmet-requirement
+        # claim is gone.
+        assert resp.json()["status"] == "installed_with_core_drift"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_core_revalidation_runs_while_the_install_lock_is_held(
+        self, mock_registry, monkeypatch,
+    ):
+        """Reading live core version outside the lock reads a passing state.
+
+        A queued install is waiting to mutate the very environment this reads.
+        Outside the lock, this can observe a core the next request puts up and
+        takes back down, and answer about an environment that never outlived the
+        read. The earlier fix moved snapshot/install/resolve inside the lock;
+        this check was added afterwards and was left outside it.
+        """
+        import importlib.metadata as md
+
+        from kestrel_sovereign.endpoints import features as features_ep
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+
+        class _Meta(dict):
+            def get_all(self, key):
+                return self.get(key, [])
+
+        monkeypatch.setattr(
+            md, "metadata",
+            lambda name: _Meta({"Requires-Dist": ["kestrel-sovereign>=0.53"]}),
+        )
+
+        held = []
+        real = features_ep._core_requirement_unsatisfied
+
+        def _observe(package_spec):
+            # Observed AT THE MOMENT OF THE CALL, not afterwards: the question
+            # is whether this read is inside the critical section.
+            held.append(features_ep._INSTALL_LOCK.locked())
+            return real(package_spec)
+
+        monkeypatch.setattr(
+            features_ep, "_core_requirement_unsatisfied", _observe,
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500, resp.json()   # the check really ran...
+        assert held == [True]                          # ...and ran holding the lock

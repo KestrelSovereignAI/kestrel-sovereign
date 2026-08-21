@@ -933,6 +933,7 @@ def _run_feature_reconcile(
     (unless ``continue_on_error`` downgrades package failures to warnings).
     """
     from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.cli_features import CORE_UNSAFE, CoreInstallGuard
     from kestrel_sovereign.feature_registry import load_registry
     import importlib.metadata as md
 
@@ -1037,9 +1038,27 @@ def _run_feature_reconcile(
         print("• reconcile: host venv already satisfies the agent allowlists.")
         return 0
 
+    # Keyed the way every package identity in the plan is keyed
+    # (``fr.canonical_package``) — an action carrying the canonical name must
+    # not miss a registry row the catalog happened to spell differently.
     git_urls = {
-        info.package: info.git for info in registry.values() if info.package
+        fr.canonical_package(info.package): info.git
+        for info in registry.values() if info.package
     }
+
+    # 4. Guard the core install across the whole batch.
+    #
+    # Every kestrel-feature-* depends on kestrel-sovereign. `uv pip` is
+    # project-blind (see _extension_install_run), so a feature whose core pin the
+    # checkout fails resolves core from the index and replaces the operator's
+    # core with a wheel copy — invisibly, because cwd=checkout keeps shadowing
+    # site-packages for anything started from inside it (issue #2949).
+    #
+    # Same guard object as `feature install` / `upgrade` / `sync`, holding core
+    # to the SAME source-map policy: reconcile never installs core itself (core
+    # classes are bundled, so they are excluded from the plan), so there is no
+    # core entry to apply first here — only a policy to hold everything else to.
+    guard = CoreInstallGuard.snapshot(source_index)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -1061,7 +1080,9 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} would {action.op} ({how})")
             continue
 
-        ok, detail = _execute_reconcile_action(action, git_urls, allow_dirty)
+        ok, detail = _execute_reconcile_action(
+            action, git_urls, allow_dirty, guard=guard,
+        )
         if ok:
             print(f"  {label:<34} {current:<10} {action.op}d ({how})")
             if detail:
@@ -1072,23 +1093,48 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} FAILED")
             for line in (detail or "").splitlines()[-5:]:
                 print(f"      {line}")
+            if guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]} for "
+                    "this install so a feature cannot silently replace the "
+                    "declared core. If this is a version conflict, update "
+                    "the checkout to satisfy the feature — do not remove the pin."
+                )
             if not continue_on_error:
                 print(
-                    "• reconcile: FAILED — aborting before feature sync. "
+                    "• reconcile: FAILED — aborting before restart. "
                     "Re-run with --continue-on-error to proceed anyway.",
                     file=sys.stderr,
                 )
-                return rc
+                break
+
+    # 5. Assert core survived. Runs even when the loop aborted early: a failing
+    # install can be the very thing that broke the link.
+    #
+    # ``CORE_UNSAFE`` outranks a package failure and is returned verbatim: it
+    # says the venv is running a core the manifest does not declare, which no
+    # caller may continue past. Collapsing it into ``1`` here is what let
+    # ``--continue-on-error`` restart the fleet onto an undeclared core.
+    if not dry_run:
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
+            rc = 1
 
     return rc
 
 
-def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
+def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guard):
     """Execute one :class:`ReconcileAction`. Returns ``(ok, detail)``.
 
     Editable -> ``git pull --ff-only`` the checkout (plus ``pip install -e`` when
     not yet installed). PyPI -> ``pip install [--upgrade] spec`` with a git-URL
     fallback (mirrors ``feature sync``/``upgrade``).
+
+    *guard* is required: every install here is a feature install, and a feature
+    install without the core guard is the #2949 defect. Callers with genuinely
+    nothing to protect pass ``CoreInstallGuard.unguarded()`` and say so.
     """
     from kestrel_sovereign.cli_features import _pip_spec
 
@@ -1103,9 +1149,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         # it is already editable-linked to this checkout, the pull alone is the
         # update. `relink` is decided by plan_reconcile (codex round 3 P2).
         if action.relink:
-            result = cli._extension_install_run(
-                ["-e", _pip_spec(str(checkout), action.extras)]
-            )
+            result = guard.run(["-e", _pip_spec(str(checkout), action.extras)])
             if result.returncode != 0:
                 return False, (result.stderr or result.stdout or "").strip()
         return True, detail
@@ -1118,17 +1162,25 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
     pip_args = []
     if action.op == "update":
         pip_args.append("--upgrade")
-    # Replacing an editable link with the PyPI wheel needs --force-reinstall;
-    # otherwise pip treats an already-satisfying editable version as done and
-    # leaves the checkout linked (codex round 9 P2).
-    if action.force_reinstall:
-        pip_args.append("--force-reinstall")
     pip_args.append(spec)
-    result = cli._extension_install_run(pip_args)
-    # The git-URL fallback installs the repo HEAD with NO version constraint, so
-    # it must NOT be used for a pinned entry — that would silently move the
-    # feature outside the operator's declared pin (codex round 7 P2).
-    if result.returncode != 0 and not action.pinned and git_urls.get(action.package):
+    # Replacing an editable link with the PyPI wheel needs a force reinstall;
+    # otherwise pip treats an already-satisfying editable version as done and
+    # leaves the checkout linked (codex round 9 P2). Scoped to THIS package —
+    # a bare --force-reinstall cascades to every resolved dependency, and core
+    # is one for every feature, so it would pull a same-version core wheel over
+    # the editable link that the version pin cannot exclude (issue #2949).
+    reinstall = action.package if action.force_reinstall else None
+    result = guard.run(pip_args, reinstall=reinstall)
+    # The git-URL fallback installs the repo HEAD from a DIFFERENT source with
+    # NO version constraint, so it is only available to an entry that declared
+    # no source of its own — substituting it for a declared one moves the
+    # feature outside the operator's window, or off the index they named
+    # (codex round 7 P2; ``ReconcileAction.source_declared``).
+    if (
+        result.returncode != 0
+        and not action.source_declared
+        and git_urls.get(action.package)
+    ):
         git_ref = f"git+{git_urls[action.package]}"
         git_spec = (
             f"{_pip_spec(action.package, action.extras)} @ {git_ref}"
@@ -1137,7 +1189,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         fallback = (
             ["--upgrade", git_spec] if action.op == "update" else [git_spec]
         )
-        result = cli._extension_install_run(fallback)
+        result = guard.run(fallback, reinstall=reinstall)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "").strip()
     return True, ""
@@ -1158,8 +1210,13 @@ def cmd_update(args) -> int:
         half-applied update doesn't get restarted into.
       - ``--continue-on-error`` lets ``feature sync`` fail without
         skipping the restart (useful when a single optional feature
-        package is temporarily unreachable).
+        package is temporarily unreachable). It does NOT cover an
+        unrepaired core drift: that returns ``CORE_UNSAFE`` and always
+        aborts before the restart, because continuing would bring the
+        agents up on a core the manifest does not declare (#2949).
     """
+    from kestrel_sovereign.cli_features import CORE_STALE, CORE_UNSAFE
+
     # cli._get_project_dir() returns the RUNTIME data root (honors
     # KESTREL_HOME) which is the wrong place for git pull and
     # uv pip install -e . — use the actual editable source checkout
@@ -1399,8 +1456,36 @@ def cmd_update(args) -> int:
                 manifest=getattr(args, "manifest", None),
                 capture=False,
                 dry_run=False,
+                # Forwarded, or `kestrel update --allow-dirty` still refuses to
+                # pull a dirty declared core checkout during sync — the flag
+                # advertised on THIS command silently not reaching the step that
+                # honours it.
+                allow_dirty=allow_dirty,
             )
             rc = cli.cmd_feature_sync(sync_args)
+            if rc == CORE_STALE:
+                # Core is on its declared path but the pull failed, so the code
+                # about to be restarted is not the code the operator asked for.
+                # Not continuable for the same reason CORE_UNSAFE is not.
+                print(
+                    "• features: FAILED — the declared core checkout could not "
+                    "be updated, so a restart would run stale code. Resolve the "
+                    "checkout (or pass --allow-dirty); --continue-on-error does "
+                    "not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_STALE
+            if rc == CORE_UNSAFE:
+                # Same rule as reconcile below: an unrepaired core drift is a
+                # safety failure, not an optional-package failure, so
+                # --continue-on-error does not reach it.
+                print(
+                    "• features: FAILED — core is not the declared install and "
+                    "could not be repaired. Refusing to continue onto an "
+                    "undeclared core; --continue-on-error does not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_UNSAFE
             if rc != 0 and not continue_on_error:
                 print(
                     "• features: FAILED — aborting before reconcile/restart. "
@@ -1432,6 +1517,17 @@ def cmd_update(args) -> int:
             continue_on_error=continue_on_error,
             prefer=prefer,
         )
+        if rc == CORE_UNSAFE:
+            # Not continuable, by design: restarting here would bring every
+            # agent up on a core the manifest does not declare, and returning 0
+            # would report that as a successful update.
+            print(
+                "• reconcile: FAILED — core is not the declared install and "
+                "could not be repaired. Refusing to restart agents onto an "
+                "undeclared core; --continue-on-error does not cover this.",
+                file=sys.stderr,
+            )
+            return CORE_UNSAFE
         if rc != 0 and not continue_on_error:
             print(
                 "• reconcile: FAILED — aborting before restart. "

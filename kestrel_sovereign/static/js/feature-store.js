@@ -312,7 +312,16 @@ async function installFeature(name) {
         const result = await API.request(`/api/features/${encodeURIComponent(name)}/install`, {
             method: 'POST',
         });
-        Toast.success(result.message || `${name} installed`);
+        // The package can install successfully and still have moved
+        // kestrel-sovereign underneath the host (#2949). The server restored
+        // core before answering — but a swap that happened at all is not a
+        // green toast. (A swap it could NOT restore fails the request outright
+        // and lands in the catch below.)
+        if (result.status === 'installed_with_core_drift') {
+            Toast.warning(result.message);
+        } else {
+            Toast.success(result.message || `${name} installed`);
+        }
         await loadFeatureStore();
     } catch (error) {
         console.error('Install failed:', error);
