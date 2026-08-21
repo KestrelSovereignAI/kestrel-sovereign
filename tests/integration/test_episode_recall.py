@@ -86,16 +86,29 @@ async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(
 ):
     """Nightly episode, pattern, and session cutoffs share one SQLite boundary.
 
-    The database deliberately contains the same cutoff day in SQL text and
-    ISO ``T``/``Z`` text. Each real storage query must exclude its strict
-    cutoff row and include only later rows, without binding an aware datetime
-    through SQLite's deprecated implicit adapter.
+    Each real storage query must exclude its strict cutoff row and include only
+    later rows, without binding an aware datetime through SQLite's deprecated
+    implicit adapter.
+
+    The rows used to be seeded in a MIXTURE of SQL text and ISO ``T``/``Z``
+    text, on the premise that a SQLite history legitimately holds both. Since
+    #3009 it does not: the column carries a CHECK, and the migration re-spells
+    what a database already held. The boundary arithmetic is what this case is
+    about and it is unchanged — the mixture was the hazard the arithmetic had
+    to survive, and that hazard is now removed at the source rather than
+    tolerated here.
     """
     import kestrel_sovereign.storage.memory_consolidator as consolidator_module
 
     monkeypatch.setattr(consolidator_module, "datetime", _FrozenDateTime)
+    # The canonical spelling, not ``isoformat()``. That was safe only while
+    # every comparison ran through ``julianday`` on both sides; since #3009
+    # ``created_at`` holds exactly one spelling and a bound value has to be in
+    # it. Same instant either way — this pins WHICH spelling crosses the
+    # boundary, because the whole point of the case below is that the cutoff
+    # and the stored rows are compared as the storage layer compares them.
     assert timestamp_query_param("sqlite", _FrozenDateTime.value) == (
-        "2026-07-31T12:00:00+00:00"
+        "2026-07-31 12:00:00"
     )
     assert await db.fetchone(
         "SELECT julianday(?)", (timestamp_query_param("sqlite", _FrozenDateTime.value),)
@@ -108,13 +121,13 @@ async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(
         db, "episode at boundary", "2026-07-01 12:00:00", {}, agent_id=episode_agent
     )
     await _insert_conversation(
-        db, "episode before boundary", "2026-07-01T11:59:59Z", {}, agent_id=episode_agent
+        db, "episode before boundary", "2026-07-01 11:59:59", {}, agent_id=episode_agent
     )
     episode_ids = [
         await _insert_conversation(
             db,
             f"episode after boundary {index}",
-            f"2026-07-01T12:00:0{index}Z",
+            f"2026-07-01 12:00:0{index}",
             {},
             agent_id=episode_agent,
         )
@@ -132,14 +145,14 @@ async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(
         await _insert_conversation(
             db,
             f"pattern excluded {index}",
-            "2026-05-02 12:00:00" if index == 0 else f"2026-05-02T11:59:5{index}Z",
+            "2026-05-02 12:00:00" if index == 0 else f"2026-05-02 11:59:5{index}",
             {"time_of_day": "late_night"},
             agent_id=pattern_agent,
         )
         await _insert_conversation(
             db,
             f"pattern included {index}",
-            f"2026-05-02T12:00:0{index + 1}Z",
+            f"2026-05-02 12:00:0{index + 1}",
             {"time_of_day": "morning"},
             agent_id=pattern_agent,
         )
@@ -156,13 +169,13 @@ async def test_consolidator_sqlite_cutoffs_normalize_mixed_timestamp_forms(
         db, "session at boundary", "2026-07-30 12:00:00", {}, agent_id=session_agent
     )
     await _insert_conversation(
-        db, "session before boundary", "2026-07-30T11:59:59Z", {}, agent_id=session_agent
+        db, "session before boundary", "2026-07-30 11:59:59", {}, agent_id=session_agent
     )
     session_ids = [
         await _insert_conversation(
             db,
             f"session after boundary {index}",
-            f"2026-07-30T12:00:0{index}Z",
+            f"2026-07-30 12:00:0{index}",
             {},
             agent_id=session_agent,
         )
