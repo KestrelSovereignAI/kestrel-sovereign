@@ -22,6 +22,7 @@ from kestrel_sovereign.storage.async_conversation_store import (
     AsyncConversationStore,
     ConversationSessionTimestampError,
 )
+from kestrel_sovereign.storage.conversation_created_at import created_at_bind
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import TransactionError
 from kestrel_sovereign.storage.destructive_audit import hash_rows
@@ -86,7 +87,13 @@ async def _seed_indexed_message(
             metadata,
             lexical_index_id,
             "v1:test",
-            _timestamp_value(db, created_at),
+            # ``created_at`` goes through the module its CHECK is computed
+            # from (#3009). ``_timestamp_value``'s ``isoformat(sep=" ")`` is
+            # canonical right up until the caller passes microseconds — which
+            # one below deliberately does, to sit just past a session boundary
+            # — and the column refuses a fraction. ``deleted_at`` carries no
+            # such rule and keeps the old rendering.
+            created_at_bind(db.backend_type, created_at),
             _timestamp_value(db, deleted_at),
         ),
     )
@@ -512,8 +519,12 @@ async def test_session_preview_and_hard_purge_are_not_capped_at_ten_thousand(
                 "user",
                 f"large session row {index}",
                 json.dumps({"session_id": session_id}),
-                _timestamp_value(
-                    storage.db,
+                # Microsecond spacing, canonicalised: the column refuses a
+                # fraction since #3009, so all 10,001 rows land in the same
+                # second and order by id. This case is about the row CAP, not
+                # about distinct stamps.
+                created_at_bind(
+                    storage.db.backend_type,
                     started_at + timedelta(microseconds=index),
                 ),
             )
