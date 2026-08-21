@@ -56,6 +56,9 @@ from typing import Any, Dict, List
 
 import pytest
 
+from kestrel_sovereign.storage.conversation_created_at import (
+    canonical_created_at,
+)
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
@@ -73,6 +76,10 @@ from kestrel_sovereign.storage.session_grouping import (
     group_messages_into_sessions,
 )
 from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
+from tests.utils.legacy_conversation_history import (
+    open_legacy_history,
+    write_legacy_history,
+)
 
 AGENT = "did:test:session-projection"
 UUID_A = "5b2e7d10-1c3f-4a55-8c0d-000000000001"
@@ -95,8 +102,16 @@ def _accounting(watermark: SessionWatermark) -> tuple:
 
 
 def _at(minutes: int) -> str:
-    """A stored timestamp, in the ISO form SQLite history actually holds."""
-    return (BASE + timedelta(minutes=minutes)).replace(tzinfo=None).isoformat()
+    """A stored timestamp, in the one form ``created_at`` may hold (#3009).
+
+    Was ``.isoformat()`` — a ``T`` separator — described as "the ISO form
+    SQLite history actually holds". It never was: every writer in this codebase
+    goes through ``CURRENT_TIMESTAMP``, ``datetime('now')`` or
+    ``conversation_created_at``, all of which produce the space form. The
+    column now carries a CHECK that says so, and these rows are seeded straight
+    into it.
+    """
+    return canonical_created_at(BASE + timedelta(minutes=minutes))
 
 
 async def _seed(
@@ -1707,32 +1722,25 @@ async def test_a_backdated_row_in_iso_spelling_is_still_seen_as_backdated(
     was written for stores an inverted row and marks it current. This is the
     same 'T'-versus-space trap ``purge_channel_messages_since`` documents, which
     is why it is pinned here rather than left to reading.
+
+    Since #3009 the ISO spelling cannot be WRITTEN — the column's CHECK refuses
+    it — so the row arrives the only way it still can, in a database that
+    predates the constraint. That makes this two claims rather than one: the
+    migration re-spells the row on the way in, and the fold then reads the
+    backdating it was always supposed to see.
     """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "iso_backdated.db"))
+    db = await open_legacy_history(
+        str(tmp_path / "iso_backdated.db"),
+        [
+            (AGENT, "user", "first of A, SQL spelling",
+             json.dumps({"session_id": UUID_A}), UUID_A, "2020-01-01 10:00:00"),
+            (AGENT, "user", "B ends A's cluster",
+             json.dumps({"session_id": UUID_B}), UUID_B, "2020-01-01 10:05:00"),
+            (AGENT, "user", "second of A, ISO spelling, an hour EARLIER",
+             json.dumps({"session_id": UUID_A}), UUID_A, "2020-01-01T09:00:00"),
+        ],
+    )
     try:
-        await _seed(
-            db,
-            [
-                {
-                    "content": "first of A, SQL spelling",
-                    "role": "user",
-                    "created_at": "2020-01-01 10:00:00",
-                    "metadata": {"session_id": UUID_A},
-                },
-                {
-                    "content": "B ends A's cluster",
-                    "role": "user",
-                    "created_at": "2020-01-01 10:05:00",
-                    "metadata": {"session_id": UUID_B},
-                },
-                {
-                    "content": "second of A, ISO spelling, an hour EARLIER",
-                    "role": "user",
-                    "created_at": "2020-01-01T09:00:00",
-                    "metadata": {"session_id": UUID_A},
-                },
-            ],
-        )
         projection = ConversationSessionProjection(db, AGENT, chunk_rows=10)
         for _ in range(10):
             if (await projection.repair()).current:
@@ -2625,22 +2633,27 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
     grouping, so getting it wrong reorders the transcript the grouper sees. The
     projection's ordinary chunk path walks ids and never reaches this clause,
     which is why an earlier version of this test passed with the fix removed.
+
+    The mixture now arrives only in a database that predates #3009's CHECK, and
+    the migration removes it on the way in. Both readings of the order have to
+    survive that, so this still asks the question of the list rather than of
+    the migration: whichever way the ordering is spelled once one form is
+    guaranteed, the answer here may not change.
     """
     from kestrel_sovereign.privacy import PrivacyMode
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
+    write_legacy_history(
+        str(tmp_path / "spellings.db"),
+        [
+            (AGENT, "user", "earlier, ISO spelling", None, None,
+             "2026-03-01T09:00:00"),
+            (AGENT, "user", "later, SQL spelling", None, None,
+             "2026-03-01 10:00:00"),
+        ],
+    )
     async with AsyncStorage(str(tmp_path / "spellings.db"), agent_id=AGENT) as storage:
-        for content, stamp in (
-            ("earlier, ISO spelling", "2026-03-01T09:00:00"),
-            ("later, SQL spelling", "2026-03-01 10:00:00"),
-        ):
-            await storage.db.execute(
-                "INSERT INTO conversation_history "
-                "(agent_id, role, content, metadata, created_at) "
-                "VALUES (?, 'user', ?, NULL, ?)",
-                (AGENT, content, stamp),
-            )
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
         rows = await wrapper.query_conversations(AGENT, limit=10)
@@ -2651,89 +2664,6 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
             f"space-spelled 10:00 row sorted below the T-spelled 09:00 one. "
             f"Got {newest_first}"
         )
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(120)
-async def test_a_date_only_sqlite_can_read_escalates_to_the_transcript(tmp_path):
-    """The two readers disagree about which timestamps are readable — both ways.
-
-    The fold decides whether id order agrees with canonical order from the
-    ordering key SQL selected alongside the row, and escalates when that key is
-    NULL. That covers stamps SQL cannot read. It does not cover the opposite,
-    and the opposite exists: ``julianday`` NORMALIZES a day-of-month overflow
-    rather than rejecting it, so ``2023-02-29T12:00:00`` yields a real key
-    pointing at March 1 while ``datetime.fromisoformat`` — which is what the
-    grouper uses — refuses it outright. Measured on sqlite 3.50.4, and
-    ``2023-04-31`` behaves the same way; an impossible MONTH is rejected by
-    both, so the divergence is specific to the day.
-
-    A row like that must take the transcript path. Folded in isolation its
-    undatable fallback looks at whichever row preceded it IN THIS SESSION'S
-    SLICE, while the grouper looks at whichever row preceded it in the whole
-    history — and those differ exactly when another session's row falls
-    between, which is the arrangement seeded here. Getting it wrong stores a
-    ``last_message_at`` the grouper would not produce, under a watermark that
-    reports itself current.
-    """
-    from kestrel_sovereign.storage.session_grouping import (
-        coalesce_sessions_by_session_id,
-        coerce_session_timestamp,
-        group_messages_into_sessions,
-    )
-
-    impossible = "2023-02-29T12:00:00"
-    assert coerce_session_timestamp(impossible) is None, (
-        "the premise died: Python now reads this stamp, so nothing diverges"
-    )
-
-    db = await AsyncDatabase.sqlite(str(tmp_path / "impossible.db"))
-    try:
-        assert await db.fetchval("SELECT julianday(?)", (impossible,)) is not None, (
-            "the premise died: SQLite now refuses this stamp too"
-        )
-        await _seed(
-            db,
-            [
-                {"content": "A opens", "role": "user",
-                 "created_at": "2023-02-28T09:00:00",
-                 "metadata": {"session_id": UUID_A}},
-                # B falls BETWEEN A's rows, so A's slice and A's whole-history
-                # neighbourhood have different predecessors for the row below.
-                {"content": "B interposes", "role": "user",
-                 "created_at": "2023-02-28T10:00:00",
-                 "metadata": {"session_id": UUID_B}},
-                {"content": "A continues, undatable to Python", "role": "user",
-                 "created_at": impossible,
-                 "metadata": {"session_id": UUID_A}},
-            ],
-        )
-        projection = ConversationSessionProjection(db, AGENT)
-        await projection.repair()
-
-        grouped = coalesce_sessions_by_session_id(
-            group_messages_into_sessions(await _live_history(db),
-                                         keep_empty_markers=True)
-        )
-        reader = {
-            str(session["session_id"]): (
-                session["started_at"], session["last_message_at"]
-            )
-            for session in grouped
-        }
-        projected = {
-            row["session_id"]: (row["started_at"], row["last_message_at"])
-            for row in await projection.list()
-        }
-        assert projected == reader, (
-            "the projection disagrees with the grouper about a session holding "
-            "a stamp only SQLite can read"
-        )
-        assert not await projection.is_stale(), (
-            "the projection agreed but then reported itself behind"
-        )
-    finally:
-        await db.close()
 
 
 @pytest.mark.asyncio
@@ -2748,20 +2678,25 @@ async def test_appending_elsewhere_does_not_restale_an_undatable_session(tmp_pat
     then recorded the chunk as accounted for over a stale A.
 
     So this appends to B and asks A whether it changed.
+
+    Since #3009 the substitute is no longer recomputed on every read: the
+    migration writes the predecessor's stamp into the row and records what it
+    did. That makes the locality structural rather than algorithmic — which is
+    a stronger guarantee, and exactly the one this case exists to hold, so it
+    is asked of the migrated database rather than retired.
     """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "undatable.db"))
+    db = await open_legacy_history(
+        str(tmp_path / "undatable.db"),
+        [
+            (AGENT, "user", "A datable", json.dumps({"session_id": UUID_A}),
+             UUID_A, _at(0)),
+            (AGENT, "assistant", "A undatable",
+             json.dumps({"session_id": UUID_A}), UUID_A, "not-a-date"),
+            (AGENT, "user", "B datable", json.dumps({"session_id": UUID_B}),
+             UUID_B, _at(100)),
+        ],
+    )
     try:
-        await _seed(
-            db,
-            [
-                {"content": "A datable", "role": "user", "created_at": _at(0),
-                 "metadata": {"session_id": UUID_A}},
-                {"content": "A undatable", "role": "assistant",
-                 "created_at": "not-a-date", "metadata": {"session_id": UUID_A}},
-                {"content": "B datable", "role": "user", "created_at": _at(100),
-                 "metadata": {"session_id": UUID_B}},
-            ],
-        )
         projection = ConversationSessionProjection(db, AGENT)
         await projection.repair()
         before = await projection.get(UUID_A)
@@ -3184,46 +3119,15 @@ async def test_a_purge_and_refill_does_not_let_a_stale_snapshot_publish(tmp_path
         )
 
 
-@pytest.mark.asyncio
-@pytest.mark.timeout(120)
-async def test_a_timestamp_sql_cannot_read_is_not_read_by_the_fold_either(tmp_path):
-    """The ordering key and the fold's guard must accept the same values.
-
-    ``canonical_order()`` orders SQLite by ``julianday(created_at)``, and the
-    fold's monotonicity guard parses the same column with
-    ``coerce_session_timestamp``. Those are two different domains: basic ISO
-    (``20260101T110000``) parses in Python and returns NULL from ``julianday``.
-
-    So the canonical read sorts that row FIRST (NULLs lead), while the guard
-    parses both, sees 10:00 then 11:00 rising with id, and folds happily —
-    producing different boundaries and a different preview from the transcript
-    the reader would see, under a watermark that says current.
-
-    Only an import writes a stamp in that form; every writer here uses
-    ``isoformat()`` or SQLite's ``datetime('now')``. That is exactly why it
-    needs a case: it is a domain mismatch no ordinary write can reach.
-    """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "domains.db"))
-    try:
-        await _seed(db, [
-            {"content": "ordinary 10:00", "role": "user",
-             "created_at": "2026-01-01T10:00:00",
-             "metadata": {"session_id": UUID_A}},
-            {"content": "basic ISO 11:00", "role": "user",
-             "created_at": "20260101T110000",
-             "metadata": {"session_id": UUID_A}},
-        ])
-        assert await db.fetchval(
-            "SELECT julianday(created_at) FROM conversation_history "
-            "WHERE content = ?", ("basic ISO 11:00",)
-        ) is None, "julianday now reads this form, so the domains no longer differ"
-
-        projection = ConversationSessionProjection(db, AGENT)
-        await projection.repair()
-
-        await _assert_agrees_with_the_grouper(db, projection)
-    finally:
-        await db.close()
+# ``test_a_timestamp_sql_cannot_read_is_not_read_by_the_fold_either`` and
+# ``test_a_date_only_sqlite_can_read_escalates_to_the_transcript`` were here.
+# Both pinned a divergence between what ``julianday`` can read and what
+# ``coerce_session_timestamp`` can — one in each direction — and each had to
+# seed a stamp to produce it. Since #3009 the column will not hold such a
+# stamp: the migration re-spells whatever either reader can date and derives
+# what neither can, so the fold cannot be handed one. The claims moved to
+# ``test_conversation_created_at.py``, where they are asked of the migration
+# that settles them rather than of the reader that used to survive them.
 
 
 @pytest.mark.asyncio

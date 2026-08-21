@@ -37,6 +37,7 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
+from .conversation_created_at import created_at_bind, fill_undatable
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
@@ -2701,37 +2702,56 @@ class AsyncStorage:
                     # ISO string is stored as TEXT. The rule has to live at the
                     # writers until #3009 adds the CHECK.
                     #
-                    # An unparseable value is still written as-is, deliberately.
-                    # Substituting a clock would invent history and dropping it
-                    # would lose the row's only ordering evidence — and this is
-                    # a restore, which is the worst place to do either quietly.
-                    # It is counted instead, because how many exist is the fact
-                    # #3009's migration needs and nobody has.
+                    # A value nothing can date is no longer written as-is:
+                    # since #3009 the column carries a CHECK, so "as-is" is not
+                    # an option the database still offers, and a restore that
+                    # raised on one bad row of a hundred thousand would lose
+                    # the whole history to save a field. It takes the stamp of
+                    # its nearest readable neighbour instead — the same rule
+                    # the boot migration applies, from `derived_stamp`, and the
+                    # same one every reader was already applying to such a row
+                    # on the fly. Nothing is invented and nothing is silent:
+                    # the original text is logged, and the count is returned to
+                    # the caller in `stats`. That is where the restore's report
+                    # goes, rather than into `conversation_history_undated` —
+                    # the migration needs that table because it overwrites the
+                    # only copy of the original, and a restore does not: the
+                    # backup it is reading still holds it.
                     is_pg = self.backend_type == "postgres"
 
                     def _ts(val):
+                        """Bind a nullable stamp — `deleted_at`, which may be
+                        genuinely absent and carries no canonical guarantee."""
                         if val is None:
                             return None
                         parsed = _parse_utc_datetime(val)
                         if parsed is None:
-                            stats["messages_with_unreadable_created_at"] = (
-                                stats.get("messages_with_unreadable_created_at", 0)
-                                + 1
-                            )
-                            logger.warning(
-                                "restore: created_at %r cannot be parsed; "
-                                "writing it unchanged (#3009)", val,
-                            )
                             return val
                         naive_utc = parsed.replace(tzinfo=None)
                         return parsed if is_pg else naive_utc.strftime(
                             "%Y-%m-%d %H:%M:%S"
                         )
 
+                    # Computed over the whole ordered list, not row by row, so
+                    # a run of undatable rows at the very START of a history
+                    # can still borrow forward from the first readable row
+                    # after it instead of falling to 1970.
+                    stamps = fill_undatable([row[5] for row in conversations])
+
                     for (
                         role, content, metadata_json, model, provider,
                         created_at, deleted_at,
-                    ) in conversations:
+                    ), (stamp, origin) in zip(conversations, stamps):
+                        if origin != "stored":
+                            stats["messages_with_unreadable_created_at"] = (
+                                stats.get("messages_with_unreadable_created_at", 0)
+                                + 1
+                            )
+                            logger.warning(
+                                "restore: created_at %r cannot be dated; "
+                                "storing %s, taken from this row's %s (#3009)",
+                                created_at, stamp, origin,
+                            )
                         # Insert into the current database under this agent_id,
                         # PRESERVING created_at (ordering) and deleted_at (trash
                         # stays trash — a restore must not un-delete rows).
@@ -2744,7 +2764,8 @@ class AsyncStorage:
                                 self.agent_id, role, content, model, provider,
                                 metadata_json,
                                 column_session_id(metadata_json),
-                                _ts(created_at), _ts(deleted_at),
+                                created_at_bind(self.backend_type, stamp),
+                                _ts(deleted_at),
                             )
                         )
                         stats["messages_restored"] += 1
