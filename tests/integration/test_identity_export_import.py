@@ -186,7 +186,9 @@ async def populated_db(test_db):
             """INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (agent_id, "user" if i % 2 == 0 else "assistant",
-             f"Test message {i}", "{}", f"2025-01-{i+1:02d}T12:00:00Z")
+             # The one spelling ``created_at`` may hold since #3009 — its CHECK
+             # refuses the ISO form, which no writer here produces anyway.
+             f"Test message {i}", "{}", f"2025-01-{i+1:02d} 12:00:00")
         )
 
     # Insert memory episodes
@@ -600,7 +602,7 @@ class TestIdentityExporter:
                 await db.execute(
                     """INSERT INTO conversation_history
                        (agent_id, role, content, metadata, created_at)
-                       VALUES (?, ?, ?, '{}', '2026-07-15T20:00:00Z')""",
+                       VALUES (?, ?, ?, '{}', '2026-07-15 20:00:00')""",
                     (agent_id, role, content),
                 )
         await db.commit()

@@ -59,7 +59,10 @@ async def test_restore_preserves_created_at_and_trash(temp_db):
         ]
         await storage.db.execute_commit(
             "UPDATE conversation_history SET created_at = ? WHERE id = ?",
-            ("2020-01-01T00:00:00+00:00", ids[0]),
+            # Canonical, because the column's CHECK refuses anything else
+            # since #3009. The claim is about the stamp being PRESERVED across
+            # a backup, not about which spelling it arrives in.
+            ("2020-01-01 00:00:00", ids[0]),
         )
         await storage.db.execute_commit(
             "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
@@ -104,7 +107,7 @@ async def test_restore_preserves_turn_order_for_same_second(temp_db):
         # Force every row to the SAME created_at (second-granularity collision).
         await storage.db.execute_commit(
             "UPDATE conversation_history SET created_at = ?",
-            ("2020-01-01T00:00:00+00:00",),
+            ("2020-01-01 00:00:00",),
         )
         blob = await storage.create_backup_blob(include_db=True)
 
