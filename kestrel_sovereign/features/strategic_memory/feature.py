@@ -194,19 +194,45 @@ class StrategicMemoryFeature(Feature):
         # how decisions recorded before this existed become reachable at all.
         await self._reindex_decisions()
 
+    def _projection_agent_id(self) -> Optional[str]:
+        """The identity decisions are indexed under.
+
+        Read off the AGENT. The feature has no ``agent_id`` of its own — this
+        previously read ``self.agent_id``, which no feature defines, so every
+        projection raised AttributeError into the best-effort handler below and
+        the index never populated in production at all. The tests did not catch
+        it because they assigned ``feature.agent_id`` by hand, so the mutants
+        died against a world that only existed in the tests (#2851).
+        """
+        for attribute in ("agent_id", "did", "id"):
+            value = getattr(self.agent, attribute, None)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
     async def _reindex_decisions(self) -> Dict[str, Any]:
         """Project STRATEGY.yaml decisions into the graph.
 
         Never raises and never touches YAML: the canonical record is already on
         disk, so a graph failure must not turn into a strategic-memory failure.
+
+        Reconciles rather than merely upserting. YAML is canonical, so a
+        decision removed or edited there must stop being reachable through the
+        index — otherwise ``recall_decisions`` returns decisions absent from the
+        canonical file, which is the opposite of a derived index.
         """
+        agent_id = self._projection_agent_id()
+        if not agent_id:
+            logger.warning(
+                "decision index skipped: agent exposes no agent_id/did/id"
+            )
+            return {"projected": 0, "skipped": 0, "failed": 0,
+                    "skipped_reason": "no_agent_identity"}
         entries = decision_entries(self._data)
-        if not entries:
-            return {"projected": 0, "skipped": 0, "failed": 0}
         try:
             storage = getattr(self.agent, "storage", None)
             graph_store = getattr(storage, "graph", None) if storage else None
-            report = await project_decisions(graph_store, self.agent_id, entries)
+            report = await project_decisions(graph_store, agent_id, entries)
         except Exception as e:  # noqa: BLE001 - the index is best-effort
             logger.warning("decision index projection failed: %s", e)
             return {"projected": 0, "skipped": 0, "failed": len(entries)}
@@ -368,11 +394,15 @@ class StrategicMemoryFeature(Feature):
             confirmation=f"Decision recorded: {decision}",
             data={"recorded": True, "decision": entry},
         )
-        # Index it so recall_decisions and mark_superseded can see it. YAML is
-        # already written at this point, so the projection is deliberately not
-        # allowed to change the outcome — a decision that reached disk was
-        # recorded whether or not its index entry landed (#2851).
-        await self._reindex_decisions()
+        # Index it so recall_decisions and mark_superseded can see it — but
+        # only if it reached canonical YAML. The entry is in ``self._data``
+        # whether or not the write succeeded, so projecting unconditionally
+        # would publish a decision through the index that does not exist in the
+        # file the index is derived from. The projection still cannot change
+        # the outcome: a decision that reached disk was recorded whether or not
+        # its index entry landed (#2851).
+        if (result.data or {}).get("persisted"):
+            await self._reindex_decisions()
         return result
 
     @tool(

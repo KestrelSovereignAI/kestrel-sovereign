@@ -27,11 +27,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
 DECISION_NODE_TYPE = "decision"
+
+#: Marks a node as created by THIS projection. Reconciliation deletes only
+#: rows carrying it, so a decision node written by anything else is never
+#: removed on our behalf.
+_PROJECTION_SOURCE = "strategic_memory"
 
 #: Node properties owned by the graph, not by STRATEGY.yaml. They are written
 #: by `mark_superseded` and have no representation in the YAML entry, so a
@@ -82,7 +87,7 @@ def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         # Provenance: this node is a projection, and the file is the original.
         # Anything reasoning over it should know it cannot be edited here.
         "claim_source": "strategy_yaml",
-        "source": "strategic_memory",
+        "source": _PROJECTION_SOURCE,
     }
 
 
@@ -114,13 +119,25 @@ async def project_decisions(
         return report
 
     try:
-        from kestrel_sovereign.storage.async_graph_store import GraphNode
+        from kestrel_sovereign.storage.async_graph_store import (
+            GraphNode,
+            NodeSwapResult,
+        )
     except Exception as e:  # noqa: BLE001 - never break a YAML write on an import
         logger.debug("decision projection unavailable: %s", e)
         report["skipped"] = len(entries)
         report["skipped_reason"] = "graph_node_unavailable"
         return report
 
+    # Membership in YAML, not success of the write. Deriving the keep-set from
+    # what projected would make a transient read or write failure look like a
+    # deletion from the canonical file, and reconciliation would then delete a
+    # node that YAML still contains — turning a recoverable blip into data loss.
+    expected_ids: Set[str] = {
+        strategy_decision_node_id(agent_id, entry)
+        for entry in entries
+        if isinstance(entry, dict) and str(entry.get("decision") or "").strip()
+    }
     for entry in entries:
         if not isinstance(entry, dict):
             report["skipped"] += 1
@@ -137,9 +154,15 @@ async def project_decisions(
         try:
             existing = await graph_store.get_node(node_id)
         except Exception as e:  # noqa: BLE001
+            # A failed READ must not be treated as "no node". Doing so drops
+            # the graph-owned properties below and the write then revives a
+            # superseded decision — the exact loss this projection exists to
+            # prevent, caused by an error it merely failed to hear.
             logger.debug("decision projection could not read %s: %s", node_id, e)
-            existing = None
+            report["failed"] += 1
+            continue
 
+        expected = existing.properties if existing is not None else None
         if existing is not None:
             existing_props = existing.properties or {}
             # Carry across what the graph owns and YAML cannot express.
@@ -149,21 +172,71 @@ async def project_decisions(
                 if key in existing_props:
                     properties[key] = existing_props[key]
 
+        node = GraphNode(
+            node_id=node_id,
+            node_type=DECISION_NODE_TYPE,
+            label=_label_for(entry),
+            properties=properties,
+        )
         try:
-            await graph_store.add_node(
-                GraphNode(
-                    node_id=node_id,
-                    node_type=DECISION_NODE_TYPE,
-                    label=_label_for(entry),
-                    properties=properties,
-                )
+            # Conditional, not a clobber. add_node is a whole-row upsert, so a
+            # mark_superseded landing between the read above and this write
+            # would be overwritten by the stale snapshot we just read — and the
+            # decision would silently come back. CAS makes the check and the
+            # write one serialized unit; a lost race means someone else changed
+            # the node, and the next reindex projects the newer state.
+            outcome = await graph_store.compare_and_swap_node(
+                node_id, expected, node
             )
-            report["projected"] += 1
         except Exception as e:  # noqa: BLE001
             logger.debug("decision projection failed for %s: %s", node_id, e)
             report["failed"] += 1
+            continue
+        if outcome == NodeSwapResult.SWAPPED:
+            report["projected"] += 1
+        else:
+            logger.debug(
+                "decision projection for %s did not land (%s)", node_id, outcome
+            )
+            report["failed"] += 1
 
+    # Reconcile: YAML is canonical, so a decision removed or edited there must
+    # stop being reachable. Upserting current entries alone leaves the old node
+    # behind — an edited decision changes its content-derived id, so the
+    # pre-edit node would linger and recall_decisions would return a decision
+    # absent from the canonical file.
+    report["removed"] = await _remove_orphans(
+        graph_store, agent_id, expected_ids
+    )
     return report
+
+
+async def _remove_orphans(
+    graph_store: Any, agent_id: str, keep: Set[str]
+) -> int:
+    """Delete this agent's projected nodes that YAML no longer contains."""
+    try:
+        nodes = await graph_store.get_nodes_by_type(DECISION_NODE_TYPE)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("decision reconcile could not list nodes: %s", e)
+        return 0
+    removed = 0
+    for node in nodes or []:
+        properties = node.properties or {}
+        # Only this agent's rows, and only rows this projection created —
+        # a decision node written by anything else is not ours to delete.
+        if properties.get("agent_id") != agent_id:
+            continue
+        if properties.get("source") != _PROJECTION_SOURCE:
+            continue
+        if node.node_id in keep:
+            continue
+        try:
+            await graph_store.delete_node(node.node_id)
+            removed += 1
+        except Exception as e:  # noqa: BLE001
+            logger.debug("decision reconcile could not delete %s: %s", node.node_id, e)
+    return removed
 
 
 def decision_entries(data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -26,21 +26,65 @@ AGENT = "did:test:strategy"
 
 
 class _FakeGraph:
-    """Whole-row upsert, like the real AsyncGraphStore.add_node."""
+    """Stands in for AsyncGraphStore, with real compare-and-swap semantics.
 
-    def __init__(self, *, fail_on=None):
+    The swap actually compares the stored properties against the caller's
+    snapshot and refuses when they differ. A double that always succeeded
+    would let the projection pass every test while still losing a concurrent
+    ``mark_superseded`` in production — the double has to be faithful to the
+    property under test, not merely to the signature.
+    """
+
+    def __init__(self, *, fail_on=None, fail_read_on=None):
         self.nodes = {}
         self.writes = 0
+        self.deleted = []
         self._fail_on = fail_on
+        self._fail_read_on = fail_read_on
+        #: Fires once, between the projection's read and its swap.
+        self.on_before_swap = None
 
     async def get_node(self, node_id):
+        if self._fail_read_on and self._fail_read_on in node_id:
+            raise RuntimeError("graph read refused")
         return self.nodes.get(node_id)
+
+    async def get_nodes_by_type(self, node_type):
+        return [n for n in self.nodes.values() if n.node_type == node_type]
+
+    async def delete_node(self, node_id):
+        self.deleted.append(node_id)
+        self.nodes.pop(node_id, None)
 
     async def add_node(self, node):
         self.writes += 1
         if self._fail_on and self._fail_on in node.node_id:
             raise RuntimeError("graph write refused")
         self.nodes[node.node_id] = node
+
+    async def compare_and_swap_node(self, node_id, expected, new_node):
+        from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+
+        if self.on_before_swap is not None:
+            hook, self.on_before_swap = self.on_before_swap, None
+            hook(self)
+
+        self.writes += 1
+        if self._fail_on and self._fail_on in node_id:
+            raise RuntimeError("graph write refused")
+
+        current = self.nodes.get(node_id)
+        if current is None:
+            if expected is not None:
+                return NodeSwapResult.NOT_FOUND
+            self.nodes[node_id] = new_node
+            return NodeSwapResult.SWAPPED
+        if (current.properties or None) != (expected or None):
+            return NodeSwapResult.PREDICATE_FAILED
+        # Properties-only, like the real primitive: type and label are set at
+        # creation and are not rewritten by a swap.
+        current.properties = new_node.properties
+        return NodeSwapResult.SWAPPED
 
 
 def _entry(decision, date="2026-07-01", rationale="because", impact="", session=""):
@@ -190,7 +234,6 @@ class TestEndToEndThroughTheFeature:
         agent.storage.graph = graph
 
         feature = StrategicMemoryFeature(agent)
-        feature.agent_id = AGENT
         await feature.initialize()
 
         result = await feature.strategy_add_decision(
@@ -243,7 +286,6 @@ class TestEndToEndThroughTheFeature:
         agent.storage.graph = graph
 
         feature = StrategicMemoryFeature(agent)
-        feature.agent_id = AGENT
         await feature.initialize()
 
         assert len(graph.nodes) == 2, (
@@ -265,7 +307,6 @@ class TestEndToEndThroughTheFeature:
         agent.storage.graph = _FakeGraph(fail_on="strategy")
 
         feature = StrategicMemoryFeature(agent)
-        feature.agent_id = AGENT
         await feature.initialize()
 
         result = await feature.strategy_add_decision(
@@ -298,8 +339,164 @@ class TestEndToEndThroughTheFeature:
         agent.storage.graph = _FakeGraph()
 
         feature = StrategicMemoryFeature(agent)
-        feature.agent_id = AGENT
         await feature.initialize()
         await feature._reindex_decisions()
 
         assert path.read_text(encoding="utf-8") == before
+
+
+# --- Review findings on the #2851 implementation -----------------------------
+
+
+class TestProductionIdentity:
+    """The projector must use an identity the real feature actually has."""
+
+    @pytest.mark.asyncio
+    async def test_projection_uses_the_agents_identity_not_a_feature_attribute(
+        self, tmp_path
+    ):
+        """``self.agent_id`` does not exist on any feature.
+
+        Reading it raised AttributeError into the best-effort handler, so the
+        index never populated in production at all — while the tests passed,
+        because they assigned ``feature.agent_id`` by hand. The mutants died
+        against a world only the tests contained.
+        """
+        from kestrel_sovereign.features.strategic_memory.feature import (
+            StrategicMemoryFeature,
+        )
+
+        agent = MagicMock()
+        agent.agent_id = AGENT
+        agent.storage.graph = _FakeGraph()
+        feature = StrategicMemoryFeature(agent)
+
+        assert not hasattr(feature, "agent_id"), (
+            "if a feature ever gains its own agent_id this test is checking "
+            "the wrong thing"
+        )
+        feature._data = {"decisions": [_entry("index me")]}
+
+        report = await feature._reindex_decisions()
+
+        assert report["projected"] == 1
+        assert agent.storage.graph.nodes
+
+
+class TestReconciliation:
+    """YAML is canonical, so removals there must reach the index."""
+
+    @pytest.mark.asyncio
+    async def test_a_decision_removed_from_yaml_stops_being_reachable(self):
+        graph = _FakeGraph()
+        await project_decisions(graph, AGENT, [_entry("keep me"), _entry("drop me")])
+        assert len(graph.nodes) == 2
+
+        report = await project_decisions(graph, AGENT, [_entry("keep me")])
+
+        assert report["removed"] == 1
+        assert [n.label for n in graph.nodes.values()] == ["keep me"]
+
+    @pytest.mark.asyncio
+    async def test_reconcile_leaves_other_agents_and_foreign_nodes_alone(self):
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        graph = _FakeGraph()
+        await project_decisions(graph, AGENT, [_entry("mine")])
+        graph.nodes["other-agent"] = GraphNode(
+            node_id="other-agent",
+            node_type="decision",
+            label="theirs",
+            properties={"agent_id": "did:test:other", "source": "strategic_memory"},
+        )
+        graph.nodes["hand-written"] = GraphNode(
+            node_id="hand-written",
+            node_type="decision",
+            label="not a projection",
+            properties={"agent_id": AGENT, "source": "somewhere_else"},
+        )
+
+        await project_decisions(graph, AGENT, [])
+
+        assert graph.deleted == [strategy_decision_node_id(AGENT, _entry("mine"))]
+        assert "other-agent" in graph.nodes
+        assert "hand-written" in graph.nodes
+
+
+class TestConcurrentSupersession:
+    """A rebuild must not clobber a supersession that lands mid-projection."""
+
+    @pytest.mark.asyncio
+    async def test_a_supersession_landing_mid_projection_is_not_overwritten(self):
+        entry = _entry("supersede me")
+        node_id = strategy_decision_node_id(AGENT, entry)
+        graph = _FakeGraph()
+        await project_decisions(graph, AGENT, [entry])
+
+        def _supersede(g):
+            g.nodes[node_id].properties = {
+                **(g.nodes[node_id].properties or {}),
+                "superseded_by": "decision:newer",
+            }
+
+        graph.on_before_swap = _supersede
+
+        report = await project_decisions(graph, AGENT, [entry])
+
+        # The write must NOT land on a stale snapshot; the supersession stands.
+        assert graph.nodes[node_id].properties["superseded_by"] == "decision:newer"
+        assert report["failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_does_not_write_a_node_without_its_graph_state(self):
+        """Treating a failed read as "absent" would revive a superseded decision."""
+        entry = _entry("read fails")
+        node_id = strategy_decision_node_id(AGENT, entry)
+        graph = _FakeGraph()
+        await project_decisions(graph, AGENT, [entry])
+        graph.nodes[node_id].properties["superseded_by"] = "decision:newer"
+        graph._fail_read_on = node_id
+
+        report = await project_decisions(graph, AGENT, [entry])
+
+        assert report["failed"] == 1
+        assert graph.nodes[node_id].properties["superseded_by"] == "decision:newer"
+
+    @pytest.mark.asyncio
+    async def test_a_decision_that_never_reached_yaml_is_not_indexed(self, tmp_path):
+        """The index must not publish what the canonical file does not contain.
+
+        The entry is appended to ``_data`` before the write is attempted, so a
+        failed write leaves it in memory. Projecting unconditionally would make
+        ``recall_decisions`` return a decision that exists nowhere on disk —
+        a derived index inventing its own source.
+        """
+        from kestrel_sovereign.features.strategic_memory.feature import (
+            StrategicMemoryFeature,
+        )
+
+        agent = MagicMock()
+        agent.agent_id = AGENT
+        agent.agent_data_dir = str(tmp_path)
+        agent.storage = MagicMock()
+        agent.storage.graph = _FakeGraph()
+
+        feature = StrategicMemoryFeature(agent)
+        await feature.initialize()
+        agent.storage.graph.nodes.clear()
+
+        def _failing_save():
+            from kestrel_sovereign.features.strategic_memory.feature import (
+                _SaveOutcome,
+            )
+
+            return _SaveOutcome(persisted=False, error="disk full")
+
+        feature._save = _failing_save
+
+        result = await feature.strategy_add_decision(
+            decision="never written", rationale="the disk was full"
+        )
+
+        assert result.data["persisted"] is False
+        assert agent.storage.graph.nodes == {}
