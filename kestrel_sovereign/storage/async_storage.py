@@ -928,6 +928,163 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all_since(since_iso, reason=reason)
 
+    async def purge_session_projection(
+        self, *, reason: str = "ephemeral-leak",
+    ) -> int:
+        """Erase this agent's #2959 projection state (EPHEMERAL).
+
+        The CACHE unconditionally; the LEDGER only when no live history
+        survives. One transaction, and the condition on the ledger is the whole
+        design:
+
+        * It is durable, not a count of what THIS attempt deleted. A retry after
+          a partial failure asks the same question and gets the same answer,
+          where delete counts would read zero and call the residue clean.
+        * When it holds, an EMPTY projection is not merely safe to leave behind
+          — it is the correct value. A projection describes live history, and
+          there is none, so erasing it writes the truth rather than guessing at
+          it. Nothing here has to reason about which rows leaked.
+
+        What accrues without anyone asking is the change ledger, because a
+        database trigger bumps it on every write to ``conversation_history`` and
+        a trigger cannot see privacy mode. A purely EPHEMERAL agent that leaked
+        one turn would otherwise leave a row naming it behind after the sweep
+        that erased the turn.
+
+        **Why the ledger cannot go alone** (round-6 review). ``is_stale()``
+        answers by comparing a stored stamp to the ledger for equality, which is
+        sound only while the ledger is monotonic — the claim
+        ``ConversationSessionProjection.observed_changes()`` makes in its own
+        docstring. Deleting the row breaks that: the trigger's next write is an
+        INSERT of ``1``, so the counter restarts. A projection repaired at stamp
+        N, purged, and then written to N more times reports itself CURRENT while
+        describing history that no longer exists — immediately when N is 1. The
+        stamp is meaningful only against the ledger incarnation it was read
+        from, so the two are erased together or neither is.
+
+        An earlier revision of this sweep did reach all three tables and needed
+        a leak-detection condition, an orphan probe and cross-table atomicity to
+        do it safely. That machinery was for the *scoped* case, where some
+        history survives and the sweep must separate what leaked from what did
+        not. None of it is needed here: this runs only when nothing survives, so
+        the answer for every row is the same one.
+
+        An agent whose legitimate pre-EPHEMERAL history survives keeps its
+        LEDGER row: it names nothing the database does not already say, and
+        deleting it would breach the scoped-purge contract, which forbids
+        touching anything authored before entry. Its projection rows go
+        regardless — they are derived, not authored, and the leaked session is
+        described in them.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from .async_conversation_store import _rows_affected
+        from .conversation_sessions import projection_tables
+
+        ledger = "conversation_history_changes"
+        tables = [
+            table for table, _ddl in projection_tables()
+            if await self.db.table_exists(table)
+        ]
+        if not tables:
+            return 0
+        # Watermark FIRST, ledger LAST, sessions in between. Two orderings have
+        # to hold at once and they do not conflict:
+        #
+        #   * The ledger last is the correctness guarantee (below).
+        #   * The watermark first matches the order a REPAIR takes them in —
+        #     `_claim()` locks the watermark row and only then upserts session
+        #     rows. Taking them the other way round here is the classic ABBA
+        #     deadlock: each holds the row the other is waiting for, and
+        #     PostgreSQL resolves it by aborting one. Aborting this sweep would
+        #     leave projection rows standing after an EPHEMERAL exit that
+        #     reported success, because this store is not a required one.
+        #
+        # The ledger goes last, and that ordering is the guarantee — not the
+        # transaction. The state to avoid is a watermark standing beside a
+        # missing ledger, because that is the one where a restarted counter can
+        # match a stale stamp. Deleting the ledger after everything derived from
+        # it makes that state unreachable at every point in the sequence, on any
+        # backend, at any isolation level: while the ledger is still there the
+        # watermark is either present and consistent or already gone, and once
+        # it is gone there is no stamp left to fool. ``projection_tables()``
+        # happens to order it last too, for an unrelated reason — the triggers
+        # reference it — so it is re-established here rather than inherited from
+        # a coincidence a future reordering could quietly take away.
+        watermark = "conversation_session_watermarks"
+        tables = (
+            [t for t in tables if t == watermark]
+            + [t for t in tables if t not in (watermark, ledger)]
+            + [t for t in tables if t == ledger]
+        )
+
+        purged = 0
+        # The transaction is what makes the sweep all-or-nothing, and on SQLite
+        # (BEGIN IMMEDIATE) it also holds the writer slot across the test. It is
+        # not load-bearing for the invariant above: under PostgreSQL READ
+        # COMMITTED a row committed after this SELECT is still invisible to it,
+        # so a concurrent write can make the survival test stale. What that
+        # costs is bounded — the projection is erased for an agent that now has
+        # history, which the next repair rebuilds, and the ledger is
+        # content-free — and it is the delete ORDER, not the isolation level,
+        # that keeps a stale stamp from ever reading as current.
+        async with self.db.transaction(immediate=True):
+            # The repair exclusion, taken the way a repair takes it. Ordering
+            # the deletes below to match a repair's write order is necessary but
+            # not sufficient: on PostgreSQL a DELETE matching no rows locks
+            # nothing, so a first-time repair can insert the watermark this
+            # sweep has already passed over.
+            from .conversation_sessions import ConversationSessionProjection
+
+            claim_created_watermark = await ConversationSessionProjection(
+                self.db, self.agent_id
+            ).claim_exclusion()
+            survives = await self.db.fetchval(
+                "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
+                (self.agent_id,),
+            )
+            # The CACHE always goes. It is rebuildable from
+            # `conversation_history`, so clearing it destroys no record — while
+            # leaving it keeps the leaked session's id, timestamps, counts and
+            # message pointer standing after a sweep that reported success. An
+            # earlier revision skipped everything whenever any history survived,
+            # reading the scoped-purge contract as covering this too. That
+            # contract is about state authored before entry, and a derived copy
+            # is not authored at all: erasing it costs a rebuild, not data
+            # (round-16 review).
+            #
+            # The LEDGER is the exception, and only while history survives. Such
+            # an agent is already named by that history, so its counter names
+            # nothing new — and erasing it there is exactly what breaks the
+            # monotonicity `is_stale()` rests on, since the trigger's next write
+            # restarts the count.
+            for table in tables:
+                if table == ledger and survives:
+                    continue
+                purged += _rows_affected(
+                    await self.db.execute(
+                        f"DELETE FROM {table} WHERE agent_id = ?",
+                        (self.agent_id,),
+                    )
+                )
+        # Do not count the row the CLAIM just made. On PostgreSQL the exclusion
+        # is acquired by inserting the watermark row when it is absent, and the
+        # very next statement here deletes it — so every clean stint reported
+        # one purged row, and `PurgeOutcome.PURGED` means "a real leak was found
+        # and removed". Measured: a stint that never touched storage returned 1.
+        # SQLite never saw it, because the claim is a no-op there — which is
+        # also why the cases asserting `session_projection == 0` did not catch
+        # it (round-20 review).
+
+        if claim_created_watermark and purged:
+            purged -= 1
+        if purged:
+            logger.info(
+                "purged the session projection for %s (%s): %d row(s) across %s",
+                self.agent_id, reason, purged, ", ".join(tables),
+            )
+        return purged
+
     async def purge_channel_messages_since(
         self, since_iso: str, *, reason: str = "ephemeral-leak",
     ) -> int:
@@ -2526,18 +2683,50 @@ class AsyncStorage:
                     # created_at/deleted_at come out of the SQLite backup as
                     # TEXT strings. Binding a string to a Postgres TIMESTAMP
                     # column fails: PostgresBackend._strip_tz only handles
-                    # datetime instances, so asyncpg rejects the raw str. Coerce
-                    # to datetime on the Postgres path (SQLite takes the string
-                    # verbatim, preserving the exact stored form). An unparseable
-                    # value is left as-is so the backend raises loudly rather than
-                    # silently nulling a NOT NULL created_at.
+                    # NORMALIZED on both backends, not just PostgreSQL (#3009).
+                    #
+                    # This restores from a backup's SQLite FILE, so `created_at`
+                    # is whatever text the source database happened to hold —
+                    # an older kestrel's spelling, an import, a hand-edited row.
+                    # Passing it through verbatim (which the SQLite path did,
+                    # because asyncpg was the only reason to convert) is the one
+                    # writer in this codebase that can put a value into
+                    # `conversation_history.created_at` that no reader can date.
+                    # Every other writer takes CURRENT_TIMESTAMP or goes through
+                    # `SovereignAdapter._restored_created_at`, which parses and
+                    # re-spells; this now agrees with it.
+                    #
+                    # The column cannot enforce this itself: SQLite has no
+                    # datetime type, so `TIMESTAMP` is NUMERIC affinity and an
+                    # ISO string is stored as TEXT. The rule has to live at the
+                    # writers until #3009 adds the CHECK.
+                    #
+                    # An unparseable value is still written as-is, deliberately.
+                    # Substituting a clock would invent history and dropping it
+                    # would lose the row's only ordering evidence — and this is
+                    # a restore, which is the worst place to do either quietly.
+                    # It is counted instead, because how many exist is the fact
+                    # #3009's migration needs and nobody has.
                     is_pg = self.backend_type == "postgres"
 
                     def _ts(val):
-                        if val is None or not is_pg:
+                        if val is None:
+                            return None
+                        parsed = _parse_utc_datetime(val)
+                        if parsed is None:
+                            stats["messages_with_unreadable_created_at"] = (
+                                stats.get("messages_with_unreadable_created_at", 0)
+                                + 1
+                            )
+                            logger.warning(
+                                "restore: created_at %r cannot be parsed; "
+                                "writing it unchanged (#3009)", val,
+                            )
                             return val
-                        dt = _parse_utc_datetime(val)
-                        return dt if dt is not None else val
+                        naive_utc = parsed.replace(tzinfo=None)
+                        return parsed if is_pg else naive_utc.strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
 
                     for (
                         role, content, metadata_json, model, provider,

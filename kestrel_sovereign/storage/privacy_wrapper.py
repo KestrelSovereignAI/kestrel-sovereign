@@ -1335,6 +1335,14 @@ class StorePurgeResult:
 
 # Content stores that hold user text. A FAILED sweep of any of these means the
 # "leave no trace" contract cannot be certified, so mode exit must fail closed.
+# The #2959 session projection sweep does not certify CONTENT — it stores a
+# pointer and counts, never text — so it is not in this set. It is required
+# nonetheless, through `REQUIRED_TRACE_STORES` below, because its residue names
+# the agent. Only `REQUIRED_CONTENT_STORES` feeds `leaked_rows`, so a clean
+# stint still cannot report a leak it did not have: the case that paragraph
+# once warned about — an agent that hard-purged its NORMAL history before
+# entering EPHEMERAL, leaving an empty history and a legitimate ledger row —
+# is a CLEAN or PURGED outcome, and only a FAILED one closes the exit.
 # The observability sink (F076) holds content-free metrics and is NOT required —
 # a failure there is recorded but never blocks a transition.
 REQUIRED_CONTENT_STORES = frozenset({
@@ -1342,6 +1350,21 @@ REQUIRED_CONTENT_STORES = frozenset({
     "graph_nodes",
     "channel_messages",
 })
+
+#: Stores that hold no user content but whose residue NAMES the agent, and whose
+#: sweep must therefore also be certified before EPHEMERAL exit.
+#:
+#: Kept separate from :data:`REQUIRED_CONTENT_STORES` because the reason differs
+#: and the name should not lie: the #2959 projection stores a pointer and
+#: counts, never text, which is why it does not certify content. But the
+#: contract is "leave no trace", and the history deletions performed by the
+#: sweep immediately before it fire the change trigger — so a projection sweep
+#: that FAILS leaves a freshly written row carrying this agent's id, after an
+#: exit that reported success (round-17 review).
+REQUIRED_TRACE_STORES = frozenset({
+    "session_projection",
+})
+
 
 
 class EphemeralPurgeReport(dict):
@@ -1382,7 +1405,8 @@ class EphemeralPurgeReport(dict):
     def required_sweep_failed(self) -> bool:
         """True if any REQUIRED content sweep failed (outcome unknown)."""
         return any(
-            r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.FAILED
+            r.store in (REQUIRED_CONTENT_STORES | REQUIRED_TRACE_STORES)
+            and r.outcome is PurgeOutcome.FAILED
             for r in self.store_results.values()
         )
 
@@ -2288,6 +2312,29 @@ class PrivacyEnforcingStorage:
         report.record(await self._sweep_store(
             "channel_messages",
             lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+        ))
+
+        # Last, because the sweeps above fire the projection's change trigger
+        # themselves; clearing first would leave a fresh row naming the very
+        # agent being erased.
+        #
+        # All of it, not just the ledger. At this phase the ledger is the only
+        # projection table that ordinarily holds anything — nothing in
+        # production maintains the projection yet (Phase C, #2960, is where that
+        # starts, and where this question has to be asked again against rows
+        # that exist). But the ledger cannot be erased on its own: a stored
+        # watermark stamp is only meaningful against the ledger incarnation it
+        # was read from, and deleting the row restarts the counter, so a
+        # surviving watermark can match it again and report a projection of
+        # purged history as CURRENT (round-6 review; see the method).
+        #
+        # This costs none of the machinery an earlier revision needed — the
+        # leak-detection condition, the orphan probe — because that was for the
+        # scoped case. Here nothing survives, so the correct projection is the
+        # empty one and every row gets the same answer.
+        report.record(await self._sweep_store(
+            "session_projection",
+            lambda: self._storage.purge_session_projection(reason=reason),
         ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
@@ -4139,11 +4186,20 @@ class PrivacyEnforcingStorage:
         else:
             archive_clause = "archived_at IS NULL"
 
+        # Newest-first here; `/api/conversations` reverses before grouping, so
+        # the grouper sees `canonical_order()`. Shared with the #2959 projection
+        # rather than restated: the projection is meant to be a faithful cache
+        # of this list, and it cannot be if the two derive from different
+        # orders. `id` is the tie-break — without it equal timestamps came back
+        # in whatever order the backend chose, so the same history could group
+        # two ways on two calls.
+        from .conversation_sessions import canonical_order
+
         return await self._storage.db.fetchall(f"""
             SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            ORDER BY created_at DESC
+            {canonical_order(self._storage.db.backend_type, descending=True)}
             LIMIT ?
         """, (agent_id, bounded_limit))
 

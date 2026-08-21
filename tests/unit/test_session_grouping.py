@@ -410,3 +410,125 @@ def test_coalesce_leaves_distinct_sessions_untouched():
     ]
     coalesced = coalesce_sessions_by_session_id(group_messages_into_sessions(msgs))
     assert [s["session_id"] for s in coalesced] == ["s1", "s2"]
+
+
+def test_an_undatable_row_is_dated_from_the_transcript_not_the_clock():
+    """Grouping must be a function of the rows, not of when it was asked.
+
+    ``now`` used to default to the wall clock, so a row with an unparseable
+    ``created_at`` was dated to the moment of the call. Two consequences, both
+    real: the same transcript grouped one way now and another way an hour
+    later, as the bad row slid forward and kept rejoining whichever session was
+    newest; and the #2959 projection could not cache the result, because a
+    cache has to be reproducible from what it caches.
+
+    The transcript here is historical, so a wall-clock default would date the
+    bad row to today — months past every real stamp — and the gap rule would
+    give it a session of its own. Pinning the newest stamp present keeps it
+    with the run it was found in.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": "not-a-date"},
+        _msg(3, "user", "still here", minutes=5, session_id="s1"),
+    ]
+
+    sessions = group_messages_into_sessions(msgs)
+
+    assert len(sessions) == 1, (
+        "the undatable row was dated far from the transcript and split off "
+        f"into its own session: {[s['started_at'] for s in sessions]}"
+    )
+    assert sessions[0]["last_message_at"] == (BASE + timedelta(minutes=5)).isoformat()
+    assert sessions[0]["message_count"] == 3
+
+
+def test_grouping_an_undatable_row_is_repeatable():
+    """The same transcript, grouped twice, must give the same answer.
+
+    The wall-clock default made this false by construction — only by a few
+    microseconds between two immediate calls, which is why asserting equality
+    of two results catches it only when the value is compared exactly.
+    """
+    msgs = [
+        _msg(1, "user", "hello", minutes=0, session_id="s1"),
+        {"id": 2, "role": "assistant", "content": "undatable",
+         "metadata": {"session_id": "s1"}, "created_at": None},
+    ]
+
+    assert group_messages_into_sessions(msgs) == group_messages_into_sessions(msgs)
+
+
+def test_the_parser_accepts_exactly_what_the_ordering_can_express():
+    """One domain, not two that agree by accident.
+
+    The canonical order compares SQLite timestamps through ``julianday``. If the
+    parser accepts a form ``julianday`` cannot read, that row parses as a
+    perfectly good timestamp everywhere in Python while sorting at the far end
+    of the SQL order — where ``LIMIT`` can drop it out of the conversation list
+    altogether.
+
+    ``datetime.fromisoformat`` on Python 3.11+ accepts the BASIC form
+    (``20260101T110000``), which no writer here produces and this function never
+    documented. Accepting it was incidental permissiveness; the two domains are
+    the same set now.
+    """
+    import itertools
+    import sqlite3
+
+    # GENERATED, not listed. The curated list below is still here for the
+    # oddities no product of parts would produce, but the parts themselves are
+    # enumerated — because the gap that got through was not an exotic spelling,
+    # it was an ordinary date carrying an ordinary offset and no time, and no
+    # hand-written corpus happened to contain one. A list can only fail to
+    # include something; a product cannot.
+    generated = [
+        date + time + zone
+        for date, time, zone in itertools.product(
+            ("2026-01-01",),
+            ("", " 11:00", "T11:00", " 11:00:00", "T11:00:00", "T11:00:00.123456"),
+            ("", "Z", "+01:00", "-05:00"),
+        )
+    ]
+    assert "2026-01-01+01:00" in generated and "2026-01-01Z" in generated, (
+        "the product stopped covering a bare date with an offset, which is the "
+        "form this case was extended for"
+    )
+
+    db = sqlite3.connect(":memory:")
+    try:
+        for value in generated + [
+            # Readable by both.
+            "2026-01-01",
+            "2026-01-01 11:00",
+            "2026-01-01 10:00:00",
+            "2026-01-01T10:00:00",
+            "2026-01-01 10:00:00.123456",
+            "2026-01-01T11:00:00+00:00",
+            "2026-01-01T11:00:00-05:00",
+            "2026-01-01T11:00:00.123+02:00",
+            "2026-01-01T11:00:00Z",
+            # Readable by Python alone, which is the whole point. The first
+            # version of this guard checked only the DATE prefix and let every
+            # one of these through — the divergence lives in the time and the
+            # offset. The lowercase `t` needed the gate moved ahead of
+            # `strptime` too, which compiles its format with `re.IGNORECASE`.
+            "20260101T110000",
+            "2026-01-01T11:00:00+0500",
+            "2026-01-01T11:00:00-05",
+            "2026-01-01t11:00:00",
+            "2026-01-01T11:00:00+00:00:30",
+            # Readable by neither.
+            "not-a-date",
+            "",
+        ]:
+            sql = db.execute("SELECT julianday(?)", (value,)).fetchone()[0]
+            python = coerce_session_timestamp(value)
+            assert (sql is None) == (python is None), (
+                f"{value!r}: julianday reads it as {sql!r} and the parser as "
+                f"{python!r}. One of them orders this row and the other dates "
+                "it, so they have to agree about whether it can be read at all."
+            )
+    finally:
+        db.close()

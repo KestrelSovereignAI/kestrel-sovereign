@@ -119,7 +119,22 @@ async def _cancel_and_observe(task: asyncio.Task[Any] | None) -> None:
 
 
 class _TwoPartyCleanupGate:
-    """Drive two transactions to one key boundary and expose lock overlap."""
+    """Drive two transactions to one key boundary and expose lock overlap.
+
+    The barrier is load-bearing and was briefly wrong. While #2959's change
+    ledger held one row per agent, the trigger maintaining it upserted that row
+    inside the writing transaction — so the second purge parked at its own
+    DELETE, before this boundary, and the leading party waited here forever for
+    a party stuck behind it. The ledger is sharded per writer now (#3005), so
+    two purges for one agent reach this point concurrently again and the
+    advisory lock is once more the only thing that serializes them, which is
+    what this case exists to check.
+
+    That episode is why ``arrivals`` is asserted and not merely counted: if
+    anything upstream ever serializes these two again, the exclusivity below
+    would hold vacuously — one arrival can hardly race itself — and this would
+    keep passing while testing nothing.
+    """
 
     def __init__(self) -> None:
         self.arrivals = 0
@@ -152,8 +167,13 @@ class _TwoPartyCleanupGate:
     async def assert_exclusive_first_holder(self) -> None:
         await asyncio.wait_for(self.first_acquired.wait(), timeout=5)
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(self.second_acquired.wait(), timeout=0.1)
+            await asyncio.wait_for(self.second_acquired.wait(), timeout=0.5)
         assert len(self.acquired) == 1
+        assert self.arrivals == 2, (
+            "only one party reached the shared-key boundary, so the exclusivity "
+            "asserted above is vacuous — something upstream serialized these "
+            "two transactions before they got here"
+        )
 
 
 async def _assert_destroyed(db: AsyncDatabase, message: _IndexedMessage) -> None:

@@ -24,10 +24,12 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    sort_sessions,
     summarize_sessions,
     timestamp_predicate,
     timestamp_query_param,
@@ -469,7 +471,11 @@ def search_session_summaries(
             session["match_snippet"] = None
         results.append(session)
 
-    results.sort(key=lambda s: s["last_message_at"], reverse=True)
+    # The same order the list and the #2959 projection page by, not a third
+    # spelling of "newest first". Ties are ordinary and `limit` truncates, so
+    # sorting on `last_message_at` alone let search and the list disagree about
+    # WHICH session made the page (round-8/9 review).
+    sort_sessions(results)
     return results[:limit]
 
 
@@ -2009,7 +2015,19 @@ class AsyncConversationStore:
 
         seen_ids: set[int] = set()
         candidates: list[tuple[datetime, int, tuple, dict[str, Any]]] = []
-        fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        # NOT a clock. An unreadable timestamp dated with `now()` sorts to the
+        # end of the candidates and is gap-filtered out of the session the
+        # conversation list says it belongs to — and it does so differently
+        # depending on when the read happens, so the same session opens with
+        # different contents on two consecutive requests. `group_messages_into_
+        # sessions` stopped consulting a clock for #2959 (a grouping that reads
+        # one cannot be cached); this is the same constant it falls back to.
+        #
+        # This does not make the two agree about which session an unreadable row
+        # joins: the grouper inherits the row's predecessor, and the candidates
+        # here are a subset that need not contain it. That is one rule with two
+        # implementations, which is #2961's subject.
+        fallback_timestamp = UNDATABLE_ROW_FALLBACK
         session_id_str = str(session_id)
         for row in rows:
             row_id = int(row[0])

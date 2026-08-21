@@ -177,6 +177,104 @@ async def test_the_counter_api_declines_the_session_key_rather_than_desyncing(
 
 
 @pytest.mark.asyncio
+async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
+    tmp_path,
+):
+    """The restore is the one writer that could put an undatable row in (#3009).
+
+    Every other path into ``conversation_history.created_at`` either omits the
+    column and takes ``CURRENT_TIMESTAMP`` or goes through
+    ``SovereignAdapter._restored_created_at``, which parses and re-spells. This
+    one reads a backup's SQLite FILE and used to copy whatever text it found
+    straight through on SQLite, because converting was only ever done to satisfy
+    asyncpg.
+
+    The column cannot defend itself. SQLite has no datetime type — ``TIMESTAMP``
+    is NUMERIC affinity and an ISO string is stored as TEXT — so until #3009 adds
+    a CHECK the rule lives at the writers, and this is the writer that did not
+    have it.
+
+    The spellings below are all ones ``julianday`` and the parser DISAGREE about,
+    which is what made them worth carrying: a ``T`` separator, a ``Z``, an
+    offset. Restored, they must all come back in the one form the readers date
+    without any fallback at all.
+    """
+    from kestrel_sovereign.storage.session_grouping import coerce_session_timestamp
+
+    source = AsyncStorage(str(tmp_path / "odd-source.db"), agent_id=AGENT)
+    await source.initialize()
+    try:
+        await source.add_conversation("user", "one", session_id=UUID_A)
+        await source.add_conversation("user", "two", session_id=UUID_A)
+        await source.add_conversation("user", "three", session_id=UUID_A)
+        # Rewritten in the source, standing in for a backup taken from an older
+        # kestrel or an import: the column accepts all of it.
+        spellings = [
+            "2026-01-02T03:04:05",
+            "2026-01-02T03:04:05Z",
+            "2026-01-02 03:04:05+01:00",
+        ]
+        ids = [
+            row[0] for row in await source.db.fetchall(
+                "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id",
+                (AGENT,),
+            )
+        ]
+        for row_id, spelling in zip(ids, spellings):
+            await source.db.execute(
+                "UPDATE conversation_history SET created_at = ? WHERE id = ?",
+                (spelling, row_id),
+            )
+        stored = [
+            row[0] for row in await source.db.fetchall(
+                "SELECT created_at FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
+            )
+        ]
+        assert stored == spellings, (
+            "the source column refused a spelling, so this case is not "
+            "reproducing what a real backup can carry"
+        )
+        blob = await source.create_backup_blob()
+    finally:
+        await source.close()
+
+    target = AsyncStorage(str(tmp_path / "odd-target.db"), agent_id=AGENT)
+    await target.initialize()
+    try:
+        stats = await target.restore_from_backup_blob(blob)
+        assert stats["messages_restored"] == 3
+        assert stats.get("messages_with_unreadable_created_at", 0) == 0
+
+        restored = [
+            row[0] for row in await target.db.fetchall(
+                "SELECT created_at FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
+            )
+        ]
+        assert restored != spellings, (
+            "the restore copied the source's spellings through unchanged"
+        )
+        for value in restored:
+            assert coerce_session_timestamp(value) is not None, (
+                f"restored created_at {value!r} is a value no reader can date"
+            )
+            # One spelling, and it is the one CURRENT_TIMESTAMP produces.
+            assert len(value) == 19 and value[10] == " ", (
+                f"restored created_at {value!r} is not the canonical form"
+            )
+        # The offset is APPLIED, not discarded: 03:04:05+01:00 is 02:04:05 UTC.
+        # Asserted by membership rather than by position, because the restore
+        # SELECTs `ORDER BY created_at, id` over the source's raw TEXT — where a
+        # space sorts before `T`, so the offset row is re-numbered FIRST and the
+        # restored order is not the order it was written in. That is worth
+        # knowing on its own: the restore re-sorts on a column whose spelling it
+        # is in the middle of normalising.
+        assert "2026-01-02 02:04:05" in restored, restored
+    finally:
+        await target.close()
+
+
 async def test_a_restore_rederives_the_column_from_the_backup_metadata(tmp_path):
     """A backup older than the column still restores with it populated.
 
