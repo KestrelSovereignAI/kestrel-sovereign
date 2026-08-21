@@ -1402,7 +1402,7 @@ class CoreInstallGuard:
             ),
         )
 
-    def _install(self, pip_args, *, constraints, reinstall, timeout):
+    def _install(self, pip_args, *, constraints, reinstall, timeout, repairing=False):
         """Run the installer — the ONE place a subprocess is started.
 
         Every install this guard performs goes through here (:meth:`run`,
@@ -1415,6 +1415,11 @@ class CoreInstallGuard:
         while a killed installer can already have replaced core. That is the
         #2949 failure with nobody told. Report what moved, then let the
         interrupt continue on its way.
+
+        *repairing* is passed by :meth:`_repair` alone, and only it can know:
+        a Ctrl-C that lands inside the automatic restore interrupted a repair
+        that WAS attempted, and telling the operator "no repair was attempted"
+        there is the same false report this path exists to prevent.
         """
         try:
             return cli._extension_install_run(
@@ -1424,10 +1429,10 @@ class CoreInstallGuard:
                 timeout=timeout,
             )
         except KeyboardInterrupt:
-            self._report_interrupt()
+            self._report_interrupt(repairing=repairing)
             raise
 
-    def _interrupt_outcome(self):
+    def _interrupt_outcome(self, *, attempted):
         """Non-mutating counterpart to :meth:`resolve`: describe, never repair.
 
         Returns None when core still conforms — an interrupt is not by itself
@@ -1440,18 +1445,18 @@ class CoreInstallGuard:
             return None
         replaced = core_install_matches(self._baseline, self.policy)
         if not self.policy.source_is_verifiable:
-            return self._unrestorable(drift, replaced, attempted=False)
+            return self._unrestorable(drift, replaced, attempted=attempted)
         _, _, rendered, shell = self._restore_plan()
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=False,
-            attempted=False,
+            attempted=attempted,
             command=rendered,
             shell=shell,
         )
 
-    def _report_interrupt(self) -> None:
+    def _report_interrupt(self, *, repairing=False) -> None:
         """Name any drift an interrupted installer left behind. REPORTS ONLY.
 
         Deliberately does not repair. A repair runs another installer, and an
@@ -1469,20 +1474,24 @@ class CoreInstallGuard:
         if not self.policy.guarded:
             return
         try:
-            outcome = self._interrupt_outcome()
+            outcome = self._interrupt_outcome(attempted=repairing)
+            if outcome is None:
+                return
+            # The WRITES are inside the guard too, not just the lookup: stderr
+            # can be a closed fd or a pipe whose reader already exited, and a
+            # BrokenPipeError escaping here would replace the operator's Ctrl-C
+            # with a traceback about the diagnostic that was trying to help.
+            print(
+                f"• core: INTERRUPTED — {outcome.headline}.",
+                file=sys.stderr,
+            )
+            for line in (outcome.drift or "").splitlines():
+                print(f"    {line}", file=sys.stderr)
+            print(f"    {outcome.restore_instruction}", file=sys.stderr)
+            for line in outcome.output.splitlines()[-3:]:
+                print(f"      {line}", file=sys.stderr)
         except Exception:  # noqa: BLE001 - see docstring: never mask the interrupt
             return
-        if outcome is None:
-            return
-        print(
-            f"• core: INTERRUPTED — {outcome.headline}.",
-            file=sys.stderr,
-        )
-        for line in (outcome.drift or "").splitlines():
-            print(f"    {line}", file=sys.stderr)
-        print(f"    {outcome.restore_instruction}", file=sys.stderr)
-        for line in outcome.output.splitlines()[-3:]:
-            print(f"      {line}", file=sys.stderr)
 
     def _restore_plan(self):
         """The exact install that would put core back — rendered, NOT run.
@@ -1571,6 +1580,7 @@ class CoreInstallGuard:
         try:
             result = self._install(
                 pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+                repairing=True,
             )
         except subprocess.TimeoutExpired as expired:
             result = _killed_process(expired)

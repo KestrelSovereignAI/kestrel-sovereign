@@ -104,6 +104,7 @@ class FakeUv:
         feature_install_fails=False,
         feature_install_times_out=False,
         feature_install_interrupted=False,
+        repair_interrupted=False,
         direct_urls=None,
         unreadable_provenance=None,
     ):
@@ -130,6 +131,7 @@ class FakeUv:
         self.feature_install_fails = feature_install_fails
         self.feature_install_times_out = feature_install_times_out
         self.feature_install_interrupted = feature_install_interrupted
+        self.repair_interrupted = repair_interrupted
         # Non-editable direct-URL installs, by dist: a VCS ref, local path or
         # remote archive. Distinct from `editable` (which is also a direct URL,
         # but flagged) and from absent (an index resolution).
@@ -354,6 +356,11 @@ class FakeUv:
             self._never_returns(cmd, target, timeout)
         if self.repair_fails:
             return self._failed(cmd, f"x Failed to install {target}: no such checkout")
+        if self.repair_interrupted:
+            # Ctrl-C DURING the automatic restore. Nothing is written, but a
+            # repair was unmistakably attempted — the distinction the interrupt
+            # report has to get right (issue #2962).
+            raise KeyboardInterrupt()
         if self.repair_noops:
             # Exit 0, venv unchanged — an installer that reported success and
             # left core exactly where it was.

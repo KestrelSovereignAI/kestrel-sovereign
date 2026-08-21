@@ -2191,3 +2191,73 @@ def test_an_interrupt_with_no_declared_source_offers_no_command(
     assert "INTERRUPTED" in err
     assert "no declared source to restore from" in err
     assert "Run `" not in err  # nothing is offered to paste
+
+
+def test_an_interrupted_repair_does_not_claim_no_repair_was_attempted(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Ctrl-C inside the automatic restore interrupted a repair that DID run.
+
+    `_repair` goes through the same install seam as everything else, so the
+    interrupt handler reaches it too — and reporting "no repair was attempted"
+    there is the same false statement the `attempted` flag exists to prevent,
+    reintroduced one layer down.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,   # the feature install swaps core...
+        repair_interrupted=True,     # ...and the restore is then interrupted
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    # The premise: a repair really was under way when the interrupt landed.
+    assert venv.editable.get(CORE) != "/src/core"
+    # The claim: it must not be described as one that never started.
+    assert "no repair was attempted" not in err
+
+
+def test_a_broken_stderr_cannot_replace_the_interrupt(
+    monkeypatch, fake_registry, tmp_path,
+):
+    """The diagnostic must never become the error the operator sees.
+
+    stderr can be a closed fd, or a pipe whose reader has exited — `... | head`
+    is enough. A BrokenPipeError escaping the reporter would replace Ctrl-C
+    with a traceback about the code that was trying to explain Ctrl-C.
+    """
+    import sys as _sys
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    class _BrokenStderr:
+        def write(self, *_args):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(_sys, "stderr", _BrokenStderr())
+
+    # KeyboardInterrupt, NOT BrokenPipeError.
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
