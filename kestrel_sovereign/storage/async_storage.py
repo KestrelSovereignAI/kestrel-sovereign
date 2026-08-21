@@ -2683,18 +2683,50 @@ class AsyncStorage:
                     # created_at/deleted_at come out of the SQLite backup as
                     # TEXT strings. Binding a string to a Postgres TIMESTAMP
                     # column fails: PostgresBackend._strip_tz only handles
-                    # datetime instances, so asyncpg rejects the raw str. Coerce
-                    # to datetime on the Postgres path (SQLite takes the string
-                    # verbatim, preserving the exact stored form). An unparseable
-                    # value is left as-is so the backend raises loudly rather than
-                    # silently nulling a NOT NULL created_at.
+                    # NORMALIZED on both backends, not just PostgreSQL (#3009).
+                    #
+                    # This restores from a backup's SQLite FILE, so `created_at`
+                    # is whatever text the source database happened to hold —
+                    # an older kestrel's spelling, an import, a hand-edited row.
+                    # Passing it through verbatim (which the SQLite path did,
+                    # because asyncpg was the only reason to convert) is the one
+                    # writer in this codebase that can put a value into
+                    # `conversation_history.created_at` that no reader can date.
+                    # Every other writer takes CURRENT_TIMESTAMP or goes through
+                    # `SovereignAdapter._restored_created_at`, which parses and
+                    # re-spells; this now agrees with it.
+                    #
+                    # The column cannot enforce this itself: SQLite has no
+                    # datetime type, so `TIMESTAMP` is NUMERIC affinity and an
+                    # ISO string is stored as TEXT. The rule has to live at the
+                    # writers until #3009 adds the CHECK.
+                    #
+                    # An unparseable value is still written as-is, deliberately.
+                    # Substituting a clock would invent history and dropping it
+                    # would lose the row's only ordering evidence — and this is
+                    # a restore, which is the worst place to do either quietly.
+                    # It is counted instead, because how many exist is the fact
+                    # #3009's migration needs and nobody has.
                     is_pg = self.backend_type == "postgres"
 
                     def _ts(val):
-                        if val is None or not is_pg:
+                        if val is None:
+                            return None
+                        parsed = _parse_utc_datetime(val)
+                        if parsed is None:
+                            stats["messages_with_unreadable_created_at"] = (
+                                stats.get("messages_with_unreadable_created_at", 0)
+                                + 1
+                            )
+                            logger.warning(
+                                "restore: created_at %r cannot be parsed; "
+                                "writing it unchanged (#3009)", val,
+                            )
                             return val
-                        dt = _parse_utc_datetime(val)
-                        return dt if dt is not None else val
+                        naive_utc = parsed.replace(tzinfo=None)
+                        return parsed if is_pg else naive_utc.strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
 
                     for (
                         role, content, metadata_json, model, provider,
