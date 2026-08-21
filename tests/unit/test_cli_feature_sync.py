@@ -2090,3 +2090,174 @@ def test_update_forwards_allow_dirty_to_feature_sync(tmp_path):
         cli.cmd_update(ns)
 
     assert captured == [True], f"update dropped --allow-dirty: {captured}"
+
+
+# ---------------------------------------------------------------------------
+# Interrupt safety (issue #2962)
+# ---------------------------------------------------------------------------
+
+
+def test_an_interrupted_install_reports_the_core_it_left_behind(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Ctrl-C never returns, so the post-check never ran — and core had moved.
+
+    A killed installer keeps whatever it already wrote, so the #2949 swap can
+    have landed. Neither the success nor the failure branch is reached, so the
+    operator was told nothing at all about a core that is no longer theirs.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    # The interrupt still reaches the operator — reporting must not convert
+    # Ctrl-C into a normal return.
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    assert CORE in err
+    # No repair was attempted, and the wording says so rather than claiming a
+    # restore that failed.
+    assert "NOT RESTORED" in err
+    assert "no repair was attempted" in err
+    # The command points back at the DECLARED source...
+    assert "/src/core" in err
+    # ...and core really was left off it: proof no repair ran, asserted on the
+    # venv itself rather than on a call count.
+    assert venv.editable.get(CORE) != "/src/core"
+
+
+def test_an_interrupt_that_moved_nothing_reports_nothing(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """An interrupt is not by itself evidence that core moved.
+
+    Reporting drift on every Ctrl-C would train the operator to ignore the one
+    that matters.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(core_checkout="/src/core")
+    use_fake_uv(monkeypatch, venv)
+
+    def _interrupted_before_writing(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli, "_extension_install_run", _interrupted_before_writing)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" not in err
+    assert venv.editable.get(CORE) == "/src/core"  # nothing moved, as modelled
+
+
+def test_an_interrupt_with_no_declared_source_offers_no_command(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """With nothing declaring where core belongs, there is no command to offer.
+
+    Printing one would name a source nobody declared — the retargeting this
+    guard exists to prevent, handed to the operator as an instruction.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')  # core NOT declared
+    venv = FakeUv(
+        core_checkout=None,
+        direct_urls={CORE: "git+https://example.invalid/ks.git@abc123"},
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    assert "no declared source to restore from" in err
+    assert "Run `" not in err  # nothing is offered to paste
+
+
+def test_an_interrupted_repair_does_not_claim_no_repair_was_attempted(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """Ctrl-C inside the automatic restore interrupted a repair that DID run.
+
+    `_repair` goes through the same install seam as everything else, so the
+    interrupt handler reaches it too — and reporting "no repair was attempted"
+    there is the same false statement the `attempted` flag exists to prevent,
+    reintroduced one layer down.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,   # the feature install swaps core...
+        repair_interrupted=True,     # ...and the restore is then interrupted
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
+
+    err = capsys.readouterr().err
+    assert "INTERRUPTED" in err
+    # The premise: a repair really was under way when the interrupt landed.
+    assert venv.editable.get(CORE) != "/src/core"
+    # The claim: it must not be described as one that never started.
+    assert "no repair was attempted" not in err
+
+
+def test_a_broken_stderr_cannot_replace_the_interrupt(
+    monkeypatch, fake_registry, tmp_path,
+):
+    """The diagnostic must never become the error the operator sees.
+
+    stderr can be a closed fd, or a pipe whose reader has exited — `... | head`
+    is enough. A BrokenPipeError escaping the reporter would replace Ctrl-C
+    with a traceback about the code that was trying to explain Ctrl-C.
+    """
+    import sys as _sys
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "/src/core"\n'
+        '\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(
+        core_checkout="/src/core",
+        honours_constraints=False,
+        feature_install_interrupted=True,
+    )
+    use_fake_uv(monkeypatch, venv)
+
+    class _BrokenStderr:
+        def write(self, *_args):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(_sys, "stderr", _BrokenStderr())
+
+    # KeyboardInterrupt, NOT BrokenPipeError.
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_feature_sync(_args(manifest))
