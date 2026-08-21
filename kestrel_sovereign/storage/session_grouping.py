@@ -123,21 +123,31 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
 
 
 def timestamp_query_param(backend_type: str, value: Any) -> Any:
-    """Bind a timestamp without relying on SQLite's implicit adapters.
+    """Bind a timestamp in the spelling the column it is compared against uses.
 
-    Conversation history contains historical SQL-style text and public ISO
-    forms. SQLite compares those values through ``julianday`` and must receive
-    an explicit ISO string; binding an aware ``datetime`` would otherwise use
-    Python's deprecated implicit SQLite adapter. PostgreSQL binds timestamp
-    predicates as naive UTC ``datetime`` objects for asyncpg.
+    Binding an aware ``datetime`` on SQLite would otherwise go through Python's
+    deprecated implicit adapter, and PostgreSQL wants a naive UTC ``datetime``
+    for asyncpg. Those two were always the job; the spelling is the part that
+    changed with #3009.
+
+    It used to be ``value.isoformat()`` on SQLite — a ``T`` separator — which
+    was safe only because every comparison ran through ``julianday`` on both
+    sides. ``created_at`` now holds exactly one spelling, and that is what
+    makes a raw text comparison correct; a parameter in a different spelling
+    would be the one value in the comparison that still needed converting. So
+    it is rendered by the same module the column's CHECK is computed from.
+
+    A value nothing can date is passed through unchanged rather than becoming
+    NULL: a predicate against it found nothing before and must go on finding
+    nothing, rather than quietly matching every row with a NULL comparison.
     """
     if backend_type == "postgres":
         parsed = coerce_session_timestamp(value)
         return value if parsed is None else parsed
-    if backend_type == "sqlite" and isinstance(value, datetime):
-        if value.tzinfo is not None:
-            value = value.astimezone(timezone.utc)
-        return value.isoformat()
+    if backend_type == "sqlite":
+        from .conversation_created_at import canonical_created_at
+
+        return canonical_created_at(value) or value
     return value
 
 
