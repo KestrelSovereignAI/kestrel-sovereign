@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 _CONCURRENT_UPDATE_MARKER = "tuple concurrently updated"
 _CONCURRENT_WRITE_RETRIES = 4
 _CONCURRENT_WRITE_BACKOFF_S = 0.02
+_ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 
 
 def _is_concurrent_update_error(exc: BaseException) -> bool:
@@ -730,6 +731,56 @@ class PostgresBackend(DatabaseBackend):
                     for namespace, key in reversed(acquired):
                         await conn.execute(
                             f"SELECT {unlock_function}($1, $2)", namespace, key
+                        )
+                except BaseException:
+                    conn.terminate()
+                    raise
+
+    @asynccontextmanager
+    async def polled_advisory_lock(
+        self, key: Tuple[int, int]
+    ) -> AsyncIterator[None]:
+        """Hold one session lock without leaving a blocked statement snapshot.
+
+        ``CREATE INDEX CONCURRENTLY`` waits for transactions with older
+        snapshots. A second initializer blocked inside ``pg_advisory_lock`` is
+        itself such a transaction, which forms a cycle with the first
+        initializer's concurrent build. Polling ``pg_try_advisory_lock`` lets
+        every unsuccessful statement finish before sleeping in Python, so a
+        waiter owns no virtual XID or snapshot while the winner builds.
+        """
+
+        namespace, lock_key = key
+        if not isinstance(namespace, int) or not isinstance(lock_key, int):
+            raise TypeError("PostgreSQL advisory lock keys must be integers")
+        advisory_pool = await self._ensure_advisory_pool()
+        async with advisory_pool.acquire() as conn:
+            acquired = False
+            try:
+                while not acquired:
+                    acquired = bool(
+                        await conn.fetchval(
+                            "SELECT pg_try_advisory_lock($1, $2)",
+                            namespace,
+                            lock_key,
+                        )
+                    )
+                    if not acquired:
+                        await asyncio.sleep(_ADVISORY_LOCK_POLL_INTERVAL_S)
+                yield
+            except BaseException:
+                conn.terminate()
+                raise
+            else:
+                try:
+                    unlocked = await conn.fetchval(
+                        "SELECT pg_advisory_unlock($1, $2)",
+                        namespace,
+                        lock_key,
+                    )
+                    if not unlocked:
+                        raise RuntimeError(
+                            "PostgreSQL polled advisory lock disappeared"
                         )
                 except BaseException:
                     conn.terminate()

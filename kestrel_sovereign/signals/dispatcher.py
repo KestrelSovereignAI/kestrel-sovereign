@@ -1313,9 +1313,11 @@ class SignalDispatcher:
         """Capture this agent's current durable commit boundary for ``source``.
 
         Call immediately before dispatching an external effect whose later
-        workflow wake must exclude previously committed history.  The API has
-        no ``agent_id`` argument by design: dispatcher ownership is the tenant
-        authority, and A2A identity is a separate boundary.
+        workflow wake must exclude previously committed history. The workflow
+        must durably commit ``boundary.to_dict()`` before external dispatch and
+        rehydrate it after restart; an in-memory cursor is not crash-safe. The
+        API has no ``agent_id`` argument by design: dispatcher ownership is the
+        tenant authority, and A2A identity is a separate boundary.
         """
 
         async with self._admit_durable_operation():

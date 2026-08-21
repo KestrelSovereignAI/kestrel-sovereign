@@ -32,6 +32,7 @@ from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+from kestrel_sovereign.signals import DurableSignalStore
 from tests.utils.aiosqlite_workers import (
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
@@ -52,8 +53,57 @@ def _durable_backend_double() -> MagicMock:
     backend.backend_type = "sqlite"
     backend.execute_script = AsyncMock()
     backend.execute = AsyncMock(return_value=1)
-    backend.fetch_one = AsyncMock(return_value=None)
-    backend.fetch_all = AsyncMock(return_value=[])
+
+    async def fetch_one(query, params=()):
+        if "FROM sqlite_master" in query and "COLLATE NOCASE" in query:
+            return (
+                "index",
+                DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                DurableSignalStore.EVENTS,
+            )
+        return None
+
+    backend.fetch_one = AsyncMock(side_effect=fetch_one)
+
+    async def fetch_all(query, params=()):
+        if query.strip() == "PRAGMA table_info(durable_signal_events)":
+            # Signal boot's normal path now trusts the same catalog evidence
+            # as a real freshly-created SQLite ledger. Keep this production-
+            # wiring double honest instead of making it resemble a partially
+            # migrated database whose history would need scanning.
+            return [
+                (0, "caller_identity", "TEXT", 0, None, 0),
+                (1, "source_sequence", "BIGINT", 1, None, 0),
+            ]
+        if "FROM sqlite_master" in query and "type = 'trigger'" in query:
+            return [
+                (name, "durable_signal_events", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_GUARDS
+            ] + [
+                (name, "durable_signal_source_sequences", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCES
+            ]
+        if query.startswith("PRAGMA index_list"):
+            return [
+                (
+                    0,
+                    DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                    1,
+                    "c",
+                    0,
+                )
+            ]
+        if query.startswith("PRAGMA index_xinfo"):
+            return [
+                (0, 0, "agent_id", 0, "BINARY", 1),
+                (1, 1, "source", 0, "BINARY", 1),
+                (2, 2, "source_sequence", 0, "BINARY", 1),
+                (3, -1, None, 0, "BINARY", 0),
+            ]
+        return []
+
+    backend.fetch_all = AsyncMock(side_effect=fetch_all)
+    backend.fetch_val = AsyncMock(return_value=None)
 
     @contextlib.asynccontextmanager
     async def transaction(*, immediate: bool = False):
