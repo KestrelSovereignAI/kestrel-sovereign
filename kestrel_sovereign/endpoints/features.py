@@ -599,6 +599,20 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
         if not bool(getattr(feature, "enabled", True))
     )
     prepared = agent._prepare_feature_contribution_transition(to_activate)
+    if prepared.rejected:
+        # A package enable is a GROUP transaction: its members go live together
+        # or not at all. Silently enabling the survivors would hand back a
+        # partially-live package reported as enabled — and indexing a rejected
+        # member raised a bare KeyError, which names neither the feature nor
+        # the reason (#2951).
+        rejection = prepared.rejected[0]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Feature '{rejection.feature_name}' cannot be enabled: "
+                f"{rejection.reason}"
+            ),
+        )
     prepared_by_feature = {id(item.feature): item for item in prepared}
     activated: List[tuple[str, Any]] = []
     try:

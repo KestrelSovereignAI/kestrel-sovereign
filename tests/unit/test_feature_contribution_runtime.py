@@ -13,6 +13,7 @@ from kestrel_sovereign import server
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionCollectionError,
+    FeatureContributionRuntimeError,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.operator import (
@@ -429,7 +430,7 @@ def test_permission_registration_failure_preserves_original_error_and_cleans_pee
     agent = _agent(tmp_path)
     feature = SDKFixtureFeature(agent)
     runtime = agent._ensure_feature_contribution_runtime()
-    prepared = runtime.prepare_transition((feature,))[0]
+    prepared = runtime.prepare_transition((feature,)).only()
 
     def fail_register(_registration):
         raise ValueError("permission commit failed")
@@ -463,7 +464,7 @@ def test_scoped_execution_targets_follow_feature_lifecycle_without_touching_peer
     agent = _agent(tmp_path)
     feature = SDKFixtureFeature(agent)
     runtime = agent._ensure_feature_contribution_runtime()
-    prepared = runtime.prepare_transition((feature,))[0]
+    prepared = runtime.prepare_transition((feature,)).only()
     runtime.activate(prepared)
 
     owned = ExecutionTargetRegistration(
@@ -577,3 +578,318 @@ def test_core_never_imports_sdk_fixture_implementation():
         root / "tests" / "fixtures" / "sdk_contribution_fixture.py"
     ).read_text(encoding="utf-8")
     assert "kestrel_sovereign" not in fixture_source
+
+
+# ---------------------------------------------------------------------------
+# Blast radius of a contribution collision (issue #2951)
+# ---------------------------------------------------------------------------
+
+
+class _PeerFixtureFeature(SDKFixtureFeature):
+    """A second feature with its own owner and its own contribution keys."""
+
+    contribution_prefix = "peer-fixture"
+
+
+def _rival_source(source):
+    """Same NAME, genuinely different contract.
+
+    `trust` is part of the contract signature, so this is a mismatch by the
+    registry's own definition — no reliance on closure-identity subtleties.
+    """
+    import dataclasses
+
+    from kestrel_sdk.signals import Trust
+
+    other = Trust.UNTRUSTED if source.trust is Trust.TRUSTED else Trust.TRUSTED
+    return dataclasses.replace(source, trust=other)
+
+
+def test_a_clash_with_an_already_registered_source_rejects_only_that_feature(tmp_path):
+    """One stale feature must not abort boot for the whole host.
+
+    The observed outage: `kestrel-feature-talon` 0.2.0 still contributed a
+    source core had just reclaimed, and EVERY agent on the host failed to load.
+    The collision is a capability gap for that feature, not an identity gap for
+    the agent.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    peer = _PeerFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    incumbent = _rival_source(feature.source)
+    # The premise, asserted rather than assumed: same name, different contract.
+    assert incumbent.name == feature.source.name
+    assert not SourceRegistry.contract_equivalent(incumbent, feature.source)
+    runtime.source_registry.register(incumbent)
+
+    transition = runtime.prepare_transition((feature, peer))
+
+    # The clashing feature is refused, and the reason names the source...
+    assert [r.feature for r in transition.rejected] == [feature]
+    assert feature.source.name in transition.rejected[0].reason
+    # ...its peer is unaffected, and the transition itself did not fail.
+    assert [item.feature for item in transition.accepted] == [peer]
+    assert [f for f, _ in transition.activatable((feature, peer))] == [peer]
+    # The incumbent registration is left exactly as it was.
+    assert runtime.source_registry.get(feature.source.name) is incumbent
+
+
+def test_an_equivalent_duplicate_contribution_is_a_no_op_success(tmp_path):
+    """Byte-identical re-registration is what every declared policy calls fine.
+
+    The old preflight compared NAMES, so the common case during an extraction —
+    core and a feature shipping the same source — was fatal. The registry
+    already knows what "the same source" means, and it is not the name.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    runtime.source_registry.register(feature.source)
+    assert SourceRegistry.contract_equivalent(
+        runtime.source_registry.get(feature.source.name), feature.source
+    )
+
+    transition = runtime.prepare_transition((feature,))
+
+    assert transition.rejected == ()
+    assert [item.feature for item in transition.accepted] == [feature]
+
+
+def test_two_features_claiming_one_name_in_the_same_batch_still_raises(tmp_path):
+    """Transition-invalid is a different class from feature-rejected.
+
+    Nothing is already registered here — the PROPOSED set is incoherent, and
+    there is no principled subset to prefer, so this must keep raising rather
+    than silently dropping whichever feature happens to be second.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    twin = _PeerFixtureFeature(agent)
+    twin.workflow_registration = type(twin.workflow_registration)(
+        owner=twin.contribution_owner,
+        name=twin.workflow_registration.name,
+        actor=twin.actor,
+        sources=(feature.source,),   # the SAME source name, from both features
+    )
+
+    runtime = agent._ensure_feature_contribution_runtime()
+    assert runtime.source_registry.get(feature.source.name) is None  # premise
+
+    with pytest.raises(FeatureContributionRuntimeError, match="workflow source name"):
+        runtime.prepare_transition((feature, twin))
+
+
+def test_activating_a_single_rejected_feature_still_raises(tmp_path):
+    """`only()` is the one-feature path: enabling a named feature must fail.
+
+    There is no fleet to keep up by continuing — the caller asked for exactly
+    this feature — so a rejection surfaces as that operation's failure rather
+    than as an empty accepted set the caller would have to notice.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.source_registry.register(_rival_source(feature.source))
+
+    with pytest.raises(FeatureContributionRuntimeError, match="different contract"):
+        runtime.prepare_transition((feature,)).only()
+
+
+def test_health_reports_a_refused_feature_and_refuses_to_call_it_healthy():
+    """A missing capability the operator thinks they have is not `healthy`.
+
+    Logging the rejection at boot files it where nobody is looking by the time
+    it matters. `/health/detailed` is the surface that has to carry it.
+    """
+    import types
+
+    from kestrel_sovereign.features.contribution_runtime import ContributionRejection
+    from kestrel_sovereign.server import _with_contribution_rejections
+
+    agent = types.SimpleNamespace(
+        rejected_feature_contributions=(
+            ContributionRejection(object(), "TalonFeature", "signal source ..."),
+        )
+    )
+    original = {"status": "healthy", "checks": []}
+
+    merged = _with_contribution_rejections(agent, original)
+
+    assert merged["status"] == "degraded"
+    assert merged["features_not_loaded"] == [
+        {"feature": "TalonFeature", "reason": "signal source ..."}
+    ]
+    # The health feature's cached dict is shared; it must not be mutated.
+    assert original == {"status": "healthy", "checks": []}
+
+
+def test_health_is_unchanged_when_nothing_was_refused():
+    """No rejections must not manufacture a key or downgrade a healthy host."""
+    import types
+
+    from kestrel_sovereign.server import _with_contribution_rejections
+
+    agent = types.SimpleNamespace(rejected_feature_contributions=())
+    original = {"status": "healthy", "checks": []}
+
+    assert _with_contribution_rejections(agent, original) is original
+
+
+def test_deactivating_a_feature_does_not_remove_an_equivalent_incumbent(tmp_path):
+    """An equivalent contribution kept the INCUMBENT — it is not ours to remove.
+
+    Accepting equivalent duplicates created this: `activate` recorded every
+    DECLARED source as registered, so teardown either unregistered core's own
+    source or failed identity validation when the objects merely matched by
+    contract. Only what a lifecycle newly added is its to tear down.
+    """
+    from tests.fixtures.sdk_contribution_fixture import _source
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # A DISTINCT but contract-equivalent incumbent — core registered its own
+    # object, which is the shape that made teardown raise identity mismatch.
+    incumbent = _source(feature.source.name)
+    assert incumbent is not feature.source
+    assert SourceRegistry.contract_equivalent(incumbent, feature.source)
+    runtime.source_registry.register(incumbent)
+
+    prepared = runtime.prepare_transition((feature,)).only()
+    runtime.activate(prepared)
+
+    assert runtime.deactivate(feature) is True
+    # The incumbent survives the feature's teardown, unchanged.
+    assert runtime.source_registry.get(feature.source.name) is incumbent
+
+
+def test_a_setup_step_name_clash_rejects_the_feature_not_the_boot(tmp_path):
+    """`preflight` raises on an already-registered NAME too, not just on order.
+
+    Gating the per-feature setup-step check on the non-order path left exactly
+    the blast radius this split removes — intact for one key type: one feature's
+    setup-step collision still aborted every agent's boot.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    peer = _PeerFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # Something already owns that setup-step name.
+    runtime.setup_step_registry.register_batch((feature.setup_registration,))
+
+    transition = runtime.prepare_transition((feature, peer))
+
+    assert [r.feature for r in transition.rejected] == [feature]
+    assert "setup step already registered" in transition.rejected[0].reason
+    assert [item.feature for item in transition.accepted] == [peer]
+
+
+def test_host_feature_rejections_reach_detailed_health():
+    """A refused HOST feature is agent-scoped nowhere, so nothing would show it.
+
+    It was recorded on the host context and never read: the reason lived only in
+    boot logs while the endpoint reported healthy over skipped host routes.
+    """
+    import types
+
+    from kestrel_sovereign.features.contribution_runtime import ContributionRejection
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    state = types.SimpleNamespace(
+        host_context=types.SimpleNamespace(
+            rejected_host_feature_contributions=(
+                ContributionRejection(object(), "EyeHostFeature", "wait provider ..."),
+            )
+        )
+    )
+    merged = _with_host_feature_rejections(state, {"status": "healthy", "checks": []})
+
+    assert merged["status"] == "degraded"
+    assert merged["host_features_not_loaded"] == [
+        {"feature": "EyeHostFeature", "reason": "wait provider ..."}
+    ]
+
+
+def test_host_feature_health_is_unchanged_with_no_host_context():
+    """No host context must not manufacture a key or downgrade a healthy host."""
+    import types
+
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    payload = {"status": "healthy", "checks": []}
+    assert _with_host_feature_rejections(types.SimpleNamespace(), payload) is payload
+
+
+def test_tearing_down_one_feature_keeps_a_source_another_still_declares(tmp_path):
+    """A shared source must outlive the first holder's teardown.
+
+    Feature B activating against an equivalent incumbent records no ownership,
+    so once A stopped owning everything it declared, tearing A down removed the
+    only registration while B's workflow was still dispatching against it. The
+    lease is derived from what is still active, not counted in the registry.
+    """
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+    second = _PeerFixtureFeature(agent)
+    # `second` declares a source EQUIVALENT to `first`'s, under the same name.
+    second.workflow_registration = type(second.workflow_registration)(
+        owner=second.contribution_owner,
+        name=second.workflow_registration.name,
+        actor=second.actor,
+        sources=(first.source,),
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # Activated separately — together they would be a within-batch duplicate.
+    runtime.activate(runtime.prepare_transition((first,)).only())
+    runtime.activate(runtime.prepare_transition((second,)).only())
+    assert runtime.source_registry.get(first.source.name) is first.source
+
+    runtime.deactivate(first)
+
+    # `second` is still active and still dispatches against that source.
+    assert runtime.is_active(second)
+    assert runtime.source_registry.get(first.source.name) is first.source
+
+    # Once the last holder goes, so does the registration.
+    runtime.deactivate(second)
+    assert runtime.source_registry.get(first.source.name) is None
+
+
+def test_a_failed_teardown_does_not_hand_the_source_to_a_second_owner(tmp_path):
+    """A raise mid-teardown must leave exactly one owner, not two.
+
+    The transfer ran before the inverse validations, so an UNRELATED mismatch
+    raised with the heir already updated while the original feature stayed
+    active recording the same source — two owners, and one more copy appended
+    on every retry.
+    """
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+    second = _PeerFixtureFeature(agent)
+    second.workflow_registration = type(second.workflow_registration)(
+        owner=second.contribution_owner,
+        name=second.workflow_registration.name,
+        actor=second.actor,
+        sources=(first.source,),
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((first,)).only())
+    runtime.activate(runtime.prepare_transition((second,)).only())
+    heir = runtime._active[id(second)]
+    assert heir.registered_sources == ()      # premise: the heir owns nothing yet
+
+    # Break an UNRELATED inverse so teardown validation raises.
+    runtime.wait_registry.unregister(first.wait_provider.kind)
+
+    for _ in range(2):
+        with pytest.raises(FeatureContributionRuntimeError, match="wait-provider"):
+            runtime.deactivate(first)
+        # No ownership changed hands, and nothing accumulated on retry.
+        assert runtime._active[id(second)].registered_sources == ()
+        assert runtime._active[id(first)].registered_sources == (first.source,)
