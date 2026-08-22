@@ -179,13 +179,36 @@ async def start_host_features(
     their sanitized wrapper crosses intact with the original failure chained.
     """
     runtime = _host_contribution_runtime(ctx)
-    prepared = runtime.prepare_transition(features)
-    by_feature = {id(item.feature): item for item in prepared}
+    transition = runtime.prepare_transition(features)
+    for rejection in transition.rejected:
+        # Loud, and never silent: a host feature that did not load must not be
+        # mistaken for one that loaded and did nothing (issue #2951).
+        logger.error(
+            "Host feature %s did not load — %s",
+            rejection.feature_name,
+            rejection.reason,
+        )
+    # Merged, not overwritten. Repeated calls against one context are
+    # supported (`previously_started`), and a plain assignment made health stop
+    # reporting feature A the moment a later call started feature B cleanly.
+    # A prior rejection is superseded only for a feature THIS call carried —
+    # its verdict now comes from this transition (#2951).
+    # Superseded by stable NAME, not object id: a fixed feature is retried as a
+    # freshly constructed instance, so an id-keyed match never fires and health
+    # goes on reporting a now-live feature as not loaded (#2951).
+    carried = {item.feature_name for item in transition.accepted} | {
+        rejection.feature_name for rejection in transition.rejected
+    }
+    ctx.rejected_host_feature_contributions = tuple(
+        rejection
+        for rejection in getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+        if rejection.feature_name not in carried
+    ) + tuple(transition.rejected)
     previously_started = tuple(getattr(ctx, "started_host_features", ()))
     started: List[HostFeature] = []
-    for feature in features:
+    for feature, prepared_item in transition.activatable(features):
         try:
-            runtime.activate(by_feature[id(feature)])
+            runtime.activate(prepared_item)
         except Exception as exc:
             # A declarative commit failure is not an optional imperative
             # lifecycle failure. Reverse the already-started prefix and reject

@@ -3359,7 +3359,61 @@ async def _phoenix_tracing_status(app) -> dict:
     }
 
 
+def _with_host_feature_rejections(app_state, payload: dict) -> dict:
+    """Fold HOST feature rejections into a detailed-health payload.
+
+    Host features are not agent-scoped, so a refused one is invisible in every
+    per-agent result. Recorded on the host context at startup, it would
+    otherwise live only in boot logs while `/health/detailed` reported healthy
+    over skipped host routes and services (#2951).
+    """
+    ctx = getattr(app_state, "host_context", None)
+    rejections = tuple(
+        getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+    )
+    if not rejections:
+        return payload
+    merged = dict(payload)
+    merged["host_features_not_loaded"] = [
+        {"feature": rejection.feature_name, "reason": rejection.reason}
+        for rejection in rejections
+    ]
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    return merged
+
+
+def _with_contribution_rejections(agent, result: dict) -> dict:
+    """Surface features that were REFUSED activation alongside health.
+
+    A feature that did not load is a capability the operator believes the host
+    has. Logging that at boot files it where nobody is looking by the time it
+    matters; ``/health/detailed`` is where a missing capability has to be
+    visible, or a silently-degraded host reads as a healthy one (#2951).
+
+    Never reports ``healthy`` over a refused contribution — the host is running
+    without something it was configured to have, which is the definition of
+    degraded.
+    """
+    rejections = tuple(getattr(agent, "rejected_feature_contributions", ()) or ())
+    if not rejections:
+        return result
+    merged = dict(result)   # copied: the health feature's cached dict is shared
+    merged["features_not_loaded"] = [
+        {"feature": rejection.feature_name, "reason": rejection.reason}
+        for rejection in rejections
+    ]
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    return merged
+
+
 async def _agent_detailed_health(agent) -> dict:
+    """Detailed health for one agent, including any refused contributions."""
+    return _with_contribution_rejections(agent, await _agent_health_result(agent))
+
+
+async def _agent_health_result(agent) -> dict:
     """Compute the detailed health result for a single agent.
 
     Prefers the agent's ``HealthFeature.get_latest()`` (its cached liveness
@@ -3442,26 +3496,46 @@ async def health_detailed(request: Request):
     # backend (and its disabled reason) is visible regardless of agent health.
     tracing = await _phoenix_tracing_status(request.app)
     if getattr(request.app.state, "startup_error", None):
+        # Host features are started AFTER a startup error is recorded, so a
+        # refused host contribution can coexist with this branch — and this is
+        # the response an operator reads during exactly that combined failure
+        # (#2951).
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": "Server startup failed",
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(
+                request.app.state,
+                {
+                    "status": "unhealthy",
+                    "error": "Server startup failed",
+                    "checks": [],
+                    "tracing": tracing,
+                },
+            ),
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
+        # Safe mode does not exclude a refused feature — optional agent features
+        # can be rejected in safe mode, and host features start independently of
+        # the agent entirely. A diagnostic response that drops the diagnostics is
+        # the one place it is least affordable (#2951).
+        #
+        # `_with_contribution_rejections` reads through `getattr`, so a None
+        # agent is a no-op rather than a branch.
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "restricted",
-                "constitution_safe_mode": safe_mode_records,
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(
+                request.app.state,
+                _with_contribution_rejections(
+                    agent,
+                    {
+                        "status": "restricted",
+                        "constitution_safe_mode": safe_mode_records,
+                        "checks": [],
+                        "tracing": tracing,
+                    },
+                ),
+            ),
         )
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
@@ -3499,8 +3573,11 @@ async def health_detailed(request: Request):
             )
             content.setdefault("checks", [])
             content.setdefault("tracing", tracing)
-            return JSONResponse(status_code=503, content=content)
-        return result
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, result)
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
     # None). Resolve health from the live fleet rather than reporting a false
@@ -3526,6 +3603,14 @@ async def health_detailed(request: Request):
                 breakdown[name] = {
                     "status": res.get("status", "unhealthy"),
                     "checks": res.get("checks", []),
+                    # Carried through: a fleet entry that says "degraded"
+                    # without naming the refused feature reports the symptom
+                    # and drops the diagnostic (#2951).
+                    **(
+                        {"features_not_loaded": res["features_not_loaded"]}
+                        if res.get("features_not_loaded")
+                        else {}
+                    ),
                 }
         overall = _roll_up_fleet_status(
             [entry["status"] for entry in breakdown.values()]
@@ -3548,8 +3633,11 @@ async def health_detailed(request: Request):
                     "scheduler_readiness_failures": scheduler_failures,
                 }
             )
-            return JSONResponse(status_code=503, content=content)
-        return content
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, content)
 
     content = {
         "status": "unhealthy",
@@ -3565,8 +3653,13 @@ async def health_detailed(request: Request):
                 "scheduler_readiness_failures": scheduler_failures,
             }
         )
-        return JSONResponse(status_code=503, content=content)
-    return content
+        return JSONResponse(
+            status_code=503,
+            content=_with_host_feature_rejections(request.app.state, content),
+        )
+    # Host features start independently of agent availability, so "no agent"
+    # must still name a refused host feature rather than drop the diagnostic.
+    return _with_host_feature_rejections(request.app.state, content)
 
 
 def _enforce_host_csrf(request: Request):
