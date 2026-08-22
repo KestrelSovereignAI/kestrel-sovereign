@@ -233,13 +233,21 @@ copies, merges, overwrites, or deletes ambiguous credentials.
 
 Moving a venv changes the absolute interpreter path embedded in console-script
 shebangs. Core therefore records the canonical absolute venv path in its
-private provisioning manifest. A missing or mismatched path stamp forces one
-full package reinstall at the adopted destination before child launch; an
-ordinary `--upgrade` is not accepted as repair because already-satisfied
-packages may retain stale scripts. The manifest is replaced atomically only
-after install and distribution verification succeed, so a crash retries the
-repair on restart. Service credentials and state beside `.venv` are preserved,
-and a valid same-path stamp remains idempotent.
+private provisioning manifest. A directory rename observed in the current
+startup, a mismatched non-empty path stamp, or a console wrapper containing a
+foreign absolute interpreter is relocation evidence. When that evidence finds
+a stale wrapper, Core performs one full package reinstall at the adopted
+destination before child launch; an ordinary `--upgrade` is not accepted as
+repair because already-satisfied packages may retain stale scripts. If repair
+cannot complete, Core quarantines the optional feature rather than launch the
+unusable wrapper. A missing path stamp alone is not relocation evidence:
+unchanged pre-upgrade venvs are positively probed and their path is atomically
+backfilled without contacting an index. A migrated module-callable runtime (or
+an already-repaired console wrapper) is similarly verified and adopted without
+an unnecessary reinstall. The manifest is replaced atomically only after
+install/adoption and distribution verification succeed, so a crash retries a
+still-demonstrably-stale repair on restart. Service credentials and state beside
+`.venv` are preserved, and a valid same-path stamp remains idempotent.
 
 Every hosted feature receives a private mutable directory below that namespace
 for its working directory, home, temp, XDG config/data/cache, channel artifacts,
@@ -337,7 +345,13 @@ stopped and must not be retried, while any named child or descendant with
 pending/retained runtime custody is identified separately for operator
 reconciliation.
 Storage-derived standalone/SQLite trees are outside hosted namespace cleanup
-and retain their existing storage lifecycle policy.
+and retain their existing storage lifecycle policy. A destructive request for
+such an agent therefore reports `runtime_cleanup_state=not_hosted`; it never
+claims the storage-backed tree was removed. If the exact owned hosted namespace
+is already absent, Core reports `runtime_cleanup_state=already_absent`. Both are
+typed no-op custody outcomes (`runtime_offboarded=false`) rather than a false
+deprovisioning success; routing withdrawal and persisted-registration removal
+remain truthful separate fields.
 Core-created standalone feature, workspace, and channel-artifact directories
 are private `0700`; a pre-existing storage parent (including process CWD) is
 operator-owned and its mode is never changed.

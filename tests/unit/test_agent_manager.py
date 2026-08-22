@@ -34,6 +34,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     ChildTerminationReconciliationError,
     RUNTIME_OFFBOARD_TIMEOUT_S,
+    RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
     _parse_runtime_offboard_timeout,
 )
@@ -1061,6 +1062,54 @@ class TestAgentManagerBasics:
         assert (outside / "keep").read_text() == "unrelated"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hosted_scope", "cleanup_state", "runtime_retained"),
+        (
+            (False, "not_hosted", True),
+            (True, "already_absent", False),
+        ),
+        ids=("storage-backed", "already-absent"),
+    )
+    async def test_destructive_remove_reports_when_no_runtime_tree_was_deleted(
+        self,
+        tmp_path,
+        hosted_scope,
+        cleanup_state,
+        runtime_retained,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = f"did:pkh:no-delete-{cleanup_state}"
+        agent = _make_mock_agent(did)
+        agent.did = did
+        if hosted_scope:
+            agent.isolated_runtime_scope = resolve_isolated_runtime_namespace(
+                manager._isolated_runtime_root,
+                derive_isolated_runtime_namespace(did),
+            )
+            assert not agent.isolated_runtime_scope.path.exists()
+        manager._agents["Hosted"] = agent
+        manager._agent_names[did] = "Hosted"
+
+        with pytest.raises(RuntimeOffboardingNotPerformedError) as raised:
+            await manager.remove_agent("Hosted", offboard_runtime=True)
+
+        assert agent.shutdown.await_count == 1
+        assert manager.get_agent("Hosted") is None
+        assert raised.value.metadata == {
+            "code": "runtime_offboarding_not_performed",
+            "agent": "Hosted",
+            "agent_id": did,
+            "agent_removed": True,
+            "runtime_offboard_requested": True,
+            "runtime_offboarded": False,
+            "runtime_retained": runtime_retained,
+            "runtime_cleanup_pending": False,
+            "runtime_cleanup_state": cleanup_state,
+            "runtime_already_absent": hosted_scope,
+            "hosted_runtime_configured": hosted_scope,
+        }
+
+    @pytest.mark.asyncio
     async def test_slow_runtime_offboarding_is_bounded_outside_lifecycle_locks(
         self, monkeypatch
     ):
@@ -1315,6 +1364,62 @@ class TestAgentManagerBasics:
         assert raised.value.status_code == 409
         assert "auto-discovered" in raised.value.detail
         manager.remove_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("cleanup_state", "runtime_retained"),
+        (("not_hosted", True), ("already_absent", False)),
+    )
+    async def test_delete_endpoint_never_claims_a_noop_runtime_offboard(
+        self,
+        tmp_path,
+        cleanup_state,
+        runtime_retained,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(
+            agents={
+                "Hosted": LocalAgentConfig(
+                    data_dir=Path("agent_data/hosted"),
+                    port=8801,
+                )
+            }
+        )
+        config.save(config_path)
+        outcome = RuntimeOffboardingNotPerformedError(
+            agent_name="Hosted",
+            agent_id="did:test:no-delete",
+            cleanup_state=cleanup_state,
+        )
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:no-delete"),
+            remove_agent=AsyncMock(side_effect=outcome),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert raised.value.detail["runtime_offboarded"] is False
+        assert raised.value.detail["runtime_retained"] is runtime_retained
+        assert raised.value.detail["runtime_cleanup_state"] == cleanup_state
+        assert raised.value.detail["persisted_registration_removed"] is True
+        assert MultiAgentConfig.from_file(config_path).agents == {}
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_retains_config_removal_while_cleanup_is_pending(

@@ -60,6 +60,7 @@ def _termination_partial_result(
     manager: object,
     error: BaseException,
     retained_error_type: type[BaseException],
+    not_performed_error_type: type[BaseException],
     reconciliation_error_type: type[BaseException],
     public_exception_type_name: Callable[[BaseException], str],
 ) -> ToolResult | None:
@@ -73,11 +74,15 @@ def _termination_partial_result(
 
     leaves = _flatten_terminal_outcomes(error)
     retained = [item for item in leaves if isinstance(item, retained_error_type)]
+    not_performed = [
+        item for item in leaves if isinstance(item, not_performed_error_type)
+    ]
     reconciliation = [
         item for item in leaves if isinstance(item, reconciliation_error_type)
     ]
     supported = (
         retained_error_type,
+        not_performed_error_type,
         reconciliation_error_type,
         asyncio.CancelledError,
     )
@@ -91,7 +96,9 @@ def _termination_partial_result(
     # Cancellation alone must retain normal task-cancellation semantics. A
     # typed reconciliation error is independently sufficient proof of removal;
     # otherwise this helper is specifically the retained-custody contract.
-    if not retained and (not reconciliation or len(reconciliation) != len(leaves)):
+    if not retained and not not_performed and (
+        not reconciliation or len(reconciliation) != len(leaves)
+    ):
         return None
 
     get_agent = getattr(manager, "get_agent", None)
@@ -116,8 +123,34 @@ def _termination_partial_result(
         name.casefold() == child_name.casefold() for name in retained_agents
     )
 
+    not_performed_agents: list[str] = []
+    for item in not_performed:
+        agent_name = _safe_retained_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name not in not_performed_agents:
+            not_performed_agents.append(agent_name)
+    not_performed_agents.sort(key=str.casefold)
+    named_child_not_performed = any(
+        name.casefold() == child_name.casefold() for name in not_performed_agents
+    )
+
+    no_op_states = {
+        str(item.metadata.get("runtime_cleanup_state"))
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+    }
+    if len(no_op_states) > 1:
+        no_op_cleanup_state = "mixed"
+    elif no_op_states:
+        no_op_cleanup_state = next(iter(no_op_states))
+    else:
+        no_op_cleanup_state = None
+
     additional = [
-        item for item in leaves if not isinstance(item, retained_error_type)
+        item
+        for item in leaves
+        if not isinstance(item, (retained_error_type, not_performed_error_type))
     ]
     additional_types = sorted(
         {public_exception_type_name(item) for item in additional}
@@ -144,10 +177,18 @@ def _termination_partial_result(
         cleanup_state = "retained"
 
     if offboard_runtime:
-        runtime_retained = bool(retained)
-        named_runtime_retained = named_child_retained
-        named_runtime_removed = not named_child_retained
-        reported_cleanup_state = cleanup_state if retained else "removed"
+        runtime_retained = bool(retained) or "not_hosted" in no_op_states
+        named_runtime_retained = named_child_retained or (
+            named_child_not_performed and "not_hosted" in no_op_states
+        )
+        named_runtime_removed = (
+            not named_child_retained and not named_child_not_performed
+        )
+        reported_cleanup_state = (
+            cleanup_state
+            if retained
+            else no_op_cleanup_state or "removed"
+        )
     else:
         # This is the compatibility stop contract: no runtime cleanup was
         # admitted, so every named/descendant tree remains available for a
@@ -164,7 +205,7 @@ def _termination_partial_result(
         "child_name": child_name,
         "agent_removed": True,
         "runtime_offboard_requested": offboard_runtime,
-        "runtime_offboarded": offboard_runtime and not retained,
+        "runtime_offboarded": offboard_runtime and not retained and not not_performed,
         "runtime_retained": runtime_retained,
         "runtime_retained_for_restart": not offboard_runtime,
         "named_child_runtime_retained": named_runtime_retained,
@@ -187,12 +228,29 @@ def _termination_partial_result(
             data["retained_cause_type"] = cause_types[0]
     if reconciliation:
         data["tracking_reconciled"] = False
+    if not_performed:
+        data["not_performed_outcome_count"] = len(not_performed)
+        data["not_performed_agents"] = not_performed_agents
+        data["runtime_custody_code"] = "runtime_offboarding_not_performed"
+        data["runtime_already_absent"] = "already_absent" in no_op_states
+        data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
 
     if not offboard_runtime:
         custody_message = (
             "The child was stopped and its runtime state was retained for "
             "restart, but lifecycle bookkeeping requires operator "
             "reconciliation. Do not retry termination."
+        )
+    elif not_performed and "already_absent" in no_op_states:
+        custody_message = (
+            "The child was stopped, but its hosted runtime namespace was already "
+            "absent and no tree was deleted. Do not retry termination."
+        )
+    elif not_performed:
+        custody_message = (
+            "The child was stopped, but it has no hosted runtime namespace that "
+            "Core can securely offboard. Its storage-backed state was not deleted. "
+            "Do not retry termination."
         )
     elif cleanup_pending:
         custody_message = (
@@ -778,6 +836,7 @@ class SpawnFeature(Feature):
         # Remove from manager (handles shutdown + cascading child termination)
         from kestrel_sovereign.multi_agent.agent_manager import (
             ChildTerminationReconciliationError,
+            RuntimeOffboardingNotPerformedError,
             RuntimeOffboardingRetainedError,
             public_exception_type_name,
         )
@@ -818,6 +877,7 @@ class SpawnFeature(Feature):
                 manager=manager,
                 error=exc,
                 retained_error_type=RuntimeOffboardingRetainedError,
+                not_performed_error_type=RuntimeOffboardingNotPerformedError,
                 reconciliation_error_type=ChildTerminationReconciliationError,
                 public_exception_type_name=public_exception_type_name,
             )

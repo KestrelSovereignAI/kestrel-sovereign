@@ -139,6 +139,55 @@ class RuntimeOffboardingRetainedError(RuntimeError):
         super().__init__(message)
 
 
+class RuntimeOffboardingNotPerformedError(RuntimeError):
+    """A destructive request stopped the agent but deleted no runtime tree.
+
+    This is intentionally distinct from retained custody: an already-absent
+    namespace has no tree to retain, while a storage-backed agent has no hosted
+    namespace that Core is authorized to delete.  Administrative callers must
+    not translate either outcome into ``runtime_offboarded=true`` merely because
+    the cleanup worker returned without raising.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        agent_id: str,
+        cleanup_state: str,
+    ) -> None:
+        if cleanup_state not in {"already_absent", "not_hosted"}:
+            raise ValueError("invalid runtime offboarding no-op state")
+        self.agent_name = agent_name
+        self.agent_id = agent_id
+        self.cleanup_state = cleanup_state
+        runtime_retained = cleanup_state == "not_hosted"
+        self.metadata = {
+            "code": "runtime_offboarding_not_performed",
+            "agent": agent_name,
+            "agent_id": agent_id,
+            "agent_removed": True,
+            "runtime_offboard_requested": True,
+            "runtime_offboarded": False,
+            "runtime_retained": runtime_retained,
+            "runtime_cleanup_pending": False,
+            "runtime_cleanup_state": cleanup_state,
+            "runtime_already_absent": cleanup_state == "already_absent",
+            "hosted_runtime_configured": cleanup_state != "not_hosted",
+        }
+        if cleanup_state == "already_absent":
+            message = (
+                f"Agent {agent_name!r} was shut down and unpublished; its hosted "
+                "runtime namespace was already absent, so no tree was deleted."
+            )
+        else:
+            message = (
+                f"Agent {agent_name!r} was shut down and unpublished; it has no "
+                "hosted runtime namespace for secure offboarding."
+            )
+        super().__init__(message)
+
+
 class ChildTerminationReconciliationError(RuntimeError):
     """A removed child needs operator reconciliation of manager bookkeeping.
 
@@ -201,7 +250,7 @@ class InflightRuntimeOffboarding:
     agent_name: str
     agent_id: str
     runtime_path: Optional[Path]
-    task: "asyncio.Task[None]"
+    task: "asyncio.Task[bool]"
 
 
 def _bounded_shutdown_metadata(value: object) -> str:
@@ -2479,7 +2528,7 @@ class AgentManager:
             primary_failure = exc
 
         offboarding_cancelled = False
-        offboarding_failure: RuntimeOffboardingRetainedError | None = None
+        offboarding_failure: BaseException | None = None
         if pending_offboarding:
             if len(pending_offboarding) != 1:
                 raise RuntimeError("one agent removal admitted multiple offboardings")
@@ -2744,6 +2793,11 @@ class AgentManager:
                     cleanup_failure,
                 ) = await self._offboard_agent_runtime_namespace(agent)
                 if cleanup_failure is not None:
+                    if cleanup_cancelled:
+                        raise BaseExceptionGroup(
+                            "Runtime offboarding had multiple terminal outcomes",
+                            [asyncio.CancelledError(), cleanup_failure],
+                        )
                     raise cleanup_failure
                 if cleanup_cancelled:
                     raise asyncio.CancelledError()
@@ -2793,7 +2847,29 @@ class AgentManager:
             asyncio.to_thread(remove_agent_runtime_namespace, agent),
             name="isolated_runtime_namespace_quarantined_offboard",
         )
-        return await await_lifecycle_task_completion(cleanup_task)
+        cancelled, failure = await await_lifecycle_task_completion(cleanup_task)
+        if failure is not None:
+            return cancelled, failure
+        result = cleanup_task.result()
+        if type(result) is not bool:
+            return False, RuntimeError(
+                "secure runtime offboarding returned an invalid outcome"
+            )
+        if result:
+            return False, None
+        agent_id = _loaded_agent_did(agent) or "<unknown>"
+        agent_name = self._agent_names.get(agent_id)
+        if type(agent_name) is not str or not agent_name:
+            agent_name = agent_id
+        return False, RuntimeOffboardingNotPerformedError(
+            agent_name=agent_name,
+            agent_id=agent_id,
+            cleanup_state=(
+                "already_absent"
+                if _agent_runtime_path(agent) is not None
+                else "not_hosted"
+            ),
+        )
 
     def _start_agent_runtime_offboarding(
         self,
@@ -2938,7 +3014,7 @@ class AgentManager:
         record: InflightRuntimeOffboarding,
         *,
         cancellation_already_observed: bool,
-    ) -> tuple[bool, Optional[RuntimeOffboardingRetainedError]]:
+    ) -> tuple[bool, Optional[BaseException]]:
         """Bound an administrative wait without cancelling filesystem cleanup."""
 
         def retained(
@@ -2986,7 +3062,22 @@ class AgentManager:
             )
         failure = record.task.exception()
         if failure is None:
-            return False, None
+            result = record.task.result()
+            if type(result) is not bool:
+                return False, retained(
+                    TypeError("secure runtime offboarding returned an invalid outcome")
+                )
+            if result:
+                return False, None
+            return False, RuntimeOffboardingNotPerformedError(
+                agent_name=record.agent_name,
+                agent_id=record.agent_id,
+                cleanup_state=(
+                    "already_absent"
+                    if record.runtime_path is not None
+                    else "not_hosted"
+                ),
+            )
         if not isinstance(failure, Exception):
             raise failure
         return False, retained(failure)
@@ -4736,10 +4827,16 @@ class AgentManager:
         )
         cancelled, failure = await await_lifecycle_task_completion(cleanup)
         if failure is not None:
-            if isinstance(failure, RuntimeOffboardingRetainedError):
+            if isinstance(
+                failure,
+                (
+                    RuntimeOffboardingRetainedError,
+                    RuntimeOffboardingNotPerformedError,
+                ),
+            ):
                 # Runtime routing and the delegated hold are already gone; the
                 # uncommitted spawn still failed to complete destructive
-                # offboarding and must expose that retained resource.
+                # offboarding and must expose that custody outcome.
                 admission.rollback_incomplete = True
             raise failure
         if cleanup.result() is True:

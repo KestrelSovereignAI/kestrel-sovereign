@@ -2021,6 +2021,205 @@ def test_hosted_migration_repairs_real_console_script_once(
     restarted._run.assert_not_called()
 
 
+def test_unmoved_legacy_manifest_backfills_venv_path_without_index_access(
+    monkeypatch,
+    tmp_path,
+):
+    """A pre-upgrade location-less stamp is not evidence of relocation."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="WhatsAppFeature",
+        entry_point="wa.feature:WhatsAppFeature",
+        distribution="offline-feature",
+        runtime="isolated-venv",
+        service="offline-service",
+        project="offline-feature",
+    )
+    feature = ProxyFeature(
+        _hosted_postgres_agent(
+            tmp_path / "runtime",
+            "agent-unmoved-manifest",
+            did="did:test:unmoved-manifest",
+        ),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    python = isolated_runtime._venv_python(feature._venv_path)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o700)
+    console = isolated_runtime._venv_bin_dir(feature._venv_path) / runtime.service
+    console.write_text(f"#!{python.resolve()}\nprint('usable')\n")
+    console.chmod(0o700)
+    manifest_path = feature._provision_manifest_path()
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "install_target": runtime.project,
+                "provisioned_against_host_sdk": "1.2.3",
+                "child_sdk_version": "1.2.3",
+                "feature_distribution_version": "4.5.6",
+                "child_feature_distribution_state": "versioned",
+                "child_feature_distribution_version": "4.5.6",
+            }
+        )
+    )
+    feature._run = Mock(side_effect=OSError("index must remain offline"))
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("4.5.6")
+    )
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "4.5.6",
+    )
+
+    feature.ensure_venv()
+
+    feature._run.assert_not_called()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["venv_path"] == str(feature._venv_path.resolve())
+    assert manifest["child_feature_distribution_version"] == "4.5.6"
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+
+
+def test_migrated_module_runtime_is_adopted_offline_without_reinstall(
+    monkeypatch,
+    tmp_path,
+):
+    """A moved venv with no generated console wrapper remains usable offline."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="ModuleFeature",
+        entry_point="module_feature.feature:ModuleFeature",
+        distribution="module-feature",
+        runtime="isolated-venv",
+        service="module_feature.service:main",
+        project="module-feature",
+    )
+    agent = _hosted_postgres_agent(
+        tmp_path / "runtime",
+        "agent-module-migration",
+        did="did:test:module-migration",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    legacy_component = feature._legacy_runtime_directory_name
+    assert legacy_component is not None
+    isolated_runtime.prepare_isolated_runtime_namespace(
+        feature._isolated_runtime_scope,
+        agent.did,
+        relative_directories=(("feature_venvs", legacy_component),),
+    )
+    source_venv = (
+        feature._agent_runtime_dir
+        / "feature_venvs"
+        / legacy_component
+        / ".venv"
+    )
+    python = isolated_runtime._venv_python(source_venv)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o700)
+
+    feature._prepare_runtime_workspace()
+    assert feature._venv_relocated_this_startup is True
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._run = Mock(side_effect=OSError("offline package index"))
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("7.8.9")
+    )
+    feature._probe_sdk_version = Mock(return_value="1.2.3")
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "7.8.9",
+    )
+
+    feature.ensure_venv()
+
+    feature._run.assert_not_called()
+    manifest = json.loads(feature._provision_manifest_path().read_text())
+    assert manifest["venv_path"] == str(feature._venv_path.resolve())
+    assert manifest["feature_distribution_version"] == "7.8.9"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
+@pytest.mark.asyncio
+async def test_relocated_console_index_failure_quarantines_before_child_start(
+    tmp_path,
+):
+    """An offline repair never launches a wrapper bound to the old venv path."""
+
+    wheel = _write_console_script_fixture_wheel(tmp_path)
+    runtime = InstalledFeatureRuntime(
+        class_name="WhatsAppFeature",
+        entry_point="wa.feature:WhatsAppFeature",
+        distribution="kestrel-console-migration-fixture",
+        runtime="isolated-venv",
+        service="kestrel-whatsapp-service",
+        project=str(wheel),
+    )
+    agent = _hosted_postgres_agent(
+        tmp_path / "runtime",
+        "agent-offline-console-migration",
+        did="did:test:offline-console-migration",
+    )
+    factory = Mock(side_effect=AssertionError("stale child must not be built"))
+    feature = ProxyFeature(agent, runtime, client_factory=factory)
+    legacy_component = feature._legacy_runtime_directory_name
+    assert legacy_component is not None
+    isolated_runtime.prepare_isolated_runtime_namespace(
+        feature._isolated_runtime_scope,
+        agent.did,
+        relative_directories=(("feature_venvs", legacy_component),),
+    )
+    source_venv = (
+        feature._agent_runtime_dir
+        / "feature_venvs"
+        / legacy_component
+        / ".venv"
+    )
+    subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(source_venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(isolated_runtime._venv_python(source_venv)),
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    old_python = str(isolated_runtime._venv_python(source_venv))
+    feature._run = Mock(
+        side_effect=subprocess.CalledProcessError(1, ["uv", "pip", "install"])
+    )
+
+    with pytest.raises(IsolatedRuntimePreparationError):
+        await feature.initialize()
+
+    target_console = (
+        feature._default_venv_path() / "bin" / "kestrel-whatsapp-service"
+    )
+    assert old_python in target_console.read_text()
+    assert not feature._provision_manifest_path().exists()
+    factory.assert_not_called()
+    install = feature._run.call_args.args[0]
+    assert "--reinstall" in install
+
+
 def test_relocated_venv_failed_repair_retains_stale_stamp_for_retry(
     monkeypatch,
     tmp_path,

@@ -16,6 +16,7 @@ from kestrel_sovereign.features.isolated_runtime import (
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     ChildTerminationReconciliationError,
+    RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
 )
 from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
@@ -32,6 +33,15 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     agent._private_key = None  # No signing in unit tests
     agent.identity = None
     return agent
+
+
+def _exception_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for nested in error.exceptions:
+            leaves.extend(_exception_leaves(nested))
+        return leaves
+    return [error]
 
 
 def _make_spawn_feature(parent_agent=None, manager=None):
@@ -437,6 +447,57 @@ class TestSpawnFeatureWithManager:
             "helper",
             offboard_runtime=True,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("cleanup_state", "runtime_retained"),
+        (("not_hosted", True), ("already_absent", False)),
+    )
+    async def test_terminate_child_reports_noop_destructive_cleanup_truthfully(
+        self,
+        cleanup_state,
+        runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager.terminate_child = AsyncMock(
+            side_effect=RuntimeOffboardingNotPerformedError(
+                agent_name="helper",
+                agent_id="did:child",
+                cleanup_state=cleanup_state,
+            )
+        )
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is runtime_retained
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_runtime_retained"] is runtime_retained
+        assert envelope.data["runtime_cleanup_state"] == cleanup_state
+        assert envelope.data["runtime_already_absent"] is (
+            cleanup_state == "already_absent"
+        )
+        assert envelope.data["not_performed_agents"] == ["helper"]
+        assert envelope.data["retry_termination"] is False
+        assert "Do not retry termination" in envelope.error
+        assert lifecycle.is_tracked("helper") is False
 
     @pytest.mark.asyncio
     async def test_terminate_child_maps_real_shutdown_handoff_to_pending_partial(
@@ -1118,11 +1179,11 @@ class TestAgentManagerSpawn:
 
         assert any(
             isinstance(error, asyncio.CancelledError)
-            for error in exc_info.value.exceptions
+            for error in _exception_leaves(exc_info.value)
         )
         assert any(
             "rollback refund failed" in str(error)
-            for error in exc_info.value.exceptions
+            for error in _exception_leaves(exc_info.value)
         )
         assert manager.get_agent("helper") is None
         assert manager._child_budgets["helper"] is budget_entry

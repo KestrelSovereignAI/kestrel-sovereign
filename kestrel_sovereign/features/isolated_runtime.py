@@ -2866,7 +2866,7 @@ def _migrate_runtime_directory_at(
     parent_fd: int,
     legacy_component: str,
     stable_component: str,
-) -> None:
+) -> bool:
     """Atomically adopt one legacy feature directory under an open parent.
 
     Both names are opaque Core-derived components.  A target collision is not
@@ -2875,7 +2875,7 @@ def _migrate_runtime_directory_at(
     """
 
     if legacy_component == stable_component:
-        return
+        return False
     if (
         _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(legacy_component) is None
         or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(stable_component) is None
@@ -2890,7 +2890,7 @@ def _migrate_runtime_directory_at(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        return
+        return False
     if not stat.S_ISDIR(legacy_metadata.st_mode):
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature legacy runtime path is unsafe."
@@ -2972,6 +2972,7 @@ def _migrate_runtime_directory_at(
             "operator custody reconciliation is required."
         ) from exc
     os.fsync(parent_fd)
+    return True
 
 
 def _log_runtime_migration_collision(
@@ -3072,13 +3073,13 @@ def _migrate_released_runtime_directory_portable(
     scope: IsolatedRuntimeNamespace,
     legacy_component: str,
     stable_component: str,
-) -> None:
+) -> bool:
     """Best-effort non-dirfd adoption with fail-closed custody checks."""
 
     try:
         root_metadata = legacy_root.stat(follow_symlinks=False)
     except FileNotFoundError:
-        return
+        return False
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature released legacy runtime root is unsafe."
@@ -3089,7 +3090,7 @@ def _migrate_released_runtime_directory_portable(
         legacy_metadata = legacy.stat(follow_symlinks=False)
     except FileNotFoundError:
         _revalidate_portable_released_root(legacy_root, root_metadata)
-        return
+        return False
     _revalidate_portable_released_root(legacy_root, root_metadata)
     _validate_released_legacy_root_custody(root_metadata)
     if stat.S_ISLNK(legacy_metadata.st_mode):
@@ -3137,6 +3138,7 @@ def _migrate_released_runtime_directory_portable(
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature released legacy runtime changed during migration."
         )
+    return True
 
 
 def migrate_released_hosted_feature_runtime(
@@ -3145,7 +3147,7 @@ def migrate_released_hosted_feature_runtime(
     owner: str,
     legacy_component: str,
     stable_component: str,
-) -> None:
+) -> bool:
     """Adopt the shipped class-named hosted tree into its tenant namespace.
 
     The managed factory, rather than feature metadata or process environment,
@@ -3165,7 +3167,7 @@ def migrate_released_hosted_feature_runtime(
         )
     if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
         try:
-            _migrate_released_runtime_directory_portable(
+            migrated = _migrate_released_runtime_directory_portable(
                 legacy_root,
                 scope,
                 legacy_component,
@@ -3178,7 +3180,7 @@ def migrate_released_hosted_feature_runtime(
                 "Hosted isolated feature released runtime could not be migrated; "
                 "tenant state was retained."
             ) from exc
-        return
+        return migrated
 
     source_parent_fd: Optional[int] = None
     target_root_fd: Optional[int] = None
@@ -3209,7 +3211,7 @@ def migrate_released_hosted_feature_runtime(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                return
+                return False
             source_root_fd = os.open(
                 legacy_root.name,
                 _directory_open_flags(),
@@ -3239,7 +3241,7 @@ def migrate_released_hosted_feature_runtime(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                return
+                return False
             _validate_released_legacy_root_custody(source_root_metadata)
             _validate_released_legacy_directory_metadata(legacy_metadata)
             legacy_fd = os.open(
@@ -3356,6 +3358,7 @@ def migrate_released_hosted_feature_runtime(
                 os.close(migrated_fd)
             os.fsync(source_root_fd)
             os.fsync(target_parent_fd)
+            return True
         finally:
             os.close(source_root_fd)
     except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
@@ -3386,6 +3389,7 @@ def _prepare_runtime_tree_portable(
     owner: str,
     relative_directories: tuple[tuple[str, ...], ...],
     directory_migrations: tuple[tuple[tuple[str, ...], str, str], ...],
+    migration_results: Optional[set[tuple[tuple[str, ...], str, str]]],
 ) -> None:
     """Best-effort non-POSIX fallback where dirfd no-follow is unavailable."""
 
@@ -3521,6 +3525,8 @@ def _prepare_runtime_tree_portable(
                 "state; operator custody reconciliation is required."
             )
         legacy.rename(stable)
+        if migration_results is not None:
+            migration_results.add((parent, legacy_component, stable_component))
     for relative in relative_directories:
         cursor = scope.path
         for component in relative:
@@ -3540,6 +3546,7 @@ def prepare_isolated_runtime_namespace(
     *,
     relative_directories: tuple[tuple[str, ...], ...] = (),
     directory_migrations: tuple[tuple[tuple[str, ...], str, str], ...] = (),
+    migration_results: Optional[set[tuple[tuple[str, ...], str, str]]] = None,
 ) -> Path:
     """Securely bind and prepare one hosted agent's mutable runtime tree.
 
@@ -3594,6 +3601,7 @@ def prepare_isolated_runtime_namespace(
                 owner,
                 relative_directories,
                 directory_migrations,
+                migration_results,
             )
         except IsolatedRuntimeNamespaceError:
             raise
@@ -3646,11 +3654,13 @@ def prepare_isolated_runtime_namespace(
                     child = _open_or_create_directory_at(descriptor, component)
                     os.close(descriptor)
                     descriptor = child
-                _migrate_runtime_directory_at(
+                migrated = _migrate_runtime_directory_at(
                     descriptor,
                     legacy_component,
                     stable_component,
                 )
+                if migrated and migration_results is not None:
+                    migration_results.add((parent, legacy_component, stable_component))
             finally:
                 os.close(descriptor)
         for relative in relative_directories:
@@ -4893,6 +4903,11 @@ class ProxyFeature(Feature):
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        # Set only when Core observes a custody-preserving directory rename in
+        # the current enable attempt. A missing manifest stamp is not evidence
+        # of relocation; older, unmoved venvs use this distinction to start
+        # offline and atomically backfill their canonical path.
+        self._venv_relocated_this_startup = False
         self._host_config: Dict[str, Any] = {}
         self._hosted_telegram_startup_attested = False
         self._hosted_telegram_route_identity: Optional[str] = None
@@ -8996,6 +9011,7 @@ class ProxyFeature(Feature):
         state, temp files, and user-home/XDG writes stay agent scoped.
         """
         runtime_dir = self._feature_runtime_dir()
+        self._venv_relocated_this_startup = False
         if self._isolated_runtime_scope is not None:
             prefix = ("feature_venvs", self._runtime_directory_name)
             legacy_component = self._legacy_runtime_directory_name
@@ -9007,19 +9023,25 @@ class ProxyFeature(Feature):
                 )
                 else ()
             )
+            migration_results: set[tuple[tuple[str, ...], str, str]] = set()
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
                 relative_directories=(("feature_venvs",),),
                 directory_migrations=migrations,
+                migration_results=migration_results,
             )
+            self._venv_relocated_this_startup = bool(migration_results)
             if self._released_legacy_runtime_root is not None:
-                migrate_released_hosted_feature_runtime(
-                    self._released_legacy_runtime_root,
-                    self._isolated_runtime_scope,
-                    _agent_runtime_owner(self.agent),
-                    self.name,
-                    self._runtime_directory_name,
+                self._venv_relocated_this_startup = (
+                    migrate_released_hosted_feature_runtime(
+                        self._released_legacy_runtime_root,
+                        self._isolated_runtime_scope,
+                        _agent_runtime_owner(self.agent),
+                        self.name,
+                        self._runtime_directory_name,
+                    )
+                    or self._venv_relocated_this_startup
                 )
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
@@ -9129,9 +9151,10 @@ class ProxyFeature(Feature):
 
     def _read_provision_manifest(self) -> Dict[str, Any]:
         try:
-            return json.loads(self._provision_manifest_path().read_text())
+            manifest = json.loads(self._provision_manifest_path().read_text())
         except Exception:  # noqa: BLE001 — missing/corrupt manifest ⇒ reprovision
             return {}
+        return manifest if isinstance(manifest, dict) else {}
 
     def _write_provision_manifest(
         self,
@@ -9141,9 +9164,7 @@ class ProxyFeature(Feature):
         feature_distribution_version: str,
         child_feature_distribution: _FeatureDistributionProbe,
     ) -> None:
-        path = self._provision_manifest_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
+        self._write_provision_manifest_payload(
             {
                 "install_target": install_target,
                 # Console-script shebangs embed the venv's absolute interpreter
@@ -9173,9 +9194,15 @@ class ProxyFeature(Feature):
                 "child_feature_distribution_version": (
                     child_feature_distribution.version
                 ),
-            },
-            indent=2,
-        ).encode("utf-8")
+            }
+        )
+
+    def _write_provision_manifest_payload(self, manifest: Dict[str, Any]) -> None:
+        """Atomically publish one private Core provisioning manifest."""
+
+        path = self._provision_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(manifest, indent=2).encode("utf-8")
         temporary = path.with_name(
             f"{path.name}.tmp-{os.getpid()}-{uuid4().hex}"
         )
@@ -9210,22 +9237,168 @@ class ProxyFeature(Feature):
             except FileNotFoundError:
                 pass
 
-    def _provision_status(self, install_target: str) -> tuple[bool, bool]:
-        """Return ``(stale, force_reinstall)`` for a Core-owned venv.
+    def _console_script_location_state(self) -> str:
+        """Return ``current``, ``relocated``, ``missing``, or ``not-applicable``.
 
-        A missing or mismatched location stamp proves that entry-point scripts
-        may still contain the source venv's absolute shebang.  ``--upgrade`` is
-        insufficient when the requested distribution is already satisfied, so
-        that state requires a forced reinstall.  If a repair crashes before
-        the atomic manifest replacement, the old/missing stamp safely causes
-        the same repair to be retried on restart.
+        A console entry point is the only launched artifact whose generated
+        wrapper normally embeds the venv's absolute path. Module callables use
+        the current venv interpreter directly and need no reinstall after a
+        directory rename. Only a positively observed foreign absolute shebang
+        proves relocation when no Core path stamp exists.
         """
 
-        manifest = self._read_provision_manifest()
+        if self._bin_path is not None:
+            return "not-applicable"
+        service = self.runtime.service
+        if type(service) is not str or not service or ":" in service:
+            return "not-applicable"
         assert self._venv_path is not None
-        if manifest.get("venv_path") != str(self._venv_path.resolve()):
+        script = _venv_bin_dir(self._venv_path) / service
+        if _secure_dirfd_supported():
+            bin_fd: Optional[int] = None
+            script_fd: Optional[int] = None
+            try:
+                bin_fd = os.open(
+                    _venv_bin_dir(self._venv_path),
+                    _directory_open_flags(),
+                )
+                metadata = os.stat(service, dir_fd=bin_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return "missing"
+                script_fd = os.open(
+                    service,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=bin_fd,
+                )
+                if not _same_file_identity(metadata, os.fstat(script_fd)):
+                    return "missing"
+                prefix = os.read(script_fd, 8192)
+            except OSError:
+                return "missing"
+            finally:
+                if script_fd is not None:
+                    os.close(script_fd)
+                if bin_fd is not None:
+                    os.close(bin_fd)
+        else:  # pragma: no cover - portable fallback
+            try:
+                metadata = script.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return "missing"
+                with script.open("rb") as stream:
+                    prefix = stream.read(8192)
+            except OSError:
+                return "missing"
+        # Console generators embed the lexical venv interpreter path even when
+        # ``bin/python`` is itself a symlink to a base interpreter. Resolving
+        # that final symlink would falsely classify every repaired uv venv as
+        # stale on the next boot.
+        current_python = os.fsencode(str(_venv_python(self._venv_path)))
+        if current_python in prefix:
+            return "current"
+        first_line = prefix.splitlines()[0] if prefix else b""
+        if first_line.startswith(b"#!"):
+            interpreter = first_line[2:].strip().split(maxsplit=1)[0]
+            if interpreter == b"/usr/bin/env":
+                return "current"
+            if interpreter.startswith(b"/"):
+                return "relocated"
+        # Windows launchers and nonstandard wrappers cannot be safely inferred
+        # from an absent text path. A rename observed by Core below remains
+        # sufficient evidence to repair them conservatively.
+        return "missing"
+
+    def _location_requires_forced_reinstall(
+        self,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        assert self._venv_path is not None
+        current_path = str(self._venv_path.resolve())
+        stamped_path = manifest.get("venv_path")
+        stamped_relocation = (
+            type(stamped_path) is str
+            and bool(stamped_path)
+            and stamped_path != current_path
+        )
+        location_state = self._console_script_location_state()
+        relocation_proven = (
+            self._venv_relocated_this_startup
+            or stamped_relocation
+            or location_state == "relocated"
+        )
+        return relocation_proven and location_state in {"relocated", "missing"}
+
+    def _provision_status(
+        self,
+        install_target: str,
+        manifest: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, bool]:
+        """Return ``(stale, force_reinstall)`` for a Core-owned venv.
+
+        A location mismatch or an observed foreign shebang proves that an
+        entry-point script may still contain the source venv's interpreter.
+        A missing stamp alone is legacy metadata, not relocation evidence. If
+        a repair crashes before the atomic manifest replacement, either the old
+        stamp or the stale wrapper itself causes the repair to be retried.
+        """
+
+        if manifest is None:
+            manifest = self._read_provision_manifest()
+        assert self._venv_path is not None
+        if self._location_requires_forced_reinstall(manifest):
             return True, True
         return self._provision_is_stale_from_manifest(install_target, manifest), False
+
+    def _adopt_verified_unstamped_venv(
+        self,
+        install_target: str,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        """Stamp an already-usable Core venv without contacting an index.
+
+        This path applies only when the location stamp is absent or obsolete
+        and no stale console wrapper requires repair. Positive child probes
+        replace the missing historical stamp; a changed recorded install target
+        still takes the ordinary provisioning path.
+        """
+
+        assert self._venv_path is not None
+        current_path = str(self._venv_path.resolve())
+        if manifest.get("venv_path") == current_path:
+            return False
+        recorded_target = manifest.get("install_target")
+        if recorded_target is not None and recorded_target != install_target:
+            return False
+        if self._console_script_location_state() in {"relocated", "missing"}:
+            return False
+        desired = _feature_distribution_version(
+            self.runtime.distribution,
+            install_target,
+        )
+        child = self._probe_feature_distribution(_venv_python(self._venv_path))
+        if not child.is_present:
+            return False
+        if desired != "unknown" and (
+            child.state != "versioned" or child.version != desired
+        ):
+            return False
+        host_sdk = _host_sdk_version()
+        child_sdk = self._probe_sdk_version(_venv_python(self._venv_path))
+        self._warn_on_sdk_mismatch(
+            _venv_python(self._venv_path),
+            host_sdk=host_sdk,
+            child_sdk=child_sdk,
+        )
+        self._write_provision_manifest(
+            install_target,
+            host_sdk,
+            child_sdk,
+            desired,
+            child,
+        )
+        return True
 
     def _provision_is_stale(self, install_target: str) -> bool:
         """Return whether this host-owned venv must be reprovisioned.
@@ -9394,8 +9567,21 @@ class ProxyFeature(Feature):
                 ["uv", "venv", str(self._venv_path)]
             )
         else:
-            stale, force_reinstall = self._provision_status(install_target)
+            manifest = self._read_provision_manifest()
+            stale, force_reinstall = self._provision_status(
+                install_target,
+                manifest,
+            )
             if not stale:
+                if manifest.get("venv_path") != str(self._venv_path.resolve()):
+                    updated = dict(manifest)
+                    updated["venv_path"] = str(self._venv_path.resolve())
+                    self._write_provision_manifest_payload(updated)
+                return
+            if not force_reinstall and self._adopt_verified_unstamped_venv(
+                install_target,
+                manifest,
+            ):
                 return
 
         # Fresh venv, changed install target, or host SDK upgraded since the

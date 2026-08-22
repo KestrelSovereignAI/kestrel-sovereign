@@ -29,6 +29,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.multi_agent.agent_manager import (
+    RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
     public_exception_type_name,
 )
@@ -102,7 +103,13 @@ def _grouped_runtime_retained_detail(
         for candidate in leaves
         if isinstance(candidate, RuntimeOffboardingRetainedError)
     ]
-    if not retained:
+    not_performed = [
+        candidate
+        for candidate in leaves
+        if isinstance(candidate, RuntimeOffboardingNotPerformedError)
+    ]
+    custody_outcomes = [*retained, *not_performed]
+    if not custody_outcomes:
         return None
     # Never turn process-control exceptions into an HTTP response. A grouped
     # CancelledError is an expected manager terminal outcome, but an actively
@@ -113,7 +120,7 @@ def _grouped_runtime_retained_detail(
     ):
         return None
 
-    detail: Dict[str, object] = dict(retained[0].metadata)
+    detail: Dict[str, object] = dict(custody_outcomes[0].metadata)
     retained_agents = sorted(
         {
             str(candidate.metadata["agent"])
@@ -122,26 +129,38 @@ def _grouped_runtime_retained_detail(
         },
         key=str.casefold,
     )
+    not_performed_agents = sorted(
+        {
+            str(candidate.metadata["agent"])
+            for candidate in not_performed
+            if type(candidate.metadata.get("agent")) is str
+        },
+        key=str.casefold,
+    )
     cleanup_states = {
         str(candidate.metadata.get("runtime_cleanup_state", "retained"))
-        for candidate in retained
+        for candidate in custody_outcomes
     }
     cleanup_pending = "pending" in cleanup_states
     if cleanup_pending and cleanup_states != {"pending"}:
         cleanup_state = "mixed"
     elif cleanup_pending:
         cleanup_state = "pending"
+    elif len(cleanup_states) == 1:
+        cleanup_state = next(iter(cleanup_states))
     else:
-        cleanup_state = "retained"
-    retained_identities = {id(candidate) for candidate in retained}
+        cleanup_state = "mixed"
+    custody_identities = {id(candidate) for candidate in custody_outcomes}
     additional = [
-        candidate for candidate in leaves if id(candidate) not in retained_identities
+        candidate for candidate in leaves if id(candidate) not in custody_identities
     ]
     detail.update(
         {
             "compound_outcome": True,
             "retained_outcome_count": len(retained),
+            "not_performed_outcome_count": len(not_performed),
             "retained_agents": retained_agents,
+            "not_performed_agents": not_performed_agents,
             "runtime_cleanup_pending": cleanup_pending,
             "runtime_cleanup_state": cleanup_state,
             "additional_outcome_count": len(additional),
@@ -574,6 +593,15 @@ async def delete_agent(
         # nor a generic server failure. Return an explicit custody outcome
         # (pending or retained) without inviting a retry against a dead route.
         raise HTTPException(status_code=409, detail=exc.metadata)
+    except RuntimeOffboardingNotPerformedError as exc:
+        # The agent is gone, but destructive intent did not remove a tree.
+        # Preserve the precise no-op state instead of returning a false 200.
+        detail = dict(exc.metadata)
+        detail["persisted_registration_removed"] = bool(
+            registration_rollback is not None
+            and registration_rollback[2] is not None
+        )
+        raise HTTPException(status_code=409, detail=detail)
     except BaseExceptionGroup as exc:
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling():
