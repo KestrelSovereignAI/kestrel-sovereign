@@ -3633,8 +3633,13 @@ async def health_detailed(request: Request):
                 "scheduler_readiness_failures": scheduler_failures,
             }
         )
-        return JSONResponse(status_code=503, content=content)
-    return content
+        return JSONResponse(
+            status_code=503,
+            content=_with_host_feature_rejections(request.app.state, content),
+        )
+    # Host features start independently of agent availability, so "no agent"
+    # must still name a refused host feature rather than drop the diagnostic.
+    return _with_host_feature_rejections(request.app.state, content)
 
 
 def _enforce_host_csrf(request: Request):

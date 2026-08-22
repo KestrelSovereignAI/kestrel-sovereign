@@ -234,3 +234,46 @@ async def test_host_stop_removes_fixture_routes_ui_and_declarations():
         assert client.get("/api/host-fixture/fixture").status_code == 404
         assert app.state.host_ui_manifest == []
         _assert_live(ctx, feature, False)
+
+
+@pytest.mark.asyncio
+async def test_a_later_start_does_not_erase_an_earlier_rejection():
+    """Incremental starts are supported, so a second call must not blank the first.
+
+    `start_host_features` may be called repeatedly against one context — that is
+    what `previously_started` exists for. Assigning the rejection list made
+    health stop reporting a still-refused feature the moment a later, unrelated
+    feature started cleanly: the diagnostic vanishing on someone else's success
+    (#2951).
+    """
+    import dataclasses
+
+    from kestrel_sdk.signals import Trust
+
+    ctx = SovereignHostContext()
+    # An empty start primes the contribution runtime (and so `ctx.signal_registry`)
+    # through the public path rather than reaching for the internals.
+    await start_host_features([], ctx)
+
+    refused = SDKFixtureHostFeature()
+    other_trust = (
+        Trust.UNTRUSTED if refused.source.trust is Trust.TRUSTED else Trust.TRUSTED
+    )
+    ctx.signal_registry.register(
+        dataclasses.replace(refused.source, trust=other_trust)
+    )
+
+    await start_host_features([refused], ctx)
+    after_first = tuple(ctx.rejected_host_feature_contributions)
+    assert len(after_first) == 1                      # the premise: it WAS refused
+    assert refused.source.name in after_first[0].reason
+
+    class _PeerHostFeature(SDKFixtureHostFeature):
+        contribution_prefix = "peer-host"
+
+    # A LATER, unrelated start succeeds...
+    peer = _PeerHostFeature()
+    await start_host_features([peer], ctx)
+
+    # ...and the earlier, still-unresolved rejection is still reported, intact.
+    assert tuple(ctx.rejected_host_feature_contributions) == after_first

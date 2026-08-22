@@ -10,6 +10,7 @@ from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import FeaturePackageInfo, FeatureStatus
 from kestrel_sovereign.features.contribution_runtime import (
     PreparedFeatureContributions,
+    PreparedTransition,
 )
 from kestrel_sovereign.ui_capabilities import (
     compute_feature_capabilities,
@@ -72,7 +73,9 @@ def _make_agent(features=None):
         )
         prepared_by_feature.clear()
         prepared_by_feature.update({id(item.feature): item for item in prepared})
-        return prepared
+        # The real method returns a PreparedTransition, not a tuple: the double
+        # has to carry the same envelope or it tests the double (#2951).
+        return PreparedTransition(accepted=prepared)
 
     async def _unregister_feature_runtime(feature, *, unload=False):
         await feature.on_disable()

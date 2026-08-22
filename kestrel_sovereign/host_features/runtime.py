@@ -188,7 +188,17 @@ async def start_host_features(
             rejection.feature_name,
             rejection.reason,
         )
-    ctx.rejected_host_feature_contributions = transition.rejected
+    # Merged, not overwritten. Repeated calls against one context are
+    # supported (`previously_started`), and a plain assignment made health stop
+    # reporting feature A the moment a later call started feature B cleanly.
+    # A prior rejection is superseded only for a feature THIS call carried —
+    # its verdict now comes from this transition (#2951).
+    retried = {id(feature) for feature in features}
+    ctx.rejected_host_feature_contributions = tuple(
+        rejection
+        for rejection in getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+        if id(rejection.feature) not in retried
+    ) + tuple(transition.rejected)
     previously_started = tuple(getattr(ctx, "started_host_features", ()))
     started: List[HostFeature] = []
     for feature, prepared_item in transition.activatable(features):
