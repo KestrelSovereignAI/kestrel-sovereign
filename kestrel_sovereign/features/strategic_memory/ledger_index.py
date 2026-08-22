@@ -320,6 +320,67 @@ async def _remove_orphans(
     return removed
 
 
+#: The status :func:`_pattern_properties` / :func:`_blocker_properties` project
+#: for a row the canonical file still holds. Named once so the recall consumers
+#: filter on the same vocabulary the projection writes — a reader that invents
+#: its own spelling silently returns everything, or nothing.
+ACTIVE_STATUS = "active"
+
+
+async def recall_nodes(
+    graph_store: Any,
+    agent_id: str,
+    node_type: str,
+    *,
+    include_retired: bool = False,
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    """Read projected ledger rows back out of the graph.
+
+    This is the consumer half of the projection, and it exists because a
+    derived index nothing reads is not an index — it is a write nobody
+    checked. The tools in :mod:`feature` call it instead of reading the YAML
+    they already hold, so the graph path is the one actually exercised: an
+    index that stops populating fails a query here rather than going unnoticed
+    until someone opens the database.
+
+    Every predicate is an exact equality and therefore goes into SQL, not into
+    a loop over the result. Post-filtering a ``LIMIT``-ed page under-reports:
+    ask for 25 active patterns when the 25 most recent rows all happen to be
+    superseded and the honest-looking answer is zero, with a hundred active
+    rows sitting just past the page boundary. Pushing the predicates down makes
+    the limit mean what the caller asked for, and lets the JSON-path partial
+    indexes do the work.
+
+    Raises rather than returning ``[]`` when the graph cannot be queried. An
+    empty list is an answer ("no such rows"); a failure is not, and the whole
+    ticket exists because a truthful-looking zero was returned for a question
+    with a non-empty answer.
+    """
+    if graph_store is None:
+        raise RuntimeError("Graph store not available")
+
+    # ``source`` keeps a hand-written node of the same type out of an answer
+    # that claims to describe the ledger; ``agent_id`` is the tenant boundary.
+    filters: Dict[str, Any] = {
+        "agent_id": agent_id,
+        "source": _PROJECTION_SOURCE,
+    }
+    if not include_retired:
+        filters["status"] = ACTIVE_STATUS
+
+    nodes = await graph_store.query_nodes_by_type_and_property(
+        node_type,
+        filters=filters,
+        order_by_created=True,
+        limit=max(1, int(limit)),
+    )
+    return [
+        {"node_id": node.node_id, "label": node.label, **(node.properties or {})}
+        for node in (nodes or [])
+    ]
+
+
 def search_rows(
     ledger_data: Dict[str, Any],
     query: str,

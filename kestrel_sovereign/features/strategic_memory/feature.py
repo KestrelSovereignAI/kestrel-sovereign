@@ -19,6 +19,7 @@ This feature also provides !strategy commands for querying and updating
 strategic context at runtime.
 """
 
+import copy
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -45,7 +46,13 @@ from .ledger import (
     has_ledger_sections,
     strip_ledger_sections,
 )
-from .ledger_index import project_ledger, search_rows
+from .ledger_index import (
+    BLOCKER_NODE_TYPE,
+    PATTERN_NODE_TYPE,
+    project_ledger,
+    recall_nodes,
+    search_rows,
+)
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
 
@@ -201,8 +208,18 @@ class StrategicMemoryFeature(Feature):
                         f"StrategicMemoryFeature loaded: {len(self._data)} top-level keys"
                     )
                 else:
-                    # Create default template so the agent can start capturing strategy
-                    self._data = dict(self._DEFAULT_TEMPLATE)
+                    # Create default template so the agent can start capturing
+                    # strategy. deepcopy, not dict(): a shallow copy shares the
+                    # class-level ``milestones``/``stakeholders``/``decisions``
+                    # LIST OBJECTS with every other instance in the process, so
+                    # ``strategy_add_decision`` appended into the template
+                    # itself. On a multi-agent host the next agent created was
+                    # then born holding the previous agent's decisions, and
+                    # ``_save()`` wrote them into its brand-new STRATEGY.yaml --
+                    # one agent's strategic record leaking into another's, on
+                    # disk. Noticed while adding the index consumers (#2954);
+                    # the bug predates them.
+                    self._data = copy.deepcopy(self._DEFAULT_TEMPLATE)
                     self._save()
                     if self._strategy_path.exists():
                         logger.info(
@@ -613,7 +630,37 @@ class StrategicMemoryFeature(Feature):
                 data={"section": section},
             )
         section = normalized_section
+        if not self._ledger.readable and section in ("blockers", "patterns"):
+            # These two sections are the ledger, entirely. Rendering them from
+            # an unread file would print an empty list under a heading that
+            # claims to be the record.
+            return self._ledger_unreadable_result({"section": section})
         body = renderer()
+        if not self._ledger.readable and section == "all":
+            # ``all`` still has a genuine brief to show -- vision, milestones,
+            # stakeholders and decisions come from STRATEGY.yaml, which is a
+            # separate file and is fine. Refusing the whole view would let a
+            # broken ledger take down a working brief, the mirror of the rule
+            # that a broken brief must not take down the ledger. So it renders,
+            # and says plainly which part of it is missing rather than showing
+            # an empty Blockers heading and letting the reader assume zero.
+            #
+            # Only ``all``: the single-section views above draw nothing from
+            # the ledger, so caveating ``!strategy vision`` with "patterns and
+            # blockers are missing" would report a loss that view never had.
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"Patterns and blockers are missing from this view: "
+                    f"{self._ledger.load_error}. Every other section is "
+                    "complete."
+                ),
+                data={
+                    "section": section,
+                    "body": body,
+                    "ledger_unavailable": True,
+                },
+            )
         return ToolResult.ok(
             confirmation=body,
             data={"section": section, "body": body},
@@ -741,6 +788,13 @@ class StrategicMemoryFeature(Feature):
             source: Where this was observed
             implication: What this means for future work
         """
+        if not self._ledger.readable:
+            # Refuse before mutating, not after. ``_persisted_ledger_result``
+            # would catch the write, but the row would already be sitting in
+            # the in-memory ledger, where ``strategy_search`` and
+            # ``strategy_view`` would show it as recorded -- a row that exists
+            # nowhere on disk and vanishes on restart.
+            return self._ledger_unreadable_result({"recorded": False})
         entry = self._ledger.add_pattern(
             pattern=pattern, source=source, implication=implication
         )
@@ -771,6 +825,14 @@ class StrategicMemoryFeature(Feature):
             reason: Why the pattern no longer holds
             superseded_by: Optional id of the pattern that replaces it
         """
+        if not self._ledger.readable:
+            # Without this the lookup below runs against the empty default
+            # ledger and returns "No pattern found with id" -- a false negative
+            # that reads as "you never recorded that", when the truth is that
+            # the file holding it could not be read.
+            return self._ledger_unreadable_result(
+                {"pattern_id": pattern_id, "superseded": False}
+            )
         key, row = self._ledger.find(pattern_id)
         if row is None or key != PATTERNS_KEY:
             return ToolResult.failed(
@@ -823,6 +885,13 @@ class StrategicMemoryFeature(Feature):
             issue: The blocker row id, or the issue number/identifier
             resolution: Optional note describing how it was resolved
         """
+        if not self._ledger.readable:
+            # Same false negative as strategy_supersede_pattern: an empty
+            # in-memory ledger answers "no blocker found with issue X" for a
+            # blocker that is sitting in the file, unread.
+            return self._ledger_unreadable_result(
+                {"issue": issue, "removed_count": 0}
+            )
         matches = self._ledger.blockers_matching(issue)
         if not matches:
             return ToolResult.failed(
@@ -899,6 +968,13 @@ class StrategicMemoryFeature(Feature):
             return ToolResult.failed(
                 "strategy_search needs a non-empty query.", data={"query": query}
             )
+        if not self._ledger.readable:
+            # "No ledger matches" from an unread ledger is the exact shape of
+            # the defect this ticket was filed on: a truthful-looking zero for
+            # a question whose real answer is non-empty.
+            return self._ledger_unreadable_result(
+                {"query": query, "kind": kind, "matches": [], "count": 0}
+            )
 
         matches = search_rows(self._ledger.data, query, kind=kind, limit=limit)
         if not matches:
@@ -936,6 +1012,160 @@ class StrategicMemoryFeature(Feature):
             },
         )
 
+    # ------------------------------------------------------------------
+    # Tools: reading the projected index back out of the graph
+    # ------------------------------------------------------------------
+
+    async def _recall_ledger(
+        self,
+        node_type: str,
+        noun: str,
+        limit: Any,
+        include_retired: bool,
+        include_flag_name: str,
+        canonical_rows: List[Dict[str, Any]],
+    ) -> ToolResult:
+        """Shared body for :meth:`recall_patterns` / :meth:`recall_blockers`.
+
+        Reads the GRAPH, deliberately, rather than the ledger this feature
+        already holds in memory. A derived index nothing queries is a write
+        nobody checked: #2851 shipped a decision projection whose only
+        consumer was itself, and the gap was invisible because every reader
+        went to YAML. Routing these two tools through the index means a
+        projection that stops working fails a query instead of going quiet.
+        """
+        if not isinstance(include_retired, bool):
+            return ToolResult.failed(
+                f"{include_flag_name} must be a boolean, got "
+                f"{type(include_retired).__name__}={include_retired!r}"
+            )
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1 or limit_val > 200:
+            return ToolResult.failed(
+                f"limit must be between 1 and 200, got {limit_val}"
+            )
+
+        agent_id = self._projection_agent_id()
+        if not agent_id:
+            return ToolResult.failed(
+                "Agent exposes no agent_id/did/id, so the strategy index "
+                "cannot be scoped to this agent -- refusing rather than "
+                "returning another agent's rows or a misleading empty list."
+            )
+        storage = getattr(self.agent, "storage", None)
+        graph_store = getattr(storage, "graph", None) if storage else None
+        try:
+            rows = await recall_nodes(
+                graph_store,
+                agent_id,
+                node_type,
+                include_retired=include_retired,
+                limit=limit_val,
+            )
+        except Exception as e:  # noqa: BLE001
+            # A query failure is not an empty result. Reporting zero here is
+            # the precise lie this ticket was filed on.
+            logger.error("strategy index recall failed for %s: %s", node_type, e)
+            return ToolResult.failed(
+                f"Could not read the strategy index: {e}",
+                data={"node_type": node_type, "count": 0},
+            )
+
+        data = {
+            "count": len(rows),
+            "limit_requested": limit_val,
+            include_flag_name: include_retired,
+            noun: rows,
+        }
+        confirmation = (
+            f"Retrieved {len(rows)} {noun[:-1] if len(rows) == 1 else noun} "
+            f"from the strategy index (limit requested: {limit_val})"
+        )
+        if rows or not self._ledger.readable:
+            # An unreadable ledger gives no trustworthy count to compare
+            # against, so the divergence check below has nothing to say.
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        # Zero rows from the index while the canonical file holds some is not
+        # an answer, it is the index being absent. Saying "0" here would
+        # reproduce exactly what #2851 was filed on: recall_decisions returning
+        # a truthful zero while STRATEGY.yaml held the real ones.
+        canonical = len(canonical_rows)
+        if canonical:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"The strategy index holds no {noun}, but "
+                    f"{LEDGER_FILENAME} holds {canonical} active row(s). The "
+                    "index is stale or was never built -- restart the agent to "
+                    "reproject, and use strategy_search to read the canonical "
+                    "file meanwhile."
+                ),
+                data={**data, "canonical_active": canonical, "index_stale": True},
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @tool(
+        name="recall_patterns",
+        description=(
+            "Recall learned patterns from the strategy index (graph nodes of "
+            "type 'strategy_pattern'). Superseded patterns are excluded by "
+            "default; pass include_superseded=True to see them."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!patterns",
+    )
+    async def recall_patterns(
+        self, limit: int = 25, include_superseded: bool = False
+    ) -> ToolResult:
+        """
+        Recall learned patterns through the graph index.
+
+        Args:
+            limit: Maximum patterns to return (1-200, default 25)
+            include_superseded: Include patterns that have been retired
+        """
+        return await self._recall_ledger(
+            node_type=PATTERN_NODE_TYPE,
+            noun="patterns",
+            limit=limit,
+            include_retired=include_superseded,
+            include_flag_name="include_superseded",
+            canonical_rows=active_patterns(self._ledger.patterns),
+        )
+
+    @tool(
+        name="recall_blockers",
+        description=(
+            "Recall blockers from the strategy index (graph nodes of type "
+            "'strategy_blocker'). Resolved blockers are excluded by default; "
+            "pass include_resolved=True to see them."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!blockers",
+    )
+    async def recall_blockers(
+        self, limit: int = 25, include_resolved: bool = False
+    ) -> ToolResult:
+        """
+        Recall blockers through the graph index.
+
+        Args:
+            limit: Maximum blockers to return (1-200, default 25)
+            include_resolved: Include blockers that have been resolved
+        """
+        return await self._recall_ledger(
+            node_type=BLOCKER_NODE_TYPE,
+            noun="blockers",
+            limit=limit,
+            include_retired=include_resolved,
+            include_flag_name="include_resolved",
+            canonical_rows=active_blockers(self._ledger.blockers),
+        )
+
     @tool(
         name="strategy_reconcile_blockers",
         description=(
@@ -953,6 +1183,13 @@ class StrategicMemoryFeature(Feature):
         Args:
             apply: Set to 'yes' to resolve blockers whose issue is closed. Default 'no' (report only).
         """
+        if not self._ledger.readable:
+            # An unread ledger has no active blockers, so the reconcile would
+            # report "no active blockers to check" -- a clean bill of health
+            # for a check that never saw the rows.
+            return self._ledger_unreadable_result(
+                {"applied": False, "checked": 0, "closed_count": 0}
+            )
         report = await check_blockers(self._ledger.data, self._data)
         if not report.get("ran"):
             # The check never ran. Reporting "0 stale blockers" here would be

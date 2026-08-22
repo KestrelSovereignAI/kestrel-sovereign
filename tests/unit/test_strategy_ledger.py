@@ -18,6 +18,7 @@ graph projection rather than by injection, exactly as #2851 settled it for
 decisions.
 """
 
+import copy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,12 +58,13 @@ class _FakeGraph:
     production.
     """
 
-    def __init__(self, *, fail_on=None, fail_read_on=None):
+    def __init__(self, *, fail_on=None, fail_read_on=None, fail_query_on=None):
         self.nodes = {}
         self.writes = 0
         self.deleted = []
         self._fail_on = fail_on
         self._fail_read_on = fail_read_on
+        self._fail_query_on = fail_query_on
 
     async def get_node(self, node_id):
         if self._fail_read_on and self._fail_read_on in node_id:
@@ -92,6 +94,33 @@ class _FakeGraph:
             return NodeSwapResult.PREDICATE_FAILED
         current.properties = new_node.properties
         return NodeSwapResult.SWAPPED
+
+    async def query_nodes_by_type_and_property(
+        self, node_type, filters=None, *, created_since=None,
+        order_by_created=True, limit=200,
+    ):
+        """Mirrors AsyncGraphStore: equality filters, created_at DESC, limit.
+
+        ``TestRecallAgainstRealGraphStore`` below runs the same consumer
+        against the real store, so this double is a convenience rather than
+        the only thing the recall path is ever proven against.
+        """
+        if self._fail_query_on and self._fail_query_on in node_type:
+            raise RuntimeError("graph query refused")
+        rows = [n for n in self.nodes.values() if n.node_type == node_type]
+        for key, value in (filters or {}).items():
+            rows = [n for n in rows if (n.properties or {}).get(key) == value]
+        if created_since is not None:
+            rows = [
+                n for n in rows
+                if str((n.properties or {}).get("created_at") or "") >= created_since
+            ]
+        if order_by_created:
+            rows.sort(
+                key=lambda n: str((n.properties or {}).get("created_at") or ""),
+                reverse=True,
+            )
+        return rows[: max(1, min(int(limit), 10000))]
 
 
 async def _feature(tmp_path, *, graph=None, strategy=None):
@@ -919,3 +948,576 @@ class TestUnreadableLedgerCannotDeleteTheIndex:
 
         assert report["removed"] == 1
         assert len(graph.nodes) == 1
+
+
+class TestTheIndexHasAConsumer:
+    """The projection is read back through the graph, not through the file.
+
+    #2851 shipped a decision projection whose only consumer was itself, and the
+    gap stayed invisible because every reader went to YAML. #3051 scopes the
+    fix for patterns and blockers to exactly this: a structural consumer that
+    queries the projected node types. Without one, "reachable by query" is a
+    claim about a write nobody checked.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recall_patterns_reads_the_graph_not_the_ledger(self, tmp_path):
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(
+            pattern="reviews stall on ambiguous ownership",
+            implication="name an owner per row",
+        )
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        row = result.data["patterns"][0]
+        assert row["text"] == "reviews stall on ambiguous ownership"
+        assert row["implication"] == "name an owner per row"
+        # Proves the answer came through the projection: node_id is the graph's
+        # address, and nothing in the YAML row carries it.
+        assert row["node_id"].startswith(f"{PATTERN_NODE_TYPE}:{AGENT}:")
+
+    @pytest.mark.asyncio
+    async def test_recall_reads_the_index_even_when_the_file_is_gone(self, tmp_path):
+        """The index is a genuine second copy, not a view over the loaded file."""
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a durable observation")
+        graph = feature.agent.storage.graph
+
+        # Empty the in-memory ledger. A reader that had been going to YAML all
+        # along would now report zero.
+        feature._ledger.data[PATTERNS_KEY] = []
+
+        result = await feature.recall_patterns()
+        assert result.data["count"] == 1
+        assert result.data["patterns"][0]["text"] == "a durable observation"
+        # Count the pattern nodes specifically. ``len(graph.nodes)`` would also
+        # count decision and blocker nodes, which is a different claim than the
+        # one this test is making.
+        pattern_nodes = [
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        ]
+        assert len(pattern_nodes) == 1
+
+    @pytest.mark.asyncio
+    async def test_recall_blockers_reads_the_graph(self, tmp_path):
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="owner/repo#42", title="CI runner is wedged", severity="high"
+        )
+
+        result = await feature.recall_blockers()
+
+        assert result.data["count"] == 1
+        row = result.data["blockers"][0]
+        assert row["text"] == "CI runner is wedged"
+        assert row["issue"] == "owner/repo#42"
+        assert row["severity"] == "high"
+        assert row["node_id"].startswith(f"{BLOCKER_NODE_TYPE}:{AGENT}:")
+
+    @pytest.mark.asyncio
+    async def test_superseded_patterns_are_excluded_by_default(self, tmp_path):
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="held once, not now")
+        pattern_id = added.data["pattern_id"]
+        await feature.strategy_supersede_pattern(
+            pattern_id=pattern_id, reason="measured again"
+        )
+
+        active = await feature.recall_patterns()
+        assert active.data["count"] == 0
+
+        everything = await feature.recall_patterns(include_superseded=True)
+        assert everything.data["count"] == 1
+        assert everything.data["patterns"][0]["status"] == "superseded"
+
+    @pytest.mark.asyncio
+    async def test_resolved_blockers_are_excluded_by_default(self, tmp_path):
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_blocker(issue="#7", title="waiting on infra")
+        await feature.strategy_resolve_blocker(
+            issue=added.data["blocker_id"], resolution="infra landed"
+        )
+
+        active = await feature.recall_blockers()
+        assert active.data["count"] == 0
+
+        everything = await feature.recall_blockers(include_resolved=True)
+        assert everything.data["count"] == 1
+        assert everything.data["blockers"][0]["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_a_query_failure_is_not_reported_as_zero(self, tmp_path):
+        """The defect the whole ticket was filed on, in its smallest form."""
+        graph = _FakeGraph(fail_query_on=PATTERN_NODE_TYPE)
+        feature = await _feature(tmp_path, graph=graph)
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "error"
+        assert "could not read the strategy index" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_index_over_a_populated_ledger_is_not_a_clean_zero(
+        self, tmp_path
+    ):
+        """recall_decisions returned a truthful 0 while YAML held the real ones.
+
+        That is the shape #2851 was filed on. Here the same divergence is
+        reported instead of being rendered as an answer.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="canonical but unindexed")
+        # Lose the index without touching the canonical file — a database
+        # restore from before the projection, or a projection that never ran.
+        feature.agent.storage.graph.nodes.clear()
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert result.data["count"] == 0
+        assert result.data["canonical_active"] == 1
+        assert result.data["index_stale"] is True
+        assert "stale or was never built" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_ledger_recalls_cleanly(self, tmp_path):
+        """The divergence check must not make an empty agent look broken."""
+        feature = await _feature(tmp_path)
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 0
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_recall_refuses_without_an_agent_identity(self, tmp_path):
+        """Scoping is the tenancy boundary; unscoped is a refusal, not a list."""
+        feature = await _feature(tmp_path)
+        for attribute in ("agent_id", "did", "id"):
+            setattr(feature.agent, attribute, None)
+
+        result = await feature.recall_blockers()
+
+        assert result.status.value == "error"
+        assert "agent_id" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_recall_does_not_return_a_foreign_agents_rows(self, tmp_path):
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="mine")
+        graph = feature.agent.storage.graph
+        graph.nodes["strategy_pattern:did:other:x"] = GraphNode(
+            node_id="strategy_pattern:did:other:x",
+            node_type=PATTERN_NODE_TYPE,
+            label="theirs",
+            properties={
+                "agent_id": "did:test:someone-else",
+                "text": "theirs",
+                "status": "active",
+                "source": "strategic_memory",
+            },
+        )
+
+        result = await feature.recall_patterns()
+
+        assert [r["text"] for r in result.data["patterns"]] == ["mine"]
+
+    @pytest.mark.asyncio
+    async def test_recall_ignores_a_node_this_projection_did_not_write(self, tmp_path):
+        """A same-typed node from elsewhere is not part of the ledger's answer."""
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="projected")
+        graph = feature.agent.storage.graph
+        graph.nodes["strategy_pattern:handwritten"] = GraphNode(
+            node_id="strategy_pattern:handwritten",
+            node_type=PATTERN_NODE_TYPE,
+            label="hand-written",
+            properties={
+                "agent_id": AGENT,
+                "text": "hand-written",
+                "status": "active",
+                "source": "somewhere_else",
+            },
+        )
+
+        result = await feature.recall_patterns()
+
+        assert [r["text"] for r in result.data["patterns"]] == ["projected"]
+
+    @pytest.mark.asyncio
+    async def test_limit_is_validated_not_silently_clamped(self, tmp_path):
+        feature = await _feature(tmp_path)
+
+        assert (await feature.recall_patterns(limit="ten")).status.value == "error"
+        assert (await feature.recall_patterns(limit=0)).status.value == "error"
+        assert (await feature.recall_patterns(limit=201)).status.value == "error"
+        assert (
+            await feature.recall_patterns(include_superseded="yes")
+        ).status.value == "error"
+
+    @pytest.mark.asyncio
+    async def test_limit_bounds_the_returned_rows(self, tmp_path):
+        feature = await _feature(tmp_path)
+        for n in range(4):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+
+        result = await feature.recall_patterns(limit=2)
+
+        assert result.data["count"] == 2
+        assert result.data["limit_requested"] == 2
+
+
+class TestRecallAgainstRealGraphStore:
+    """The consumer, proven against AsyncGraphStore on real SQLite.
+
+    The double above mirrors the production query, but a double is only ever
+    evidence about itself. These run the same projection and the same recall
+    through the real store so the JSON-path filtering, ordering and scoping are
+    the ones production actually applies.
+    """
+
+    @pytest.mark.asyncio
+    async def test_projected_rows_are_recallable_from_a_real_store(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            graph = AsyncGraphStore(database)
+            feature = await _feature(tmp_path, graph=graph)
+
+            await feature.strategy_add_pattern(
+                pattern="the double is not the store",
+                implication="prove the consumer against production",
+            )
+            await feature.strategy_add_blocker(
+                issue="#11", title="blocked on a real query", severity="critical"
+            )
+
+            patterns = await feature.recall_patterns()
+            assert patterns.status.value == "ok"
+            assert patterns.data["count"] == 1
+            assert patterns.data["patterns"][0]["text"] == "the double is not the store"
+
+            blockers = await feature.recall_blockers()
+            assert blockers.status.value == "ok"
+            assert blockers.data["count"] == 1
+            assert blockers.data["blockers"][0]["issue"] == "#11"
+            assert blockers.data["blockers"][0]["severity"] == "critical"
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
+    async def test_supersession_reaches_the_real_index(self, tmp_path):
+        """Retiring a row in YAML must remove it from the real query's answer."""
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            graph = AsyncGraphStore(database)
+            feature = await _feature(tmp_path, graph=graph)
+            added = await feature.strategy_add_pattern(pattern="true until it wasn't")
+
+            await feature.strategy_supersede_pattern(
+                pattern_id=added.data["pattern_id"], reason="re-measured"
+            )
+
+            assert (await feature.recall_patterns()).data["count"] == 0
+            everything = await feature.recall_patterns(include_superseded=True)
+            assert everything.data["count"] == 1
+            assert everything.data["patterns"][0]["status"] == "superseded"
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
+    async def test_a_real_store_scopes_recall_to_this_agent(self, tmp_path):
+        """The agent filter is pushed into SQL; prove it there, not in a double."""
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import (
+            AsyncGraphStore,
+            GraphNode,
+        )
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            graph = AsyncGraphStore(database)
+            feature = await _feature(tmp_path, graph=graph)
+            await feature.strategy_add_pattern(pattern="mine")
+
+            await graph.add_node(GraphNode(
+                node_id="strategy_pattern:did:test:stranger:z",
+                node_type=PATTERN_NODE_TYPE,
+                label="theirs",
+                properties={
+                    "agent_id": "did:test:stranger",
+                    "text": "theirs",
+                    "status": "active",
+                    "source": "strategic_memory",
+                },
+            ))
+
+            result = await feature.recall_patterns()
+            assert [r["text"] for r in result.data["patterns"]] == ["mine"]
+        finally:
+            await database.close()
+
+
+class TestUnreadableLedgerRefusesEveryToolThatTouchesIt:
+    """Fail closed, and say which failure it is.
+
+    An empty in-memory ledger answers "no patterns", "no blocker found with
+    issue X", "no matches" — all of them truthful about the object in memory
+    and all of them false about the agent's record. The reviewer's rule: every
+    reader and mutator refuses before inspecting or modifying ``ledger.data``.
+    """
+
+    @staticmethod
+    async def _broken(tmp_path):
+        (tmp_path / LEDGER_FILENAME).write_text(
+            "patterns_learned: [unclosed\n", encoding="utf-8"
+        )
+        feature = await _feature(tmp_path)
+        assert not feature._ledger.readable
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_add_pattern_does_not_mutate_before_refusing(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        result = await feature.strategy_add_pattern(pattern="would be phantom")
+
+        assert result.status.value == "error"
+        assert result.data["ledger_unavailable"] is True
+        # The row must not be sitting in memory looking recorded.
+        assert feature._ledger.data.get(PATTERNS_KEY, []) == []
+
+    @pytest.mark.asyncio
+    async def test_search_refuses_rather_than_reporting_no_matches(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        result = await feature.strategy_search(query="anything")
+
+        assert result.status.value == "error"
+        assert result.data["ledger_unavailable"] is True
+
+    @pytest.mark.asyncio
+    async def test_supersede_refuses_rather_than_reporting_not_found(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        result = await feature.strategy_supersede_pattern(pattern_id="pat_abc")
+
+        assert result.status.value == "error"
+        assert result.data["ledger_unavailable"] is True
+        assert "no pattern found" not in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_refuses_rather_than_reporting_not_found(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        result = await feature.strategy_resolve_blocker(issue="#42")
+
+        assert result.status.value == "error"
+        assert result.data["ledger_unavailable"] is True
+        assert "no blocker found" not in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_refuses_rather_than_reporting_a_clean_bill(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        result = await feature.strategy_reconcile_blockers()
+
+        assert result.status.value == "error"
+        assert result.data["ledger_unavailable"] is True
+
+    @pytest.mark.asyncio
+    async def test_ledger_sections_of_the_view_refuse(self, tmp_path):
+        feature = await self._broken(tmp_path)
+
+        for section in ("patterns", "blockers"):
+            result = await feature.strategy_view(section=section)
+            assert result.status.value == "error", section
+            assert result.data["ledger_unavailable"] is True, section
+
+    @pytest.mark.asyncio
+    async def test_the_standing_brief_still_renders_with_a_caveat(self, tmp_path):
+        """A broken ledger must not take down a working STRATEGY.yaml.
+
+        The mirror of the rule the loader already follows in the other
+        direction. ``all`` renders what is genuine and names what is missing.
+        """
+        (tmp_path / LEDGER_FILENAME).write_text(
+            "patterns_learned: [unclosed\n", encoding="utf-8"
+        )
+        feature = await _feature(
+            tmp_path, strategy={"vision": "Ship the tortoise", "milestones": []}
+        )
+        assert not feature._ledger.readable
+
+        result = await feature.strategy_view(section="all")
+
+        assert result.status.value == "partial"
+        assert "Ship the tortoise" in result.confirmation
+        assert result.data["ledger_unavailable"] is True
+        assert "Patterns and blockers are missing" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_vision_is_unaffected_by_a_broken_ledger(self, tmp_path):
+        """A view that never held ledger content loses nothing, so says nothing.
+
+        Caveating ``!strategy vision`` with "patterns and blockers are missing"
+        would report a loss that view never had. Only ``all`` genuinely drops a
+        section it would otherwise have rendered.
+        """
+        feature = await self._broken(tmp_path)
+        feature._data["vision"] = "Still readable"
+
+        result = await feature.strategy_view(section="vision")
+
+        assert result.status.value == "ok"
+        assert "Still readable" in result.confirmation
+        assert "ledger_unavailable" not in (result.data or {})
+
+
+class TestTheDefaultTemplateIsNotSharedBetweenAgents:
+    """One agent's strategic record must not be born inside another's.
+
+    ``_data = dict(self._DEFAULT_TEMPLATE)`` was a shallow copy, so the
+    ``decisions`` / ``milestones`` / ``stakeholders`` lists were the SAME
+    objects on every instance in the process. ``strategy_add_decision``
+    appended into the class-level template, and the next agent created was
+    born holding them — then ``_save()`` wrote them to its own STRATEGY.yaml.
+
+    Found while adding the index consumers: a full-suite run projected four
+    graph nodes where one was expected, because earlier tests had been
+    appending into the shared list all along. The bug predates this ticket;
+    it is fixed here because it lives in this file and is one line.
+    """
+
+    @staticmethod
+    async def _fresh(tmp_path, name):
+        agent = MagicMock()
+        agent.agent_id = f"did:test:{name}"
+        agent.agent_data_dir = str(tmp_path / name)
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+        agent.storage = MagicMock()
+        agent.storage.graph = _FakeGraph()
+        feature = StrategicMemoryFeature(agent)
+        await feature.initialize()
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_a_decision_does_not_leak_into_the_next_agent(self, tmp_path):
+        first = await self._fresh(tmp_path, "agent_a")
+        await first.strategy_add_decision(
+            decision="Agent A private decision", rationale="its own reasons"
+        )
+
+        second = await self._fresh(tmp_path, "agent_b")
+
+        assert second._data.get("decisions") == [], (
+            "a second agent must not be born holding the first agent's decisions"
+        )
+        on_disk = _yaml.safe_load(
+            (tmp_path / "agent_b" / "STRATEGY.yaml").read_text(encoding="utf-8")
+        )
+        assert on_disk.get("decisions") == [], (
+            "and the leak must not have been written to its STRATEGY.yaml"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_class_level_template_is_never_mutated(self, tmp_path):
+        before = copy.deepcopy(StrategicMemoryFeature._DEFAULT_TEMPLATE)
+
+        feature = await self._fresh(tmp_path, "agent_c")
+        await feature.strategy_add_decision(decision="mutating?", rationale="r")
+        feature._data.setdefault("milestones", []).append({"name": "M1"})
+        feature._data.setdefault("stakeholders", []).append({"name": "S1"})
+
+        assert StrategicMemoryFeature._DEFAULT_TEMPLATE == before
+
+    @pytest.mark.asyncio
+    async def test_each_agent_gets_its_own_container_objects(self, tmp_path):
+        first = await self._fresh(tmp_path, "agent_d")
+        second = await self._fresh(tmp_path, "agent_e")
+
+        for key in ("milestones", "stakeholders", "decisions"):
+            assert first._data[key] is not second._data[key], key
+            assert (
+                first._data[key] is not StrategicMemoryFeature._DEFAULT_TEMPLATE[key]
+            ), key
+
+
+class TestRecallLimitIsNotUnderReported:
+    """A page of retired rows must not hide the active rows behind it.
+
+    Filtering status in Python after a ``LIMIT``-ed query means asking for 25
+    active patterns returns zero whenever the 25 most recent happen to be
+    superseded — an honest-looking count with a hundred active rows just past
+    the page boundary. The predicates are exact equalities, so they belong in
+    SQL where the limit can mean what the caller asked for.
+    """
+
+    @staticmethod
+    async def _with_retired_newest(tmp_path, graph):
+        feature = await _feature(tmp_path, graph=graph)
+        # Oldest first, so the superseded rows sort newest under created_at
+        # DESC and would occupy the whole first page.
+        added = []
+        for n in range(3):
+            r = await feature.strategy_add_pattern(pattern=f"still true {n}")
+            added.append(r.data["pattern_id"])
+        for n in range(3):
+            r = await feature.strategy_add_pattern(pattern=f"no longer true {n}")
+            await feature.strategy_supersede_pattern(
+                pattern_id=r.data["pattern_id"], reason="re-measured"
+            )
+        # recorded_at is a date, so force a strict ordering that puts the
+        # retired rows unambiguously newest.
+        for row in feature._ledger.patterns:
+            if row["pattern"].startswith("no longer"):
+                row["recorded_at"] = "2099-01-01"
+        feature._ledger.save()
+        await feature._reindex_ledger()
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_active_rows_survive_a_page_full_of_retired_ones(self, tmp_path):
+        feature = await self._with_retired_newest(tmp_path, _FakeGraph())
+
+        result = await feature.recall_patterns(limit=3)
+
+        assert result.data["count"] == 3, (
+            "three active patterns exist; a page of superseded rows must not "
+            "consume the limit"
+        )
+        assert all(
+            r["text"].startswith("still true") for r in result.data["patterns"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_holds_against_a_real_graph_store(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            feature = await self._with_retired_newest(
+                tmp_path, AsyncGraphStore(database)
+            )
+
+            result = await feature.recall_patterns(limit=3)
+
+            assert result.data["count"] == 3
+            assert all(
+                r["text"].startswith("still true") for r in result.data["patterns"]
+            )
+        finally:
+            await database.close()
