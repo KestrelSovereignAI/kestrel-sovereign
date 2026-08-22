@@ -18,6 +18,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     ChildTerminationReconciliationError,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
+    _uncommitted_spawn_not_hosted_cancellation,
 )
 from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -42,6 +43,40 @@ def _exception_leaves(error: BaseException) -> list[BaseException]:
             leaves.extend(_exception_leaves(nested))
         return leaves
     return [error]
+
+
+def test_uncommitted_spawn_not_hosted_classifier_is_narrow() -> None:
+    not_hosted = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="not_hosted",
+    )
+    already_absent = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="already_absent",
+    )
+
+    assert _uncommitted_spawn_not_hosted_cancellation(not_hosted) is False
+    assert (
+        _uncommitted_spawn_not_hosted_cancellation(
+            BaseExceptionGroup(
+                "cancelled storage-backed rollback",
+                [asyncio.CancelledError(), not_hosted],
+            )
+        )
+        is True
+    )
+    assert _uncommitted_spawn_not_hosted_cancellation(already_absent) is None
+    assert (
+        _uncommitted_spawn_not_hosted_cancellation(
+            ExceptionGroup(
+                "refund failure must survive",
+                [not_hosted, RuntimeError("refund failed")],
+            )
+        )
+        is None
+    )
 
 
 def _make_spawn_feature(parent_agent=None, manager=None):
@@ -1183,6 +1218,11 @@ class TestAgentManagerSpawn:
         )
         assert any(
             "rollback refund failed" in str(error)
+            for error in _exception_leaves(exc_info.value)
+        )
+        assert any(
+            isinstance(error, RuntimeOffboardingNotPerformedError)
+            and error.cleanup_state == "not_hosted"
             for error in _exception_leaves(exc_info.value)
         )
         assert manager.get_agent("helper") is None

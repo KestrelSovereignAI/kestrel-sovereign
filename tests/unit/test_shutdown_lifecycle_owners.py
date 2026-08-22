@@ -24,7 +24,6 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
-    RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
 )
 from kestrel_sovereign.spawn.delegated_wallet import (
@@ -2896,23 +2895,8 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
     assert not shutdown.done()
     allow_budget.set()
 
-    with pytest.raises(ExceptionGroup) as raised:
+    with pytest.raises(RuntimeError, match="Spawn was fenced"):
         await asyncio.wait_for(spawn, timeout=1.0)
-
-    def leaf_errors(error: BaseException):
-        if isinstance(error, BaseExceptionGroup):
-            for nested in error.exceptions:
-                yield from leaf_errors(nested)
-            return
-        yield error
-
-    leaves = list(leaf_errors(raised.value))
-    assert any("Spawn was fenced" in str(error) for error in leaves)
-    assert any(
-        isinstance(error, RuntimeOffboardingNotPerformedError)
-        and error.metadata["runtime_cleanup_state"] == "not_hosted"
-        for error in leaves
-    )
     assert await asyncio.wait_for(shutdown, timeout=1.0) is None
     assert child.shutdown_calls == 1
     assert manager.list_agents() == {}

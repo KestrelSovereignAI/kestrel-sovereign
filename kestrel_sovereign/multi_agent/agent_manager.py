@@ -225,6 +225,52 @@ def _contains_lifecycle_cancellation(error: BaseException | None) -> bool:
     return False
 
 
+def _uncommitted_spawn_not_hosted_cancellation(
+    error: BaseException,
+) -> Optional[bool]:
+    """Classify the one cleanup no-op an uncommitted spawn may reconcile.
+
+    A storage-backed child has no hosted namespace to offboard. Once its
+    process is shut down, rollback can still be complete, but only after the
+    caller verifies that routing and the delegated hold are gone. Accept one
+    Core-typed ``not_hosted`` outcome, optionally grouped solely with lifecycle
+    cancellation. Every other custody state or operational/programmer failure
+    remains visible to the spawn owner.
+    """
+
+    leaves: list[BaseException] = []
+
+    def collect(candidate: BaseException) -> None:
+        if isinstance(candidate, BaseExceptionGroup):
+            for nested in candidate.exceptions:
+                collect(nested)
+            return
+        leaves.append(candidate)
+
+    collect(error)
+    no_hosted = [
+        candidate
+        for candidate in leaves
+        if isinstance(candidate, RuntimeOffboardingNotPerformedError)
+        and candidate.cleanup_state == "not_hosted"
+    ]
+    if len(no_hosted) != 1 or any(
+        not isinstance(
+            candidate,
+            (RuntimeOffboardingNotPerformedError, asyncio.CancelledError),
+        )
+        for candidate in leaves
+    ):
+        return None
+    if any(
+        isinstance(candidate, RuntimeOffboardingNotPerformedError)
+        and candidate.cleanup_state != "not_hosted"
+        for candidate in leaves
+    ):
+        return None
+    return any(isinstance(candidate, asyncio.CancelledError) for candidate in leaves)
+
+
 def _is_lifecycle_terminal_outcome(error: BaseException) -> bool:
     """Whether a lifecycle owner may aggregate this outcome and keep sweeping."""
 
@@ -4826,20 +4872,29 @@ class AgentManager:
             name=f"rollback_uncommitted_spawn:{admission.name}",
         )
         cancelled, failure = await await_lifecycle_task_completion(cleanup)
+        no_hosted_cleanup = False
         if failure is not None:
-            if isinstance(
-                failure,
-                (
-                    RuntimeOffboardingRetainedError,
-                    RuntimeOffboardingNotPerformedError,
-                ),
-            ):
-                # Runtime routing and the delegated hold are already gone; the
-                # uncommitted spawn still failed to complete destructive
-                # offboarding and must expose that custody outcome.
-                admission.rollback_incomplete = True
-            raise failure
-        if cleanup.result() is True:
+            no_hosted_cancellation = _uncommitted_spawn_not_hosted_cancellation(
+                failure
+            )
+            if no_hosted_cancellation is not None:
+                # remove_agent already proved successful shutdown and routing
+                # withdrawal. Preserve any cancellation, then use the same
+                # authoritative resource inspection as a concurrent-removal
+                # handoff before accepting this private rollback.
+                no_hosted_cleanup = True
+                cancelled = cancelled or no_hosted_cancellation
+            else:
+                if isinstance(
+                    failure,
+                    (
+                        RuntimeOffboardingRetainedError,
+                        RuntimeOffboardingNotPerformedError,
+                    ),
+                ):
+                    admission.rollback_incomplete = True
+                raise failure
+        if not no_hosted_cleanup and cleanup.result() is True:
             return cancelled
 
         inspection = asyncio.create_task(
