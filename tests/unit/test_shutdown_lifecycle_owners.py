@@ -1445,6 +1445,86 @@ async def test_terminal_quarantine_drain_seals_late_bounded_removal_handoffs() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_kind", ("authorized", "registered"))
+async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
+    monkeypatch,
+    tmp_path,
+    identity_kind,
+) -> None:
+    """No identity cleanup task can appear after a drain's empty seal point."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    did = f"did:test:sealed-{identity_kind}-offboarding"
+    name = "Cold"
+    if identity_kind == "authorized":
+        manager._seed_scheduler_authority(
+            {
+                did: (
+                    name,
+                    LocalAgentConfig(
+                        data_dir=f"agent_data/{identity_kind}",
+                        port=8801,
+                        autostart=False,
+                    ),
+                )
+            }
+        )
+    cleanup = MagicMock(side_effect=AssertionError("post-seal cleanup started"))
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_isolated_runtime_namespace",
+        cleanup,
+    )
+    seal_visible = asyncio.Event()
+    allow_drain_scan = asyncio.Event()
+    real_set_seal = manager._set_quarantined_shutdown_handoffs_sealed
+
+    async def expose_empty_seal(sealed: bool) -> bool:
+        cancelled = await real_set_seal(sealed)
+        if sealed:
+            seal_visible.set()
+            await allow_drain_scan.wait()
+        return cancelled
+
+    monkeypatch.setattr(
+        manager,
+        "_set_quarantined_shutdown_handoffs_sealed",
+        expose_empty_seal,
+    )
+    drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+    try:
+        await asyncio.wait_for(seal_visible.wait(), timeout=1.0)
+        kwargs = (
+            {"known_agent_id": did}
+            if identity_kind == "registered"
+            else {}
+        )
+        assert await asyncio.wait_for(
+            manager.remove_agent(name, offboard_runtime=True, **kwargs),
+            timeout=1.0,
+        ) is False
+        assert manager._inflight_runtime_offboardings == {}
+        cleanup.assert_not_called()
+        assert did not in manager._scheduler_revoked_dids
+        assert name not in manager._scheduler_revoked_names
+        if identity_kind == "authorized":
+            assert manager.is_scheduler_agent_authorized(did)
+            assert manager.scheduler_authority_for(did)[0] == name
+        else:
+            assert manager.scheduler_authority_for(did) is None
+        assert not drain.done()
+    finally:
+        allow_drain_scan.set()
+
+    assert await asyncio.wait_for(drain, timeout=1.0) is False
+    assert manager._quarantined_shutdown_handoffs_sealed is False
+    assert manager._inflight_runtime_offboardings == {}
+    cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_terminal_quarantine_drain_reports_precompleted_reaper_failure() -> None:
     """Unsafe metadata from a precompleted reaper remains terminal evidence."""
 

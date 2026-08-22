@@ -1556,6 +1556,126 @@ class TestAgentManagerBasics:
         assert retained.read_text() == "must-remain"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheduler_authorized", (False, True))
+    async def test_case_variant_remove_shuts_down_exact_live_agent_before_cleanup(
+        self,
+        monkeypatch,
+        scheduler_authorized,
+        tmp_path,
+    ):
+        from kestrel_sovereign.features import isolated_runtime
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:case-variant-offboarding"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            did,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("case-sensitive-custody")
+        agent = _make_mock_agent(did)
+        agent.did = did
+        agent.isolated_runtime_scope = scope
+        manager._agents["Hosted"] = agent
+        manager._agent_names[did] = "Hosted"
+        if scheduler_authorized:
+            manager._seed_scheduler_authority(
+                {
+                    did: (
+                        "Hosted",
+                        LocalAgentConfig(data_dir="managed", port=8801),
+                    )
+                }
+            )
+        real_remove = isolated_runtime.remove_agent_runtime_namespace
+        cleanup_calls = 0
+
+        def assert_shutdown_precedes_cleanup(candidate):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            assert candidate is agent
+            assert agent.shutdown.await_count == 1
+            return real_remove(candidate)
+
+        monkeypatch.setattr(
+            isolated_runtime,
+            "remove_agent_runtime_namespace",
+            assert_shutdown_precedes_cleanup,
+        )
+
+        assert await manager.remove_agent(
+            "hosted",
+            offboard_runtime=True,
+        )
+
+        agent.shutdown.assert_awaited_once_with()
+        assert cleanup_calls == 1
+        assert manager.get_agent("Hosted") is None
+        assert manager.get_agent("hosted") is None
+        assert manager.get_agent_name(did) is None
+        assert "Hosted" not in manager._agents
+        assert not scope.path.exists()
+        assert not manager.is_scheduler_agent_authorized(did)
+
+    @pytest.mark.asyncio
+    async def test_delete_case_edited_registration_cannot_bypass_live_shutdown(
+        self,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:case-edited-registration"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        agent = _make_mock_agent(did)
+        agent.did = did
+        agent.isolated_runtime_scope = scope
+        manager._agents["Hosted"] = agent
+        manager._agent_names[did] = "Hosted"
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(
+            agents={
+                "hosted": LocalAgentConfig(
+                    data_dir="agent_data/hosted",
+                    port=8801,
+                )
+            }
+        )
+        config.save(config_path)
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        response = await delete_agent.__wrapped__(
+            request,
+            "HOSTED",
+            offboard_runtime=True,
+        )
+
+        assert response["success"] is True
+        agent.shutdown.assert_awaited_once_with()
+        assert manager.get_agent("Hosted") is None
+        assert manager.get_agent("hosted") is None
+        assert not scope.path.exists()
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+        assert request.app.state.multi_agent_config.agents == {}
+
+    @pytest.mark.asyncio
     async def test_explicit_offboard_removes_authorized_cold_agent_runtime(
         self,
         tmp_path,

@@ -749,6 +749,42 @@ class TestSpawnFeatureWithManager:
         assert "private-reconcile-text" not in str(envelope.to_dict())
 
     @pytest.mark.asyncio
+    async def test_destructive_reconciliation_partial_reports_runtime_removed(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ChildTerminationReconciliationError(
+                child_name="helper",
+                cause=OSError("private-reconcile-text"),
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_offboard_requested"] is True
+        assert envelope.data["runtime_offboarded"] is True
+        assert envelope.data["runtime_retained"] is False
+        assert envelope.data["runtime_retained_for_restart"] is False
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["tracking_reconciled"] is False
+        assert "private-reconcile-text" not in str(envelope.to_dict())
+        manager.terminate_child.assert_awaited_once_with(
+            parent.agent_id,
+            "helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
     async def test_terminate_child_flattens_retained_and_reconciliation(self):
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
@@ -1095,7 +1131,6 @@ class TestAgentManagerSpawn:
 
     @pytest.mark.asyncio
     async def test_terminate_child(self):
-        parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
 
         manager = AgentManager()
@@ -1183,7 +1218,6 @@ class TestAgentManagerSpawn:
     @pytest.mark.asyncio
     async def test_terminate_children_cascading(self):
         """Terminating children should cascade to grandchildren."""
-        parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
         grandchild = _make_mock_agent("did:grandchild")
 

@@ -1543,6 +1543,52 @@ class AgentManager:
 
         return name.casefold()
 
+    def _published_agent_binding(
+        self,
+        name: str,
+    ) -> tuple[Optional[str], Optional[KestrelAgent]]:
+        """Resolve one case-insensitive routing name to its exact publication.
+
+        Name admission forbids canonical duplicates, but removal is a security
+        boundary and must not silently choose if internal state is corrupt.
+        Returning the exact dictionary key ensures shutdown, reverse-map
+        withdrawal, scheduler revocation, and runtime deletion all describe
+        the same live agent even when an API/config spelling differs by case.
+        """
+
+        exact = self._agents.get(name)
+        if exact is not None:
+            return name, exact
+        canonical = self._canonical_agent_name(name)
+        matches = [
+            (routing_name, agent)
+            for routing_name, agent in self._agents.items()
+            if self._canonical_agent_name(routing_name) == canonical
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Case-insensitive agent routing state is ambiguous; removal refused"
+            )
+        return matches[0] if matches else (None, None)
+
+    def _scheduler_authority_binding_by_name(
+        self,
+        name: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve one canonical routing name to exact scheduler authority."""
+
+        canonical = self._canonical_agent_name(name)
+        matches = [
+            (routing_name, agent_id)
+            for agent_id, (routing_name, _config) in self._scheduler_authority_by_did.items()
+            if self._canonical_agent_name(routing_name) == canonical
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Case-insensitive scheduler authority is ambiguous; removal refused"
+            )
+        return matches[0] if matches else (None, None)
+
     def _quarantined_cleanup_name_is_reserved(self, canonical_name: str) -> bool:
         """Whether active or unsafe quarantined cleanup owns this name.
 
@@ -2380,9 +2426,11 @@ class AgentManager:
         # Recheck after I/O so a concurrent cold wake cannot replace the
         # registration with a different DID between witness and DELETE.
         async with self._lock:
-            current = self.get_agent(name)
+            _published_name, current = self._published_agent_binding(name)
             current_id = _loaded_agent_did(current) if current is not None else None
-            known_id = self._scheduler_authority_by_name.get(name)
+            _authority_name, known_id = self._scheduler_authority_binding_by_name(
+                name
+            )
             did_authority = self._scheduler_authority_by_did.get(agent_id)
         if (current_id and current_id != agent_id) or (
             known_id and known_id != agent_id
@@ -2498,13 +2546,16 @@ class AgentManager:
             )
 
         async with self._lock:
-            current = self._agents.get(name)
+            published_name, current = self._published_agent_binding(name)
             agent_id = _loaded_agent_did(current) if current is not None else None
             if agent_id and known_agent_id and agent_id != known_agent_id:
                 raise ValueError(
                     "Registered agent identity does not match the loaded agent; "
                     "offboarding was refused."
                 )
+            authority_name, authority_id = self._scheduler_authority_binding_by_name(
+                name
+            )
             if not isinstance(agent_id, str) or not agent_id:
                 # A scheduler can be partway through a cold load while the
                 # agent is still absent from ``_agents``.  The live authority
@@ -2513,7 +2564,7 @@ class AgentManager:
                 # lifecycle lock and revoke the desired state, rather than
                 # returning a misleading 404 and letting the already-claimed
                 # cold wake publish the agent immediately afterwards.
-                agent_id = self._scheduler_authority_by_name.get(name)
+                agent_id = authority_id
             if agent_id and known_agent_id and agent_id != known_agent_id:
                 raise ValueError(
                     "Registered agent identity does not match scheduler authority; "
@@ -2521,6 +2572,11 @@ class AgentManager:
                 )
             if not agent_id and known_agent_id:
                 agent_id = known_agent_id
+            # From this point onward, every routing mutation uses the exact
+            # published/authorized spelling. A case-variant administrative
+            # request must never miss a live process yet still reach its
+            # canonical DID's destructive cleanup.
+            name = published_name or authority_name or name
 
         if not isinstance(agent_id, str) or not agent_id:
             async with self._a2a_lifecycle_lock:
@@ -2530,115 +2586,129 @@ class AgentManager:
                     pending_offboarding=pending_offboarding,
                 )
 
+        cold_identity_offboarding: Optional[
+            tuple[str, Optional[tuple[str, LocalAgentConfig]]]
+        ] = None
         async with self.scheduler_lifecycle_lock(agent_id):
             async with self._a2a_lifecycle_lock:
                 # Re-read after waiting: another lifecycle operation may have
-                # completed first.  The fallback preserves the old no-agent
-                # and unpublished-budget behavior.
-                current = self._agents.get(name)
+                # completed first. The exact published key may differ from the
+                # request only by case; retain that key through every mutation.
+                published_name, current = self._published_agent_binding(name)
+                if published_name is not None:
+                    name = published_name
                 current_did = (
                     _loaded_agent_did(current) if current is not None else None
                 )
                 authority = self.scheduler_authority_for(agent_id)
                 if current is None:
-                    # DELETE won the race with a cold scheduler load. Revoking
-                    # an authorized-but-unpublished tenant is a completed
-                    # runtime removal.
+                    # DELETE won the race with a cold scheduler load. Revoke
+                    # desired state while the lifecycle writers are held, then
+                    # admit destructive I/O only after releasing them. The
+                    # separate manager-lock admission below owns the terminal
+                    # seal check and inflight registration atomically.
                     if authority is not None and self._canonical_agent_name(
                         authority[0]
                     ) == self._canonical_agent_name(name):
-                        self._revoke_scheduler_authority(authority[0], agent_id)
+                        name = authority[0]
+                        revoked = self._revoke_scheduler_authority(name, agent_id)
                         if offboard_runtime:
-                            pending_offboarding.append(
-                                self._start_agent_runtime_offboarding_identity(
-                                    name=name,
-                                    agent_id=agent_id,
-                                )
+                            cold_identity_offboarding = (name, revoked)
+                        else:
+                            logger.info(
+                                "Revoked cold scheduler authority for agent %r",
+                                name,
                             )
-                        logger.info(
-                            "Revoked cold scheduler authority for agent %r",
-                            name,
-                        )
-                        reconciliation_cancelled = (
-                            await self._reconcile_fully_removed_child_tracking()
-                        )
-                        if reconciliation_cancelled:
-                            raise asyncio.CancelledError()
-                        return True
-                    if known_agent_id == agent_id:
+                            reconciliation_cancelled = (
+                                await self._reconcile_fully_removed_child_tracking()
+                            )
+                            if reconciliation_cancelled:
+                                raise asyncio.CancelledError()
+                            return True
+                    elif known_agent_id == agent_id:
                         if authority is not None:
                             raise ValueError(
                                 "Registered agent DID belongs to a different routing "
                                 "name; offboarding was refused."
                             )
-                        # A persisted local registration can be intentionally
-                        # cold without live scheduler authority.  Its read-only
-                        # DID witness admits the same identity-scoped cleanup
-                        # worker used for an authorized cold agent.  Revoke the
-                        # desired name before starting deletion so a concurrent
-                        # wake cannot publish it after config removal.
                         if self._has_budgeted_descendants(name):
                             raise ValueError(
                                 f"Cannot remove '{name}' directly: it has budgeted "
                                 "child agents. Use terminate_child, which cascades "
                                 "and releases nested budgets leaf-first (#2113)."
                             )
-                        self._revoke_scheduler_authority(name, agent_id)
-                        try:
-                            pending_offboarding.append(
-                                self._start_agent_runtime_offboarding_identity(
-                                    name=name,
-                                    agent_id=agent_id,
-                                )
-                            )
-                        except BaseException:
-                            self._scheduler_revoked_names.discard(name)
-                            self._scheduler_revoked_dids.discard(agent_id)
-                            raise
-                        reconciliation_cancelled = (
-                            await self._reconcile_fully_removed_child_tracking()
+                        revoked = self._revoke_scheduler_authority(name, agent_id)
+                        cold_identity_offboarding = (name, revoked)
+                    else:
+                        return await self._remove_agent_without_scheduler_lifecycle(
+                            name,
+                            offboard_runtime=offboard_runtime,
+                            pending_offboarding=pending_offboarding,
                         )
-                        if reconciliation_cancelled:
-                            raise asyncio.CancelledError()
+                else:
+                    if current_did != agent_id:
+                        # This DELETE resolved ``name`` to ``agent_id`` before it
+                        # waited for that DID's scheduler writer. A replacement
+                        # identity may publish after an earlier same-name DELETE
+                        # completes. Never remove that replacement while holding
+                        # the obsolete identity's lifecycle lock.
                         logger.info(
-                            "Offboarded registered cold agent %r by durable identity",
+                            "Agent %r changed identity while waiting for removal; "
+                            "refusing to remove the replacement",
                             name,
                         )
-                        return True
-                    return await self._remove_agent_without_scheduler_lifecycle(
-                        name,
-                        offboard_runtime=offboard_runtime,
-                        pending_offboarding=pending_offboarding,
-                    )
-                if current_did != agent_id:
-                    # This DELETE resolved ``name`` to ``agent_id`` before it
-                    # waited for that DID's scheduler writer. A replacement
-                    # identity may publish after an earlier same-name DELETE
-                    # completes. Never remove that replacement while holding
-                    # the obsolete identity's lifecycle lock.
-                    logger.info(
-                        "Agent %r changed identity while waiting for removal; "
-                        "refusing to remove the replacement",
-                        name,
-                    )
-                    return False
+                        return False
 
-                revoked = None
-                if authority is not None and authority[0] == name:
-                    revoked = self._revoke_scheduler_authority(name, agent_id)
-                try:
-                    removed = await self._remove_agent_without_scheduler_lifecycle(
-                        name,
-                        offboard_runtime=offboard_runtime,
-                        pending_offboarding=pending_offboarding,
-                    )
-                except BaseException:
-                    if self._agents.get(name) is not None:
+                    revoked = None
+                    if authority is not None and self._canonical_agent_name(
+                        authority[0]
+                    ) == self._canonical_agent_name(name):
+                        revoked = self._revoke_scheduler_authority(
+                            authority[0], agent_id
+                        )
+                    try:
+                        removed = await self._remove_agent_without_scheduler_lifecycle(
+                            name,
+                            offboard_runtime=offboard_runtime,
+                            pending_offboarding=pending_offboarding,
+                        )
+                    except BaseException:
+                        if self._published_agent_binding(name)[1] is not None:
+                            self._restore_scheduler_authority(agent_id, revoked)
+                        raise
+                    if not removed:
                         self._restore_scheduler_authority(agent_id, revoked)
-                    raise
-                if not removed:
-                    self._restore_scheduler_authority(agent_id, revoked)
-                return removed
+                    return removed
+
+        assert cold_identity_offboarding is not None
+        cold_name, revoked = cold_identity_offboarding
+        admitted, admission_cancelled = (
+            await self._admit_agent_runtime_offboarding_identity(
+                name=cold_name,
+                agent_id=agent_id,
+                revoked=revoked,
+                pending_offboarding=pending_offboarding,
+            )
+        )
+        if not admitted:
+            logger.warning(
+                "Refusing identity offboarding of agent %r after terminal manager "
+                "shutdown handoffs were sealed",
+                cold_name,
+            )
+            if admission_cancelled:
+                raise asyncio.CancelledError()
+            return False
+        reconciliation_cancelled = (
+            await self._reconcile_fully_removed_child_tracking()
+        )
+        logger.info(
+            "Offboarded registered cold agent %r by durable identity",
+            cold_name,
+        )
+        if admission_cancelled or reconciliation_cancelled:
+            raise asyncio.CancelledError()
+        return True
 
     def _handoff_shutdown_to_quarantined_reaper(
         self,
@@ -2756,13 +2826,66 @@ class AgentManager:
         cleanup_task.add_done_callback(retire_inflight)
         return record
 
+    async def _admit_agent_runtime_offboarding_identity(
+        self,
+        *,
+        name: str,
+        agent_id: str,
+        revoked: Optional[tuple[str, LocalAgentConfig]],
+        pending_offboarding: list[InflightRuntimeOffboarding],
+    ) -> tuple[bool, bool]:
+        """Atomically seal-check and register one cold-identity deletion.
+
+        Callers deliberately release scheduler and A2A lifecycle writers
+        before entering this method.  The manager lock is the sole
+        linearization boundary shared with terminal drain sealing: either the
+        inflight task is registered before the seal and the drain joins it, or
+        the sealed refusal restores desired-state revocation without starting
+        filesystem work.  Cancellation is remembered only after that ownership
+        decision has completed.
+        """
+
+        acquire = asyncio.create_task(
+            self._lock.acquire(),
+            name="agent_manager:admit_identity_runtime_offboarding",
+        )
+        cancelled, failure = await await_lifecycle_task_completion(acquire)
+        if failure is not None:
+            raise RuntimeError(
+                "Unable to serialize identity runtime offboarding admission"
+            ) from failure
+        try:
+            if self._quarantined_shutdown_handoffs_sealed:
+                if revoked is not None:
+                    self._restore_scheduler_authority(agent_id, revoked)
+                else:
+                    self._scheduler_revoked_names.discard(name)
+                    self._scheduler_revoked_dids.discard(agent_id)
+                return False, cancelled
+            try:
+                record = self._start_agent_runtime_offboarding_identity(
+                    name=name,
+                    agent_id=agent_id,
+                )
+            except BaseException:
+                if revoked is not None:
+                    self._restore_scheduler_authority(agent_id, revoked)
+                else:
+                    self._scheduler_revoked_names.discard(name)
+                    self._scheduler_revoked_dids.discard(agent_id)
+                raise
+            pending_offboarding.append(record)
+            return True, cancelled
+        finally:
+            self._lock.release()
+
     def _start_agent_runtime_offboarding_identity(
         self,
         *,
         name: str,
         agent_id: str,
     ) -> InflightRuntimeOffboarding:
-        """Admit deletion for an authorized cold agent without constructing it."""
+        """Register deletion for a cold agent while the caller owns ``_lock``."""
 
         from kestrel_sovereign.features.isolated_runtime import (
             remove_isolated_runtime_namespace,

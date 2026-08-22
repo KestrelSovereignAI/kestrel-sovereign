@@ -2125,6 +2125,7 @@ class IsolatedRuntimePreparationError(RuntimeError):
 _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
 _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
+_HOSTED_RUNTIME_VENV_SETTING = "runtime.venv"
 _SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 
 
@@ -2177,7 +2178,11 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
             safe_names = [
                 key
                 for key in self.environment_keys
-                if type(key) is str and _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key)
+                if type(key) is str
+                and (
+                    _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key)
+                    or key == _HOSTED_RUNTIME_VENV_SETTING
+                )
             ]
             name = safe_names[0] if len(safe_names) == 1 else "<unknown>"
             return (
@@ -3002,14 +3007,14 @@ def _validate_released_legacy_directory_metadata(
             "Hosted isolated feature released legacy runtime path is unsafe."
         )
     if os.name == "posix" and metadata.st_uid != os.geteuid():
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature released legacy runtime is not owned by "
-            "the service account."
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime custody could not "
+            "be proven; tenant state was retained."
         )
     if stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise IsolatedRuntimeNamespaceError(
-            "Hosted isolated feature released legacy runtime is writable by "
-            "another account."
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime custody could not "
+            "be proven; tenant state was retained."
         )
 
 
@@ -4254,43 +4259,82 @@ def _hosted_prebuilt_override_error(key: str) -> IsolatedRuntimeConfigurationErr
     )
 
 
-def _validate_hosted_process_prebuilt_overrides(feature_name: str) -> None:
-    """Accept only existing immutable-shape process-wide launch overrides.
+def _validate_hosted_prebuilt_venv(
+    value: str,
+    *,
+    setting: str,
+    require_absolute: bool,
+) -> Path:
+    """Validate one immutable hosted venv selection without following its leaf.
 
-    These two variables are operator/host configuration, not tenant config, so
-    they may be shared only as prebuilt artifacts.  Core must never create,
-    upgrade, or stamp a path selected process-wide: doing so lets concurrent
-    hosted agents race over shared mutable provisioning state.
+    ``runtime.venv`` comes from installed package metadata.  Unlike a
+    standalone declaration, a relative value would resolve against Core's
+    process CWD and become one shared mutable location for every tenant, so it
+    is never a valid hosted selection.  Environment overrides retain their
+    established absolute-normalization behavior but are subject to the same
+    immutable artifact checks.
+    """
+
+    try:
+        candidate = Path(value).expanduser()
+        if require_absolute and not candidate.is_absolute():
+            raise ValueError("hosted runtime venv must be absolute")
+        venv_path = Path(os.path.abspath(candidate))
+        venv_metadata = venv_path.stat(follow_symlinks=False)
+        manifest = venv_path / ".kestrel_provision.json"
+        try:
+            manifest.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            manifest_present = False
+        else:
+            manifest_present = True
+        config_metadata = (venv_path / "pyvenv.cfg").stat(follow_symlinks=False)
+        python_path = _venv_python(venv_path)
+        python_metadata = python_path.stat()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _hosted_prebuilt_override_error(setting) from None
+    if (
+        not stat.S_ISDIR(venv_metadata.st_mode)
+        or manifest_present
+        or not stat.S_ISREG(config_metadata.st_mode)
+        or not stat.S_ISREG(python_metadata.st_mode)
+        or (os.name == "posix" and not os.access(python_path, os.X_OK))
+    ):
+        raise _hosted_prebuilt_override_error(setting)
+    return venv_path
+
+
+def _validate_hosted_process_prebuilt_overrides(
+    feature_name: str,
+    *,
+    runtime_venv: Optional[str] = None,
+) -> None:
+    """Accept only existing immutable-shape hosted launch overrides.
+
+    Process variables and installed ``runtime.venv`` metadata are host
+    configuration rather than tenant config, so they may be shared only as
+    prebuilt artifacts. Core must never create, upgrade, or stamp either path:
+    doing so lets concurrent hosted agents race over mutable provisioning
+    state.
     """
 
     venv_key = _env_key(feature_name, "VENV")
     venv_value = os.environ.get(venv_key)
     if venv_value:
-        try:
-            venv_path = Path(os.path.abspath(Path(venv_value).expanduser()))
-            venv_metadata = venv_path.stat(follow_symlinks=False)
-            manifest = venv_path / ".kestrel_provision.json"
-            try:
-                manifest.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                manifest_present = False
-            else:
-                manifest_present = True
-            config_metadata = (venv_path / "pyvenv.cfg").stat(
-                follow_symlinks=False
-            )
-            python_path = _venv_python(venv_path)
-            python_metadata = python_path.stat()
-        except (OSError, RuntimeError, ValueError):
-            raise _hosted_prebuilt_override_error(venv_key) from None
-        if (
-            not stat.S_ISDIR(venv_metadata.st_mode)
-            or manifest_present
-            or not stat.S_ISREG(config_metadata.st_mode)
-            or not stat.S_ISREG(python_metadata.st_mode)
-            or (os.name == "posix" and not os.access(python_path, os.X_OK))
-        ):
-            raise _hosted_prebuilt_override_error(venv_key)
+        _validate_hosted_prebuilt_venv(
+            venv_value,
+            setting=venv_key,
+            require_absolute=False,
+        )
+
+    if runtime_venv is not None:
+        if type(runtime_venv) is not str or not runtime_venv:
+            raise _hosted_prebuilt_override_error(_HOSTED_RUNTIME_VENV_SETTING)
+        _validate_hosted_prebuilt_venv(
+            runtime_venv,
+            setting=_HOSTED_RUNTIME_VENV_SETTING,
+            require_absolute=True,
+        )
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
@@ -4822,7 +4866,10 @@ class ProxyFeature(Feature):
             or getattr(agent, "isolated_runtime_hosted", False) is True
         ):
             _assert_hosted_feature_env_is_scoped(self.name, self.runtime.distribution)
-            _validate_hosted_process_prebuilt_overrides(self.name)
+            _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
@@ -8863,7 +8910,10 @@ class ProxyFeature(Feature):
             # long-lived hosts can mutate ``os.environ`` between discovery and
             # enable.  A late process-wide path must never acquire provisioning
             # authority merely because the ProxyFeature already exists.
-            _validate_hosted_process_prebuilt_overrides(self.name)
+            _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
         if bin_override:
             return self._default_venv_path(), Path(bin_override).expanduser().resolve()
@@ -8917,6 +8967,15 @@ class ProxyFeature(Feature):
         """Whether this host selected a process-wide immutable venv artifact."""
 
         return bool(os.environ.get(_env_key(self.name, "VENV")))
+
+    def _hosted_immutable_venv_setting(self) -> Optional[str]:
+        """Return the safe setting name selecting an immutable hosted venv."""
+
+        if self._process_venv_is_overridden():
+            return _env_key(self.name, "VENV")
+        if self.runtime.venv is not None:
+            return _HOSTED_RUNTIME_VENV_SETTING
+        return None
 
     def _default_venv_path(self) -> Path:
         return self._feature_runtime_dir() / ".venv"
@@ -9084,37 +9143,89 @@ class ProxyFeature(Feature):
     ) -> None:
         path = self._provision_manifest_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "install_target": install_target,
-                    # The host SDK we provisioned AGAINST — staleness keys on a
-                    # change here, so a genuinely SDK-pinned feature reinstalls
-                    # once per host bump, not on every startup.
-                    "provisioned_against_host_sdk": host_sdk,
-                    # The SDK version that actually landed in the venv (may lag
-                    # host_sdk if the feature pins it); recorded for diagnosis.
-                    "child_sdk_version": child_sdk,
-                    # ``project`` is commonly an unversioned pip target. Keep
-                    # the host-visible distribution release separately so an
-                    # upgraded isolated feature cannot keep running an older
-                    # child merely because its target string did not change.
-                    "feature_distribution_version": feature_distribution_version,
-                    # The feature release actually resolved inside the child
-                    # venv.  It must equal the host-visible desired release
-                    # whenever that release is known; retaining it makes the
-                    # successful verification auditable and invalidates old
-                    # manifests that predate this check once.
-                    "child_feature_distribution_state": (
-                        child_feature_distribution.state
-                    ),
-                    "child_feature_distribution_version": (
-                        child_feature_distribution.version
-                    ),
-                },
-                indent=2,
-            )
+        payload = json.dumps(
+            {
+                "install_target": install_target,
+                # Console-script shebangs embed the venv's absolute interpreter
+                # path. A directory adoption therefore makes an otherwise
+                # version-current venv stale. Stamp the canonical location so
+                # both released-layout and pre-stable moves force exactly one
+                # reinstall at their destination.
+                "venv_path": str(self._venv_path.resolve()),
+                # The host SDK we provisioned AGAINST — staleness keys on a
+                # change here, so a genuinely SDK-pinned feature reinstalls
+                # once per host bump, not on every startup.
+                "provisioned_against_host_sdk": host_sdk,
+                # The SDK version that actually landed in the venv (may lag
+                # host_sdk if the feature pins it); recorded for diagnosis.
+                "child_sdk_version": child_sdk,
+                # ``project`` is commonly an unversioned pip target. Keep
+                # the host-visible distribution release separately so an
+                # upgraded isolated feature cannot keep running an older
+                # child merely because its target string did not change.
+                "feature_distribution_version": feature_distribution_version,
+                # The feature release actually resolved inside the child
+                # venv.  It must equal the host-visible desired release
+                # whenever that release is known; retaining it makes the
+                # successful verification auditable and invalidates old
+                # manifests that predate this check once.
+                "child_feature_distribution_state": child_feature_distribution.state,
+                "child_feature_distribution_version": (
+                    child_feature_distribution.version
+                ),
+            },
+            indent=2,
+        ).encode("utf-8")
+        temporary = path.with_name(
+            f"{path.name}.tmp-{os.getpid()}-{uuid4().hex}"
         )
+        descriptor: Optional[int] = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                _PRIVATE_FILE_MODE,
+            )
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, path)
+            path.chmod(_PRIVATE_FILE_MODE)
+            if os.name == "posix":
+                parent_fd = os.open(path.parent, _directory_open_flags())
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature provisioning state could not be recorded."
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _provision_status(self, install_target: str) -> tuple[bool, bool]:
+        """Return ``(stale, force_reinstall)`` for a Core-owned venv.
+
+        A missing or mismatched location stamp proves that entry-point scripts
+        may still contain the source venv's absolute shebang.  ``--upgrade`` is
+        insufficient when the requested distribution is already satisfied, so
+        that state requires a forced reinstall.  If a repair crashes before
+        the atomic manifest replacement, the old/missing stamp safely causes
+        the same repair to be retried on restart.
+        """
+
+        manifest = self._read_provision_manifest()
+        assert self._venv_path is not None
+        if manifest.get("venv_path") != str(self._venv_path.resolve()):
+            return True, True
+        return self._provision_is_stale_from_manifest(install_target, manifest), False
 
     def _provision_is_stale(self, install_target: str) -> bool:
         """Return whether this host-owned venv must be reprovisioned.
@@ -9124,7 +9235,15 @@ class ProxyFeature(Feature):
         version does not become a moving stale marker: it is stamped as
         ``unknown`` and remains fresh until a concrete version is observable.
         """
-        manifest = self._read_provision_manifest()
+        return self._provision_status(install_target)[0]
+
+    def _provision_is_stale_from_manifest(
+        self,
+        install_target: str,
+        manifest: Dict[str, Any],
+    ) -> bool:
+        """Apply version/probe staleness checks to one location-valid stamp."""
+
         if manifest.get("install_target") != install_target:
             return True
         if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
@@ -9212,12 +9331,20 @@ class ProxyFeature(Feature):
                 f"Isolated feature {self.name} has no project/distribution to install"
             )
 
-        if self._runtime_is_hosted() and self._process_venv_is_overridden():
+        hosted_immutable_setting = (
+            self._hosted_immutable_venv_setting()
+            if self._runtime_is_hosted()
+            else None
+        )
+        if hosted_immutable_setting is not None:
             # Revalidate at the mutation boundary, not only at discovery/path
-            # resolution. A concurrent host setting or late Core manifest must
-            # never make this process-wide path fall through to uv creation,
-            # upgrade, or manifest stamping.
-            _validate_hosted_process_prebuilt_overrides(self.name)
+            # resolution. A concurrent host/metadata change or late Core
+            # manifest must never make this shared path fall through to uv
+            # creation, upgrade, or manifest stamping.
+            _validate_hosted_process_prebuilt_overrides(
+                self.name,
+                runtime_venv=self.runtime.venv,
+            )
             try:
                 self._verify_prebuilt_feature_distribution(
                     python_path,
@@ -9228,7 +9355,7 @@ class ProxyFeature(Feature):
                 raise
             except Exception as exc:
                 raise _hosted_prebuilt_override_error(
-                    _env_key(self.name, "VENV")
+                    hosted_immutable_setting
                 ) from exc
             return
 
@@ -9261,20 +9388,26 @@ class ProxyFeature(Feature):
         # Something), but leave the venv untouched and do not stamp a manifest we
         # don't own. Host-owned default venvs (and a not-yet-created override
         # path we bootstrap below) keep the full reprovision lifecycle.
+        force_reinstall = False
         if not exists:
-            self._run(["uv", "venv", str(self._venv_path)])
-        elif not self._provision_is_stale(install_target):
-            return
+            self._run_provisioning_command(
+                ["uv", "venv", str(self._venv_path)]
+            )
+        else:
+            stale, force_reinstall = self._provision_status(install_target)
+            if not stale:
+                return
 
         # Fresh venv, changed install target, or host SDK upgraded since the
-        # venv was provisioned. On an existing venv, upgrade in place so a stale
-        # kestrel-sdk is replaced; then stamp the manifest so the next startup
-        # can tell whether another reprovision is due.
+        # venv was provisioned. A moved/unstamped venv requires ``--reinstall``
+        # so console scripts are rewritten even when package versions are
+        # already satisfied; other stale existing venvs upgrade in place.
+        # Stamp only after install and verification both succeed.
         cmd = ["uv", "pip", "install", "--python", str(python_path)]
         if exists:
-            cmd.append("--upgrade")
+            cmd.append("--reinstall" if force_reinstall else "--upgrade")
         cmd.append(install_target)
-        self._run(cmd)
+        self._run_provisioning_command(cmd)
 
         # Verify what actually landed: a feature that pins an older SDK can
         # install "successfully" while keeping the stale wire contract. Surface
@@ -9328,6 +9461,16 @@ class ProxyFeature(Feature):
                 child_sdk,
                 host_sdk,
             )
+
+    def _run_provisioning_command(self, cmd: List[str]) -> None:
+        """Map expected host provisioning failures to optional quarantine."""
+
+        try:
+            self._run(cmd)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature venv provisioning could not be completed."
+            ) from exc
 
     def _run(self, cmd: List[str]) -> None:
         if not cmd:

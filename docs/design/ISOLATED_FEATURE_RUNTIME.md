@@ -88,7 +88,9 @@ its `pyproject.toml` (read from installed metadata, no import required):
 [tool.kestrel.feature]
 runtime = "isolated-venv"          # default: "in-process"
 service = "kestrel_whatsapp_web.service:main"   # entry point of the service
-venv = "service"                   # path (relative to package) of the service's own venv/project
+# Optional standalone-only mutable selection. Hosted declarations must use an
+# absolute, already-built immutable operator venv.
+venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
 ```
 
 - `runtime = "in-process"` (default, omitted) → today's behavior, unchanged.
@@ -113,7 +115,9 @@ feature, instead of importing the class it instantiates a **proxy `Feature`**:
 
 **venv resolution / provisioning** (Talon's discovery order, generalized):
 1. `KESTREL_FEATURE_<NAME>_VENV` / `..._BIN` env override.
-2. Configured path (host config).
+2. Configured path (host config). In hosted mode, metadata `venv` must be an
+   absolute, already-existing immutable prebuilt venv; relative paths are
+   rejected because they otherwise resolve through the shared Core CWD.
 3. Convention: `<package>/<venv>/.venv` (e.g. `service/.venv`) or sibling repo.
 4. On-demand provision: `uv venv` + `uv pip install` of the service project
    (opt-in; gives true "feature brings its own venv" UX).
@@ -227,6 +231,16 @@ new collision retains the old tree (and both trees for a collision) and
 quarantines the optional feature for operator reconciliation; Core never
 copies, merges, overwrites, or deletes ambiguous credentials.
 
+Moving a venv changes the absolute interpreter path embedded in console-script
+shebangs. Core therefore records the canonical absolute venv path in its
+private provisioning manifest. A missing or mismatched path stamp forces one
+full package reinstall at the adopted destination before child launch; an
+ordinary `--upgrade` is not accepted as repair because already-satisfied
+packages may retain stale scripts. The manifest is replaced atomically only
+after install and distribution verification succeed, so a crash retries the
+repair on restart. Service credentials and state beside `.venv` are preserved,
+and a valid same-path stamp remains idempotent.
+
 Every hosted feature receives a private mutable directory below that namespace
 for its working directory, home, temp, XDG config/data/cache, channel artifacts,
 provisioning manifest, and default venv. Hosted children inherit only a narrow
@@ -243,6 +257,13 @@ venv already exists; a venv carrying Core's provisioning manifest is refused.
 Core never creates, upgrades, or stamps a process-wide override. The validated
 operator-selected artifact may be shared, but every child process and mutable
 workspace/cache/state path remains namespace-distinct.
+
+Installed `[tool.kestrel.feature] venv = ...` metadata follows the same hosted
+immutable-prebuilt contract as `..._VENV`: the value must be absolute, the venv
+and executable interpreter must already exist, and the directory must not carry
+a Core provisioning manifest. Core revalidates it immediately before the
+mutation boundary and never creates, upgrades, or stamps it. Standalone agents
+retain their historical mutable and relative metadata behavior.
 
 The per-feature directory identity is a digest of the normalized distribution
 name and declared feature class. Entry-point module paths and service runner
