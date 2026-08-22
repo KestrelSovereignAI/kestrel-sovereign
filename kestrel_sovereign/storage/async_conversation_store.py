@@ -3303,6 +3303,22 @@ class AsyncConversationStore:
         projection = ConversationSessionProjection(self.db, agent)
         if after is None:
             await self._repair_until_whole(projection)
+        else:
+            # A continuation does not repair — moving the ground under a cursor
+            # is how a keyset page starts skipping rows — but it does have to
+            # ASK. Between two pages the projection can be discarded and rewalked
+            # (any delete, archive or purge makes the next repair a rebuild), and
+            # a page read mid-walk sees a partial table whose end is not the end
+            # of the list. Without this, the 503 protected page one and page two
+            # quietly returned `next_cursor: null` over a truncated cache.
+            #
+            # One primary-key read, and it asks the same question page one does.
+            accounted = await projection.accounted()
+            if not accounted.valid or not accounted.complete:
+                raise ProjectionNotReady(
+                    f"{agent}'s conversation index is being rebuilt; the page "
+                    "after this cursor would end early and say it was the end"
+                )
         # One more than asked for, which is how "is there another page" is
         # answered without a second query and without a COUNT over the whole
         # table — the cost this table exists to remove.

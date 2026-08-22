@@ -865,6 +865,13 @@ export function mountConversations(containerEl, config = {}) {
         // generation too, and a flag left set then leaves the reloaded list's
         // Load more button disabled as "Loading…" for good.
         loadingMore = false;
+        // The cursor goes too, and this is not the same statement. The old
+        // Load more button is still painted while page one is in flight, and
+        // a click on it would capture the NEW generation — so it would not be
+        // discarded as stale, and it would append the previous generation's
+        // rows and overwrite the cursor page one is about to set. Dropping the
+        // cursor makes that click inert until page one lands with its own.
+        nextCursor = null;
         try {
             const page = await loadData();
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list

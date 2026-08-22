@@ -411,9 +411,12 @@ async def test_a_half_built_index_is_a_503_not_a_truncated_list(tmp_path):
     continues the walk.
     """
     now = datetime(2026, 5, 1, 9, 0, 0)
+    # Two sessions, so a page of one has a second page to continue to.
     storage, wrapped = await _seeded_list_storage(tmp_path, "half-built.db", [
         ("user", "hello", "{}", now),
         ("assistant", "hi", "{}", now + timedelta(minutes=1)),
+        ("user", "later", "{}", now + timedelta(hours=3)),
+        ("assistant", "and again", "{}", now + timedelta(hours=3, minutes=1)),
     ])
     app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
@@ -435,7 +438,21 @@ async def test_a_half_built_index_is_a_503_not_a_truncated_list(tmp_path):
 
         # ...and an index that IS complete serves normally, so the refusal is
         # not simply refusing everything.
-        assert _listed(app, "?limit=10").status_code == 200
+        first = _listed(app, "?limit=1")
+        assert first.status_code == 200
+
+        # A CONTINUATION is refused too. It does not repair — moving the ground
+        # under a cursor is how a keyset page starts skipping rows — but a page
+        # read while the projection is being rewalked ends early and says
+        # `next_cursor: null`, which reads as the end of the list.
+        token = first.json()["next_cursor"]
+        assert token, "the fixture needs a second page for this to mean anything"
+        with patch(
+            "kestrel_sovereign.storage.conversation_sessions"
+            ".ConversationSessionProjection.accounted",
+            side_effect=never_complete,
+        ):
+            assert _listed(app, f"?limit=1&cursor={token}").status_code == 503
     finally:
         _restore_app(app, original)
         await storage.close()

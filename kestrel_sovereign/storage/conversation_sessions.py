@@ -746,6 +746,86 @@ class SessionCursorError(ValueError):
     """
 
 
+#: How a cursor names a position, and there are two because there are two ways
+#: a page is produced.
+#:
+#: ``keyset`` carries the ordering's keys and is what the projection pages by:
+#: it has an index and a stable key, and an offset there would count rows that
+#: move between two requests.
+#:
+#: ``offset`` carries a count, and is what the grouped paths page by — the
+#: archived view and ISOLATED's in-memory buffer. Those have no table: they
+#: derive and order the WHOLE set inside one request and then slice it, so a
+#: position in that slice is exactly what an offset is. A keyset there would
+#: have to carry the boundary session's id, which nothing bounds — a 4,000
+#: character id mints a 5,408 character token, past the length the endpoint's
+#: own parameter accepts, so the server would hand back a `next_cursor` it then
+#: refuses with 422 and every later session would be unreachable. Measured.
+#:
+#: An offset re-derives against a set that may have changed between requests,
+#: which a keyset would not. That is the honest trade for these paths and no
+#: worse than what they already are: the set is re-derived per request either
+#: way, so it has always been a snapshot.
+_CURSOR_KEYSET = "keyset"
+_CURSOR_OFFSET = "offset"
+
+
+def encode_offset_cursor(offset: int, view: str) -> str:
+    """A position in a materialized, re-derived page sequence (#2960)."""
+    return _encode_cursor(_CURSOR_OFFSET, view, int(offset))
+
+
+def decode_offset_cursor(token: str, view: str) -> int:
+    """An offset token back into a count, refusing anything else."""
+    value = _decode_cursor(_CURSOR_OFFSET, token, view)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SessionCursorError("cursor's offset is not a count")
+    return value
+
+
+def _encode_cursor(kind: str, view: str, keys: Any) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps(
+            {"v": _CURSOR_VERSION, "kind": kind, "view": view, "k": keys},
+            separators=(",", ":"),
+            # UTF-8 rather than ASCII escapes. A size choice, not a guard —
+            # what keeps a token inside the parameter that takes it is
+            # `SESSION_CURSOR_MAX_LENGTH`, which is derived from the escaped
+            # worst case and holds either way. This just stops an ordinary
+            # non-ASCII session id from costing twelve characters per emoji.
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(kind: str, token: str, view: str) -> Any:
+    """The shared envelope checks: readable, this version, this kind, this view.
+
+    ``kind`` is checked rather than dispatched on, so a token minted for one
+    paging model can never be read by the other — the two mean different things
+    by the same field, and a caller silently accepting the wrong one resumes at
+    a position that was never its own.
+    """
+    if not isinstance(token, str) or not token:
+        raise SessionCursorError("cursor is empty")
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception as exc:
+        raise SessionCursorError("cursor is not readable") from exc
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise SessionCursorError("cursor was minted by a different version")
+    if payload.get("kind") != kind:
+        raise SessionCursorError(
+            f"cursor names a {payload.get('kind')!r} position, not {kind!r}"
+        )
+    if payload.get("view") != view:
+        raise SessionCursorError(
+            f"cursor belongs to the {payload.get('view')!r} view, not {view!r}"
+        )
+    return payload.get("k")
+
+
 def encode_session_cursor(session: Dict[str, Any], view: str) -> str:
     """One page's last row, spelled so the next request can resume from it.
 
@@ -765,22 +845,9 @@ def encode_session_cursor(session: Dict[str, Any], view: str) -> str:
     spelling the Python-side continuation compares in, so a cursor means one
     thing on every path that can honour it.
     """
-    return base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "v": _CURSOR_VERSION,
-                "view": view,
-                "k": list(session_cursor_values(session)),
-            },
-            separators=(",", ":"),
-            # UTF-8 rather than ASCII escapes. A size choice, not a guard —
-            # what keeps a token inside the parameter that takes it is
-            # `SESSION_CURSOR_MAX_LENGTH`, which is derived from the escaped
-            # worst case and holds either way. This just stops an ordinary
-            # non-ASCII session id from costing twelve characters per emoji.
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).decode("ascii").rstrip("=")
+    return _encode_cursor(
+        _CURSOR_KEYSET, view, list(session_cursor_values(session))
+    )
 
 
 def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
@@ -796,20 +863,7 @@ def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
     caller that runs a SQL page binds it for its own engine — so this codec
     stays the one thing both the SQL and the Python continuation can share.
     """
-    if not isinstance(token, str) or not token:
-        raise SessionCursorError("cursor is empty")
-    padded = token + "=" * (-len(token) % 4)
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
-    except Exception as exc:
-        raise SessionCursorError("cursor is not readable") from exc
-    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
-        raise SessionCursorError("cursor was minted by a different version")
-    if payload.get("view") != view:
-        raise SessionCursorError(
-            f"cursor belongs to the {payload.get('view')!r} view, not {view!r}"
-        )
-    values = payload.get("k")
+    values = _decode_cursor(_CURSOR_KEYSET, token, view)
     if not isinstance(values, list) or len(values) != len(SESSION_ORDER):
         raise SessionCursorError("cursor does not carry this ordering's keys")
     for (column, _), value in zip(SESSION_ORDER, values):

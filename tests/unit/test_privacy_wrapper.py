@@ -3,6 +3,9 @@ Tests for the Privacy-Enforcing Storage Wrapper.
 """
 
 import warnings
+import json
+from datetime import datetime, timedelta
+
 import pytest
 from unittest.mock import Mock, AsyncMock, PropertyMock
 from kestrel_sovereign.privacy import PrivacyMode
@@ -525,6 +528,49 @@ class TestPrivacyAwareQueries:
         assert await wrapper.list_session_page("agent-1", view="archived") == {
             "sessions": [], "next_cursor": None
         }
+
+    @pytest.mark.asyncio
+    async def test_a_grouped_page_mints_a_cursor_the_endpoint_accepts(
+        self, mock_storage
+    ):
+        """The grouped paths page by OFFSET, and that is why.
+
+        Nothing bounds a session id arriving in ``metadata.session_id`` on
+        these paths — the projection's storability rule does not apply, because
+        there is no projection. A keyset cursor would carry that id, and a
+        4,000-character one mints a 5,408-character token against a bound of
+        4,224: the server would hand back a ``next_cursor`` its own parameter
+        then refuses with 422, and every later session would be unreachable.
+
+        An offset names a position in a set this path materializes anyway.
+        """
+        from kestrel_sovereign.storage.conversation_sessions import (
+            SESSION_CURSOR_MAX_LENGTH,
+        )
+
+        huge = "s" * 4000
+        now = datetime(2026, 5, 1, 9, 0, 0)
+        mock_storage.db.fetchall.return_value = [
+            (index, "user", f"m{index}", json.dumps({"session_id": f"{huge}-{index}"}),
+             now + timedelta(hours=index * 3))
+            for index in range(3)
+        ]
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        page = await wrapper.list_session_page("agent-1", limit=1, view="archived")
+
+        assert len(page["sessions"]) == 1
+        token = page["next_cursor"]
+        assert token, "three sessions and a page of one must offer a next page"
+        assert len(token) <= SESSION_CURSOR_MAX_LENGTH, (
+            f"the archived view minted a {len(token)}-character cursor its own "
+            f"endpoint refuses past {SESSION_CURSOR_MAX_LENGTH}"
+        )
+        # ...and it resumes where it stopped.
+        second = await wrapper.list_session_page(
+            "agent-1", limit=1, view="archived", cursor=token
+        )
+        assert second["sessions"][0]["session_id"] != page["sessions"][0]["session_id"]
 
     @pytest.mark.asyncio
     async def test_list_session_page_archived_reads_without_a_row_cap(self, mock_storage):

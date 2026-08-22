@@ -1489,13 +1489,25 @@ def _normalized_history_row(row: Sequence[Any]) -> Dict[str, Any]:
 def _page_grouped_sessions(
     rows: List[Dict[str, Any]], *, limit: int, cursor: Optional[str], view: str
 ) -> Dict[str, Any]:
-    """:func:`page_grouped_sessions`, with this endpoint's cursor on both ends."""
-    from .conversation_sessions import decode_session_cursor, encode_session_cursor
+    """:func:`page_grouped_sessions`, paged by OFFSET (#2960).
 
-    after = decode_session_cursor(cursor, view) if cursor else None
-    sessions, has_more = page_grouped_sessions(rows, limit=limit, after=after)
+    These paths have no table. They derive and order the whole set inside one
+    request and then slice it, so a position in that slice is what a cursor
+    names here — and an offset is exactly that. The projection's keyset cursor
+    would be wrong twice over: nothing bounds a grouped session's id, so the
+    token could outgrow the parameter the endpoint accepts (measured: a 4,000
+    character id mints a 5,408 character token against a 4,224 bound), and the
+    set is re-derived per request anyway, so the stability a keyset buys is
+    stability this path never had.
+    """
+    from .conversation_sessions import decode_offset_cursor, encode_offset_cursor
+
+    offset = decode_offset_cursor(cursor, view) if cursor else 0
+    sessions, has_more = page_grouped_sessions(rows, limit=limit, offset=offset)
     next_cursor = (
-        encode_session_cursor(sessions[-1], view) if has_more and sessions else None
+        encode_offset_cursor(offset + len(sessions), view)
+        if has_more and sessions
+        else None
     )
     return {"sessions": sessions, "next_cursor": next_cursor}
 

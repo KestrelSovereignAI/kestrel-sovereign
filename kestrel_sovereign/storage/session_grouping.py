@@ -696,59 +696,6 @@ def session_cursor_values(session: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-def _strictly_after(value: Any, pivot: Any, descending: bool) -> bool:
-    """Whether ``value`` sits past ``pivot`` in one key's own direction.
-
-    Both keys of :data:`SESSION_ORDER` are non-null — by schema in the
-    projection, and by construction in the grouper, which substitutes the
-    preceding row's instant for an undatable row rather than leaving a stamp
-    out. So there is no NULL placement to agree on with
-    :func:`session_cursor_clause`, and a ``None`` arriving here raises rather
-    than being given a position: an invented one would be this rendering's
-    alone, and the two would then disagree about where that session sits.
-    """
-    return value < pivot if descending else value > pivot
-
-
-def session_cursor_after(
-    sessions: List[Dict[str, Any]], after: Optional[Sequence[Any]]
-) -> List[Dict[str, Any]]:
-    """The sessions strictly after ``after``, in :data:`SESSION_ORDER`.
-
-    The Python rendering of :func:`session_cursor_clause`, for the two paths
-    that have no table to page: ISOLATED privacy mode, whose conversations live
-    in an in-memory buffer, and the archived view, whose membership the #2959
-    projection does not describe. One declaration, two renderings, and a
-    differential test — the arrangement :func:`sort_sessions` and
-    :func:`session_order_sql` already share, for the same reason.
-
-    ``sessions`` is assumed sorted by :func:`sort_sessions`; this filters, it
-    does not order.
-    """
-    if after is None:
-        return list(sessions)
-    if len(after) != len(SESSION_ORDER):
-        raise ValueError(
-            f"session cursor needs {len(SESSION_ORDER)} values, got {len(after)}"
-        )
-    pivot = tuple(
-        session_order_value(column, value)
-        for (column, _), value in zip(SESSION_ORDER, after)
-    )
-    kept = []
-    for session in sessions:
-        keys = session_cursor_values(session)
-        for index, (_, descending) in enumerate(SESSION_ORDER):
-            if keys[index] == pivot[index]:
-                continue
-            if _strictly_after(keys[index], pivot[index], descending):
-                kept.append(session)
-            break
-        # Falling off the loop means equal on every key, which is the cursor's
-        # own row — behind it, not after it.
-    return kept
-
-
 def sort_sessions(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Order session dicts by :data:`SESSION_ORDER`, in place.
 
@@ -765,7 +712,7 @@ def page_grouped_sessions(
     messages: Iterable[Dict[str, Any]],
     *,
     limit: int,
-    after: Optional[Sequence[Any]] = None,
+    offset: int = 0,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Group an OLDEST-FIRST transcript into one page of sessions.
 
@@ -790,7 +737,7 @@ def page_grouped_sessions(
         group_messages_into_sessions(messages, keep_empty_markers=True)
     )
     sort_sessions(grouped)
-    remaining = session_cursor_after(grouped, after)
+    remaining = grouped[max(0, int(offset)):]
     bounded = max(1, int(limit))
     return remaining[:bounded], len(remaining) > bounded
 

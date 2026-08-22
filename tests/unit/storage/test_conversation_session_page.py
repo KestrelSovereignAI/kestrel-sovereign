@@ -46,7 +46,6 @@ from kestrel_sovereign.storage.conversation_sessions import (
 from kestrel_sovereign.storage.session_id_column import SESSION_ID_MAX_LENGTH
 from kestrel_sovereign.storage.session_grouping import (
     SESSION_ORDER,
-    session_cursor_after,
     session_order_index_columns,
     session_order_sql,
     sort_sessions,
@@ -113,20 +112,25 @@ async def _page_all_sql(projection, limit: int) -> List[str]:
 
 
 def _page_all_python(rows: List[Dict[str, Any]], limit: int) -> List[str]:
-    """The same walk over the same rows, through the Python rendering."""
+    """The same sessions, ordered and sliced rather than walked by key.
+
+    This is what the grouped paths do — ISOLATED's buffer and the archived view
+    materialize the whole set, order it, and take a window — so it is the
+    answer the keyset walk has to agree with. Two paging MODELS over one
+    ordering, which is the disagreement worth catching: a keyset that resumes
+    even slightly wrong lands somewhere a slice never would.
+    """
     ordered = sort_sessions(list(rows))
     seen: List[str] = []
-    after = None
+    offset = 0
     for _ in range(500):
-        remaining = session_cursor_after(ordered, after)
-        page = remaining[:limit]
+        page = ordered[offset:offset + limit]
         if not page:
             return seen
         seen.extend(row["session_id"] for row in page)
+        offset += len(page)
         if len(page) < limit:
             return seen
-        token = encode_session_cursor(page[-1], "active")
-        after = decode_session_cursor(token, "active")
     raise AssertionError("paging did not terminate")
 
 
@@ -150,10 +154,11 @@ async def test_paging_reaches_every_session_exactly_once(tmp_path, limit):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2, 5, 37, 100])
 async def test_the_sql_page_and_the_python_page_are_the_same_walk(tmp_path, limit):
-    """The differential. Two renderings of :data:`SESSION_ORDER`, one answer.
+    """The differential. Two paging models over one ordering, one answer.
 
-    The active view pages in the engine and the archived view pages in Python;
-    a caller cannot tell which served it, so they must not be able to tell.
+    The active view walks the projection by key in the engine; the archived
+    view and ISOLATED materialize their sessions and slice. A caller cannot
+    tell which served it, so they must not be able to tell.
     """
     rows = _rows()
     db, projection = await _seeded(tmp_path, f"diff-{limit}.db", rows)
@@ -365,7 +370,8 @@ def test_a_cursor_whose_timestamp_is_not_one_is_refused(stamp):
     and quietly selects the wrong page.
     """
     token = base64.urlsafe_b64encode(
-        json.dumps({"v": 1, "view": "active", "k": [stamp, "sess-001"]}).encode()
+        json.dumps({"v": 1, "kind": "keyset", "view": "active",
+                    "k": [stamp, "sess-001"]}).encode()
     ).decode().rstrip("=")
     with pytest.raises(SessionCursorError):
         decode_session_cursor(token, "active")
@@ -375,7 +381,8 @@ def test_a_cursor_carrying_a_real_timestamp_is_accepted():
     """...and the refusal above is not simply refusing everything."""
     token = base64.urlsafe_b64encode(
         json.dumps(
-            {"v": 1, "view": "active", "k": ["2026-05-01 09:00:00", "sess-001"]}
+            {"v": 1, "kind": "keyset", "view": "active",
+             "k": ["2026-05-01 09:00:00", "sess-001"]}
         ).encode()
     ).decode().rstrip("=")
     assert decode_session_cursor(token, "active") == (
@@ -476,7 +483,7 @@ def test_a_cursor_carrying_a_null_key_is_refused(keys):
     with ``None`` and raises (a 500), the SQL one compares against NULL and
     quietly serves an empty page."""
     token = base64.urlsafe_b64encode(
-        json.dumps({"v": 1, "view": "active", "k": keys}).encode()
+        json.dumps({"v": 1, "kind": "keyset", "view": "active", "k": keys}).encode()
     ).decode().rstrip("=")
     with pytest.raises(SessionCursorError):
         decode_session_cursor(token, "active")

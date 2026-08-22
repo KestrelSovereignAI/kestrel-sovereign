@@ -193,6 +193,47 @@ test('a same-view refresh clears a superseded continuation\'s lock', async () =>
     handle.destroy();
 });
 
+test('a continuation cannot join a refresh that has not landed yet', async () => {
+    // The old Load more button is still painted while a same-view reload is in
+    // flight. A click on it captures the NEW generation — so the stale guard
+    // would wave it through — and it would append the PREVIOUS generation's
+    // rows and overwrite the cursor page one is about to set.
+    const el = makeContainer();
+    const calls = [];
+    let releaseFirst;
+    const gate = new Promise((resolve) => { releaseFirst = resolve; });
+    let reloaded = false;
+    const api = {
+        getConversations: async (decrypt, view, cursor) => {
+            calls.push(cursor ?? null);
+            if (cursor === 'stale-cursor') {
+                return { conversations: [conversation('from-old-generation')], next_cursor: null };
+            }
+            if (reloaded) { await gate; return { conversations: [conversation('fresh')], next_cursor: 'fresh-cursor' }; }
+            return { conversations: [conversation('a')], next_cursor: 'stale-cursor' };
+        },
+        listTrash: async () => ({ messages: [] }),
+    };
+    const handle = mountConversations(el, { api, agentName: 'Emma' });
+    await settle();
+    assert.ok(moreBtn(el), 'page one offered a continuation');
+
+    reloaded = true;
+    const reloading = handle.refresh();   // same view, page one gated
+    await settle();
+    moreBtn(el)?.click();                 // the stale button, mid-reload
+    await settle();
+    releaseFirst();
+    await reloading;
+    await settle();
+
+    assert.ok(!calls.includes('stale-cursor'),
+        'a continuation from the previous generation was allowed to run');
+    assert.deepEqual(rows(el).map((r) => r.dataset.sessionId), ['fresh']);
+    assert.equal(handle.hasMore, true, 'the reload\'s own cursor must survive');
+    handle.destroy();
+});
+
 test('a page that lands after a view switch is dropped, not appended', async () => {
     // The stale-response guard the list already has for refresh(), applied to
     // the continuation: appending a page belonging to the previous view paints
