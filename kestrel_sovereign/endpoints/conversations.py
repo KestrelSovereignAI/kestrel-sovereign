@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["conversations"])
 
+
 def _public_metadata(meta):
     """Return metadata safe for user-facing conversation history payloads."""
     if not isinstance(meta, dict):

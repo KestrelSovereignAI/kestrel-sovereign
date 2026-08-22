@@ -123,6 +123,11 @@ async def test_archive_does_not_touch_deleted_rows(tmp_path):
         ) == []
 
 
+def _listed(page):
+    """The session ids one page of the conversation list carries (#2960)."""
+    return [session["session_id"] for session in page["sessions"]]
+
+
 @pytest.mark.asyncio
 async def test_session_archive_round_trip_through_privacy_wrapper(tmp_path):
     """End-to-end via the privacy wrapper (the HTTP-endpoint path).
@@ -142,9 +147,11 @@ async def test_session_archive_round_trip_through_privacy_wrapper(tmp_path):
         ]:
             await wrapper.add_conversation(role, content, session_id=session_id)
 
-        # Active view has all three; archived view is empty.
-        assert len(await wrapper.query_conversations(AGENT_ID, view="active")) == 3
-        assert await wrapper.query_conversations(AGENT_ID, view="archived") == []
+        # Active view lists the session; archived view is empty.
+        assert _listed(await wrapper.list_session_page(AGENT_ID)) == [session_id]
+        assert _listed(
+            await wrapper.list_session_page(AGENT_ID, view="archived")
+        ) == []
         assert await wrapper.list_archived_conversations() == []
 
         # Archive the whole session.
@@ -152,8 +159,10 @@ async def test_session_archive_round_trip_through_privacy_wrapper(tmp_path):
         assert archived == 3
 
         # Active view drops it; archived view + list surface it.
-        assert await wrapper.query_conversations(AGENT_ID, view="active") == []
-        assert len(await wrapper.query_conversations(AGENT_ID, view="archived")) == 3
+        assert _listed(await wrapper.list_session_page(AGENT_ID)) == []
+        archived_page = await wrapper.list_session_page(AGENT_ID, view="archived")
+        assert _listed(archived_page) == [session_id]
+        assert archived_page["sessions"][0]["message_count"] == 3
         arch_list = await wrapper.list_archived_conversations()
         assert len(arch_list) == 3
         assert all(m["archived_at"] is not None for m in arch_list)
@@ -164,8 +173,10 @@ async def test_session_archive_round_trip_through_privacy_wrapper(tmp_path):
         )
         assert unarchived == 3
 
-        assert len(await wrapper.query_conversations(AGENT_ID, view="active")) == 3
-        assert await wrapper.query_conversations(AGENT_ID, view="archived") == []
+        assert _listed(await wrapper.list_session_page(AGENT_ID)) == [session_id]
+        assert _listed(
+            await wrapper.list_session_page(AGENT_ID, view="archived")
+        ) == []
         assert await wrapper.list_archived_conversations() == []
 
 
@@ -180,4 +191,4 @@ async def test_archive_view_default_is_active(tmp_path):
         await wrapper.archive_conversation_session(session_id, AGENT_ID)
 
         # Garbage view -> active semantics -> archived row hidden.
-        assert await wrapper.query_conversations(AGENT_ID, view="bogus") == []
+        assert _listed(await wrapper.list_session_page(AGENT_ID, view="bogus")) == []
