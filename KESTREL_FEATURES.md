@@ -603,7 +603,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `get_child_result` |  | `agent_management` | `child_name` | 53 | `enabled` |
 | `list_children` |  | `agent_management` |  | 27 | `enabled` |
 | `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 369 | `enabled` |
-| `terminate_child` |  | `agent_management` | `child_name` | 53 | `enabled` |
+| `terminate_child` |  | `agent_management` | `child_name`, `offboard_runtime` | 118 | `enabled` |
 
 ### `state_of_mind` (StateOfMindFeature)
 
@@ -1102,6 +1102,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
