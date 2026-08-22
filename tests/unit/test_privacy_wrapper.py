@@ -493,13 +493,18 @@ class TestPrivacyAwareQueries:
         mock_storage.list_session_page = AsyncMock()
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
 
+        # TWO USER turns, because that is what makes the order observable: the
+        # preview picker takes the FIRST user row, so a transcript with one user
+        # turn previews the same text whichever way round it is read, and a test
+        # built that way passes with the buffer reversed.
         await wrapper.add_conversation("user", "Hello")
         await wrapper.add_conversation("assistant", "Hi")
+        await wrapper.add_conversation("user", "and another thing")
 
         page = await wrapper.list_session_page("agent-1")
         assert len(page["sessions"]) == 1
         assert page["sessions"][0]["preview_content"] == "Hello"
-        assert page["sessions"][0]["message_count"] == 2
+        assert page["sessions"][0]["message_count"] == 3
         assert page["next_cursor"] is None
         # Should NOT touch persistent storage.
         mock_storage.list_session_page.assert_not_called()
