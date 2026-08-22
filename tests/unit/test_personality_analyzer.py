@@ -275,7 +275,10 @@ class TestPersonalityAnalyzerDecryption:
                 await db.execute(
                     "INSERT INTO conversation_history "
                     "(agent_id, role, content, metadata, created_at) "
-                    "VALUES (?, 'assistant', ?, ?, '2025-01-01T00:00:00Z')",
+                    # Spelled as the column now requires (#3009): an ISO stamp
+                    # with a T and a Z is refused by its CHECK, and no writer
+                    # in this codebase produced one.
+                    "VALUES (?, 'assistant', ?, ?, '2025-01-01 00:00:00')",
                     (agent_id, ciphertext, meta),
                 )
             await db.commit()

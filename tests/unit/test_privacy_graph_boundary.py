@@ -2656,12 +2656,19 @@ async def test_volatile_run_consolidation_skips_durable_path(tmp_path, mode):
     mode: no temporal patterns (the raw-DB leak the graph proxy can't see), no
     episodes, and an explicit privacy-blocked report so the manual
     ``memory_consolidate`` tool cannot report success (#2672 P5)."""
+    from kestrel_sovereign.storage.conversation_created_at import (
+        canonical_created_at,
+    )
     from kestrel_sovereign.storage.memory_system import MemorySystem
 
     async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
         now = datetime.now(timezone.utc)
         for i in range(30):
-            ts = (now - timedelta(days=1, minutes=i)).isoformat()
+            # ``canonical_created_at`` rather than ``isoformat()``: the column
+            # carries a CHECK since #3009 and refuses the ISO spelling, which
+            # nothing in this codebase writes. The case is about consolidation,
+            # not about timestamp text.
+            ts = canonical_created_at(now - timedelta(days=1, minutes=i))
             await raw.db.execute(
                 "INSERT INTO conversation_history "
                 "(agent_id, role, content, metadata, created_at) "

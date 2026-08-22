@@ -48,6 +48,10 @@ from kestrel_sovereign.storage.conversation_sessions import (
     PROJECTION_INPUT_COLUMNS,
     ConversationSessionProjection,
 )
+from kestrel_sovereign.storage.conversation_created_at import (
+    created_at_bind,
+    created_at_check,
+)
 from kestrel_sovereign.storage.session_grouping import (
     group_messages_into_sessions,
     timestamp_query_param,
@@ -1531,12 +1535,30 @@ async def _create_core_tables(db: AsyncDatabase, *tables: str) -> None:
     ``_create_pre_migration_table`` above deliberately builds a legacy shape by
     hand. These tests need the current one, and hand-copying it is how a
     fixture starts testing a table the product does not have.
+
+    ``conversation_history`` is fetched from its own template rather than from
+    ``CORE_SCHEMA``, because since #3009 that is where it is declared: its
+    CHECK is per-backend, and ``normalize_schema`` would strip the column
+    default on the way to SQLite (#3048). Same reasoning as the projection's
+    own tables below — take the shipped declaration, wherever the product keeps
+    it.
     """
     from kestrel_sovereign.storage.async_database import CORE_SCHEMA
+    from kestrel_sovereign.storage.conversation_created_at import (
+        conversation_history_ddl,
+    )
     from kestrel_sovereign.storage.db import normalize_schema
 
     statements = normalize_schema(CORE_SCHEMA, db.backend_type).split(";")
     for table in tables:
+        if table == "conversation_history":
+            await db.execute(
+                conversation_history_ddl(db.backend_type).replace(
+                    "CREATE TABLE {table}",
+                    "CREATE TABLE IF NOT EXISTS conversation_history",
+                )
+            )
+            continue
         needle = f"CREATE TABLE IF NOT EXISTS {table} ("
         matching = [s for s in statements if needle in s]
         assert len(matching) == 1, f"{table}: {len(matching)} declarations in CORE_SCHEMA"
@@ -3241,58 +3263,161 @@ async def test_tied_sessions_page_by_code_point_not_by_locale(postgres_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_concurrent_initializers_create_the_undated_table_once(postgres_db):
+    """The same post-upgrade burst, for the table #3009 adds.
+
+    ``_init_schema`` runs on every ``from_pool()``, so the first boot after
+    this ticket ships is genuinely parallel and none of its objects exist yet.
+    A bare ``CREATE TABLE IF NOT EXISTS`` evaluates its existence test before
+    taking the lock that would exclude a peer, so several initializers proceed
+    and the losers die on ``pg_class``'s unique index — not a skipped table, a
+    failed request. This is the case that made the projection's own schema pass
+    go through probe -> lock -> re-probe, and it applies unchanged here.
+
+    PostgreSQL-only, for the reason its neighbour above gives: SQLite
+    serializes writers on one file and cannot exhibit the catalog race, so a
+    dual-backend spelling would contribute a leg that passes whatever the code
+    does.
+
+    Bounded, because a lock test that can hang reports nothing.
+    """
+    from kestrel_sovereign.storage.conversation_created_at import UNDATED_TABLE
+
+    async with _schema_every_task_can_see(postgres_db) as db:
+        await _create_core_tables(db, *_PROJECTION_TABLES)
+        assert await db.table_exists(UNDATED_TABLE) is False
+
+        outcomes = await _before_the_budget(
+            db,
+            "eight concurrent initializers creating the undated-row record",
+            asyncio.gather(
+                *(db._migrate_conversation_created_at() for _ in range(8)),
+                return_exceptions=True,
+            ),
+            budget=60.0,
+        )
+        raised = [o for o in outcomes if isinstance(o, BaseException)]
+        assert not raised, raised
+        assert await db.table_exists(UNDATED_TABLE) is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.dual_backend
 @pytest.mark.timeout(120)
-async def test_a_null_stamped_row_is_not_redated_by_an_append(db_backend, monkeypatch):
-    """An undatable row must sort first on BOTH engines, and stay put.
+async def test_a_database_holding_undatable_rows_is_repaired_on_both_engines(
+    db_backend,
+):
+    """#3009's migration, run against a table that already breaks its rule.
 
-    The engines disagree by default: `created_at ASC` puts NULL LAST on
-    PostgreSQL and FIRST on SQLite. That is already two orders wearing one name,
-    and it decides something load-bearing — the grouper dates a row with no
-    readable stamp from the row BEFORE it. Ordered last, an ordinary append to
-    an unrelated session becomes that row's new predecessor and re-dates it;
-    `_plan` sees a pure append, folds only the appended session, and records a
-    current watermark over the session that just changed underneath it.
+    The two backends reach the same place by different routes and it is worth
+    saying which is which. On SQLite the violation can be a SPELLING as well as
+    a NULL, there is no ``ADD CONSTRAINT``, and the retrofit rebuilds the whole
+    table. On PostgreSQL ``created_at`` is a real ``timestamp``, so the only
+    violation possible is NULL, and the constraint is added ``NOT VALID`` and
+    then validated in place. Two mechanisms, one outcome, which is exactly the
+    kind of pair that drifts unless something asks both.
 
-    Ordered first it has no predecessor and cannot acquire one, so its stamp is
-    the epoch and nothing appended later can move it.
-
-    Dual-backend on purpose: the SQLite leg passes either way, which is exactly
-    why the SQLite-only version of this case did not catch it.
+    The undatable row here has a readable row on each side of it, so the choice
+    of neighbour is observable rather than incidental: taking the successor
+    would date the message AFTER the reply that follows it.
     """
-    from kestrel_sovereign.storage.async_conversation_store import (
-        AsyncConversationStore,
+    from kestrel_sovereign.storage.conversation_created_at import (
+        CONSTRAINT_NAME,
+        UNDATED_TABLE,
     )
 
-    _without_embeddings(monkeypatch)
+    agent_id = f"did:test:created-at-repair:{uuid4()}"
+    async with _isolated_schema(db_backend) as db:
+        await _create_pre_migration_table(db)
+        stamps = ["2026-03-01 09:00:00", None, "2026-03-01 09:10:00"]
+        for index, stamp in enumerate(stamps):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
+                (agent_id, f"turn {index}",
+                 created_at_bind(db.backend_type, stamp)),
+            )
+
+        await db._migrate_conversation_created_at()
+
+        repaired = [
+            row[0] for row in await db.fetchall(
+                "SELECT created_at FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (agent_id,),
+            )
+        ]
+        assert [str(value)[:19] for value in repaired] == [
+            "2026-03-01 09:00:00",
+            "2026-03-01 09:00:00",   # its PREDECESSOR, not its successor
+            "2026-03-01 09:10:00",
+        ]
+        recorded = await db.fetchall(
+            f"SELECT original_created_at, derived_from FROM {UNDATED_TABLE} "
+            "WHERE agent_id = ?", (agent_id,),
+        )
+        assert recorded == [(None, "predecessor")], (
+            "the repair rewrote a row without recording what it replaced"
+        )
+        assert await db._check_constraint_exists(
+            "conversation_history", CONSTRAINT_NAME,
+            created_at_check(db.backend_type),
+        ), "the constraint did not land after the rows were made to satisfy it"
+
+        with pytest.raises(Exception) as refused:
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, created_at) "
+                "VALUES (?, 'user', 'after', NULL)",
+                (agent_id,),
+            )
+        assert CONSTRAINT_NAME in str(refused.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.timeout(120)
+async def test_a_stamp_no_reader_can_date_is_refused_by_both_engines(db_backend):
+    """The NULL stamp both engines used to accept, refused on both (#3009).
+
+    This case used to be about ORDER: the engines disagree by default —
+    ``created_at ASC`` puts NULL LAST on PostgreSQL and FIRST on SQLite — and
+    the grouper dates a row with no readable stamp from the row BEFORE it.
+    Ordered last, an ordinary append to an unrelated session became that row's
+    new predecessor and re-dated it, while ``_plan`` saw a pure append, folded
+    only the appended session, and recorded a current watermark over the
+    session that had changed underneath it.
+
+    ``canonical_order()`` still places its NULLs explicitly and that is still
+    load-bearing for the read path. But the row this defended against can no
+    longer be WRITTEN: the column's CHECK refuses a NULL stamp, and #3009's
+    migration re-dates the ones already stored from a neighbour once, durably,
+    rather than every reader re-deriving it. So the claim moves down a layer —
+    from "the order copes with such a row" to "such a row does not arrive" —
+    and is asked of both engines, because the CHECK is rendered differently on
+    each and only PostgreSQL's type does half the work for it.
+
+    ``test_after_the_migration_both_readers_can_date_every_row`` in
+    ``tests/unit/storage/test_conversation_created_at.py`` is the other half:
+    the rows a database ALREADY held.
+    """
     agent_id = f"did:test:null-stamp:{uuid4()}"
     async with _isolated_schema(db_backend) as db:
         await _create_projection_schema(db)
-        store = AsyncConversationStore(db, agent_id=agent_id)
-
-        await db.execute(
-            "INSERT INTO conversation_history "
-            "(agent_id, role, content, metadata, session_id, created_at) "
-            "VALUES (?, 'user', 'undatable', ?, ?, NULL)",
-            (agent_id, json.dumps({"session_id": UUID_A}), UUID_A),
+        with pytest.raises(Exception) as refused:
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, session_id, created_at) "
+                "VALUES (?, 'user', 'undatable', ?, ?, NULL)",
+                (agent_id, json.dumps({"session_id": UUID_A}), UUID_A),
+            )
+        assert "conversation_history_created_at_canonical" in str(refused.value), (
+            f"the row was refused, but not by the constraint: {refused.value}"
         )
-        projection = ConversationSessionProjection(db, agent_id)
-        assert (await projection.repair()).current
-        before = await projection.get(UUID_A)
-        assert before is not None, "the undatable session was not projected"
-
-        # An ordinary append, to a DIFFERENT session.
-        await store.add_conversation("user", "unrelated later turn", session_id=UUID_B)
-        assert (await projection.repair()).current
-
-        assert await projection.get(UUID_A) == before, (
-            "appending to another session moved the undatable session's stored "
-            "row; on this backend the NULL stamp sorts last, so the append "
-            "became its predecessor"
-        )
-        await _assert_the_projection_agrees_with_the_grouper(
-            db, projection, agent_id
-        )
+        # Not followed by a COUNT: PostgreSQL aborts the whole transaction on a
+        # constraint violation, so any statement issued after it on the same
+        # connection fails with "current transaction is aborted" and would
+        # assert nothing about the row. The named constraint IS the claim.
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,19 @@ from .db import (
     normalize_schema,
 )
 from .db.sqlite import _minimum_close_timeout_s
+from .conversation_created_at import (
+    CONSTRAINT_NAME as CREATED_AT_CONSTRAINT,
+    UNDATED_DDL,
+    UNDATED_TABLE,
+    canonical_created_at,
+    canonical_sql,
+    conversation_history_ddl,
+    created_at_bind,
+    created_at_check,
+    derived_stamp,
+    noncanonical_predicate,
+    repairable_bulk_update,
+)
 from .session_id_column import backfill_statement
 
 logger = logging.getLogger(__name__)
@@ -191,22 +204,13 @@ CREATE TABLE IF NOT EXISTS schema_backfills (
     completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS conversation_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    rendered_content TEXT DEFAULT NULL,
-    model TEXT DEFAULT NULL,
-    provider TEXT DEFAULT NULL,
-    metadata TEXT,
-    session_id TEXT DEFAULT NULL,
-    lexical_index_id TEXT DEFAULT NULL,
-    lexical_index_version TEXT DEFAULT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP DEFAULT NULL,
-    archived_at TIMESTAMP DEFAULT NULL
-);
+-- conversation_history is created from
+-- ``conversation_created_at.conversation_history_ddl()``, immediately before
+-- this schema runs, and NOT from this text. Its CHECK is per-backend, and
+-- ``normalize_schema`` strips ``DEFAULT CURRENT_TIMESTAMP`` on the way to
+-- SQLite (#3048) — the column that has to stop being nullable is the last one
+-- that can afford to lose its default. The indexes below still belong here,
+-- because the table exists by the time they run.
 
 CREATE TABLE IF NOT EXISTS conversation_lexical_tokens (
     agent_id TEXT NOT NULL,
@@ -823,6 +827,31 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
 """
 
 
+def core_schema_sql(backend_type: str) -> str:
+    """The whole core schema for one backend, in dependency order.
+
+    ``CORE_SCHEMA`` stopped being the whole of it when #3009 moved
+    ``conversation_history`` into ``conversation_created_at``: its CHECK is
+    per-backend, and ``normalize_schema`` strips the column default on the way
+    to SQLite (#3048). Its indexes stayed behind in ``CORE_SCHEMA``, so the
+    table has to come FIRST.
+
+    This exists because three callers build a database out of that text and
+    each was silently left with a schema missing one table — and, because the
+    indexes are still declared, an error rather than a quiet gap. They asked
+    for "the core schema" and should go on getting it; where a table happens to
+    be declared is this module's business, not theirs.
+    """
+    return (
+        conversation_history_ddl(backend_type).replace(
+            "CREATE TABLE {table}",
+            "CREATE TABLE IF NOT EXISTS conversation_history",
+        )
+        + ";\n"
+        + normalize_schema(CORE_SCHEMA, backend_type)
+    )
+
+
 class AsyncDatabase:
     """
     Async database manager supporting SQLite and PostgreSQL.
@@ -941,7 +970,10 @@ class AsyncDatabase:
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
-        schema = normalize_schema(CORE_SCHEMA, self.backend_type)
+        # Through the accessor, not CORE_SCHEMA directly: conversation_history
+        # is declared per-backend and has to be created before the indexes
+        # CORE_SCHEMA still carries for it. See ``core_schema_sql``.
+        schema = core_schema_sql(self.backend_type)
 
         # Execute each statement separately for PostgreSQL compatibility
         for statement in schema.split(';'):
@@ -1297,6 +1329,12 @@ class AsyncDatabase:
         # so the first read finds it stale and rebuilds it then. A boot-time
         # backfill would have to sit behind a completion marker that would go on
         # claiming "built" for a table the next relink had already moved.
+        # #3009: conversation_history.created_at gains the guarantee its
+        # readers have been standing in for. Before the projection's schema
+        # pass, which the docstring on the method explains at length: on SQLite
+        # the retrofit rebuilds the table and takes the #2959 triggers with it.
+        await self._migrate_conversation_created_at()
+
         await self.ensure_session_projection_schema()
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
@@ -2312,6 +2350,169 @@ class AsyncDatabase:
             "agent_id, session_id",
         )
 
+    async def _migrate_conversation_created_at(self) -> None:
+        """Give ``conversation_history.created_at`` a guarantee (#3009).
+
+        The column promised nothing: nullable, and on SQLite holding whatever
+        text a writer supplied, because ``TIMESTAMP`` there is NUMERIC affinity
+        and an ISO string is stored as TEXT. Every reader carried a fallback
+        for a value only that absence let through. This installs the CHECK the
+        readers have been standing in for, and repairs whatever a database
+        already holds so the CHECK can be true of it.
+
+        Idempotent and cheap after the first run: the constraint IS the marker,
+        so a database that has it skips the scan entirely — no separate ledger
+        that could disagree with the schema.
+
+        Ordered BEFORE ``ensure_session_projection_schema``, and that is
+        load-bearing rather than tidy. On SQLite the retrofit rebuilds the
+        table, and ``DROP TABLE`` takes the #2959 change triggers with it.
+        Running the projection's schema pass afterwards finds the trigger
+        family missing, recreates it, and — because the shape changed —
+        rotates the generation, which invalidates a projection whose rows were
+        just rewritten underneath it. Reversed, the projection would go on
+        claiming to be current for a table it no longer has triggers on.
+        """
+        # Created by the migration that writes to it, and OUTSIDE the
+        # constraint probe below, so it exists on every boot rather than only
+        # on the one that retrofits. A database born with the constraint never
+        # reaches the repair, and would otherwise have nowhere to answer "which
+        # rows did a repair have to date from a neighbour" — including "none",
+        # which is the answer on every healthy host and still worth being able
+        # to ask for. Not routed through ``normalize_schema`` for the same
+        # reason as conversation_history itself: it would strip
+        # ``recorded_at``'s default on the way to SQLite (#3048), which its NOT
+        # NULL then makes unsatisfiable.
+        #
+        # Probe -> lock -> re-probe, not a bare ``CREATE TABLE IF NOT EXISTS``.
+        # That spelling is idempotent in SEQUENCE and unsafe in PARALLEL, which
+        # is the same trap ``ensure_index`` documents at length: PostgreSQL
+        # evaluates the existence test before taking the lock that would
+        # exclude a peer, so two initializers that pass it together both build
+        # the relation and the loser fails on ``pg_class``'s unique index.
+        # ``_init_schema`` runs on every ``from_pool()`` — frinz calls it per
+        # request — so the first post-upgrade request burst IS the parallel
+        # case, and the loser does not merely skip the table: its whole
+        # initialization raises and the request fails.
+        if not await self.table_exists(UNDATED_TABLE):
+            async with self.migration_lock(f"create_{UNDATED_TABLE}"):
+                if not await self.table_exists(UNDATED_TABLE):
+                    await self.execute(UNDATED_DDL)
+        await self.ensure_check_constraint(
+            "conversation_history",
+            CREATED_AT_CONSTRAINT,
+            created_at_check(self.backend_type),
+            canonical_ddl=conversation_history_ddl(self.backend_type),
+            remediation=self._repair_conversation_created_at,
+        )
+
+    async def _repair_conversation_created_at(self) -> None:
+        """Make every existing ``created_at`` canonical, in three passes.
+
+        Runs inside ``ensure_check_constraint``'s migration transaction, so a
+        failure anywhere leaves both the rows and the constraint untouched.
+
+        1. **The engine's pass.** One set-based UPDATE re-spells every row
+           SQLite can read: a ``T`` separator, a ``Z``, an offset (converted to
+           UTC), a bare date, fractional seconds. Nothing on PostgreSQL, where
+           a ``timestamp`` column has no spelling to get wrong.
+        2. **Python's pass**, over what the engine could not read. It accepts
+           more — ``2026-01-02Z``, a lowercase ``t``, the basic form — and
+           re-spells those exactly. Second, deliberately: it and ``strftime``
+           disagree about an impossible day-of-month, and running the engine
+           first means such a value is normalized by the reading that can
+           handle it rather than thrown to the derivation below.
+        3. **Derivation**, for a value neither can read. The row takes its
+           nearest readable neighbour's stamp — which is what every reader
+           already computed for it — and the original text is recorded in
+           ``conversation_history_undated`` beside it. That table is the whole
+           reason this is a repair rather than a quiet overwrite: the database
+           is being rewritten in place, so a value not kept here is gone.
+        """
+        broken = await self.fetchone(
+            "SELECT COUNT(*) FROM conversation_history WHERE "
+            + noncanonical_predicate(self.backend_type)
+        )
+        if not broken or not broken[0]:
+            return
+
+        bulk = repairable_bulk_update(self.backend_type)
+        if bulk:
+            await self.execute(bulk)
+
+        residue = await self.fetchall(
+            "SELECT id, agent_id, created_at FROM conversation_history "
+            "WHERE " + noncanonical_predicate(self.backend_type)
+            + " ORDER BY id"
+        )
+        repaired, derived = 0, 0
+        for message_id, agent_id, raw in residue:
+            stamp = canonical_created_at(raw)
+            origin = "stored"
+            if stamp is None:
+                stamp, origin = derived_stamp(
+                    await self._readable_neighbour(agent_id, message_id, "<"),
+                    await self._readable_neighbour(agent_id, message_id, ">"),
+                )
+                derived += 1
+            else:
+                repaired += 1
+            await self.execute(
+                "UPDATE conversation_history SET created_at = ? WHERE id = ?",
+                (created_at_bind(self.backend_type, stamp), message_id),
+            )
+            if origin == "stored":
+                continue
+            await self.execute(
+                f"INSERT INTO {UNDATED_TABLE} "
+                "(message_id, agent_id, original_created_at, "
+                "derived_created_at, derived_from) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                (
+                    message_id, agent_id,
+                    None if raw is None else str(raw),
+                    created_at_bind(self.backend_type, stamp),
+                    origin,
+                ),
+            )
+        rewritten = broken[0] - len(residue)
+        logger.info(
+            "conversation_history.created_at: %d row(s) were not canonical — "
+            "%d re-spelled by the engine, %d by the parser, %d dated from a "
+            "neighbour and recorded in %s (#3009)",
+            broken[0], rewritten, repaired, derived, UNDATED_TABLE,
+        )
+        if derived:
+            logger.warning(
+                "conversation_history.created_at: %d row(s) carried a value "
+                "nothing could date. Their original text is in %s; the stamp "
+                "now stored is the neighbouring row's, which is what the "
+                "readers were already using for them.",
+                derived, UNDATED_TABLE,
+            )
+
+    async def _readable_neighbour(
+        self, agent_id: str, message_id: int, direction: str
+    ) -> Optional[str]:
+        """The canonical stamp of the nearest datable row on one side of a row.
+
+        ``direction`` is ``"<"`` for the predecessor or ``">"`` for the
+        successor. Scoped to the agent, because a stamp borrowed across a
+        tenant boundary would date one agent's message from another's history.
+        Rows repaired earlier in this pass are eligible: their value is by then
+        their own nearest readable predecessor's, so a run of undatable rows
+        converges on the same stamp whichever way it is read.
+        """
+        order = "DESC" if direction == "<" else "ASC"
+        row = await self.fetchone(
+            "SELECT created_at FROM conversation_history "
+            f"WHERE agent_id = ? AND id {direction} ? "
+            f"AND ({created_at_check(self.backend_type)}) "
+            f"ORDER BY id {order} LIMIT 1",
+            (agent_id, message_id),
+        )
+        return canonical_created_at(row[0]) if row else None
+
     async def ensure_check_constraint(
         self,
         table: str,
@@ -2336,11 +2537,15 @@ class AsyncDatabase:
         the table fresh and rebuilds it here, so the two cannot drift — passing
         a second, hand-copied spelling is exactly the divergence being fixed.
 
-        ``remediation`` is ``(sql, params)`` applied under the lock BEFORE the
-        constraint. Rows predating the constraint may already violate it, and
-        both backends refuse to add it while they do — Postgres fails
-        ``VALIDATE``, SQLite fails the rebuild's INSERT. Deciding what those
-        rows become is the caller's: only it knows which value is the safe one.
+        ``remediation`` is applied under the lock BEFORE the constraint —
+        either ``(sql, params)`` or a zero-argument coroutine function, for a
+        repair no single statement can express. Rows predating the constraint
+        may already violate it, and both backends refuse to add it while they
+        do — Postgres fails ``VALIDATE``, SQLite fails the rebuild's INSERT.
+        Deciding what those rows become is the caller's: only it knows which
+        value is the safe one. A callable runs inside this method's transaction
+        and must not open its own, so a failed repair rolls back with the
+        constraint that depended on it.
 
         Idempotent and safe to call every boot: it probes first, and the whole
         migration runs inside one ``migration_lock`` transaction, so an
@@ -2357,7 +2562,9 @@ class AsyncDatabase:
             # rebuilt the table while this one waited.
             if await self._check_constraint_exists(table, constraint, expression):
                 return
-            if remediation is not None:
+            if callable(remediation):
+                await remediation()
+            elif remediation is not None:
                 sql, params = remediation
                 await self.execute(sql, params)
 
@@ -2424,16 +2631,28 @@ class AsyncDatabase:
         ``sqlite_master`` and replayed, because ``DROP TABLE`` takes them with
         it and a silently-missing index degrades queries without failing them.
 
+        **Columns the canonical DDL does not declare are carried across**, with
+        the type and default the live table gives them. A constraint retrofit
+        is not a reshaping: a column present here but absent from the template
+        is almost always one a later ``ALTER`` added — ``conversation_history``
+        gains ``embedding_vec`` and ``embedding_profile_id`` that way, in
+        backend-shaped migrations no single template can declare — and copying
+        only the intersection would silently delete every stored embedding on
+        SQLite. This helper cannot tell a deliberate removal from an
+        un-templated column, so it keeps the data and lets the caller drop a
+        column explicitly if it ever means to.
+
         Runs inside the caller's ``migration_lock`` transaction, so a failure
         anywhere leaves the original table untouched.
         """
         staging = f"{table}__rebuild"
-        old_columns = [
-            r[1]
+        live = [
+            (r[1], r[2], r[3], r[4])
             for r in await self._backend.fetch_all(
                 f"PRAGMA table_info('{table}')"
             )
         ]
+        old_columns = [name for name, _type, _notnull, _default in live]
         index_ddl = [
             r[0]
             for r in await self._backend.fetch_all(
@@ -2451,8 +2670,8 @@ class AsyncDatabase:
                 f"PRAGMA table_info('{staging}')"
             )
         ]
-        # Copy the intersection in the NEW table's order. A column the new
-        # shape drops is intentionally left behind; one it adds takes its
+        # Copy the intersection in the NEW table's order, then everything the
+        # template did not declare. A column the new shape adds takes its
         # declared default rather than a NULL the DDL may forbid.
         shared = [c for c in new_columns if c in old_columns]
         if not shared:
@@ -2460,7 +2679,22 @@ class AsyncDatabase:
                 f"{table}: canonical DDL shares no columns with the live "
                 "table; refusing to rebuild"
             )
-        column_list = ", ".join(shared)
+        carried = [c for c in old_columns if c not in new_columns]
+        for name, col_type, notnull, default in live:
+            if name not in carried:
+                continue
+            # Spelled from what the live table reports, so a carried column
+            # keeps the shape it had. ``ADD COLUMN`` cannot introduce NOT NULL
+            # without a default, but a column that reached the live table by
+            # ``ADD COLUMN`` already satisfies that; anything else raises here
+            # rather than being quietly dropped.
+            definition = f"{name} {col_type or 'BLOB'}"
+            if default is not None:
+                definition += f" DEFAULT {default}"
+            if notnull:
+                definition += " NOT NULL"
+            await self.execute(f"ALTER TABLE {staging} ADD COLUMN {definition}")
+        column_list = ", ".join(shared + carried)
         await self.execute(
             f"INSERT INTO {staging} ({column_list}) "
             f"SELECT {column_list} FROM {table}"

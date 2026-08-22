@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kestrel_sovereign.storage.conversation_created_at import (
+    canonical_created_at,
+)
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.storage.memory_system import MemorySystem
@@ -107,7 +110,11 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
         memory_system = MemorySystem(storage, AGENT_ID)
         await memory_system.initialize()
 
-        old_created_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+        # Canonical, because the column carries a CHECK since #3009. This
+        # case is about consolidation age, not timestamp text.
+        old_created_at = canonical_created_at(
+            datetime.now(timezone.utc) - timedelta(days=200)
+        )
         base_metadata = {"importance": 0.5, "session_id": "decay-session"}
         await storage.conversation.add_conversation(
             "assistant",
