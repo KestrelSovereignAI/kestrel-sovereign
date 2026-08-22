@@ -193,7 +193,10 @@ async def test_a_boot_against_only_unparseable_metadata_still_completes(tmp_path
     db = await AsyncDatabase.sqlite(str(db_path))
     try:
         assert [session_id for _c, _m, session_id in await _rows(db)] == [None] * 5
-        assert "idx_conversation_agent_session" in await _index_names(db)
+        assert any(
+        n.startswith("idx_conversation_agent_session_")
+        for n in await _index_names(db)
+    )
     finally:
         await db.close()
 
@@ -233,7 +236,10 @@ async def test_legacy_database_gains_the_column_and_its_index(tmp_path):
             row[1] for row in await db.fetchall("PRAGMA table_info(conversation_history)")
         }
         assert "session_id" in columns
-        assert "idx_conversation_agent_session" in await _index_names(db)
+        assert any(
+        n.startswith("idx_conversation_agent_session_")
+        for n in await _index_names(db)
+    )
     finally:
         await db.close()
 
@@ -247,7 +253,10 @@ async def test_fresh_database_gains_the_column_and_its_index(tmp_path):
             row[1] for row in await db.fetchall("PRAGMA table_info(conversation_history)")
         }
         assert "session_id" in columns
-        assert "idx_conversation_agent_session" in await _index_names(db)
+        assert any(
+        n.startswith("idx_conversation_agent_session_")
+        for n in await _index_names(db)
+    )
     finally:
         await db.close()
 

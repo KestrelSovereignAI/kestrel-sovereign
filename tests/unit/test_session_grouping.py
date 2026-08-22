@@ -180,10 +180,11 @@ def test_timestamp_sql_boundary_normalizes_sqlite_and_preserves_postgres_binds()
     """
     aware = datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
 
-    assert canonical_timestamp_sql("sqlite", "created_at") == "julianday(created_at)"
-    assert timestamp_predicate("sqlite", "created_at", ">") == (
-        "julianday(created_at) > julianday(?)"
-    )
+    # The column compares as ITSELF on both backends now — the whole of step 5
+    # in one assertion. A function call around it is not indexable, which is
+    # why removing it is the point rather than a tidy-up.
+    assert canonical_timestamp_sql("sqlite", "created_at") == "created_at"
+    assert timestamp_predicate("sqlite", "created_at", ">") == "created_at > ?"
     assert timestamp_query_param("sqlite", aware) == "2026-06-29 12:00:00"
     # The offset is APPLIED on the way, not dropped: 07:00-05:00 is 12:00 UTC.
     assert timestamp_query_param("sqlite", "2026-06-29T07:00:00-05:00") == (
@@ -513,75 +514,47 @@ def test_grouping_an_undatable_row_is_repeatable():
     assert group_messages_into_sessions(msgs) == group_messages_into_sessions(msgs)
 
 
-def test_the_parser_accepts_exactly_what_the_ordering_can_express():
-    """One domain, not two that agree by accident.
+def test_text_order_is_clock_order_for_everything_the_column_can_hold():
+    """The claim that replaced "the parser and ``julianday`` agree" (#3009).
 
-    The canonical order compares SQLite timestamps through ``julianday``. If the
-    parser accepts a form ``julianday`` cannot read, that row parses as a
-    perfectly good timestamp everywhere in Python while sorting at the far end
-    of the SQL order — where ``LIMIT`` can drop it out of the conversation list
-    altogether.
+    This case used to require that ``coerce_session_timestamp`` accept exactly
+    what SQLite's ``julianday`` could read, because the canonical order compared
+    through ``julianday`` and a row the parser dated but SQL could not would
+    sort at the far end of that order — where ``LIMIT`` drops it out of the
+    conversation list.
 
-    ``datetime.fromisoformat`` on Python 3.11+ accepts the BASIC form
-    (``20260101T110000``), which no writer here produces and this function never
-    documented. Accepting it was incidental permissiveness; the two domains are
-    the same set now.
+    Step 5 removed the reason. ``created_at`` admits one fixed-width spelling
+    now and the ordering compares the column as itself, so the requirement is
+    no longer an agreement between two domains: it is that **text order is
+    clock order** over the values the column can hold, and that the parser
+    reads all of them. Two domains agreeing was always the weaker property —
+    it had to be maintained. This one follows from the spelling.
+
+    Still GENERATED rather than listed, for the reason the old case gave: the
+    gap that got through last time was not an exotic spelling but an ordinary
+    date carrying an ordinary offset, which no hand-written corpus happened to
+    contain. A list can only fail to include something; a product cannot.
     """
     import itertools
-    import sqlite3
 
-    # GENERATED, not listed. The curated list below is still here for the
-    # oddities no product of parts would produce, but the parts themselves are
-    # enumerated — because the gap that got through was not an exotic spelling,
-    # it was an ordinary date carrying an ordinary offset and no time, and no
-    # hand-written corpus happened to contain one. A list can only fail to
-    # include something; a product cannot.
-    generated = [
-        date + time + zone
-        for date, time, zone in itertools.product(
-            ("2026-01-01",),
-            ("", " 11:00", "T11:00", " 11:00:00", "T11:00:00", "T11:00:00.123456"),
-            ("", "Z", "+01:00", "-05:00"),
-        )
-    ]
-    assert "2026-01-01+01:00" in generated and "2026-01-01Z" in generated, (
-        "the product stopped covering a bare date with an offset, which is the "
-        "form this case was extended for"
+    from kestrel_sovereign.storage.conversation_created_at import (
+        canonical_created_at,
     )
 
-    db = sqlite3.connect(":memory:")
-    try:
-        for value in generated + [
-            # Readable by both.
-            "2026-01-01",
-            "2026-01-01 11:00",
-            "2026-01-01 10:00:00",
-            "2026-01-01T10:00:00",
-            "2026-01-01 10:00:00.123456",
-            "2026-01-01T11:00:00+00:00",
-            "2026-01-01T11:00:00-05:00",
-            "2026-01-01T11:00:00.123+02:00",
-            "2026-01-01T11:00:00Z",
-            # Readable by Python alone, which is the whole point. The first
-            # version of this guard checked only the DATE prefix and let every
-            # one of these through — the divergence lives in the time and the
-            # offset. The lowercase `t` needed the gate moved ahead of
-            # `strptime` too, which compiles its format with `re.IGNORECASE`.
-            "20260101T110000",
-            "2026-01-01T11:00:00+0500",
-            "2026-01-01T11:00:00-05",
-            "2026-01-01t11:00:00",
-            "2026-01-01T11:00:00+00:00:30",
-            # Readable by neither.
-            "not-a-date",
-            "",
-        ]:
-            sql = db.execute("SELECT julianday(?)", (value,)).fetchone()[0]
-            python = coerce_session_timestamp(value)
-            assert (sql is None) == (python is None), (
-                f"{value!r}: julianday reads it as {sql!r} and the parser as "
-                f"{python!r}. One of them orders this row and the other dates "
-                "it, so they have to agree about whether it can be read at all."
-            )
-    finally:
-        db.close()
+    base = datetime(2026, 1, 1, 11, 0, 0)
+    canonical = [
+        canonical_created_at(base + timedelta(days=d, seconds=sec))
+        for d, sec in itertools.product(
+            (-400, -1, 0, 1, 400, 4000), (0, 1, 59, 3600, 86399)
+        )
+    ]
+    assert len(set(canonical)) == len(canonical), "the corpus repeats itself"
+
+    parsed = {value: coerce_session_timestamp(value) for value in canonical}
+    unreadable = [v for v, dt in parsed.items() if dt is None]
+    assert not unreadable, f"the parser cannot read stored values: {unreadable}"
+
+    assert sorted(canonical) == sorted(canonical, key=lambda v: parsed[v]), (
+        "lexicographic order diverged from chronological order, which is the "
+        "property that lets the ordering compare created_at as itself"
+    )

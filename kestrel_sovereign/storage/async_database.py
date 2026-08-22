@@ -827,6 +827,17 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
 """
 
 
+def _definition_fingerprint(backend_type: str, columns: str, where: str) -> str:
+    """A short digest of what an index actually IS, for its name to carry.
+
+    Covers the backend as well as the expression: the same call renders a
+    different index on each engine, and a database that somehow saw both must
+    not treat them as the same object.
+    """
+    material = "\n".join((backend_type, columns, where)).encode("utf-8")
+    return hashlib.blake2s(material, digest_size=4).hexdigest()
+
+
 def core_schema_sql(backend_type: str) -> str:
     """The whole core schema for one backend, in dependency order.
 
@@ -1894,26 +1905,59 @@ class AsyncDatabase:
         parentheses (``"agent_id, session_id"``). Neither it nor ``name`` may
         come from untrusted input — both are interpolated, as no backend binds
         parameters into DDL.
+
+        **The name carries a fingerprint of the definition**, so ``name`` is a
+        family rather than an object: ``idx_foo`` becomes ``idx_foo_a1b2c3d4``
+        and a changed ``columns``/``where`` is a different name. Members of the
+        family that do not match are dropped.
+
+        Without that, this method answers "is there an index called X on this
+        table" and nothing answers "is it the index we meant". Several of these
+        definitions are COMPUTED — ``canonical_order_index_columns()`` renders
+        the ordering key per backend — so changing the ordering leaves the old
+        index in place, matching nothing the new ``ORDER BY`` asks for. The
+        symptom is a query plan: no error, no missing index, just the
+        O(history) scan the epic exists to remove, silently back.
+
+        The fingerprint is in the NAME because that is the only place both
+        engines compare exactly. SQLite stores the ``CREATE INDEX`` verbatim, so
+        its text could be compared; PostgreSQL normalizes it —
+        ``(agent_id, created_at ASC NULLS FIRST, id ASC)`` reads back as
+        ``USING btree (agent_id, created_at NULLS FIRST, id)`` — so a text
+        comparison there rebuilds on every boot. Measured on PostgreSQL 16.14.
+        Same reasoning, and the same shape, as the #2998 trigger names.
         """
-        if await self._index_exists(name, table):
+        wanted = f"{name}_{_definition_fingerprint(self.backend_type, columns, where)}"
+        if await self._index_exists(wanted, table):
             return
         created = False
         async with self.migration_lock(lock_name or f"index_{name}"):
             # Re-probed under the lock: a concurrent initializer may have
             # created it while this one waited.
-            if not await self._index_exists(name, table):
+            if not await self._index_exists(wanted, table):
                 await self._backend.execute(
-                    f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})"
+                    f"CREATE INDEX IF NOT EXISTS {wanted} ON {table}({columns})"
                     + (f" WHERE {where}" if where else "")
                 )
                 created = True
+            # Created BEFORE the superseded members are dropped. A window with
+            # two indexes is a little redundant work; a window with none is the
+            # unindexed scan this exists to prevent, taken during a boot.
+            for stale in await self._index_family(name, table):
+                if stale != wanted:
+                    await self._backend.execute(
+                        f"DROP INDEX IF EXISTS {self._quoted(stale)}"
+                    )
+                    logger.info(
+                        "%s: retired index %s; its definition moved", table, stale
+                    )
         # Outside the lock deliberately: the statement has committed, so this
         # reads what the next boot would read, and a raise here is the caller's
         # own error rather than a rolled-back transaction's.
-        if not await self._index_exists(name, table):
-            owner = await self._index_name_owner(name, table)
+        if not await self._index_exists(wanted, table):
+            owner = await self._index_name_owner(wanted, table)
             raise RuntimeError(
-                f"{table}: index {name}({columns}) was not created. The name "
+                f"{table}: index {wanted}({columns}) was not created. The name "
                 f"is already taken by "
                 + (f"an index on {owner!r}" if owner else "another relation")
                 + " — index names are unique per database on SQLite and per "
@@ -1921,7 +1965,7 @@ class AsyncDatabase:
                 "it as already present and did nothing. Rename one of them."
             )
         if created:
-            logger.info("%s: created index %s(%s)", table, name, columns)
+            logger.info("%s: created index %s(%s)", table, wanted, columns)
 
     async def ensure_session_projection_schema(self) -> None:
         """Create the #2959 projection's tables, triggers and indexes. (#2959)
@@ -2269,6 +2313,29 @@ class AsyncDatabase:
                 "SELECT tbl_name FROM sqlite_master WHERE name = ?", (name,)
             )
         return row[0] if row and row[0] else None
+
+    async def _index_family(self, name: str, table: str) -> Set[str]:
+        """Every index on ``table`` whose name is a member of the ``name`` family.
+
+        A member is ``<name>_<fingerprint>``. Matched on the underscore-suffixed
+        prefix rather than on ``name`` alone, so a family called ``idx_foo``
+        never claims ``idx_foobar``'s indexes and drop them.
+        """
+        prefix = f"{name}_"
+        if self.backend_type == "postgres":
+            rows = await self._backend.fetch_all(
+                "SELECT c.relname FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE i.indrelid = to_regclass(?) AND c.relname LIKE ?",
+                (table, f"{prefix}%"),
+            )
+        else:
+            rows = await self._backend.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = ? AND name LIKE ?",
+                (table, f"{prefix}%"),
+            )
+        return {row[0] for row in rows}
 
     async def _index_exists(self, name: str, table: str) -> bool:
         """Whether ``table`` already carries an index called ``name``.

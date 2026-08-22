@@ -61,25 +61,29 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
     accept datetimes as-is, try the historical SQL/ISO string formats, and
     fall back to :meth:`datetime.fromisoformat` for ``Z``/offset-bearing values.
 
-    SQLite conversation history legitimately contains a mixture of naive SQL
-    timestamps and ISO-8601 values.  Treat naive values as UTC and normalize
-    aware values to naive UTC so sorting and gap arithmetic can never raise on
-    an aware/naive mixture.  ``None`` means chronology cannot be established;
-    presentation callers may substitute a clock, while destructive callers
-    must fail closed.
+    Treat naive values as UTC and normalize aware values to naive UTC so
+    sorting and gap arithmetic can never raise on an aware/naive mixture.
+    ``None`` means chronology cannot be established; presentation callers may
+    substitute a clock, while destructive callers must fail closed.
+
+    This used to be gated by a regex admitting exactly what SQLite's
+    ``julianday`` could order, because a value Python dated but SQL could not
+    would sort at the far end of the canonical order and fall out of a
+    ``LIMIT``. Since #3009 the ordering compares ``created_at`` as itself and
+    the column admits one spelling, so there is no second domain to stay inside
+    — and a parameter is canonicalized by ``comparable_created_at`` before it
+    reaches SQL. The gate protected nothing and made the reader narrower than
+    the repairer for no reason.
+
+    It still returns ``None`` for a value with no date, and that is NOT dead:
+    ISOLATED privacy mode keeps conversations in an in-memory buffer whose
+    entries carry no ``created_at`` at all, so the grouper below genuinely
+    receives undatable rows from a path that has no database to constrain.
     """
     parsed: Optional[datetime]
     if isinstance(created_at, datetime):
         parsed = created_at
     elif isinstance(created_at, str):
-        # The gate goes BEFORE every attempt, not just the last one. Both
-        # parsers below read strings the ordering key cannot: `strptime`
-        # compiles its format with `re.IGNORECASE`, so it takes a lowercase
-        # `t` separator that `julianday` rejects, and `fromisoformat` takes
-        # more still. Guarding only the fallback left that one through —
-        # measured, and the reason the first version of this fix was incomplete.
-        if not _JULIANDAY_READABLE.match(created_at):
-            return None
         parsed = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
             try:
@@ -88,22 +92,6 @@ def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
             except ValueError:
                 continue
         if parsed is None:
-            # Guarded by what the ORDERING can read, because `fromisoformat`
-            # accepts a good deal more than `julianday` does — the basic form
-            # (`20260101T110000`), a `+0500` offset, a lowercase `t` —
-            # incidental permissiveness, not a format this codebase writes or
-            # this function documents. Accepting it made the parser's domain
-            # wider than the SQL ordering key's: `julianday` returns NULL for
-            # it, so such a row sorted at the far end of the canonical order and
-            # `LIMIT` could drop it from the conversation list entirely, while
-            # every Python path treated it as a perfectly good 2026 timestamp
-            # (round-18 review).
-            #
-            # Narrowed rather than normalized in SQL: one domain defined by what
-            # the ordering can express beats a normalization kept in step with a
-            # parser, which is how the two came apart in the first place. A
-            # value outside it is undatable in BOTH, and an undatable row has a
-            # defined home — the stamp of the row before it.
             try:
                 parsed = datetime.fromisoformat(
                     created_at[:-1] + "+00:00"
@@ -158,9 +146,26 @@ def timestamp_query_param(backend_type: str, value: Any) -> Any:
 
 
 def canonical_timestamp_sql(backend_type: str, expression: str) -> str:
-    """Normalize a timestamp SQL expression for the active backend."""
-    if backend_type == "sqlite":
-        return f"julianday({expression})"
+    """Compare a timestamp column as itself, on both backends (#3009 step 5).
+
+    This wrapped SQLite in ``julianday()`` for as long as ``created_at`` could
+    hold more than one spelling of an instant. It had to: ``"T"`` is 0x54 and a
+    space is 0x20, so ``'2026-03-01T09:00:00'`` compares GREATER than
+    ``'2026-03-01 10:00:00'`` and an hour-earlier row sorts last. A raw text
+    comparison was not merely uglier, it was wrong.
+
+    The column now carries a CHECK that admits exactly one spelling, and it is
+    fixed-width, so **lexicographic order IS chronological order** — pinned by
+    ``test_the_canonical_spelling_sorts_as_the_clock_does``. Comparing the
+    column as itself is now both correct and indexable: a function call is not,
+    which is why removing this is the point rather than a tidy-up.
+
+    Kept as a function, and still called at every site, because the question
+    "how is this column compared" must have exactly one answer. Two call sites
+    spelling it differently is the defect ``canonical_order()`` was written to
+    end; an identity function that everyone routes through preserves that,
+    where inlining it would scatter the decision again.
+    """
     return expression
 
 
@@ -214,30 +219,6 @@ _GROUPING_EPOCH = datetime(1970, 1, 1)
 #: implementations, which is #2961's subject and not something a shared constant
 #: can fix.
 UNDATABLE_ROW_FALLBACK = _GROUPING_EPOCH
-
-#: Exactly the strings SQLite's ``julianday`` can read, which is what the
-#: canonical order compares. Written as the WHOLE value, not a prefix: the first
-#: version of this guard checked only the date, and the divergence between
-#: Python and ``julianday`` is mostly in the time and the offset. Measured
-#: against sqlite 3.50.4 over a battery of spellings — `+0500`, `-05`, a
-#: lowercase `t`, a seconds-bearing offset, the basic form — this agrees with
-#: the engine on every one, in both directions.
-#:
-#: The engine takes: a date; optionally a time after a space or an UPPERCASE
-#: ``T``; optionally fractional seconds; optionally ``Z`` or ``+/-HH:MM``.
-_JULIANDAY_READABLE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}"          # date
-    r"([ T]\d{2}:\d{2}"             # optional time, space or uppercase T
-    r"(:\d{2}(\.\d+)?)?"           # optional seconds, optional fraction
-    # NESTED inside the time, not beside it. Spelled as a sibling the two were
-    # independently optional, so `2026-01-01Z` and `2026-01-01+01:00` matched —
-    # and `julianday` returns NULL for a date carrying an offset but no time,
-    # while the parser below dates them happily. That is exactly the
-    # divergence this expression exists to close, reintroduced by where a
-    # bracket fell.
-    r"(Z|[+-]\d{2}:\d{2})?)?$"      # optional UTC marker or +/-HH:MM offset
-)
-
 
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
