@@ -48,11 +48,15 @@ def _make_strategic():
 
     from kestrel_sovereign.features.strategic_memory import StrategicMemoryFeature
     from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
+    from kestrel_sovereign.features.strategic_memory.ledger import StrategyLedger
 
     feat = StrategicMemoryFeature(agent=MagicMock())
     feat._data = {}
     feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
     feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))
+    # Blockers are ledger rows now (#2954); stub its write the same way.
+    feat._ledger = StrategyLedger(Path("/tmp/kestrel-test/STRATEGY_LEDGER.yaml"))
+    feat._ledger.save = MagicMock(return_value=None)
     return feat
 
 
@@ -62,14 +66,14 @@ class TestStrategicSeverity:
         feat = _make_strategic()
         result = await feat.strategy_add_blocker(issue="X", title="t", severity="moderate")
         assert result.status is ToolResultStatus.OK, result
-        assert feat._data["blockers"][-1]["severity"] == "medium"
+        assert feat._ledger.blockers[-1]["severity"] == "medium"
 
     @pytest.mark.asyncio
     async def test_medium_is_canonical_and_accepted(self):
         feat = _make_strategic()
         result = await feat.strategy_add_blocker(issue="X", title="t", severity="MEDIUM")
         assert result.status is ToolResultStatus.OK
-        assert feat._data["blockers"][-1]["severity"] == "medium"
+        assert feat._ledger.blockers[-1]["severity"] == "medium"
 
     @pytest.mark.asyncio
     async def test_genuine_typo_rejected_with_listing(self):

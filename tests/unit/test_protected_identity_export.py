@@ -334,7 +334,11 @@ def test_concurrent_new_exports_remain_distinct_and_private(tmp_path):
 
 def test_legacy_hardening_is_metadata_only_and_refuses_unsafe_entries(tmp_path):
     export_root = tmp_path / "exports"
-    export_root.mkdir(mode=0o755)
+    export_root.mkdir()
+    # chmod, not mkdir(mode=...): mkdir's mode is masked by the process umask,
+    # so under a 0o077 umask this deliberately-legacy root was created 0o700
+    # and the "export root is not mode 0700" finding could never be produced.
+    export_root.chmod(0o755)
     legacy = export_root / "identity_legacy.json"
     legacy.write_text("legacy-secret", encoding="utf-8")
     legacy.chmod(0o644)

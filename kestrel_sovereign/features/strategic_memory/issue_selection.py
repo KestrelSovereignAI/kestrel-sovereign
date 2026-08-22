@@ -15,6 +15,36 @@ from kestrel_sovereign.features.strategic_memory.github_integration import (
 logger = logging.getLogger(__name__)
 
 
+def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
+    """Split an issue reference into its repository and its number.
+
+    ``strategy_add_blocker`` documents that it accepts a qualified reference
+    (``owner/repo#123``), so every consumer has to be able to read one back.
+    Doing that at each call site is how ``int("owner/repo#123")`` ended up in
+    the dispatch path: the string carries two facts and the reader wanted one.
+    Parsing once, here, keeps the repository and the number separable wherever
+    a reference is recorded, reconciled or selected.
+
+    Returns ``(repo, number)``. Either may be ``None``: a bare ``#123`` has no
+    repository, and an unparseable reference has no number.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    repo: Optional[str] = None
+    if "#" in text:
+        head, _, tail = text.partition("#")
+        head = head.strip().strip("/")
+        if head:
+            repo = head
+        text = tail.strip()
+    text = text.lstrip("#").strip()
+    try:
+        return repo, int(text)
+    except (TypeError, ValueError):
+        return repo, None
+
+
 async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return the highest-priority issue represented by strategic memory."""
     token = get_github_token()
@@ -24,18 +54,27 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     config = data.get("morning_signal_config", {})
     repos = config.get("scan_repos", [])
-    if not repos:
-        return None
 
     for blocker in data.get("blockers", []):
         if blocker.get("severity") not in ("critical", "high") or not blocker.get("issue"):
             continue
-        issue_ref = str(blocker["issue"]).lstrip("#")
-        repo = blocker.get("repo") or await _find_issue_repo(issue_ref, repos, token)
+        ref_repo, issue_number = parse_issue_ref(blocker["issue"])
+        if issue_number is None:
+            # An unparseable reference is not dispatchable, and guessing a
+            # number from it would dispatch against the wrong issue.
+            continue
+        # A blocker that names its own repository does not need the scan list.
+        # Returning early on an empty scan_repos skipped exactly those, which
+        # are the ones whose target is least ambiguous.
+        repo = blocker.get("repo") or ref_repo
+        if not repo:
+            if not repos:
+                continue
+            repo = await _find_issue_repo(str(issue_number), repos, token)
         if repo:
             return {
                 "repo": repo,
-                "issue_number": int(issue_ref),
+                "issue_number": issue_number,
                 "issue_title": blocker.get("title", "Blocker"),
                 "priority": "high",
                 "context": (
