@@ -94,6 +94,23 @@ CANONICAL_FORMAT = "%Y-%m-%d %H:%M:%S"
 #: ledger that can disagree with the schema (``migrate_columns_once``'s rule).
 CONSTRAINT_NAME = "conversation_history_created_at_canonical"
 
+#: The columns the CHECK above actually constrains — and therefore the only
+#: ones that may be compared as raw text.
+#:
+#: ``deleted_at`` and ``archived_at`` are deliberately absent. They are
+#: TIMESTAMP columns on the same table, written by the same code, and they look
+#: interchangeable with ``created_at`` at every call site — but nothing
+#: enforces their spelling, so SQLite history genuinely holds both the ISO and
+#: the SQL form in them. Comparing those as text is wrong in the direction that
+#: destroys data: ``'T'`` is 0x54 and a space is 0x20, so a row deleted at
+#: ``2026-06-01T11:59:59Z`` compares GREATER than the ``2026-06-01 12:00:00``
+#: cutoff and survives a purge that should have taken it — or, with the
+#: comparison the other way, is destroyed when it should have survived.
+#:
+#: Named as a set rather than assumed per call site so that when a column gains
+#: the constraint it joins this line and every comparison follows.
+CANONICAL_COLUMNS = frozenset({"created_at"})
+
 #: Where an unrepairable row's original text is kept.
 UNDATED_TABLE = "conversation_history_undated"
 

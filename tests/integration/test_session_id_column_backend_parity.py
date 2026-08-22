@@ -561,8 +561,8 @@ async def test_a_table_of_nothing_but_poison_still_migrates(db_backend):
         )
         assert [row[0] for row in values] == [None] * len(poison)
         # The index is the second thing an oversized id would have broken.
-        assert await db._index_exists(
-            "idx_conversation_agent_session", "conversation_history"
+        assert await _index_present(
+            db, "idx_conversation_agent_session", "conversation_history"
         )
 
 
@@ -1029,12 +1029,12 @@ async def test_index_existence_probe_answers_truthfully_on_both_backends(db_back
         await _create_pre_migration_table(db)
         name = f"idx_probe_{uuid4().hex[:12]}"
 
-        assert await db._index_exists(name, "conversation_history") is False
+        assert await _index_present(db, name, "conversation_history") is False
         await db.ensure_index(name, "conversation_history", "agent_id")
-        assert await db._index_exists(name, "conversation_history") is True
+        assert await _index_present(db, name, "conversation_history") is True
         # Second call is the every-boot-after-the-first path.
         await db.ensure_index(name, "conversation_history", "agent_id")
-        assert await db._index_exists(name, "conversation_history") is True
+        assert await _index_present(db, name, "conversation_history") is True
 
 
 @pytest.mark.asyncio
@@ -1045,8 +1045,8 @@ async def test_the_session_index_lands_on_both_backends(db_backend):
         await _create_pre_migration_table(db)
         await db._migrate_conversation_session_id_column()
 
-        assert await db._index_exists(
-            "idx_conversation_agent_session", "conversation_history"
+        assert await _index_present(
+            db, "idx_conversation_agent_session", "conversation_history"
         ) is True
 
 
@@ -1087,7 +1087,8 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 f'CREATE TABLE "{decoy_schema}".unrelated (id BIGSERIAL PRIMARY KEY)'
             )
             await db.execute(
-                f'CREATE INDEX {index} ON "{decoy_schema}".unrelated (id)'
+                f'CREATE INDEX {_wanted_index_name(db, index, "agent_id, session_id")} '
+                f'ON "{decoy_schema}".unrelated (id)'
             )
             await db.execute(
                 f'CREATE TABLE "{target_schema}".conversation_history ('
@@ -1103,12 +1104,12 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 "SELECT n.nspname FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
                 "WHERE c.oid = to_regclass(?)",
-                (index,),
+                (_wanted_index_name(db, index, "agent_id, session_id"),),
             ) == decoy_schema
 
-            assert await db._index_exists(index, "conversation_history") is False
+            assert await _index_present(db, index, "conversation_history") is False
             await db._migrate_conversation_session_id_column()
-            assert await db._index_exists(index, "conversation_history") is True
+            assert await _index_present(db, index, "conversation_history") is True
 
             # ...and it was built beside the TARGET table, not the decoy.
             owner = await db.fetchval(
@@ -1117,7 +1118,10 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 "JOIN pg_class t ON t.oid = i.indrelid "
                 "JOIN pg_namespace n ON n.oid = t.relnamespace "
                 "WHERE ix.relname = ? AND n.nspname = ?",
-                (index, target_schema),
+                (
+                    _wanted_index_name(db, index, "agent_id, session_id"),
+                    target_schema,
+                ),
             )
             assert owner == f"{target_schema}.conversation_history"
     finally:
@@ -1146,15 +1150,19 @@ async def test_a_same_schema_name_collision_is_reported_not_shrugged_off(postgre
         async with db.transaction():
             await db.execute(f'SET LOCAL search_path TO "{schema}"')
             await db.execute("CREATE TABLE decoy (id BIGSERIAL PRIMARY KEY)")
-            await db.execute(f"CREATE INDEX {index} ON decoy (id)")
+            await db.execute(
+                f"CREATE INDEX "
+                f"{_wanted_index_name(db, index, 'agent_id, session_id')} "
+                "ON decoy (id)"
+            )
             await _create_pre_migration_table(db)
 
             with pytest.raises(RuntimeError, match="decoy"):
                 await db._migrate_conversation_session_id_column()
 
             # The engine really did nothing; the name still belongs to the decoy.
-            assert await db._index_exists(index, "conversation_history") is False
-            assert await db._index_exists(index, "decoy") is True
+            assert await _index_present(db, index, "conversation_history") is False
+            assert await _index_present(db, index, "decoy") is True
             # ...and the column half of the migration DID land, so the failure
             # is about the index alone and a rename is all the operator needs.
             assert await db._column_exists("conversation_history", "session_id")
@@ -1199,11 +1207,11 @@ async def test_index_creation_waits_on_the_real_advisory_lock(postgres_db):
             # below, so this one is a timeout by design.
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(builder), timeout=1.0)
-            assert await db._index_exists(index, table) is False
+            assert await _index_present(db, index, table) is False
 
         await _before_the_budget(db, "the builder after the lock was released",
                                  builder)
-        assert await db._index_exists(index, table) is True
+        assert await _index_present(db, index, table) is True
         # Success path: ensure_index leaves nothing behind on the key either.
         assert await _advisory_lock_holders(db, lock) == []
     finally:
@@ -1245,7 +1253,7 @@ async def test_concurrent_initializers_leave_exactly_one_index(postgres_db):
             "SELECT COUNT(*) FROM pg_index i "
             "JOIN pg_class c ON c.oid = i.indexrelid "
             "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
-            (table, index),
+            (table, _wanted_index_name(db, index, "agent_id")),
         )
         assert count == 1
         # Four takers, zero holders afterwards.
@@ -1313,7 +1321,9 @@ async def test_the_failure_path_releases_the_migration_lock(postgres_db):
     lock = f"index_{index}"
     await db.execute(f"CREATE TABLE {decoy} (id BIGSERIAL PRIMARY KEY)")
     await db.execute(f"CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, agent_id TEXT)")
-    await db.execute(f"CREATE INDEX {index} ON {decoy} (id)")
+    await db.execute(
+        f"CREATE INDEX {_wanted_index_name(db, index, 'agent_id')} ON {decoy} (id)"
+    )
     try:
         async with _parked_lock_holder(db, lock):
             assert len(await _advisory_lock_holders(db, lock)) == 1
@@ -1380,7 +1390,7 @@ async def test_ensure_index_under_an_open_migration_transaction_does_not_deadloc
             db, "ensure_index inside an open migration transaction",
             migrate_then_index(),
         )
-        assert await db._index_exists(index, table) is True
+        assert await _index_present(db, index, table) is True
         assert await _advisory_lock_holders(db, f"index_{index}") == []
         assert await _advisory_lock_holders(db, f"{table}_columns") == []
     finally:
@@ -1527,6 +1537,29 @@ def _without_embeddings(monkeypatch) -> None:
     thing on every machine.
     """
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+
+
+def _wanted_index_name(db, name: str, columns: str, where: str = "") -> str:
+    """The name ``ensure_index`` will use for this definition on this backend.
+
+    Computed the same way the method computes it rather than pasted, so a case
+    about a NAME collision really collides (#3009 step 5).
+    """
+    from kestrel_sovereign.storage.async_database import _definition_fingerprint
+
+    return f"{name}_{_definition_fingerprint(db.backend_type, columns, where)}"
+
+
+async def _index_present(db, name: str, table: str) -> bool:
+    """Whether ``table`` carries any member of the ``name`` index family.
+
+    Since #3009 step 5 an index name ends in a fingerprint of its definition,
+    so a bare name is a FAMILY and probing for it verbatim always answers
+    False. Cases that mean "the index landed" ask this; cases that are about a
+    specific NAME being taken keep using ``_index_exists``, which is still the
+    exact question there.
+    """
+    return bool(await db._index_family(name, table))
 
 
 async def _create_core_tables(db: AsyncDatabase, *tables: str) -> None:
@@ -2053,6 +2086,8 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
     from kestrel_sovereign.storage.conversation_sessions import (
         FUNCTION_NAME_PREFIX,
         TRIGGER_NAME_PREFIX,
+        active_history_predicate,
+        canonical_order_index_columns,
         mutation_trigger_functions,
         mutation_triggers,
         projection_tables,
@@ -2067,7 +2102,7 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
         # same width.
         for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
             name, table = entry[0], entry[1]
-            assert await db._index_exists(name, table) is False
+            assert await _index_present(db, name, table) is False
 
         await db.ensure_session_projection_schema()
         # Idempotent: ``_init_schema`` runs on every ``from_pool()``, so the
@@ -2084,9 +2119,19 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
         ) == {name for name, _ddl in mutation_trigger_functions(db.backend_type)}
         for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
             name, table = entry[0], entry[1]
-            assert await db._index_exists(name, table) is True
+            assert await _index_present(db, name, table) is True
+        # Asked of the DEFINITION, not just the family: an index whose
+        # expression no longer matches the ORDER BY is not a slow index, it is
+        # no index, and the name is computed from what canonical_order()
+        # renders so the two cannot drift apart silently (#3009 step 5).
         assert await db._index_exists(
-            "idx_conversation_agent_canonical", "conversation_history"
+            _wanted_index_name(
+                db,
+                "idx_conversation_agent_canonical",
+                canonical_order_index_columns(db.backend_type),
+                active_history_predicate(),
+            ),
+            "conversation_history",
         ) is True, "the index the conversation list's ordering needs is absent"
 
 

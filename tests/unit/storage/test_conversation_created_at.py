@@ -491,12 +491,14 @@ async def test_the_rebuild_puts_back_the_indexes_it_dropped(tmp_path):
             )
         }
         for expected in (
-            "idx_conversation_agent_canonical",
+            "idx_conversation_agent_canonical_",
             "idx_conversation_agent_created_at",
-            "idx_conversation_agent_session",
-            "idx_conversation_agent_live_row_id",
+            "idx_conversation_agent_session_",
+            "idx_conversation_agent_live_row_id_",
         ):
-            assert expected in indexes, f"the rebuild lost {expected}"
+            assert any(n.startswith(expected) for n in indexes), (
+                f"the rebuild lost {expected}"
+            )
     finally:
         await db.close()
 
