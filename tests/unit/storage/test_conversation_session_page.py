@@ -187,28 +187,142 @@ async def test_a_tie_spanning_a_page_seam_is_neither_repeated_nor_dropped(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_a_session_with_no_readable_activity_is_still_reachable(tmp_path):
-    """A NULL ``last_message_at`` sorts LAST and is reached, not lost.
+async def test_the_stamps_a_page_orders_by_cannot_be_null(tmp_path):
+    """The invariant is in the schema, not only in the writers.
 
-    ``last_message_at < ?`` is NULL for such a row, so a keyset predicate that
-    did not say otherwise would exclude it from every page — a conversation
-    unreachable at any depth, which is the defect this ticket removes. Nothing
-    in the codebase writes a NULL here today; the column permits one, and a
-    session the list can never show is not a state to discover from production.
+    A NULL ``last_message_at`` would be a session the page cannot reach:
+    ``last_message_at < ?`` is NULL for such a row, so it falls out of every
+    page at every depth — a conversation that has vanished, which is the defect
+    this ticket exists to remove. Admitting it in the predicate instead costs
+    the index seek (measured, 17.7 ms against 0.11 ms on 200,000 sessions), so
+    the column states what every writer already guarantees and the predicate
+    stays seekable.
     """
-    rows = _rows()[:4]
-    rows.append({
-        "session_id": "undated", "started_at": None, "last_message_at": None,
-        "message_count": 1, "user_message_count": 1,
-        "first_user_message_id": 99, "wake_source": None,
-    })
-    db, projection = await _seeded(tmp_path, "undated.db", rows)
+    db, _projection = await _seeded(tmp_path, "not-null.db", _rows()[:1])
     try:
-        seen = await _page_all_sql(projection, 2)
+        for column in ("started_at", "last_message_at"):
+            with pytest.raises(Exception) as raised:
+                await db.execute(
+                    "INSERT INTO conversation_sessions "
+                    "(agent_id, session_id, started_at, last_message_at, "
+                    "message_count, user_message_count) VALUES (?, ?, ?, ?, ?, ?)",
+                    (AGENT, f"null-{column}",
+                     None if column == "started_at" else "2026-05-01 09:00:00",
+                     None if column == "last_message_at" else "2026-05-01 09:00:00",
+                     1, 1),
+                )
+            assert "NOT NULL" in str(raised.value).upper(), raised.value
     finally:
         await db.close()
-    assert "undated" in seen, "an undatable session was unreachable by paging"
-    assert seen[-1] == "undated", "an undatable session is the EARLIEST, so it is last"
+
+
+@pytest.mark.asyncio
+async def test_a_table_predating_the_not_null_stamps_is_replaced_and_rederived(
+    tmp_path,
+):
+    """The upgrade path. This table is a cache, so the migration is to drop it.
+
+    A database created before #2960 permits a NULL in the columns the page
+    orders by, and there is no ``ALTER`` for that on SQLite. Rewriting it in
+    place would be more expensive than deriving it again — nothing here is a
+    record, and a repair reproduces every row.
+
+    The watermarks are the other half: left alone they would describe rows that
+    no longer exist and report the projection current over an empty table. The
+    generation is rotated for exactly that, which is the mechanism already
+    written for "the mechanism's shape moved".
+    """
+    from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+    path = str(tmp_path / "legacy-shape.db")
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        # Put the pre-#2960 shape back, and fill it the way a shipped build
+        # would have: rows, and a watermark saying they are accounted for.
+        await db.execute("DROP TABLE conversation_sessions")
+        await db.execute(
+            "CREATE TABLE conversation_sessions ("
+            " agent_id TEXT NOT NULL, session_id TEXT NOT NULL,"
+            " started_at TIMESTAMP, last_message_at TIMESTAMP,"
+            " message_count INTEGER NOT NULL DEFAULT 0,"
+            " user_message_count INTEGER NOT NULL DEFAULT 0,"
+            " first_user_message_id INTEGER, wake_source TEXT,"
+            " PRIMARY KEY (agent_id, session_id))"
+        )
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        assert not await projection.is_stale(), "the fixture must start current"
+        # A row only the old shape could hold, added AFTER the repair so it is
+        # not discarded by it — and writing this table moves no change stamp,
+        # so the watermark goes on saying the projection is current.
+        await db.execute(
+            "INSERT INTO conversation_sessions (agent_id, session_id, started_at,"
+            " last_message_at, message_count, user_message_count)"
+            " VALUES (?, 'ghost', NULL, NULL, 3, 2)",
+            (AGENT,),
+        )
+        assert not await projection.is_stale()
+        assert any(r["session_id"] == "ghost" for r in await projection.list())
+    finally:
+        await db.close()
+
+    # ...and now a build that wants the stamps NOT NULL opens it.
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        assert not await db._column_accepts_null(
+            "conversation_sessions", "last_message_at"
+        ), "the migration left the old shape standing"
+        projection = ConversationSessionProjection(db, AGENT)
+        assert await projection.is_stale(), (
+            "the table was replaced but the watermark still claimed it was "
+            "current — a projection reporting itself true over nothing"
+        )
+        await projection.repair()
+        listed = {row["session_id"] for row in await projection.list()}
+        assert "ghost" not in listed, "a row from the retired table survived"
+        assert listed == {"1"}, listed
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_continuation_page_seeks_rather_than_rewalking(tmp_path):
+    """Page nine must not cost what pages one through eight already paid.
+
+    The disjunction a keyset expands to is not a range, so the engine cannot
+    seek on it — it plans ``(agent_id=?)`` and walks every entry above the
+    cursor. Measured on 200,000 sessions: 17.7 ms a page that way against
+    0.11 ms with the redundant leading bound, which is ``O(rows already paged)``
+    reappearing on the continuation after the first page was made bounded.
+    """
+    db, projection = await _seeded(tmp_path, "seek.db", _rows())
+    try:
+        first = await projection.page(limit=5)
+        after = projection._bound_cursor(
+            decode_session_cursor(encode_session_cursor(first[-1], "active"), "active")
+        )
+        from kestrel_sovereign.storage.session_grouping import session_cursor_clause
+
+        clause, params = session_cursor_clause(db.backend_type, after)
+        plan = await db.fetchall(
+            "EXPLAIN QUERY PLAN SELECT session_id FROM conversation_sessions "
+            f"WHERE agent_id = ? AND {clause} "
+            f"{session_order_sql(db.backend_type)} LIMIT ?",
+            (AGENT, *params, 5),
+        )
+    finally:
+        await db.close()
+    text = " ".join(str(row) for row in plan).upper()
+    assert "LAST_MESSAGE_AT<" in text.replace(" ", ""), (
+        f"the continuation did not seek on the ordering key: {text}"
+    )
+    assert "USE TEMP B-TREE" not in text, text
 
 
 @pytest.mark.asyncio

@@ -851,12 +851,30 @@ REBUILT = "rebuilt"
 # every ``from_pool()`` — frinz calls it per request — so a post-upgrade request
 # burst is exactly the parallel case.
 
+#: The projection columns that may never hold NULL, and the reason is the
+#: PAGE (#2960) rather than tidiness.
+#:
+#: Every writer already guarantees it: the grouper produces ``isoformat()`` text
+#: for both stamps — substituting the preceding row's instant for an undatable
+#: row rather than leaving one out — and ``timestamp_query_param`` never returns
+#: ``None``. The column merely failed to say so, and what that cost was
+#: measured: a keyset predicate has to admit NULL to keep a NULL-stamped session
+#: reachable at all, and that ``OR ... IS NULL`` is what stops the engine
+#: seeking. On 200,000 sessions, SQLite: 0.11 ms with a seekable predicate,
+#: 20.7 ms without — the same ``O(rows above the cursor)`` walk this epic exists
+#: to remove, arriving back on the continuation instead of on the first page.
+#:
+#: So the choice was between a slow page and a column that states the invariant.
+#: An invariant a writer keeps and a schema does not is one an ``UPDATE`` run by
+#: hand can break, and the failure is silent: the session simply stops appearing.
+NON_NULL_PROJECTION_COLUMNS: Tuple[str, ...] = ("started_at", "last_message_at")
+
 _CONVERSATION_SESSIONS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_sessions (
     agent_id              TEXT NOT NULL,
     session_id            TEXT NOT NULL,
-    started_at            TIMESTAMP,
-    last_message_at       TIMESTAMP,
+    started_at            TIMESTAMP NOT NULL,
+    last_message_at       TIMESTAMP NOT NULL,
     message_count         INTEGER NOT NULL DEFAULT 0,
     user_message_count    INTEGER NOT NULL DEFAULT 0,
     first_user_message_id INTEGER,

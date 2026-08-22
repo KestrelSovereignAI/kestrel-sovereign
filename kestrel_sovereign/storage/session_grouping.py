@@ -518,35 +518,19 @@ def _session_order_key(backend_type: str, column: str) -> str:
 
 
 def _session_order_terms(backend_type: str) -> List[str]:
-    """Every key of :data:`SESSION_ORDER`, with direction and NULL placement.
+    """Every key of :data:`SESSION_ORDER`, with its direction.
 
-    The placement is the same decision
-    :func:`~kestrel_sovereign.storage.conversation_sessions.canonical_order`
-    makes about ``created_at``: an undatable row is the EARLIEST row, on both
-    engines, always — so a newest-first page puts it last. That rule has to be
-    named because the engines disagree by default: measured,
-    ``ORDER BY last_message_at DESC`` puts NULL FIRST on PostgreSQL and LAST on
-    SQLite, so a session with no readable activity would take the top of the
-    list on one backend and the bottom on the other, from the same rows.
-
-    It is spelled **only where the engine's own default is not already the
-    rule** — which is PostgreSQL. Two measurements decide that: SQLite's
-    defaults are exactly this (``DESC`` → NULLS LAST, ``ASC`` → NULLS FIRST),
-    and SQLite rejects the spelling outright inside ``CREATE INDEX``
-    ("unsupported use of NULLS LAST", 3.50.4). An index that cannot carry the
-    clause beside an ``ORDER BY`` that does is a page that stops using its
-    index, which is the whole cost this table was built to remove — so the one
-    exception is made here, once, rather than in each caller.
+    No NULL placement, because there are no NULLs to place: both keys are
+    ``NOT NULL`` in the projection's schema (see
+    ``NON_NULL_PROJECTION_COLUMNS``), and stating a placement here would be a
+    rule about a state the table cannot hold — one SQLite rejects outright
+    inside ``CREATE INDEX`` ("unsupported use of NULLS LAST", 3.50.4), so the
+    ordering and the index that serves it could not even be spelled the same
+    way.
     """
-    spell_nulls = backend_type == "postgres"
     return [
         f"{_session_order_key(backend_type, column)} "
         f"{'DESC' if descending else 'ASC'}"
-        + (
-            f" {'NULLS LAST' if descending else 'NULLS FIRST'}"
-            if spell_nulls
-            else ""
-        )
         for column, descending in SESSION_ORDER
     ]
 
@@ -579,64 +563,42 @@ def session_cursor_clause(
     result is the standard lexicographic keyset expansion — equal on every
     earlier key, past the cursor on this one — generated from the same
     declaration :func:`session_order_sql` is, so a page and its continuation
-    cannot come to order by different things. Written as a predicate rather than
-    resolved with ``OFFSET`` because an offset counts rows that may have moved
-    between two requests, which is how a paging list silently drops or repeats a
-    session while the agent is still writing.
+    cannot come to order by different things. A predicate rather than an
+    ``OFFSET`` because an offset counts rows that may have moved between two
+    requests, which is how a paging list silently drops or repeats a session
+    while the agent is still writing.
 
-    NULL is handled at both ends for the reason :func:`_session_order_terms`
-    places it: a NULL key is the EARLIEST value, so a newest-first page reaches
-    it last. ``last_message_at < ?`` is NULL for such a row and would exclude it
-    from every page — that session would be unreachable at any depth, which is
-    the exact defect #2960 exists to remove. So a descending key admits NULL
-    once the cursor has passed the dated rows, and a cursor standing ON one has
-    nothing further in that key's direction: its term is dropped rather than
-    written as an always-false clause, because a term that can never match is
-    not a bound, it is noise the planner has to carry.
+    **The leading conjunct is redundant and load-bearing.** ``last_message_at
+    <= ?`` is implied by every branch of the disjunction that follows, and
+    without it the engine cannot use the index to SEEK: measured on 200,000
+    sessions, SQLite plans ``(agent_id=?)`` and walks every entry above the
+    cursor at 17.7 ms per page, and ``(agent_id=? AND last_message_at<?)`` at
+    0.11 ms. A disjunction is not a range, so the range has to be stated
+    separately — otherwise the continuation costs ``O(rows already paged)``,
+    which is the shape this epic exists to remove, reappearing one page in.
     """
     if len(after) != len(SESSION_ORDER):
         raise ValueError(
             f"session cursor needs {len(SESSION_ORDER)} values, got {len(after)}"
         )
+    lead_column, lead_descending = SESSION_ORDER[0]
+    lead_key = _session_order_key(backend_type, lead_column)
+    conjuncts = [f"{lead_key} {'<=' if lead_descending else '>='} ?"]
+    params: List[Any] = [after[0]]
+
     terms: List[str] = []
-    params: List[Any] = []
     for index, (column, descending) in enumerate(SESSION_ORDER):
+        clauses = [
+            f"{_session_order_key(backend_type, SESSION_ORDER[earlier][0])} = ?"
+            for earlier in range(index)
+        ]
+        params.extend(after[earlier] for earlier in range(index))
         key = _session_order_key(backend_type, column)
-        value = after[index]
-        # "Past this key" in this key's own direction, NULL placement included.
-        if value is None:
-            if descending:
-                # NULLs sit at the end of a descending page: nothing follows.
-                continue
-            advance = f"{key} IS NOT NULL"
-            advance_params: Tuple[Any, ...] = ()
-        elif descending:
-            advance = f"({key} < ? OR {key} IS NULL)"
-            advance_params = (value,)
-        else:
-            advance = f"{key} > ?"
-            advance_params = (value,)
-        # ...equal on everything more significant. NULL-safe, because a cursor
-        # may carry one and ``= NULL`` matches nothing.
-        clauses: List[str] = []
-        equal_params: List[Any] = []
-        for earlier in range(index):
-            earlier_key = _session_order_key(backend_type, SESSION_ORDER[earlier][0])
-            earlier_value = after[earlier]
-            if earlier_value is None:
-                clauses.append(f"{earlier_key} IS NULL")
-            else:
-                clauses.append(f"{earlier_key} = ?")
-                equal_params.append(earlier_value)
-        clauses.append(advance)
-        params.extend(equal_params)
-        params.extend(advance_params)
+        clauses.append(f"{key} {'<' if descending else '>'} ?")
+        params.append(after[index])
         terms.append("(" + " AND ".join(clauses) + ")")
-    if not terms:
-        # Every key stood at the end of its own direction, so nothing follows
-        # this cursor. Saying so in SQL keeps the caller's one code path.
-        return "1 = 0", ()
-    return "(" + " OR ".join(terms) + ")", tuple(params)
+    conjuncts.append("(" + " OR ".join(terms) + ")")
+    return "(" + " AND ".join(conjuncts) + ")", tuple(params)
 
 
 def iso_session_timestamp(value: Any) -> Any:
@@ -699,17 +661,14 @@ def session_cursor_values(session: Dict[str, Any]) -> Tuple[Any, ...]:
 def _strictly_after(value: Any, pivot: Any, descending: bool) -> bool:
     """Whether ``value`` sits past ``pivot`` in one key's own direction.
 
-    NULL placement matches :func:`_session_order_terms` exactly — last on a
-    descending key, first on an ascending one — because this predicate and that
-    ``ORDER BY`` are two renderings of one rule and a page whose continuation
-    disagreed with its ordering would skip or repeat rows at the seam.
+    Both keys of :data:`SESSION_ORDER` are non-null — by schema in the
+    projection, and by construction in the grouper, which substitutes the
+    preceding row's instant for an undatable row rather than leaving a stamp
+    out. So there is no NULL placement to agree on with
+    :func:`session_cursor_clause`, and a ``None`` arriving here raises rather
+    than being given a position: an invented one would be this rendering's
+    alone, and the two would then disagree about where that session sits.
     """
-    if value is None and pivot is None:
-        return False
-    if value is None:
-        return descending
-    if pivot is None:
-        return not descending
     return value < pivot if descending else value > pivot
 
 
@@ -747,7 +706,8 @@ def session_cursor_after(
             if _strictly_after(keys[index], pivot[index], descending):
                 kept.append(session)
             break
-        # Equal on every key is the cursor's own row, which is behind it.
+        # Falling off the loop means equal on every key, which is the cursor's
+        # own row — behind it, not after it.
     return kept
 
 

@@ -2046,6 +2046,7 @@ class AsyncDatabase:
             live_history_predicate,
             mutation_trigger_functions,
             mutation_triggers,
+            NON_NULL_PROJECTION_COLUMNS,
             projection_tables,
             shape_change_invalidation,
         )
@@ -2061,6 +2062,25 @@ class AsyncDatabase:
             for table, ddl in tables
             if not await self.table_exists(table)
         ]
+        # A projection table carrying an EARLIER shape is as good as missing.
+        # #2960 made ``started_at`` / ``last_message_at`` NOT NULL — the page's
+        # keyset predicate cannot seek while it must also admit NULL — and a
+        # database created before that still permits one. There is no ALTER for
+        # it on SQLite and no reason to reach for one on either engine: this
+        # table is a rebuildable cache, so the migration is to drop it and let a
+        # repair derive it again, which is cheaper than rewriting it in place.
+        async def _predates_the_not_null_stamps(table: str) -> bool:
+            for column in NON_NULL_PROJECTION_COLUMNS:
+                if await self._column_accepts_null(table, column):
+                    return True
+            return False
+
+        outdated_tables = [
+            table
+            for table in ("conversation_sessions",)
+            if not any(table == name for name, _ in missing_tables)
+            and await _predates_the_not_null_stamps(table)
+        ]
         # Set equality, not "are the ones I want present". The names carry the
         # mechanism's fingerprint, so a database running a SUPERSEDED shape has
         # names this run has never heard of — and that database is exactly the
@@ -2073,10 +2093,33 @@ class AsyncDatabase:
         )
         if (
             missing_tables
+            or outdated_tables
             or installed_triggers != set(wanted_triggers)
             or installed_functions != set(wanted_functions)
         ):
             async with self.migration_lock("conversation_sessions_2959"):
+                # Re-probed under the lock: a concurrent initializer may have
+                # replaced this while this one waited.
+                for table in outdated_tables:
+                    if not await _predates_the_not_null_stamps(table):
+                        continue
+                    await self._backend.execute(
+                        f"DROP TABLE IF EXISTS {self._quoted(table)}"
+                    )
+                    logger.info(
+                        "dropped %s: it predates the NOT NULL stamps and will "
+                        "be derived again (#2960)", table,
+                    )
+                    # The watermarks describe rows that no longer exist, so
+                    # something has to say so. Rotating the generation is the
+                    # mechanism already written for "the shape moved": both
+                    # `is_stale` and `_plan` read a changed generation as
+                    # counters belonging to a different incarnation, and answer
+                    # REBUILD — including for a repair already in flight, whose
+                    # publish fence re-reads it.
+                    await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
                 # Re-probed under the lock: a concurrent initializer may have
                 # created every one of these while this one waited.
                 for table, ddl in tables:
@@ -2906,7 +2949,34 @@ class AsyncDatabase:
                 f"WHERE name='{column}'"
             )
         return bool(row and row[0] > 0)
-    
+
+    async def _column_accepts_null(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` still permits NULL.
+
+        Asked of the same relation ``ALTER TABLE`` and every unqualified read
+        resolve — ``to_regclass`` on PostgreSQL, ``pragma_table_info`` on SQLite
+        — for the reason :meth:`_column_exists` spells out: a name-based
+        ``information_schema`` probe answers about whichever same-named table
+        the search path happens to union in.
+
+        A column that does not exist reads as ``False``: "this column accepts
+        NULL" is a claim about a column, and the absent one is not a nullable
+        one. The callers that care create the table when it is missing.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT attnotnull FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
+                (table, column),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                f"SELECT \"notnull\" FROM pragma_table_info('{table}') "
+                f"WHERE name='{column}'"
+            )
+        return bool(row) and not bool(row[0])
+
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
     # ─────────────────────────────────────────────────────────────────
