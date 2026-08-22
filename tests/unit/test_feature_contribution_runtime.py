@@ -859,3 +859,37 @@ def test_tearing_down_one_feature_keeps_a_source_another_still_declares(tmp_path
     # Once the last holder goes, so does the registration.
     runtime.deactivate(second)
     assert runtime.source_registry.get(first.source.name) is None
+
+
+def test_a_failed_teardown_does_not_hand_the_source_to_a_second_owner(tmp_path):
+    """A raise mid-teardown must leave exactly one owner, not two.
+
+    The transfer ran before the inverse validations, so an UNRELATED mismatch
+    raised with the heir already updated while the original feature stayed
+    active recording the same source — two owners, and one more copy appended
+    on every retry.
+    """
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+    second = _PeerFixtureFeature(agent)
+    second.workflow_registration = type(second.workflow_registration)(
+        owner=second.contribution_owner,
+        name=second.workflow_registration.name,
+        actor=second.actor,
+        sources=(first.source,),
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((first,)).only())
+    runtime.activate(runtime.prepare_transition((second,)).only())
+    heir = runtime._active[id(second)]
+    assert heir.registered_sources == ()      # premise: the heir owns nothing yet
+
+    # Break an UNRELATED inverse so teardown validation raises.
+    runtime.wait_registry.unregister(first.wait_provider.kind)
+
+    for _ in range(2):
+        with pytest.raises(FeatureContributionRuntimeError, match="wait-provider"):
+            runtime.deactivate(first)
+        # No ownership changed hands, and nothing accumulated on retry.
+        assert runtime._active[id(second)].registered_sources == ()
+        assert runtime._active[id(first)].registered_sources == (first.source,)

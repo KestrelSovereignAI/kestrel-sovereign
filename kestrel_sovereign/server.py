@@ -3496,14 +3496,21 @@ async def health_detailed(request: Request):
     # backend (and its disabled reason) is visible regardless of agent health.
     tracing = await _phoenix_tracing_status(request.app)
     if getattr(request.app.state, "startup_error", None):
+        # Host features are started AFTER a startup error is recorded, so a
+        # refused host contribution can coexist with this branch — and this is
+        # the response an operator reads during exactly that combined failure
+        # (#2951).
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "unhealthy",
-                "error": "Server startup failed",
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(
+                request.app.state,
+                {
+                    "status": "unhealthy",
+                    "error": "Server startup failed",
+                    "checks": [],
+                    "tracing": tracing,
+                },
+            ),
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)

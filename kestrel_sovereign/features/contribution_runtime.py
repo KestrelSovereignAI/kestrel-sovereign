@@ -556,14 +556,14 @@ class FeatureContributionRuntime:
                 retained.append(source)
             else:
                 inherited.append((heir_id, source))
-        for heir_id, source in inherited:
-            heir = self._active[heir_id]
-            self._active[heir_id] = replace(
-                heir, registered_sources=heir.registered_sources + (source,)
-            )
         sources = tuple(retained)
 
-        # Validate every exact inverse before mutating any registry.
+        # Validate every exact inverse before mutating any registry — the
+        # ownership transfer below included. Handing the source to the heir
+        # before validation meant an UNRELATED mismatch (a missing wait
+        # provider, say) raised with the heir already updated while this
+        # feature stayed active recording the same source: two owners, and one
+        # more copy appended on every retry (#2951).
         for registration in values.wait_providers:
             if not self.wait_registry.contains(
                 registration.name, registration.provider
@@ -609,6 +609,14 @@ class FeatureContributionRuntime:
                 active.permission_registration
             )
         self.setup_step_registry.unregister_batch(values.setup_steps)
+        # Ownership changes hands only now, past every validation and in the
+        # same mutating stretch as the unregistrations — so a teardown that
+        # raises leaves exactly one owner, and a retry does not append a second.
+        for heir_id, source in inherited:
+            heir = self._active[heir_id]
+            self._active[heir_id] = replace(
+                heir, registered_sources=heir.registered_sources + (source,)
+            )
         del self._active[id(feature)]
         return True
 
