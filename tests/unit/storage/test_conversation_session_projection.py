@@ -61,6 +61,7 @@ from kestrel_sovereign.storage.conversation_created_at import (
 )
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.conversation_sessions import (
     CURRENT,
     active_history_predicate,
@@ -237,10 +238,18 @@ async def _assert_agrees_with_the_grouper(
 
     * Every session the projection claims, the grouper also finds, with the
       same boundaries, counts, pointer and wake source.
-    * Every session the grouper finds whose id the column may hold, the
-      projection claims. Absence is only ever an id outside that contract —
-      the legacy row-id keys and the ``did:x:1`` shapes — which is Phase A's
-      invariant carried forward: silent where it must be, never wrong.
+    * Every session the grouper finds whose id a READER CAN OPEN, the projection
+      claims. Absence is only ever an id no reader could round-trip — the
+      ``did:x:1`` shapes — which is Phase A's invariant carried forward: silent
+      where it must be, never wrong.
+
+    That second direction was narrower when this table had no reader: it also
+    excused the legacy row-id keys of #2012, on the grounds that absence is the
+    permitted direction. #2960 makes this table THE conversation list, so an
+    absent session is a conversation that has vanished from the UI. A row-id key
+    is not in the column and never can be, but it is exactly what the row-id
+    resolver opens — so it is claimed, and the test for "can a reader open this"
+    is asked of the resolver rather than of the column.
     """
     history = await _live_history(db, agent_id)
     reference = _reference_sessions(history)
@@ -254,7 +263,10 @@ async def _assert_agrees_with_the_grouper(
         assert projected == reference[session_id], session_id
 
     expected = {
-        session_id for session_id in reference if is_stampable_session_id(session_id)
+        session_id
+        for session_id in reference
+        if is_stampable_session_id(session_id)
+        or coerce_persistent_message_id(session_id) is not None
     }
     assert set(stored) == expected
     return stored
@@ -292,11 +304,15 @@ async def _assert_repaired_projection_is_true(
                 "which is not a live row"
             )
             assert live[0] == "user"
-        counted = await db.fetchval(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? "
-            "AND session_id = ? AND deleted_at IS NULL AND archived_at IS NULL",
-            (agent_id, row["session_id"]),
-        )
+        # Counted through the store's own resolver, not by the indexed column.
+        # The column is one of the two ways a session is keyed and it cannot
+        # find the other: a legacy row-id session (#2012) carries NULL in every
+        # row's column by construction. A membership test that only knows the
+        # column would report those as empty and would be asserting the
+        # checker's blind spot rather than the projection's claim.
+        counted = await AsyncConversationStore(
+            db, agent_id=agent_id
+        ).count_session_messages(row["session_id"], deleted_filter="live")
         assert counted > 0, (
             f"session {row['session_id']!r} has a projection row but no live rows"
         )
@@ -2515,12 +2531,19 @@ async def test_the_list_orders_ties_deterministically(tmp_path):
     Asserted through a real database rather than a double: the ordering is
     decided by SQL, so a mock storage would only prove that the test knows what
     it wrote.
+
+    Asked of the LIST, which since #2960 means the sessions page rather than a
+    window of raw rows. The consequence is what is observable and what a user
+    would see move: a legacy cluster is keyed and previewed by its FIRST row in
+    canonical order, so a tie resolved differently gives the same three messages
+    a different session id and a different card.
     """
     from kestrel_sovereign.privacy import PrivacyMode
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
     async with AsyncStorage(str(tmp_path / "ties.db"), agent_id=AGENT) as storage:
+        ids = []
         for content in ("first", "second", "third"):
             await storage.db.execute(
                 "INSERT INTO conversation_history "
@@ -2528,17 +2551,26 @@ async def test_the_list_orders_ties_deterministically(tmp_path):
                 "VALUES (?, 'user', ?, NULL, ?)",
                 (AGENT, content, _at(0)),
             )
+        ids = [
+            row[0] for row in await storage.db.fetchall(
+                "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id",
+                (AGENT,),
+            )
+        ]
+        assert len(ids) == 3, "the corpus did not land, so the order proves nothing"
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations(AGENT, limit=10)
-        ids = [row[0] for row in rows]
+        page = await wrapper.list_session_page(AGENT, limit=10)
+        sessions = page["sessions"]
 
-        assert len(ids) == 3, "the corpus did not land, so the order proves nothing"
-        assert ids == sorted(ids, reverse=True), (
-            "rows sharing a timestamp came back in an order the backend chose; "
-            f"got {ids}. The list must break ties on id so the same history "
-            "always groups the same way."
+        assert len(sessions) == 1, f"three tied rows are one cluster; got {sessions}"
+        assert sessions[0]["session_id"] == str(min(ids)), (
+            "rows sharing a timestamp were ordered by whatever the backend "
+            f"chose; the cluster keyed on {sessions[0]['session_id']!r} rather "
+            f"than on the lowest id {min(ids)}. The list must break ties on id "
+            "so the same history always groups the same way."
         )
+        assert sessions[0]["preview_content"] == "first"
 
 
 @pytest.mark.asyncio
@@ -2651,11 +2683,13 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
     two rows come back reversed under a raw ``ORDER BY created_at``, and
     ``julianday()`` restores chronology.
 
-    Asked of ``query_conversations``, because that is where the order is
-    actually consumed: the conversation list pages by it and reverses it before
-    grouping, so getting it wrong reorders the transcript the grouper sees. The
-    projection's ordinary chunk path walks ids and never reaches this clause,
-    which is why an earlier version of this test passed with the fix removed.
+    Asked of the LIST, because that is where the order is actually consumed.
+    Since #2960 the list reads the sessions table, and the derivation that fills
+    it for a history holding unstamped rows — which this one is — walks the
+    whole transcript in exactly this order, so getting it wrong reorders the
+    sequence the grouper sees and moves the session boundaries. The chunked
+    path walks ids and never reaches this clause, which is why an earlier
+    version of this test passed with the fix removed.
 
     The mixture now arrives only in a database that predates #3009's CHECK, and
     the migration removes it on the way in. Both readings of the order have to
@@ -2679,8 +2713,8 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
     async with AsyncStorage(str(tmp_path / "spellings.db"), agent_id=AGENT) as storage:
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations(AGENT, limit=10)
-        newest_first = [row[2] for row in rows]
+        page = await wrapper.list_session_page(AGENT, limit=10)
+        newest_first = [s["preview_content"] for s in page["sessions"]]
 
         assert newest_first == ["later, SQL spelling", "earlier, ISO spelling"], (
             "the list paged these newest-first by TEXT, not by time: the "
