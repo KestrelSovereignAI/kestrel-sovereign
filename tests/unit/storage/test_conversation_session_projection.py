@@ -63,6 +63,8 @@ from kestrel_sovereign.storage.async_conversation_store import AsyncConversation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
     CURRENT,
+    active_history_predicate,
+    canonical_order_index_columns,
     INCREMENTAL,
     PROJECTION_INPUT_COLUMNS,
     REBUILT,
@@ -1340,10 +1342,31 @@ async def test_initializing_a_database_wires_the_projections_whole_schema(tmp_pa
         # each rather than assuming both tuples are the same width.
         for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
             name, table = entry[0], entry[1]
-            assert await db._index_exists(name, table) is True, name
-        assert await db._index_exists(
-            "idx_conversation_agent_canonical", "conversation_history"
-        ) is True, "the index the conversation list's ordering needs is absent"
+            # A family, not an object: since #3009 step 5 the name carries a
+            # fingerprint of the definition, so a changed expression is a
+            # changed name and the old member is retired.
+            assert await db._index_family(name, table), name
+        # Asked of the DEFINITION, not just the family: this is the index that
+        # keeps the conversation list a bounded traversal, and an index whose
+        # expression no longer matches the ORDER BY is not a slow index, it is
+        # no index. The name is computed from what `canonical_order()` renders,
+        # so the two cannot drift apart silently.
+        from kestrel_sovereign.storage.async_database import (
+            _definition_fingerprint,
+        )
+
+        wanted = (
+            "idx_conversation_agent_canonical_"
+            + _definition_fingerprint(
+                db.backend_type,
+                canonical_order_index_columns(db.backend_type),
+                active_history_predicate(),
+            )
+        )
+        assert await db._index_exists(wanted, "conversation_history") is True, (
+            "the index the conversation list's ordering needs is absent, or "
+            "carries an expression the ordering no longer asks for"
+        )
         for table, _ddl in projection_tables():
             assert await db.table_exists(table), table
         # Set equality, so a superseded trigger left behind beside the wanted
