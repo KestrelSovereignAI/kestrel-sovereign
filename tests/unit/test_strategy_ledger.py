@@ -1521,3 +1521,80 @@ class TestRecallLimitIsNotUnderReported:
             )
         finally:
             await database.close()
+
+
+class TestDataLossGuardsAreDefended:
+    """The two P1 guards that reconciliation and persistence depend on.
+
+    Both were correct in the tree and killed no mutant: removing the
+    fail-closed check in ``save()``, and letting ``resolve_row_repo`` bind an
+    unqualified reference to the first configured repository, each left the
+    suite green. A guard nothing tests is one refactor from being deleted as
+    dead weight, and both of these protect against silent data loss rather
+    than a visible error.
+    """
+
+    def test_save_refuses_to_overwrite_a_ledger_it_could_not_parse(self, tmp_path):
+        """An unreadable ledger must be left on disk untouched.
+
+        ``load()`` leaves the in-memory sections empty when the parse fails,
+        so writing them back is not an update — it deletes everything the
+        parse could not reach.
+        """
+        from kestrel_sovereign.features.strategic_memory.ledger import StrategyLedger
+
+        path = tmp_path / "STRATEGY_LEDGER.yaml"
+        malformed = "version: 1\npatterns: [unclosed\n"
+        path.write_text(malformed, encoding="utf-8")
+
+        ledger = StrategyLedger(path)
+        ledger.load()
+        assert ledger.load_error, "precondition: the file must fail to parse"
+
+        error = ledger.save()
+
+        assert error is not None, "save() must refuse, not silently succeed"
+        assert "Refusing to write" in error
+        assert path.read_text(encoding="utf-8") == malformed, (
+            "the malformed file must be byte-identical after a refused save"
+        )
+
+    def test_an_unqualified_issue_is_ambiguous_across_several_repositories(self):
+        """`#42` is not an issue identifier; `owner/repo#42` is.
+
+        Binding an unqualified reference to the first configured repository
+        containing that number resolved a blocker whose issue was open in one
+        project because a different project had closed its own issue 42.
+        """
+        from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
+            AMBIGUOUS_REPO,
+            resolve_row_repo,
+        )
+
+        repo, problem = resolve_row_repo(
+            {"issue": "#42"}, ["owner/alpha", "owner/beta"]
+        )
+
+        assert repo is None, "must not guess a repository"
+        assert problem == AMBIGUOUS_REPO
+
+    def test_a_row_that_names_its_repository_is_never_ambiguous(self):
+        """The guard must refuse guesses without refusing known answers."""
+        from kestrel_sovereign.features.strategic_memory.blocker_reconcile import (
+            resolve_row_repo,
+        )
+
+        declared, problem = resolve_row_repo(
+            {"issue": "#42", "repo": "owner/alpha"}, ["owner/alpha", "owner/beta"]
+        )
+        assert (declared, problem) == ("owner/alpha", None)
+
+        qualified, problem = resolve_row_repo(
+            {"issue": "owner/beta#42"}, ["owner/alpha", "owner/beta"]
+        )
+        assert (qualified, problem) == ("owner/beta", None)
+
+        single, problem = resolve_row_repo({"issue": "#42"}, ["owner/alpha"])
+        assert (single, problem) == ("owner/alpha", None), (
+            "one configured repository makes an unqualified reference unambiguous"
+        )
