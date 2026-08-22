@@ -287,6 +287,18 @@ async def test_a_table_predating_the_not_null_stamps_is_replaced_and_rederived(
         listed = {row["session_id"] for row in await projection.list()}
         assert "ghost" not in listed, "a row from the retired table survived"
         assert listed == {"1"}, listed
+        # ...and the page is still bounded. ``DROP TABLE`` takes the table's
+        # indexes with it, so a migration that only restored the ROWS would
+        # leave every page sorting the whole table — the cost this epic
+        # removed, gone again on the one boot nobody watches.
+        plan = await db.fetchall(
+            "EXPLAIN QUERY PLAN SELECT session_id FROM conversation_sessions "
+            f"WHERE agent_id = ? {session_order_sql(db.backend_type)} LIMIT ?",
+            (AGENT, 10),
+        )
+        text = " ".join(str(row) for row in plan).upper()
+        assert "IDX_CONVERSATION_SESSIONS_RECENT" in text, text
+        assert "USE TEMP B-TREE" not in text, text
     finally:
         await db.close()
 
