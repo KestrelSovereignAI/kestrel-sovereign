@@ -2,19 +2,29 @@
 Strategic Memory Feature for Kestrel agents.
 
 Provides persistent strategic context (vision, milestones, stakeholders,
-decisions, blockers, patterns) that survives across sessions. Loaded from
-STRATEGY.yaml in the agent's data directory and injected into the system
-prompt via the BootstrapLoader.
+decisions, blockers, patterns) that survives across sessions.
+
+Two canonical files, split by how the content is meant to be read:
+
+* ``STRATEGY.yaml`` -- the standing brief (vision, milestones, stakeholders,
+  decisions). A bootstrap file: injected into the system prompt every turn by
+  the BootstrapLoader, and therefore deliberately kept small.
+* ``STRATEGY_LEDGER.yaml`` -- the growing logs (patterns learned, blockers).
+  Not a bootstrap file. Reached by query through the graph projection in
+  :mod:`ledger_index`, because a 175 KB append-only log poured into a 20,000
+  character prompt budget does not inform an agent, it truncates at a byte
+  offset (#2954).
 
 This feature also provides !strategy commands for querying and updating
 strategic context at runtime.
 """
 
+import copy
 import logging
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -23,8 +33,26 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
+from .blocker_reconcile import AMBIGUOUS_REPO, check_blockers, configured_repos
 from .decision_index import decision_entries, project_decisions
 from .issue_selection import pick_top_issue
+from .ledger import (
+    BLOCKERS_KEY,
+    LEDGER_FILENAME,
+    PATTERNS_KEY,
+    StrategyLedger,
+    active_blockers,
+    active_patterns,
+    has_ledger_sections,
+    strip_ledger_sections,
+)
+from .ledger_index import (
+    BLOCKER_NODE_TYPE,
+    PATTERN_NODE_TYPE,
+    project_ledger,
+    recall_nodes,
+    search_rows,
+)
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
 
@@ -71,6 +99,14 @@ _GITHUB_PREREQ_FAILURE_PREFIXES: tuple = (
 def _is_github_prereq_failure(body: str) -> bool:
     return any(body.startswith(p) for p in _GITHUB_PREREQ_FAILURE_PREFIXES)
 
+
+#: How many patterns ``strategy_view patterns`` renders before pointing at the
+#: query layer. The whole point of moving the log out of the prompt was to stop
+#: pouring hundreds of rows into a context window; rendering all of them here
+#: would rebuild the same problem inside a tool result. The renderer says how
+#: many it withheld — a silently capped list is a lie about the record.
+_PATTERN_VIEW_LIMIT = 25
+
 # Try to import yaml; fall back to a simple parser if not available
 try:
     import yaml
@@ -112,20 +148,23 @@ class StrategicMemoryFeature(Feature):
 
     STRATEGY_FILENAME = "STRATEGY.yaml"
 
+    # ``patterns`` is deliberately absent. The template used to ship it empty
+    # while every reader and writer used ``patterns_learned``, so agents ended
+    # up carrying both keys -- one empty, one holding hundreds of rows. Two
+    # names for one concept is one name too many; the ledger owns it now.
     _DEFAULT_TEMPLATE = {
         "version": 1,
         "vision": "Define your agent's long-term vision here.",
         "milestones": [],
         "stakeholders": [],
         "decisions": [],
-        "blockers": [],
-        "patterns": [],
     }
 
     def __init__(self, agent):
         super().__init__(agent)
         self._data: Dict[str, Any] = {}
         self._strategy_path: Optional[Path] = None
+        self._ledger = StrategyLedger(None)
 
     @property
     def tool_description(self) -> str:
@@ -169,8 +208,18 @@ class StrategicMemoryFeature(Feature):
                         f"StrategicMemoryFeature loaded: {len(self._data)} top-level keys"
                     )
                 else:
-                    # Create default template so the agent can start capturing strategy
-                    self._data = dict(self._DEFAULT_TEMPLATE)
+                    # Create default template so the agent can start capturing
+                    # strategy. deepcopy, not dict(): a shallow copy shares the
+                    # class-level ``milestones``/``stakeholders``/``decisions``
+                    # LIST OBJECTS with every other instance in the process, so
+                    # ``strategy_add_decision`` appended into the template
+                    # itself. On a multi-agent host the next agent created was
+                    # then born holding the previous agent's decisions, and
+                    # ``_save()`` wrote them into its brand-new STRATEGY.yaml --
+                    # one agent's strategic record leaking into another's, on
+                    # disk. Noticed while adding the index consumers (#2954);
+                    # the bug predates them.
+                    self._data = copy.deepcopy(self._DEFAULT_TEMPLATE)
                     self._save()
                     if self._strategy_path.exists():
                         logger.info(
@@ -187,12 +236,237 @@ class StrategicMemoryFeature(Feature):
         except Exception as e:
             logger.error(f"Failed to load strategic memory: {e}")
 
+        # The ledger is loaded even when STRATEGY.yaml failed above: the two
+        # files are independent canonical records, and a broken brief must not
+        # take the pattern/blocker log down with it.
+        try:
+            self._ledger = StrategyLedger(
+                self._strategy_path.parent / LEDGER_FILENAME
+                if self._strategy_path
+                else None
+            )
+            self._ledger.load()
+            self._migrate_ledger_sections()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to load strategy ledger: {e}")
+
         # Rebuild the graph index from what YAML says (#2851). Doing it at load
         # is what makes the index genuinely derived: an agent whose database was
         # lost, or whose STRATEGY.yaml was edited by hand or pulled from git,
         # gets a correct index on next start with no migration step. It is also
         # how decisions recorded before this existed become reachable at all.
         await self._reindex_decisions()
+        await self._reindex_ledger()
+
+    # ------------------------------------------------------------------
+    # Ledger: migration, persistence, projection
+    # ------------------------------------------------------------------
+
+    def _migrate_ledger_sections(self) -> Dict[str, Any]:
+        """Move ``patterns_learned``/``blockers`` out of STRATEGY.yaml.
+
+        Ordered so that no ordering can lose a row: the ledger is written
+        first, and STRATEGY.yaml only gives the sections up once that write is
+        confirmed persisted. An interrupted migration therefore leaves the rows
+        duplicated across both files -- recoverable, and converged by the next
+        run, because :meth:`StrategyLedger.absorb` skips ids it already holds.
+        """
+        report = {"migrated": False, "patterns": 0, "blockers": 0}
+        if not self._ledger.readable:
+            # The file exists and could not be understood. Migrating into it
+            # would write over contents we never read.
+            report["error"] = self._ledger.load_error
+            return report
+
+        if not has_ledger_sections(self._data):
+            # Already migrated (or a fresh agent). Still normalize, so
+            # hand-written rows without ids get addressable -- and persist
+            # that, because an id minted only in memory is an address that
+            # changes on the next restart, orphaning every graph node and
+            # every id the agent wrote down.
+            if self._ledger.needs_save and self._ledger.active:
+                error = self._ledger.save()
+                if error:
+                    logger.warning(
+                        "Strategy ledger ids minted in memory but not "
+                        "persisted: %s",
+                        error,
+                    )
+                    report["error"] = error
+            return report
+
+        absorbed = self._ledger.absorb(self._data)
+        if absorbed.get("error"):
+            report["error"] = absorbed["error"]
+            return report
+        self._ledger.normalize()
+        error = self._ledger.save()
+        if error:
+            logger.error(
+                "Strategy ledger migration deferred -- %s. STRATEGY.yaml is "
+                "unchanged and still holds the rows.",
+                error,
+            )
+            report["error"] = error
+            return report
+
+        if strip_ledger_sections(self._data):
+            outcome = self._save()
+            if not outcome.persisted:
+                # The ledger already has the rows; STRATEGY.yaml keeping its
+                # copy for now is a duplicate, not a loss. Re-read it so the
+                # in-memory brief matches the file that is actually on disk.
+                logger.warning(
+                    "Strategy ledger written but STRATEGY.yaml could not be "
+                    "trimmed: %s",
+                    outcome.error,
+                )
+                report["error"] = outcome.error
+        report["migrated"] = True
+        report["patterns"] = absorbed["patterns"]
+        report["blockers"] = absorbed["blockers"]
+        if absorbed["patterns"] or absorbed["blockers"]:
+            logger.info(
+                "Strategy ledger migration: %d pattern(s), %d blocker(s) moved "
+                "to %s",
+                absorbed["patterns"],
+                absorbed["blockers"],
+                LEDGER_FILENAME,
+            )
+        return report
+
+    def _strategy_data_view(self) -> Dict[str, Any]:
+        """STRATEGY.yaml plus the ledger's *active* rows, for readers.
+
+        The split is a persistence decision, not a behaviour change:
+        ``morning_signal``, ``pick_top_issue`` and the section renderers asked
+        for ``data["blockers"]`` before and must still get blockers. They see
+        the active rows only -- a resolved blocker is history, not a blocker.
+
+        Deliberately a copy. Merging the ledger into ``self._data`` would put
+        the ledger's rows back into whatever ``_save()`` writes to
+        STRATEGY.yaml, undoing the migration on the next write.
+        """
+        view = dict(self._data)
+        view[BLOCKERS_KEY] = active_blockers(self._ledger.blockers)
+        view[PATTERNS_KEY] = active_patterns(self._ledger.patterns)
+        return view
+
+    def _resolve_blocker_repo(
+        self, issue: str, declared: str
+    ) -> tuple[str, Optional[str]]:
+        """Decide which repository a new blocker's issue belongs to.
+
+        Returns ``(repo, error)``. Three unambiguous sources, in order: what
+        the caller declared, a fully qualified ``owner/repo#N`` issue, and a
+        lone configured ``scan_repos`` entry. When several repositories are
+        configured and none of those apply, this refuses rather than guessing
+        -- the guess is what made reconciliation resolve a blocker against the
+        wrong project's issue 42.
+
+        An unqualified issue with *no* configured repos is left unbound: there
+        is nothing to be ambiguous between, and refusing would block recording
+        a blocker on a host with no GitHub configuration at all.
+        """
+        declared = str(declared or "").strip()
+        if declared:
+            return declared, None
+        raw = str(issue or "").strip()
+        if "#" in raw and "/" in raw.split("#", 1)[0]:
+            return raw.split("#", 1)[0], None
+        configured = configured_repos(self._data)
+        if len(configured) == 1:
+            return configured[0], None
+        if len(configured) > 1 and str(issue or "").strip():
+            return "", (
+                f"{len(configured)} repositories are configured "
+                f"({', '.join(configured)}), so issue {issue!r} is ambiguous. "
+                "Pass repo='owner/repo', or write the issue as "
+                "'owner/repo#123'."
+            )
+        return "", None
+
+    def _ledger_unreadable_result(self, data: Dict[str, Any]) -> ToolResult:
+        """The refusal every ledger tool returns when the file is unreadable.
+
+        Fail closed, and say so. The alternative -- carrying on with an empty
+        in-memory ledger -- reads as "you have no patterns" and, on the first
+        write, becomes true.
+        """
+        return ToolResult.failed(
+            f"Strategy ledger is unavailable: {self._ledger.load_error}. "
+            "Nothing was read or written; repair or move the file and restart.",
+            data={**data, "ledger_unavailable": True},
+        )
+
+    def _persisted_ledger_result(
+        self, confirmation: str, data: Dict[str, Any]
+    ) -> ToolResult:
+        """Turn a ledger write into an honest ToolResult, as ``_save`` does."""
+        if not self._ledger.readable:
+            return self._ledger_unreadable_result(
+                {**data, "persisted": False}
+            )
+        if not self._ledger.path:
+            return ToolResult.failed(
+                "No strategy ledger path configured -- strategic memory is "
+                "not active, so nothing was persisted.",
+                data={**data, "persisted": False},
+            )
+        error = self._ledger.save()
+        if error:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"In-memory update applied but the write failed: {error}"
+                ),
+                data={**data, "persisted": False},
+            )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={**data, "persisted": True},
+        )
+
+    async def _reindex_ledger(self) -> Dict[str, Any]:
+        """Project the ledger into the graph.
+
+        Never raises and never touches the ledger file: the canonical record is
+        already on disk, so a graph failure must not turn into a strategic-
+        memory failure. Reconciles rather than merely upserting, for the same
+        reason the decision index does -- a row deleted from the canonical file
+        must stop being reachable through the index.
+        """
+        if not self._ledger.readable:
+            # An unreadable ledger is not an empty one. Reconciliation derives
+            # its keep-set from the ledger's contents, so projecting a failed
+            # parse would present "no rows" as "every row was deleted" and take
+            # the whole derived index with it -- a parse error escalated into
+            # data loss. Exactly the failure the decision index hit in #2851
+            # when its keep-set came from a failed read rather than from
+            # canonical membership.
+            logger.warning(
+                "strategy ledger index skipped: ledger unreadable (%s)",
+                self._ledger.load_error,
+            )
+            return {"projected": 0, "skipped": 0, "failed": 0,
+                    "skipped_reason": "ledger_unavailable"}
+        agent_id = self._projection_agent_id()
+        if not agent_id:
+            logger.warning(
+                "strategy ledger index skipped: agent exposes no agent_id/did/id"
+            )
+            return {"projected": 0, "skipped": 0, "failed": 0,
+                    "skipped_reason": "no_agent_identity"}
+        try:
+            storage = getattr(self.agent, "storage", None)
+            graph_store = getattr(storage, "graph", None) if storage else None
+            report = await project_ledger(graph_store, agent_id, self._ledger)
+        except Exception as e:  # noqa: BLE001 - the index is best-effort
+            logger.warning("strategy ledger index projection failed: %s", e)
+            return {"projected": 0, "skipped": 0, "failed": 0, "error": str(e)}
+        if report.get("failed") or report.get("skipped_reason"):
+            logger.info("strategy ledger index: %s", report)
+        return report
 
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
@@ -329,7 +603,7 @@ class StrategicMemoryFeature(Feature):
         Args:
             section: Which section to view -- all, vision, milestones, stakeholders, decisions, blockers, patterns
         """
-        if not self._data:
+        if not self._data and not (self._ledger.patterns or self._ledger.blockers):
             return ToolResult.failed(
                 "No strategic memory loaded. Create a STRATEGY.yaml in the agent data directory.",
             )
@@ -356,7 +630,37 @@ class StrategicMemoryFeature(Feature):
                 data={"section": section},
             )
         section = normalized_section
+        if not self._ledger.readable and section in ("blockers", "patterns"):
+            # These two sections are the ledger, entirely. Rendering them from
+            # an unread file would print an empty list under a heading that
+            # claims to be the record.
+            return self._ledger_unreadable_result({"section": section})
         body = renderer()
+        if not self._ledger.readable and section == "all":
+            # ``all`` still has a genuine brief to show -- vision, milestones,
+            # stakeholders and decisions come from STRATEGY.yaml, which is a
+            # separate file and is fine. Refusing the whole view would let a
+            # broken ledger take down a working brief, the mirror of the rule
+            # that a broken brief must not take down the ledger. So it renders,
+            # and says plainly which part of it is missing rather than showing
+            # an empty Blockers heading and letting the reader assume zero.
+            #
+            # Only ``all``: the single-section views above draw nothing from
+            # the ledger, so caveating ``!strategy vision`` with "patterns and
+            # blockers are missing" would report a loss that view never had.
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"Patterns and blockers are missing from this view: "
+                    f"{self._ledger.load_error}. Every other section is "
+                    "complete."
+                ),
+                data={
+                    "section": section,
+                    "body": body,
+                    "ledger_unavailable": True,
+                },
+            )
         return ToolResult.ok(
             confirmation=body,
             data={"section": section, "body": body},
@@ -411,7 +715,13 @@ class StrategicMemoryFeature(Feature):
         category=ToolCategory.SYSTEM,
     )
     async def strategy_add_blocker(
-        self, issue: str, title: str, severity: str = "medium", owner: str = "unassigned", notes: str = ""
+        self,
+        issue: str,
+        title: str,
+        severity: str = "medium",
+        owner: str = "unassigned",
+        repo: str = "",
+        notes: str = "",
     ) -> ToolResult:
         """
         Add a blocker to the strategic memory.
@@ -421,6 +731,7 @@ class StrategicMemoryFeature(Feature):
             title: Short description of the blocker
             severity: How severe -- one of low, medium, high, critical (default medium)
             owner: Who owns resolving this blocker
+            repo: owner/repo the issue lives in. Inferred from a qualified issue or a single configured scan repo; required when several are configured.
             notes: Additional context
         """
         # Normalize + validate so an unrecognized severity isn't persisted
@@ -431,22 +742,37 @@ class StrategicMemoryFeature(Feature):
                 f"Invalid severity '{severity}'. Must be one of: low, medium, high, critical.",
                 data={"severity": severity},
             )
-        if "blockers" not in self._data:
-            self._data["blockers"] = []
+        if not self._ledger.readable:
+            return self._ledger_unreadable_result({"recorded": False})
 
-        entry = {
-            "issue": issue,
-            "title": title,
-            "severity": severity,
-            "owner": owner,
-            "blocked_since": str(date.today()),
-            "notes": notes,
-        }
-        self._data["blockers"].append(entry)
-        return self._persisted_result(
-            confirmation=f"Blocker recorded: {title}",
-            data={"recorded": True, "blocker": entry},
+        # Bind the repository now, while the caller is here to say which one.
+        # A row written without it is a row a later reconcile has to guess
+        # about, and "#42 is closed" is only true of a specific repository --
+        # binding to the first configured repo that happens to have an issue 42
+        # is how a blocker gets resolved against a different project's ticket.
+        resolved_repo, repo_error = self._resolve_blocker_repo(issue, repo)
+        if repo_error:
+            return ToolResult.failed(
+                repo_error, data={"recorded": False, "issue": issue}
+            )
+        entry = self._ledger.add_blocker(
+            issue=issue,
+            title=title,
+            severity=severity,
+            owner=owner,
+            notes=notes,
+            repo=resolved_repo,
         )
+        result = self._persisted_ledger_result(
+            confirmation=f"Blocker recorded: {title} (id {entry['id']})",
+            data={"recorded": True, "blocker": entry, "blocker_id": entry["id"]},
+        )
+        # Index only what reached the canonical file, for the same reason
+        # ``strategy_add_decision`` does: a derived index must not publish a row
+        # its source does not contain.
+        if (result.data or {}).get("persisted"):
+            await self._reindex_ledger()
+        return result
 
     @tool(
         name="strategy_add_pattern",
@@ -462,46 +788,511 @@ class StrategicMemoryFeature(Feature):
             source: Where this was observed
             implication: What this means for future work
         """
-        if "patterns_learned" not in self._data:
-            self._data["patterns_learned"] = []
-
-        entry = {
-            "pattern": pattern,
-            "source": source,
-            "implication": implication,
-        }
-        self._data["patterns_learned"].append(entry)
-        return self._persisted_result(
-            confirmation=f"Pattern recorded: {pattern}",
-            data={"recorded": True, "pattern": entry},
+        if not self._ledger.readable:
+            # Refuse before mutating, not after. ``_persisted_ledger_result``
+            # would catch the write, but the row would already be sitting in
+            # the in-memory ledger, where ``strategy_search`` and
+            # ``strategy_view`` would show it as recorded -- a row that exists
+            # nowhere on disk and vanishes on restart.
+            return self._ledger_unreadable_result({"recorded": False})
+        entry = self._ledger.add_pattern(
+            pattern=pattern, source=source, implication=implication
         )
+        result = self._persisted_ledger_result(
+            confirmation=f"Pattern recorded: {pattern} (id {entry['id']})",
+            data={"recorded": True, "pattern": entry, "pattern_id": entry["id"]},
+        )
+        if (result.data or {}).get("persisted"):
+            await self._reindex_ledger()
+        return result
+
+    @tool(
+        name="strategy_supersede_pattern",
+        description=(
+            "Retire a learned pattern by its id, optionally naming the pattern "
+            "that replaces it. The row is kept as history, not deleted."
+        ),
+        category=ToolCategory.SYSTEM,
+    )
+    async def strategy_supersede_pattern(
+        self, pattern_id: str, reason: str = "", superseded_by: str = ""
+    ) -> ToolResult:
+        """
+        Mark a learned pattern superseded so it drops out of the active set.
+
+        Args:
+            pattern_id: The pattern row id (from strategy_add_pattern / strategy_search)
+            reason: Why the pattern no longer holds
+            superseded_by: Optional id of the pattern that replaces it
+        """
+        if not self._ledger.readable:
+            # Without this the lookup below runs against the empty default
+            # ledger and returns "No pattern found with id" -- a false negative
+            # that reads as "you never recorded that", when the truth is that
+            # the file holding it could not be read.
+            return self._ledger_unreadable_result(
+                {"pattern_id": pattern_id, "superseded": False}
+            )
+        key, row = self._ledger.find(pattern_id)
+        if row is None or key != PATTERNS_KEY:
+            return ToolResult.failed(
+                f"No pattern found with id: {pattern_id}. Use strategy_search "
+                "to find a pattern's id.",
+                data={"pattern_id": pattern_id, "superseded": False},
+            )
+        if row.get("superseded_at"):
+            return ToolResult.failed(
+                f"Pattern {pattern_id} was already superseded on "
+                f"{row['superseded_at']}.",
+                data={"pattern_id": pattern_id, "superseded": False},
+            )
+        if superseded_by:
+            replacement_key, replacement = self._ledger.find(superseded_by)
+            if replacement is None or replacement_key != PATTERNS_KEY:
+                return ToolResult.failed(
+                    f"No pattern found with id: {superseded_by} -- refusing to "
+                    "record a replacement that does not exist.",
+                    data={"pattern_id": pattern_id, "superseded": False},
+                )
+
+        self._ledger.supersede_pattern(
+            row, reason=reason, superseded_by=superseded_by
+        )
+        result = self._persisted_ledger_result(
+            confirmation=f"Pattern {pattern_id} superseded.",
+            data={"superseded": True, "pattern_id": pattern_id, "pattern": row},
+        )
+        if (result.data or {}).get("persisted"):
+            await self._reindex_ledger()
+        return result
 
     @tool(
         name="strategy_resolve_blocker",
-        description="Mark a blocker as resolved and remove it from active blockers.",
+        description=(
+            "Resolve one blocker by its row id (preferred) or by a unique issue "
+            "identifier. Refuses an issue key that matches several rows -- "
+            "resolve those individually by id."
+        ),
         category=ToolCategory.SYSTEM,
     )
-    async def strategy_resolve_blocker(self, issue: str) -> ToolResult:
+    async def strategy_resolve_blocker(
+        self, issue: str, resolution: str = ""
+    ) -> ToolResult:
         """
-        Resolve a blocker by its issue identifier.
+        Resolve a blocker by its row id or issue identifier.
 
         Args:
-            issue: The issue number or identifier to resolve
+            issue: The blocker row id, or the issue number/identifier
+            resolution: Optional note describing how it was resolved
         """
-        blockers = self._data.get("blockers", [])
-        original_count = len(blockers)
-        self._data["blockers"] = [b for b in blockers if b.get("issue") != issue]
-        removed = original_count - len(self._data["blockers"])
-
-        if removed > 0:
-            return self._persisted_result(
-                confirmation=f"Blocker {issue} resolved and removed.",
-                data={"resolved": True, "issue": issue, "removed_count": removed},
+        if not self._ledger.readable:
+            # Same false negative as strategy_supersede_pattern: an empty
+            # in-memory ledger answers "no blocker found with issue X" for a
+            # blocker that is sitting in the file, unread.
+            return self._ledger_unreadable_result(
+                {"issue": issue, "removed_count": 0}
             )
-        return ToolResult.failed(
-            f"No blocker found with issue: {issue}",
-            data={"issue": issue, "removed_count": 0},
+        matches = self._ledger.blockers_matching(issue)
+        if not matches:
+            return ToolResult.failed(
+                f"No blocker found with issue: {issue}",
+                data={"issue": issue, "removed_count": 0},
+            )
+        if len(matches) > 1:
+            # The defect this ticket was filed on: matching by issue key alone
+            # removed every row that shared it -- one call returned
+            # removed_count 10. Ambiguity is now a refusal with the ids needed
+            # to be specific, not a bulk delete the caller never asked for.
+            ids = [str(m.get("id") or "?") for m in matches]
+            return ToolResult.failed(
+                f"{len(matches)} blockers share issue {issue}: "
+                + ", ".join(ids)
+                + ". Resolve them one at a time by id.",
+                data={
+                    "issue": issue,
+                    "removed_count": 0,
+                    "ambiguous": True,
+                    "candidate_ids": ids,
+                },
+            )
+
+        row = matches[0]
+        self._ledger.resolve_blocker(row, resolution=resolution)
+        result = self._persisted_ledger_result(
+            confirmation=f"Blocker {row.get('id')} ({issue}) resolved.",
+            data={
+                "resolved": True,
+                "issue": issue,
+                "blocker_id": row.get("id"),
+                "removed_count": 1,
+            },
         )
+        if (result.data or {}).get("persisted"):
+            await self._reindex_ledger()
+        return result
+
+    @tool(
+        name="strategy_search",
+        description=(
+            "Search the strategy ledger (learned patterns and blockers) by "
+            "keyword. This is the query path that replaced dumping the whole "
+            "log into the system prompt."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!strategy-search",
+    )
+    async def strategy_search(
+        self, query: str, kind: str = "all", limit: int = 10
+    ) -> ToolResult:
+        """
+        Search learned patterns and blockers.
+
+        Args:
+            query: Words to match against the ledger rows
+            kind: Which rows to search -- all, patterns, blockers (default all)
+            limit: Maximum matches to return (default 10)
+        """
+        kind = (kind or "all").strip().lower()
+        if kind not in ("all", "patterns", "pattern", "blockers", "blocker"):
+            return ToolResult.failed(
+                f"Unknown kind: {kind}. Available: all, patterns, blockers.",
+                data={"kind": kind},
+            )
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"limit must be an integer, got {limit!r}", data={"limit": limit}
+            )
+        if not str(query or "").strip():
+            return ToolResult.failed(
+                "strategy_search needs a non-empty query.", data={"query": query}
+            )
+        if not self._ledger.readable:
+            # "No ledger matches" from an unread ledger is the exact shape of
+            # the defect this ticket was filed on: a truthful-looking zero for
+            # a question whose real answer is non-empty.
+            return self._ledger_unreadable_result(
+                {"query": query, "kind": kind, "matches": [], "count": 0}
+            )
+
+        matches = search_rows(self._ledger.data, query, kind=kind, limit=limit)
+        if not matches:
+            return ToolResult.ok(
+                confirmation=f"No ledger matches for {query!r}.",
+                data={"query": query, "kind": kind, "matches": [], "count": 0},
+            )
+        lines = [f"## Ledger matches for {query!r}"]
+        for match in matches:
+            row = match["row"]
+            text = row.get("pattern") if match["kind"] == "pattern" else row.get("title")
+            lines.append(f"- [{match['kind']} {match['id']}] {text}")
+            detail = (
+                row.get("implication")
+                if match["kind"] == "pattern"
+                else row.get("notes")
+            )
+            if detail:
+                lines.append(f"  {detail}")
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "query": query,
+                "kind": kind,
+                "count": len(matches),
+                "matches": [
+                    {
+                        "id": m["id"],
+                        "kind": m["kind"],
+                        "score": m["score"],
+                        "row": m["row"],
+                    }
+                    for m in matches
+                ],
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Tools: reading the projected index back out of the graph
+    # ------------------------------------------------------------------
+
+    async def _recall_ledger(
+        self,
+        node_type: str,
+        noun: str,
+        limit: Any,
+        include_retired: bool,
+        include_flag_name: str,
+        canonical_rows: List[Dict[str, Any]],
+    ) -> ToolResult:
+        """Shared body for :meth:`recall_patterns` / :meth:`recall_blockers`.
+
+        Reads the GRAPH, deliberately, rather than the ledger this feature
+        already holds in memory. A derived index nothing queries is a write
+        nobody checked: #2851 shipped a decision projection whose only
+        consumer was itself, and the gap was invisible because every reader
+        went to YAML. Routing these two tools through the index means a
+        projection that stops working fails a query instead of going quiet.
+        """
+        if not isinstance(include_retired, bool):
+            return ToolResult.failed(
+                f"{include_flag_name} must be a boolean, got "
+                f"{type(include_retired).__name__}={include_retired!r}"
+            )
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit_val < 1 or limit_val > 200:
+            return ToolResult.failed(
+                f"limit must be between 1 and 200, got {limit_val}"
+            )
+
+        agent_id = self._projection_agent_id()
+        if not agent_id:
+            return ToolResult.failed(
+                "Agent exposes no agent_id/did/id, so the strategy index "
+                "cannot be scoped to this agent -- refusing rather than "
+                "returning another agent's rows or a misleading empty list."
+            )
+        storage = getattr(self.agent, "storage", None)
+        graph_store = getattr(storage, "graph", None) if storage else None
+        try:
+            rows = await recall_nodes(
+                graph_store,
+                agent_id,
+                node_type,
+                include_retired=include_retired,
+                limit=limit_val,
+            )
+        except Exception as e:  # noqa: BLE001
+            # A query failure is not an empty result. Reporting zero here is
+            # the precise lie this ticket was filed on.
+            logger.error("strategy index recall failed for %s: %s", node_type, e)
+            return ToolResult.failed(
+                f"Could not read the strategy index: {e}",
+                data={"node_type": node_type, "count": 0},
+            )
+
+        data = {
+            "count": len(rows),
+            "limit_requested": limit_val,
+            include_flag_name: include_retired,
+            noun: rows,
+        }
+        confirmation = (
+            f"Retrieved {len(rows)} {noun[:-1] if len(rows) == 1 else noun} "
+            f"from the strategy index (limit requested: {limit_val})"
+        )
+        if rows or not self._ledger.readable:
+            # An unreadable ledger gives no trustworthy count to compare
+            # against, so the divergence check below has nothing to say.
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        # Zero rows from the index while the canonical file holds some is not
+        # an answer, it is the index being absent. Saying "0" here would
+        # reproduce exactly what #2851 was filed on: recall_decisions returning
+        # a truthful zero while STRATEGY.yaml held the real ones.
+        canonical = len(canonical_rows)
+        if canonical:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"The strategy index holds no {noun}, but "
+                    f"{LEDGER_FILENAME} holds {canonical} active row(s). The "
+                    "index is stale or was never built -- restart the agent to "
+                    "reproject, and use strategy_search to read the canonical "
+                    "file meanwhile."
+                ),
+                data={**data, "canonical_active": canonical, "index_stale": True},
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @tool(
+        name="recall_patterns",
+        description=(
+            "Recall learned patterns from the strategy index (graph nodes of "
+            "type 'strategy_pattern'). Superseded patterns are excluded by "
+            "default; pass include_superseded=True to see them."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!patterns",
+    )
+    async def recall_patterns(
+        self, limit: int = 25, include_superseded: bool = False
+    ) -> ToolResult:
+        """
+        Recall learned patterns through the graph index.
+
+        Args:
+            limit: Maximum patterns to return (1-200, default 25)
+            include_superseded: Include patterns that have been retired
+        """
+        return await self._recall_ledger(
+            node_type=PATTERN_NODE_TYPE,
+            noun="patterns",
+            limit=limit,
+            include_retired=include_superseded,
+            include_flag_name="include_superseded",
+            canonical_rows=active_patterns(self._ledger.patterns),
+        )
+
+    @tool(
+        name="recall_blockers",
+        description=(
+            "Recall blockers from the strategy index (graph nodes of type "
+            "'strategy_blocker'). Resolved blockers are excluded by default; "
+            "pass include_resolved=True to see them."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!blockers",
+    )
+    async def recall_blockers(
+        self, limit: int = 25, include_resolved: bool = False
+    ) -> ToolResult:
+        """
+        Recall blockers through the graph index.
+
+        Args:
+            limit: Maximum blockers to return (1-200, default 25)
+            include_resolved: Include blockers that have been resolved
+        """
+        return await self._recall_ledger(
+            node_type=BLOCKER_NODE_TYPE,
+            noun="blockers",
+            limit=limit,
+            include_retired=include_resolved,
+            include_flag_name="include_resolved",
+            canonical_rows=active_blockers(self._ledger.blockers),
+        )
+
+    @tool(
+        name="strategy_reconcile_blockers",
+        description=(
+            "Check each active blocker against live GitHub issue state and "
+            "report which reference already-closed issues. Pass apply='yes' to "
+            "resolve the stale rows."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!strategy-reconcile",
+    )
+    async def strategy_reconcile_blockers(self, apply: str = "no") -> ToolResult:
+        """
+        Reconcile the blocker ledger against live GitHub state.
+
+        Args:
+            apply: Set to 'yes' to resolve blockers whose issue is closed. Default 'no' (report only).
+        """
+        if not self._ledger.readable:
+            # An unread ledger has no active blockers, so the reconcile would
+            # report "no active blockers to check" -- a clean bill of health
+            # for a check that never saw the rows.
+            return self._ledger_unreadable_result(
+                {"applied": False, "checked": 0, "closed_count": 0}
+            )
+        report = await check_blockers(self._ledger.data, self._data)
+        if not report.get("ran"):
+            # The check never ran. Reporting "0 stale blockers" here would be
+            # the same shape of lie the ticket was filed about.
+            return ToolResult.failed(
+                report.get("reason", "Blocker reconciliation could not run."),
+                data={"applied": False, "report": report},
+            )
+
+        closed = report.get("closed", [])
+        body = self._format_reconcile_report(report)
+        data = {
+            "applied": False,
+            "checked": report.get("checked", 0),
+            "closed_count": len(closed),
+            "report": report,
+        }
+        if not is_auto_fix(apply):
+            if not closed:
+                return ToolResult.ok(confirmation=body, data=data)
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"apply={apply!r}: this is a report-only reconcile, no "
+                    f"blocker was resolved. Re-run with apply='yes' to resolve "
+                    f"the {len(closed)} stale row(s)."
+                ),
+                data=data,
+            )
+
+        resolved: List[str] = []
+        for entry in closed:
+            _, row = self._ledger.find(str(entry.get("id") or ""))
+            if row is None:
+                continue
+            self._ledger.resolve_blocker(
+                row,
+                resolution=(
+                    f"GitHub issue {entry.get('issue')} is closed "
+                    f"({entry.get('repo') or 'unknown repo'})"
+                ),
+            )
+            resolved.append(str(row.get("id")))
+        data["resolved_ids"] = resolved
+        if not resolved:
+            # Nothing was written, so there is no persist outcome to report.
+            # Claiming ``persisted: True`` off a run that touched no row would
+            # be a small lie in the same envelope the honesty layer reads.
+            return ToolResult.ok(
+                confirmation=f"{body}\n\nNo blocker needed resolving.",
+                data={**data, "applied": True},
+            )
+        result = self._persisted_ledger_result(
+            confirmation=f"{body}\n\nResolved {len(resolved)} stale blocker(s).",
+            data={**data, "applied": True},
+        )
+        if (result.data or {}).get("persisted"):
+            await self._reindex_ledger()
+        return result
+
+    @staticmethod
+    def _format_reconcile_report(report: Dict[str, Any]) -> str:
+        lines = ["## Blocker Reconciliation"]
+        checked = report.get("checked", 0)
+        unchecked = report.get("unresolvable", [])
+        if not checked and not unchecked:
+            # "Every active blocker still references an open issue" would read
+            # as a clean bill of health for a check that had nothing to check.
+            return "\n".join(lines + ["No active blockers to check."])
+        lines.append(f"Checked {checked} active blocker(s).")
+        if unchecked:
+            # Say it up front, not only in the section below: a run where every
+            # row was skipped must not read like a run where every row passed.
+            lines.append(
+                f"{len(unchecked)} active blocker(s) could not be checked."
+            )
+        closed = report.get("closed", [])
+        if closed:
+            lines.append("")
+            lines.append("### Referencing closed issues")
+            for entry in closed:
+                lines.append(
+                    f"- [{entry.get('id')}] {entry.get('issue')}: "
+                    f"{entry.get('title')}"
+                )
+        if unchecked:
+            lines.append("")
+            lines.append("### Could not be checked")
+            for entry in unchecked:
+                line = f"- [{entry.get('id')}] {entry.get('issue')}"
+                if entry.get("reason") == AMBIGUOUS_REPO:
+                    # Name the actual problem. "Could not be checked" alone
+                    # invites the reader to assume a transient GitHub failure,
+                    # when the fix is one field on the row.
+                    candidates = ", ".join(entry.get("candidate_repos") or [])
+                    line += (
+                        f" -- names no repository, and {candidates} are all "
+                        "configured. Set repo on the row to check it."
+                    )
+                lines.append(line)
+        if not closed and not unchecked:
+            lines.append("Every active blocker still references an open issue.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Tools: GitHub-powered (delegated to sub-modules)
@@ -515,7 +1306,9 @@ class StrategicMemoryFeature(Feature):
     )
     async def morning_signal(self) -> ToolResult:
         """Generate the Morning Signal briefing from strategic memory + live GitHub data."""
-        briefing = await generate_morning_signal(self._data)
+        # The merged view, not ``self._data``: the briefing has always led with
+        # blockers, and the file split must not quietly empty that section.
+        briefing = await generate_morning_signal(self._strategy_data_view())
         return ToolResult.ok(
             confirmation=briefing,
             data={"briefing": briefing},
@@ -588,7 +1381,7 @@ class StrategicMemoryFeature(Feature):
                 data={"mode": mode, "dispatched": False},
             )
 
-        issue = await pick_top_issue(self._data)
+        issue = await pick_top_issue(self._strategy_data_view())
         workflow_name = self._dispatch_workflow_name()
         if not issue:
             return ToolResult.ok(
@@ -882,22 +1675,35 @@ class StrategicMemoryFeature(Feature):
         return "\n".join(lines)
 
     def _format_blockers(self) -> str:
-        blockers = self._data.get("blockers", [])
+        blockers = self._strategy_data_view().get(BLOCKERS_KEY, [])
         if not blockers:
             return "## Blockers\nNo active blockers."
         lines = ["## Blockers"]
         for b in blockers:
-            lines.append(f"- [{b.get('severity', '?').upper()}] {b.get('issue', '?')}: {b.get('title', '?')} (owner: {b.get('owner', 'unassigned')})")
+            lines.append(
+                f"- [{str(b.get('severity', '?')).upper()}] "
+                f"{b.get('issue', '?')}: {b.get('title', '?')} "
+                f"(id: {b.get('id', '?')}, owner: {b.get('owner', 'unassigned')})"
+            )
         return "\n".join(lines)
 
     def _format_patterns(self) -> str:
-        patterns = self._data.get("patterns_learned", [])
+        patterns = self._strategy_data_view().get(PATTERNS_KEY, [])
         if not patterns:
             return "## Patterns Learned\nNone recorded."
         lines = ["## Patterns Learned"]
-        for p in patterns:
-            lines.append(f"- {p.get('pattern', '?')}")
+        for p in patterns[:_PATTERN_VIEW_LIMIT]:
+            lines.append(f"- [{p.get('id', '?')}] {p.get('pattern', '?')}")
             impl = p.get("implication")
             if impl:
                 lines.append(f"  Implication: {impl}")
+        withheld = len(patterns) - _PATTERN_VIEW_LIMIT
+        if withheld > 0:
+            # Say what was withheld. A capped list that reads like a complete
+            # one is the same defect as a prompt truncated at a byte offset,
+            # only quieter.
+            lines.append(
+                f"\n({withheld} more active pattern(s) not shown -- use "
+                f"strategy_search to reach them.)"
+            )
         return "\n".join(lines)
