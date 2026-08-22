@@ -4255,7 +4255,9 @@ class PrivacyEnforcingStorage:
                 view=view,
             )
 
-        return await self._storage.list_session_page(limit=bounded, cursor=cursor)
+        return await self._storage.list_session_page(
+            agent_id=agent_id, limit=bounded, cursor=cursor
+        )
 
     async def search_conversations(
         self, agent_id: str, query: str, limit: int = 20, view: str = "active"

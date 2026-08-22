@@ -456,7 +456,13 @@ class TestPrivacyAwareQueries:
         page = await wrapper.list_session_page("agent-1", limit=25)
 
         assert page == {"sessions": [{"session_id": "s1"}], "next_cursor": "tok"}
-        mock_storage.list_session_page.assert_awaited_once_with(limit=25, cursor=None)
+        # The agent is NAMED, not inherited. The read this replaced scoped its
+        # SQL to the id it was given, and a page that quietly answered for the
+        # store's own agent instead would return an empty list rather than
+        # refuse — which is how this was found.
+        mock_storage.list_session_page.assert_awaited_once_with(
+            agent_id="agent-1", limit=25, cursor=None
+        )
         # The list no longer reads history rows itself — that read, and the
         # 1,000-row cap on it, are what #2960 removed.
         mock_storage.db.fetchall.assert_not_called()

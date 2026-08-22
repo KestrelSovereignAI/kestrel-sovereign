@@ -722,12 +722,18 @@ class AsyncStorage:
         )
 
     async def list_session_page(
-        self, *, limit: int = 50, cursor: Optional[str] = None
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
     ) -> Dict[str, Any]:
         """One page of the active conversation list — facade delegator (#2960)."""
         if not self._initialized:
             await self.initialize()
-        return await self.conversation.list_session_page(limit=limit, cursor=cursor)
+        return await self.conversation.list_session_page(
+            agent_id=agent_id, limit=limit, cursor=cursor
+        )
 
     async def count_session_messages(
         self, session_id: str, deleted_filter: str = "all"

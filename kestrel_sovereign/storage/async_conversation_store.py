@@ -3221,7 +3221,11 @@ class AsyncConversationStore:
         )
 
     async def list_session_page(
-        self, *, limit: int = 50, cursor: Optional[str] = None
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
     ) -> Dict[str, Any]:
         """One page of the active conversation list, from the sessions table.
 
@@ -3265,9 +3269,18 @@ class AsyncConversationStore:
             live_history_predicate,
         )
 
+        # Named by the caller, defaulting to the one this store was built for.
+        # Every other method here is bound to ``self.agent_id``, and this one
+        # would be too if its caller were not the privacy wrapper, whose read
+        # methods take the agent as an argument. Ignoring that argument and
+        # answering for a different agent is the one behaviour that must not
+        # happen — the read this replaces scoped its SQL to the value it was
+        # given, so silently substituting another agent's would report an empty
+        # list rather than refusing.
+        agent = agent_id or self.agent_id
         bounded = max(1, int(limit))
         after = decode_session_cursor(cursor, "active") if cursor else None
-        projection = ConversationSessionProjection(self.db, self.agent_id)
+        projection = ConversationSessionProjection(self.db, agent)
         if after is None:
             await projection.repair()
         # One more than asked for, which is how "is there another page" is
@@ -3284,6 +3297,7 @@ class AsyncConversationStore:
                 if row["first_user_message_id"] is not None
             ],
             live_history_predicate(),
+            agent_id=agent,
         )
         sessions = [self._as_listed_session(row, previews) for row in rows]
         next_cursor = (
@@ -3294,7 +3308,11 @@ class AsyncConversationStore:
         return {"sessions": sessions, "next_cursor": next_cursor}
 
     async def _preview_rows(
-        self, message_ids: List[Any], membership: str
+        self,
+        message_ids: List[Any],
+        membership: str,
+        *,
+        agent_id: Optional[str] = None,
     ) -> Dict[Any, Tuple[Any, Dict[str, Any]]]:
         """``{id: (content, metadata)}`` for the rows a page previews.
 
@@ -3314,7 +3332,7 @@ class AsyncConversationStore:
         rows = await self.db.fetchall(
             "SELECT id, content, metadata FROM conversation_history "
             f"WHERE agent_id = ? AND id IN ({placeholders}) AND {membership}",
-            (self.agent_id, *message_ids),
+            (agent_id or self.agent_id, *message_ids),
         )
         return {
             row[0]: (row[1], parse_message_metadata(row[2])) for row in rows
