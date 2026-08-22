@@ -1128,3 +1128,102 @@ async def test_storage_phase_uses_sqlite_by_default(tmp_path):
         assert args and args[0] == str(tmp_path / "boot.db")
         assert "backend" not in kwargs
     assert "storage" in ctx.rollback_labels
+
+
+# ---------------------------------------------------------------------------
+# A feature's duplicate signal source must not abort boot (issue #2951)
+# ---------------------------------------------------------------------------
+
+
+def _feature_contributing(agent, source_name: str):
+    """A fixture feature whose workflow contributes *source_name*.
+
+    The contract deliberately differs from core's registration of the same
+    name — which is the real shape: two `fleet_stalled_sweep` registrations
+    bound to different callbacks are a genuine mismatch, not a duplicate.
+    """
+    import dataclasses
+
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+    feature = SDKFixtureFeature(agent)
+    colliding = dataclasses.replace(feature.source, name=source_name)
+    feature.workflow_registration = type(feature.workflow_registration)(
+        owner=feature.contribution_owner,
+        name=feature.workflow_registration.name,
+        actor=feature.actor,
+        sources=(colliding,),
+    )
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_one_features_duplicate_source_does_not_abort_boot(tmp_path):
+    """The regression: one stale feature took every agent on the host down.
+
+    `kestrel-feature-talon` 0.2.0 contributed a source core had just reclaimed,
+    and boot failed for Meridian, Claw, Nellie and Emma alike. The agent must
+    now boot, without that feature, and say why.
+    """
+    from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+    agent = _make_agent(tmp_path)
+    feature = _feature_contributing(agent, sorted(SOURCE_NAMES)[0])
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            return_value=[feature],
+        ):
+            await agent.initialize()
+
+        # The agent boots.
+        assert agent._boot_state is BootPhaseState.READY
+        # The offending feature does not load...
+        assert feature not in agent.features.values()
+        # ...and the reason is REPORTED, not merely logged.
+        reasons = [r.reason for r in agent.rejected_feature_contributions]
+        assert len(reasons) == 1
+        assert sorted(SOURCE_NAMES)[0] in reasons[0]
+        # Core's own registration is untouched.
+        assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_feature_is_absent_from_the_mandatory_readiness_check(tmp_path):
+    """A rejected MANDATORY feature must still fail boot.
+
+    Degrading a mandatory feature to "did not load" would turn an identity gap
+    into a capability gap — the inversion #2871 warns against. The postcondition
+    that catches it is `verify_mandatory_feature_set`, which can only do so if
+    the rejected feature is genuinely ABSENT from the mapping it is handed.
+
+    That absence is what this asserts. The raising behaviour of the
+    postcondition itself is covered by its own tests; this pins the half that
+    this change could break.
+    """
+    from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+    agent = _make_agent(tmp_path)
+    feature = _feature_contributing(agent, sorted(SOURCE_NAMES)[0])
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            return_value=[feature],
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"
+        ) as verify:
+            await agent.initialize()
+
+        # It ran at agent readiness...
+        stages = [c.kwargs.get("stage") for c in verify.call_args_list]
+        assert "agent readiness" in stages
+        # ...over a feature set that does NOT contain the rejected feature, so a
+        # mandatory one would be counted as missing.
+        checked = verify.call_args_list[stages.index("agent readiness")].args[0]
+        assert feature not in (
+            checked.values() if hasattr(checked, "values") else checked
+        )
+    finally:
+        await _cleanup(agent)

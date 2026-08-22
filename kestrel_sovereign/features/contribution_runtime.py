@@ -207,6 +207,74 @@ class PreparedFeatureContributions:
 
 
 @dataclass(frozen=True, slots=True)
+class ContributionRejection:
+    """One feature refused activation, and why — reported, never silent."""
+
+    feature: object
+    feature_name: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTransition:
+    """The prospective active set: what may activate, and what was refused.
+
+    A collision with an ALREADY-registered key is a capability gap for the
+    offending feature, not an identity gap for the agent, so it must not be
+    able to abort boot for every agent on the host (issue #2951). The rejected
+    features are carried here rather than raised, and
+    :meth:`activatable` derives the pairing every caller needs so none of them
+    has to remember to skip a rejected feature.
+    """
+
+    accepted: tuple[PreparedFeatureContributions, ...] = ()
+    rejected: tuple[ContributionRejection, ...] = ()
+
+    def activatable(
+        self, features: Iterable[object]
+    ) -> tuple[tuple[object, PreparedFeatureContributions], ...]:
+        """``(feature, prepared)`` for exactly the features that may activate.
+
+        Callers used to build ``{id(item.feature): item}`` and index into it
+        per feature, which raises ``KeyError`` the moment a feature is excluded.
+        Deriving the list here means a new call site cannot forget the skip —
+        the pairing simply does not contain what must not be activated.
+        """
+        by_feature = {id(item.feature): item for item in self.accepted}
+        return tuple(
+            (feature, by_feature[id(feature)])
+            for feature in features
+            if id(feature) in by_feature
+        )
+
+    def only(self) -> PreparedFeatureContributions:
+        """The single accepted item — or raise the rejection that refused it.
+
+        The one-feature paths (registering or enabling a named feature) are not
+        the boot batch: the caller asked for exactly this feature, and there is
+        no fleet to keep up by continuing without it. A rejection there IS that
+        operation's failure, so it surfaces as one.
+        """
+        if self.rejected:
+            raise FeatureContributionRuntimeError(self.rejected[0].reason)
+        return self.accepted[0]
+
+    def rejection_for(self, feature: object) -> ContributionRejection | None:
+        """The rejection recorded for *feature*, if it was refused."""
+        for rejection in self.rejected:
+            if rejection.feature is feature:
+                return rejection
+        return None
+
+    def __iter__(self):
+        """Iterate the ACCEPTED set, so ``for item in prepared`` still reads true."""
+        return iter(self.accepted)
+
+    def __len__(self) -> int:
+        return len(self.accepted)
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveFeatureContributions:
     """The exact teardown capability retained for one active lifecycle."""
 
@@ -250,10 +318,14 @@ class FeatureContributionRuntime:
         )
         self._active: dict[int, ActiveFeatureContributions] = {}
 
-    def prepare_transition(
-        self, features: Iterable[object]
-    ) -> tuple[PreparedFeatureContributions, ...]:
-        """Collect once and validate a complete prospective active set."""
+    def prepare_transition(self, features: Iterable[object]) -> PreparedTransition:
+        """Collect once and validate a complete prospective active set.
+
+        Returns what may activate AND what was refused. A feature clashing with
+        an already-registered key is excluded rather than raised, so one stale
+        third-party package cannot abort boot for every agent on the host
+        (issue #2951).
+        """
 
         feature_values = tuple(features)
         if len({id(feature) for feature in feature_values}) != len(feature_values):
@@ -279,8 +351,14 @@ class FeatureContributionRuntime:
                 failing.feature,
                 "validate_contribution_owner_uniqueness",
             ) from exc
-        self._preflight_keys(prepared, validate_setup_order=True)
-        return prepared
+        rejections = self._preflight_keys(prepared, validate_setup_order=True)
+        refused = {id(rejection.feature) for rejection in rejections}
+        return PreparedTransition(
+            accepted=tuple(
+                item for item in prepared if id(item.feature) not in refused
+            ),
+            rejected=rejections,
+        )
 
     def activate(
         self, prepared: PreparedFeatureContributions
@@ -298,7 +376,12 @@ class FeatureContributionRuntime:
                 prepared.owner,
             ]
         )
-        self._preflight_keys((prepared,), validate_setup_order=False)
+        # One feature, committing now: a clash here IS this activation's
+        # failure and belongs to the caller that asked for it. The per-feature
+        # transaction boundary is unchanged — only the whole-set gate moved.
+        rejections = self._preflight_keys((prepared,), validate_setup_order=False)
+        if rejections:
+            raise FeatureContributionRuntimeError(rejections[0].reason)
 
         values = prepared.contributions
         operator_set: OperatorRegistrationSet | None = None
@@ -614,7 +697,21 @@ class FeatureContributionRuntime:
         prepared: tuple[PreparedFeatureContributions, ...],
         *,
         validate_setup_order: bool,
-    ) -> None:
+    ) -> tuple[ContributionRejection, ...]:
+        """Validate a prospective set. TWO failure classes, resolved differently.
+
+        **Transition-invalid** — two features in this same batch claiming one
+        key, or a setup order the resulting set cannot satisfy. The proposed set
+        is incoherent and there is no subset to prefer, so this still raises.
+
+        **Feature-rejected** — one feature clashing with something ALREADY
+        registered. That is a capability gap for *that feature*; it is not an
+        identity gap for the agent, and it must not abort boot for every agent
+        on the host. Core registers the same generic sources under ``OPTIONAL``
+        ("nothing ever raises"), so the identical collision was survivable on
+        the core path and fatal here (issue #2951). Returned as rejections for
+        the caller to exclude and report.
+        """
         service_refs = []
         workflow_names = []
         wait_names = []
@@ -644,42 +741,76 @@ class FeatureContributionRuntime:
             [registration.name for registration in setup_steps], "setup step name"
         )
 
-        for reference in service_refs:
-            if self.operator_registry.resolve_service(reference) is not None:
-                raise FeatureContributionRuntimeError(
-                    "service registration conflicts with an active service"
-                )
-        for name in workflow_names:
-            if self.operator_registry.get_workflow_registration(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"workflow actor already registered: {name}"
-                )
-        for name in wait_names:
-            if self.wait_registry.get(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"wait provider already registered: {name}"
-                )
-        for item in prepared:
-            for workflow in item.contributions.workflows:
-                for source in workflow.sources:
-                    SourceRegistry._validate(source)
-                    if self.source_registry.get(source.name) is not None:
-                        raise FeatureContributionRuntimeError(
-                            f"signal source already registered: {source.name}"
-                        )
-        for name in permission_names:
-            if self.permission_defaults_registry.registration(name) is not None:
-                raise FeatureContributionRuntimeError(
-                    f"permission defaults already registered for {name}"
-                )
+        rejections = tuple(
+            ContributionRejection(item.feature, item.feature_name, reason)
+            for item, reason in (
+                (item, self._active_conflict(item, check_setup_steps=not validate_setup_order))
+                for item in prepared
+            )
+            if reason is not None
+        )
+
         if validate_setup_order:
-            self.setup_step_registry.preflight(tuple(setup_steps))
-        else:
-            for registration in setup_steps:
-                if self.setup_step_registry.get(registration.name) is not None:
-                    raise FeatureContributionRuntimeError(
-                        f"setup step already registered: {registration.name}"
+            # Over the ACCEPTED steps only: a rejected feature never activates,
+            # so its steps are not part of the resulting set and ordering the
+            # batch around them would validate a set that will not exist.
+            refused = {id(rejection.feature) for rejection in rejections}
+            self.setup_step_registry.preflight(
+                tuple(
+                    registration
+                    for item in prepared
+                    if id(item.feature) not in refused
+                    for registration in item.contributions.setup_steps
+                )
+            )
+        return rejections
+
+    def _active_conflict(
+        self, item: PreparedFeatureContributions, *, check_setup_steps: bool
+    ) -> str | None:
+        """Why ONE feature cannot activate against what is already registered.
+
+        Returns the first reason, or None. Per-feature by construction: the flat
+        key lists above cannot say which feature contributed a colliding name,
+        and a rejection that cannot name its feature cannot exclude it either.
+        """
+        values = item.contributions
+        for registration in values.services:
+            if self.operator_registry.resolve_service(registration.reference) is not None:
+                return "service registration conflicts with an active service"
+        for registration in values.workflows:
+            if self.operator_registry.get_workflow_registration(registration.name) is not None:
+                return f"workflow actor already registered: {registration.name}"
+        for registration in values.wait_providers:
+            if self.wait_registry.get(registration.name) is not None:
+                return f"wait provider already registered: {registration.name}"
+        for workflow in values.workflows:
+            for source in workflow.sources:
+                try:
+                    SourceRegistry._validate(source)
+                except Exception as exc:  # noqa: BLE001 - reject the feature, not the boot
+                    return f"invalid signal source {source.name!r}: {exc}"
+                existing = self.source_registry.get(source.name)
+                if existing is None:
+                    continue
+                # The registry already knows what "the same source" means, and
+                # it is not the NAME. A byte-identical re-registration — the
+                # common case when core and a feature ship the same generic
+                # source through an extraction — is a no-op success under every
+                # declared policy; only a DIFFERENT contract is a clash.
+                if not SourceRegistry.contract_equivalent(existing, source):
+                    return (
+                        "signal source already registered with a different "
+                        f"contract: {source.name}"
                     )
+        if values.permission_defaults is not None:
+            if self.permission_defaults_registry.registration(item.feature_name) is not None:
+                return f"permission defaults already registered for {item.feature_name}"
+        if check_setup_steps:
+            for registration in values.setup_steps:
+                if self.setup_step_registry.get(registration.name) is not None:
+                    return f"setup step already registered: {registration.name}"
+        return None
 
     @staticmethod
     def _require_unique(values: list[object], description: str) -> None:
@@ -695,7 +826,9 @@ __all__ = [
     "FeatureContributionRuntime",
     "FeatureContributionRuntimeError",
     "PermissionDefaultRegistration",
+    "ContributionRejection",
     "PermissionDefaultsRegistry",
     "PreparedFeatureContributions",
+    "PreparedTransition",
     "SetupStepRegistry",
 ]

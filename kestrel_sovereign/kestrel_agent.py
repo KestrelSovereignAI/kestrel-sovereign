@@ -554,6 +554,12 @@ class KestrelAgent(
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
     """
 
+    #: Features refused activation because a contribution clashed with an
+    #: already-registered key. Class-level so `/health/detailed` can be asked
+    #: before boot has run and get "none refused" rather than an attribute
+    #: error — an absent answer must not read as a clean one (#2951).
+    rejected_feature_contributions: tuple = ()
+
     def __init__(
         self,
         did: str,
@@ -2860,13 +2866,13 @@ class KestrelAgent(
         prepared_contributions = self._prepare_feature_contribution_transition(
             enabled_discovered_features
         )
-        prepared_by_feature = {
-            id(item.feature): item for item in prepared_contributions
-        }
-        for feature in enabled_discovered_features:
+        self._record_contribution_rejections(prepared_contributions)
+        for feature, prepared_item in prepared_contributions.activatable(
+            enabled_discovered_features
+        ):
             await self._register_feature(
                 feature,
-                prepared_contributions=prepared_by_feature[id(feature)],
+                prepared_contributions=prepared_item,
             )
         verify_mandatory_feature_set(
             self.features,
@@ -4185,6 +4191,22 @@ class KestrelAgent(
         self.setup_step_registry = runtime.setup_step_registry
         return runtime
 
+    def _record_contribution_rejections(self, transition) -> None:
+        """Log and RETAIN the features refused activation.
+
+        Retained, not just logged: a feature that did not load must not be
+        indistinguishable from one that loaded and had nothing to do. This is
+        what ``/health/detailed`` reports (issue #2951).
+        """
+        self.rejected_feature_contributions = tuple(transition.rejected)
+        for rejection in transition.rejected:
+            logging.error(
+                "Feature '%s' did not load — %s. The agent is running WITHOUT "
+                "it; every other feature and agent is unaffected.",
+                rejection.feature_name,
+                rejection.reason,
+            )
+
     def _prepare_feature_contribution_transition(self, features):
         """Collect and prevalidate one complete feature activation transition."""
         from kestrel_sovereign.features.contribution_runtime import (
@@ -4376,7 +4398,7 @@ class KestrelAgent(
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
-            )[0]
+            ).only()
         try:
             await feature.initialize()
         except Exception as exc:
@@ -4603,7 +4625,7 @@ class KestrelAgent(
         if prepared_contributions is None:
             prepared_contributions = self._prepare_feature_contribution_transition(
                 (feature,)
-            )[0]
+            ).only()
         try:
             await feature.initialize()
             # initialize() can reset config a feature does not persist (a

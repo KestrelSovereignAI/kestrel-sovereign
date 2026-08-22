@@ -3359,7 +3359,37 @@ async def _phoenix_tracing_status(app) -> dict:
     }
 
 
+def _with_contribution_rejections(agent, result: dict) -> dict:
+    """Surface features that were REFUSED activation alongside health.
+
+    A feature that did not load is a capability the operator believes the host
+    has. Logging that at boot files it where nobody is looking by the time it
+    matters; ``/health/detailed`` is where a missing capability has to be
+    visible, or a silently-degraded host reads as a healthy one (#2951).
+
+    Never reports ``healthy`` over a refused contribution — the host is running
+    without something it was configured to have, which is the definition of
+    degraded.
+    """
+    rejections = tuple(getattr(agent, "rejected_feature_contributions", ()) or ())
+    if not rejections:
+        return result
+    merged = dict(result)   # copied: the health feature's cached dict is shared
+    merged["features_not_loaded"] = [
+        {"feature": rejection.feature_name, "reason": rejection.reason}
+        for rejection in rejections
+    ]
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    return merged
+
+
 async def _agent_detailed_health(agent) -> dict:
+    """Detailed health for one agent, including any refused contributions."""
+    return _with_contribution_rejections(agent, await _agent_health_result(agent))
+
+
+async def _agent_health_result(agent) -> dict:
     """Compute the detailed health result for a single agent.
 
     Prefers the agent's ``HealthFeature.get_latest()`` (its cached liveness
