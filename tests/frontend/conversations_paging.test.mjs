@@ -30,7 +30,8 @@ globalThis.window.confirm = globalThis.confirm;
 
 const { mountConversations } = await import('../../kestrel_sovereign/static/js/conversations.js');
 
-const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+// Several ticks: a page is a fetch, a state update and a repaint.
+const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0)); };
 
 function conversation(id) {
     return {
@@ -42,21 +43,21 @@ function conversation(id) {
     };
 }
 
-// A server holding `pages` responses, handing out the next one whenever the
-// cursor it minted comes back.
+// A server holding `pages` of session ids. Page N's `next_cursor` names page
+// N+1, and handing that token back is the only way to reach it — which is the
+// contract the component has to honour.
 function pagingApi(pages) {
     const calls = [];
+    const token = (index) => `cursor-for-page-${index}`;
     return {
         calls,
         getConversations: async (decrypt, view, cursor) => {
-            calls.push({ decrypt, view, cursor });
-            const index = cursor === null || cursor === undefined
-                ? 0
-                : pages.findIndex((p) => p.token === cursor);
-            const page = pages[index];
+            calls.push({ decrypt, view, cursor: cursor ?? null });
+            const index = cursor ? pages.findIndex((_, i) => token(i) === cursor) : 0;
+            if (index < 0) throw new Error(`unknown cursor ${cursor}`);
             return {
-                conversations: page.rows.map(conversation),
-                next_cursor: index + 1 < pages.length ? pages[index].token : null,
+                conversations: pages[index].map(conversation),
+                next_cursor: index + 1 < pages.length ? token(index + 1) : null,
             };
         },
         listTrash: async () => ({ messages: [] }),
@@ -74,10 +75,7 @@ const moreBtn = (el) => el.querySelector('.conversations-load-more');
 
 test('a next_cursor paints a Load more button; its absence does not', async () => {
     const el = makeContainer();
-    const api = pagingApi([
-        { token: 'tok-1', rows: ['a', 'b'] },
-        { token: 'tok-2', rows: ['c'] },
-    ]);
+    const api = pagingApi([['a', 'b'], ['c']]);
     const handle = mountConversations(el, { api, agentName: 'Emma' });
     await settle();
 
@@ -90,7 +88,8 @@ test('a next_cursor paints a Load more button; its absence does not', async () =
 
     // Appended, not replaced — the pages already read stay on screen.
     assert.deepEqual(rows(el).map((r) => r.dataset.sessionId), ['a', 'b', 'c']);
-    assert.equal(api.calls[1].cursor, 'tok-1', 'the server is asked with ITS token');
+    assert.equal(api.calls[1].cursor, 'cursor-for-page-1',
+        'the server is asked with the token IT minted, not one the client built');
     assert.equal(moreBtn(el), null, 'no next_cursor is the end of the list');
     assert.equal(handle.hasMore, false);
     handle.destroy();
@@ -101,10 +100,7 @@ test('a session served on two pages is rendered once', async () => {
     // session whose activity moved across the cursor. A repeat is the benign
     // direction; a repeated ROW in the list is not.
     const el = makeContainer();
-    const api = pagingApi([
-        { token: 'tok-1', rows: ['a', 'b'] },
-        { token: 'tok-2', rows: ['b', 'c'] },
-    ]);
+    const api = pagingApi([['a', 'b'], ['b', 'c']]);
     const handle = mountConversations(el, { api, agentName: 'Emma' });
     await settle();
     moreBtn(el).click();
@@ -116,10 +112,7 @@ test('a session served on two pages is rendered once', async () => {
 
 test('a refresh starts over at the top rather than continuing', async () => {
     const el = makeContainer();
-    const api = pagingApi([
-        { token: 'tok-1', rows: ['a', 'b'] },
-        { token: 'tok-2', rows: ['c'] },
-    ]);
+    const api = pagingApi([['a', 'b'], ['c']]);
     const handle = mountConversations(el, { api, agentName: 'Emma' });
     await settle();
     moreBtn(el).click();
