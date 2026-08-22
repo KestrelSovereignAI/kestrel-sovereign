@@ -262,13 +262,27 @@ async def _assert_agrees_with_the_grouper(
         )
         assert projected == reference[session_id], session_id
 
-    expected = {
-        session_id
-        for session_id in reference
-        if is_stampable_session_id(session_id)
-        or coerce_persistent_message_id(session_id) is not None
-    }
-    assert set(stored) == expected
+    # Asked of the RESOLVER, not modelled from the key's shape. "Can a reader
+    # open this session" is the whole of the second direction, and every
+    # spelling of it that reasons about the key instead has been wrong: Phase B
+    # asked `is_stampable_session_id`, which is a question about Phase A's
+    # INDEXED COLUMN — and the resolver does not use that column. It matches a
+    # row id, or `metadata LIKE '%"session_id": "<value>"%'`. So an `sms:`
+    # session (rasa_shim files every SMS turn under `sms:{sender}`) opens
+    # perfectly and was being dropped from the list.
+    #
+    # `_get_session_messages` is the resolver both halves of that live in, and
+    # `include_markers=True` is what makes a marker-only session (#2222) — real,
+    # openable, and carrying no messages — answer yes.
+    store = AsyncConversationStore(db, agent_id=agent_id)
+    openable = set()
+    for session_id in reference:
+        rows = await store._get_session_messages(
+            session_id, limit=1, deleted_filter="live", include_markers=True
+        )
+        if rows:
+            openable.add(session_id)
+    assert set(stored) == openable
     return stored
 
 
@@ -583,8 +597,10 @@ async def test_the_projection_says_what_the_grouper_says(seeded):
     assert stored[UUID_C]["message_count"] == 2
     assert stored[UUID_C]["first_user_message_id"] == ids["C live turn"]
 
-    # The legacy and outside-the-contract clusters are absent, never invented.
-    assert OUTSIDE_THE_CONTRACT not in stored
+    # A session the indexed COLUMN may not hold is still listed, because the
+    # column is not what opens it (#2960). `did:x:1` resolves through
+    # `metadata LIKE`, exactly as `rasa_shim`'s `sms:{sender}` sessions do.
+    assert OUTSIDE_THE_CONTRACT in stored
 
 
 @pytest.mark.asyncio
@@ -2224,12 +2240,19 @@ async def test_two_repairs_racing_leave_a_projection_that_is_true(modern):
 
 
 @pytest.mark.asyncio
-async def test_an_id_outside_the_column_contract_is_never_projected(seeded):
-    """Phase A's invariant, carried forward: absent is allowed, wrong is not.
+async def test_an_id_outside_the_column_contract_is_still_listed(seeded):
+    """An id Phase A's column may not hold is one a READER opens perfectly.
 
-    ``did:x:1`` is a session the grouper honours and the indexed column may not
-    hold, so no projection row may claim it — and adding more of its rows must
-    not change that.
+    Phase B refused these on the grounds that absence is the permitted
+    direction, which it was while nothing read this table. #2960 makes it the
+    conversation list, and the refusal was resting on a proxy: the session
+    resolver does not consult the indexed column at all — it matches a row id,
+    or `metadata LIKE '%"session_id": "<value>"%'`. `did:x:1` is found by the
+    second, and so is every SMS turn `rasa_shim` files under `sms:{sender}`,
+    which is core code and not a hypothetical.
+
+    So the claim is inverted, deliberately: the session is listed, its counts
+    track its rows, and adding more of them keeps both true.
     """
     db, _store, projection = seeded
     await _seed(
@@ -2239,28 +2262,35 @@ async def test_an_id_outside_the_column_contract_is_never_projected(seeded):
     )
 
     await projection.repair()
-    assert await projection.get(OUTSIDE_THE_CONTRACT) is None
-    assert not any(
-        row["session_id"] == OUTSIDE_THE_CONTRACT for row in await projection.list()
+    stored = await projection.get(OUTSIDE_THE_CONTRACT)
+    assert stored is not None, (
+        "a session the resolver opens was dropped from the list — the defect "
+        "#2960 exists to remove, arriving through the column contract"
     )
+    assert stored["session_id"] == OUTSIDE_THE_CONTRACT
     await _assert_repaired_projection_is_true(db, projection)
 
 
 @pytest.mark.asyncio
-async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
+async def test_a_row_whose_column_contradicts_its_metadata_is_refused(modern):
     """The guard that only a Phase A violation can reach — defended, not assumed.
 
-``project_transcript`` drops any session whose id
-    :func:`is_stampable_session_id` rejects, and the column contract means no
-    shipped write path can produce one. That makes the filter a clause no
-    ordinary test can exercise, which Phase A's Finding named as the worst kind:
-    it reads as protection while a mutation removing it goes unnoticed.
+    Phase A's column is a derived duplicate of ``metadata.session_id``, written
+    by the same INSERT. The two disagreeing is a violation with no correct
+    answer: filing the row under either candidate puts it somewhere the
+    transcript does not show it. ``project_transcript`` refuses the whole
+    session, and no shipped write path can produce the state, which makes the
+    clause one no ordinary test exercises — the worst kind, reading as
+    protection while a mutation removing it goes unnoticed.
 
-    So the violation is written directly into the column, bypassing
-    ``column_session_id`` the way only a future bug could. The projection's
-    primary key is ``(agent_id, session_id)`` and Phase C will read it, so a row
-    keyed by a value the contract forbids is a key no reader can round-trip.
-    Absent is the permitted direction.
+    So the contradiction is written straight into the column, bypassing
+    ``column_session_id`` the way only a future bug could.
+
+    This case used to smuggle a value the column's CHARSET forbids and assert
+    the session vanished. That claim went with #2960: the resolver does not
+    consult the column, so such a session is openable and dropping it from the
+    list is the bug. What survives is the disagreement, which is a different
+    thing and still refused.
 
     On the all-stamped corpus deliberately: that is the derivation a chunk
     feeds, so this is the path where the filter is load-bearing.
@@ -2272,17 +2302,21 @@ async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
         "VALUES (?, ?, ?, ?, ?, ?)",
         (
             AGENT, "user", "smuggled row",
-            json.dumps({"session_id": OUTSIDE_THE_CONTRACT}),
-            OUTSIDE_THE_CONTRACT,
+            json.dumps({"session_id": UUID_A}),
+            "a-column-value-nothing-wrote",
             _at(700),
         ),
     )
 
     await projection.repair()
-    assert await projection.get(OUTSIDE_THE_CONTRACT) is None
+    assert await projection.get("a-column-value-nothing-wrote") is None
     assert not any(
-        row["session_id"] == OUTSIDE_THE_CONTRACT for row in await projection.list()
+        row["session_id"] == "a-column-value-nothing-wrote"
+        for row in await projection.list()
     )
+    # ...and the session its metadata names is refused too, rather than stored
+    # describing a set of rows that does not include the contradicting one.
+    assert await projection.get(UUID_A) is None
 
 
 @pytest.mark.asyncio

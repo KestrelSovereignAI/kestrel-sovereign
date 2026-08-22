@@ -1842,56 +1842,71 @@ def project_transcript(
         )
         return []
 
-    # Every value the `session_id` COLUMN actually holds in this transcript.
+    # Every value this transcript's METADATA files a row under, which is what
+    # decides whether a reader can open a session — not the indexed column.
+    # ``AsyncConversationStore._get_session_messages`` resolves a session two
+    # ways and neither of them is the column: as a row id, or by matching
+    # ``metadata LIKE '%"session_id": "<value>"%'``. Phase A's column is a
+    # derived duplicate for INDEXING, and asking it "can this be opened" was a
+    # proxy for a question it does not answer.
+    #
+    # Collected with the grouper's own acceptance rule, because this has to be
+    # the set of keys the grouper could have produced from metadata: it files a
+    # row under ``metadata.session_id`` when that value is truthy and not
+    # ``str(...).isdigit()``, and a value it would ignore is not a key it can
+    # have chosen.
+    #
     # Taken across all rows rather than per session, because a session
     # established by a `new_session` marker alone (#2222) carries no messages —
     # the marker is structural and excluded from them — while its own row does
-    # carry the column. A per-session test would have silently stopped
-    # projecting exactly the just-started conversations `keep_empty_markers`
-    # exists to keep.
-    columns_seen = {str(value) for value in stamped.values() if value is not None}
+    # carry the id. A per-session test would have silently stopped projecting
+    # exactly the just-started conversations `keep_empty_markers` exists to keep.
+    metadata_keys_seen = set()
+    for message in messages:
+        candidate = message["metadata"].get(SESSION_ID_KEY)
+        if candidate and not str(candidate).isdigit():
+            metadata_keys_seen.add(str(candidate))
 
     projections: List[SessionProjection] = []
     for session in grouped:
         session_id = str(session["session_id"])
-        # The requirement is that a reader can OPEN this key — #3001's `"-1"`
-        # case is what named it: a key that is neither a column value nor a row
-        # id lists a session no reader can open and no lifecycle tool can
-        # delete. There are exactly two ways a key satisfies that, because there
-        # are exactly two ways the grouper produces one.
+        # The requirement is that a READER CAN OPEN this key. The grouper mints
+        # a key exactly two ways, and each is opened by a different half of the
+        # resolver:
         #
-        # 1. It came from the indexed column, and therefore from metadata.
-        #    `is_stampable_session_id` asks whether the column could hold it;
-        #    `columns_seen` asks whether it actually does. Both, because they are
-        #    different questions and the second used to be inferred from the
-        #    first.
-        # 2. The grouper INVENTED it, from the first row's id, for a legacy
-        #    cluster carrying no session id anywhere (#2012). That key is not in
-        #    the column and never can be — Phase A's contract excludes bare
-        #    integers on purpose — but it is exactly what the row-id resolver
-        #    opens, so `coerce_persistent_message_id` is the test, not the
-        #    column.
+        # 1. From ``metadata.session_id``, which the resolver matches on
+        #    directly. Charset does not enter into it — ``rasa_shim`` files
+        #    every SMS turn under ``sms:{sender}``, which Phase A's column may
+        #    not hold and the resolver opens without difficulty.
+        # 2. Invented from the first row's id, for a legacy cluster carrying no
+        #    session id anywhere (#2012), which the row-id half opens — and
+        #    only if it is a usable row id, which is what #3001's ``"-1"`` case
+        #    was about: SQLite allows a negative rowid, and a key of ``"-1"``
+        #    is refused by ``coerce_persistent_message_id``, so neither half of
+        #    the resolver would find it.
         #
-        # Phase B dropped the second kind, on the grounds that absence is the
-        # permitted direction. It was, while nothing read this table. #2960
-        # makes this table THE conversation list, so a dropped session is a
-        # conversation that has vanished from the UI — which is the defect this
-        # epic exists to remove, arriving by a different route. Measured on
-        # Emma's live database: 473 of 1,522 live rows carry no session id.
+        # Phase B asked ``is_stampable_session_id`` here instead, and that was a
+        # proxy twice over: it is a question about the COLUMN, and the column
+        # resolves nothing. It dropped both the row-id keys and every metadata
+        # key outside the column's charset. That cost nothing while nothing read
+        # this table; #2960 makes it THE conversation list, so a dropped session
+        # is a conversation that has vanished — this ticket's own bug, arriving
+        # by another route. Measured: an `sms:` session listed as absent, and
+        # 473 of Emma's 1,522 live rows carry no session id at all.
         #
         # Storing them is sound because the two derivations cannot meet over
-        # one. A key of this kind exists only for a cluster with no stampable id
-        # anywhere, so at least one of its rows has a NULL column, so
-        # `_has_unstamped_rows()` is true, so every step takes THIS pass — the
-        # chunked fold, which is keyed on the column and could not maintain such
-        # a row, never runs while one can exist. And the transition out of that
+        # one. A key outside the column's charset is a key no row's column can
+        # hold, so every row of that session is unstamped, so
+        # `_has_unstamped_rows()` is true and every step takes the transcript
+        # pass — the chunked fold, which is keyed on the column and could not
+        # maintain such a row, never runs while one can exist. Leaving that
         # state cannot be reached by appends alone (removing an unstamped row is
         # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
-        # discard clears any row left behind.
-        if is_stampable_session_id(session_id):
-            if session_id not in columns_seen:
-                continue
-        elif coerce_persistent_message_id(session_id) is None:
+        # discard clears anything left behind.
+        if (
+            session_id not in metadata_keys_seen
+            and coerce_persistent_message_id(session_id) is None
+        ):
             continue
         # Asked of every session, whichever way its key was arrived at: a row
         # whose column names a different session is in the wrong place under

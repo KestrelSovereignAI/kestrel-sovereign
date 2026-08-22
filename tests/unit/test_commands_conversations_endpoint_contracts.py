@@ -310,6 +310,44 @@ async def test_conversations_endpoint_falls_back_to_rowid_for_legacy_cluster(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_session_id_the_indexed_column_cannot_hold_is_still_listed(tmp_path):
+    """``rasa_shim`` files every SMS turn under ``sms:{sender}`` — core code,
+    not a hypothetical — and a colon is outside Phase A's column charset, so the
+    column stays NULL for those rows.
+
+    The column is not what opens a session. ``_get_session_messages`` resolves a
+    row id or matches ``metadata LIKE '%"session_id": "<value>"%'``, and an
+    ``sms:`` session is found by the second. A list built on "could the column
+    hold this key" therefore dropped a whole channel's conversations — the exact
+    disappearance this ticket exists to end, reached by another route.
+    """
+    now = datetime(2026, 5, 1, 9, 0, 0)
+    sms = json.dumps({"session_id": "sms:+15551234567"})
+    storage, wrapped = await _seeded_list_storage(tmp_path, "sms.db", [
+        ("user", "text me the forecast", sms, now),
+        ("assistant", "clear all week", sms, now + timedelta(minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        response = _listed(app, "?limit=10")
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert [s["session_id"] for s in sessions] == ["sms:+15551234567"]
+        assert sessions[0]["preview"] == "text me the forecast"
+        assert sessions[0]["message_count"] == 2
+        # The column really is NULL — the fixture stamps it the way a writer
+        # does, so this is the state production is in, not one the test built.
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND session_id IS NULL",
+            (LIST_AGENT,),
+        ) == 2
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(300)
 async def test_every_session_is_reachable_by_paging_a_history_past_the_old_window(
     tmp_path,
