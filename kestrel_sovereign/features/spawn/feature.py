@@ -56,6 +56,7 @@ def _safe_retained_agent_name(error: object) -> str | None:
 def _termination_partial_result(
     *,
     child_name: str,
+    offboard_runtime: bool,
     manager: object,
     error: BaseException,
     retained_error_type: type[BaseException],
@@ -142,15 +143,34 @@ def _termination_partial_result(
     else:
         cleanup_state = "retained"
 
+    if offboard_runtime:
+        runtime_retained = bool(retained)
+        named_runtime_retained = named_child_retained
+        named_runtime_removed = not named_child_retained
+        reported_cleanup_state = cleanup_state if retained else "removed"
+    else:
+        # This is the compatibility stop contract: no runtime cleanup was
+        # admitted, so every named/descendant tree remains available for a
+        # later restart regardless of the independent tracking failure that
+        # made the overall lifecycle outcome partial.
+        runtime_retained = True
+        named_runtime_retained = True
+        named_runtime_removed = False
+        cleanup_pending = False
+        reported_cleanup_state = "not_requested"
+
     data: Dict[str, Any] = {
         "terminated": True,
         "child_name": child_name,
         "agent_removed": True,
-        "runtime_retained": bool(retained),
-        "named_child_runtime_retained": named_child_retained,
-        "named_child_runtime_removed": not named_child_retained,
+        "runtime_offboard_requested": offboard_runtime,
+        "runtime_offboarded": offboard_runtime and not retained,
+        "runtime_retained": runtime_retained,
+        "runtime_retained_for_restart": not offboard_runtime,
+        "named_child_runtime_retained": named_runtime_retained,
+        "named_child_runtime_removed": named_runtime_removed,
         "runtime_cleanup_pending": cleanup_pending,
-        "runtime_cleanup_state": cleanup_state if retained else "removed",
+        "runtime_cleanup_state": reported_cleanup_state,
         "operator_action_required": True,
         "retry_termination": False,
         "retained_outcome_count": len(retained),
@@ -168,7 +188,13 @@ def _termination_partial_result(
     if reconciliation:
         data["tracking_reconciled"] = False
 
-    if cleanup_pending:
+    if not offboard_runtime:
+        custody_message = (
+            "The child was stopped and its runtime state was retained for "
+            "restart, but lifecycle bookkeeping requires operator "
+            "reconciliation. Do not retry termination."
+        )
+    elif cleanup_pending:
         custody_message = (
             "Secure runtime cleanup is still pending for "
             f"{', '.join(retained_agents)} and may complete in manager-owned "
@@ -788,6 +814,7 @@ class SpawnFeature(Feature):
             # namespace-security failure into a tool ERROR would mask it.
             partial = _termination_partial_result(
                 child_name=child_name,
+                offboard_runtime=offboard_runtime,
                 manager=manager,
                 error=exc,
                 retained_error_type=RuntimeOffboardingRetainedError,

@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 from uuid import uuid4
 
@@ -2123,6 +2124,7 @@ class IsolatedRuntimePreparationError(RuntimeError):
 
 _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
+_CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
 _SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 
 
@@ -2171,7 +2173,81 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
                 "env and cwd delivery; update it to accept both hosted launch "
                 "arguments"
             )
+        if self.reason == _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE:
+            safe_names = [
+                key
+                for key in self.environment_keys
+                if type(key) is str and _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key)
+            ]
+            name = safe_names[0] if len(safe_names) == 1 else "<unknown>"
+            return (
+                f"hosted process-wide prebuilt override {name} must name an "
+                "existing operator-owned executable or venv with no Core "
+                "provisioning manifest"
+            )
         return "the hosted isolated feature configuration is unsafe"
+
+
+def safe_isolated_runtime_preparation_diagnostic(
+    error: BaseException,
+) -> str:
+    """Classify a preparation failure without reflecting arbitrary text.
+
+    Optional feature packages can raise the public preparation exception or
+    attach an ``OSError`` containing paths and credentials.  Only Core-chosen
+    errno categories cross the startup log boundary; all messages and path
+    attributes on the original exception remain private.
+    """
+
+    current: BaseException | None = error
+    visited: set[int] = set()
+    error_number: int | None = None
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, OSError) and type(current.errno) is int:
+            error_number = current.errno
+            break
+        current = current.__cause__ or current.__context__
+
+    if error_number == errno.EXDEV:
+        return (
+            "released runtime state cannot be adopted across filesystems; "
+            "move it onto the hosted runtime filesystem and retry"
+        )
+    if error_number in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+        return (
+            "the runtime filesystem has insufficient free space or quota; "
+            "restore capacity and retry"
+        )
+    if error_number in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return (
+            "the host filesystem denied runtime preparation; verify the "
+            "configured mount ownership and write policy"
+        )
+    if error_number in {errno.EMFILE, errno.ENFILE}:
+        return (
+            "the host exhausted its file-descriptor capacity during runtime "
+            "preparation; restore capacity and retry"
+        )
+    return (
+        "the agent-scoped runtime could not be prepared; inspect the sanitized "
+        "traceback and host filesystem health"
+    )
+
+
+def sanitized_isolated_runtime_preparation_exc_info(
+    error: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """Return traceback evidence whose exception text and cause are sanitized."""
+
+    safe_error = IsolatedRuntimePreparationError(
+        safe_isolated_runtime_preparation_diagnostic(error)
+    )
+    safe_error.__traceback__ = error.__traceback__
+    safe_error.__cause__ = None
+    safe_error.__context__ = None
+    safe_error.__suppress_context__ = True
+    return type(safe_error), safe_error, error.__traceback__
 
 
 class _RuntimeOwnerMarkerMissing(IsolatedRuntimeNamespaceError):
@@ -2937,6 +3013,55 @@ def _validate_released_legacy_directory_metadata(
         )
 
 
+def _validate_released_legacy_root_custody(metadata: os.stat_result) -> None:
+    """Quarantine populated released state whose custody cannot be proven.
+
+    The released ``feature_venvs`` parent predates Core's private-directory
+    contract and may legitimately remain permissive after every class-named
+    child has already been migrated.  Its mode is therefore relevant only
+    when the requested legacy component still exists.  A non-directory is a
+    path-substitution violation; ownership or write-access ambiguity for a
+    populated directory is an operational custody problem and quarantines only
+    the optional feature without moving either tree.
+    """
+
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root is unsafe."
+        )
+    if (
+        os.name == "posix"
+        and (
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        )
+    ):
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released runtime custody could not be "
+            "proven; tenant state was retained."
+        )
+
+
+def _revalidate_portable_released_root(
+    legacy_root: Path,
+    expected: os.stat_result,
+) -> None:
+    """Detect a portable-path root substitution before any rename."""
+
+    try:
+        current = legacy_root.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root changed "
+            "during validation."
+        ) from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_file_identity(expected, current):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root changed "
+            "during validation."
+        )
+
+
 def _migrate_released_runtime_directory_portable(
     legacy_root: Path,
     scope: IsolatedRuntimeNamespace,
@@ -2949,18 +3074,20 @@ def _migrate_released_runtime_directory_portable(
         root_metadata = legacy_root.stat(follow_symlinks=False)
     except FileNotFoundError:
         return
-    if legacy_root.is_symlink():
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature released legacy runtime root is unsafe."
         )
-    _validate_operator_root_metadata(root_metadata)
     legacy = legacy_root / legacy_component
     stable = scope.path / "feature_venvs" / stable_component
     try:
         legacy_metadata = legacy.stat(follow_symlinks=False)
     except FileNotFoundError:
+        _revalidate_portable_released_root(legacy_root, root_metadata)
         return
-    if legacy.is_symlink():
+    _revalidate_portable_released_root(legacy_root, root_metadata)
+    _validate_released_legacy_root_custody(root_metadata)
+    if stat.S_ISLNK(legacy_metadata.st_mode):
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature released legacy runtime path is unsafe."
         )
@@ -2979,6 +3106,7 @@ def _migrate_released_runtime_directory_portable(
             "Hosted isolated feature has both released legacy and stable runtime "
             "state; operator custody reconciliation is required."
         )
+    _revalidate_portable_released_root(legacy_root, root_metadata)
     try:
         legacy.rename(stable)
     except OSError as exc:
@@ -3098,7 +3226,6 @@ def migrate_released_hosted_feature_runtime(
                     "Hosted isolated feature released legacy runtime root changed "
                     "during validation."
                 )
-            _validate_operator_root_metadata(source_root_metadata)
 
             try:
                 legacy_metadata = os.stat(
@@ -3108,6 +3235,7 @@ def migrate_released_hosted_feature_runtime(
                 )
             except FileNotFoundError:
                 return
+            _validate_released_legacy_root_custody(source_root_metadata)
             _validate_released_legacy_directory_metadata(legacy_metadata)
             legacy_fd = os.open(
                 legacy_component,
@@ -4119,6 +4247,65 @@ def _assert_hosted_feature_env_is_scoped(
     )
 
 
+def _hosted_prebuilt_override_error(key: str) -> IsolatedRuntimeConfigurationError:
+    return IsolatedRuntimeConfigurationError(
+        reason=_CONFIGURATION_HOSTED_PREBUILT_OVERRIDE,
+        environment_keys=(key,),
+    )
+
+
+def _validate_hosted_process_prebuilt_overrides(feature_name: str) -> None:
+    """Accept only existing immutable-shape process-wide launch overrides.
+
+    These two variables are operator/host configuration, not tenant config, so
+    they may be shared only as prebuilt artifacts.  Core must never create,
+    upgrade, or stamp a path selected process-wide: doing so lets concurrent
+    hosted agents race over shared mutable provisioning state.
+    """
+
+    venv_key = _env_key(feature_name, "VENV")
+    venv_value = os.environ.get(venv_key)
+    if venv_value:
+        try:
+            venv_path = Path(os.path.abspath(Path(venv_value).expanduser()))
+            venv_metadata = venv_path.stat(follow_symlinks=False)
+            manifest = venv_path / ".kestrel_provision.json"
+            try:
+                manifest.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                manifest_present = False
+            else:
+                manifest_present = True
+            config_metadata = (venv_path / "pyvenv.cfg").stat(
+                follow_symlinks=False
+            )
+            python_path = _venv_python(venv_path)
+            python_metadata = python_path.stat()
+        except (OSError, RuntimeError, ValueError):
+            raise _hosted_prebuilt_override_error(venv_key) from None
+        if (
+            not stat.S_ISDIR(venv_metadata.st_mode)
+            or manifest_present
+            or not stat.S_ISREG(config_metadata.st_mode)
+            or not stat.S_ISREG(python_metadata.st_mode)
+            or (os.name == "posix" and not os.access(python_path, os.X_OK))
+        ):
+            raise _hosted_prebuilt_override_error(venv_key)
+
+    bin_key = _env_key(feature_name, "BIN")
+    bin_value = os.environ.get(bin_key)
+    if bin_value:
+        try:
+            bin_path = Path(os.path.abspath(Path(bin_value).expanduser()))
+            bin_metadata = bin_path.stat(follow_symlinks=False)
+        except (OSError, RuntimeError, ValueError):
+            raise _hosted_prebuilt_override_error(bin_key) from None
+        if not stat.S_ISREG(bin_metadata.st_mode) or (
+            os.name == "posix" and not os.access(bin_path, os.X_OK)
+        ):
+            raise _hosted_prebuilt_override_error(bin_key)
+
+
 def _isolated_child_env(
     venv_path: Optional[Path],
     *,
@@ -4635,6 +4822,7 @@ class ProxyFeature(Feature):
             or getattr(agent, "isolated_runtime_hosted", False) is True
         ):
             _assert_hosted_feature_env_is_scoped(self.name, self.runtime.distribution)
+            _validate_hosted_process_prebuilt_overrides(self.name)
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
         # Event acknowledgement requests are intentionally detached from the
         # SDK read loop (which cannot await a response it must itself read).
@@ -8670,6 +8858,12 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
+        if self._runtime_is_hosted():
+            # Revalidate here as well as at construction: tests, embedders, and
+            # long-lived hosts can mutate ``os.environ`` between discovery and
+            # enable.  A late process-wide path must never acquire provisioning
+            # authority merely because the ProxyFeature already exists.
+            _validate_hosted_process_prebuilt_overrides(self.name)
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
         if bin_override:
             return self._default_venv_path(), Path(bin_override).expanduser().resolve()
@@ -8718,6 +8912,11 @@ class ProxyFeature(Feature):
             os.environ.get(_env_key(self.name, "VENV"))
             or self.runtime.venv
         )
+
+    def _process_venv_is_overridden(self) -> bool:
+        """Whether this host selected a process-wide immutable venv artifact."""
+
+        return bool(os.environ.get(_env_key(self.name, "VENV")))
 
     def _default_venv_path(self) -> Path:
         return self._feature_runtime_dir() / ".venv"
@@ -9012,6 +9211,26 @@ class ProxyFeature(Feature):
             raise RuntimeError(
                 f"Isolated feature {self.name} has no project/distribution to install"
             )
+
+        if self._runtime_is_hosted() and self._process_venv_is_overridden():
+            # Revalidate at the mutation boundary, not only at discovery/path
+            # resolution. A concurrent host setting or late Core manifest must
+            # never make this process-wide path fall through to uv creation,
+            # upgrade, or manifest stamping.
+            _validate_hosted_process_prebuilt_overrides(self.name)
+            try:
+                self._verify_prebuilt_feature_distribution(
+                    python_path,
+                    install_target,
+                )
+                self._warn_on_sdk_mismatch(python_path)
+            except IsolatedRuntimeConfigurationError:
+                raise
+            except Exception as exc:
+                raise _hosted_prebuilt_override_error(
+                    _env_key(self.name, "VENV")
+                ) from exc
+            return
 
         exists = python_path.exists()
 

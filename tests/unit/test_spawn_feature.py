@@ -408,7 +408,10 @@ class TestSpawnFeatureWithManager:
             "terminated": True,
             "child_name": "helper",
             "agent_removed": True,
+            "runtime_offboard_requested": True,
+            "runtime_offboarded": False,
             "runtime_retained": True,
+            "runtime_retained_for_restart": False,
             "named_child_runtime_retained": True,
             "named_child_runtime_removed": False,
             "runtime_cleanup_pending": False,
@@ -732,8 +735,13 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.terminate_child(child_name="helper")
 
         assert envelope.status is ToolResultStatus.PARTIAL
-        assert envelope.data["runtime_retained"] is False
-        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["runtime_retained_for_restart"] is True
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["runtime_cleanup_state"] == "not_requested"
         assert envelope.data["tracking_reconciled"] is False
         assert envelope.data["additional_outcome_types"] == [
             "ChildTerminationReconciliationError"
@@ -770,7 +778,12 @@ class TestSpawnFeatureWithManager:
 
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["retained_agent"] == "grandchild"
-        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained_for_restart"] is True
+        assert envelope.data["runtime_cleanup_state"] == "not_requested"
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
         assert envelope.data["tracking_reconciled"] is False
         assert envelope.data["additional_outcome_count"] == 1
         assert envelope.data["additional_outcome_types"] == [

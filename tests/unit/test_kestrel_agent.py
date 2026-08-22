@@ -3328,7 +3328,7 @@ class TestInitialize:
         )
         bin_key = "KESTREL_FEATURE_LATESCOPEDCONFIGFEATURE_BIN"
         unsafe_key = "KESTREL_FEATURE_LATESCOPEDCONFIGFEATURE_TOKEN"
-        monkeypatch.setenv(bin_key, "/bin/true")
+        monkeypatch.setenv(bin_key, "/usr/bin/true")
         client_factory = MagicMock(
             side_effect=AssertionError("quarantined child must not start")
         )

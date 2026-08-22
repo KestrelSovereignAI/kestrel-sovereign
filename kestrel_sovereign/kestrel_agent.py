@@ -4528,11 +4528,35 @@ class KestrelAgent(
             if isinstance(preparation_error, type) and isinstance(
                 exc, preparation_error
             ):
+                diagnostic_factory = getattr(
+                    isolated_runtime,
+                    "safe_isolated_runtime_preparation_diagnostic",
+                    None,
+                )
+                exc_info_factory = getattr(
+                    isolated_runtime,
+                    "sanitized_isolated_runtime_preparation_exc_info",
+                    None,
+                )
+                diagnostic = (
+                    diagnostic_factory(exc)
+                    if callable(diagnostic_factory)
+                    else (
+                        "the agent-scoped runtime could not be prepared; inspect "
+                        "host filesystem health"
+                    )
+                )
+                safe_exc_info = (
+                    exc_info_factory(exc)
+                    if callable(exc_info_factory)
+                    else None
+                )
                 logging.error(
-                    "Optional isolated feature '%s' is unavailable because its "
-                    "agent-scoped runtime could not be prepared safely; other agent "
-                    "features will continue.",
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
                     getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                    exc_info=safe_exc_info,
                 )
                 return False
             raise

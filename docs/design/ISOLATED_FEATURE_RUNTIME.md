@@ -237,9 +237,12 @@ Twilio, WhatsApp, or `KESTREL_FEATURE_<NAME>_*` configuration is not silently
 dropped or forwarded across tenants: hosted discovery names the offending keys
 and refuses that optional feature until the values are moved into the agent's
 persisted feature configuration. `..._BIN` and `..._VENV` remain host-side
-artifact-selection inputs and are never exposed to the child. An
-operator-selected prebuilt venv remains immutable and may be shared as an
-artifact, but the child process and all mutable paths remain namespace-distinct.
+artifact-selection inputs and are never exposed to the child. In hosted mode
+these process-wide overrides are accepted only when the executable or complete
+venv already exists; a venv carrying Core's provisioning manifest is refused.
+Core never creates, upgrades, or stamps a process-wide override. The validated
+operator-selected artifact may be shared, but every child process and mutable
+workspace/cache/state path remains namespace-distinct.
 
 The per-feature directory identity is a digest of the normalized distribution
 name and declared feature class. Entry-point module paths and service runner
@@ -278,10 +281,14 @@ ordinary child termination stop/unpublish agents but retain every hosted
 namespace. The DELETE compatibility default also leaves `multi_agent.toml`
 registration intact, so a later host restart may start the agent again.
 `DELETE /api/agents/{name}?offboard_runtime=true` is the explicit destructive
-contract. It is available only to config-driven deployments and removes the
-persisted registration before runtime deletion, preventing credential-less
-autostart resurrection; auto-discovery deployments are refused because safely
-deprovisioning them would also require an explicit primary-storage policy.
+contract. It is available only to config-driven deployments. Core first resolves
+the registered local DID without mutating configuration, refuses an absent or
+ambiguous identity, then removes the persisted registration before runtime
+deletion. A stopped/never-loaded registered agent follows the same DID-scoped
+offboarding admission without being constructed. This prevents credential-less
+autostart resurrection and avoids guessing a namespace from a routing name;
+auto-discovery deployments are refused because safely deprovisioning them would
+also require an explicit primary-storage policy.
 Approved `terminate_child(..., offboard_runtime=true)` calls and rollback of an
 uncommitted spawn carry the same separate destructive intent. After durable
 shutdown, AgentManager verifies the ownership

@@ -1264,7 +1264,10 @@ class TestAgentManagerBasics:
             }
         )
         config.save(config_path)
-        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=True))
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(return_value=True),
+        )
         state = SimpleNamespace(
             agent_manager=manager,
             multi_agent_config_path=config_path,
@@ -1281,6 +1284,7 @@ class TestAgentManagerBasics:
         manager.remove_agent.assert_awaited_once_with(
             "Hosted",
             offboard_runtime=True,
+            known_agent_id="did:test:hosted",
         )
         assert MultiAgentConfig.from_file(config_path).agents == {}
         assert state.multi_agent_config.agents == {}
@@ -1336,7 +1340,10 @@ class TestAgentManagerBasics:
             cause=TimeoutError("private shutdown handoff"),
             cleanup_pending=True,
         )
-        manager = SimpleNamespace(remove_agent=AsyncMock(side_effect=pending))
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:pending"),
+            remove_agent=AsyncMock(side_effect=pending),
+        )
         request = SimpleNamespace(
             app=SimpleNamespace(
                 state=SimpleNamespace(
@@ -1374,7 +1381,10 @@ class TestAgentManagerBasics:
         )
         config = MultiAgentConfig(agents={"Hosted": original})
         config.save(config_path)
-        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=False))
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(return_value=False),
+        )
         request = SimpleNamespace(
             app=SimpleNamespace(
                 state=SimpleNamespace(
@@ -1581,6 +1591,209 @@ class TestAgentManagerBasics:
 
         assert not scope.path.exists()
         assert not manager.is_scheduler_agent_authorized(did)
+
+    @pytest.mark.asyncio
+    async def test_explicit_offboard_removes_witnessed_registered_cold_runtime(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A known stopped registration is not a false 404 or duplicate sweep."""
+
+        from kestrel_sovereign.features import isolated_runtime
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:registered-cold-offboarding"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            did,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("registered-cold-credential")
+        real_remove = isolated_runtime.remove_isolated_runtime_namespace
+        cleanup_calls = 0
+
+        def count_cleanup(*args, **kwargs):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            return real_remove(*args, **kwargs)
+
+        monkeypatch.setattr(
+            isolated_runtime,
+            "remove_isolated_runtime_namespace",
+            count_cleanup,
+        )
+
+        assert await manager.remove_agent(
+            "Cold",
+            offboard_runtime=True,
+            known_agent_id=did,
+        )
+
+        assert cleanup_calls == 1
+        assert not scope.path.exists()
+        assert manager.get_agent("Cold") is None
+        assert not manager.is_scheduler_agent_authorized(did)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_outcome", ("success", "failure", "pending"))
+    async def test_delete_endpoint_offboards_registered_unloaded_agent_truthfully(
+        self,
+        cleanup_outcome,
+        monkeypatch,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+        from kestrel_sovereign.features import isolated_runtime
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = f"did:pkh:cold-endpoint-{cleanup_outcome}"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            did,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text(f"cold-{cleanup_outcome}-credential")
+        config_path = tmp_path / f"multi-agent-{cleanup_outcome}.toml"
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data/cold"),
+            port=8801,
+            autostart=False,
+        )
+        config = MultiAgentConfig(agents={"Cold": local})
+        config.save(config_path)
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        anchor = AsyncMock(return_value=did)
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            anchor,
+        )
+        real_remove = isolated_runtime.remove_isolated_runtime_namespace
+        cleanup_calls = 0
+        cleanup_started = threading.Event()
+        cleanup_release = threading.Event()
+
+        def controlled_cleanup(*args, **kwargs):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_outcome == "failure":
+                raise PermissionError("private operator runtime path")
+            if cleanup_outcome == "pending":
+                cleanup_started.set()
+                cleanup_release.wait(timeout=5)
+            return real_remove(*args, **kwargs)
+
+        monkeypatch.setattr(
+            isolated_runtime,
+            "remove_isolated_runtime_namespace",
+            controlled_cleanup,
+        )
+        if cleanup_outcome == "pending":
+            monkeypatch.setattr(
+                "kestrel_sovereign.multi_agent.agent_manager.RUNTIME_OFFBOARD_TIMEOUT_S",
+                0.01,
+            )
+
+        try:
+            if cleanup_outcome == "success":
+                result = await delete_agent.__wrapped__(
+                    request,
+                    "Cold",
+                    offboard_runtime=True,
+                )
+                assert result["runtime_offboarded"] is True
+                assert result["persisted_registration_removed"] is True
+                assert not scope.path.exists()
+            else:
+                with pytest.raises(HTTPException) as raised:
+                    await delete_agent.__wrapped__(
+                        request,
+                        "Cold",
+                        offboard_runtime=True,
+                    )
+                assert raised.value.status_code == 409
+                expected_state = (
+                    "pending" if cleanup_outcome == "pending" else "retained"
+                )
+                assert raised.value.detail["runtime_cleanup_state"] == expected_state
+                assert str(tmp_path) not in str(raised.value.detail)
+                assert credential.read_text() == f"cold-{cleanup_outcome}-credential"
+
+            assert cleanup_calls == 1
+            assert MultiAgentConfig.from_file(config_path).agents == {}
+            assert request.app.state.multi_agent_config.agents == {}
+            assert manager.get_agent("Cold") is None
+            anchor.assert_awaited_once_with(
+                str(local.resolve_data_dir(tmp_path)),
+                mode=AgentDIDLookupMode.COLD_READ_ONLY,
+            )
+        finally:
+            cleanup_release.set()
+            if cleanup_outcome == "pending":
+                await manager.drain_quarantined_shutdowns()
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_refuses_unresolved_registered_identity_before_mutation(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        config_path = tmp_path / "multi_agent.toml"
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data/unresolved"),
+            port=8801,
+            autostart=False,
+        )
+        config = MultiAgentConfig(agents={"Unresolved": local})
+        config.save(config_path)
+        before = config_path.read_bytes()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            AsyncMock(side_effect=OSError("private anchor path")),
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Unresolved",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert "identity is unavailable" in raised.value.detail
+        assert config_path.read_bytes() == before
+        assert "Unresolved" in request.app.state.multi_agent_config.agents
+        assert manager._inflight_runtime_offboardings == {}
 
     @pytest.mark.asyncio
     async def test_offboarding_failure_and_cancellation_never_republish_dead_agent(

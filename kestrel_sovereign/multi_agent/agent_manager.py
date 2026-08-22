@@ -2309,6 +2309,93 @@ class AgentManager:
         self._seed_scheduler_authority(mapping)
         return mapping
 
+    async def resolve_registered_agent_id(
+        self,
+        name: str,
+        config: LocalAgentConfig,
+    ) -> str:
+        """Resolve a persisted local registration to one durable DID.
+
+        Destructive offboarding calls this before mutating ``multi_agent.toml``.
+        A loaded or scheduler-authorized identity is accepted only when it is
+        coherent with the requested registration; an otherwise cold identity
+        is read through the immutable anchor path.  Failure is intentionally a
+        refusal, never permission to guess a namespace from the routing name.
+        """
+
+        if not isinstance(config, LocalAgentConfig):
+            raise ValueError("Registered agent is not a local hosted agent.")
+        canonical_name = self._canonical_agent_name(name)
+        async with self._lock:
+            loaded_matches = [
+                agent
+                for routing_name, agent in self._agents.items()
+                if self._canonical_agent_name(routing_name) == canonical_name
+            ]
+            authority_matches = [
+                (agent_id, entry)
+                for agent_id, entry in self._scheduler_authority_by_did.items()
+                if self._canonical_agent_name(entry[0]) == canonical_name
+            ]
+        if len(loaded_matches) > 1 or len(authority_matches) > 1:
+            raise ValueError(
+                "Registered agent identity is ambiguous; offboarding was refused."
+            )
+
+        loaded_id = (
+            _loaded_agent_did(loaded_matches[0]) if loaded_matches else None
+        )
+        authority_id = authority_matches[0][0] if authority_matches else None
+        if loaded_id and authority_id and loaded_id != authority_id:
+            raise ValueError(
+                "Registered agent identity conflicts with live scheduler authority; "
+                "offboarding was refused."
+            )
+        if loaded_id:
+            return loaded_id
+        if authority_id:
+            authority_config = authority_matches[0][1][1]
+            if authority_config != config:
+                raise ValueError(
+                    "Persisted agent registration changed from scheduler authority; "
+                    "offboarding was refused."
+                )
+            return authority_id
+
+        try:
+            resolved_dir = config.resolve_data_dir(self._base_data_dir)
+            agent_id = await read_anchor_agent_did(
+                str(resolved_dir),
+                mode=AgentDIDLookupMode.COLD_READ_ONLY,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Registered agent identity is unavailable; offboarding was refused."
+            ) from exc
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError(
+                "Registered agent identity is unavailable; offboarding was refused."
+            )
+
+        # Recheck after I/O so a concurrent cold wake cannot replace the
+        # registration with a different DID between witness and DELETE.
+        async with self._lock:
+            current = self.get_agent(name)
+            current_id = _loaded_agent_did(current) if current is not None else None
+            known_id = self._scheduler_authority_by_name.get(name)
+            did_authority = self._scheduler_authority_by_did.get(agent_id)
+        if (current_id and current_id != agent_id) or (
+            known_id and known_id != agent_id
+        ) or (
+            did_authority is not None
+            and self._canonical_agent_name(did_authority[0]) != canonical_name
+        ):
+            raise ValueError(
+                "Registered agent identity changed during offboarding admission; "
+                "offboarding was refused."
+            )
+        return agent_id
+
     def get_agent_name(self, agent_id: str) -> Optional[str]:
         """Get the name for an agent by its DID."""
         return self._agent_names.get(agent_id)
@@ -2318,6 +2405,7 @@ class AgentManager:
         name: str,
         *,
         offboard_runtime: bool = False,
+        known_agent_id: Optional[str] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -2336,6 +2424,7 @@ class AgentManager:
             removed = await self._remove_agent_serialized(
                 name,
                 offboard_runtime=offboard_runtime,
+                known_agent_id=known_agent_id,
                 pending_offboarding=pending_offboarding,
             )
         except BaseException as exc:
@@ -2378,6 +2467,7 @@ class AgentManager:
         name: str,
         *,
         offboard_runtime: bool,
+        known_agent_id: Optional[str],
         pending_offboarding: list[InflightRuntimeOffboarding],
     ) -> bool:
         """Stop and unpublish an agent while serializing with cold wakes.
@@ -2398,10 +2488,23 @@ class AgentManager:
         """
         if type(offboard_runtime) is not bool:
             raise TypeError("offboard_runtime must be a bool")
+        if known_agent_id is not None and (
+            not offboard_runtime
+            or type(known_agent_id) is not str
+            or not known_agent_id
+        ):
+            raise TypeError(
+                "known_agent_id requires destructive offboarding and a non-empty DID"
+            )
 
         async with self._lock:
             current = self._agents.get(name)
             agent_id = _loaded_agent_did(current) if current is not None else None
+            if agent_id and known_agent_id and agent_id != known_agent_id:
+                raise ValueError(
+                    "Registered agent identity does not match the loaded agent; "
+                    "offboarding was refused."
+                )
             if not isinstance(agent_id, str) or not agent_id:
                 # A scheduler can be partway through a cold load while the
                 # agent is still absent from ``_agents``.  The live authority
@@ -2411,6 +2514,13 @@ class AgentManager:
                 # returning a misleading 404 and letting the already-claimed
                 # cold wake publish the agent immediately afterwards.
                 agent_id = self._scheduler_authority_by_name.get(name)
+            if agent_id and known_agent_id and agent_id != known_agent_id:
+                raise ValueError(
+                    "Registered agent identity does not match scheduler authority; "
+                    "offboarding was refused."
+                )
+            if not agent_id and known_agent_id:
+                agent_id = known_agent_id
 
         if not isinstance(agent_id, str) or not agent_id:
             async with self._a2a_lifecycle_lock:
@@ -2434,8 +2544,10 @@ class AgentManager:
                     # DELETE won the race with a cold scheduler load. Revoking
                     # an authorized-but-unpublished tenant is a completed
                     # runtime removal.
-                    if authority is not None and authority[0] == name:
-                        self._revoke_scheduler_authority(name, agent_id)
+                    if authority is not None and self._canonical_agent_name(
+                        authority[0]
+                    ) == self._canonical_agent_name(name):
+                        self._revoke_scheduler_authority(authority[0], agent_id)
                         if offboard_runtime:
                             pending_offboarding.append(
                                 self._start_agent_runtime_offboarding_identity(
@@ -2452,6 +2564,46 @@ class AgentManager:
                         )
                         if reconciliation_cancelled:
                             raise asyncio.CancelledError()
+                        return True
+                    if known_agent_id == agent_id:
+                        if authority is not None:
+                            raise ValueError(
+                                "Registered agent DID belongs to a different routing "
+                                "name; offboarding was refused."
+                            )
+                        # A persisted local registration can be intentionally
+                        # cold without live scheduler authority.  Its read-only
+                        # DID witness admits the same identity-scoped cleanup
+                        # worker used for an authorized cold agent.  Revoke the
+                        # desired name before starting deletion so a concurrent
+                        # wake cannot publish it after config removal.
+                        if self._has_budgeted_descendants(name):
+                            raise ValueError(
+                                f"Cannot remove '{name}' directly: it has budgeted "
+                                "child agents. Use terminate_child, which cascades "
+                                "and releases nested budgets leaf-first (#2113)."
+                            )
+                        self._revoke_scheduler_authority(name, agent_id)
+                        try:
+                            pending_offboarding.append(
+                                self._start_agent_runtime_offboarding_identity(
+                                    name=name,
+                                    agent_id=agent_id,
+                                )
+                            )
+                        except BaseException:
+                            self._scheduler_revoked_names.discard(name)
+                            self._scheduler_revoked_dids.discard(agent_id)
+                            raise
+                        reconciliation_cancelled = (
+                            await self._reconcile_fully_removed_child_tracking()
+                        )
+                        if reconciliation_cancelled:
+                            raise asyncio.CancelledError()
+                        logger.info(
+                            "Offboarded registered cold agent %r by durable identity",
+                            name,
+                        )
                         return True
                     return await self._remove_agent_without_scheduler_lifecycle(
                         name,
