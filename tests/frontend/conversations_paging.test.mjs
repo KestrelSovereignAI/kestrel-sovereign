@@ -161,5 +161,14 @@ test('a page that lands after a view switch is dropped, not appended', async () 
     const ids = rows(el).map((r) => r.dataset.sessionId);
     assert.ok(!ids.includes('late'), 'the previous view\'s page must not be painted');
     assert.deepEqual(ids, ['archived-1']);
+    // ...and the pane can still page. A losing continuation that left the
+    // in-flight flag set would disable Load more for the rest of its life.
+    assert.equal(calls.some((c) => c.view === 'archived' && c.cursor === null), true);
+    const more = moreBtn(el);
+    assert.ok(more, 'the new view offers its own next page');
+    assert.equal(more.disabled, false, 'a lost continuation left the pane wedged');
+    more.click();
+    await settle();
+    assert.deepEqual(rows(el).map((r) => r.dataset.sessionId), ['archived-1', 'late']);
     handle.destroy();
 });

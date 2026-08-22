@@ -914,16 +914,22 @@ export function mountConversations(containerEl, config = {}) {
             // would lose conversations the user can already see.
             Toast.show(`Failed to load more conversations: ${e.message}`, 'error');
         } finally {
-            if (seq === refreshSeq) {
-                loadingMore = false;
-                renderCurrent();
-            }
+            // ALWAYS cleared, including on the stale path. Leaving it set
+            // because a view switch won the race would disable the button for
+            // the rest of the pane's life — a list that silently stops paging.
+            loadingMore = false;
+            renderCurrent();
         }
     }
 
     function setView(next) {
         if (next === view) return;
         view = next;
+        // Dropped BEFORE the reload, not after it. A cursor belongs to the view
+        // that minted it — the server refuses one replayed against another —
+        // so a Load more clicked in the window before the new page lands would
+        // otherwise send the previous view's token and fail (#2960).
+        nextCursor = null;
         searchTerm = '';
         search.value = '';
         searchResults = null;
@@ -934,6 +940,8 @@ export function mountConversations(containerEl, config = {}) {
 
     function retarget(nextAgentName) {
         agentName = nextAgentName;
+        // The previous agent's place in the previous agent's list.
+        nextCursor = null;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
         // A pending/answered server search belongs to the OLD agent — drop it
         // so stale hits never paint post-switch; refresh() re-runs the search
