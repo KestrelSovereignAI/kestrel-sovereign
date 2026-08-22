@@ -443,7 +443,7 @@ class StrategicMemoryFeature(Feature):
         try:
             storage = getattr(self.agent, "storage", None)
             graph_store = getattr(storage, "graph", None) if storage else None
-            report = await project_ledger(graph_store, agent_id, self._ledger.data)
+            report = await project_ledger(graph_store, agent_id, self._ledger)
         except Exception as e:  # noqa: BLE001 - the index is best-effort
             logger.warning("strategy ledger index projection failed: %s", e)
             return {"projected": 0, "skipped": 0, "failed": 0, "error": str(e)}

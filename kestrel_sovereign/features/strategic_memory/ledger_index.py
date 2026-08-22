@@ -23,7 +23,7 @@ pattern in YAML could never take effect in the index.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Mapping
 
 from .ledger import (
     BLOCKERS_KEY,
@@ -122,9 +122,17 @@ def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str
 async def project_ledger(
     graph_store,
     agent_id: str,
-    ledger_data: Dict[str, Any],
+    ledger: Any,
 ) -> Dict[str, Any]:
     """Upsert ledger rows as graph nodes.
+
+    Takes the LEDGER, not its ``data``. Reconciliation derives its keep-set
+    from the rows it is given, so a failed parse — which leaves the sections
+    empty — reads as "every row was deleted" and takes the derived index with
+    it. A bare mapping cannot express the difference between "no rows" and
+    "could not be read", so the guard had to live at the call site, where the
+    next call site added would silently omit it. Passing the ledger moves the
+    question into the value: readability travels with the rows.
 
     Best-effort by design: the graph is an index, so a failure to write it must
     never fail the ledger write that YAML already persisted. The canonical
@@ -134,6 +142,16 @@ async def project_ledger(
     blocker text, since callers surface it to logs.
     """
     report: Dict[str, Any] = {"projected": 0, "skipped": 0, "failed": 0, "removed": 0}
+    # A mapping is still accepted, but only when it cannot be an unreadable
+    # ledger — i.e. a caller that has already established readability, or a
+    # test constructing rows directly.
+    if isinstance(ledger, Mapping):
+        ledger_data: Dict[str, Any] = dict(ledger)
+    else:
+        if not getattr(ledger, "readable", True):
+            report["skipped_reason"] = "ledger_unavailable"
+            return report
+        ledger_data = getattr(ledger, "data", {}) or {}
     patterns = _dict_rows(ledger_data, PATTERNS_KEY)
     blockers = _dict_rows(ledger_data, BLOCKERS_KEY)
     total = len(patterns) + len(blockers)

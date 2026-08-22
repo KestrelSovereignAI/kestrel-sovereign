@@ -861,3 +861,61 @@ class TestExistingReadersStillSeeBlockers:
         rendered = await feature.strategy_view(section="blockers")
         assert "still blocking" in rendered.confirmation
         assert "id:" in rendered.confirmation
+
+
+class TestUnreadableLedgerCannotDeleteTheIndex:
+    """An unreadable ledger is not an empty one.
+
+    Reconciliation derives its keep-set from the rows it is given, so a failed
+    parse reads as "every row was deleted" and takes the derived index with it
+    — a parse error escalated into data loss. The guard lives in the projector
+    rather than only at its caller, because a bare mapping cannot express the
+    difference and the next call site added would omit it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ledger_projects_nothing_and_deletes_nothing(self):
+        from kestrel_sovereign.features.strategic_memory.ledger_index import (
+            project_ledger,
+        )
+
+        graph = _FakeGraph()
+        rows = {PATTERNS_KEY: [{"id": "p1", "pattern": "keep me"}], BLOCKERS_KEY: []}
+        await project_ledger(graph, AGENT, rows)
+        assert len(graph.nodes) == 1
+
+        class _UnreadableLedger:
+            readable = False
+            load_error = "while parsing a block mapping"
+            data = {PATTERNS_KEY: [], BLOCKERS_KEY: []}
+
+        report = await project_ledger(graph, AGENT, _UnreadableLedger())
+
+        assert report["skipped_reason"] == "ledger_unavailable"
+        assert report["removed"] == 0
+        assert len(graph.nodes) == 1, "the valid index must survive a parse failure"
+
+    @pytest.mark.asyncio
+    async def test_a_readable_ledger_still_reconciles_removals(self):
+        """The guard must not disable reconciliation for a healthy ledger."""
+        from kestrel_sovereign.features.strategic_memory.ledger_index import (
+            project_ledger,
+        )
+
+        graph = _FakeGraph()
+        await project_ledger(
+            graph, AGENT,
+            {PATTERNS_KEY: [{"id": "p1", "pattern": "a"}, {"id": "p2", "pattern": "b"}],
+             BLOCKERS_KEY: []},
+        )
+        assert len(graph.nodes) == 2
+
+        class _ReadableLedger:
+            readable = True
+            load_error = None
+            data = {PATTERNS_KEY: [{"id": "p1", "pattern": "a"}], BLOCKERS_KEY: []}
+
+        report = await project_ledger(graph, AGENT, _ReadableLedger())
+
+        assert report["removed"] == 1
+        assert len(graph.nodes) == 1
