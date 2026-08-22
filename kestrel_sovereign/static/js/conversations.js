@@ -914,11 +914,17 @@ export function mountConversations(containerEl, config = {}) {
             // would lose conversations the user can already see.
             Toast.show(`Failed to load more conversations: ${e.message}`, 'error');
         } finally {
-            // ALWAYS cleared, including on the stale path. Leaving it set
-            // because a view switch won the race would disable the button for
-            // the rest of the pane's life — a list that silently stops paging.
-            loadingMore = false;
-            renderCurrent();
+            // Cleared only if this continuation still owns the list. A page
+            // that lost the race clearing the flag would clear one a NEWER
+            // continuation had set — the flag belongs to a generation, not to
+            // the pane. Ownership changes clear it themselves (setView /
+            // retarget), which is what stops an obsolete request that has not
+            // settled yet from leaving the new view's Load more disabled: these
+            // fetches carry no timeout, so "until it settles" can be for ever.
+            if (seq === refreshSeq) {
+                loadingMore = false;
+                renderCurrent();
+            }
         }
     }
 
@@ -928,8 +934,11 @@ export function mountConversations(containerEl, config = {}) {
         // Dropped BEFORE the reload, not after it. A cursor belongs to the view
         // that minted it — the server refuses one replayed against another —
         // so a Load more clicked in the window before the new page lands would
-        // otherwise send the previous view's token and fail (#2960).
+        // otherwise send the previous view's token and fail (#2960). The
+        // in-flight flag goes with it: whatever continuation is still running
+        // belongs to the view being left.
         nextCursor = null;
+        loadingMore = false;
         searchTerm = '';
         search.value = '';
         searchResults = null;
@@ -940,8 +949,10 @@ export function mountConversations(containerEl, config = {}) {
 
     function retarget(nextAgentName) {
         agentName = nextAgentName;
-        // The previous agent's place in the previous agent's list.
+        // The previous agent's place in the previous agent's list, and
+        // whatever continuation is still fetching it.
         nextCursor = null;
+        loadingMore = false;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
         // A pending/answered server search belongs to the OLD agent — drop it
         // so stale hits never paint post-switch; refresh() re-runs the search

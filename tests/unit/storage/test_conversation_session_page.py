@@ -28,6 +28,8 @@ to remove, arriving back with every test still green.
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -301,6 +303,82 @@ async def test_a_table_predating_the_not_null_stamps_is_replaced_and_rederived(
         assert "USE TEMP B-TREE" not in text, text
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_recreated_empty_cache_does_not_report_itself_current(tmp_path):
+    """The sessions table can go WITHOUT its watermarks, and then it lies.
+
+    A restore that carried the watermark tables but not the cache, or a hand
+    recovery that dropped it, leaves the numbers matching: the ledger has not
+    moved, the watermark still equals it, and ``is_stale()`` answers False over
+    a table that is now empty. Before #2960 that cost nothing, because nothing
+    read the table. Now it is a conversation list that serves nothing, for
+    ever, beside intact history.
+
+    Recreating it is therefore the same event as replacing it, and both rotate
+    the generation.
+    """
+    path = str(tmp_path / "recreated.db")
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        assert [r["session_id"] for r in await projection.list()] == ["1"]
+        assert not await projection.is_stale()
+        # ...and the cache alone goes.
+        await db.execute("DROP TABLE conversation_sessions")
+    finally:
+        await db.close()
+
+    db = await AsyncDatabase.sqlite(path)
+    try:
+        projection = ConversationSessionProjection(db, AGENT)
+        assert await projection.is_stale(), (
+            "an empty cache reported itself current: the watermark still "
+            "matched a ledger that had not moved, so nothing would ever "
+            "rebuild it and the list would serve nothing for ever"
+        )
+        await projection.repair()
+        assert [r["session_id"] for r in await projection.list()] == ["1"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("stamp", ["not-a-date", "", "2026-13-45 99:99:99", "0"])
+def test_a_cursor_whose_timestamp_is_not_one_is_refused(stamp):
+    """A cursor is client-supplied text, and its keys are typed.
+
+    Checking only that a key is a *string* lets a tampered token through, and
+    what happens then is worse than an error on one backend and worse than that
+    on the other: on PostgreSQL the string reaches asyncpg as a ``TIMESTAMP``
+    parameter and raises out of the query, past the handler that turns a bad
+    cursor into a 400; on SQLite it compares as text against canonical stamps
+    and quietly selects the wrong page.
+    """
+    token = base64.urlsafe_b64encode(
+        json.dumps({"v": 1, "view": "active", "k": [stamp, "sess-001"]}).encode()
+    ).decode().rstrip("=")
+    with pytest.raises(SessionCursorError):
+        decode_session_cursor(token, "active")
+
+
+def test_a_cursor_carrying_a_real_timestamp_is_accepted():
+    """...and the refusal above is not simply refusing everything."""
+    token = base64.urlsafe_b64encode(
+        json.dumps(
+            {"v": 1, "view": "active", "k": ["2026-05-01 09:00:00", "sess-001"]}
+        ).encode()
+    ).decode().rstrip("=")
+    assert decode_session_cursor(token, "active") == (
+        "2026-05-01 09:00:00", "sess-001",
+    )
 
 
 @pytest.mark.asyncio

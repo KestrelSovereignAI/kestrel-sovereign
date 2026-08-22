@@ -324,6 +324,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .session_grouping import (
     SESSION_ORDER,
+    SESSION_ORDER_TEXT_COLUMNS,
     canonical_timestamp_sql,
     coalesce_sessions_by_session_id,
     coerce_session_timestamp,
@@ -775,9 +776,23 @@ def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
     values = payload.get("k")
     if not isinstance(values, list) or len(values) != len(SESSION_ORDER):
         raise SessionCursorError("cursor does not carry this ordering's keys")
-    for value in values:
+    for (column, _), value in zip(SESSION_ORDER, values):
         if value is not None and not isinstance(value, str):
             raise SessionCursorError("cursor's keys are not text")
+        # Each key is checked against what its COLUMN is, not merely against
+        # being a string. A token is client-supplied, and a timestamp key that
+        # cannot be read is not a cursor this build cannot honour — it is one
+        # that reaches asyncpg as a ``TIMESTAMP`` parameter and raises out of
+        # the query, past the handler that turns a bad cursor into a 400 and
+        # into the one that reports a server fault. On SQLite it is worse than
+        # an error: ``'not-a-date'`` compares as text against canonical stamps
+        # and simply selects the wrong page.
+        if (
+            value is not None
+            and column not in SESSION_ORDER_TEXT_COLUMNS
+            and coerce_session_timestamp(value) is None
+        ):
+            raise SessionCursorError(f"cursor's {column} is not a timestamp")
     return tuple(values)
 
 
@@ -2276,7 +2291,7 @@ class ConversationSessionProjection:
         """
         return tuple(
             value
-            if column == "session_id" or value is None
+            if column in SESSION_ORDER_TEXT_COLUMNS or value is None
             else timestamp_query_param(self.db.backend_type, value)
             for (column, _), value in zip(SESSION_ORDER, after)
         )

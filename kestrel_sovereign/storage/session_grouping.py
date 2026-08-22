@@ -533,6 +533,16 @@ SESSION_ORDER: Tuple[Tuple[str, bool], ...] = (
     ("session_id", False),
 )
 
+#: Which of :data:`SESSION_ORDER`'s keys are text rather than timestamps.
+#:
+#: Named once because three places need the distinction and were spelling it as
+#: ``column == "session_id"`` each time: the comparable rendering of a key, the
+#: binding of a cursor for its engine, and the validation of a cursor arriving
+#: from a client. A key added to the ordering and forgotten in one of the three
+#: is a cursor that compares a timestamp as text or hands a client's string to
+#: asyncpg as a ``TIMESTAMP``.
+SESSION_ORDER_TEXT_COLUMNS = frozenset({"session_id"})
+
 
 def _session_order_key(backend_type: str, column: str) -> str:
     """One ordering key of :data:`SESSION_ORDER`, spelled for this backend.
@@ -670,7 +680,7 @@ def session_order_value(column: str, value: Any) -> Any:
     """
     if value is None:
         return None
-    if column == "session_id":
+    if column in SESSION_ORDER_TEXT_COLUMNS:
         return str(value)
     from .conversation_created_at import comparable_created_at
 

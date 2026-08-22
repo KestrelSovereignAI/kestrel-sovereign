@@ -128,6 +128,40 @@ test('a refresh starts over at the top rather than continuing', async () => {
     handle.destroy();
 });
 
+test('a continuation still in flight does not disable the next view\'s button', async () => {
+    // The flag belongs to a GENERATION, not to the pane. These fetches carry no
+    // timeout or abort signal, so a continuation that never settles would leave
+    // Load more disabled for the rest of the pane's life if the flag were the
+    // pane's — and clearing it unconditionally when a losing page finally
+    // settles is the opposite bug: it clears one a newer continuation had set.
+    const el = makeContainer();
+    let release;
+    const stuck = new Promise((resolve) => { release = resolve; });
+    const api = {
+        getConversations: async (decrypt, view, cursor) => {
+            if (cursor === 'stuck') { await stuck; return { conversations: [], next_cursor: null }; }
+            return {
+                conversations: [conversation(`${view}-1`)],
+                next_cursor: cursor ? null : 'stuck',
+            };
+        },
+        listTrash: async () => ({ messages: [] }),
+    };
+    const handle = mountConversations(el, { api, agentName: 'Emma' });
+    await settle();
+    moreBtn(el).click();            // never settles
+    await settle();
+    handle.setView('archived');     // ownership moves
+    await settle();
+
+    const more = moreBtn(el);
+    assert.ok(more, 'the new view offers its own next page');
+    assert.equal(more.disabled, false,
+        'a continuation belonging to the previous view still held the flag');
+    release();
+    handle.destroy();
+});
+
 test('a page that lands after a view switch is dropped, not appended', async () => {
     // The stale-response guard the list already has for refresh(), applied to
     // the continuation: appending a page belonging to the previous view paints

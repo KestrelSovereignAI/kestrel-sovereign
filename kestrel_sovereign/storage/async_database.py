@@ -2100,6 +2100,9 @@ class AsyncDatabase:
             async with self.migration_lock("conversation_sessions_2959"):
                 # Re-probed under the lock: a concurrent initializer may have
                 # replaced this while this one waited.
+                # Whether this block leaves `conversation_sessions` EMPTY —
+                # by replacing it, or by creating one that was not there.
+                emptied_the_cache = False
                 for table in outdated_tables:
                     if not await _predates_the_not_null_stamps(table):
                         continue
@@ -2110,16 +2113,12 @@ class AsyncDatabase:
                         "dropped %s: it predates the NOT NULL stamps and will "
                         "be derived again (#2960)", table,
                     )
-                    # The watermarks describe rows that no longer exist, so
-                    # something has to say so. Rotating the generation is the
-                    # mechanism already written for "the shape moved": both
-                    # `is_stale` and `_plan` read a changed generation as
-                    # counters belonging to a different incarnation, and answer
-                    # REBUILD — including for a repair already in flight, whose
-                    # publish fence re-reads it.
-                    await self._backend.execute(
-                        shape_change_invalidation(self.backend_type)
-                    )
+                    # No flag set here on purpose: a dropped table is recreated
+                    # by the loop below, which is where "the cache is empty" is
+                    # recorded. Setting it in both places reads as belt and
+                    # braces and is really one statement that cannot change the
+                    # outcome — a mutation removing it survived, which is what
+                    # that always means.
                 # Re-probed under the lock: a concurrent initializer may have
                 # created every one of these while this one waited.
                 for table, ddl in tables:
@@ -2128,6 +2127,30 @@ class AsyncDatabase:
                             normalize_schema(ddl, self.backend_type)
                         )
                         logger.info("created %s (#2959)", table)
+                        # Creating this one is the same event as replacing it,
+                        # and both reach here by ordinary routes: a restore that
+                        # carried the watermarks but not the cache, or a hand
+                        # recovery that dropped it. The watermarks then describe
+                        # rows that are gone, `is_stale()` compares numbers that
+                        # still match, and the projection reports itself current
+                        # over an EMPTY table — so the conversation list serves
+                        # nothing, for ever, beside intact history. Measured
+                        # before this was here.
+                        if table == "conversation_sessions":
+                            emptied_the_cache = True
+                if emptied_the_cache:
+                    # Rotating the generation is the mechanism already written
+                    # for "the shape moved": both `is_stale` and `_plan` read a
+                    # changed generation as counters belonging to a different
+                    # incarnation, and answer REBUILD — including for a repair
+                    # already in flight, whose publish fence re-reads it.
+                    await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
+                    logger.info(
+                        "conversation_sessions is empty; every agent's "
+                        "projection will be derived again (#2960)"
+                    )
                 installed_triggers = await self._trigger_family(
                     TRIGGER_NAME_PREFIX, "conversation_history"
                 )
