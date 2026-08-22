@@ -24,8 +24,11 @@ import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
 
-from kestrel_sovereign.storage.session_grouping import summarize_sessions
-from typing import Dict, List, Optional, Any, Tuple, Union
+from kestrel_sovereign.storage.session_grouping import (
+    page_grouped_sessions,
+    summarize_sessions,
+)
+from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -1465,6 +1468,45 @@ class _PrivacyGuardedSemanticVectorProjection:
             return await self._projection.erasure_observation()
         finally:
             self._owner._release_semantic_vector_lease()
+
+
+def _normalized_history_row(row: Sequence[Any]) -> Dict[str, Any]:
+    """One ``conversation_history`` tuple as the grouper's message dict.
+
+    ``metadata`` is parsed to a dict here and the ``enc`` / ``sent_form`` flags
+    on it are what the endpoint's preview decoration reads, so an unreadable
+    document becomes an empty dict rather than dropping the row: a message with
+    a broken metadata blob is still a message in the conversation.
+    """
+    metadata: Dict[str, Any] = {}
+    if row[3]:
+        try:
+            parsed = json.loads(row[3])
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Failed to parse metadata for message {row[0]}: {e}")
+    return {
+        "id": row[0],
+        "role": row[1],
+        "content": row[2],
+        "metadata": metadata,
+        "created_at": row[4],
+    }
+
+
+def _page_grouped_sessions(
+    rows: List[Dict[str, Any]], *, limit: int, cursor: Optional[str], view: str
+) -> Dict[str, Any]:
+    """:func:`page_grouped_sessions`, with this endpoint's cursor on both ends."""
+    from .conversation_sessions import decode_session_cursor, encode_session_cursor
+
+    after = decode_session_cursor(cursor, view) if cursor else None
+    sessions, has_more = page_grouped_sessions(rows, limit=limit, after=after)
+    next_cursor = (
+        encode_session_cursor(sessions[-1], view) if has_more and sessions else None
+    )
+    return {"sessions": sessions, "next_cursor": next_cursor}
 
 
 class PrivacyEnforcingStorage:
@@ -4127,81 +4169,102 @@ class PrivacyEnforcingStorage:
     # operations that were previously done via direct storage.db access.
     # Use these instead of accessing .db, .conversation, or .files directly.
 
-    async def query_conversations(
-        self, agent_id: str, limit: int = 50, view: str = "active"
-    ) -> List[Tuple]:
+    async def list_session_page(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 50,
+        view: str = "active",
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One page of the conversation list, respecting privacy mode (#2960).
+
+        Returns ``{"sessions": [...], "next_cursor": str | None}``. The session
+        dicts are the shared grouper's shape on every branch, so the endpoint
+        decorates one thing.
+
+        Four branches, and each is a different answer to "where do this agent's
+        sessions live":
+
+        * **EPHEMERAL** — nowhere. No data is exposed, and no projection is
+          maintained either: this returns before the repair that would build
+          one. That is #2959's own recommendation rather than a new position.
+          A projection kept while EPHEMERAL is in force is state the sweep must
+          then erase, and a repair reads history outside its transaction, so a
+          pass that began before a purge can publish a pre-purge snapshot after
+          it. Not projecting has nothing to erase and nothing to republish.
+        * **ISOLATED** — an in-memory buffer, with no database behind it, so the
+          grouper stays the derivation for this path (and Phase D keeps it for
+          the same reason).
+        * **archived** — live rows the user tidied away (#2149). The #2959
+          projection describes ``deleted_at IS NULL AND archived_at IS NULL``
+          and this membership is disjoint from it, so these are still derived by
+          grouping. They are read WITHOUT a row cap: capping them is what put
+          34% of the active list out of reach, and reintroducing it here would
+          leave the same defect standing behind the archive tab. The cost is
+          proportional to what the user chose to archive rather than to history,
+          which keeps growing on its own.
+        * **anything else** — the projection, paged by key, in SQL.
         """
-        Query conversation history rows respecting privacy mode.
-
-        In EPHEMERAL mode, returns an empty list (no persistent data exposed).
-        In ISOLATED mode, returns session-local conversations as tuple rows.
-        In other modes, queries the persistent database.
-
-        Args:
-            view: ``active`` (default) returns live, non-archived rows;
-                ``archived`` returns live rows with ``archived_at`` set
-                (#2149). Any other value falls back to ``active``.
-
-        Returns rows as tuples:
-        (id, role, content, metadata, created_at, model, provider)
-        """
-        bounded_limit = max(1, min(int(limit), 1000))
         if view not in ("active", "archived"):
             view = "active"
+        bounded = max(1, int(limit))
 
         if self._privacy_config.is_ephemeral():
-            logger.debug("query_conversations blocked: ephemeral mode returns no data")
-            return []
+            logger.debug("list_session_page blocked: ephemeral mode returns no data")
+            return {"sessions": [], "next_cursor": None}
 
         if self._policy.use_session_storage:
             # In-memory session storage has no archive concept: the archived
-            # view is always empty, the active view returns the buffer.
+            # view is always empty, the active view is the buffer.
             if view == "archived":
-                return []
-            # Return session conversations formatted as tuple rows. Surface the
-            # resolved session_id in the metadata (real id, else the sentinel)
-            # so the /api/conversations grouping labels each session with an id
-            # that delete_conversation_session can actually resolve — the UI and
-            # the agent tools share one identity (#2019).
+                return {"sessions": [], "next_cursor": None}
+            # OLDEST-FIRST, which is what the grouper reads and what the buffer
+            # already is. The read this replaces handed these rows to a caller
+            # that reversed them, because the SQL branch beside it returns
+            # newest-first — so in ISOLATED mode the transcript was grouped
+            # backwards, and the "first user message" a card previewed was the
+            # last one. Returning grouped sessions rather than raw rows is what
+            # removes the chance to get that wrong: the order is decided once,
+            # here, next to the rows it describes.
             rows = []
-            for i, conv in enumerate(self._session_conversations):
+            for index, conv in enumerate(self._session_conversations):
                 meta = dict(conv.get("metadata") or {})
                 sid = _conv_session_id(conv)
                 meta["session_id"] = (
                     sid if sid is not None else _ISOLATED_UNLABELED_SESSION_ID
                 )
-                rows.append((
-                    i,  # synthetic row id (message id, not session id)
-                    conv.get("role", ""),
-                    conv.get("content", ""),
-                    json.dumps(meta),
-                    conv.get("created_at", None),
-                    conv.get("model"),
-                    conv.get("provider"),
-                ))
-            return rows
+                rows.append({
+                    "id": index,
+                    "role": conv.get("role", ""),
+                    "content": conv.get("content", ""),
+                    "metadata": meta,
+                    "created_at": conv.get("created_at", None),
+                })
+            return _page_grouped_sessions(rows, limit=bounded, cursor=cursor, view=view)
 
         if view == "archived":
-            archive_clause = "archived_at IS NOT NULL"
-        else:
-            archive_clause = "archived_at IS NULL"
+            from .conversation_sessions import (
+                archived_history_predicate,
+                canonical_order,
+            )
 
-        # Newest-first here; `/api/conversations` reverses before grouping, so
-        # the grouper sees `canonical_order()`. Shared with the #2959 projection
-        # rather than restated: the projection is meant to be a faithful cache
-        # of this list, and it cannot be if the two derive from different
-        # orders. `id` is the tie-break — without it equal timestamps came back
-        # in whatever order the backend chose, so the same history could group
-        # two ways on two calls.
-        from .conversation_sessions import canonical_order
+            # No LIMIT. See the docstring: a cap here is the same defect this
+            # ticket removes from the active list, one tab across.
+            raw = await self._storage.db.fetchall(f"""
+                SELECT id, role, content, metadata, created_at
+                FROM conversation_history
+                WHERE agent_id = ? AND {archived_history_predicate()}
+                {canonical_order(self._storage.db.backend_type)}
+            """, (agent_id,))
+            return _page_grouped_sessions(
+                [_normalized_history_row(row) for row in raw],
+                limit=bounded,
+                cursor=cursor,
+                view=view,
+            )
 
-        return await self._storage.db.fetchall(f"""
-            SELECT id, role, content, metadata, created_at, model, provider
-            FROM conversation_history
-            WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            {canonical_order(self._storage.db.backend_type, descending=True)}
-            LIMIT ?
-        """, (agent_id, bounded_limit))
+        return await self._storage.list_session_page(limit=bounded, cursor=cursor)
 
     async def search_conversations(
         self, agent_id: str, query: str, limit: int = 20, view: str = "active"
@@ -5061,7 +5124,7 @@ class PrivacyEnforcingStorage:
         warnings.warn(
             f"Direct access to PrivacyEnforcingStorage.{property_name} is deprecated. "
             f"Use privacy-aware methods instead "
-            f"(e.g., query_conversations, get_conversation_history).",
+            f"(e.g., list_session_page, get_conversation_history).",
             DeprecationWarning,
             stacklevel=3,
         )

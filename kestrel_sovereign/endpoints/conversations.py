@@ -9,10 +9,8 @@ from kestrel_sovereign.rate_limit import limiter
 
 from kestrel_sovereign.storage.session_grouping import (
     autonomous_wake_preview,
-    coalesce_sessions_by_session_id,
-    group_messages_into_sessions,
-    sort_sessions,
 )
+from kestrel_sovereign.storage.conversation_sessions import SessionCursorError
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -21,10 +19,6 @@ from kestrel_sovereign.endpoints.agent_helpers import get_agent
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["conversations"])
-
-SESSION_GAP_OVERSAMPLE = 20
-MAX_CONVERSATION_LIST_ROWS = 1000
-
 
 def _public_metadata(meta):
     """Return metadata safe for user-facing conversation history payloads."""
@@ -74,12 +68,21 @@ async def list_conversations(
     decrypt: bool = True,
     view: str = Query("active"),
     q: str = Query(None, min_length=1, max_length=256),
+    cursor: str = Query(None, min_length=1, max_length=1024),
 ):
     """List conversation sessions grouped by date/time.
 
     ``view=active`` (default) lists live, non-archived sessions;
     ``view=archived`` lists archived sessions (#2149). Any other value
     falls back to ``active``.
+
+    ``cursor`` continues a previous page and ``next_cursor`` in the response
+    carries the token for the one after this (``null`` at the end of the list).
+    Before #2960 there was no continuation at all: the list derived sessions
+    from a fixed 1000-row window of history and 34% of Emma's conversations
+    fell outside it, unreachable at any ``limit``. The token is opaque — it
+    carries the ordering's keys, and the ordering is not a contract a caller
+    may pin.
 
     ``q`` switches the endpoint into full-text search: only sessions whose
     message content (decrypted server-side, sent-form unwrapped) or
@@ -169,57 +172,34 @@ async def list_conversations(
                 "total": len(sessions),
                 "encrypted_at_rest": encrypted_at_rest,
                 "query": search_query,
+                # Search is not paged (Phase D, #2961) and says so rather than
+                # omitting the key: a caller that reads `next_cursor` off every
+                # response must be told "there is no next page", not left to
+                # read `undefined` and guess which it meant.
+                "next_cursor": None,
             }
 
-        # Python still groups raw messages into sessions by 30-minute gaps, so
-        # fetch more rows than the requested session count while keeping a hard
-        # SQL-side budget for large histories.
-        row_limit = min(limit * SESSION_GAP_OVERSAMPLE, MAX_CONVERSATION_LIST_ROWS)
+        # The sessions table, paged by key (#2960). What stood here fetched
+        # `limit * 20` rows of history capped at 1000, grouped whatever fell
+        # inside that window, and sliced — so a session whose rows had all aged
+        # past the cap was absent from every page at every `limit`. Measured on
+        # Emma's live database: 49 of 144 conversations, 34%.
+        #
+        # The privacy layer decides where the sessions come from — the #2959
+        # projection for the active view, the grouper for the archived one and
+        # for ISOLATED's in-memory buffer, nothing at all under EPHEMERAL — and
+        # hands back one shape, so the decoration below is written once.
+        try:
+            page = await storage.list_session_page(
+                agent_id, limit=limit, view=view, cursor=cursor
+            )
+        except SessionCursorError as e:
+            # Client-supplied text that this build cannot read. A 400 says so;
+            # silently restarting at page one would answer a request for page
+            # nine with page one and look like a list that forgot where it was.
+            raise HTTPException(status_code=400, detail=f"Invalid cursor: {e}")
 
-        # Use privacy-aware query method instead of direct storage.db access.
-        rows = await storage.query_conversations(agent_id, limit=row_limit, view=view)
-
-        if not rows:
-            return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
-
-        # Normalize raw rows (newest-first from SQL) into oldest-first dicts and
-        # run them through the shared session-boundary algorithm (#2019) — the
-        # same one the agent's list_conversations tool uses, so the UI and the
-        # agent never disagree on where a session begins. Metadata is parsed to
-        # a dict here but its enc/sent_form flags are preserved for preview
-        # decoration above.
-        normalized = []
-        for row in reversed(rows):
-            msg_id, role, content, metadata_json, created_at = row[0], row[1], row[2], row[3], row[4]
-            meta = {}
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for message {msg_id}: {e}")
-                    meta = {}
-            normalized.append({
-                "id": msg_id,
-                "role": role,
-                "content": content,
-                "metadata": meta,
-                "created_at": created_at,
-            })
-
-        # Coalesce same-UUID clusters (resumed-past-the-gap conversations) so a
-        # listed session_id is a unique delete target, matching the lifecycle
-        # tools and avoiding a delete-one-destroys-both collision (#2019).
-        # keep_empty_markers=True so a just-started conversation (a session
-        # marker with no messages yet) is list-visible immediately (#2222) —
-        # the UI optimistically prepends a tile for it on New, and this
-        # reconciling list must include it or the tile vanishes on refresh.
-        grouped = coalesce_sessions_by_session_id(
-            group_messages_into_sessions(normalized, keep_empty_markers=True)
-        )
-        # Newest-first by last activity so a resumed conversation ranks by its
-        # latest message rather than its first cluster's position (#2019).
-        sort_sessions(grouped)
-        sessions = grouped[:limit]
+        sessions = page["sessions"]
         for session in sessions:
             _decorate_preview(session)
 
@@ -239,8 +219,13 @@ async def list_conversations(
 
         return {
             "conversations": sessions,
+            # The count of THIS PAGE, which is what it has always been. It was
+            # never a total — the old path could not compute one — and calling
+            # it one now would be a new claim, made by a read that still does
+            # not count the table.
             "total": len(sessions),
-            "encrypted_at_rest": encrypted_at_rest
+            "encrypted_at_rest": encrypted_at_rest,
+            "next_cursor": page["next_cursor"],
         }
     except HTTPException:
         raise

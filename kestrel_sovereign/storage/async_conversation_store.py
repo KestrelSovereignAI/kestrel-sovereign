@@ -27,6 +27,7 @@ from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
+    iso_session_timestamp,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
@@ -3217,6 +3218,144 @@ class AsyncConversationStore:
             # <retrieved_context>.../<user_input>... replay wrappers.
             preview_transform=extract_raw_user_content,
         )
+
+    async def list_session_page(
+        self, *, limit: int = 50, cursor: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """One page of the active conversation list, from the sessions table.
+
+        Phase C of #2948, and the read the epic exists for. What this replaces
+        fetched a fixed window of ``conversation_history`` — ``limit * 20``
+        rows, capped at 1000 — and grouped whatever fell inside it. Measured on
+        Emma's live database, 34% of her conversations were outside that window
+        and no ``limit`` could reach them, because the cap was a constant rather
+        than a function of the request. Here the bound is the page and the
+        continuation is a key, so every session is reachable by asking again.
+
+        Returns ``{"sessions": [...], "next_cursor": str | None}``. The session
+        dicts carry exactly the fields the shared grouper emits — including the
+        undecorated ``preview_content`` / ``preview_metadata`` /
+        ``preview_wake_source`` triple — so the endpoint decorates one shape
+        whichever path produced it.
+
+        **The preview is a pointer, resolved here, never a stored copy.**
+        ``content`` is ciphertext, so a preview column would be a plaintext copy
+        of encrypted text and a record outliving what it describes (#2948).
+        The projection stores which row the picker chose; this reads that row's
+        body at request time, and a pointer at a row that has since gone
+        resolves to nothing rather than to a stale excerpt.
+
+        **Repair runs on the first page only.** The list must be current, and
+        the projection is a cache that knows how far behind it is — three
+        primary-key reads answer that, at any size of history. Repeating it per
+        page would be work for no answer, and worse: a repair between two pages
+        can move ``last_message_at`` under the cursor, so a page sequence is
+        consistent to the extent that it is read from one repair's output.
+        Keyset pagination over a table the agent is still writing to can still
+        show a session twice or not at all if that session's activity moves
+        across the cursor mid-walk — that is inherent to paging live data, and
+        it is a far smaller window than the one this replaces, in which 34% of
+        sessions could not be shown at all.
+        """
+        from .conversation_sessions import (
+            ConversationSessionProjection,
+            decode_session_cursor,
+            encode_session_cursor,
+            live_history_predicate,
+        )
+
+        bounded = max(1, int(limit))
+        after = decode_session_cursor(cursor, "active") if cursor else None
+        projection = ConversationSessionProjection(self.db, self.agent_id)
+        if after is None:
+            await projection.repair()
+        # One more than asked for, which is how "is there another page" is
+        # answered without a second query and without a COUNT over the whole
+        # table — the cost this table exists to remove.
+        rows = await projection.page(limit=bounded + 1, after=after)
+        has_more = len(rows) > bounded
+        rows = rows[:bounded]
+
+        previews = await self._preview_rows(
+            [
+                row["first_user_message_id"]
+                for row in rows
+                if row["first_user_message_id"] is not None
+            ],
+            live_history_predicate(),
+        )
+        sessions = [self._as_listed_session(row, previews) for row in rows]
+        next_cursor = (
+            encode_session_cursor(sessions[-1], "active")
+            if has_more and sessions
+            else None
+        )
+        return {"sessions": sessions, "next_cursor": next_cursor}
+
+    async def _preview_rows(
+        self, message_ids: List[Any], membership: str
+    ) -> Dict[Any, Tuple[Any, Dict[str, Any]]]:
+        """``{id: (content, metadata)}`` for the rows a page previews.
+
+        One statement for the whole page rather than one per row: a list of 50
+        is 50 round trips otherwise, which on the read path is the cost the
+        projection just removed reappearing one layer up.
+
+        Scoped to this agent AND to the membership the projection describes, so
+        a pointer at a row that has since been deleted or archived resolves to
+        nothing. That is the designed direction — the pointer is a *detectable*
+        stale state, and the change stamp has already moved, so the next repair
+        replaces it.
+        """
+        if not message_ids:
+            return {}
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = await self.db.fetchall(
+            "SELECT id, content, metadata FROM conversation_history "
+            f"WHERE agent_id = ? AND id IN ({placeholders}) AND {membership}",
+            (self.agent_id, *message_ids),
+        )
+        resolved: Dict[Any, Tuple[Any, Dict[str, Any]]] = {}
+        for row in rows:
+            metadata: Dict[str, Any] = {}
+            if row[2]:
+                try:
+                    parsed = json.loads(row[2])
+                    if isinstance(parsed, dict):
+                        metadata = parsed
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        f"list_session_page: unreadable metadata on message {row[0]}: {e}"
+                    )
+            resolved[row[0]] = (row[1], metadata)
+        return resolved
+
+    @staticmethod
+    def _as_listed_session(
+        row: Dict[str, Any], previews: Dict[Any, Tuple[Any, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """One projection row shaped exactly as the grouper shapes a session.
+
+        The timestamps are re-spelled with ``isoformat()`` because that is what
+        the grouper emits and therefore what every consumer of this endpoint
+        has always received — the browser parses it, and the projection holds
+        the column's own spelling instead (canonical text on SQLite, a
+        ``datetime`` on PostgreSQL, which would serialize as neither). A value
+        that cannot be read is passed through as text rather than dropped: it is
+        wrong to show, but it is what the row says, and a ``None`` here would
+        move the session to the end of the list on the strength of a spelling.
+        """
+        content, metadata = previews.get(row["first_user_message_id"], (None, {}))
+        return {
+            "session_id": row["session_id"],
+            "started_at": iso_session_timestamp(row["started_at"]),
+            "last_message_at": iso_session_timestamp(row["last_message_at"]),
+            "message_count": row["message_count"],
+            "user_message_count": row["user_message_count"],
+            "preview_content": content,
+            "preview_metadata": metadata,
+            "preview_wake_source": row["wake_source"],
+        }
 
     async def count_session_messages(
         self, session_id: str, deleted_filter: str = "all"

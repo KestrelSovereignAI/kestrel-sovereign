@@ -26,32 +26,32 @@ session, so long-lived autonomous agents accumulate large message counts in
 comparatively few sessions. Only the projection is bounded in every
 distribution.
 
-Left for Phase C (#2960), stated here so it is not rediscovered
---------------------------------------------------------------
+What Phase C (#2960) settled
+----------------------------
 
-Nothing in production calls :meth:`repair` yet, so ``conversation_sessions``
-and ``conversation_session_watermarks`` hold nothing outside tests. That is
-what makes the EPHEMERAL sweep in ``privacy_wrapper`` as narrow as it is: the
-change ledger is the only table a trigger can fill on its own.
-
-The moment Phase C maintains the projection, two things become live that are
-dormant here, and both were found by review against this design rather than
-guessed at:
+:meth:`repair` now runs in production: ``list_session_page`` calls it before
+serving the first page of the active conversation list. Two things this design
+named as dormant became live with it, and the answer to both was the one this
+section originally guessed at — **stop projecting**, rather than purge harder.
 
 * **A repair can republish purged state.** :meth:`_rebuild_from_transcript`
   reads history OUTSIDE its transaction, deliberately, because that read is
-  unbounded. A pass that began before an EPHEMERAL purge can therefore take the
-  lock afterwards and write a pre-purge snapshot — restoring leaked counts,
-  timestamps and pointers after the purge reported success. Publishing needs to
-  revalidate under the lock that the change stamp it read still stands.
-* **The sweep grows back to three tables**, and with it the questions this
-  revision could answer by narrowing: what evidence a retry uses, and whether
-  the deletes need to be atomic with each other.
+  unbounded. A pass that began before an EPHEMERAL purge could therefore take
+  the lock afterwards and write a pre-purge snapshot, restoring leaked counts,
+  timestamps and pointers after the purge reported success.
+* **The sweep would grow back to three tables**, with the questions that come
+  with it: what evidence a retry uses, and whether the deletes must be atomic
+  with each other.
 
-The cleanest answer to both is probably not to purge harder but to stop
-projecting: a projection not maintained while EPHEMERAL is in force has nothing
-to erase. That is a cross-cutting privacy change touching the trigger layer,
-which is why it is named here rather than attempted in this phase.
+Neither is reachable now, because ``PrivacyEnforcingStorage.list_session_page``
+returns before any repair while EPHEMERAL is in force. A projection that is
+never maintained under that mode has nothing to erase and nothing to republish,
+so the sweep stays as narrow as it is — the change ledger, which is the only
+table a trigger can fill on its own.
+
+The mode is read per request rather than latched at boot, so a mode that is
+turned on mid-life stops the projection at the next read; what an earlier,
+non-EPHEMERAL life projected is what the sweep already erases.
 
 The contract: a rebuildable cache, repaired in bounded chunks
 =============================================================
@@ -313,6 +313,7 @@ entirely: a repair never reads ciphertext, at any size of session.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -322,10 +323,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .session_grouping import (
+    SESSION_ORDER,
     canonical_timestamp_sql,
     coalesce_sessions_by_session_id,
     coerce_session_timestamp,
     group_messages_into_sessions,
+    session_cursor_clause,
+    session_cursor_values,
     session_order_sql,
     timestamp_query_param,
 )
@@ -691,6 +695,88 @@ def _canonical_key(backend_type: str, column: str) -> str:
     return column
 
 
+
+
+#: The wire format of a page cursor. Stamped into every token and checked on
+#: the way back in, so a token minted by an older shape is refused rather than
+#: read as though its fields meant what they mean now.
+_CURSOR_VERSION = 1
+
+
+class SessionCursorError(ValueError):
+    """A page cursor that this build cannot read.
+
+    Its own type rather than a bare ``ValueError`` because the caller has to
+    tell "the client sent nonsense" (answerable with a 400) from "the database
+    failed" (a 500). A cursor is client-supplied text, so this is reachable by
+    anyone with the endpoint, and the two must not be confused.
+    """
+
+
+def encode_session_cursor(session: Dict[str, Any], view: str) -> str:
+    """One page's last row, spelled so the next request can resume from it.
+
+    Opaque on purpose: the fields inside are :data:`SESSION_ORDER`'s keys, which
+    is an ordering decision this epic has already changed twice. A client that
+    could read the token would come to depend on that shape, and the tie-break
+    is exactly the part a caller must not pin.
+
+    ``view`` travels with it because the views are served by different
+    machinery — the active list pages the #2959 projection in SQL, the archived
+    one pages the grouper's output in Python — and a token minted by one and
+    replayed against the other would resume from a key the other never ordered
+    by. Refusing that is a 400; silently serving page one for it is a list that
+    lies about where the user was.
+
+    The keys go through :func:`session_cursor_values`, which is the same
+    spelling the Python-side continuation compares in, so a cursor means one
+    thing on every path that can honour it.
+    """
+    return base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "v": _CURSOR_VERSION,
+                "view": view,
+                "k": list(session_cursor_values(session)),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
+    """A token back into :data:`SESSION_ORDER` values, comparably spelled.
+
+    Every failure is one exception type. A client can put anything in this
+    parameter, and the two alternatives are the ones that hurt: returning
+    ``None`` for an unreadable token silently serves page one to a caller that
+    asked for page nine, and letting a ``binascii`` error escape reports a
+    client's typo as a server fault.
+
+    Backend-free by construction. What comes back is text (or ``None``), and the
+    caller that runs a SQL page binds it for its own engine — so this codec
+    stays the one thing both the SQL and the Python continuation can share.
+    """
+    if not isinstance(token, str) or not token:
+        raise SessionCursorError("cursor is empty")
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception as exc:
+        raise SessionCursorError("cursor is not readable") from exc
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise SessionCursorError("cursor was minted by a different version")
+    if payload.get("view") != view:
+        raise SessionCursorError(
+            f"cursor belongs to the {payload.get('view')!r} view, not {view!r}"
+        )
+    values = payload.get("k")
+    if not isinstance(values, list) or len(values) != len(SESSION_ORDER):
+        raise SessionCursorError("cursor does not carry this ordering's keys")
+    for value in values:
+        if value is not None and not isinstance(value, str):
+            raise SessionCursorError("cursor's keys are not text")
+    return tuple(values)
 
 
 #: What one chunk selects: this agent's next live rows, and only those. The rows
@@ -2095,6 +2181,58 @@ class ConversationSessionProjection:
             (self.agent_id,),
         )
         return [_as_dict(row) for row in rows]
+
+    async def page(
+        self, *, limit: int, after: Optional[Sequence[Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """One page of this agent's sessions, newest activity first (#2960).
+
+        ``after`` is the previous page's last row in :data:`SESSION_ORDER`, as
+        :func:`decode_session_cursor` returns it; ``None`` starts at the top.
+
+        This is the read the epic exists for. The list it replaces fetched a
+        fixed window of ``conversation_history`` and hoped the sessions it
+        wanted fell inside — measured on Emma, 34% of her conversations did not,
+        and no ``limit`` could reach them because the window was a constant. Here
+        the bound is the page, the continuation is a key rather than an offset,
+        and every session is reachable by asking again.
+
+        ``limit`` is applied in SQL, not in Python. Trimming a longer read would
+        make the cost of page one a function of how much history exists, which
+        is the property this table was measured into existence to remove.
+        """
+        where = ["agent_id = ?"]
+        params: List[Any] = [self.agent_id]
+        if after is not None:
+            clause, cursor_params = session_cursor_clause(
+                self.db.backend_type, self._bound_cursor(after)
+            )
+            where.append(clause)
+            params.extend(cursor_params)
+        rows = await self.db.fetchall(
+            f"SELECT session_id, {', '.join(PROJECTION_COLUMNS)} "
+            "FROM conversation_sessions "
+            f"WHERE {' AND '.join(where)} "
+            f"{session_order_sql(self.db.backend_type)} LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [_as_dict(row) for row in rows]
+
+    def _bound_cursor(self, after: Sequence[Any]) -> Tuple[Any, ...]:
+        """A decoded cursor's keys, typed for the engine holding the columns.
+
+        The codec is backend-free — it hands back text — and the timestamp
+        column is a real ``timestamp`` on PostgreSQL and canonical text on
+        SQLite. Binding through the same adapter :meth:`_store` wrote the column
+        with is what makes the comparison one the index can use, rather than a
+        text-to-timestamp coercion the planner performs per row.
+        """
+        return tuple(
+            value
+            if column == "session_id" or value is None
+            else timestamp_query_param(self.db.backend_type, value)
+            for (column, _), value in zip(SESSION_ORDER, after)
+        )
 
     # ── one chunk ────────────────────────────────────────────────────────
 
