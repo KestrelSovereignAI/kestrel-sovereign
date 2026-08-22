@@ -736,3 +736,90 @@ def test_health_is_unchanged_when_nothing_was_refused():
     original = {"status": "healthy", "checks": []}
 
     assert _with_contribution_rejections(agent, original) is original
+
+
+def test_deactivating_a_feature_does_not_remove_an_equivalent_incumbent(tmp_path):
+    """An equivalent contribution kept the INCUMBENT — it is not ours to remove.
+
+    Accepting equivalent duplicates created this: `activate` recorded every
+    DECLARED source as registered, so teardown either unregistered core's own
+    source or failed identity validation when the objects merely matched by
+    contract. Only what a lifecycle newly added is its to tear down.
+    """
+    from tests.fixtures.sdk_contribution_fixture import _source
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # A DISTINCT but contract-equivalent incumbent — core registered its own
+    # object, which is the shape that made teardown raise identity mismatch.
+    incumbent = _source(feature.source.name)
+    assert incumbent is not feature.source
+    assert SourceRegistry.contract_equivalent(incumbent, feature.source)
+    runtime.source_registry.register(incumbent)
+
+    prepared = runtime.prepare_transition((feature,)).only()
+    runtime.activate(prepared)
+
+    assert runtime.deactivate(feature) is True
+    # The incumbent survives the feature's teardown, unchanged.
+    assert runtime.source_registry.get(feature.source.name) is incumbent
+
+
+def test_a_setup_step_name_clash_rejects_the_feature_not_the_boot(tmp_path):
+    """`preflight` raises on an already-registered NAME too, not just on order.
+
+    Gating the per-feature setup-step check on the non-order path left exactly
+    the blast radius this split removes — intact for one key type: one feature's
+    setup-step collision still aborted every agent's boot.
+    """
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    peer = _PeerFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # Something already owns that setup-step name.
+    runtime.setup_step_registry.register_batch((feature.setup_registration,))
+
+    transition = runtime.prepare_transition((feature, peer))
+
+    assert [r.feature for r in transition.rejected] == [feature]
+    assert "setup step already registered" in transition.rejected[0].reason
+    assert [item.feature for item in transition.accepted] == [peer]
+
+
+def test_host_feature_rejections_reach_detailed_health():
+    """A refused HOST feature is agent-scoped nowhere, so nothing would show it.
+
+    It was recorded on the host context and never read: the reason lived only in
+    boot logs while the endpoint reported healthy over skipped host routes.
+    """
+    import types
+
+    from kestrel_sovereign.features.contribution_runtime import ContributionRejection
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    state = types.SimpleNamespace(
+        host_context=types.SimpleNamespace(
+            rejected_host_feature_contributions=(
+                ContributionRejection(object(), "EyeHostFeature", "wait provider ..."),
+            )
+        )
+    )
+    merged = _with_host_feature_rejections(state, {"status": "healthy", "checks": []})
+
+    assert merged["status"] == "degraded"
+    assert merged["host_features_not_loaded"] == [
+        {"feature": "EyeHostFeature", "reason": "wait provider ..."}
+    ]
+
+
+def test_host_feature_health_is_unchanged_with_no_host_context():
+    """No host context must not manufacture a key or downgrade a healthy host."""
+    import types
+
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    payload = {"status": "healthy", "checks": []}
+    assert _with_host_feature_rejections(types.SimpleNamespace(), payload) is payload

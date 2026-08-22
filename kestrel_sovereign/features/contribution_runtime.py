@@ -28,7 +28,11 @@ from kestrel_sovereign.operator import (
     OperatorRegistrationSet,
     OperatorRuntimeRegistry,
 )
-from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+from kestrel_sovereign.signals import (
+    RegistrationPolicy,
+    RegistrationState,
+    SourceRegistry,
+)
 from kestrel_sovereign.waits import WaitRegistry
 
 
@@ -282,6 +286,11 @@ class ActiveFeatureContributions:
     operator_registrations: OperatorRegistrationSet
     permission_registration: PermissionDefaultRegistration | None
     execution_target_registrations: tuple[OperatorRegistrationSet, ...] = ()
+    #: The sources this lifecycle NEWLY added — not everything it declared.
+    #: An equivalent re-registration is a no-op success that keeps the
+    #: INCUMBENT (core's, typically), so tearing down by declaration would
+    #: unregister a source this feature never owned (#2951).
+    registered_sources: tuple = ()
 
 
 class FeatureContributionRuntime:
@@ -404,10 +413,20 @@ class FeatureContributionRuntime:
                 for source in workflow.sources
             )
             if sources:
-                self.source_registry.register_batch(
+                outcomes = self.source_registry.register_batch(
                     sources, RegistrationPolicy.MANDATORY
                 )
-                registered_sources.extend(sources)
+                # Only what was NEWLY added is ours to roll back or tear down.
+                # `ALREADY_EQUIVALENT` means the incumbent stayed, and it is not
+                # this feature's to remove (#2951).
+                newly = {
+                    outcome.name
+                    for outcome in outcomes
+                    if outcome.state is RegistrationState.REGISTERED
+                }
+                registered_sources.extend(
+                    source for source in sources if source.name in newly
+                )
             if values.permission_defaults is not None:
                 candidate_permission_registration = PermissionDefaultRegistration(
                     owner=prepared.owner,
@@ -448,6 +467,7 @@ class FeatureContributionRuntime:
             prepared=prepared,
             operator_registrations=operator_set,
             permission_registration=permission_registration,
+            registered_sources=tuple(registered_sources),
         )
         self._active[id(prepared.feature)] = active
         return active
@@ -498,9 +518,10 @@ class FeatureContributionRuntime:
                 "active feature contribution identity does not match"
             )
         values = active.prepared.contributions
-        sources = tuple(
-            source for workflow in values.workflows for source in workflow.sources
-        )
+        # What this lifecycle ADDED, not what it declared: an equivalent
+        # contribution left the incumbent in place, and unregistering that would
+        # delete core's own source on a feature teardown (#2951).
+        sources = active.registered_sources
 
         # Validate every exact inverse before mutating any registry.
         for registration in values.wait_providers:
@@ -744,7 +765,7 @@ class FeatureContributionRuntime:
         rejections = tuple(
             ContributionRejection(item.feature, item.feature_name, reason)
             for item, reason in (
-                (item, self._active_conflict(item, check_setup_steps=not validate_setup_order))
+                (item, self._active_conflict(item))
                 for item in prepared
             )
             if reason is not None
@@ -765,9 +786,7 @@ class FeatureContributionRuntime:
             )
         return rejections
 
-    def _active_conflict(
-        self, item: PreparedFeatureContributions, *, check_setup_steps: bool
-    ) -> str | None:
+    def _active_conflict(self, item: PreparedFeatureContributions) -> str | None:
         """Why ONE feature cannot activate against what is already registered.
 
         Returns the first reason, or None. Per-feature by construction: the flat
@@ -806,10 +825,13 @@ class FeatureContributionRuntime:
         if values.permission_defaults is not None:
             if self.permission_defaults_registry.registration(item.feature_name) is not None:
                 return f"permission defaults already registered for {item.feature_name}"
-        if check_setup_steps:
-            for registration in values.setup_steps:
-                if self.setup_step_registry.get(registration.name) is not None:
-                    return f"setup step already registered: {registration.name}"
+        # Unconditional: `preflight` ALSO raises on a name already registered,
+        # so gating this on the order-validating path left a setup-step
+        # collision aborting the whole boot — the very blast radius this split
+        # exists to remove, still intact for one key type (#2951).
+        for registration in values.setup_steps:
+            if self.setup_step_registry.get(registration.name) is not None:
+                return f"setup step already registered: {registration.name}"
         return None
 
     @staticmethod

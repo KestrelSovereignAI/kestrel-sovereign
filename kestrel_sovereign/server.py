@@ -3359,6 +3359,30 @@ async def _phoenix_tracing_status(app) -> dict:
     }
 
 
+def _with_host_feature_rejections(app_state, payload: dict) -> dict:
+    """Fold HOST feature rejections into a detailed-health payload.
+
+    Host features are not agent-scoped, so a refused one is invisible in every
+    per-agent result. Recorded on the host context at startup, it would
+    otherwise live only in boot logs while `/health/detailed` reported healthy
+    over skipped host routes and services (#2951).
+    """
+    ctx = getattr(app_state, "host_context", None)
+    rejections = tuple(
+        getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+    )
+    if not rejections:
+        return payload
+    merged = dict(payload)
+    merged["host_features_not_loaded"] = [
+        {"feature": rejection.feature_name, "reason": rejection.reason}
+        for rejection in rejections
+    ]
+    if merged.get("status") == "healthy":
+        merged["status"] = "degraded"
+    return merged
+
+
 def _with_contribution_rejections(agent, result: dict) -> dict:
     """Surface features that were REFUSED activation alongside health.
 
@@ -3529,8 +3553,11 @@ async def health_detailed(request: Request):
             )
             content.setdefault("checks", [])
             content.setdefault("tracing", tracing)
-            return JSONResponse(status_code=503, content=content)
-        return result
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, result)
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
     # None). Resolve health from the live fleet rather than reporting a false
@@ -3556,6 +3583,14 @@ async def health_detailed(request: Request):
                 breakdown[name] = {
                     "status": res.get("status", "unhealthy"),
                     "checks": res.get("checks", []),
+                    # Carried through: a fleet entry that says "degraded"
+                    # without naming the refused feature reports the symptom
+                    # and drops the diagnostic (#2951).
+                    **(
+                        {"features_not_loaded": res["features_not_loaded"]}
+                        if res.get("features_not_loaded")
+                        else {}
+                    ),
                 }
         overall = _roll_up_fleet_status(
             [entry["status"] for entry in breakdown.values()]
@@ -3578,8 +3613,11 @@ async def health_detailed(request: Request):
                     "scheduler_readiness_failures": scheduler_failures,
                 }
             )
-            return JSONResponse(status_code=503, content=content)
-        return content
+            return JSONResponse(
+                status_code=503,
+                content=_with_host_feature_rejections(request.app.state, content),
+            )
+        return _with_host_feature_rejections(request.app.state, content)
 
     content = {
         "status": "unhealthy",
