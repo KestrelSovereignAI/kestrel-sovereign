@@ -443,59 +443,95 @@ class TestPrivacyAwareQueries:
         storage.conversation.encryption_enabled = True
         return storage
 
-    # --- query_conversations ---
+    # --- list_session_page ---
 
     @pytest.mark.asyncio
-    async def test_query_conversations_normal_mode(self, mock_storage):
-        """NORMAL mode should query the persistent database."""
-        mock_storage.db.fetchall.return_value = [
-            (1, "user", "Hello", None, "2026-01-01 12:00:00"),
-            (2, "assistant", "Hi", None, "2026-01-01 12:00:01"),
-        ]
+    async def test_list_session_page_normal_mode_reads_the_projection(self, mock_storage):
+        """NORMAL mode delegates to the sessions table, not to raw history."""
+        mock_storage.list_session_page = AsyncMock(
+            return_value={"sessions": [{"session_id": "s1"}], "next_cursor": "tok"}
+        )
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations("agent-1")
-        assert len(rows) == 2
-        assert rows[0][1] == "user"
-        mock_storage.db.fetchall.assert_awaited_once()
-        sql, params = mock_storage.db.fetchall.await_args.args
-        assert "LIMIT ?" in sql
-        assert params == ("agent-1", 50)
+        page = await wrapper.list_session_page("agent-1", limit=25)
 
-    @pytest.mark.asyncio
-    async def test_query_conversations_clamps_sql_limit(self, mock_storage):
-        """NORMAL mode should keep list queries under the raw-row safety cap."""
-        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
-
-        await wrapper.query_conversations("agent-1", limit=5000)
-
-        sql, params = mock_storage.db.fetchall.await_args.args
-        assert "LIMIT ?" in sql
-        assert params == ("agent-1", 1000)
-
-    @pytest.mark.asyncio
-    async def test_query_conversations_ephemeral_returns_empty(self, mock_storage):
-        """EPHEMERAL mode should return empty list, not query db."""
-        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
-
-        rows = await wrapper.query_conversations("agent-1")
-        assert rows == []
+        assert page == {"sessions": [{"session_id": "s1"}], "next_cursor": "tok"}
+        mock_storage.list_session_page.assert_awaited_once_with(limit=25, cursor=None)
+        # The list no longer reads history rows itself — that read, and the
+        # 1,000-row cap on it, are what #2960 removed.
         mock_storage.db.fetchall.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_query_conversations_isolated_returns_session(self, mock_storage):
-        """ISOLATED mode should return session-local data."""
+    async def test_list_session_page_ephemeral_projects_nothing(self, mock_storage):
+        """EPHEMERAL returns no data AND maintains no projection.
+
+        Not merely an empty answer: the repair that would build one reads
+        history outside its own transaction, so a pass started before a purge
+        can publish a pre-purge snapshot after it. Not projecting is what makes
+        that unreachable, and it is #2959's own recommendation.
+        """
+        mock_storage.list_session_page = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+        mock_storage.list_session_page.assert_not_called()
+        mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_isolated_groups_the_buffer_oldest_first(
+        self, mock_storage
+    ):
+        """ISOLATED has no database, so the grouper stays the derivation.
+
+        The order is the point. The read this replaces handed the buffer to a
+        caller that reversed it — correct for the SQL branch beside it, which
+        returned newest-first, and backwards for this one. Grouped backwards,
+        the "first user message" a card previews is the last one.
+        """
+        mock_storage.list_session_page = AsyncMock()
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
 
         await wrapper.add_conversation("user", "Hello")
         await wrapper.add_conversation("assistant", "Hi")
 
-        rows = await wrapper.query_conversations("agent-1")
-        assert len(rows) == 2
-        assert rows[0][1] == "user"
-        assert rows[1][1] == "assistant"
-        # Should NOT touch persistent storage
+        page = await wrapper.list_session_page("agent-1")
+        assert len(page["sessions"]) == 1
+        assert page["sessions"][0]["preview_content"] == "Hello"
+        assert page["sessions"][0]["message_count"] == 2
+        assert page["next_cursor"] is None
+        # Should NOT touch persistent storage.
+        mock_storage.list_session_page.assert_not_called()
         mock_storage.db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_isolated_has_no_archive(self, mock_storage):
+        """The in-memory buffer has no archive concept, so that view is empty."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
+        await wrapper.add_conversation("user", "Hello")
+
+        assert await wrapper.list_session_page("agent-1", view="archived") == {
+            "sessions": [], "next_cursor": None
+        }
+
+    @pytest.mark.asyncio
+    async def test_list_session_page_archived_reads_without_a_row_cap(self, mock_storage):
+        """The archived view is derived, and derived WITHOUT a LIMIT.
+
+        Its membership is disjoint from the one the projection describes, so it
+        is still grouped from rows — but a cap here is the same defect #2960
+        removes from the active list, one tab across.
+        """
+        mock_storage.db.fetchall.return_value = []
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        await wrapper.list_session_page("agent-1", view="archived")
+
+        sql, params = mock_storage.db.fetchall.await_args.args
+        assert "archived_at IS NOT NULL" in sql
+        assert "LIMIT" not in sql.upper(), sql
+        assert params == ("agent-1",)
 
     # --- query_conversation_start ---
 
