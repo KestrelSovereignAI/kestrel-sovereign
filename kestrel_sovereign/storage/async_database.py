@@ -7,6 +7,7 @@ All queries use SQLite-style ? placeholders - automatically converted for Postgr
 import asyncio
 import hashlib
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -825,6 +826,31 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
 """
+
+
+#: Hex digits in an index-name fingerprint. Named because ``_index_family``
+#: matches on it: a family boundary and the names it generates have to be the
+#: same length or the boundary is not exact.
+_FINGERPRINT_HEX = 8
+
+#: PostgreSQL truncates an identifier over this many BYTES without complaining,
+#: after which the exact probe cannot find what was just created and boot
+#: raises. SQLite has no such limit, but one rule is easier to keep true.
+_MAX_IDENTIFIER_BYTES = 63
+
+
+def _fingerprinted_index_name(name: str, fingerprint: str) -> str:
+    """``name`` plus its fingerprint, within PostgreSQL's identifier limit.
+
+    The BASE is shortened, never the fingerprint: the suffix is what makes a
+    changed definition a changed name, and truncating it would collapse
+    distinct definitions onto one name — reintroducing the exact bug this
+    mechanism exists to fix, in a form far harder to see.
+    """
+    suffix = f"_{fingerprint}"
+    budget = _MAX_IDENTIFIER_BYTES - len(suffix.encode("utf-8"))
+    trimmed = name.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    return f"{trimmed}{suffix}"
 
 
 def _definition_fingerprint(backend_type: str, columns: str, where: str) -> str:
@@ -1927,7 +1953,9 @@ class AsyncDatabase:
         comparison there rebuilds on every boot. Measured on PostgreSQL 16.14.
         Same reasoning, and the same shape, as the #2998 trigger names.
         """
-        wanted = f"{name}_{_definition_fingerprint(self.backend_type, columns, where)}"
+        wanted = _fingerprinted_index_name(
+            name, _definition_fingerprint(self.backend_type, columns, where)
+        )
         if await self._index_exists(wanted, table):
             return
         created = False
@@ -1945,8 +1973,13 @@ class AsyncDatabase:
             # unindexed scan this exists to prevent, taken during a boot.
             for stale in await self._index_family(name, table):
                 if stale != wanted:
+                    schema = await self._index_namespace(stale, table)
+                    qualified = (
+                        f"{self._quoted(schema)}.{self._quoted(stale)}"
+                        if schema else self._quoted(stale)
+                    )
                     await self._backend.execute(
-                        f"DROP INDEX IF EXISTS {self._quoted(stale)}"
+                        f"DROP INDEX IF EXISTS {qualified}"
                     )
                     logger.info(
                         "%s: retired index %s; its definition moved", table, stale
@@ -2315,27 +2348,62 @@ class AsyncDatabase:
         return row[0] if row and row[0] else None
 
     async def _index_family(self, name: str, table: str) -> Set[str]:
-        """Every index on ``table`` whose name is a member of the ``name`` family.
+        """Every index on ``table`` that is a member of the ``name`` family.
 
-        A member is ``<name>_<fingerprint>``. Matched on the underscore-suffixed
-        prefix rather than on ``name`` alone, so a family called ``idx_foo``
-        never claims ``idx_foobar``'s indexes and drop them.
+        A member is ``<name>`` itself or ``<name>_<fingerprint>``, and nothing
+        else. Three things that a prefix test gets wrong, all of them silent:
+
+        * ``idx_foo_archived_<hash>`` begins with ``idx_foo_`` but belongs to a
+          DIFFERENT family that this method's caller also manages. Matched by
+          prefix, ensuring the active index drops the archived one on every
+          boot, which then gets rebuilt by the next call — a full index rebuild
+          of the biggest table, every boot, reported nowhere.
+        * SQL ``LIKE`` treats ``_`` as a single-character wildcard, and every
+          name here is full of them, so the pattern was looser still.
+        * The BARE name is a member. Databases predating the fingerprint have
+          indexes called exactly ``name``; excluded from the family they are
+          never retired, so every upgraded database keeps a duplicate (on
+          PostgreSQL) or a stale expression index (on SQLite) forever, paying
+          write amplification on ``conversation_history`` for it.
+
+        Filtered in Python against an anchored pattern rather than in SQL, so
+        there is no escaping to get wrong and the boundary is exact.
         """
-        prefix = f"{name}_"
+        member = re.compile(rf"\A{re.escape(name)}(_[0-9a-f]{{{_FINGERPRINT_HEX}}})?\Z")
         if self.backend_type == "postgres":
             rows = await self._backend.fetch_all(
                 "SELECT c.relname FROM pg_index i "
                 "JOIN pg_class c ON c.oid = i.indexrelid "
-                "WHERE i.indrelid = to_regclass(?) AND c.relname LIKE ?",
-                (table, f"{prefix}%"),
+                "WHERE i.indrelid = to_regclass(?)",
+                (table,),
             )
         else:
             rows = await self._backend.fetch_all(
                 "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND tbl_name = ? AND name LIKE ?",
-                (table, f"{prefix}%"),
+                "AND tbl_name = ?",
+                (table,),
             )
-        return {row[0] for row in rows}
+        return {row[0] for row in rows if member.match(row[0])}
+
+    async def _index_namespace(self, name: str, table: str) -> Optional[str]:
+        """The schema holding ``table``'s index called ``name``, on PostgreSQL.
+
+        A bare ``DROP INDEX`` resolves by ``search_path``, so with a same-named
+        index in an EARLIER schema it removes that one and leaves the target's
+        alone — the same trap ``_index_exists`` documents for the probe, in the
+        destructive direction. The catalogue already knows which relation was
+        found; the drop is qualified with it.
+        """
+        if self.backend_type != "postgres":
+            return None
+        row = await self._backend.fetch_one(
+            "SELECT n.nspname FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
+            (table, name),
+        )
+        return row[0] if row else None
 
     async def _index_exists(self, name: str, table: str) -> bool:
         """Whether ``table`` already carries an index called ``name``.

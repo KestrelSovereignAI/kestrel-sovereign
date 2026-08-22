@@ -98,12 +98,14 @@ class _RecordingBackend:
         """
         await asyncio.sleep(0)
         assert "sqlite_master" in sql and "type = 'index'" in sql, sql
-        table, like = params
-        prefix = like.rstrip("%")
+        assert "LIKE" not in sql.upper(), (
+            "the family query filters in Python now — a LIKE here would be "
+            "treating every '_' in an index name as a wildcard again"
+        )
+        (table,) = params
         return [
-            (name,)
-            for name, owner in sorted(self.indexes.items())
-            if owner == table and name.startswith(prefix)
+            (name,) for name, owner in sorted(self.indexes.items())
+            if owner == table
         ]
 
     @property
@@ -307,3 +309,69 @@ async def test_an_unchanged_definition_is_not_rebuilt_on_the_next_boot():
 
     assert len(backend.creates) == 1, backend.creates
     assert backend.drops == [], backend.drops
+
+
+@pytest.mark.asyncio
+async def test_a_family_does_not_claim_a_longer_name_that_starts_the_same():
+    """``idx_foo_archived_<hash>`` is not a member of the ``idx_foo`` family.
+
+    Both are shipped, both are managed by separate ``ensure_index`` calls, and a
+    prefix test makes the active one drop the archived one on every boot — which
+    the next call then rebuilds. A full index rebuild of the biggest table, on
+    every boot, reported nowhere.
+
+    ``LIKE`` made it looser still: every ``_`` in these names is a
+    single-character wildcard.
+    """
+    backend = _RecordingBackend()
+    db = AsyncDatabase(backend)
+
+    # The archived index exists; the active one does NOT. That ordering is the
+    # whole test: `ensure_index` returns early when its own index is already
+    # there, so the retirement pass only runs on the boot that BUILDS one — the
+    # upgrade boot, which is exactly when a bad family boundary does its damage.
+    await db.ensure_index("idx_foo_archived", "conversation_history", "agent_id, id")
+    archived = _named("idx_foo_archived", "agent_id, id")
+    assert backend.indexes == {archived: "conversation_history"}
+
+    await db.ensure_index("idx_foo", "conversation_history", "agent_id")
+
+    assert archived in backend.indexes, (
+        "building the active index retired the archived one; they are separate "
+        "families and the next boot would rebuild it, every boot"
+    )
+    assert backend.drops == [], backend.drops
+
+
+@pytest.mark.asyncio
+async def test_an_index_from_before_the_fingerprint_is_retired():
+    """Every existing database has bare-named indexes; they are members too.
+
+    Excluded from the family they are never retired, so an upgraded database
+    keeps a duplicate (PostgreSQL) or a stale expression index (SQLite) for
+    good, paying write amplification on ``conversation_history`` for it.
+    """
+    backend = _RecordingBackend()
+    backend.indexes["idx_legacy"] = "conversation_history"  # the pre-#3009 name
+    db = AsyncDatabase(backend)
+
+    await db.ensure_index("idx_legacy", "conversation_history", "agent_id")
+
+    assert "idx_legacy" not in backend.indexes, "the bare-named index survived"
+    assert _named("idx_legacy", "agent_id") in backend.indexes
+
+
+def test_a_long_name_stays_within_postgresqls_identifier_limit():
+    """PostgreSQL truncates silently past 63 bytes, and the probe then misses.
+
+    The BASE is shortened, never the fingerprint: the suffix is what makes a
+    changed definition a changed name, so truncating it would collapse distinct
+    definitions onto one name — this mechanism's own bug, harder to see.
+    """
+    from kestrel_sovereign.storage.async_database import (
+        _fingerprinted_index_name,
+    )
+
+    generated = _fingerprinted_index_name("idx_" + "x" * 70, "deadbeef")
+    assert len(generated.encode("utf-8")) == 63
+    assert generated.endswith("_deadbeef")
