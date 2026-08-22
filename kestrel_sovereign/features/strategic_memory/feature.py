@@ -419,6 +419,20 @@ class StrategicMemoryFeature(Feature):
         reason the decision index does -- a row deleted from the canonical file
         must stop being reachable through the index.
         """
+        if not self._ledger.readable:
+            # An unreadable ledger is not an empty one. Reconciliation derives
+            # its keep-set from the ledger's contents, so projecting a failed
+            # parse would present "no rows" as "every row was deleted" and take
+            # the whole derived index with it -- a parse error escalated into
+            # data loss. Exactly the failure the decision index hit in #2851
+            # when its keep-set came from a failed read rather than from
+            # canonical membership.
+            logger.warning(
+                "strategy ledger index skipped: ledger unreadable (%s)",
+                self._ledger.load_error,
+            )
+            return {"projected": 0, "skipped": 0, "failed": 0,
+                    "skipped_reason": "ledger_unavailable"}
         agent_id = self._projection_agent_id()
         if not agent_id:
             logger.warning(
