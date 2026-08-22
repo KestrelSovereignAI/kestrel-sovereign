@@ -1306,8 +1306,9 @@ async def test_a_database_that_gains_the_ledger_after_its_history_is_rebuilt(
         projection = ConversationSessionProjection(db, AGENT)
         await db.execute(
             "INSERT INTO conversation_sessions "
-            "(agent_id, session_id, message_count) VALUES (?, ?, ?)",
-            (AGENT, "a-session-that-is-gone", 7),
+            "(agent_id, session_id, started_at, last_message_at, message_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (AGENT, "a-session-that-is-gone", _at(0), _at(1), 7),
         )
         await db.execute("DELETE FROM conversation_history_changes", ())
         await db.execute("DELETE FROM conversation_session_watermarks", ())
