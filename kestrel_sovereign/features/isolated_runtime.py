@@ -2385,6 +2385,81 @@ def resolve_isolated_runtime_namespace(
     )
 
 
+def resolve_legacy_isolated_runtime_root(
+    root: str | os.PathLike[str],
+    scope: IsolatedRuntimeNamespace,
+) -> Path:
+    """Validate the factory-owned source of the released hosted layout.
+
+    This path is migration input only.  It must name the exact historical
+    ``feature_venvs`` directory below an already-existing per-agent data
+    directory, and it must be disjoint from the new runtime root.  Filesystem
+    identity and ownership are checked again descriptor-relatively when a
+    feature is adopted; construction deliberately performs no creation.
+    """
+
+    if not isinstance(root, (str, os.PathLike)):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a path."
+        )
+    try:
+        root_text = os.fspath(root)
+    except TypeError as exc:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a path."
+        ) from exc
+    if type(root_text) is not str or not root_text or "\x00" in root_text:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be a non-empty path."
+        )
+    expanded = os.path.expanduser(root_text)
+    if not os.path.isabs(expanded):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must be absolute."
+        )
+    canonical = Path(os.path.abspath(expanded))
+    if canonical.name != "feature_venvs":
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must name feature_venvs."
+        )
+    if not canonical.parent.is_dir():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime parent must already exist."
+        )
+    try:
+        resolved_parent = canonical.parent.resolve(strict=True)
+    except OSError as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature legacy runtime parent could not be resolved."
+        ) from exc
+    if resolved_parent != canonical.parent:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime parent must not contain "
+            "path aliases or symlinks."
+        )
+    if canonical.is_symlink():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy runtime root must not be a symlink."
+        )
+    try:
+        canonical.relative_to(scope.root)
+    except ValueError:
+        pass
+    else:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy and current runtime roots must be disjoint."
+        )
+    try:
+        scope.root.relative_to(canonical)
+    except ValueError:
+        pass
+    else:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature legacy and current runtime roots must be disjoint."
+        )
+    return canonical
+
+
 def _directory_open_flags() -> int:
     return (
         os.O_RDONLY
@@ -2396,6 +2471,69 @@ def _directory_open_flags() -> int:
 
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _rename_directory_noreplace_at(
+    source_parent_fd: int,
+    source_component: str,
+    target_parent_fd: int,
+    target_component: str,
+) -> None:
+    """Atomically rename a directory while refusing any existing target.
+
+    Plain POSIX ``rename`` may replace an empty directory created after a
+    collision pre-check, destroying the competing custody claim. Linux and
+    Darwin both expose an exclusive descriptor-relative variant. Other POSIX
+    platforms fail closed rather than weakening migration semantics.
+    """
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_component)
+    target = os.fsencode(target_component)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_parent_fd,
+            source,
+            target_parent_fd,
+            target,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace directory rename is unavailable",
+            )
+        renameatx_np.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            source_parent_fd,
+            source,
+            target_parent_fd,
+            target,
+            0x00000004,  # RENAME_EXCL
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def _secure_dirfd_supported() -> bool:
@@ -2709,11 +2847,11 @@ def _migrate_runtime_directory_at(
         )
 
     try:
-        os.rename(
+        _rename_directory_noreplace_at(
+            parent_fd,
             legacy_component,
+            parent_fd,
             stable_component,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
         )
     except FileNotFoundError:
         # A concurrent preparer may have completed the same atomic rename.
@@ -2758,6 +2896,8 @@ def _migrate_runtime_directory_at(
 def _log_runtime_migration_collision(
     legacy_component: str,
     stable_component: str,
+    *,
+    legacy_parent: str = "feature_venvs",
 ) -> None:
     """Log opaque namespace-relative custody locations for the operator.
 
@@ -2771,9 +2911,341 @@ def _log_runtime_migration_collision(
         "Hosted isolated feature runtime migration collision; both trees were "
         "retained and the feature is unavailable pending custody reconciliation "
         "(legacy=%s, stable=%s)",
-        f"feature_venvs/{legacy_component}",
+        f"{legacy_parent}/{legacy_component}",
         f"feature_venvs/{stable_component}",
     )
+
+
+def _validate_released_legacy_directory_metadata(
+    metadata: os.stat_result,
+) -> None:
+    """Require custody properties Core can prove without mutating old state."""
+
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime path is unsafe."
+        )
+    if os.name == "posix" and metadata.st_uid != os.geteuid():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime is not owned by "
+            "the service account."
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime is writable by "
+            "another account."
+        )
+
+
+def _migrate_released_runtime_directory_portable(
+    legacy_root: Path,
+    scope: IsolatedRuntimeNamespace,
+    legacy_component: str,
+    stable_component: str,
+) -> None:
+    """Best-effort non-dirfd adoption with fail-closed custody checks."""
+
+    try:
+        root_metadata = legacy_root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if legacy_root.is_symlink():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime root is unsafe."
+        )
+    _validate_operator_root_metadata(root_metadata)
+    legacy = legacy_root / legacy_component
+    stable = scope.path / "feature_venvs" / stable_component
+    try:
+        legacy_metadata = legacy.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if legacy.is_symlink():
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime path is unsafe."
+        )
+    _validate_released_legacy_directory_metadata(legacy_metadata)
+    if stable.exists() or stable.is_symlink():
+        if stable.is_symlink() or not stable.is_dir():
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature stable runtime path is unsafe."
+            )
+        _log_runtime_migration_collision(
+            legacy_component,
+            stable_component,
+            legacy_parent="released_feature_venvs",
+        )
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both released legacy and stable runtime "
+            "state; operator custody reconciliation is required."
+        )
+    try:
+        legacy.rename(stable)
+    except OSError as exc:
+        if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise
+        _log_runtime_migration_collision(
+            legacy_component,
+            stable_component,
+            legacy_parent="released_feature_venvs",
+        )
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature has both released legacy and stable runtime "
+            "state; operator custody reconciliation is required."
+        ) from exc
+    try:
+        migrated = stable.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released legacy runtime migration did not "
+            "complete; tenant state was retained."
+        ) from exc
+    if not _same_file_identity(legacy_metadata, migrated):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released legacy runtime changed during migration."
+        )
+
+
+def migrate_released_hosted_feature_runtime(
+    legacy_root: Path,
+    scope: IsolatedRuntimeNamespace,
+    owner: str,
+    legacy_component: str,
+    stable_component: str,
+) -> None:
+    """Adopt the shipped class-named hosted tree into its tenant namespace.
+
+    The managed factory, rather than feature metadata or process environment,
+    supplies ``legacy_root``.  Adoption renames the complete feature directory
+    so venv contents and service data (including channel credentials) move as
+    one filesystem object.  Cross-device moves fail with both custody trees
+    untouched; collisions are never merged or overwritten.
+    """
+
+    if (
+        not isinstance(legacy_root, Path)
+        or _ISOLATED_FEATURE_CLASS_NAME.fullmatch(legacy_component) is None
+        or _HOSTED_FEATURE_RUNTIME_COMPONENT.fullmatch(stable_component) is None
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted isolated feature released runtime migration is not canonical."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - Windows fallback
+        try:
+            _migrate_released_runtime_directory_portable(
+                legacy_root,
+                scope,
+                legacy_component,
+                stable_component,
+            )
+        except IsolatedRuntimeNamespaceError:
+            raise
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature released runtime could not be migrated; "
+                "tenant state was retained."
+            ) from exc
+        return
+
+    source_parent_fd: Optional[int] = None
+    target_root_fd: Optional[int] = None
+    namespace_fd: Optional[int] = None
+    target_parent_fd: Optional[int] = None
+    try:
+        try:
+            source_parent_fd = os.open(
+                legacy_root.parent,
+                _directory_open_flags(),
+            )
+            lexical_parent = os.stat(
+                legacy_root.parent,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(lexical_parent.st_mode) or not _same_file_identity(
+                lexical_parent,
+                os.fstat(source_parent_fd),
+            ):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime parent "
+                    "changed during validation."
+                )
+            try:
+                source_root_metadata = os.stat(
+                    legacy_root.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            source_root_fd = os.open(
+                legacy_root.name,
+                _directory_open_flags(),
+                dir_fd=source_parent_fd,
+            )
+        except IsolatedRuntimeNamespaceError:
+            raise
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime contains "
+                    "an unsafe path entry."
+                ) from exc
+            raise
+
+        try:
+            if not _same_file_identity(source_root_metadata, os.fstat(source_root_fd)):
+                raise IsolatedRuntimeNamespaceError(
+                    "Hosted isolated feature released legacy runtime root changed "
+                    "during validation."
+                )
+            _validate_operator_root_metadata(source_root_metadata)
+
+            try:
+                legacy_metadata = os.stat(
+                    legacy_component,
+                    dir_fd=source_root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            _validate_released_legacy_directory_metadata(legacy_metadata)
+            legacy_fd = os.open(
+                legacy_component,
+                _directory_open_flags(),
+                dir_fd=source_root_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(legacy_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+            finally:
+                os.close(legacy_fd)
+
+            target_root_fd = _open_secure_absolute_directory(scope.root)
+            namespace_fd = os.dup(target_root_fd)
+            for component in scope.namespace.parts:
+                child = os.open(
+                    component,
+                    _directory_open_flags(),
+                    dir_fd=namespace_fd,
+                )
+                os.close(namespace_fd)
+                namespace_fd = child
+            _read_existing_runtime_owner(namespace_fd, owner)
+            target_parent_fd = os.open(
+                "feature_venvs",
+                _directory_open_flags(),
+                dir_fd=namespace_fd,
+            )
+
+            try:
+                stable_metadata = os.stat(
+                    stable_component,
+                    dir_fd=target_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                stable_metadata = None
+            if stable_metadata is not None:
+                if not stat.S_ISDIR(stable_metadata.st_mode):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature stable runtime path is unsafe."
+                    )
+                _log_runtime_migration_collision(
+                    legacy_component,
+                    stable_component,
+                    legacy_parent="released_feature_venvs",
+                )
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature has both released legacy and stable "
+                    "runtime state; operator custody reconciliation is required."
+                )
+
+            try:
+                _rename_directory_noreplace_at(
+                    source_root_fd,
+                    legacy_component,
+                    target_parent_fd,
+                    stable_component,
+                )
+            except FileNotFoundError:
+                try:
+                    post_legacy = os.stat(
+                        legacy_component,
+                        dir_fd=source_root_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    post_legacy = None
+                try:
+                    post_stable = os.stat(
+                        stable_component,
+                        dir_fd=target_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    post_stable = None
+                if (
+                    post_legacy is not None
+                    or post_stable is None
+                    or not _same_file_identity(legacy_metadata, post_stable)
+                ):
+                    raise IsolatedRuntimePreparationError(
+                        "Hosted isolated feature released legacy runtime migration "
+                        "did not complete; tenant state was retained."
+                    ) from None
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                _log_runtime_migration_collision(
+                    legacy_component,
+                    stable_component,
+                    legacy_parent="released_feature_venvs",
+                )
+                raise IsolatedRuntimePreparationError(
+                    "Hosted isolated feature has both released legacy and stable "
+                    "runtime state; operator custody reconciliation is required."
+                ) from exc
+            migrated_fd = os.open(
+                stable_component,
+                _directory_open_flags(),
+                dir_fd=target_parent_fd,
+            )
+            try:
+                if not _same_file_identity(legacy_metadata, os.fstat(migrated_fd)):
+                    raise IsolatedRuntimeNamespaceError(
+                        "Hosted isolated feature released legacy runtime changed "
+                        "during migration."
+                    )
+            finally:
+                os.close(migrated_fd)
+            os.fsync(source_root_fd)
+            os.fsync(target_parent_fd)
+        finally:
+            os.close(source_root_fd)
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted isolated feature released runtime migration encountered "
+                "an unsafe path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted isolated feature released runtime could not be migrated; "
+            "tenant state was retained."
+        ) from exc
+    finally:
+        if target_parent_fd is not None:
+            os.close(target_parent_fd)
+        if namespace_fd is not None:
+            os.close(namespace_fd)
+        if target_root_fd is not None:
+            os.close(target_root_fd)
+        if source_parent_fd is not None:
+            os.close(source_parent_fd)
 
 
 def _prepare_runtime_tree_portable(
@@ -3345,6 +3817,13 @@ def _agent_runtime_scope(agent: Any) -> Optional[IsolatedRuntimeNamespace]:
     if runtime_root is not None or runtime_namespace is not None:
         return resolve_isolated_runtime_namespace(runtime_root, runtime_namespace)
     return None
+
+
+def _agent_released_legacy_runtime_root(agent: Any) -> Optional[Path]:
+    """Return only a factory-validated released-layout migration source."""
+
+    value = _runtime_scope_value(agent, "isolated_runtime_legacy_root")
+    return value if isinstance(value, Path) else None
 
 
 def _agent_runtime_owner(agent: Any) -> str:
@@ -4060,6 +4539,11 @@ class ProxyFeature(Feature):
         )
         self._legacy_runtime_directory_name = (
             _legacy_hosted_feature_runtime_component(runtime)
+            if self._isolated_runtime_scope is not None
+            else None
+        )
+        self._released_legacy_runtime_root = (
+            _agent_released_legacy_runtime_root(agent)
             if self._isolated_runtime_scope is not None
             else None
         )
@@ -8268,6 +8752,20 @@ class ProxyFeature(Feature):
             prepare_isolated_runtime_namespace(
                 self._isolated_runtime_scope,
                 _agent_runtime_owner(self.agent),
+                relative_directories=(("feature_venvs",),),
+                directory_migrations=migrations,
+            )
+            if self._released_legacy_runtime_root is not None:
+                migrate_released_hosted_feature_runtime(
+                    self._released_legacy_runtime_root,
+                    self._isolated_runtime_scope,
+                    _agent_runtime_owner(self.agent),
+                    self.name,
+                    self._runtime_directory_name,
+                )
+            prepare_isolated_runtime_namespace(
+                self._isolated_runtime_scope,
+                _agent_runtime_owner(self.agent),
                 relative_directories=(
                     ("channel_link_artifacts",),
                     prefix,
@@ -8279,7 +8777,6 @@ class ProxyFeature(Feature):
                     prefix + ("cache",),
                     prefix + ("provisioning_cache",),
                 ),
-                directory_migrations=migrations,
             )
             return runtime_dir
         # The storage parent belongs to the standalone operator and may be the

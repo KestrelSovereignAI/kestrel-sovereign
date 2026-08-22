@@ -1192,7 +1192,7 @@ class TestAgentManagerBasics:
         assert (scope.path / ".kestrel-runtime-owner").is_file()
 
     @pytest.mark.asyncio
-    async def test_delete_endpoint_requests_explicit_runtime_offboarding(self):
+    async def test_delete_endpoint_defaults_to_state_preserving_stop(self):
         from kestrel_sovereign.endpoints.models import delete_agent
 
         manager = SimpleNamespace(remove_agent=AsyncMock(return_value=True))
@@ -1204,9 +1204,197 @@ class TestAgentManagerBasics:
 
         manager.remove_agent.assert_awaited_once_with(
             "Hosted",
-            offboard_runtime=True,
+            offboard_runtime=False,
         )
         assert result["success"] is True
+        assert result["runtime_offboarded"] is False
+        assert result["runtime_retained_for_restart"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_default_does_not_rewrite_autostart_config(
+        self,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(
+            agents={
+                "Hosted": LocalAgentConfig(
+                    data_dir=Path("agent_data/hosted"),
+                    port=8801,
+                    autostart=True,
+                )
+            }
+        )
+        config.save(config_path)
+        before = config_path.read_bytes()
+        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=True))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        result = await delete_agent.__wrapped__(request, "Hosted")
+
+        assert config_path.read_bytes() == before
+        assert "Hosted" in MultiAgentConfig.from_file(config_path).agents
+        assert result["runtime_retained_for_restart"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_explicit_offboard_removes_autostart_registration(
+        self,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(
+            agents={
+                "Hosted": LocalAgentConfig(
+                    data_dir=Path("agent_data/hosted"),
+                    port=8801,
+                    autostart=True,
+                )
+            }
+        )
+        config.save(config_path)
+        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=True))
+        state = SimpleNamespace(
+            agent_manager=manager,
+            multi_agent_config_path=config_path,
+            multi_agent_config=config,
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+        result = await delete_agent.__wrapped__(
+            request,
+            "Hosted",
+            offboard_runtime=True,
+        )
+
+        manager.remove_agent.assert_awaited_once_with(
+            "Hosted",
+            offboard_runtime=True,
+        )
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+        assert state.multi_agent_config.agents == {}
+        assert result["runtime_offboarded"] is True
+        assert result["persisted_registration_removed"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_refuses_destructive_auto_discovery_deployment(self):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=True))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=None,
+                )
+            )
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert "auto-discovered" in raised.value.detail
+        manager.remove_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_retains_config_removal_while_cleanup_is_pending(
+        self,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(
+            agents={
+                "Hosted": LocalAgentConfig(
+                    data_dir=Path("agent_data/hosted"),
+                    port=8801,
+                )
+            }
+        )
+        config.save(config_path)
+        pending = RuntimeOffboardingRetainedError(
+            agent_name="Hosted",
+            agent_id="did:test:pending",
+            runtime_path=tmp_path / "private-runtime",
+            cause=TimeoutError("private shutdown handoff"),
+            cleanup_pending=True,
+        )
+        manager = SimpleNamespace(remove_agent=AsyncMock(side_effect=pending))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert raised.value.detail["runtime_cleanup_state"] == "pending"
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+        assert str(tmp_path) not in str(raised.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_restores_registration_when_removal_is_refused(
+        self,
+        tmp_path,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        manager = SimpleNamespace(remove_agent=AsyncMock(return_value=False))
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 404
+        restored = MultiAgentConfig.from_file(config_path)
+        assert restored.agents["Hosted"] == original
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_reports_unpublished_agent_with_retained_runtime(
@@ -1358,6 +1546,43 @@ class TestAgentManagerBasics:
         assert retained.read_text() == "must-remain"
 
     @pytest.mark.asyncio
+    async def test_explicit_offboard_removes_authorized_cold_agent_runtime(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:cold-offboarding"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            did,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        (scope.path / "feature_venvs" / "feature-safe" / "credential").write_text(
+            "cold-credential"
+        )
+        manager._seed_scheduler_authority(
+            {
+                did: (
+                    "Cold",
+                    LocalAgentConfig(
+                        data_dir="agent_data/cold",
+                        port=8801,
+                        autostart=False,
+                    ),
+                )
+            }
+        )
+
+        assert await manager.remove_agent("Cold", offboard_runtime=True) is True
+
+        assert not scope.path.exists()
+        assert not manager.is_scheduler_agent_authorized(did)
+
+    @pytest.mark.asyncio
     async def test_offboarding_failure_and_cancellation_never_republish_dead_agent(
         self,
     ):
@@ -1453,7 +1678,11 @@ class TestAgentManagerBasics:
         )
 
         with pytest.raises(RuntimeOffboardingRetainedError):
-            await manager.terminate_child(parent_did, "Child")
+            await manager.terminate_child(
+                parent_did,
+                "Child",
+                offboard_runtime=True,
+            )
 
         assert manager.get_agent("Child") is None
         assert manager.get_children(parent_did) == []
@@ -1491,7 +1720,10 @@ class TestAgentManagerBasics:
         manager.remove_agent = AsyncMock(side_effect=[retained, grouped, True])
 
         with pytest.raises(BaseExceptionGroup) as raised:
-            await manager.terminate_children(parent_did)
+            await manager.terminate_children(
+                parent_did,
+                offboard_runtime=True,
+            )
 
         assert manager.remove_agent.await_args_list == [
             (("First",), {"offboard_runtime": True}),
@@ -1535,7 +1767,11 @@ class TestAgentManagerBasics:
         manager.remove_agent = AsyncMock(side_effect=remove_child)
 
         with pytest.raises(RuntimeOffboardingRetainedError):
-            await manager.terminate_child(parent_did, "Child")
+            await manager.terminate_child(
+                parent_did,
+                "Child",
+                offboard_runtime=True,
+            )
 
         manager.remove_agent.assert_awaited_once_with(
             "Child", offboard_runtime=True
@@ -1554,7 +1790,11 @@ class TestAgentManagerBasics:
         )
 
         with pytest.raises(ChildTerminationReconciliationError) as raised:
-            await manager.terminate_child(parent_did, "Child")
+            await manager.terminate_child(
+                parent_did,
+                "Child",
+                offboard_runtime=True,
+            )
 
         assert raised.value.cause is cause
         assert raised.value.metadata == {
@@ -2768,6 +3008,7 @@ class TestLoadFromConfig:
         llm_service.providers = []
         manager = AgentManager(base_data_dir=tmp_path)
         config = LocalAgentConfig(data_dir=Path("agent_data/real"), port=8801)
+        (tmp_path / "agent_data" / "real").mkdir(parents=True)
 
         with patch.object(
             LocalAgentConfig, "validate_runtime", return_value=[]
@@ -2788,6 +3029,9 @@ class TestLoadFromConfig:
         assert str(agent.isolated_runtime_namespace) == expected_namespace
         assert agent.isolated_runtime_path == (
             tmp_path / "isolated_feature_runtime" / expected_namespace
+        ).resolve()
+        assert agent.isolated_runtime_legacy_root == (
+            tmp_path / "agent_data" / "real" / "feature_venvs"
         ).resolve()
 
     @pytest.mark.asyncio
@@ -2825,6 +3069,11 @@ class TestLoadFromConfig:
         assert second["isolated_runtime_root"] == expected_root
         assert first["isolated_runtime_hosted"] is True
         assert second["isolated_runtime_hosted"] is True
+        expected_legacy_root = (
+            tmp_path / "agent_data" / "companion" / "feature_venvs"
+        ).resolve()
+        assert first["isolated_runtime_legacy_root"] == expected_legacy_root
+        assert second["isolated_runtime_legacy_root"] == expected_legacy_root
         assert first["isolated_runtime_namespace"] == (
             derive_isolated_runtime_namespace("did:tenant-a")
         )

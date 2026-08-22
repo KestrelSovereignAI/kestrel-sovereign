@@ -287,12 +287,17 @@ class SpawnedAgentLifecycle:
         self,
         child_name: str,
         reason: str = "explicit termination",
+        *,
+        offboard_runtime: bool = False,
     ) -> Optional[SpawnResult]:
         """Explicitly terminate a tracked child.
 
         Args:
             child_name: Name of the child to terminate.
             reason: Human-readable reason for termination.
+            offboard_runtime: Explicit destructive runtime-deprovision intent.
+                Ordinary TTL, result, and parent-shutdown paths leave this
+                false so a restart retains child state.
 
         Returns:
             SpawnResult if the child was tracked, None otherwise.
@@ -316,7 +321,10 @@ class SpawnedAgentLifecycle:
         self._results[child_name] = result
 
         await self._terminate_and_cleanup(
-            child_name, SpawnStatus.TERMINATED, reason=reason
+            child_name,
+            SpawnStatus.TERMINATED,
+            reason=reason,
+            offboard_runtime=offboard_runtime,
         )
 
         return result
@@ -392,6 +400,8 @@ class SpawnedAgentLifecycle:
         child_name: str,
         status: SpawnStatus,
         reason: str = "",
+        *,
+        offboard_runtime: bool = False,
     ) -> None:
         """Terminate the child in AgentManager and clean up ephemeral resources.
 
@@ -399,6 +409,7 @@ class SpawnedAgentLifecycle:
             child_name: Name of the child to terminate.
             status: The status that caused termination.
             reason: Human-readable reason.
+            offboard_runtime: Explicit destructive tenant-runtime intent.
         """
         tracked = self._tracked.get(child_name)
         if tracked is None:
@@ -407,7 +418,17 @@ class SpawnedAgentLifecycle:
         # Terminate via AgentManager (handles cascading grandchildren)
         termination_failure: BaseException | None = None
         try:
-            await self._agent_manager.terminate_child(tracked.parent_did, child_name)
+            if offboard_runtime:
+                await self._agent_manager.terminate_child(
+                    tracked.parent_did,
+                    child_name,
+                    offboard_runtime=True,
+                )
+            else:
+                await self._agent_manager.terminate_child(
+                    tracked.parent_did,
+                    child_name,
+                )
         except BaseException as exc:
             if not _is_expected_termination_outcome(exc):
                 raise

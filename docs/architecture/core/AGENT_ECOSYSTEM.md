@@ -153,7 +153,7 @@ Spawn tools use the existing `PermissionLevel` system (`ALLOW/DENY/ASK/SESSION`)
 |------|---------|-------------|
 | `spawn_agent` | `ASK` | Create ephemeral/persistent child |
 | `delegate_task` | `ALLOW` | Send task to existing child |
-| `terminate_child` | `ALLOW` | Terminate a child agent |
+| `terminate_child` | `ASK` | Stop a child (runtime retained by default); explicit offboarding is destructive |
 
 ### Implementation
 
@@ -186,4 +186,4 @@ graph TD
     
     style B fill:#f9f,stroke:#333,stroke-width:2px;
     style C fill:#cde,stroke:#333,stroke-width:2px;
-``` 
+```

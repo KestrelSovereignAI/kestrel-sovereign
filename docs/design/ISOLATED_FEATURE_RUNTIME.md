@@ -161,6 +161,9 @@ KestrelAgent(
         authenticated_user_id,
         companion_did,
     ),
+    # Managed upgrade input only: the released hosted layout below this
+    # exact agent data directory. It is never used as a runtime fallback.
+    isolated_runtime_legacy_root=agent_data_dir / "feature_venvs",
     isolated_runtime_hosted=True,
 )
 ```
@@ -213,6 +216,17 @@ HOME, TMPDIR, XDG, or relative-path behavior. Operators remain responsible for
 ensuring any process-wide standalone data-directory override is not shared by
 agents that require distinct mutable state.
 
+Released managed PostgreSQL agents also used that class-named layout under
+their resolved per-agent data directory. The managed factory supplies that
+exact old `feature_venvs` root as migration input. On first isolated-feature
+startup, Core validates the old root and class directory without following
+symlinks, verifies service-account custody, and atomically renames the complete
+class directory (venv plus service state/credentials) into the DID-owned stable
+namespace. A cross-device move, unsafe owner/mode, path race, or both-old-and-
+new collision retains the old tree (and both trees for a collision) and
+quarantines the optional feature for operator reconciliation; Core never
+copies, merges, overwrites, or deletes ambiguous credentials.
+
 Every hosted feature receives a private mutable directory below that namespace
 for its working directory, home, temp, XDG config/data/cache, channel artifacts,
 provisioning manifest, and default venv. Hosted children inherit only a narrow
@@ -259,10 +273,18 @@ offload atomic file replacement/unlink work. A read or event therefore never
 materializes a missing tenant namespace.
 
 Explicit tenant offboarding is the runtime-state deletion boundary. Normal host
-shutdown, restart, lifespan teardown, and startup rollback stop/unpublish agents
-but retain every hosted namespace. Administrative DELETE/deprovision, explicit
-child termination, and rollback of an uncommitted spawn carry a separate
-destructive intent: after durable shutdown, AgentManager verifies the ownership
+shutdown, restart, lifespan teardown, ordinary `DELETE /api/agents/{name}`, and
+ordinary child termination stop/unpublish agents but retain every hosted
+namespace. The DELETE compatibility default also leaves `multi_agent.toml`
+registration intact, so a later host restart may start the agent again.
+`DELETE /api/agents/{name}?offboard_runtime=true` is the explicit destructive
+contract. It is available only to config-driven deployments and removes the
+persisted registration before runtime deletion, preventing credential-less
+autostart resurrection; auto-discovery deployments are refused because safely
+deprovisioning them would also require an explicit primary-storage policy.
+Approved `terminate_child(..., offboard_runtime=true)` calls and rollback of an
+uncommitted spawn carry the same separate destructive intent. After durable
+shutdown, AgentManager verifies the ownership
 marker against the removed DID and deletes the namespace with
 descriptor-relative, no-follow recursion. A foreign/corrupt or nested marker,
 unsafe path, or unsupported secure-deletion platform retains the tree and makes
@@ -277,10 +299,15 @@ the cleanup may still finish, so this is not a claim of permanent retention.
 A completed cleanup failure instead reports `runtime_cleanup_state=retained`.
 Neither response exposes the host path. If shutdown is quarantined, its retained
 reaper deletes only when the original caller carried that explicit intent and
-durable shutdown later succeeds. The `terminate_child` tool reports this split
-outcome as partial success: the named child is stopped and must not be retried,
-while any named child or descendant with pending/retained runtime custody is
-identified separately for operator reconciliation.
+durable shutdown later succeeds. The initiating DELETE/tool call immediately
+receives a typed pending-custody outcome rather than claiming deletion; the
+reaper remains the sole owner of eventual deletion. The `terminate_child` tool
+defaults to state retention and is permission-gated `ASK` because its explicit
+`offboard_runtime=true` variant is irreversible. For that destructive variant,
+the tool reports pending/retained cleanup as partial success: the named child is
+stopped and must not be retried, while any named child or descendant with
+pending/retained runtime custody is identified separately for operator
+reconciliation.
 Storage-derived standalone/SQLite trees are outside hosted namespace cleanup
 and retain their existing storage lifecycle policy.
 Core-created standalone feature, workspace, and channel-artifact directories

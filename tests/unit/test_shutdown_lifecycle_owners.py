@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
@@ -22,7 +22,10 @@ from kestrel_sovereign.kestrel_agent import (
     await_lifecycle_task_completion,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentManager,
+    RuntimeOffboardingRetainedError,
+)
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
@@ -1694,7 +1697,12 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
     try:
         await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
         await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
-        assert await asyncio.wait_for(removal, timeout=1.0) is True
+        with pytest.raises(RuntimeOffboardingRetainedError) as raised:
+            await asyncio.wait_for(removal, timeout=1.0)
+        assert raised.value.metadata["agent_removed"] is True
+        assert raised.value.metadata["runtime_cleanup_pending"] is True
+        assert raised.value.metadata["runtime_cleanup_state"] == "pending"
+        assert manager.get_agent("hostile") is None
         manager._offboard_agent_runtime_namespace.assert_not_awaited()
 
         agent.allow_shutdown_finish.set()
@@ -1703,6 +1711,115 @@ async def test_explicit_offboarding_intent_survives_quarantined_reaper_handoff(
         agent.allow_shutdown_finish.set()
         if not removal.done():
             await asyncio.wait_for(removal, timeout=1.0)
+
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+
+
+@pytest.mark.asyncio
+async def test_handed_off_offboarding_failure_is_owned_once_and_remains_visible(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+
+    class ObservableHostileShutdownAgent(_CancellationHostileShutdownAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reaper_handed_off = asyncio.Event()
+
+        def handoff_shutdown_to_reaper(self, shutdown_task):
+            reaper = super().handoff_shutdown_to_reaper(shutdown_task)
+            self.reaper_handed_off.set()
+            return reaper
+
+    manager = AgentManager()
+    agent = ObservableHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    retained_failure = OSError("private retained runtime path")
+    manager._offboard_agent_runtime_namespace = AsyncMock(
+        return_value=(False, retained_failure)
+    )
+
+    removal = asyncio.create_task(
+        manager.remove_agent("hostile", offboard_runtime=True)
+    )
+    try:
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(agent.reaper_handed_off.wait(), timeout=1.0)
+        with pytest.raises(RuntimeOffboardingRetainedError) as pending:
+            await asyncio.wait_for(removal, timeout=1.0)
+        assert pending.value.metadata["runtime_cleanup_state"] == "pending"
+        assert manager._inflight_runtime_offboardings == {}
+
+        agent.allow_shutdown_finish.set()
+        with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers"):
+            await manager.drain_quarantined_shutdowns()
+    finally:
+        agent.allow_shutdown_finish.set()
+        if not removal.done():
+            with pytest.raises(RuntimeOffboardingRetainedError):
+                await asyncio.wait_for(removal, timeout=1.0)
+
+    manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
+    assert manager.get_agent("hostile") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_maps_real_shutdown_handoff_to_pending_custody(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from kestrel_sovereign.endpoints.models import delete_agent
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    agent = _CancellationHostileShutdownAgent()
+    manager._agents["hostile"] = agent
+    manager._agent_names[agent.agent_id] = "hostile"
+    manager._offboard_agent_runtime_namespace = AsyncMock(return_value=(False, None))
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(
+        agents={
+            "hostile": LocalAgentConfig(
+                data_dir="agent_data/hostile",
+                port=8801,
+            )
+        }
+    )
+    config.save(config_path)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                agent_manager=manager,
+                multi_agent_config_path=config_path,
+                multi_agent_config=config,
+            )
+        )
+    )
+
+    try:
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "hostile",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        assert raised.value.detail["agent_removed"] is True
+        assert raised.value.detail["runtime_cleanup_state"] == "pending"
+        assert manager.get_agent("hostile") is None
+        assert MultiAgentConfig.from_file(config_path).agents == {}
+        manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+        agent.allow_shutdown_finish.set()
+        assert await manager.drain_quarantined_shutdowns() is False
+    finally:
+        agent.allow_shutdown_finish.set()
 
     manager._offboard_agent_runtime_namespace.assert_awaited_once_with(agent)
 
@@ -2845,7 +2962,7 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
         *,
         offboard_runtime: bool = False,
     ) -> bool:
-        assert offboard_runtime is True
+        assert offboard_runtime is False
         assert name == child_name
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
@@ -2897,7 +3014,7 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
         *,
         offboard_runtime: bool = False,
     ) -> bool:
-        assert offboard_runtime is True
+        assert offboard_runtime is False
         assert name == child_name
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name

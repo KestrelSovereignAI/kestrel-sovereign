@@ -8,6 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
+from kestrel_sovereign.features.isolated_runtime import (
+    derive_isolated_runtime_namespace,
+    prepare_isolated_runtime_namespace,
+    resolve_isolated_runtime_namespace,
+)
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     ChildTerminationReconciliationError,
@@ -332,9 +337,34 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.terminate_child(child_name="helper")
 
         assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained_for_restart"] is True
         manager._lifecycle.terminate.assert_awaited_once_with(
             child_name="helper",
             reason="explicit termination",
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_explicit_offboard_threads_destructive_intent(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["runtime_offboarded"] is True
+        assert envelope.data["runtime_retained_for_restart"] is False
+        manager._lifecycle.terminate.assert_awaited_once_with(
+            child_name="helper",
+            reason="explicit termination",
+            offboard_runtime=True,
         )
 
     @pytest.mark.asyncio
@@ -365,7 +395,10 @@ class TestSpawnFeatureWithManager:
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
         with caplog.at_level("ERROR"):
-            envelope = await feature.terminate_child(child_name="helper")
+            envelope = await feature.terminate_child(
+                child_name="helper",
+                offboard_runtime=True,
+            )
 
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.confirmation == "Terminated child 'helper'."
@@ -396,7 +429,79 @@ class TestSpawnFeatureWithManager:
         assert secret not in serialized
         assert lifecycle.is_tracked("helper") is False
         assert lifecycle.get_result("helper").status.value == "terminated"
-        manager.terminate_child.assert_awaited_once_with("did:parent", "helper")
+        manager.terminate_child.assert_awaited_once_with(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_maps_real_shutdown_handoff_to_pending_partial(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
+            0.01,
+        )
+
+        class HostileChild:
+            agent_id = "did:child:handoff"
+
+            def __init__(self):
+                self.shutdown_entered = asyncio.Event()
+                self.allow_shutdown_finish = asyncio.Event()
+
+            async def shutdown(self):
+                self.shutdown_entered.set()
+                while not self.allow_shutdown_finish.is_set():
+                    try:
+                        await self.allow_shutdown_finish.wait()
+                    except asyncio.CancelledError:
+                        pass
+
+            def handoff_shutdown_to_reaper(self, shutdown_task):
+                async def reap():
+                    await asyncio.shield(shutdown_task)
+
+                return asyncio.create_task(reap())
+
+        parent = _make_mock_agent("did:parent")
+        child = HostileChild()
+        manager = AgentManager()
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children[parent.agent_id] = ["helper"]
+        manager._offboard_agent_runtime_namespace = AsyncMock(return_value=(False, None))
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        try:
+            envelope = await feature.terminate_child(
+                child_name="helper",
+                offboard_runtime=True,
+            )
+
+            assert envelope.status is ToolResultStatus.PARTIAL
+            assert envelope.data["runtime_cleanup_state"] == "pending"
+            assert envelope.data["retry_termination"] is False
+            assert envelope.data["retained_agent"] == "helper"
+            assert manager.get_agent("helper") is None
+            manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+            child.allow_shutdown_finish.set()
+            assert await manager.drain_quarantined_shutdowns() is False
+        finally:
+            child.allow_shutdown_finish.set()
+
+        manager._offboard_agent_runtime_namespace.assert_awaited_once_with(child)
 
     @pytest.mark.asyncio
     async def test_terminate_child_flattens_grouped_retained_agents(self):
@@ -437,7 +542,10 @@ class TestSpawnFeatureWithManager:
         )
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
-        envelope = await feature.terminate_child(child_name="helper")
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
 
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["retained_agents"] == ["grandchild", "helper"]
@@ -495,7 +603,10 @@ class TestSpawnFeatureWithManager:
         manager.remove_agent = AsyncMock(side_effect=remove_agent)
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
-        envelope = await feature.terminate_child(child_name="Child")
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
 
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["retained_agent"] == "Grandchild"
@@ -543,7 +654,10 @@ class TestSpawnFeatureWithManager:
         )
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
-        envelope = await feature.terminate_child(child_name="helper")
+        envelope = await feature.terminate_child(
+            child_name="helper",
+            offboard_runtime=True,
+        )
 
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["additional_outcome_count"] == 1
@@ -555,6 +669,11 @@ class TestSpawnFeatureWithManager:
         assert "private-cancel-text" not in serialized
         assert "private-timeout-text" not in serialized
         assert "/private/helper" not in serialized
+        manager.terminate_child.assert_awaited_once_with(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        )
 
     @pytest.mark.asyncio
     async def test_terminate_child_preserves_active_cancellation_group(self):
@@ -776,9 +895,9 @@ class TestSpawnFeatureDefaultPermissions:
         feature = _make_spawn_feature()
         assert feature.default_permissions["delegate_task"] == "allow"
 
-    def test_terminate_child_defaults_to_allow(self):
+    def test_terminate_child_requires_approval_for_destructive_variant(self):
         feature = _make_spawn_feature()
-        assert feature.default_permissions["terminate_child"] == "allow"
+        assert feature.default_permissions["terminate_child"] == "ask"
 
 
 class TestAgentManagerSpawn:
@@ -981,6 +1100,66 @@ class TestAgentManagerSpawn:
         assert "helper" not in manager.get_children("did:parent")
         assert manager.get_mandate("helper") is None
         child.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_default_retains_hosted_runtime_for_restart(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent("did:child:retained")
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("retain-on-stop")
+        child.isolated_runtime_scope = scope
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+
+        assert await manager.terminate_child("did:parent", "helper") is True
+
+        assert credential.read_text() == "retain-on-stop"
+        assert scope.path.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_explicit_offboard_deletes_hosted_runtime(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent("did:child:offboard")
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        (scope.path / "feature_venvs" / "feature-safe" / "credential").write_text(
+            "delete-on-offboard"
+        )
+        child.isolated_runtime_scope = scope
+        manager._agents["helper"] = child
+        manager._agent_names[child.agent_id] = "helper"
+        manager._parent_children["did:parent"] = ["helper"]
+
+        assert await manager.terminate_child(
+            "did:parent",
+            "helper",
+            offboard_runtime=True,
+        ) is True
+
+        assert not scope.path.exists()
 
     @pytest.mark.asyncio
     async def test_terminate_child_not_found(self):

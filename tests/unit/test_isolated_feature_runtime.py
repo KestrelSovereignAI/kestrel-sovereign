@@ -1525,6 +1525,266 @@ def test_hosted_feature_runtime_identity_ignores_module_and_service_refactors():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="migration uses secure POSIX dirfds")
+def test_hosted_feature_runtime_adopts_released_class_named_whatsapp_tree(tmp_path):
+    """The deployed PG layout moves intact, including venv and credentials."""
+
+    agent_dir = tmp_path / "agent_data" / "Hosted"
+    legacy_root = agent_dir / "feature_venvs"
+    legacy_feature = legacy_root / "WhatsAppFeature"
+    credential = legacy_feature / "whatsapp_service" / "session.sqlite3"
+    venv_marker = legacy_feature / ".venv" / "pyvenv.cfg"
+    credential.parent.mkdir(parents=True, mode=0o700)
+    venv_marker.parent.mkdir(mode=0o700)
+    legacy_root.chmod(0o700)
+    legacy_feature.chmod(0o700)
+    credential.write_bytes(b"released-linked-device-credential")
+    venv_marker.write_text("home = /operator/python\n")
+    runtime_root = tmp_path / "isolated_feature_runtime"
+    agent = KestrelAgent(
+        did="did:test:released-hosted-layout",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        llm_service=Mock(providers=[]),
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=runtime_root,
+        isolated_runtime_namespace="agent-released",
+        isolated_runtime_legacy_root=legacy_root,
+        isolated_runtime_hosted=True,
+    )
+    feature = ProxyFeature(
+        agent,
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+
+    stable = feature._prepare_runtime_workspace()
+
+    assert (stable / "whatsapp_service" / "session.sqlite3").read_bytes() == (
+        b"released-linked-device-credential"
+    )
+    assert (stable / ".venv" / "pyvenv.cfg").read_text() == (
+        "home = /operator/python\n"
+    )
+    assert not legacy_feature.exists()
+    assert legacy_root.is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="migration uses secure POSIX dirfds")
+def test_hosted_released_runtime_symlink_is_rejected_without_touching_target(tmp_path):
+    agent_dir = tmp_path / "agent_data" / "Hosted"
+    legacy_root = agent_dir / "feature_venvs"
+    legacy_root.mkdir(parents=True, mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "session.sqlite3"
+    secret.write_bytes(b"other-tenant-secret")
+    (legacy_root / "WhatsAppFeature").symlink_to(outside, target_is_directory=True)
+    agent = KestrelAgent(
+        did="did:test:released-hosted-symlink",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        llm_service=Mock(providers=[]),
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=tmp_path / "isolated_feature_runtime",
+        isolated_runtime_namespace="agent-symlink",
+        isolated_runtime_legacy_root=legacy_root,
+        isolated_runtime_hosted=True,
+    )
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="unsafe"):
+        feature._prepare_runtime_workspace()
+
+    assert secret.read_bytes() == b"other-tenant-secret"
+    assert not feature._feature_runtime_dir().exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="migration uses secure POSIX dirfds")
+@pytest.mark.asyncio
+async def test_hosted_released_runtime_collision_retains_both_credential_trees(
+    caplog,
+    tmp_path,
+):
+    agent_dir = tmp_path / "agent_data" / "Hosted"
+    legacy_root = agent_dir / "feature_venvs"
+    legacy_credential = (
+        legacy_root / "WhatsAppFeature" / "whatsapp_service" / "session.sqlite3"
+    )
+    legacy_credential.parent.mkdir(parents=True, mode=0o700)
+    legacy_root.chmod(0o700)
+    (legacy_root / "WhatsAppFeature").chmod(0o700)
+    legacy_credential.write_bytes(b"released-custody")
+    agent = KestrelAgent(
+        did="did:test:released-hosted-collision",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        llm_service=Mock(providers=[]),
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=tmp_path / "isolated_feature_runtime",
+        isolated_runtime_namespace="agent-collision",
+        isolated_runtime_legacy_root=legacy_root,
+        isolated_runtime_hosted=True,
+    )
+    client_started = False
+
+    def client_factory(**kwargs):
+        nonlocal client_started
+        client_started = True
+        return FakeIsolatedClient(**kwargs)
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
+    isolated_runtime.prepare_isolated_runtime_namespace(
+        feature._isolated_runtime_scope,
+        agent.did,
+        relative_directories=(
+            (
+                "feature_venvs",
+                feature._runtime_directory_name,
+                "whatsapp_service",
+            ),
+        ),
+    )
+    stable_credential = (
+        feature._feature_runtime_dir() / "whatsapp_service" / "session.sqlite3"
+    )
+    stable_credential.write_bytes(b"stable-custody")
+
+    with caplog.at_level("ERROR"):
+        available = await agent._register_startup_feature(
+            feature,
+            prepared_contributions=Mock(),
+        )
+
+    assert available is False
+    assert feature.name not in agent.features
+    assert client_started is False
+    assert feature._client is None
+    assert legacy_credential.read_bytes() == b"released-custody"
+    assert stable_credential.read_bytes() == b"stable-custody"
+    assert "released_feature_venvs/WhatsAppFeature" in caplog.text
+    assert f"feature_venvs/{feature._runtime_directory_name}" in caplog.text
+    assert str(agent_dir) not in caplog.text
+    assert "released-custody" not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="migration uses secure POSIX dirfds")
+@pytest.mark.parametrize("collision_errno", (errno.EEXIST, errno.ENOTEMPTY))
+def test_hosted_released_runtime_rename_race_never_overwrites_new_custody(
+    caplog,
+    collision_errno,
+    monkeypatch,
+    tmp_path,
+):
+    agent_dir = tmp_path / "agent_data" / "Hosted"
+    legacy_root = agent_dir / "feature_venvs"
+    legacy_credential = (
+        legacy_root / "WhatsAppFeature" / "whatsapp_service" / "session.sqlite3"
+    )
+    legacy_credential.parent.mkdir(parents=True, mode=0o700)
+    legacy_root.chmod(0o700)
+    (legacy_root / "WhatsAppFeature").chmod(0o700)
+    legacy_credential.write_bytes(b"released-race-custody")
+    agent = KestrelAgent(
+        did="did:test:released-hosted-race",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        llm_service=Mock(providers=[]),
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=tmp_path / "isolated_feature_runtime",
+        isolated_runtime_namespace="agent-race",
+        isolated_runtime_legacy_root=legacy_root,
+        isolated_runtime_hosted=True,
+    )
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+    stable_credential = (
+        feature._feature_runtime_dir() / "whatsapp_service" / "session.sqlite3"
+    )
+    real_rename = isolated_runtime._rename_directory_noreplace_at
+    rename_calls = 0
+
+    def collide(source_fd, source, target_fd, target):
+        nonlocal rename_calls
+        if source != "WhatsAppFeature":
+            return real_rename(source_fd, source, target_fd, target)
+        rename_calls += 1
+        stable_credential.parent.mkdir(parents=True)
+        stable_credential.write_bytes(b"stable-race-custody")
+        raise OSError(collision_errno, "synthetic released-layout collision")
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_rename_directory_noreplace_at",
+        collide,
+    )
+
+    with caplog.at_level("ERROR"), pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="custody reconciliation",
+    ):
+        feature._prepare_runtime_workspace()
+
+    assert rename_calls == 1
+    assert legacy_credential.read_bytes() == b"released-race-custody"
+    assert stable_credential.read_bytes() == b"stable-race-custody"
+    assert "released_feature_venvs/WhatsAppFeature" in caplog.text
+    assert str(agent_dir) not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exclusive rename is POSIX-specific")
+def test_runtime_migration_atomic_rename_refuses_even_empty_target(tmp_path):
+    """Mutation guard: plain rename would silently replace this empty target."""
+
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "stable").mkdir()
+    parent_fd = os.open(tmp_path, isolated_runtime._directory_open_flags())
+    try:
+        with pytest.raises(OSError) as raised:
+            isolated_runtime._rename_directory_noreplace_at(
+                parent_fd,
+                "legacy",
+                parent_fd,
+                "stable",
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert raised.value.errno in {errno.EEXIST, errno.ENOTEMPTY}
+    assert (tmp_path / "legacy").is_dir()
+    assert (tmp_path / "stable").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ownership policy is POSIX-specific")
+def test_hosted_released_runtime_refuses_writable_source_without_moving_state(
+    tmp_path,
+):
+    agent_dir = tmp_path / "agent_data" / "Hosted"
+    legacy_root = agent_dir / "feature_venvs"
+    legacy_feature = legacy_root / "WhatsAppFeature"
+    credential = legacy_feature / "whatsapp_service" / "session.sqlite3"
+    credential.parent.mkdir(parents=True, mode=0o700)
+    credential.write_bytes(b"untrusted-writable-custody")
+    legacy_root.chmod(0o777)
+    agent = KestrelAgent(
+        did="did:test:released-hosted-writable",
+        storage_path=str(agent_dir / "kestrel_prime.db"),
+        llm_service=Mock(providers=[]),
+        database_url="postgresql://hosted.example/kestrel",
+        db_backend="postgres",
+        isolated_runtime_root=tmp_path / "isolated_feature_runtime",
+        isolated_runtime_namespace="agent-writable",
+        isolated_runtime_legacy_root=legacy_root,
+        isolated_runtime_hosted=True,
+    )
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="world-writable"):
+        feature._prepare_runtime_workspace()
+
+    assert credential.read_bytes() == b"untrusted-writable-custody"
+    assert not feature._feature_runtime_dir().exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="migration uses secure POSIX dirfds")
 def test_hosted_feature_runtime_adopts_legacy_hash_before_refactor(tmp_path):
     runtime_root = tmp_path / "hosted-runtime"
     agent = _hosted_postgres_agent(runtime_root, "tenant/agent")
@@ -1752,17 +2012,21 @@ async def test_hosted_feature_runtime_rename_race_retains_both_custody_trees(
     legacy_credential.write_text("legacy-race-custody")
     rename_calls = 0
 
-    def collide_after_precheck(source, target, **kwargs):
+    def collide_after_precheck(source_fd, source, target_fd, target):
         nonlocal rename_calls
         rename_calls += 1
         assert source == legacy_component
         assert target == stable_component
-        assert kwargs["src_dir_fd"] == kwargs["dst_dir_fd"]
+        assert source_fd == target_fd
         stable_credential.parent.mkdir(parents=True)
         stable_credential.write_text("stable-race-custody")
         raise OSError(collision_errno, "synthetic directory collision")
 
-    monkeypatch.setattr(isolated_runtime.os, "rename", collide_after_precheck)
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_rename_directory_noreplace_at",
+        collide_after_precheck,
+    )
 
     with caplog.at_level("ERROR"):
         available = await agent._register_startup_feature(
@@ -1820,7 +2084,11 @@ def test_hosted_feature_runtime_rename_unrelated_oserror_is_not_collision(
     def fail_rename(*_args, **_kwargs):
         raise OSError(errno.EIO, "synthetic unrelated I/O failure")
 
-    monkeypatch.setattr(isolated_runtime.os, "rename", fail_rename)
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_rename_directory_noreplace_at",
+        fail_rename,
+    )
 
     with caplog.at_level("ERROR"), pytest.raises(
         IsolatedRuntimePreparationError,

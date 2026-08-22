@@ -361,13 +361,112 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         raise HTTPException(status_code=500, detail="Error creating agent.")
 
 
+def _remove_persisted_agent_registration_for_offboarding(
+    request: Request,
+    agent_name: str,
+):
+    """Remove one autostart registration before destructive runtime cleanup.
+
+    Returning the removed config permits the narrow false/pre-shutdown-error
+    rollback below.  A config-less auto-discovery deployment cannot safely
+    promise deprovisioning without also deleting its primary storage tree, so
+    it must refuse this runtime-only operation.
+    """
+
+    config_path = getattr(request.app.state, "multi_agent_config_path", None)
+    if config_path is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Destructive runtime offboarding requires a config-driven "
+                "multi-agent deployment so the agent cannot be auto-discovered "
+                "again on restart."
+            ),
+        )
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    try:
+        current = MultiAgentConfig.from_file(config_path)
+    except Exception as exc:
+        logger.error(
+            "Could not load multi-agent config before offboarding %r",
+            agent_name,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Destructive runtime offboarding requires a readable persisted "
+                "multi-agent registration."
+            ),
+        ) from exc
+
+    matching = [
+        name for name in current.agents if name.casefold() == agent_name.casefold()
+    ]
+    if len(matching) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Persisted agent registration is ambiguous; offboarding refused.",
+        )
+    persisted_name = matching[0] if matching else agent_name
+    removed_config = current.agents.pop(persisted_name, None)
+    try:
+        type(current).model_validate(current.model_dump())
+        current.save(config_path)
+    except Exception as exc:
+        logger.error(
+            "Could not remove persisted registration before offboarding %r",
+            agent_name,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persisted agent registration could not be removed; runtime "
+                "offboarding was not started."
+            ),
+        ) from exc
+    request.app.state.multi_agent_config = current
+    return config_path, persisted_name, removed_config
+
+
+def _restore_persisted_agent_registration(
+    request: Request,
+    rollback: tuple[object, str, object],
+) -> None:
+    """Restore a registration only after manager proves removal did not start."""
+
+    config_path, persisted_name, removed_config = rollback
+    if removed_config is None:
+        return
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    current = MultiAgentConfig.from_file(config_path)
+    if any(name.casefold() == persisted_name.casefold() for name in current.agents):
+        raise RuntimeError(
+            "agent registration changed concurrently; refusing rollback overwrite"
+        )
+    current.agents[persisted_name] = removed_config
+    type(current).model_validate(current.model_dump())
+    current.save(config_path)
+    request.app.state.multi_agent_config = current
+
+
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
-async def delete_agent(request: Request, agent_name: str):
-    """Explicitly deprovision an agent from the multi-agent manager.
+async def delete_agent(
+    request: Request,
+    agent_name: str,
+    offboard_runtime: bool = False,
+):
+    """Stop a live agent, retaining its runtime unless explicitly offboarded.
 
-    Shuts down the agent and securely removes its hosted isolated-feature
-    runtime namespace. The primary agent storage directory is not deleted.
+    The compatibility default withdraws routing and stops the process while
+    preserving runtime state and the persisted registration for a later host
+    restart. ``offboard_runtime=true`` is destructive: it first removes the
+    persisted registration, then securely removes the hosted isolated-feature
+    namespace. The primary agent storage directory is not deleted.
 
     Only available in multi-agent mode.
     """
@@ -378,10 +477,20 @@ async def delete_agent(request: Request, agent_name: str):
             detail="Agent management is only available in multi-agent mode.",
         )
 
+    if type(offboard_runtime) is not bool:
+        raise HTTPException(status_code=400, detail="offboard_runtime must be a bool")
+
+    registration_rollback = None
+    if offboard_runtime:
+        registration_rollback = _remove_persisted_agent_registration_for_offboarding(
+            request,
+            agent_name,
+        )
+
     try:
         removed = await agent_manager.remove_agent(
             agent_name,
-            offboard_runtime=True,
+            offboard_runtime=offboard_runtime,
         )
     except RuntimeOffboardingRetainedError as exc:
         # Shutdown/unpublication succeeded, so this is neither a missing agent
@@ -406,14 +515,59 @@ async def delete_agent(request: Request, agent_name: str):
         # remove_agent refuses to delete an agent that still has budgeted child
         # agents (#2113) — that teardown must go through terminate_child. Surface
         # it as a controlled 409, not a 500.
+        if registration_rollback is not None:
+            try:
+                _restore_persisted_agent_registration(request, registration_rollback)
+            except Exception as rollback_error:
+                logger.error(
+                    "Could not restore persisted registration after refused "
+                    "offboarding of %r",
+                    agent_name,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent offboarding was refused and its persisted "
+                        "registration requires operator reconciliation."
+                    ),
+                ) from rollback_error
         raise HTTPException(status_code=409, detail=str(e))
     if not removed:
+        if registration_rollback is not None:
+            try:
+                _restore_persisted_agent_registration(request, registration_rollback)
+            except Exception as rollback_error:
+                logger.error(
+                    "Could not restore persisted registration after agent %r "
+                    "was not found",
+                    agent_name,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent was not removed and its persisted registration "
+                        "requires operator reconciliation."
+                    ),
+                ) from rollback_error
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found.")
 
     return {
         "success": True,
         "name": agent_name,
-        "message": f"Agent '{agent_name}' shut down and removed.",
+        "runtime_offboarded": offboard_runtime,
+        "runtime_retained_for_restart": not offboard_runtime,
+        "persisted_registration_removed": bool(
+            offboard_runtime
+            and registration_rollback is not None
+            and registration_rollback[2] is not None
+        ),
+        "message": (
+            f"Agent '{agent_name}' shut down and deprovisioned."
+            if offboard_runtime
+            else f"Agent '{agent_name}' shut down; runtime retained for restart."
+        ),
     }
 
 

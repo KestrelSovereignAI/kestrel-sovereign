@@ -699,15 +699,25 @@ class SpawnFeature(Feature):
 
     @tool(
         name="terminate_child",
-        description="Terminate a child agent, stopping it and releasing its resources.",
+        description=(
+            "Stop a child agent. By default its runtime state is retained for "
+            "restart; offboard_runtime=true irreversibly deletes the child and "
+            "descendant hosted runtime trees after shutdown."
+        ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def terminate_child(self, child_name: str) -> ToolResult:
+    async def terminate_child(
+        self,
+        child_name: str,
+        offboard_runtime: bool = False,
+    ) -> ToolResult:
         """
         Terminate a child agent early.
 
         Args:
             child_name: Name of the child agent to terminate
+            offboard_runtime: Explicitly and irreversibly delete hosted
+                runtime state after stopping the child and descendants.
 
         Returns:
             ToolResult.ok when the child was actually terminated.
@@ -721,6 +731,8 @@ class SpawnFeature(Feature):
         manager = self._get_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
+        if type(offboard_runtime) is not bool:
+            return ToolResult.failed(error="offboard_runtime must be a bool")
 
         # Verify this is our child
         parent_did = self.agent.agent_id
@@ -747,13 +759,27 @@ class SpawnFeature(Feature):
         lifecycle = self._get_lifecycle(manager)
         try:
             if lifecycle is not None:
-                result = await lifecycle.terminate(
-                    child_name=child_name,
-                    reason="explicit termination",
-                )
+                if offboard_runtime:
+                    result = await lifecycle.terminate(
+                        child_name=child_name,
+                        reason="explicit termination",
+                        offboard_runtime=True,
+                    )
+                else:
+                    result = await lifecycle.terminate(
+                        child_name=child_name,
+                        reason="explicit termination",
+                    )
                 removed = result is not None
             else:
-                removed = await manager.terminate_child(parent_did, child_name)
+                if offboard_runtime:
+                    removed = await manager.terminate_child(
+                        parent_did,
+                        child_name,
+                        offboard_runtime=True,
+                    )
+                else:
+                    removed = await manager.terminate_child(parent_did, child_name)
         except BaseException as exc:
             # Manager-typed terminal outcomes prove that routing withdrawal
             # succeeded even when custody/reconciliation did not. Flatten
@@ -774,7 +800,12 @@ class SpawnFeature(Feature):
         if removed:
             return ToolResult.ok(
                 f"Terminated child '{child_name}'.",
-                data={"terminated": True, "child_name": child_name},
+                data={
+                    "terminated": True,
+                    "child_name": child_name,
+                    "runtime_offboarded": offboard_runtime,
+                    "runtime_retained_for_restart": not offboard_runtime,
+                },
             )
 
         return ToolResult.failed(error=f"Failed to terminate '{child_name}'")
@@ -792,12 +823,15 @@ class SpawnFeature(Feature):
         """Default permission levels for spawn tools.
 
         spawn_agent requires explicit approval (ASK) since it creates new agents.
-        Other tools default to ALLOW since they operate on already-approved children.
+        Read/delegation tools default to ALLOW. ``terminate_child`` is ASK
+        because its explicit ``offboard_runtime`` mode irreversibly deletes
+        tenant state; permission policy is tool-scoped rather than argument-
+        scoped, so the safe default must cover the destructive variant.
         """
         return {
             "spawn_agent": "ask",
             "list_children": "allow",
             "delegate_task": "allow",
             "get_child_result": "allow",
-            "terminate_child": "allow",
+            "terminate_child": "ask",
         }

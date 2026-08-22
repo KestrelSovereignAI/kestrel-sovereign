@@ -1242,6 +1242,7 @@ class AgentManager:
                     identity_export_dir=identity_export_dir,
                     isolated_runtime_root=runtime_root,
                     isolated_runtime_namespace=runtime_namespace,
+                    isolated_runtime_legacy_root=resolved_dir / "feature_venvs",
                     isolated_runtime_hosted=True,
                     semantic_inference_profile=semantic_inference_profile,
                     semantic_inference_limits=semantic_inference_limits,
@@ -2435,6 +2436,13 @@ class AgentManager:
                     # runtime removal.
                     if authority is not None and authority[0] == name:
                         self._revoke_scheduler_authority(name, agent_id)
+                        if offboard_runtime:
+                            pending_offboarding.append(
+                                self._start_agent_runtime_offboarding_identity(
+                                    name=name,
+                                    agent_id=agent_id,
+                                )
+                            )
                         logger.info(
                             "Revoked cold scheduler authority for agent %r",
                             name,
@@ -2585,6 +2593,44 @@ class AgentManager:
             agent_name=name,
             agent_id=_loaded_agent_did(agent) or "<unknown>",
             runtime_path=_agent_runtime_path(agent),
+            task=cleanup_task,
+        )
+        record_key = id(cleanup_task)
+        self._inflight_runtime_offboardings[record_key] = record
+
+        def retire_inflight(_task: "asyncio.Future[object]") -> None:
+            self._inflight_runtime_offboardings.pop(record_key, None)
+
+        cleanup_task.add_done_callback(retire_inflight)
+        return record
+
+    def _start_agent_runtime_offboarding_identity(
+        self,
+        *,
+        name: str,
+        agent_id: str,
+    ) -> InflightRuntimeOffboarding:
+        """Admit deletion for an authorized cold agent without constructing it."""
+
+        from kestrel_sovereign.features.isolated_runtime import (
+            remove_isolated_runtime_namespace,
+            resolve_isolated_runtime_namespace,
+        )
+
+        root, namespace = self._isolated_runtime_scope(agent_id)
+        scope = resolve_isolated_runtime_namespace(root, namespace)
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(
+                remove_isolated_runtime_namespace,
+                scope,
+                agent_id,
+            ),
+            name=f"isolated_runtime_namespace_offboard:{name}",
+        )
+        record = InflightRuntimeOffboarding(
+            agent_name=name,
+            agent_id=agent_id,
+            runtime_path=scope.path,
             task=cleanup_task,
         )
         record_key = id(cleanup_task)
@@ -3253,6 +3299,9 @@ class AgentManager:
         # still refund the hold.  Treat it as a completed removal rather than
         # silently retaining money because there is no routing entry.
         ordinary_budget_release: Optional[InflightRemovalBudgetRelease] = None
+        handoff_offboarding_pending: Optional[
+            RuntimeOffboardingRetainedError
+        ] = None
         async with self._lock:
             if self._quarantined_shutdown_handoffs_sealed:
                 logger.warning(
@@ -3323,6 +3372,16 @@ class AgentManager:
                     shutdown_task=shutdown_task,
                     offboard_runtime=offboard_runtime,
                 )
+                if shutdown_handed_off and offboard_runtime:
+                    handoff_offboarding_pending = RuntimeOffboardingRetainedError(
+                        agent_name=name,
+                        agent_id=_loaded_agent_did(agent) or "<unknown>",
+                        runtime_path=_agent_runtime_path(agent),
+                        cause=RuntimeError(
+                            "runtime offboarding is owned by quarantined shutdown"
+                        ),
+                        cleanup_pending=True,
+                    )
                 if shutdown_handed_off:
                     logger.warning(
                         "Agent '%s' shutdown was cancelled; durable cleanup is "
@@ -3344,6 +3403,16 @@ class AgentManager:
                     shutdown_task=shutdown_task,
                     offboard_runtime=offboard_runtime,
                 )
+                if shutdown_handed_off and offboard_runtime:
+                    handoff_offboarding_pending = RuntimeOffboardingRetainedError(
+                        agent_name=name,
+                        agent_id=_loaded_agent_did(agent) or "<unknown>",
+                        runtime_path=_agent_runtime_path(agent),
+                        cause=TimeoutError(
+                            "runtime offboarding awaits quarantined shutdown"
+                        ),
+                        cleanup_pending=True,
+                    )
                 if shutdown_handed_off:
                     logger.warning(
                         "Agent '%s' exceeded its shutdown bound; durable cleanup "
@@ -3496,6 +3565,8 @@ class AgentManager:
             terminal_outcomes.append(asyncio.CancelledError())
         if release_failure is not None:
             terminal_outcomes.append(release_failure)
+        if handoff_offboarding_pending is not None:
+            terminal_outcomes.append(handoff_offboarding_pending)
         _raise_lifecycle_outcomes(
             f"Agent {name!r} removal had terminal budget outcomes",
             terminal_outcomes,
@@ -4577,7 +4648,13 @@ class AgentManager:
         """Get the SpawnMandate for a child agent."""
         return self._child_mandates.get(child_name)
 
-    async def terminate_child(self, parent_did: str, child_name: str) -> bool:
+    async def terminate_child(
+        self,
+        parent_did: str,
+        child_name: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
         """Terminate a specific child agent and its descendants.
 
         Removes the child from the parent-child map, terminates any
@@ -4586,6 +4663,10 @@ class AgentManager:
         Args:
             parent_did: DID of the parent agent.
             child_name: Name of the child to terminate.
+            offboard_runtime: Explicit destructive intent. The compatibility
+                default stops/unpublishes the child while retaining its
+                isolated runtime for restart; only an approved deprovisioning
+                path may set this true.
 
         Returns:
             True if the child was found and terminated.
@@ -4593,6 +4674,8 @@ class AgentManager:
         children = self._parent_children.get(parent_did, [])
         if child_name not in children:
             return False
+        if type(offboard_runtime) is not bool:
+            raise TypeError("offboard_runtime must be a bool")
 
         terminal_outcomes: list[BaseException] = []
 
@@ -4603,7 +4686,13 @@ class AgentManager:
         child_agent = self.get_agent(child_name)
         if child_agent is not None:
             try:
-                await self.terminate_children(child_agent.agent_id)
+                if offboard_runtime:
+                    await self.terminate_children(
+                        child_agent.agent_id,
+                        offboard_runtime=True,
+                    )
+                else:
+                    await self.terminate_children(child_agent.agent_id)
             except BaseException as exc:
                 if not _is_lifecycle_terminal_outcome(exc):
                     raise
@@ -4625,7 +4714,7 @@ class AgentManager:
         try:
             removed = await self.remove_agent(
                 child_name,
-                offboard_runtime=True,
+                offboard_runtime=offboard_runtime,
             )
         except BaseException as exc:
             if not _is_lifecycle_terminal_outcome(exc):
@@ -4721,21 +4810,38 @@ class AgentManager:
         )
         return True
 
-    async def terminate_children(self, parent_did: str) -> int:
+    async def terminate_children(
+        self,
+        parent_did: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> int:
         """Terminate all children of a parent agent (cascading).
 
         Args:
             parent_did: DID of the parent whose children to terminate.
+            offboard_runtime: Whether to securely delete each descendant's
+                hosted runtime after shutdown. Defaults to retention.
 
         Returns:
             Number of children terminated.
         """
         children = list(self._parent_children.get(parent_did, []))
+        if type(offboard_runtime) is not bool:
+            raise TypeError("offboard_runtime must be a bool")
         count = 0
         terminal_outcomes: list[BaseException] = []
         for child_name in children:
             try:
-                if await self.terminate_child(parent_did, child_name):
+                if offboard_runtime:
+                    terminated = await self.terminate_child(
+                        parent_did,
+                        child_name,
+                        offboard_runtime=True,
+                    )
+                else:
+                    terminated = await self.terminate_child(parent_did, child_name)
+                if terminated:
                     count += 1
             except BaseException as exc:
                 if not _is_lifecycle_terminal_outcome(exc):

@@ -575,6 +575,7 @@ class KestrelAgent(
         isolated_feature_data_dir: Optional[Path] = None,
         isolated_runtime_root: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_legacy_root: Optional[str | os.PathLike[str]] = None,
         isolated_runtime_hosted: bool = False,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
@@ -643,6 +644,11 @@ class KestrelAgent(
             isolated_runtime_namespace: Canonical relative tenant/agent
                        namespace below ``isolated_runtime_root``. The runtime
                        validates it and securely binds it to this agent DID.
+            isolated_runtime_legacy_root: Explicit, agent-scoped location of
+                       the released hosted feature runtime layout. Managed
+                       factories may supply this only to adopt existing
+                       ``feature_venvs/<ClassName>`` state into the new
+                       namespace; it is never a runtime fallback.
             isolated_runtime_hosted: Declares that this agent shares a host
                        runtime. Discovery of an isolated feature fails closed
                        unless an explicit root and namespace were supplied.
@@ -707,6 +713,7 @@ class KestrelAgent(
         self.isolated_runtime_root: Optional[Path] = None
         self.isolated_runtime_namespace: Optional[Path] = None
         self.isolated_runtime_path: Optional[Path] = None
+        self.isolated_runtime_legacy_root: Optional[Path] = None
         self.isolated_runtime_scope = None
         if isolated_runtime_root is not None or isolated_runtime_namespace is not None:
             # Keep the hosted runtime boundary owned by the isolated-runtime
@@ -715,6 +722,7 @@ class KestrelAgent(
             # feature, rather than deriving mutable placement from database
             # storage (which PostgreSQL-backed hosted agents deliberately lack).
             from kestrel_sovereign.features.isolated_runtime import (
+                resolve_legacy_isolated_runtime_root,
                 resolve_isolated_runtime_namespace,
             )
 
@@ -725,6 +733,18 @@ class KestrelAgent(
             self.isolated_runtime_namespace = runtime_scope.namespace
             self.isolated_runtime_path = runtime_scope.path
             self.isolated_runtime_scope = runtime_scope
+            if isolated_runtime_legacy_root is not None:
+                self.isolated_runtime_legacy_root = (
+                    resolve_legacy_isolated_runtime_root(
+                        isolated_runtime_legacy_root,
+                        runtime_scope,
+                    )
+                )
+        elif isolated_runtime_legacy_root is not None:
+            raise ValueError(
+                "isolated_runtime_legacy_root requires the hosted isolated "
+                "runtime root/namespace contract"
+            )
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
         # attribute from birth — no construction path (fleet load, spawn /
