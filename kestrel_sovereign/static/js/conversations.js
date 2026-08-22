@@ -858,6 +858,13 @@ export function mountConversations(containerEl, config = {}) {
         // rows shown with Archived actions). Same guard identity.js's list had
         // (conversationListRequestSeq, #1358).
         const seq = ++refreshSeq;
+        // Any continuation still fetching belongs to the generation this
+        // supersedes. Cleared HERE rather than only in setView/retarget,
+        // because an ordinary same-view reload — after a rename, an archive, a
+        // trash, a New conversation, or a host-triggered refresh — bumps the
+        // generation too, and a flag left set then leaves the reloaded list's
+        // Load more button disabled as "Loading…" for good.
+        loadingMore = false;
         try {
             const page = await loadData();
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
@@ -935,10 +942,9 @@ export function mountConversations(containerEl, config = {}) {
         // that minted it — the server refuses one replayed against another —
         // so a Load more clicked in the window before the new page lands would
         // otherwise send the previous view's token and fail (#2960). The
-        // in-flight flag goes with it: whatever continuation is still running
-        // belongs to the view being left.
+        // (The in-flight flag is cleared by the refresh() below, which every
+        // ownership change goes through.)
         nextCursor = null;
-        loadingMore = false;
         searchTerm = '';
         search.value = '';
         searchResults = null;
@@ -949,10 +955,8 @@ export function mountConversations(containerEl, config = {}) {
 
     function retarget(nextAgentName) {
         agentName = nextAgentName;
-        // The previous agent's place in the previous agent's list, and
-        // whatever continuation is still fetching it.
+        // The previous agent's place in the previous agent's list.
         nextCursor = null;
-        loadingMore = false;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
         // A pending/answered server search belongs to the OLD agent — drop it
         // so stale hits never paint post-switch; refresh() re-runs the search

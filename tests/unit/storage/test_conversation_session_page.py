@@ -37,11 +37,13 @@ import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_sessions import (
+    SESSION_CURSOR_MAX_LENGTH,
     ConversationSessionProjection,
     SessionCursorError,
     decode_session_cursor,
     encode_session_cursor,
 )
+from kestrel_sovereign.storage.session_id_column import SESSION_ID_MAX_LENGTH
 from kestrel_sovereign.storage.session_grouping import (
     SESSION_ORDER,
     session_cursor_after,
@@ -379,6 +381,105 @@ def test_a_cursor_carrying_a_real_timestamp_is_accepted():
     assert decode_session_cursor(token, "active") == (
         "2026-05-01 09:00:00", "sess-001",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_id",
+    ["x" * (SESSION_ID_MAX_LENGTH + 1), "a\x00b", "\ud800", "\U0001F642" * 200],
+    ids=["too-long", "nul", "lone-surrogate", "too-long-in-bytes"],
+)
+async def test_a_key_the_primary_key_cannot_hold_is_refused(tmp_path, session_id):
+    """Openable is not the same question as storable, and both must hold.
+
+    #2960 widened the list to key on whatever the grouper produced, so an id no
+    longer has to fit Phase A's column charset — that is what keeps
+    ``rasa_shim``'s ``sms:{sender}`` sessions listed. It does still have to fit
+    this table's own primary key: PostgreSQL cannot hold a NUL in TEXT, cannot
+    encode a lone surrogate, and refuses a composite B-tree entry past ~2704
+    bytes.
+
+    The consequence of getting that wrong is not a lost session. ``_store``
+    raises inside the repair that runs on the first page of every conversation
+    list, so ONE such row would fail the whole list for that agent until
+    somebody edited the database by hand.
+    """
+    db = await AsyncDatabase.sqlite(str(tmp_path / "unstorable.db"))
+    try:
+        for index, text in enumerate(("first", "second")):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, created_at) "
+                "VALUES (?, 'user', ?, ?, ?)",
+                (AGENT, text, json.dumps({"session_id": session_id}),
+                 f"2026-05-01 09:0{index}:00"),
+            )
+        projection = ConversationSessionProjection(db, AGENT)
+        # The point is that this does not RAISE, and that the list still works.
+        await projection.repair()
+        assert [r["session_id"] for r in await projection.page(limit=10)] == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_key_the_column_forbids_but_the_key_can_hold_is_listed(tmp_path):
+    """...and the bound is not simply the column contract wearing a new name."""
+    db = await AsyncDatabase.sqlite(str(tmp_path / "storable.db"))
+    try:
+        for index, text in enumerate(("first", "second")):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, created_at) "
+                "VALUES (?, 'user', ?, ?, ?)",
+                (AGENT, text, json.dumps({"session_id": "sms:+15551234567"}),
+                 f"2026-05-01 09:0{index}:00"),
+            )
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        assert [r["session_id"] for r in await projection.page(limit=10)] == [
+            "sms:+15551234567"
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ["\x01" * SESSION_ID_MAX_LENGTH, '"' * SESSION_ID_MAX_LENGTH,
+     "\U0001F642" * (SESSION_ID_MAX_LENGTH // 4), "x" * SESSION_ID_MAX_LENGTH],
+    ids=["control-chars", "quotes", "emoji", "plain"],
+)
+def test_every_token_the_server_can_mint_fits_the_parameter_that_takes_it(session_id):
+    """A `next_cursor` the endpoint's own parameter refuses is a page boundary
+    nothing can cross — this ticket's bug, wearing a 422.
+
+    The worst case is not the longest id but the most heavily ESCAPED one: JSON
+    turns an ASCII control character into a six-byte ``u`` escape, which
+    is where the bound's multiplier comes from.
+    """
+    token = encode_session_cursor(
+        {"last_message_at": "2026-01-01 00:00:00.123456", "session_id": session_id},
+        "archived",
+    )
+    assert len(token) <= SESSION_CURSOR_MAX_LENGTH, (
+        f"a {len(session_id)}-character id minted a {len(token)}-character "
+        f"token, past the {SESSION_CURSOR_MAX_LENGTH} the endpoint accepts"
+    )
+    assert decode_session_cursor(token, "archived")[1] == session_id
+
+
+@pytest.mark.parametrize("keys", [[None, "s"], ["2026-05-01 09:00:00", None], [None, None]])
+def test_a_cursor_carrying_a_null_key_is_refused(keys):
+    """No server mints one — both ordering keys are NOT NULL — and accepting it
+    fails differently on each path: the Python continuation compares a string
+    with ``None`` and raises (a 500), the SQL one compares against NULL and
+    quietly serves an empty page."""
+    token = base64.urlsafe_b64encode(
+        json.dumps({"v": 1, "view": "active", "k": keys}).encode()
+    ).decode().rstrip("=")
+    with pytest.raises(SessionCursorError):
+        decode_session_cursor(token, "active")
 
 
 @pytest.mark.asyncio

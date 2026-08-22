@@ -398,6 +398,50 @@ async def test_every_session_is_reachable_by_paging_a_history_past_the_old_windo
 
 
 @pytest.mark.asyncio
+async def test_a_half_built_index_is_a_503_not_a_truncated_list(tmp_path):
+    """A partial projection is missing the FRONT of the list, not the tail.
+
+    The walk goes forward by row id, so what a budget-exhausted repair has
+    written is the OLDEST sessions — while the list is ordered by most recent
+    activity. Serving it hands the user their oldest conversations, omits every
+    recent one, and ends with ``next_cursor: null``, which reads as the end of
+    a list that is missing its beginning.
+
+    503 says the index is not ready. It clears itself: the next request
+    continues the walk.
+    """
+    now = datetime(2026, 5, 1, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "half-built.db", [
+        ("user", "hello", "{}", now),
+        ("assistant", "hi", "{}", now + timedelta(minutes=1)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
+    try:
+        # A walk that can never land: every repair leaves the watermark short.
+        from kestrel_sovereign.storage.conversation_sessions import SessionWatermark
+
+        async def never_complete():
+            return SessionWatermark("gen", True, 1, 1, 0, 999)
+
+        with patch(
+            "kestrel_sovereign.storage.conversation_sessions"
+            ".ConversationSessionProjection.accounted",
+            side_effect=never_complete,
+        ):
+            response = _listed(app, "?limit=10")
+        assert response.status_code == 503
+        assert "still being built" in response.json()["detail"]
+        assert response.headers.get("Retry-After") == "5"
+
+        # ...and an index that IS complete serves normally, so the refusal is
+        # not simply refusing everything.
+        assert _listed(app, "?limit=10").status_code == 200
+    finally:
+        _restore_app(app, original)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_a_cursor_this_build_cannot_read_is_a_client_error(tmp_path):
     """A cursor is client-supplied text. Restarting at page one for an
     unreadable one answers a request for page nine with page one and looks like

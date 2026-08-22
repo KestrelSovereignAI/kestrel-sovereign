@@ -10,7 +10,11 @@ from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.storage.session_grouping import (
     autonomous_wake_preview,
 )
-from kestrel_sovereign.storage.conversation_sessions import SessionCursorError
+from kestrel_sovereign.storage.conversation_sessions import (
+    SESSION_CURSOR_MAX_LENGTH,
+    SessionCursorError,
+)
+from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -69,7 +73,9 @@ async def list_conversations(
     decrypt: bool = True,
     view: str = Query("active"),
     q: str = Query(None, min_length=1, max_length=256),
-    cursor: str = Query(None, min_length=1, max_length=1024),
+    cursor: str = Query(
+        None, min_length=1, max_length=SESSION_CURSOR_MAX_LENGTH
+    ),
 ):
     """List conversation sessions grouped by date/time.
 
@@ -199,6 +205,17 @@ async def list_conversations(
             # silently restarting at page one would answer a request for page
             # nine with page one and look like a list that forgot where it was.
             raise HTTPException(status_code=400, detail=f"Invalid cursor: {e}")
+        except ProjectionNotReady as e:
+            # The session index has not finished its first walk, so what it
+            # holds is the OLDEST conversations and the newest are missing with
+            # nothing in the response to say so. 503 with Retry-After: the next
+            # request continues the walk, so this clears itself.
+            logger.warning("Conversation list not ready for %s: %s", agent_id, e)
+            raise HTTPException(
+                status_code=503,
+                detail="The conversation index is still being built. Try again shortly.",
+                headers={"Retry-After": "5"},
+            )
 
         sessions = page["sessions"]
         for session in sessions:

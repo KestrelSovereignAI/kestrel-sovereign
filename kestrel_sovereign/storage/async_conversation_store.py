@@ -56,6 +56,25 @@ from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
 
+
+class ProjectionNotReady(RuntimeError):
+    """The session index is not complete enough to answer the list (#2960).
+
+    Its own type because the caller has to tell it from a storage failure: this
+    one is temporary and self-correcting — the next request continues the walk
+    — so it is a 503 rather than a 500.
+    """
+
+
+#: How many budgeted repairs one list request will run before refusing.
+#:
+#: Each is ``STEP_BUDGET * CHUNK_ROWS`` live rows, so this is tens of millions
+#: of rows for one agent — far past anything measured, and past the point where
+#: a synchronous rebuild belongs on a request at all. It is a backstop on the
+#: refusal, not a work budget: the loop exits the moment the walk lands, which
+#: for every agent this has been measured on is the first pass.
+REPAIR_PASSES = 8
+
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
 
@@ -3269,6 +3288,7 @@ class AsyncConversationStore:
             live_history_predicate,
         )
 
+
         # Named by the caller, defaulting to the one this store was built for.
         # Every other method here is bound to ``self.agent_id``, and this one
         # would be too if its caller were not the privacy wrapper, whose read
@@ -3282,7 +3302,7 @@ class AsyncConversationStore:
         after = decode_session_cursor(cursor, "active") if cursor else None
         projection = ConversationSessionProjection(self.db, agent)
         if after is None:
-            await projection.repair()
+            await self._repair_until_whole(projection)
         # One more than asked for, which is how "is there another page" is
         # answered without a second query and without a COUNT over the whole
         # table — the cost this table exists to remove.
@@ -3306,6 +3326,42 @@ class AsyncConversationStore:
             else None
         )
         return {"sessions": sessions, "next_cursor": next_cursor}
+
+    async def _repair_until_whole(
+        self, projection, *, passes: int = REPAIR_PASSES
+    ) -> None:
+        """Repair until the walk has reached its target, or refuse to serve.
+
+        A repair is budgeted — ``STEP_BUDGET`` chunks of ``CHUNK_ROWS`` — and
+        may legitimately stop part-way on a history bigger than that product.
+        The projection is then *partial*, and partial is not "a bit behind":
+        the walk goes forward by row id, so what it has written is the OLDEST
+        sessions, and the list is ordered by most recent activity. A partial
+        projection is therefore missing the FRONT of the list — the
+        conversations the user is most likely looking for — and it says so
+        nowhere: the last page comes back with ``next_cursor: null``, which
+        reads as the end of a list that is missing its beginning.
+
+        So this loops rather than serving what happens to be there, and if the
+        walk still has not landed it refuses. That is a worse answer for the
+        request and the only honest one: an error says the list is not ready,
+        while a truncated list says these are your conversations.
+
+        ``accounted().complete`` is the question, not ``RepairOutcome.current``.
+        They differ in the case that matters: a row arriving DURING a repair
+        makes ``current`` false while the walk has reached its target perfectly
+        well, and that is the ordinary state of an agent being written to. Only
+        an unfinished WALK leaves a hole.
+        """
+        for _ in range(max(1, int(passes))):
+            await projection.repair()
+            if (await projection.accounted()).complete:
+                return
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index is still being built; "
+            "serving it now would list the oldest conversations and omit the "
+            "newest, with nothing to say so"
+        )
 
     async def _preview_rows(
         self,

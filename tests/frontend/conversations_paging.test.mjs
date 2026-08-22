@@ -162,6 +162,37 @@ test('a continuation still in flight does not disable the next view\'s button', 
     handle.destroy();
 });
 
+test('a same-view refresh clears a superseded continuation\'s lock', async () => {
+    // Not only view/agent changes take a new generation: an ordinary reload
+    // after a rename, an archive, a trash, a New conversation or a host-driven
+    // refresh does too. A continuation still in flight then belongs to the
+    // previous generation, and a flag left set leaves the reloaded list's Load
+    // more disabled as "Loading…" for the rest of the pane's life.
+    const el = makeContainer();
+    let release;
+    const stuck = new Promise((resolve) => { release = resolve; });
+    const api = {
+        getConversations: async (decrypt, view, cursor) => {
+            if (cursor === 'stuck') { await stuck; return { conversations: [], next_cursor: null }; }
+            return { conversations: [conversation('a')], next_cursor: cursor ? null : 'stuck' };
+        },
+        listTrash: async () => ({ messages: [] }),
+    };
+    const handle = mountConversations(el, { api, agentName: 'Emma' });
+    await settle();
+    moreBtn(el).click();          // never settles
+    await settle();
+    await handle.refresh();       // SAME view — the ordinary post-mutation reload
+    await settle();
+
+    const more = moreBtn(el);
+    assert.ok(more, 'the reloaded list offers its next page');
+    assert.equal(more.disabled, false,
+        'a superseded continuation left the reloaded list unable to page');
+    release();
+    handle.destroy();
+});
+
 test('a page that lands after a view switch is dropped, not appended', async () => {
     // The stale-response guard the list already has for refresh(), applied to
     // the continuation: appending a page belonging to the previous view paints

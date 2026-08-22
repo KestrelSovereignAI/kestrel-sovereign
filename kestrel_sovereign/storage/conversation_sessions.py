@@ -336,7 +336,12 @@ from .session_grouping import (
     timestamp_query_param,
 )
 from .conversation_ids import coerce_persistent_message_id
-from .session_id_column import SESSION_ID_KEY, is_stampable_session_id
+from .session_id_column import (
+    SESSION_ID_KEY,
+    SESSION_ID_MAX_LENGTH,
+    is_stampable_session_id,
+    is_storable_session_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -700,6 +705,31 @@ def _canonical_key(backend_type: str, column: str) -> str:
 
 
 
+#: The longest token :func:`encode_session_cursor` can produce, in characters.
+#:
+#: Derived, not chosen. The endpoint has to accept every token it hands out —
+#: a `next_cursor` its own parameter then refuses makes every session after
+#: that page boundary unreachable, which is this ticket's bug wearing a 422 —
+#: so the bound is computed from what a token can contain rather than set to a
+#: round number that looked large enough.
+#:
+#: Worst case, in bytes of JSON before base64:
+#:
+#: * the fixed envelope and the timestamp key: under 96 bytes, generously.
+#: * the session id: up to ``SESSION_ID_MAX_LENGTH`` bytes, and JSON escaping
+#:   is what makes that not the answer. A quote or a backslash doubles, and an
+#:   ASCII control character becomes ``\u00XX`` — six bytes for one. Six is
+#:   therefore the multiplier, and it is reachable: the storability rule admits
+#:   any text PostgreSQL can hold, which includes control characters.
+#:
+#: base64 is 4 characters per 3 bytes, and the padding is stripped.
+_CURSOR_ENVELOPE_BYTES = 96
+_JSON_WORST_ESCAPE = 6
+SESSION_CURSOR_MAX_LENGTH = (
+    ((_CURSOR_ENVELOPE_BYTES + _JSON_WORST_ESCAPE * SESSION_ID_MAX_LENGTH) + 2)
+    // 3
+) * 4
+
 #: The wire format of a page cursor. Stamped into every token and checked on
 #: the way back in, so a token minted by an older shape is refused rather than
 #: read as though its fields meant what they mean now.
@@ -743,6 +773,12 @@ def encode_session_cursor(session: Dict[str, Any], view: str) -> str:
                 "k": list(session_cursor_values(session)),
             },
             separators=(",", ":"),
+            # UTF-8 rather than ASCII escapes. A size choice, not a guard —
+            # what keeps a token inside the parameter that takes it is
+            # `SESSION_CURSOR_MAX_LENGTH`, which is derived from the escaped
+            # worst case and holds either way. This just stops an ordinary
+            # non-ASCII session id from costing twelve characters per emoji.
+            ensure_ascii=False,
         ).encode("utf-8")
     ).decode("ascii").rstrip("=")
 
@@ -777,8 +813,15 @@ def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
     if not isinstance(values, list) or len(values) != len(SESSION_ORDER):
         raise SessionCursorError("cursor does not carry this ordering's keys")
     for (column, _), value in zip(SESSION_ORDER, values):
-        if value is not None and not isinstance(value, str):
-            raise SessionCursorError("cursor's keys are not text")
+        # NULL is not a value this ordering can hold. Both keys are NOT NULL in
+        # the projection's schema and the grouper substitutes a stamp rather
+        # than omitting one, so a null key is a token no server minted — and
+        # letting it through is worse than refusing on every path: the Python
+        # continuation compares a string against ``None`` and raises
+        # ``TypeError`` (a 500), while the SQL one compares against NULL and
+        # quietly serves an empty page.
+        if not isinstance(value, str):
+            raise SessionCursorError(f"cursor's {column} is missing or not text")
         # Each key is checked against what its COLUMN is, not merely against
         # being a string. A token is client-supplied, and a timestamp key that
         # cannot be read is not a cursor this build cannot honour — it is one
@@ -788,8 +831,7 @@ def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
         # an error: ``'not-a-date'`` compares as text against canonical stamps
         # and simply selects the wrong page.
         if (
-            value is not None
-            and column not in SESSION_ORDER_TEXT_COLUMNS
+            column not in SESSION_ORDER_TEXT_COLUMNS
             and coerce_session_timestamp(value) is None
         ):
             raise SessionCursorError(f"cursor's {column} is not a timestamp")
@@ -1922,6 +1964,25 @@ def project_transcript(
             session_id not in metadata_keys_seen
             and coerce_persistent_message_id(session_id) is None
         ):
+            continue
+        # ...and this table's own primary key has to be able to hold it, which
+        # is a second question and not the same one. Openable says a reader can
+        # find the session; storable says PostgreSQL can put the key in a
+        # composite B-tree — no NUL, encodable, within the length bound. A key
+        # past one of those does not lose a session quietly: `_store` raises,
+        # inside the repair that runs on the first page of every conversation
+        # list, so the WHOLE list fails for that agent until the row is edited
+        # by hand. Refusing one session and saying so is the smaller harm, and
+        # it is said out loud because a dropped session is now a conversation
+        # missing from the UI.
+        if not is_storable_session_id(session_id):
+            logger.warning(
+                "conversation_sessions: session %r cannot be stored as a "
+                "projection key (%d bytes, NUL or unencodable); it will not "
+                "appear in the conversation list",
+                session_id[:64],
+                len(session_id.encode("utf-8", errors="replace")),
+            )
             continue
         # Asked of every session, whichever way its key was arrived at: a row
         # whose column names a different session is in the wrong place under
