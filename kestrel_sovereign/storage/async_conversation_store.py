@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
@@ -709,6 +710,20 @@ class AsyncConversationStore:
             projection, lexical_tokens_available = (
                 await self._conversation_lexical_purge_capability()
             )
+            # Same question as the lexical one, asked the same way and inside
+            # the same writer/DDL boundary: does this database HAVE the table
+            # whose rows must die alongside the messages? A database that never
+            # ran #3009's migration has no record table and therefore no
+            # records — nothing to leak — so the purge proceeds. Refusing a
+            # hard purge because a record of "we could not date this row" is
+            # unavailable would trade a real deletion for a bookkeeping one,
+            # which is the wrong way round for a privacy primitive
+            # (test_conversation_purge_schema_compat pins that a degraded
+            # schema keeps hard purge AVAILABLE).
+            #
+            # Existence, not exceptions: a DELETE that fails for any other
+            # reason must still take the transaction down with it.
+            undated_records_available = await self.db.table_exists(UNDATED_TABLE)
 
             active_scope = dict(scope)
             active_queries = selection_queries
@@ -790,6 +805,20 @@ class AsyncConversationStore:
                     (self.agent_id, *batch),
                 )
                 purged += _rows_affected(affected)
+                # In the SAME statement batch, and for the same reason the
+                # lexical tokens are: ``conversation_history_undated`` has no
+                # cascade either, and it holds the ORIGINAL text of a stamp
+                # #3009's migration could not read. That text came out of the
+                # agent's own history and can be anything at all, so a row left
+                # behind here is exactly the residue this primitive exists to
+                # prevent — a permanent purge that leaves the message's
+                # agent_id and a fragment of its content addressable.
+                if undated_records_available:
+                    await self.db.execute(
+                        f"DELETE FROM {UNDATED_TABLE} "
+                        f"WHERE agent_id = ? AND message_id IN ({placeholders})",
+                        (self.agent_id, *batch),
+                    )
 
             # Delete a key only after its selected owners are gone, and only
             # when no surviving row still owns it.  Legacy databases did not

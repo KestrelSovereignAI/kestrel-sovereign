@@ -22,6 +22,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kestrel_sovereign.storage.conversation_created_at import canonical_created_at
+
 
 def extract_messages(jsonl_path: str) -> list[dict]:
     """Extract human/assistant messages from Claude Code JSONL."""
@@ -124,10 +126,15 @@ def sync_to_agent(messages: list[dict], db_path: str, agent_id: str = None) -> d
         prefix = "[SESSION SYNC — birth session transcript]\n\n"
         tagged_content = prefix + msg["content"]
 
-        # Use original timestamp if available, otherwise now
-        ts = msg["timestamp"] if msg["timestamp"] else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        # Normalize timestamp format
-        ts = ts.replace("T", " ").split("+")[0].split(".")[0] if "T" in ts else ts
+        # Use original timestamp if available, otherwise now. Spelled by the
+        # module the column's CHECK is computed from (#3009) rather than by
+        # hand here: the hand-rolled version only normalized values containing
+        # a "T", so a space-separated value carrying an offset was written
+        # verbatim — which the CHECK now refuses — and it TRUNCATED the offset
+        # rather than applying it, dating "03:04:05+01:00" an hour late.
+        ts = canonical_created_at(msg["timestamp"]) or canonical_created_at(
+            datetime.now(timezone.utc)
+        )
 
         # No ``session_id`` (#2958). The column is derived from
         # ``metadata.session_id`` and the metadata built above never carries
