@@ -1575,6 +1575,7 @@ class PrivacyEnforcingStorage:
         # privacy transition must not land between the facade's policy check
         # and the producer returning its registered artifact.
         self._active_semantic_artifact_producer_leases = 0
+        self._active_session_projection_leases = 0
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -2181,6 +2182,40 @@ class PrivacyEnforcingStorage:
                 raise RuntimeError("semantic vector privacy lease underflow")
             self._active_semantic_vector_leases -= 1
 
+    def _acquire_session_projection_lease(self) -> bool:
+        """Fence a session-projection read against a privacy transition.
+
+        Returns whether a lease was taken — ``False`` means the mode is
+        EPHEMERAL and the caller must serve nothing rather than build anything.
+
+        The check and the lease are one step, under the same lock every other
+        lease uses, and that is the whole point. ``list_session_page`` reads the
+        mode and then AWAITS a repair that writes ``conversation_sessions`` and
+        its watermark. Without a lease the mode can flip to EPHEMERAL in that
+        window and the sweep can finish clearing those tables before the repair
+        resumes — so the repair republishes a description of pre-EPHEMERAL
+        conversations after the purge reported success. That is precisely the
+        hazard #2959 named and #2960 claimed to make unreachable by not
+        projecting; not projecting is only true if the decision cannot be
+        overtaken by the transition it is deciding about.
+
+        No new mechanism: ``set_privacy_mode`` already refuses a transition
+        while any lease is held, so adding this one to that list is the whole
+        of the fix.
+        """
+        with self._explicit_fact_lease_lock:
+            if self._privacy_config.is_ephemeral():
+                return False
+            self._active_session_projection_leases += 1
+            return True
+
+    def _release_session_projection_lease(self) -> None:
+        """Release one projection lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_session_projection_leases <= 0:
+                raise RuntimeError("session projection privacy lease underflow")
+            self._active_session_projection_leases -= 1
+
     def _acquire_semantic_artifact_producer_lease(self) -> None:
         """Fence a governed artifact producer before its policy checks.
 
@@ -2222,12 +2257,13 @@ class PrivacyEnforcingStorage:
                     self._active_explicit_fact_leases > 0
                     or self._active_semantic_vector_leases > 0
                     or self._active_semantic_artifact_producer_leases > 0
+                    or self._active_session_projection_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
-                    "explicit semantic fact, vector operation, or governed artifact "
-                    "producer is in flight; retry "
+                    "explicit semantic fact, vector operation, governed artifact "
+                    "producer, or session-projection read is in flight; retry "
                     "the transition after that operation completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
@@ -4267,9 +4303,19 @@ class PrivacyEnforcingStorage:
                 view=view,
             )
 
-        return await self._storage.list_session_page(
-            agent_id=agent_id, limit=bounded, cursor=cursor
-        )
+        # Leased across the await, not merely checked before it. The repair
+        # this triggers WRITES the projection, so a mode transition landing
+        # mid-await would let it republish pre-EPHEMERAL state after the sweep
+        # had cleared it.
+        if not self._acquire_session_projection_lease():
+            logger.debug("list_session_page blocked: ephemeral mode returns no data")
+            return {"sessions": [], "next_cursor": None}
+        try:
+            return await self._storage.list_session_page(
+                agent_id=agent_id, limit=bounded, cursor=cursor
+            )
+        finally:
+            self._release_session_projection_lease()
 
     async def search_conversations(
         self, agent_id: str, query: str, limit: int = 20, view: str = "active"

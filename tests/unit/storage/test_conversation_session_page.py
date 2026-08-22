@@ -543,6 +543,53 @@ async def test_a_page_rebuilt_underneath_the_read_is_not_returned(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_generation_rotated_under_the_read_invalidates_the_page(tmp_path):
+    """The fence asks the same question at both ends, generation included.
+
+    Rotating the generation leaves the watermark ROW untouched, so a fence that
+    compared only that row would pass — and return a page read from a cache
+    that has since been retired, ending with ``next_cursor: null``. The two
+    ends of a boundary have to ask one thing.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "rotated-under.db"))
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        store = await _store_with(db)
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        real_page = projection.page
+        rotations = {"count": 0}
+
+        async def page_then_rotate(*args, **kwargs):
+            rows = await real_page(*args, **kwargs)
+            rotations["count"] += 1
+            # The watermark row is deliberately NOT touched.
+            await db.execute(
+                "UPDATE conversation_history_changes "
+                "SET generation = ? WHERE agent_id = ? AND slot = 0",
+                (f"incarnation-{rotations['count']}", AGENT),
+            )
+            return rows
+
+        projection.page = page_then_rotate
+        with pytest.raises(ProjectionNotReady):
+            await store._page_a_whole_projection(
+                projection, limit=10, after=None, refresh=False
+            )
+        assert rotations["count"] > 1, "the read must be retried, not abandoned"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_a_watermark_from_a_retired_generation_does_not_serve_a_page(tmp_path):
     """``valid`` and ``complete`` can both hold over a cache that is gone.
 

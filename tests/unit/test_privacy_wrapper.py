@@ -2,6 +2,7 @@
 Tests for the Privacy-Enforcing Storage Wrapper.
 """
 
+import asyncio
 import warnings
 import json
 from datetime import datetime, timedelta
@@ -482,6 +483,18 @@ class TestPrivacyAwareQueries:
         mock_storage.list_session_page = AsyncMock()
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
 
+        # EVERY branch, not only the projection one. The archived view reads
+        # rows directly and the isolated branch reads a buffer, so a guard that
+        # only covered the projection would leak both.
+        for view in ("active", "archived", "nonsense"):
+            assert await wrapper.list_session_page("agent-1", view=view) == {
+                "sessions": [], "next_cursor": None
+            }
+        # ...including with a buffer already holding messages from before the
+        # transition, which is the isolated branch's input.
+        wrapper._session_conversations.append(
+            {"role": "user", "content": "from before", "metadata": {}}
+        )
         assert await wrapper.list_session_page("agent-1") == {
             "sessions": [], "next_cursor": None
         }
@@ -528,6 +541,60 @@ class TestPrivacyAwareQueries:
         assert await wrapper.list_session_page("agent-1", view="archived") == {
             "sessions": [], "next_cursor": None
         }
+
+    @pytest.mark.asyncio
+    async def test_a_projection_read_refuses_a_privacy_transition_mid_flight(
+        self, mock_storage
+    ):
+        """The mode is LEASED across the await, not merely read before it.
+
+        The repair a page triggers WRITES the projection and its watermark. If
+        the mode could flip to EPHEMERAL while that is in flight, the sweep
+        could clear those tables and the repair could then republish a
+        description of pre-EPHEMERAL conversations after the purge reported
+        success — the exact hazard #2959 named and #2960 claims to make
+        unreachable by not projecting at all.
+        """
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_page(**kwargs):
+            entered.set()
+            await release.wait()
+            return {"sessions": [], "next_cursor": None}
+
+        mock_storage.list_session_page = slow_page
+        reading = asyncio.ensure_future(wrapper.list_session_page("agent-1"))
+        await entered.wait()
+        try:
+            with pytest.raises(PrivacyViolationError):
+                wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        finally:
+            release.set()
+            await reading
+        # ...and once it has returned, the transition is allowed again, so the
+        # lease is a fence rather than a lock somebody forgot to drop.
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_projection_read_takes_no_lease_under_ephemeral(self, mock_storage):
+        """EPHEMERAL serves nothing and leases nothing, so it cannot wedge a
+        later transition."""
+        mock_storage.list_session_page = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.EPHEMERAL)
+
+        assert await wrapper.list_session_page("agent-1") == {
+            "sessions": [], "next_cursor": None
+        }
+        mock_storage.list_session_page.assert_not_called()
+        assert wrapper._active_session_projection_leases == 0
+        wrapper.set_privacy_mode(PrivacyMode.NORMAL)
 
     @pytest.mark.asyncio
     async def test_a_grouped_page_mints_a_cursor_the_endpoint_accepts(

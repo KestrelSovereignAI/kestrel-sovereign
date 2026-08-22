@@ -3395,7 +3395,12 @@ class AsyncConversationStore:
                     # started will have finished by the next attempt.
                     continue
             rows = await projection.page(limit=limit, after=after)
-            if await projection.accounted() == before:
+            # The SAME question afterwards, generation included. Comparing the
+            # watermark row alone would miss a generation rotation — that
+            # leaves the row untouched — so a cache recreated under the read
+            # would pass the fence and return an obsolete page as the end of
+            # the list. A boundary has two ends and they have to ask one thing.
+            if await self._whole_watermark(projection) == before:
                 return rows
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index was rebuilt underneath "
