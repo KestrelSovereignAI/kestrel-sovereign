@@ -329,6 +329,7 @@ from .session_grouping import (
     coerce_session_timestamp,
     group_messages_into_sessions,
     session_cursor_clause,
+    parse_message_metadata,
     session_cursor_values,
     session_order_sql,
     timestamp_query_param,
@@ -1755,19 +1756,6 @@ class SessionProjection:
     wake_source: Optional[str]
 
 
-def _parse_metadata(raw: Any) -> Dict[str, Any]:
-    """Metadata as the grouper wants it: a dict, or an empty one."""
-    if isinstance(raw, dict):
-        return raw
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def project_transcript(
     rows: Sequence[Sequence[Any]], expect: Optional[str] = None
 ) -> List[SessionProjection]:
@@ -1817,7 +1805,7 @@ def project_transcript(
                 # picker answers WHICH row rather than what it said. See the
                 # module docstring for why that is faithful.
                 "content": str(row_id),
-                "metadata": _parse_metadata(metadata),
+                "metadata": parse_message_metadata(metadata),
                 "created_at": created_at,
             }
         )

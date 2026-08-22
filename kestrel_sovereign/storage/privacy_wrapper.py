@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager, contextmanager
 
 from kestrel_sovereign.storage.session_grouping import (
     page_grouped_sessions,
+    parse_message_metadata,
     summarize_sessions,
 )
 from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
@@ -1473,24 +1474,14 @@ class _PrivacyGuardedSemanticVectorProjection:
 def _normalized_history_row(row: Sequence[Any]) -> Dict[str, Any]:
     """One ``conversation_history`` tuple as the grouper's message dict.
 
-    ``metadata`` is parsed to a dict here and the ``enc`` / ``sent_form`` flags
-    on it are what the endpoint's preview decoration reads, so an unreadable
-    document becomes an empty dict rather than dropping the row: a message with
-    a broken metadata blob is still a message in the conversation.
+    ``metadata`` is parsed to a dict here because the ``enc`` / ``sent_form``
+    flags on it are what the endpoint's preview decoration reads.
     """
-    metadata: Dict[str, Any] = {}
-    if row[3]:
-        try:
-            parsed = json.loads(row[3])
-            if isinstance(parsed, dict):
-                metadata = parsed
-        except (TypeError, ValueError) as e:
-            logger.warning(f"Failed to parse metadata for message {row[0]}: {e}")
     return {
         "id": row[0],
         "role": row[1],
         "content": row[2],
-        "metadata": metadata,
+        "metadata": parse_message_metadata(row[3]),
         "created_at": row[4],
     }
 

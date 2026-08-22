@@ -28,6 +28,7 @@ from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
     iso_session_timestamp,
+    parse_message_metadata,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
@@ -3315,20 +3316,9 @@ class AsyncConversationStore:
             f"WHERE agent_id = ? AND id IN ({placeholders}) AND {membership}",
             (self.agent_id, *message_ids),
         )
-        resolved: Dict[Any, Tuple[Any, Dict[str, Any]]] = {}
-        for row in rows:
-            metadata: Dict[str, Any] = {}
-            if row[2]:
-                try:
-                    parsed = json.loads(row[2])
-                    if isinstance(parsed, dict):
-                        metadata = parsed
-                except (TypeError, ValueError) as e:
-                    logger.warning(
-                        f"list_session_page: unreadable metadata on message {row[0]}: {e}"
-                    )
-            resolved[row[0]] = (row[1], metadata)
-        return resolved
+        return {
+            row[0]: (row[1], parse_message_metadata(row[2])) for row in rows
+        }
 
     @staticmethod
     def _as_listed_session(

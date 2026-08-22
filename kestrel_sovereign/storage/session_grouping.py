@@ -15,6 +15,7 @@ plain dicts, and hands them here.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -238,6 +239,33 @@ _GROUPING_EPOCH = datetime(1970, 1, 1)
 #: implementations, which is #2961's subject and not something a shared constant
 #: can fix.
 UNDATABLE_ROW_FALLBACK = _GROUPING_EPOCH
+
+
+def parse_message_metadata(raw: Any) -> Dict[str, Any]:
+    """A row's ``metadata`` as every reader of it wants: a dict, or an empty one.
+
+    ``metadata`` is free text and legacy rows hold documents no parser can read,
+    so an unreadable one becomes an empty dict rather than dropping the row: a
+    message with a broken blob is still a message in the conversation, and the
+    flags read off it (``enc``, ``sent_form``, ``new_session``) are absent
+    rather than wrong.
+
+    Authored once because three call sites had grown their own copy — the
+    projection's derivation, the list endpoint's normalization and the preview
+    resolution — and they disagreed about a JSON document that parses to
+    something other than an object. ``"[]"`` is valid JSON and is not metadata;
+    two of the three would have handed a list to code that calls ``.get``.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
