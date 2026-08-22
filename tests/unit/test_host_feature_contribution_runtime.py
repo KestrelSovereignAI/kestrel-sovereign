@@ -269,7 +269,11 @@ async def test_a_later_start_does_not_erase_an_earlier_rejection():
     assert refused.source.name in after_first[0].reason
 
     class _PeerHostFeature(SDKFixtureHostFeature):
+        # A genuinely DIFFERENT feature: overriding the contribution prefix
+        # alone leaves `.name` shared, which the supersede-by-name rule
+        # correctly reads as a retry of the same feature.
         contribution_prefix = "peer-host"
+        name = "peer-host"
 
     # A LATER, unrelated start succeeds...
     peer = _PeerHostFeature()

@@ -522,6 +522,46 @@ class FeatureContributionRuntime:
         # contribution left the incumbent in place, and unregistering that would
         # delete core's own source on a feature teardown (#2951).
         sources = active.registered_sources
+        # A registration another ACTIVE lifecycle still declares is still in
+        # use: feature B activating against an equivalent incumbent records no
+        # ownership, so tearing A down would remove the only registration while
+        # B's workflow is still dispatching against it.
+        #
+        # Ownership TRANSFERS rather than the teardown simply skipping it.
+        # Skipping leaks: B never registered the source, so when B later goes
+        # nothing removes it and the registration outlives every holder. Exactly
+        # one active lifecycle owns each feature-introduced registration, and
+        # here that owner changes hands (#2951).
+        #
+        # Matching by NAME is sufficient: a same-name source with a different
+        # contract is rejected at activation, so anything still active under
+        # this name is contract-equivalent by construction.
+        inherited = []
+        retained = []
+        for source in sources:
+            heir_id = next(
+                (
+                    other_id
+                    for other_id, other in self._active.items()
+                    if other_id != id(feature)
+                    and any(
+                        candidate.name == source.name
+                        for workflow in other.prepared.contributions.workflows
+                        for candidate in workflow.sources
+                    )
+                ),
+                None,
+            )
+            if heir_id is None:
+                retained.append(source)
+            else:
+                inherited.append((heir_id, source))
+        for heir_id, source in inherited:
+            heir = self._active[heir_id]
+            self._active[heir_id] = replace(
+                heir, registered_sources=heir.registered_sources + (source,)
+            )
+        sources = tuple(retained)
 
         # Validate every exact inverse before mutating any registry.
         for registration in values.wait_providers:

@@ -823,3 +823,39 @@ def test_host_feature_health_is_unchanged_with_no_host_context():
 
     payload = {"status": "healthy", "checks": []}
     assert _with_host_feature_rejections(types.SimpleNamespace(), payload) is payload
+
+
+def test_tearing_down_one_feature_keeps_a_source_another_still_declares(tmp_path):
+    """A shared source must outlive the first holder's teardown.
+
+    Feature B activating against an equivalent incumbent records no ownership,
+    so once A stopped owning everything it declared, tearing A down removed the
+    only registration while B's workflow was still dispatching against it. The
+    lease is derived from what is still active, not counted in the registry.
+    """
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+    second = _PeerFixtureFeature(agent)
+    # `second` declares a source EQUIVALENT to `first`'s, under the same name.
+    second.workflow_registration = type(second.workflow_registration)(
+        owner=second.contribution_owner,
+        name=second.workflow_registration.name,
+        actor=second.actor,
+        sources=(first.source,),
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    # Activated separately — together they would be a within-batch duplicate.
+    runtime.activate(runtime.prepare_transition((first,)).only())
+    runtime.activate(runtime.prepare_transition((second,)).only())
+    assert runtime.source_registry.get(first.source.name) is first.source
+
+    runtime.deactivate(first)
+
+    # `second` is still active and still dispatches against that source.
+    assert runtime.is_active(second)
+    assert runtime.source_registry.get(first.source.name) is first.source
+
+    # Once the last holder goes, so does the registration.
+    runtime.deactivate(second)
+    assert runtime.source_registry.get(first.source.name) is None

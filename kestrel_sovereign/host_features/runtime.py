@@ -193,11 +193,16 @@ async def start_host_features(
     # reporting feature A the moment a later call started feature B cleanly.
     # A prior rejection is superseded only for a feature THIS call carried —
     # its verdict now comes from this transition (#2951).
-    retried = {id(feature) for feature in features}
+    # Superseded by stable NAME, not object id: a fixed feature is retried as a
+    # freshly constructed instance, so an id-keyed match never fires and health
+    # goes on reporting a now-live feature as not loaded (#2951).
+    carried = {item.feature_name for item in transition.accepted} | {
+        rejection.feature_name for rejection in transition.rejected
+    }
     ctx.rejected_host_feature_contributions = tuple(
         rejection
         for rejection in getattr(ctx, "rejected_host_feature_contributions", ()) or ()
-        if id(rejection.feature) not in retried
+        if rejection.feature_name not in carried
     ) + tuple(transition.rejected)
     previously_started = tuple(getattr(ctx, "started_host_features", ()))
     started: List[HostFeature] = []

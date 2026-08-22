@@ -3508,14 +3508,27 @@ async def health_detailed(request: Request):
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
+        # Safe mode does not exclude a refused feature — optional agent features
+        # can be rejected in safe mode, and host features start independently of
+        # the agent entirely. A diagnostic response that drops the diagnostics is
+        # the one place it is least affordable (#2951).
+        #
+        # `_with_contribution_rejections` reads through `getattr`, so a None
+        # agent is a no-op rather than a branch.
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "restricted",
-                "constitution_safe_mode": safe_mode_records,
-                "checks": [],
-                "tracing": tracing,
-            },
+            content=_with_host_feature_rejections(
+                request.app.state,
+                _with_contribution_rejections(
+                    agent,
+                    {
+                        "status": "restricted",
+                        "constitution_safe_mode": safe_mode_records,
+                        "checks": [],
+                        "tracing": tracing,
+                    },
+                ),
+            ),
         )
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
