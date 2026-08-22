@@ -489,6 +489,107 @@ def test_a_cursor_carrying_a_null_key_is_refused(keys):
         decode_session_cursor(token, "active")
 
 
+async def _store_with(db):
+    from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+    return AsyncConversationStore(db, agent_id=AGENT)
+
+
+@pytest.mark.asyncio
+async def test_a_page_rebuilt_underneath_the_read_is_not_returned(tmp_path):
+    """The readiness check and the read are ONE observation, or they are two.
+
+    Another request's repair clears the table and commits its chunks as it
+    goes, so a page read in that window is a partial one — and its last row
+    comes back with ``next_cursor: null``, which is a truncated list wearing the
+    shape of a complete one. The watermark is therefore read again afterwards
+    and required to be identical; it moves only when a repair writes it.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "rebuilt-under.db"))
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        store = await _store_with(db)
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+
+        # A repair lands between the check and the read, every time.
+        real_page = projection.page
+        rebuilt = {"count": 0}
+
+        async def page_after_a_rebuild(*args, **kwargs):
+            rebuilt["count"] += 1
+            await db.execute(
+                "UPDATE conversation_session_watermarks "
+                "SET accounted_stamp = accounted_stamp + 1 WHERE agent_id = ?",
+                (AGENT,),
+            )
+            return await real_page(*args, **kwargs)
+
+        projection.page = page_after_a_rebuild
+        with pytest.raises(ProjectionNotReady):
+            await store._page_a_whole_projection(
+                projection, limit=10, after=None, refresh=False
+            )
+        assert rebuilt["count"] > 1, "the read must be retried, not abandoned"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_watermark_from_a_retired_generation_does_not_serve_a_page(tmp_path):
+    """``valid`` and ``complete`` can both hold over a cache that is gone.
+
+    Recreating the sessions table rotates the change-stamp generation and
+    leaves the watermark, which then describes rows that no longer exist. Both
+    numbers still line up, so a check that asked only those two would page an
+    empty cache and report the end of the list.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "old-generation.db"))
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        store = await _store_with(db)
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        accounted = await projection.accounted()
+        assert accounted.valid and accounted.complete
+
+        # What recreating the cache does: the rows go, the generation rotates,
+        # the watermark stays.
+        await db.execute("DELETE FROM conversation_sessions WHERE agent_id = ?", (AGENT,))
+        await db.execute(
+            "UPDATE conversation_history_changes SET generation = 'a-new-incarnation' "
+            "WHERE agent_id = ? AND slot = 0",
+            (AGENT,),
+        )
+        still = await projection.accounted()
+        assert still.valid and still.complete, (
+            "the case only means something while the FLAGS still say current"
+        )
+
+        assert await store._whole_watermark(projection) is None
+        # A continuation repairs rather than refusing for ever, so it recovers.
+        rows = await store._page_a_whole_projection(
+            projection, limit=10, after=None, refresh=False
+        )
+        assert [r["session_id"] for r in rows] == ["1"]
+    finally:
+        await db.close()
+
+
 @pytest.mark.asyncio
 async def test_a_continuation_page_seeks_rather_than_rewalking(tmp_path):
     """Page nine must not cost what pages one through eight already paid.

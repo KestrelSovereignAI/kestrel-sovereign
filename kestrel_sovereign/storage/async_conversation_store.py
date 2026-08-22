@@ -75,6 +75,14 @@ class ProjectionNotReady(RuntimeError):
 #: for every agent this has been measured on is the first pass.
 REPAIR_PASSES = 8
 
+#: How many times a list request will re-read a page that was rebuilt under it.
+#:
+#: Each attempt is three primary-key reads and one bounded page query, so this
+#: is cheap; it is a bound on a race rather than on work. Losing it three times
+#: running means a projection being rebuilt continuously, which is a state to
+#: report rather than to keep retrying inside a request.
+_PAGE_ATTEMPTS = 3
+
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
 
@@ -3301,28 +3309,12 @@ class AsyncConversationStore:
         bounded = max(1, int(limit))
         after = decode_session_cursor(cursor, "active") if cursor else None
         projection = ConversationSessionProjection(self.db, agent)
-        if after is None:
-            await self._repair_until_whole(projection)
-        else:
-            # A continuation does not repair — moving the ground under a cursor
-            # is how a keyset page starts skipping rows — but it does have to
-            # ASK. Between two pages the projection can be discarded and rewalked
-            # (any delete, archive or purge makes the next repair a rebuild), and
-            # a page read mid-walk sees a partial table whose end is not the end
-            # of the list. Without this, the 503 protected page one and page two
-            # quietly returned `next_cursor: null` over a truncated cache.
-            #
-            # One primary-key read, and it asks the same question page one does.
-            accounted = await projection.accounted()
-            if not accounted.valid or not accounted.complete:
-                raise ProjectionNotReady(
-                    f"{agent}'s conversation index is being rebuilt; the page "
-                    "after this cursor would end early and say it was the end"
-                )
         # One more than asked for, which is how "is there another page" is
         # answered without a second query and without a COUNT over the whole
         # table — the cost this table exists to remove.
-        rows = await projection.page(limit=bounded + 1, after=after)
+        rows = await self._page_a_whole_projection(
+            projection, limit=bounded + 1, after=after, refresh=after is None
+        )
         has_more = len(rows) > bounded
         rows = rows[:bounded]
 
@@ -3342,6 +3334,73 @@ class AsyncConversationStore:
             else None
         )
         return {"sessions": sessions, "next_cursor": next_cursor}
+
+    async def _whole_watermark(self, projection):
+        """This projection's watermark if it describes the WHOLE history, else None.
+
+        Three questions, and all three have to hold before a page read means
+        anything:
+
+        * **valid** — something has been accounted for at all. All-zero is both
+          "never built" and "built over an empty history", and only the flag
+          separates them.
+        * **complete** — the walk reached its target. A part-walked projection
+          holds the OLDEST sessions (the walk goes forward by row id) while the
+          list is ordered by most recent activity, so it is missing the FRONT of
+          the list, not its tail.
+        * **the same generation** — the counters this watermark was compared
+          against are the ones standing now. A recreated cache rotates the
+          generation and leaves the watermark, which is then ``valid`` and
+          ``complete`` about a table that no longer exists; without this the
+          continuation would page an empty cache and call it the end.
+        """
+        accounted = await projection.accounted()
+        if not accounted.valid or not accounted.complete:
+            return None
+        if accounted.generation != await projection.observed_generation():
+            return None
+        return accounted
+
+    async def _page_a_whole_projection(
+        self, projection, *, limit: int, after, refresh: bool
+    ) -> List[Dict[str, Any]]:
+        """Read one page, having established the projection was whole THROUGHOUT.
+
+        The check and the read are one observation, not two. A repair started by
+        another request between them clears the table and commits chunks as it
+        goes, so a page read in that window is a partial one — and its last row
+        comes back with ``next_cursor: null``, which is a truncated list wearing
+        the shape of a complete one. So the watermark is read before and after
+        and required to be identical: it moves only when a repair writes it, and
+        that is exactly the concurrency this cannot tolerate. Ordinary appends
+        do not move it, so a page read beside a live conversation is unaffected.
+
+        ``refresh`` is page one, which repairs first so the list reflects
+        messages written since the last request. A continuation does not, on
+        purpose: repairing moves ``last_message_at``, and a keyset cursor
+        resumed against moved keys skips rows. It DOES repair when the
+        projection is not whole — the cursor is meaningless over a partial table
+        anyway, and refusing without repairing would make the 503 unclearable,
+        since only page-one requests would ever advance the walk.
+        """
+        for _ in range(_PAGE_ATTEMPTS):
+            before = await self._whole_watermark(projection)
+            if refresh or before is None:
+                await self._repair_until_whole(projection)
+                before = await self._whole_watermark(projection)
+                if before is None:
+                    # Whole a moment ago and not whole now: another repair got
+                    # in between. Try again rather than raise — the loop below
+                    # is where giving up lives, and a repair that has just
+                    # started will have finished by the next attempt.
+                    continue
+            rows = await projection.page(limit=limit, after=after)
+            if await projection.accounted() == before:
+                return rows
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index was rebuilt underneath "
+            f"{_PAGE_ATTEMPTS} attempts to read a page of it"
+        )
 
     async def _repair_until_whole(
         self, projection, *, passes: int = REPAIR_PASSES
@@ -3371,7 +3430,7 @@ class AsyncConversationStore:
         """
         for _ in range(max(1, int(passes))):
             await projection.repair()
-            if (await projection.accounted()).complete:
+            if await self._whole_watermark(projection) is not None:
                 return
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index is still being built; "
