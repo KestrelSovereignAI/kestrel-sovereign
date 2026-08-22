@@ -160,12 +160,25 @@ def canonical_timestamp_sql(backend_type: str, expression: str) -> str:
     column as itself is now both correct and indexable: a function call is not,
     which is why removing this is the point rather than a tidy-up.
 
+    **Only for a column that carries the constraint.** ``created_at`` does;
+    ``deleted_at`` and ``archived_at`` do not, and they are TIMESTAMP columns on
+    the same table written by the same code, so they look interchangeable at
+    every call site. SQLite history really does hold both spellings in them, and
+    comparing those as text is wrong in the direction that destroys data — a row
+    deleted at ``2026-06-01T11:59:59Z`` compares GREATER than a
+    ``2026-06-01 12:00:00`` cutoff and survives a purge that should have taken
+    it. So an unconstrained column keeps ``julianday``, and which columns are
+    constrained is read from :data:`CANONICAL_COLUMNS` rather than decided here.
+
     Kept as a function, and still called at every site, because the question
     "how is this column compared" must have exactly one answer. Two call sites
     spelling it differently is the defect ``canonical_order()`` was written to
-    end; an identity function that everyone routes through preserves that,
-    where inlining it would scatter the decision again.
+    end; inlining it would scatter the decision again.
     """
+    from .conversation_created_at import CANONICAL_COLUMNS
+
+    if backend_type == "sqlite" and expression not in CANONICAL_COLUMNS:
+        return f"julianday({expression})"
     return expression
 
 
@@ -193,8 +206,14 @@ def timestamp_predicate(backend_type: str, column: str, operator: str) -> str:
     """Compare timestamp columns and parameters across supported backends."""
     if operator not in {"<", ">", ">="}:
         raise ValueError(f"Unsupported timestamp comparison: {operator}")
+    # BOTH sides from the column's treatment, never judged independently. The
+    # placeholder is not a column and can carry no guarantee of its own, so
+    # asking `canonical_timestamp_sql` about "?" renders `julianday(?)` beside a
+    # bare `created_at` — text compared against a float, which SQLite answers by
+    # type order rather than by chronology and never raises. A destructive
+    # predicate built that way silently matches the wrong set.
     left = canonical_timestamp_sql(backend_type, column)
-    right = canonical_timestamp_sql(backend_type, "?")
+    right = "?" if left == column else canonical_timestamp_sql(backend_type, "?")
     return f"{left} {operator} {right}"
 
 

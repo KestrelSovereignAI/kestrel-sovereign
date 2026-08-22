@@ -558,3 +558,36 @@ def test_text_order_is_clock_order_for_everything_the_column_can_hold():
         "lexicographic order diverged from chronological order, which is the "
         "property that lets the ordering compare created_at as itself"
     )
+
+
+def test_a_predicate_compares_both_sides_the_same_way():
+    """The two halves of a comparison must get the SAME treatment (#3009).
+
+    Only ``created_at`` carries the canonical CHECK. ``deleted_at`` and
+    ``archived_at`` are TIMESTAMP columns on the same table, written by the same
+    code, and unconstrained — SQLite history really does hold both spellings in
+    them — so they still have to be compared through ``julianday``.
+
+    The placeholder is not a column and carries no guarantee of its own, so
+    asking about it independently renders ``julianday(?)`` beside a bare
+    ``created_at``: text compared against a float. SQLite answers that by TYPE
+    order rather than by chronology and never raises, so a destructive
+    predicate built that way silently matches the wrong set — and
+    ``purge_trash_older_than`` is one of these.
+    """
+    import sqlite3
+
+    assert timestamp_predicate("sqlite", "created_at", ">") == "created_at > ?"
+    assert timestamp_predicate("sqlite", "deleted_at", ">") == (
+        "julianday(deleted_at) > julianday(?)"
+    )
+
+    # And the mismatched form really does answer by type, not by clock.
+    engine = sqlite3.connect(":memory:")
+    mismatched = engine.execute(
+        "SELECT '2026-06-01 12:00:00' > julianday('2026-06-01 11:00:00')"
+    ).fetchone()[0]
+    assert mismatched == 1, (
+        "the premise died: SQLite no longer orders text above numbers, so a "
+        "mismatched comparison would now fail loudly instead of silently"
+    )

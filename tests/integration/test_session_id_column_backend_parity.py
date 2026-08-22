@@ -561,8 +561,8 @@ async def test_a_table_of_nothing_but_poison_still_migrates(db_backend):
         )
         assert [row[0] for row in values] == [None] * len(poison)
         # The index is the second thing an oversized id would have broken.
-        assert await db._index_exists(
-            "idx_conversation_agent_session", "conversation_history"
+        assert await _index_present(
+            db, "idx_conversation_agent_session", "conversation_history"
         )
 
 
@@ -1118,7 +1118,10 @@ async def test_a_decoy_index_in_an_earlier_schema_does_not_suppress_the_real_one
                 "JOIN pg_class t ON t.oid = i.indrelid "
                 "JOIN pg_namespace n ON n.oid = t.relnamespace "
                 "WHERE ix.relname = ? AND n.nspname = ?",
-                (index, target_schema),
+                (
+                    _wanted_index_name(db, index, "agent_id, session_id"),
+                    target_schema,
+                ),
             )
             assert owner == f"{target_schema}.conversation_history"
     finally:
@@ -1250,7 +1253,7 @@ async def test_concurrent_initializers_leave_exactly_one_index(postgres_db):
             "SELECT COUNT(*) FROM pg_index i "
             "JOIN pg_class c ON c.oid = i.indexrelid "
             "WHERE i.indrelid = to_regclass(?) AND c.relname = ?",
-            (table, index),
+            (table, _wanted_index_name(db, index, "agent_id")),
         )
         assert count == 1
         # Four takers, zero holders afterwards.
@@ -2083,6 +2086,8 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
     from kestrel_sovereign.storage.conversation_sessions import (
         FUNCTION_NAME_PREFIX,
         TRIGGER_NAME_PREFIX,
+        active_history_predicate,
+        canonical_order_index_columns,
         mutation_trigger_functions,
         mutation_triggers,
         projection_tables,
@@ -2115,8 +2120,18 @@ async def test_the_whole_projection_schema_lands_on_both_backends(db_backend):
         for entry in (_SESSION_PROJECTION_INDEX, _SESSION_FRONTIER_INDEX):
             name, table = entry[0], entry[1]
             assert await _index_present(db, name, table) is True
+        # Asked of the DEFINITION, not just the family: an index whose
+        # expression no longer matches the ORDER BY is not a slow index, it is
+        # no index, and the name is computed from what canonical_order()
+        # renders so the two cannot drift apart silently (#3009 step 5).
         assert await db._index_exists(
-            "idx_conversation_agent_canonical", "conversation_history"
+            _wanted_index_name(
+                db,
+                "idx_conversation_agent_canonical",
+                canonical_order_index_columns(db.backend_type),
+                active_history_predicate(),
+            ),
+            "conversation_history",
         ) is True, "the index the conversation list's ordering needs is absent"
 
 
