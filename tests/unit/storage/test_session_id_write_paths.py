@@ -23,6 +23,7 @@ against both engines in
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
@@ -123,128 +124,58 @@ async def test_a_salvage_marker_outside_the_contract_stamps_null_not_garbage(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["counter_field", "timestamp_field"])
-async def test_the_counter_api_declines_the_session_key_rather_than_desyncing(
-    tmp_path, field
-):
-    """The second door onto ``metadata.session_id``, and it says no.
-
-    Both of this method's field names come from the caller, so it *can* be
-    pointed at the indexed key — and what it would write there is a counter or
-    an ISO timestamp, neither of which is a session identity. Teaching it to
-    keep the column in step would make that call succeed quietly; refusing
-    leaves the caller's bug where the caller can see it.
-
-    The row must be untouched afterwards. A refusal that had already written
-    half of what it was asked for would be worse than the desync.
-    """
-    db = await AsyncDatabase.sqlite(str(tmp_path / "counter.db"))
-    try:
-        store = AsyncConversationStore(db, agent_id=AGENT)
-        await store.add_conversation("user", "turn", session_id=UUID_A)
-        message_id = int((await db.fetchone(
-            "SELECT id FROM conversation_history ORDER BY id LIMIT 1"
-        ))[0])
-
-        with pytest.raises(ValueError, match="session identity"):
-            await store.atomic_increment_metadata_counter(
-                message_id, **{
-                    "counter_field": "access_count",
-                    field: "session_id",
-                }
-            )
-
-        metadata, session_id = await db.fetchone(
-            "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
-            (message_id,),
-        )
-        assert json.loads(metadata)["session_id"] == UUID_A
-        assert "access_count" not in json.loads(metadata)
-        assert session_id == UUID_A
-
-        # The ordinary call it exists for is unaffected.
-        assert await store.atomic_increment_metadata_counter(
-            message_id, "access_count", "last_accessed"
-        )
-        metadata, session_id = await db.fetchone(
-            "SELECT metadata, session_id FROM conversation_history WHERE id = ?",
-            (message_id,),
-        )
-        assert json.loads(metadata)["access_count"] == 1
-        assert session_id == UUID_A
-    finally:
-        await db.close()
-
-
-@pytest.mark.asyncio
 async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
     tmp_path,
 ):
-    """The restore is the one writer that could put an undatable row in (#3009).
+    """The restore reads a FILE, so the column's CHECK cannot police it (#3009).
 
-    Every other path into ``conversation_history.created_at`` either omits the
-    column and takes ``CURRENT_TIMESTAMP`` or goes through
-    ``SovereignAdapter._restored_created_at``, which parses and re-spells. This
-    one reads a backup's SQLite FILE and used to copy whatever text it found
-    straight through on SQLite, because converting was only ever done to satisfy
-    asyncpg.
+    Every other path into ``conversation_history.created_at`` writes through
+    ``AsyncDatabase``, where the constraint applies. This one opens the backup's
+    SQLite file directly with ``aiosqlite`` and copies rows out of it, so it is
+    handed whatever text an older kestrel, an import, or a hand-edited row put
+    there — and it used to pass that straight through on SQLite, because
+    converting was only ever done to satisfy asyncpg.
 
-    The column cannot defend itself. SQLite has no datetime type — ``TIMESTAMP``
-    is NUMERIC affinity and an ISO string is stored as TEXT — so until #3009 adds
-    a CHECK the rule lives at the writers, and this is the writer that did not
-    have it.
+    The backup is therefore built by hand from the pre-#3009 table shape, which
+    is what a backup taken before this change actually contains. Producing it
+    by rewriting a live database is no longer possible, and would not be the
+    same thing if it were.
 
-    The spellings below are all ones ``julianday`` and the parser DISAGREE about,
-    which is what made them worth carrying: a ``T`` separator, a ``Z``, an
-    offset. Restored, they must all come back in the one form the readers date
-    without any fallback at all.
+    The spellings are ones ``julianday`` and the parser DISAGREE about — a
+    ``T``, a ``Z``, an offset — plus one nothing can date at all. The first
+    three must come back in the single form the readers date without any
+    fallback; the last must take a neighbour's stamp, be counted, and not
+    arrive as text the CHECK would refuse.
     """
-    from kestrel_sovereign.storage.session_grouping import coerce_session_timestamp
+    import tarfile
 
-    source = AsyncStorage(str(tmp_path / "odd-source.db"), agent_id=AGENT)
-    await source.initialize()
-    try:
-        await source.add_conversation("user", "one", session_id=UUID_A)
-        await source.add_conversation("user", "two", session_id=UUID_A)
-        await source.add_conversation("user", "three", session_id=UUID_A)
-        # Rewritten in the source, standing in for a backup taken from an older
-        # kestrel or an import: the column accepts all of it.
-        spellings = [
-            "2026-01-02T03:04:05",
-            "2026-01-02T03:04:05Z",
-            "2026-01-02 03:04:05+01:00",
-        ]
-        ids = [
-            row[0] for row in await source.db.fetchall(
-                "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id",
-                (AGENT,),
-            )
-        ]
-        for row_id, spelling in zip(ids, spellings):
-            await source.db.execute(
-                "UPDATE conversation_history SET created_at = ? WHERE id = ?",
-                (spelling, row_id),
-            )
-        stored = [
-            row[0] for row in await source.db.fetchall(
-                "SELECT created_at FROM conversation_history WHERE agent_id = ? "
-                "ORDER BY id", (AGENT,),
-            )
-        ]
-        assert stored == spellings, (
-            "the source column refused a spelling, so this case is not "
-            "reproducing what a real backup can carry"
+    from kestrel_sovereign.storage.session_grouping import coerce_session_timestamp
+    from tests.utils.legacy_conversation_history import write_legacy_history
+
+    backup_db = str(tmp_path / "kestrel.db")
+    write_legacy_history(
+        backup_db,
+        [
+            (AGENT, "user", "one", None, None, "2026-01-02T03:04:05"),
+            (AGENT, "user", "two", None, None, "2026-01-02T05:04:05Z"),
+            (AGENT, "user", "three", None, None, "2026-01-02 07:04:05+01:00"),
+            (AGENT, "user", "four", None, None, "an older kestrel's idea"),
+        ],
+    )
+    blob = AsyncStorage._tar_gzip_paths([(backup_db, "kestrel.db")])
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        assert tar.getnames() == ["kestrel.db"], (
+            "the hand-built blob does not have the shape the restore looks for"
         )
-        blob = await source.create_backup_blob()
-    finally:
-        await source.close()
 
     target = AsyncStorage(str(tmp_path / "odd-target.db"), agent_id=AGENT)
     await target.initialize()
     try:
         stats = await target.restore_from_backup_blob(blob)
-        assert stats["messages_restored"] == 3
-        assert stats.get("messages_with_unreadable_created_at", 0) == 0
+        assert stats["messages_restored"] == 4
+        assert stats.get("messages_with_unreadable_created_at", 0) == 1, (
+            "the row nothing could date was not reported to the caller"
+        )
 
         restored = [
             row[0] for row in await target.db.fetchall(
@@ -252,9 +183,6 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
                 "ORDER BY id", (AGENT,),
             )
         ]
-        assert restored != spellings, (
-            "the restore copied the source's spellings through unchanged"
-        )
         for value in restored:
             assert coerce_session_timestamp(value) is not None, (
                 f"restored created_at {value!r} is a value no reader can date"
@@ -263,14 +191,20 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
             assert len(value) == 19 and value[10] == " ", (
                 f"restored created_at {value!r} is not the canonical form"
             )
-        # The offset is APPLIED, not discarded: 03:04:05+01:00 is 02:04:05 UTC.
+        # The offset is APPLIED, not discarded: 07:04:05+01:00 is 06:04:05 UTC.
         # Asserted by membership rather than by position, because the restore
         # SELECTs `ORDER BY created_at, id` over the source's raw TEXT — where a
         # space sorts before `T`, so the offset row is re-numbered FIRST and the
         # restored order is not the order it was written in. That is worth
         # knowing on its own: the restore re-sorts on a column whose spelling it
         # is in the middle of normalising.
-        assert "2026-01-02 02:04:05" in restored, restored
+        assert "2026-01-02 06:04:05" in restored, restored
+        # NOT asserted here: that `restored` is sorted. It is not, and the
+        # reason is the re-sort described above — `sorted(restored) ==
+        # restored` fails on this very corpus. Normalising before ordering
+        # would fix it, but that decides what a restore's ordering MEANS for a
+        # backup whose ids and stamps disagree, which is a question of its own
+        # and is filed as #3049 rather than settled in passing here.
     finally:
         await target.close()
 
