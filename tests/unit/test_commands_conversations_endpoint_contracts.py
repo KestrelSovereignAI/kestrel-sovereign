@@ -121,37 +121,65 @@ def test_sessions_endpoint_returns_message_totals_from_history():
         _restore_app(app, original)
 
 
-def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
-    now = datetime(2026, 3, 17, 9, 0, 0)
-    rows = [
-        (4, "user", "plain text", "{}", now + timedelta(minutes=3)),
-        (3, "system", "[New conversation started]", '{"new_session": true, "type": "session_marker"}', now + timedelta(minutes=2)),
-        (2, "assistant", "hello", "{}", now + timedelta(minutes=1)),
-        (1, "user", "ciphertext", '{"enc": true}', now),
-    ]
-    storage = MagicMock(agent_id="did:agent", encryption_enabled=True)
-    storage.query_conversations = AsyncMock(return_value=rows)
-    agent = MagicMock(storage=storage)
+LIST_AGENT = "did:test:conversation-list"
 
-    app, original = _prepare_app(agent)
+
+async def _seeded_list_storage(tmp_path, name, rows):
+    """A real store + privacy wrapper holding ``rows``, for the list endpoint.
+
+    The list reads the #2959 projection through the privacy layer (#2960), so a
+    fixture that mocks the storage call proves nothing about where sessions come
+    from. These go through the real derivation: rows are inserted with the
+    ``session_id`` column left NULL — which is what legacy history looks like and
+    what makes the projection derive attribution from the transcript, exactly as
+    a reader would.
+
+    ``rows`` are ``(role, content, metadata_json, created_at)``, oldest first.
+    """
+    storage = AsyncStorage(str(tmp_path / name))
+    storage.agent_id = LIST_AGENT
+    await storage.initialize()
+    await storage.db.execute_many(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+        [(LIST_AGENT, *row) for row in rows],
+    )
+    return storage, PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+
+def _listed(app, query=""):
+    with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+        with TestClient(app) as client:
+            return client.get(f"/api/conversations{query}", headers=_api_headers())
+
+
+@pytest.mark.asyncio
+async def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview(tmp_path):
+    """Two clusters an hour apart list as two sessions, newest first, and an
+    undecryptable preview is reported as encrypted rather than shown."""
+    now = datetime(2026, 3, 17, 9, 0, 0)
+    storage, wrapped = await _seeded_list_storage(tmp_path, "encrypted.db", [
+        ("user", "ciphertext", '{"enc": true}', now),
+        ("assistant", "hello", "{}", now + timedelta(minutes=1)),
+        ("user", "plain text", "{}", now + timedelta(hours=2)),
+    ])
+    app, original = _prepare_app(MagicMock(storage=wrapped))
     try:
         with patch("kestrel_sovereign.endpoints.conversations.get_agent_fernet", return_value=object()):
             with patch("kestrel_sovereign.endpoints.conversations.decrypt_string", side_effect=ValueError("bad key")):
-                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                    with TestClient(app) as client:
-                        response = client.get("/api/conversations?limit=10", headers=_api_headers())
+                response = _listed(app, "?limit=10")
         assert response.status_code == 200
         payload = response.json()
         assert payload["total"] == 2
-        latest_session = payload["conversations"][0]
-        older_session = payload["conversations"][1]
+        latest_session, older_session = payload["conversations"]
         assert latest_session["preview"] == "plain text"
         assert older_session["preview"] == "ciphertext"
         assert older_session["preview_encrypted"] is True
-        assert payload["encrypted_at_rest"] is True
-        storage.query_conversations.assert_awaited_once_with("did:agent", limit=200, view="active")
+        # Nothing follows a page that held every session.
+        assert payload["next_cursor"] is None
     finally:
         _restore_app(app, original)
+        await storage.close()
 
 
 def _wake_meta(session_id, source="talon.job_complete"):

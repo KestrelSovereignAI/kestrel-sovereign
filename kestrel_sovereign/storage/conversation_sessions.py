@@ -333,6 +333,7 @@ from .session_grouping import (
     session_order_sql,
     timestamp_query_param,
 )
+from .conversation_ids import coerce_persistent_message_id
 from .session_id_column import SESSION_ID_KEY, is_stampable_session_id
 
 logger = logging.getLogger(__name__)
@@ -1847,23 +1848,48 @@ def project_transcript(
     projections: List[SessionProjection] = []
     for session in grouped:
         session_id = str(session["session_id"])
-        # Two questions, and they are not the same one. `is_stampable_session_id`
-        # asks whether the COLUMN could hold this value; the second asks whether
-        # this key came FROM that column at all.
+        # The requirement is that a reader can OPEN this key — #3001's `"-1"`
+        # case is what named it: a key that is neither a column value nor a row
+        # id lists a session no reader can open and no lifecycle tool can
+        # delete. There are exactly two ways a key satisfies that, because there
+        # are exactly two ways the grouper produces one.
         #
-        # The second used to be inferred from the first, because a key the
-        # grouper invented is a row id and a row id is all digits. That is a
-        # proxy, and #3001 broke it by making negative ids supported: `"-1"`
-        # contains a hyphen, so it is not all digits and sails through — and the
-        # projection then lists a session `coerce_persistent_message_id`
-        # refuses, which no reader can open and no lifecycle tool can delete.
-        # The rows carry their own `session_id`, so the question is asked of
-        # that instead of reconstructed from the key's shape.
-        if not is_stampable_session_id(session_id):
+        # 1. It came from the indexed column, and therefore from metadata.
+        #    `is_stampable_session_id` asks whether the column could hold it;
+        #    `columns_seen` asks whether it actually does. Both, because they are
+        #    different questions and the second used to be inferred from the
+        #    first.
+        # 2. The grouper INVENTED it, from the first row's id, for a legacy
+        #    cluster carrying no session id anywhere (#2012). That key is not in
+        #    the column and never can be — Phase A's contract excludes bare
+        #    integers on purpose — but it is exactly what the row-id resolver
+        #    opens, so `coerce_persistent_message_id` is the test, not the
+        #    column.
+        #
+        # Phase B dropped the second kind, on the grounds that absence is the
+        # permitted direction. It was, while nothing read this table. #2960
+        # makes this table THE conversation list, so a dropped session is a
+        # conversation that has vanished from the UI — which is the defect this
+        # epic exists to remove, arriving by a different route. Measured on
+        # Emma's live database: 473 of 1,522 live rows carry no session id.
+        #
+        # Storing them is sound because the two derivations cannot meet over
+        # one. A key of this kind exists only for a cluster with no stampable id
+        # anywhere, so at least one of its rows has a NULL column, so
+        # `_has_unstamped_rows()` is true, so every step takes THIS pass — the
+        # chunked fold, which is keyed on the column and could not maintain such
+        # a row, never runs while one can exist. And the transition out of that
+        # state cannot be reached by appends alone (removing an unstamped row is
+        # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
+        # discard clears any row left behind.
+        if is_stampable_session_id(session_id):
+            if session_id not in columns_seen:
+                continue
+        elif coerce_persistent_message_id(session_id) is None:
             continue
-
-        if session_id not in columns_seen:
-            continue
+        # Asked of every session, whichever way its key was arrived at: a row
+        # whose column names a different session is in the wrong place under
+        # either derivation, and for an invented key ANY non-NULL column is that.
         divergent = [
             message["id"]
             for message in session.get("messages", ())
