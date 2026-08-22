@@ -114,6 +114,26 @@ class TestAgentCancellation:
         assert "req-1" not in mock_agent._active_request_started_at
         assert mock_agent.active_request_ages() == {}
 
+    def test_duplicate_inflight_request_id_is_reference_counted(self, mock_agent):
+        """One retry cleanup must not unregister its still-running sibling."""
+        mock_agent.register_active_request("retry-id")
+        mock_agent.register_active_request("retry-id")
+        mock_agent._cancelled_requests.add("retry-id")
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+
+        assert mock_agent._active_request_counts["retry-id"] == 1
+        assert "retry-id" in mock_agent._active_request_ids
+        assert "retry-id" in mock_agent._active_request_started_at
+        assert "retry-id" in mock_agent._cancelled_requests
+
+        mock_agent._cleanup_cancelled_request("retry-id")
+
+        assert "retry-id" not in mock_agent._active_request_counts
+        assert "retry-id" not in mock_agent._active_request_ids
+        assert "retry-id" not in mock_agent._active_request_started_at
+        assert "retry-id" not in mock_agent._cancelled_requests
+
     def test_prune_removes_stale_request(self, mock_agent):
         """A request older than the window is pruned and returned."""
         mock_agent.register_active_request("stale")
@@ -221,6 +241,135 @@ class TestStopEndpoint:
         mock_agent.cancel_current_request.assert_called_once_with(request_id="req-123")
 
     @pytest.mark.asyncio
+    async def test_stop_endpoint_decodes_a_verbatim_invoke_header_echo_once(self):
+        """A response header copied into stop targets the original opaque ID.
+
+        X-Request-ID is a percent-encoded transport form.  The deliberate
+        literal percent and percent-looking text here catch both the old
+        literal-header bug and accidental double decoding.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.agent.invocation import invocation_id_response_header
+        from kestrel_sovereign.endpoints.agent import router
+
+        request_id = "cancel ☃ / 100% %E2%98%83?x=y#fragment"
+        header_echo = invocation_id_response_header(request_id)
+        app = FastAPI()
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.cancel_current_request = MagicMock(return_value=True)
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/stop",
+            headers={"X-Request-ID": header_echo},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["request_id"] == request_id
+        mock_agent.cancel_current_request.assert_called_once_with(request_id=request_id)
+
+    @pytest.mark.asyncio
+    async def test_stop_body_request_id_remains_literal_and_wins_over_header(self):
+        """Body IDs retain their historical precedence over header wire IDs."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.agent.invocation import invocation_id_response_header
+        from kestrel_sovereign.endpoints.agent import router
+
+        app = FastAPI()
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.cancel_current_request = MagicMock(return_value=True)
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/stop",
+            headers={"X-Request-ID": invocation_id_response_header("header ☃")},
+            json={"request_id": "body literal %E2%98%83"},
+        )
+
+        assert response.status_code == 200, response.text
+        mock_agent.cancel_current_request.assert_called_once_with(
+            request_id="body literal %E2%98%83"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_accepts_its_own_header_echo_without_forking_identity(self):
+        """The shared invoke/stream ingress decodes the echoed wire key once."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.agent.invocation import invocation_id_response_header
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        request_id = "stream ☃ / 100% %E2%98%83?retry=yes"
+        header_echo = invocation_id_response_header(request_id)
+        received_ids = []
+
+        async def _stream(*_args, **kwargs):
+            received_ids.append(kwargs["request_id"])
+            yield "ok"
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.process_input_streaming = _stream
+        mock_agent.register_active_request = MagicMock()
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            headers={"X-Request-ID": header_echo},
+            json={"input": "teach this"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Request-ID"] == header_echo
+        assert received_ids == [request_id]
+        mock_agent.register_active_request.assert_called_once_with(request_id)
+        mock_agent._cleanup_cancelled_request.assert_called_once_with(request_id)
+
+    @pytest.mark.asyncio
+    async def test_invoke_accepts_its_own_header_echo_without_forking_identity(self):
+        """Non-streaming invocation shares the canonical header wire contract."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.agent.invocation import invocation_id_response_header
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        request_id = "invoke ☃ / 100% %E2%98%83?retry=yes"
+        header_echo = invocation_id_response_header(request_id)
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.process_input = AsyncMock(return_value="ok")
+        mock_agent.register_active_request = MagicMock()
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        mock_agent._conversation_response_identity = MagicMock(return_value={})
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/invoke",
+            headers={"X-Request-ID": header_echo},
+            json={"input": "teach this"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Request-ID"] == header_echo
+        assert mock_agent.process_input.await_args.kwargs["invocation_id"] == request_id
+        mock_agent.register_active_request.assert_called_once_with(request_id)
+        mock_agent._cleanup_cancelled_request.assert_called_once_with(request_id)
+
+    @pytest.mark.asyncio
     async def test_stream_endpoint_emits_stop_notice_on_empty_cancelled_stream(self):
         """#2674 P2: a strict (fail-closed) response audit stopped before dispatch
         WITHHOLDS every chunk and returns cleanly, so ``process_input_streaming``
@@ -262,6 +411,142 @@ class TestStopEndpoint:
         # Exactly one notice — the post-loop emit must not double up with any
         # in-loop emit (there were no chunks, so only the fallback fires).
         assert response.text.count("Request stopped") == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_reuses_client_request_id_for_turn_provenance(self):
+        """A stream retry id is validated, echoed, and passed to the turn."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        received_ids = []
+
+        async def _stream(*args, **kwargs):
+            received_ids.append(kwargs["request_id"])
+            yield "ok"
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent.process_input_streaming = _stream
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+
+        client = TestClient(app)
+        response = client.post(
+            "/api/agent/stream",
+            json={"input": "teach this", "request_id": "retry-2765"},
+        )
+        retry_response = client.post(
+            "/api/agent/stream",
+            json={"input": "teach this", "request_id": "retry-2765"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] == "retry-2765"
+        assert retry_response.status_code == 200
+        assert retry_response.headers["X-Request-ID"] == "retry-2765"
+        assert response.headers["X-Stream-Delivery-ID"].startswith("stream:")
+        assert (
+            response.headers["X-Stream-Delivery-ID"]
+            != retry_response.headers["X-Stream-Delivery-ID"]
+        )
+        assert received_ids == ["retry-2765", "retry-2765"]
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_encodes_unicode_retry_id_without_orphaning_lifecycle(self):
+        """UTF-8 retry IDs remain raw to the turn and safe in response headers."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        received_ids = []
+
+        async def _stream(*args, **kwargs):
+            received_ids.append(kwargs["request_id"])
+            yield "ok"
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent.process_input_streaming = _stream
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            json={"input": "teach this", "request_id": "retry-☃"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["X-Request-ID"] == "retry-%E2%98%83"
+        assert received_ids == ["retry-☃"]
+        mock_agent._cleanup_cancelled_request.assert_called_once_with("retry-☃")
+
+    @pytest.mark.asyncio
+    async def test_stream_setup_failure_cleans_tap_and_request_lifecycle(self, monkeypatch):
+        """A response-construction error cannot strand a registered stream."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import kestrel_sovereign.endpoints.agent as agent_endpoints
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+        from kestrel_sovereign.streams.tap import AgentStreamTap
+
+        class ResponseConstructionFailure:
+            def __init__(self, *args, **kwargs):
+                raise UnicodeEncodeError("latin-1", "☃", 0, 1, "ordinal not in range")
+
+        AgentStreamTap.reset()
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        mock_agent = MagicMock()
+        mock_agent.register_active_request = MagicMock()
+        mock_agent._cleanup_cancelled_request = MagicMock()
+        mock_agent.storage.resolve_session_id = AsyncMock(side_effect=lambda s: s)
+        app.state.agent = mock_agent
+        monkeypatch.setattr(agent_endpoints, "StreamingResponse", ResponseConstructionFailure)
+
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/api/agent/stream",
+            json={"input": "teach this", "request_id": "cleanup-retry-2765"},
+        )
+
+        assert response.status_code == 500
+        mock_agent._cleanup_cancelled_request.assert_called_once_with("cleanup-retry-2765")
+        assert AgentStreamTap.get_instance()._queues == {}
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_rejects_invalid_client_request_id(self):
+        """Malformed retry ids never reach cancellation or provenance code."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        app.state.agent = MagicMock()
+
+        client = TestClient(app)
+        response = client.post(
+            "/api/agent/stream",
+            json={"input": "teach this", "request_id": ""},
+        )
+
+        assert response.status_code == 400
 
     @pytest.mark.asyncio
     async def test_stream_endpoint_late_cancel_after_completed_output_no_stop_notice(self):

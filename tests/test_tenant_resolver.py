@@ -156,10 +156,46 @@ def test_host_config_mapping_injects_resolver():
     # With a multi-agent-style config the resolver is still present alongside
     # the host bind/port/agents keys.
     cfg = SimpleNamespace(
-        host=SimpleNamespace(bind="0.0.0.0", port=8888),
+        host=SimpleNamespace(
+            bind="0.0.0.0",
+            port=8888,
+            features={
+                "talon": {
+                    "runtime": {"project_parent": "/srv/kestrel/projects"}
+                }
+            },
+        ),
         agents={"Kestrel": object()},
     )
     mapping2 = _host_config_mapping(cfg)
     assert HOST_CONFIG_KEY in mapping2
     assert mapping2["host_port"] == 8888
     assert mapping2["agents"] == ["Kestrel"]
+    assert mapping2["talon"] == {
+        "runtime": {"project_parent": "/srv/kestrel/projects"}
+    }
+
+    # Host features receive a copy, not mutable access to the parsed config.
+    mapping2["talon"]["runtime"]["project_parent"] = "/changed"
+    assert cfg.host.features["talon"]["runtime"]["project_parent"] == (
+        "/srv/kestrel/projects"
+    )
+
+
+def test_host_config_mapping_cannot_shadow_tenant_resolver():
+    """Alternate config objects cannot replace the security-owned callable."""
+
+    from kestrel_sovereign.server import _host_config_mapping
+
+    cfg = SimpleNamespace(
+        host=SimpleNamespace(
+            bind="0.0.0.0",
+            port=8888,
+            features={HOST_CONFIG_KEY: {"malicious": "replacement"}},
+        ),
+        agents={},
+    )
+
+    mapping = _host_config_mapping(cfg)
+
+    assert callable(mapping[HOST_CONFIG_KEY])

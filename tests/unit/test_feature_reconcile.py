@@ -159,6 +159,40 @@ def test_resolve_packages_local_core_class_needs_no_install():
     assert class_to_pkg["AttachmentsFeature"] == fr.CORE_DISTRIBUTION
 
 
+def test_resolve_packages_matches_a_catalog_row_spelled_differently():
+    """Live metadata and the catalog may spell one distribution two ways.
+
+    ``ep.dist.name`` reports whatever the installed package's METADATA says;
+    the catalog row carries the git URL and extras the plan needs. Matched raw,
+    the two miss each other and the package is planned from a synthesized
+    sourceless info — no git URL, and (via the source index, keyed the same
+    way) no declared source or pin either (#2949).
+    """
+    reg = {
+        "reflection": FeaturePackageInfo(
+            name="reflection", package="Kestrel_Feature_Reflection",
+            git="https://example/reflection.git",
+            features=["ReflectionFeature"], description="", core=False,
+        ),
+    }
+    # 1. Installed: resolved from live metadata, matched to the catalog row.
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"ReflectionFeature"}, reg,
+        entrypoint_dists={"ReflectionFeature": "kestrel_feature_reflection"},
+    )
+    assert unresolved == []
+    assert class_to_pkg == {"ReflectionFeature": "kestrel-feature-reflection"}
+    assert pkg_infos["kestrel-feature-reflection"].git == "https://example/reflection.git"
+
+    # 2. Not installed: resolved from the catalog alone, same identity.
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"ReflectionFeature"}, reg,
+    )
+    assert unresolved == []
+    assert class_to_pkg == {"ReflectionFeature": "kestrel-feature-reflection"}
+    assert list(pkg_infos) == ["kestrel-feature-reflection"]
+
+
 def test_resolve_packages_uncatalogued_uninstalled_class_is_unresolved():
     """The motivating bug: an allowlist names a feature that is neither
     installed nor catalogued nor bundled -> hard error."""
@@ -187,6 +221,35 @@ def test_build_source_index_resolves_names_and_dist_names():
     assert idx["kestrel-feature-voice"].mode == "editable"
     assert idx["kestrel-feature-reflection"].pypi == ">=0.2,<0.3"
     assert idx["kestrel-feature-reflection"].mode == "pypi"
+
+
+def test_source_index_keys_are_canonical_whoever_spelled_the_name():
+    """One key per distribution, whichever of the three sources named it.
+
+    The operator's spelling, the catalog's ``package``, and live metadata all
+    reach this index; :func:`resolve_packages` looks it up under
+    :func:`canonical_package` form, so anything that keys it otherwise is a
+    silently unmanaged package (#2949).
+    """
+    reg = dict(_registry())
+    # A catalog row that spells its own distribution with underscores.
+    reg["reflection"] = FeaturePackageInfo(
+        name="reflection", package="Kestrel_Feature_Reflection",
+        git="https://example/reflection.git",
+        features=["ReflectionFeature"], description="", core=False,
+    )
+    entries = [
+        # Operator's spelling differs from the catalog's, which differs again
+        # from the canonical form. All three are one distribution (PEP 503).
+        {"name": "KESTREL.FEATURE.REFLECTION", "editable": None,
+         "pypi": ">=0.2,<0.3", "extras": []},
+        {"name": "some_private_pkg", "editable": None, "pypi": "", "extras": []},
+    ]
+    idx = fr.build_source_index(entries, reg)
+    assert idx["kestrel-feature-reflection"].pypi == ">=0.2,<0.3"
+    # Unknown to the catalog: still canonical, so a live dist reporting
+    # ``some-private-pkg`` finds it.
+    assert idx["some-private-pkg"].pypi == ""
 
 
 # --------------------------------------------------------------------------
@@ -434,3 +497,702 @@ def test_plan_prefer_source_without_checkout_falls_back_to_pypi():
     assert no_source == []
     (a,) = actions
     assert a.mode == "pypi" and a.source == "kestrel-feature-voice>=0.3"
+
+
+# --- core source policy (#2949) --------------------------------------------
+#
+# Every kestrel-feature-* depends on kestrel-sovereign, so a feature install can
+# resolve core from the index. These pin the *policy*: where core is supposed to
+# come from, what constraint that implies, and what counts as a violation.
+
+
+_DERIVE = object()
+
+
+def _shape(version=None, editable_path=None, direct_url=_DERIVE, known=True,
+           revision=None):
+    """Build a CoreInstallShape the way real metadata would.
+
+    An editable install records a PEP 610 direct URL *as well as* the editable
+    flag, so ``direct_url`` defaults to ``editable_path`` — a shape with an
+    editable path but no direct URL is one the metadata cannot produce, and
+    asserting against it would prove nothing. Pass ``direct_url`` explicitly to
+    model a NON-editable direct install (VCS, local path, remote archive):
+    the case that ``not is_editable`` cannot distinguish from an index wheel.
+    """
+    if direct_url is _DERIVE:
+        direct_url = editable_path
+    if not known:
+        prov = fr.Provenance.unknown()
+    elif direct_url:
+        prov = fr.Provenance.direct(
+            direct_url, editable=bool(editable_path), revision=revision,
+        )
+    else:
+        prov = fr.Provenance.from_index_install()
+    return fr.CoreInstallShape(version=version, provenance=prov)
+
+
+def test_core_policy_defaults_to_the_live_editable_link():
+    """No manifest entry: protect the link the venv actually has."""
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
+    assert policy.editable == "/src/core" and policy.pypi is None
+    assert policy.guarded
+
+
+def test_core_policy_is_unguarded_for_an_undeclared_wheel():
+    """Core already a wheel and nothing declared — there is no link to protect
+    and no editable install is invented for the operator."""
+    policy = fr.resolve_core_policy({}, _shape())
+    assert not policy.guarded
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
+
+
+def test_core_policy_prefers_the_manifest_over_the_live_link():
+    """An explicit entry is the operator moving core; the live link does not
+    override their declaration."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, editable="/src/next")}
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
+    assert policy.editable == "/src/next"
+
+
+def test_core_policy_carries_a_declared_pypi_window():
+    """A `pypi` entry declares a wheel — and a non-empty spec is still a
+    declaration the batch must hold, not a waiver of the guard."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
+    assert policy.editable is None and policy.pypi == ">=0.52,<0.53"
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == [
+        "kestrel-sovereign>=0.52,<0.53"
+    ]
+
+
+def test_core_policy_with_an_empty_pypi_spec_still_holds_the_source():
+    """`pypi = ""` is "any version FROM THE INDEX" — a declaration, not a waiver.
+
+    Half of it is empty: there is no version window, so no constraint line to
+    write. The other half is not: the entry names where core comes from, so an
+    editable link (or a core that is not installed at all) violates it exactly
+    as a version outside a window would. Reading the empty spec as "unguarded"
+    let the live link the operator declared they were leaving pass the check
+    (issue #2949).
+    """
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi="")}
+    policy = fr.resolve_core_policy(idx, _shape(editable_path="/src/old"))
+
+    assert policy.guarded
+    assert fr.core_install_constraints(_shape(version="0.52.0"), policy) == []
+    assert fr.core_install_matches(_shape("0.52.0", None), policy)  # a wheel: fine
+    assert not fr.core_install_matches(_shape("0.52.0", "/src/old"), policy)
+    assert not fr.core_install_matches(_shape(None, None), policy)  # not installed
+    assert policy.describe_expected() == (
+        "kestrel-sovereign from the index (non-editable)"
+    )
+
+
+def test_editable_constraint_tracks_the_installed_version():
+    """The pin is `==<what is installed now>`, so it must be derived from the
+    shape at install time — re-snapshot after moving core."""
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
+    assert fr.core_install_constraints(_shape("0.52.0", "/src/core"), policy) == [
+        "kestrel-sovereign==0.52.0"
+    ]
+    assert fr.core_install_constraints(_shape("0.53.0", "/src/core"), policy) == [
+        "kestrel-sovereign==0.53.0"
+    ]
+
+
+def test_editable_policy_tolerates_version_drift_but_not_a_lost_link():
+    """Reinstalling the checkout is normal; losing the link is the defect."""
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
+    assert fr.core_install_matches(_shape("0.99.0", "/src/core"), policy)
+    assert not fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(_shape("0.52.0", "/src/other"), policy)
+
+
+def test_pypi_policy_is_violated_by_a_version_outside_the_window():
+    """A feature that dragged core past `<0.53` violated the manifest just as
+    loudly as one that dropped an editable link."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.53")}
+    policy = fr.resolve_core_policy(idx, _shape())
+    assert fr.core_install_matches(_shape("0.52.1", None), policy)
+    assert not fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(_shape("0.52.1", "/src/core"), policy)
+
+
+def test_pypi_policy_rejects_a_non_editable_direct_url_install():
+    """`pypi` declares a SOURCE, and "not editable" is not that source.
+
+    A core installed from a VCS ref, a local path or a remote archive is
+    non-editable and can sit inside the declared version window, so a predicate
+    built on `not is_editable` accepted it — silently satisfying a source
+    declaration it plainly violates. PEP 610 records these installs with a
+    `direct_url.json` that has no `dir_info.editable`, which is exactly the
+    evidence the version-shaped proxy threw away (issue #2949).
+    """
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, _shape())
+
+    # An index wheel: no direct URL recorded at all. This is the only shape
+    # that actually came from an index.
+    assert fr.core_install_matches(_shape("0.53.0", None), policy)
+
+    # Same version, same "not editable" — but installed from a git ref, and
+    # from a local directory. Both violate a `pypi` source declaration.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="git+https://example.invalid/core@abc"),
+        policy,
+    )
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="/src/core-checkout"), policy,
+    )
+
+
+def test_pypi_policy_with_no_version_window_still_rejects_a_direct_url():
+    """`pypi = ""` is a pure SOURCE declaration — the case with no version
+    opinion left to lean on, where testing the proxy could not distinguish
+    anything at all."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi="")}
+    policy = fr.resolve_core_policy(idx, _shape())
+    assert fr.core_install_matches(_shape("0.53.0", None), policy)
+    assert not fr.core_install_matches(
+        _shape("0.53.0", None, direct_url="git+https://example.invalid/core"),
+        policy,
+    )
+
+
+def test_unreadable_provenance_is_guarded_not_treated_as_a_plain_wheel():
+    """An undeclared core whose provenance will not read must still be guarded.
+
+    "Core is a known index wheel, nothing to protect" and "we could not tell
+    what core is" both reduce to ``editable_path is None``. Resolving the policy
+    from that narrowed value made the second indistinguishable from the first,
+    so a damaged venv ran with NO constraint and NO verification — the batch
+    free to replace a core that might well have been an editable link.
+    """
+    known_wheel = fr.resolve_core_policy({}, _shape("0.53.0"))
+    assert not known_wheel.guarded  # nothing declared, nothing to protect
+
+    unknown = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert unknown.guarded
+    assert unknown.hold_version == "0.53.0"
+    # It pins the version — the mechanism a feature actually uses to move core.
+    assert fr.core_install_constraints(_shape("0.53.0", known=False), unknown) == [
+        f"{fr.CORE_DISTRIBUTION}==0.53.0",
+    ]
+    # And it judges only that: the source is unknowable, so it is not asserted.
+    assert fr.core_install_matches(_shape("0.53.0", known=False), unknown)
+    assert not fr.core_install_matches(_shape("0.54.0", known=False), unknown)
+    # Which is exactly why it must not claim it can repair one.
+    assert not unknown.source_is_verifiable
+    assert "unverifiable" in unknown.describe_expected()
+
+
+def test_a_known_direct_url_core_is_guarded_too():
+    """A non-editable direct-URL core is not a "plain wheel with nothing to
+    protect" — it is as deliberate an install as an editable link.
+
+    Its provenance is perfectly READABLE, so the unknown-provenance branch did
+    not cover it, and it has no editable_path, so the editable branch did not
+    either. It fell through to an empty policy: no constraint, no verification,
+    and a feature free to replace an explicitly-sourced core with an index wheel
+    while the command reported success. Splitting on `provenance_known` instead
+    of `from_index` is what left that gap.
+    """
+    url = "git+https://example.invalid/core@abc"
+    shape = _shape("0.53.0", direct_url=url)
+    policy = fr.resolve_core_policy({}, shape)
+
+    assert policy.guarded
+    assert policy.hold_version == "0.53.0"
+    assert policy.hold_provenance.url == url
+    assert fr.core_install_constraints(shape, policy) == [
+        f"{fr.CORE_DISTRIBUTION}==0.53.0",
+    ]
+    # Held, and a swap to the same-version index wheel is still caught.
+    assert fr.core_install_matches(shape, policy)
+    assert not fr.core_install_matches(_shape("0.54.0"), policy)
+    # No declared source, so it must not pretend it can repair — but it CAN say
+    # where core actually came from, which the unreadable case cannot.
+    assert not policy.source_is_verifiable
+    assert url in policy.describe_expected()
+
+
+def test_holding_a_known_direct_url_catches_a_same_version_swap():
+    """A version pin cannot see a source swap — the lesson of this entire change.
+
+    Replacing a git-installed core with the index wheel that publishes that very
+    version passes every version test there is. Asserting only the version in
+    the hold branch would have rebuilt the original defect inside the policy
+    written to prevent it: `verify()` reporting success, and `kestrel update`
+    restarting, while core's source had changed underneath.
+
+    Where the source is genuinely unknown there is nothing to compare, so the
+    version is all that can honestly be asserted — the two cases must not be
+    collapsed in either direction.
+    """
+    url = "git+https://example.invalid/core@abc"
+    before = _shape("0.53.0", direct_url=url)
+    policy = fr.resolve_core_policy({}, before)
+
+    assert fr.core_install_matches(before, policy)  # untouched: fine
+    # Same version, swapped to the index wheel — invisible to a version pin.
+    assert not fr.core_install_matches(_shape("0.53.0"), policy)
+    # Same version, swapped to a DIFFERENT direct URL — equally a swap.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", direct_url="git+https://example.invalid/core@def"), policy,
+    )
+
+    # Unknown source: nothing to compare against, so version stability is the
+    # whole assertion and a same-version shape still passes.
+    blind = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert blind.hold_provenance is not None and not blind.hold_provenance.known
+    assert fr.core_install_matches(_shape("0.53.0", known=False), blind)
+
+
+def test_a_same_version_swap_between_two_commits_is_caught():
+    """The end the url-only identity could not see.
+
+    Same repository, same package version, different commit. Every version test
+    passes and the urls match, so a check built on `url` alone reports no
+    change — while core is running different code than the batch started with.
+    """
+    repo = "https://github.com/example/core"
+    before = _shape("0.53.0", direct_url=repo, revision="aaa111")
+    policy = fr.resolve_core_policy({}, before)
+
+    assert fr.core_install_matches(before, policy)
+    after = _shape("0.53.0", direct_url=repo, revision="bbb222")
+    assert after.direct_url == before.direct_url  # the url cannot tell them apart
+    assert not fr.core_install_matches(after, policy)
+
+
+def test_relinking_the_same_path_as_editable_is_a_change():
+    """Same url, same version — but a copy and a live checkout are not the same
+    install.
+
+    A non-editable direct install re-linked with `-e` at the same version keeps
+    every other identity field, so an identity that omits editability calls it
+    no change. It is the opposite of no change: core stops being a fixed copy
+    and becomes a checkout whose contents move under the running host.
+    """
+    path = "/src/core"
+    before = _shape("0.53.0", direct_url=path)          # installed, not linked
+    policy = fr.resolve_core_policy({}, before)
+    assert not before.is_editable
+
+    after = _shape("0.53.0", editable_path=path)        # now a live checkout
+    assert after.direct_url == before.direct_url        # url cannot tell them apart
+    assert after.provenance.source_id != before.provenance.source_id
+    assert not fr.core_install_matches(after, policy)
+
+
+def test_source_id_covers_every_provenance_field_by_construction():
+    """A field added to Provenance joins the identity without anyone remembering.
+
+    Both hand-written versions of this tuple shipped incomplete — the revision,
+    hash and subdirectory first, then `editable` — each while its docstring
+    claimed completeness. This test fails if a new field is ever added and
+    silently left out of source comparisons, which is the failure the derivation
+    exists to make impossible.
+    """
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(fr.Provenance)}
+    identity = names - fr._PROVENANCE_NON_IDENTITY
+
+    # Every identity field actually reaches source_id, positionally.
+    assert len(fr.Provenance().source_id) == len(identity)
+
+    # And each one genuinely changes the identity when it changes — a field
+    # present in the tuple but ignored downstream would still be a silent gap.
+    base = fr.Provenance.direct("u", revision="r", subdirectory="s",
+                                archive_hash="h")
+    for name in identity:
+        current = getattr(base, name)
+        changed = (not current) if isinstance(current, bool) else f"{current}-x"
+        other = dataclasses.replace(base, **{name: changed})
+        assert other.source_id != base.source_id, name
+
+    # `known` is excluded on purpose: it says whether we could READ the source,
+    # not which source it is.
+    assert fr._PROVENANCE_NON_IDENTITY == {"known"}
+
+
+def test_a_declared_source_still_wins_over_unreadable_provenance():
+    """The hold policy is the *fallback*. Where the operator declared core's
+    source, that declaration is still the policy — and still repairable."""
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, _shape("0.53.0", known=False))
+    assert policy.pypi == ">=0.52,<0.54" and policy.hold_version is None
+    assert policy.source_is_verifiable
+
+
+def test_provenance_answers_one_question_and_accounts_for_unknown():
+    """The type exists so unknown cannot be dropped by a caller.
+
+    Both questions the codebase asks — "from an index?" and "which checkout?" —
+    are answered by the value itself, so there is no `known` flag beside the
+    data for a caller to forget. Two callers forgot it in a single review round
+    when there was one.
+    """
+    index = fr.Provenance.from_index_install()
+    git = fr.Provenance.direct("git+https://example.invalid/c@abc")
+    editable = fr.Provenance.direct("/src/core", editable=True)
+    unknown = fr.Provenance.unknown()
+
+    assert index.is_from_index and index.editable_path is None
+    assert not git.is_from_index and git.editable_path is None
+    assert not editable.is_from_index and editable.editable_path == "/src/core"
+    # Unknown answers no to both, and is never mistaken for an index install.
+    assert not unknown.is_from_index and unknown.editable_path is None
+    assert "unknown source" in unknown.describe()
+
+
+def test_unknown_provenance_does_not_satisfy_a_pypi_source():
+    """"We could not read it" is not "it came from an index".
+
+    Both states used to reduce to "no direct URL", so a package whose
+    `direct_url.json` was damaged satisfied a declared `pypi` source and the
+    guard skipped repairing it — a safety predicate failing OPEN on the single
+    input it cannot verify. Failing closed costs at most an unnecessary
+    reinstall; failing open is the defect this guard exists to stop.
+    """
+    idx = {fr.CORE_DISTRIBUTION: fr.SourceEntry(
+        package=fr.CORE_DISTRIBUTION, pypi=">=0.52,<0.54")}
+    policy = fr.resolve_core_policy(idx, _shape())
+
+    readable = _shape("0.53.0")
+    unknown = _shape("0.53.0", known=False)
+
+    assert readable.from_index and fr.core_install_matches(readable, policy)
+    assert not unknown.from_index
+    assert not fr.core_install_matches(unknown, policy)
+    assert "unknown source" in unknown.describe()
+
+
+def test_shape_describes_a_direct_url_install_distinctly():
+    """An operator reading the failure must be told which wrong source it is."""
+    assert "index wheel" in _shape("0.53.0", None).describe()
+    assert "editable" in _shape("0.53.0", "/src/core").describe()
+    described = _shape("0.53.0", None, direct_url="git+https://x.invalid/c").describe()
+    assert "direct URL" in described and "git+https://x.invalid/c" in described
+
+
+def test_describe_core_change_names_before_after_and_expected():
+    policy = fr.resolve_core_policy({}, _shape(editable_path="/src/core"))
+    described = fr.describe_core_change(
+        _shape("0.52.0", "/src/core"), _shape("0.53.0", None), policy,
+    )
+    assert "before: editable → /src/core (0.52.0)" in described
+    assert "after:  non-editable (index wheel in site-packages) (0.53.0)" in described
+    assert "expected: editable → /src/core" in described
+    assert fr.describe_core_change(
+        _shape("0.52.0", "/src/core"), _shape("0.53.0", "/src/core"), policy,
+    ) is None
+
+
+def test_a_malformed_pypi_spec_fails_closed_rather_than_satisfying_everything():
+    """An unevaluable rule is not a rule that is met.
+
+    `version_satisfies` answers True when a spec will not parse — safe for the
+    reporting caller it was written for, catastrophic for the guard: every
+    installed version "satisfies" a garbage window. And the constraint rendered
+    from it is `<pkg><spec>`, which for `banana` is the package NAME
+    `kestrel-sovereignbanana` — pinning something that does not exist and
+    leaving core entirely free while verification reports conformity. A guard
+    that pins an unrelated package and then claims success is worse than none.
+    """
+    policy = fr.CoreSourcePolicy(pypi="banana")
+    shape = _shape("0.53.0")
+
+    assert not fr.spec_is_valid("banana")
+    assert fr.spec_is_valid(">=0.52,<0.54") and fr.spec_is_valid("")
+    # Fails closed, and emits no constraint rather than a fake one.
+    assert not fr.core_install_matches(shape, policy)
+    assert fr.core_install_constraints(shape, policy) == []
+    # A valid spec is unaffected.
+    good = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert fr.core_install_matches(shape, good)
+    assert fr.core_install_constraints(shape, good) == [
+        f"{fr.CORE_DISTRIBUTION}>=0.52,<0.54",
+    ]
+
+
+def test_a_malformed_installed_version_fails_closed_too():
+    """Both operands of the comparison have to be evaluable.
+
+    `Version(version)` raises on malformed metadata and `version_satisfies`
+    converts that into True, so a core whose recorded version is garbage sat
+    "inside" every declared window and was never repaired. Validating only the
+    SPEC left this side wide open — the same fail-open, one operand over.
+    """
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+
+    assert fr.version_is_valid("0.53.0")
+    assert not fr.version_is_valid("not-a-version")
+    assert not fr.version_is_valid(None)
+
+    assert not fr.core_install_matches(_shape("not-a-version"), policy)
+    assert fr.core_install_matches(_shape("0.53.0"), policy)   # unaffected
+
+
+def test_provenance_becoming_readable_under_a_hold_is_drift():
+    """Unknown → known is an observable change, not a clean bill of health.
+
+    A fresh install writes fresh metadata, so provenance becoming readable
+    almost always means something reinstalled core. Accepting it because the
+    version matched reopened the silent same-version replacement this guard
+    exists to catch: an unreadable editable link swapped for the index wheel
+    publishing that same version read as no drift.
+    """
+    before = _shape("0.53.0", known=False)
+    policy = fr.resolve_core_policy({}, before)
+    assert policy.hold_version == "0.53.0"
+
+    # Still unreadable and unmoved: nothing to report.
+    assert fr.core_install_matches(_shape("0.53.0", known=False), policy)
+    # Now a readable index wheel at the same version — something wrote metadata.
+    assert not fr.core_install_matches(_shape("0.53.0"), policy)
+    # And a readable direct URL at the same version, equally.
+    assert not fr.core_install_matches(
+        _shape("0.53.0", direct_url="git+https://example.invalid/c"), policy,
+    )
+    # A version move is still drift regardless.
+    assert not fr.core_install_matches(_shape("0.54.0", known=False), policy)
+
+
+# --- the malformed-input contract (#2949) -----------------------------------
+#
+# Every unevaluable input this guard consumes, enumerated in one place and
+# asserted to fail CLOSED. Written after four separate review rounds each found
+# one more of these individually — a malformed spec, a malformed version,
+# unreadable provenance, provenance that became readable. They are the same
+# defect wearing different inputs, and finding them one review at a time is a
+# lottery. A guard that reports conformity over something it could not evaluate
+# is worse than no guard: it reports success.
+#
+# The rule these pin: an input the guard cannot evaluate is never evidence that
+# the policy is met. Cost of failing closed is a repair nobody needed; cost of
+# failing open is the defect the whole change exists to remove.
+
+
+_UNEVALUABLE_SPECS = ["banana", "!!", ">=", "1.0", "===", ">>>1"]
+_UNEVALUABLE_VERSIONS = ["not-a-version", "", None, "0.53.0.dev.x", "..", "1.0.0-BAD-!!"]
+
+
+@pytest.mark.parametrize("spec", _UNEVALUABLE_SPECS)
+def test_contract_an_unevaluable_spec_never_conforms(spec):
+    """A declared window we cannot parse is not a window anything is inside."""
+    assert not fr.spec_is_valid(spec)
+    assert not fr.core_install_matches(_shape("0.53.0"), fr.CoreSourcePolicy(pypi=spec))
+
+
+@pytest.mark.parametrize("spec", _UNEVALUABLE_SPECS)
+def test_contract_an_unevaluable_spec_emits_no_constraint(spec):
+    """`<pkg><garbage>` is not a constraint on <pkg> — it names another package
+    entirely, so emitting it is worse than emitting nothing."""
+    assert fr.core_install_constraints(
+        _shape("0.53.0"), fr.CoreSourcePolicy(pypi=spec),
+    ) == []
+
+
+@pytest.mark.parametrize("version", _UNEVALUABLE_VERSIONS)
+def test_contract_an_unevaluable_installed_version_never_conforms(version):
+    """The other operand. Validating only the spec left this side open."""
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert not fr.core_install_matches(_shape(version), policy)
+
+
+@pytest.mark.parametrize("version", _UNEVALUABLE_VERSIONS)
+def test_contract_a_hold_policy_rejects_an_unevaluable_version(version):
+    """A hold asserts only that nothing moved — but 'moved to garbage' moved."""
+    hold = fr.resolve_core_policy({}, _shape("0.53.0", known=False))
+    assert not fr.core_install_matches(_shape(version, known=False), hold)
+
+
+def test_contract_unreadable_provenance_never_satisfies_a_declared_source():
+    """Damaged metadata is not evidence of an index install."""
+    policy = fr.CoreSourcePolicy(pypi=">=0.52,<0.54")
+    assert not fr.core_install_matches(_shape("0.53.0", known=False), policy)
+
+
+@pytest.mark.parametrize("path", ["", None, "\x00bad", "relative/../x"])
+def test_contract_a_damaged_editable_path_never_satisfies_a_checkout(path):
+    """An editable policy names a specific checkout; anything we cannot resolve
+    to that checkout is not it."""
+    policy = fr.CoreSourcePolicy(editable="/src/core")
+    prov = (
+        fr.Provenance.direct(path, editable=True) if path else fr.Provenance.unknown()
+    )
+    shape = fr.CoreInstallShape(version="0.53.0", provenance=prov)
+    assert not fr.core_install_matches(shape, policy)
+
+
+def test_contract_every_guard_verdict_input_is_covered_here():
+    """The enumeration must keep pace with the guard's inputs.
+
+    Derived from the dataclasses, not from a list written here: a NEW field on
+    CoreInstallShape or CoreSourcePolicy is in scope automatically, which a
+    hardcoded attribute list cannot do — it can only see names someone
+    remembered to add, which is the same maintained-list defect that kept
+    `source_id` incomplete twice.
+
+    Fails when `core_install_matches` starts consuming an input that has no
+    malformed-input case above. Finding the next unevaluable input one review
+    round at a time is what this file exists to stop.
+    """
+    import dataclasses
+    import inspect
+    import re
+
+    src = inspect.getsource(fr.core_install_matches)
+
+    def _members(cls):
+        names = {f.name for f in dataclasses.fields(cls)}
+        names |= {
+            n for n, v in vars(cls).items() if isinstance(v, property)
+        }
+        return names
+
+    scope = {
+        "shape": _members(fr.CoreInstallShape),
+        "policy": _members(fr.CoreSourcePolicy),
+    }
+
+    # Inputs that DO have a malformed case in the contract above, or that
+    # cannot be malformed (a bool is a bool).
+    covered = {
+        "policy.pypi", "policy.editable", "policy.hold_version",
+        "policy.hold_provenance", "policy.guarded", "policy.source_is_verifiable",
+        "shape.version", "shape.provenance", "shape.editable_path",
+        "shape.is_editable", "shape.from_index", "shape.direct_url",
+        "shape.provenance_known",
+    }
+
+    referenced = {
+        f"{obj}.{attr}"
+        for obj, attrs in scope.items()
+        for attr in attrs
+        # Word-boundary, or `shape.editable_path` also registers as
+        # `shape.editable` and the contract reports a gap that is not there.
+        if re.search(rf"\b{obj}\.{attr}\b", src)
+    }
+
+    uncovered = referenced - covered
+    assert not uncovered, (
+        f"core_install_matches consumes {sorted(uncovered)} with no "
+        "malformed-input case in the contract above — add one, or add the name "
+        "to `covered` with a reason it cannot be malformed."
+    )
+
+
+def test_a_direct_url_core_without_version_metadata_is_still_guarded():
+    """A missing version must not cost the guard entirely.
+
+    METADATA can omit or empty `Version`. Requiring one before holding meant a
+    damaged direct-URL core fell through to NO policy — unguarded, despite
+    positive evidence it did not come from an index — so a feature install could
+    replace it with an index wheel and nothing would ever report it.
+
+    Detection does not need a version; only the version PIN does. Losing the pin
+    is not a reason to lose the check.
+    """
+    url = "git+https://example.invalid/core@abc"
+    for missing in (None, ""):
+        shape = fr.CoreInstallShape(
+            version=missing, provenance=fr.Provenance.direct(url),
+        )
+        policy = fr.resolve_core_policy({}, shape)
+
+        assert policy.guarded, missing
+        assert not policy.source_is_verifiable      # nothing declared to restore from
+        assert policy.hold_version is None          # no pin is possible...
+        assert policy.hold_provenance.url == url    # ...but the source is held
+
+        # Unmoved: fine. Swapped to the index wheel: caught.
+        assert fr.core_install_matches(shape, policy)
+        assert not fr.core_install_matches(
+            fr.CoreInstallShape(
+                version=missing, provenance=fr.Provenance.from_index_install(),
+            ),
+            policy,
+        )
+
+    # A KNOWN index wheel with no version is still nothing to protect.
+    plain = fr.CoreInstallShape(
+        version=None, provenance=fr.Provenance.from_index_install(),
+    )
+    assert not fr.resolve_core_policy({}, plain).guarded
+
+
+def test_a_provenance_only_hold_does_not_describe_itself_as_unconstrained():
+    """A policy that rejected the change must not report `unconstrained`.
+
+    The version half can be absent — METADATA may omit `Version` — and the
+    describe path keyed only on the version, so a hold that DID guard (and did
+    catch a swap) told the operator it was constraining nothing. A drift error
+    that contradicts the verdict beside it is worse than terse.
+    """
+    url = "git+https://example.invalid/core@abc"
+    shape = fr.CoreInstallShape(version=None, provenance=fr.Provenance.direct(url))
+    policy = fr.resolve_core_policy({}, shape)
+
+    expected = policy.describe_expected()
+    assert "unconstrained" not in expected
+    assert url in expected
+    assert "version unavailable" in expected or "unavailable" in expected
+    # And it really is guarding: the swap it describes is the one it catches.
+    assert not fr.core_install_matches(
+        fr.CoreInstallShape(
+            version=None, provenance=fr.Provenance.from_index_install(),
+        ),
+        policy,
+    )
+
+
+def test_a_missing_version_is_not_reported_as_a_missing_install():
+    """Provenance can prove the distribution is present when the version cannot.
+
+    Inferring "not installed" from an absent version made the guard's recovery
+    diagnostics claim the package was gone while naming the source it came
+    from.
+    """
+    present = fr.CoreInstallShape(
+        version=None,
+        provenance=fr.Provenance.direct("git+https://example.invalid/core@abc"),
+    )
+    assert "not installed" not in present.describe()
+    assert "unavailable" in present.describe()
+
+    # A genuinely absent core still reads as absent.
+    absent = fr.CoreInstallShape(
+        version=None, provenance=fr.Provenance.from_index_install(),
+    )
+    assert "not installed" in absent.describe()
+
+
+# NB: a TRAILING comma (">=1,") is normalized away and accepted by the
+# installer, so it is correctly valid — only genuinely empty clauses are not.
+@pytest.mark.parametrize("spec", [",", ",>=1", ">=1,,<2", ",,"])
+def test_contract_a_spec_the_installer_rejects_is_not_valid(spec):
+    """`SpecifierSet` drops empty clauses; the installer does not.
+
+    ",", ",>=1" and ">=1,,<2" all "parse" as specifier sets, and then the string
+    RENDERED from them is a requirement pip and uv both reject — so a manifest
+    typo passed validation here and failed far away, in a constraints file. The
+    only bar worth checking is the installer's, which means validating the
+    rendered requirement.
+    """
+    from packaging.requirements import Requirement
+
+    assert not fr.spec_is_valid(spec)
+    with pytest.raises(Exception):
+        Requirement(f"{fr.CORE_DISTRIBUTION}{spec}")

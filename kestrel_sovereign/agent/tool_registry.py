@@ -159,12 +159,83 @@ class ToolRegistryMixin:
         }
 
     def _visible_known_tool_names(self) -> set[str]:
-        """Return tool names the LLM may call under the active context profile."""
+        """Return the tool names currently *advertised* to the LLM.
+
+        This is the schema view — what ``_build_all_tools`` puts in the request
+        — and it is deliberately narrower than what the agent can dispatch:
+        progressive disclosure hides tools, exploration replaces a feature's
+        dispatcher with its individual tools, and LRU eviction sheds direct
+        tools. Use :meth:`_known_tool_names` for the guardrail allowlist;
+        anything narrower rejects live capability as "unknown" (#2929).
+        """
         return {
             tool_def["function"]["name"]
             for tool_def in self._build_all_tools()
             if isinstance(tool_def.get("function", {}).get("name"), str)
         }
+
+    def _registered_features_by_tool_name(self) -> Dict[str, Any]:
+        """Return every dispatchable loaded feature keyed by dispatcher name.
+
+        Same enabled/dispatch-capability gates as
+        :meth:`_visible_features_by_tool_name`, minus the context-profile
+        filter: hiding a feature is a prompt-budget decision, not a capability
+        boundary, so a hidden feature is still *known* and still dispatchable
+        if the model names it. A soft-disabled feature (``enabled=False``) is
+        excluded — that one IS a capability boundary (#2522).
+        """
+        return {
+            feature.tool_name: feature
+            for feature in self.features.values()
+            if bool(getattr(feature, "enabled", True))
+            and self._feature_supports_subagent_dispatch(feature)
+        }
+
+    def _registered_tool_names(self) -> set[str]:
+        """Return every tool name the live registry can resolve.
+
+        Derived from what is actually loaded, never hand-maintained (#2929):
+
+        * subagent dispatcher names of every enabled, dispatchable feature —
+          whether or not that feature has been explored (exploration drops the
+          dispatcher from the *schema* view, which is what made a name that
+          worked one call ago bounce on the next),
+        * every ``@tool`` name those features expose, promoted or not,
+        * every direct tool currently mounted, including dynamically-mounted
+          ones (MCP servers etc.) that belong to no feature.
+        """
+        names: set[str] = {
+            name for name in (getattr(self, "_direct_tools", None) or {})
+            if isinstance(name, str)
+        }
+        names.update(self._registered_features_by_tool_name())
+        for feature in (getattr(self, "features", None) or {}).values():
+            if not bool(getattr(feature, "enabled", True)):
+                continue
+            get_tools = getattr(feature, "get_tools", None)
+            if not callable(get_tools):
+                continue
+            try:
+                for tool in get_tools() or []:
+                    name = getattr(tool, "name", None)
+                    if isinstance(name, str) and name:
+                        names.add(name)
+            except Exception:  # noqa: BLE001 — one broken feature mustn't
+                continue      # shrink the allowlist for every other feature
+        return names
+
+    def _known_tool_names(self) -> set[str]:
+        """Return the guardrail allowlist for this turn.
+
+        The union of what the LLM is currently shown
+        (:meth:`_visible_known_tool_names`) and what the live registry can
+        resolve (:meth:`_registered_tool_names`). Membership is *derived*, so
+        it cannot drift from the features that are loaded, and it cannot shrink
+        mid-turn as exploration, eviction, or a context profile changes the
+        advertised view — both of which produced pre-permission, unaudited
+        bounces of legitimately registered tools (#2929).
+        """
+        return self._visible_known_tool_names() | self._registered_tool_names()
 
     def register_dynamic_tools(self, owner: str, tools, *, pin: bool = False) -> int:
         """Mount runtime tools owned by ``owner`` into the direct-tool registry.

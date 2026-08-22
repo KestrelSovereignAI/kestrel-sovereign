@@ -2,8 +2,11 @@ import logging
 import json
 import os
 import asyncio
+import contextlib
 import hashlib
 import inspect
+import math
+import sys
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
 from datetime import datetime
@@ -13,27 +16,47 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     EphemeralPurgeReport,
     StorePurgeResult,
     PurgeOutcome,
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
 )
 from kestrel_sovereign.security.encryption import DecryptionError
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
-from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
+from kestrel_sovereign.config import (
+    SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
+    SEMANTIC_CAPABILITIES_CONFIG_ENV,
+    SEMANTIC_INFERENCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIG_ENV,
+    SEMANTIC_MAINTENANCE_CONFIGURED_ENV,
+    TRUSTED_AGENTS_DIR,
+)
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Mapping
 import re
 from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
-from kestrel_sovereign.extensions.app_extension import AppExtension
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import (
     MandatoryFeatureReadinessError,
     discover_features,
-    get_feature_by_name,
     verify_mandatory_feature_set,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.config_validation import validate_feature_config
+
+
+class HostFeatureConfigError(RuntimeError):
+    """The host could not read the feature configuration it was asked to apply."""
 from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.command_policy import (
+    BOOTSTRAP_ALLOWED_COMMANDS,
+    SAFE_MODE_COMMANDS,
+    prefixed_command_token,
+)
 from kestrel_sovereign.a2a.task_manager import TaskManager
 from kestrel_sovereign.a2a.stores import (
     SQLiteTaskStore, SQLiteSessionService, SQLiteObservabilityStore,
@@ -41,6 +64,7 @@ from kestrel_sovereign.a2a.stores import (
 )
 # PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
     BootContext,
@@ -55,7 +79,6 @@ from kestrel_sovereign.agent.streaming import (
     resolve_turn_invocation_context,
     _snapshot_post_response_hooks,
 )
-from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
@@ -64,6 +87,7 @@ from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
@@ -77,10 +101,18 @@ from kestrel_sovereign.security.input_guardrails import (
 )
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
+    KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     optional_span,
 )
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.features.peers.directory import (
+        PeerDirectoryRouter,
+        PeerRequester,
+    )
+    from kestrel_sovereign.knowledge.inference import InferenceProfile
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -124,6 +156,10 @@ class PrivacyTransitionResult:
     # reported as successful. Distinct from ``requires_confirmation`` (a staged
     # data-destructive downgrade the user can still confirm).
     purge_failed: bool = False
+    # True when an already-running durable explicit-fact operation won the
+    # privacy linearization race. No privacy state changed; callers should
+    # surface a retryable conflict rather than success or an internal error.
+    retryable_conflict: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -231,7 +267,97 @@ KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION = float(
 )
 
 
-def _resolve_shutdown_budget() -> tuple[float, float]:
+def _raise_unexpected_lifecycle_exception_group(
+    error: BaseExceptionGroup,
+) -> None:
+    """Propagate process-control leaves from an owned lifecycle outcome."""
+
+    _expected, unexpected = error.split((asyncio.CancelledError, Exception))
+    if unexpected is not None:
+        raise unexpected
+
+
+async def await_lifecycle_task_completion(
+    task: "asyncio.Future[object]",
+) -> tuple[bool, BaseException | None]:
+    """Drive one lifecycle task to a terminal state despite caller cancellation.
+
+    A shutdown owner can be cancelled repeatedly while the task it owns still
+    has to release a durable owner or close SQLite.  ``shield`` preserves that
+    work; this helper preserves the *join*.  The returned boolean records
+    cancellation of the joiner, while the second item reports the task's
+    terminal outcome without confusing a task-cancellation with a fresh
+    cancellation of the lifecycle owner.
+    """
+    # A ``CancelledError`` raised by ``shield(task)`` is ambiguous when both
+    # tasks are cancelled in the same loop turn: it can report the owned task's
+    # terminal cancellation, this joiner's cancellation, or both.  Only the
+    # joiner itself can authoritatively tell us whether its cancellation was
+    # requested.  Do not infer that from the owned task's terminal state.
+    joiner = asyncio.current_task()
+    cancelled = bool(joiner is not None and joiner.cancelling())
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if joiner is not None and joiner.cancelling():
+                cancelled = True
+        except BaseExceptionGroup as error:
+            # A lifecycle owner can deliberately retain cancellation and an
+            # ordinary cleanup failure in one group.  Like an Exception, that
+            # is the owned task's terminal outcome, not a reason to abandon
+            # later cleanup owners that the caller must still join.
+            # Process-control exceptions are not lifecycle failure data.
+            # Preserve their grouping and propagate them immediately.
+            _raise_unexpected_lifecycle_exception_group(error)
+            assert task.done()
+        except Exception:
+            # ``shield`` re-raises the owned task's terminal exception into
+            # this joiner.  The lifecycle contract returns that outcome as
+            # data so a staged owner can drain every later resource before it
+            # reports or aggregates the failure.  It is terminal at this
+            # point; fetch it below exactly once from the task itself.
+            assert task.done()
+
+    if task.cancelled():
+        return cancelled, asyncio.CancelledError()
+    failure = task.exception()
+    if isinstance(failure, BaseExceptionGroup):
+        # A task can already be terminal when this helper is entered, in which
+        # case the loop above never observes its raised group.
+        _raise_unexpected_lifecycle_exception_group(failure)
+    return cancelled, failure
+
+
+async def await_agent_shutdown_completion(agent: object) -> bool:
+    """Join an agent's deferred durable cleanup without dropping it on cancel.
+
+    ``KestrelAgent.shutdown`` may transfer dispatcher release and shared
+    storage close to a continuation after its bounded user-facing shutdown
+    budget expires.  The lifecycle caller that reported that timeout remains
+    responsible for joining the continuation before its event loop exits.
+
+    Returns whether this *join* observed cancellation.  Callers choose whether
+    to re-raise after cleanup; either way the continuation has already reached
+    a terminal result, so no SQLite worker or runtime owner is orphaned.
+    """
+    waiter = getattr(agent, "wait_for_shutdown_completion", None)
+    if not callable(waiter):
+        return False
+    completion = waiter()
+    if not inspect.isawaitable(completion):
+        return False
+
+    task = asyncio.ensure_future(completion)
+    cancelled, failure = await await_lifecycle_task_completion(task)
+    if failure is not None:
+        raise failure
+    return cancelled
+
+
+def _resolve_shutdown_budget(
+    minimum_tail_reserve: float = 0.0,
+) -> tuple[float, float]:
     """Resolve ``(prefix_budget, tail_reserve)`` for whole-agent shutdown.
 
     Both values are clamped and validated against the production outer
@@ -242,12 +368,22 @@ def _resolve_shutdown_budget() -> tuple[float, float]:
       An override above it would let the outer ``wait_for`` (not our own
       composition) be what stops us, starving later steps and the durable
       tail; the mismatch is logged at WARNING and reconciled by clamping.
-    * The durable-tail reserve is clamped into ``[min_step, total / 2]`` so
-      the tail always has a nonzero, honest window and the fallible prefix
-      always keeps the majority of the budget. ``reserve >= total`` is an
-      explicit, safe clamp (logged), not a zero-budget prefix.
+    * The configured durable-tail reserve is clamped into
+      ``[min_step, total / 2]`` so the tail always has a nonzero, honest
+      window and the fallible prefix normally keeps the majority of the
+      budget.  A backend may require a larger minimum reservation for an
+      owned resource to complete shutdown safely; that declared requirement
+      wins, while the total remains bounded by the production outer deadline.
 
-    Returns ``(prefix_budget, tail_reserve)`` with both strictly > 0.
+    ``minimum_tail_reserve`` is an optional, backend-owned contract such as
+    SQLite's aiosqlite worker termination window.  It is deliberately not
+    part of the generic SDK storage interface: a backend that does not expose
+    it keeps the existing shutdown allocation unchanged.
+
+    Returns ``(prefix_budget, tail_reserve)``.  The prefix can be zero only
+    when an operator configures an outer budget too small to leave time for a
+    safety-critical backend close; the total still never exceeds the outer
+    deadline.
     """
     outer = float(SHUTDOWN_TIMEOUT)
     total = KESTREL_AGENT_SHUTDOWN_TIMEOUT_S
@@ -279,8 +415,88 @@ def _resolve_shutdown_budget() -> tuple[float, float]:
     if reserve <= 0.0:
         reserve = min(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, max_reserve)
 
+    required_tail = max(0.0, minimum_tail_reserve)
+    if required_tail > total:
+        logging.warning(
+            "Storage close requires %.2fs but the production shutdown "
+            "budget is %.2fs; reserving the complete bounded budget for the "
+            "durable tail.",
+            required_tail,
+            total,
+        )
+        required_tail = total
+    reserve = max(reserve, required_tail)
+
     prefix_budget = max(0.0, total - reserve)
     return prefix_budget, reserve
+
+
+def _minimum_storage_close_timeout(storage: Any) -> float:
+    """Read an optional backend-owned storage-close reservation safely.
+
+    Generic and non-SQLite storages deliberately do not need to implement the
+    extension.  Treat malformed values as no reservation rather than letting a
+    mock/proxy attribute change the shutdown budget or make it unbounded.
+    """
+    try:
+        value = getattr(storage, "minimum_close_timeout_s", 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _storage_preclose(storage: Any):
+    """Return storage's optional bounded pre-close operation, if available.
+
+    ``AsyncStorage`` uses this hook to dispose a cached SQLAlchemy engine
+    before closing its primary backend connection.  Keeping that unbounded
+    external-resource work out of the primary close step preserves SQLite's
+    aiosqlite worker-drain reservation.  Generic storage implementations keep
+    their existing one-step close behavior.
+    """
+    try:
+        dispose = getattr(storage, "dispose_cached_sqla_factory", None)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return dispose if callable(dispose) else None
+
+
+def _minimum_storage_preclose_timeout(storage: Any) -> float:
+    """Read the optional cached-SQLAlchemy close reservation safely."""
+    try:
+        value = getattr(storage, "minimum_sqla_factory_close_timeout_s", 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _minimum_storage_potential_preclose_timeout(storage: Any) -> float:
+    """Read a late-created SQLAlchemy factory's close reservation safely.
+
+    Feature shutdown may lazily construct a factory after whole-agent
+    shutdown has allocated its durable-tail deadline.  SQLite storage exposes
+    this potential reservation independently of the current cache; older or
+    generic storage implementations fall back to the currently cached value.
+    """
+    try:
+        value = getattr(
+            storage,
+            "minimum_potential_sqla_factory_close_timeout_s",
+            0.0,
+        )
+    except (AttributeError, TypeError, ValueError):
+        value = 0.0
+    if not isinstance(value, bool) and isinstance(value, (int, float)):
+        value = float(value)
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return _minimum_storage_preclose_timeout(storage)
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -353,11 +569,23 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        hosted_telegram_route_attestation_resolver: Any = None,
+        peer_directory_router: Optional["PeerDirectoryRouter"] = None,
+        peer_requester: Optional["PeerRequester"] = None,
+        isolated_feature_data_dir: Optional[Path] = None,
+        isolated_runtime_root: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_namespace: Optional[str | os.PathLike[str]] = None,
+        isolated_runtime_hosted: bool = False,
         sovereign_trust_root_path: Optional[str] = None,
         identity_export_dir: Optional[Path] = None,
-        isolated_runtime_root: Optional[Union[str, Path]] = None,
-        isolated_runtime_namespace: Optional[Union[str, Path]] = None,
-        isolated_runtime_hosted: bool = False,
+        semantic_inference_profile: Optional["InferenceProfile"] = None,
+        semantic_inference_limits: Optional["InferenceLimits"] = None,
+        semantic_maintenance_limits: Optional["SemanticMaintenanceLimits"] = None,
+        semantic_capabilities: Optional["SemanticRuntimeCapabilities"] = None,
+        semantic_inference_configured: bool = False,
+        semantic_maintenance_configured: bool = False,
+        semantic_capabilities_configured: bool = False,
+        semantic_maintenance_allow_prior_verified_snapshot: bool = False,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -370,6 +598,10 @@ class KestrelAgent(
             privacy_mode: Privacy mode for this session.
             pg_pool: Optional PostgreSQL pool for feedback feature.
             database_url: PostgreSQL connection string (for postgres backend).
+                With ``pg_pool``, an explicitly supplied value also configures
+                the separate scheduler advisory-lock pool.  An ambient
+                ``KESTREL_DATABASE_URL`` does not replace the connection recipe
+                copied from the supplied pool.
             db_backend: Database backend type ('sqlite' or 'postgres').
                        Defaults to KESTREL_DB_BACKEND env var or 'sqlite'.
             allowed_features: Optional set of feature class names to load.
@@ -388,6 +620,32 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            hosted_telegram_route_attestation_resolver: Optional host-owned
+                       pre-initialize resolver for a Telegram route already
+                       provisioned outside Core. It supplies typed ledger
+                       evidence before isolated feature discovery can start
+                       the child handshake; Core never provisions provider
+                       HTTP/webhooks through this seam.
+            peer_directory_router: Optional hosted peer-directory/router.  When
+                       supplied it replaces the local multi-agent HTTP adapter
+                       used by ``PeersFeature``.
+            peer_requester: Host-authenticated stable requester identity plus
+                       opaque authorization scope for ``peer_directory_router``.
+                       This is injected by the embedding runtime, never derived
+                       from a tool caller or user-id field.
+            isolated_feature_data_dir: Optional host-owned per-agent directory
+                       retained for standalone embedding compatibility. Hosted
+                       and multi-tenant factories must use the explicit root /
+                       namespace contract below instead.
+            isolated_runtime_root: Host-owned root for isolated-feature mutable
+                       runtime state. Hosted factories must pair this with
+                       ``isolated_runtime_namespace``.
+            isolated_runtime_namespace: Canonical relative tenant/agent
+                       namespace below ``isolated_runtime_root``. The runtime
+                       validates it and securely binds it to this agent DID.
+            isolated_runtime_hosted: Declares that this agent shares a host
+                       runtime. Discovery of an isolated feature fails closed
+                       unless an explicit root and namespace were supplied.
             sovereign_trust_root_path: Optional operator-owned JSON DID-document
                        path used to authorize constitution reanchor artifacts.
                        When omitted, the shared resolver reads
@@ -396,15 +654,24 @@ class KestrelAgent(
             identity_export_dir: Optional per-agent local identity export
                        directory. Multi-agent hosts resolve this before agent
                        construction so it never depends on process CWD.
-            isolated_runtime_root: Host-owned root for isolated-feature mutable
-                       runtime state. Hosted factories must pair this with
-                       ``isolated_runtime_namespace``.
-            isolated_runtime_namespace: Relative tenant/agent namespace below
-                       ``isolated_runtime_root``. It is canonicalized and
-                       containment-checked before use.
-            isolated_runtime_hosted: Declares that this agent is hosted in a
-                       shared runtime. An isolated feature then fails closed if
-                       no explicit root and namespace were supplied.
+            semantic_inference_profile: Parsed, exact semantic materialization
+                       profile injected by a managed agent configuration.
+            semantic_inference_limits: Parsed, bounded materialization limits
+                       injected with the selected profile.  The limits remain
+                       operator configuration rather than service constants.
+            semantic_maintenance_limits: Parsed bounded validation, audit,
+                       and report budget for post-consolidation maintenance.
+            semantic_inference_configured: Whether the managed configuration
+                       explicitly supplied the profile, including an explicit
+                       disabled profile. When true it takes precedence over a
+                       legacy per-agent kestrel.toml block.
+            semantic_maintenance_configured: Whether the managed
+                configuration explicitly supplied maintenance limits.
+                When true it takes precedence over a legacy per-agent
+                kestrel.toml block, even when inference is disabled.
+            semantic_maintenance_allow_prior_verified_snapshot: Explicit
+                operator policy allowing scheduled training to use a prior
+                complete maintenance snapshot for the active capability.
         """
         self.did = did
         self._privacy_mode = privacy_mode
@@ -412,6 +679,16 @@ class KestrelAgent(
         effective_db_backend = db_backend or os.environ.get(
             "KESTREL_DB_BACKEND", "sqlite"
         )
+        if type(isolated_runtime_hosted) is not bool:
+            raise TypeError("isolated_runtime_hosted must be a bool")
+        if isolated_feature_data_dir is not None and (
+            isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
+        ):
+            raise ValueError(
+                "isolated_feature_data_dir cannot be combined with the hosted "
+                "isolated runtime root/namespace contract"
+            )
         # PostgreSQL hosts commonly have no agent-local filesystem database.
         # Treat that construction shape as hosted even if its factory predates
         # the explicit runtime-scope arguments.  An isolated feature then fails
@@ -420,6 +697,8 @@ class KestrelAgent(
         # supply them below to make the feature usable.
         self.isolated_runtime_hosted = bool(
             isolated_runtime_hosted
+            or isolated_runtime_root is not None
+            or isolated_runtime_namespace is not None
             or (
                 storage_path is None
                 and effective_db_backend.lower() == "postgres"
@@ -428,6 +707,7 @@ class KestrelAgent(
         self.isolated_runtime_root: Optional[Path] = None
         self.isolated_runtime_namespace: Optional[Path] = None
         self.isolated_runtime_path: Optional[Path] = None
+        self.isolated_runtime_scope = None
         if isolated_runtime_root is not None or isolated_runtime_namespace is not None:
             # Keep the hosted runtime boundary owned by the isolated-runtime
             # module. This validates path traversal once at construction and
@@ -444,6 +724,7 @@ class KestrelAgent(
             self.isolated_runtime_root = runtime_scope.root
             self.isolated_runtime_namespace = runtime_scope.namespace
             self.isolated_runtime_path = runtime_scope.path
+            self.isolated_runtime_scope = runtime_scope
         # Human display name for observability span attribution (#2602). Set to
         # a best-effort floor at construction so EVERY agent object carries the
         # attribute from birth — no construction path (fleet load, spawn /
@@ -464,6 +745,25 @@ class KestrelAgent(
         # on-disk host.db lookups during credential resolution at init.
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
+        if hosted_telegram_route_attestation_resolver is not None:
+            from kestrel_sovereign.features.isolated_runtime import (
+                set_hosted_telegram_route_attestation_resolver,
+            )
+
+            set_hosted_telegram_route_attestation_resolver(
+                self, hosted_telegram_route_attestation_resolver
+            )
+        # Scoped peer routing is an explicit dependency-injection seam for
+        # hosted multi-tenant runtimes.  PeersFeature validates the pair at
+        # initialization; keeping the opaque scope here avoids serializing it
+        # into agent state or accepting any caller-controlled substitute.
+        self.peer_directory_router = peer_directory_router
+        self.peer_requester = peer_requester
+        self.isolated_feature_data_dir = (
+            Path(isolated_feature_data_dir).expanduser().resolve()
+            if isolated_feature_data_dir is not None
+            else None
+        )
         self._sovereign_trust_root_path = sovereign_trust_root_path
         self.identity_export_dir = identity_export_dir
 
@@ -516,6 +816,170 @@ class KestrelAgent(
         # ``kestrel.toml`` and apply it to the privacy_agent's PrivacyConfig
         # when it gets constructed in ``initialize()``. Default stays False.
         self._privacy_computer_access: bool = False
+        # Inference remains opt-in per tenant. An enabled profile carries exact
+        # ontology and rule versions; SleepMixin consumes this value on every
+        # incremental maintenance pass and never selects a profile itself.
+        # Managed agents receive this from their LocalAgentConfig; direct
+        # agents retain the existing per-agent TOML control surface below.
+        from kestrel_sovereign.knowledge.inference import (
+            InferenceError,
+            InferenceLimits,
+        )
+        from kestrel_sovereign.knowledge.maintenance import (
+            SemanticMaintenanceError,
+            SemanticMaintenanceLimits,
+            maintenance_allows_prior_verified_snapshot,
+            maintenance_limits_from_config,
+        )
+        from kestrel_sovereign.knowledge.capabilities import (
+            SemanticCapabilityConfigurationError,
+            SemanticRuntimeCapabilities,
+            semantic_capabilities_from_config,
+        )
+
+        if semantic_inference_limits is not None and not isinstance(
+            semantic_inference_limits, InferenceLimits
+        ):
+            raise RuntimeError("Invalid semantic inference limits")
+        self.semantic_inference_profile = semantic_inference_profile
+        self.semantic_inference_limits = semantic_inference_limits or InferenceLimits()
+        if semantic_maintenance_limits is not None and not isinstance(
+            semantic_maintenance_limits, SemanticMaintenanceLimits
+        ):
+            raise RuntimeError("Invalid semantic maintenance limits")
+        self.semantic_maintenance_limits = (
+            semantic_maintenance_limits or SemanticMaintenanceLimits()
+        )
+        if semantic_capabilities is not None and not isinstance(
+            semantic_capabilities, SemanticRuntimeCapabilities
+        ):
+            raise RuntimeError("Invalid semantic capability selection")
+        self.semantic_capabilities = (
+            semantic_capabilities or SemanticRuntimeCapabilities.stable()
+        )
+        if semantic_capabilities is not None:
+            try:
+                self.semantic_capabilities.validate()
+            except SemanticCapabilityConfigurationError as exc:
+                raise RuntimeError("Invalid semantic capability selection") from exc
+        self.semantic_inference_configured = semantic_inference_configured
+        self.semantic_maintenance_configured = semantic_maintenance_configured
+        # An explicitly injected runtime selection is itself an opt-in.  Do
+        # not require direct constructors to also know the internal lifecycle
+        # flag used by managed config/env boot paths.
+        semantic_capabilities_configured = (
+            semantic_capabilities_configured or semantic_capabilities is not None
+        )
+        self.semantic_capabilities_configured = semantic_capabilities_configured
+        if type(semantic_maintenance_allow_prior_verified_snapshot) is not bool:
+            raise RuntimeError(
+                "Invalid semantic maintenance prior verified snapshot policy"
+            )
+        self.semantic_maintenance_allow_prior_verified_snapshot = (
+            semantic_maintenance_allow_prior_verified_snapshot
+        )
+        if semantic_inference_profile is not None:
+            from kestrel_sovereign.knowledge.inference import (
+                validate_inference_profile,
+            )
+
+            try:
+                validate_inference_profile(semantic_inference_profile)
+            except InferenceError as exc:
+                raise RuntimeError("Invalid semantic inference profile") from exc
+        if not semantic_inference_configured:
+            serialized_profile = os.environ.get(SEMANTIC_INFERENCE_CONFIG_ENV)
+            if serialized_profile is not None:
+                try:
+                    environment_profile = json.loads(serialized_profile)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Invalid {SEMANTIC_INFERENCE_CONFIG_ENV} configuration"
+                    ) from exc
+                from kestrel_sovereign.knowledge.inference import (
+                    inference_limits_from_config,
+                    inference_profile_from_config,
+                    validate_inference_profile,
+                )
+
+                try:
+                    self.semantic_inference_profile = inference_profile_from_config(
+                        environment_profile
+                    )
+                    self.semantic_inference_limits = inference_limits_from_config(
+                        environment_profile
+                    )
+                    if self.semantic_inference_profile is not None:
+                        validate_inference_profile(self.semantic_inference_profile)
+                except InferenceError as exc:
+                    raise RuntimeError(
+                        f"Invalid {SEMANTIC_INFERENCE_CONFIG_ENV} configuration"
+                    ) from exc
+                semantic_inference_configured = True
+                self.semantic_inference_configured = True
+        serialized_capabilities = os.environ.get(SEMANTIC_CAPABILITIES_CONFIG_ENV)
+        environment_capabilities_configured = os.environ.get(
+            SEMANTIC_CAPABILITIES_CONFIGURED_ENV
+        )
+        if not semantic_capabilities_configured:
+            if environment_capabilities_configured not in (None, "1"):
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_CAPABILITIES_CONFIGURED_ENV} configuration"
+                )
+            if (
+                environment_capabilities_configured == "1"
+                and serialized_capabilities is None
+            ):
+                raise RuntimeError(
+                    f"{SEMANTIC_CAPABILITIES_CONFIGURED_ENV} requires "
+                    f"{SEMANTIC_CAPABILITIES_CONFIG_ENV}"
+                )
+        if not semantic_capabilities_configured and serialized_capabilities is not None:
+            try:
+                capability_config = json.loads(serialized_capabilities)
+                self.semantic_capabilities = semantic_capabilities_from_config(
+                    capability_config
+                )
+            except (json.JSONDecodeError, SemanticCapabilityConfigurationError) as exc:
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_CAPABILITIES_CONFIG_ENV} configuration"
+                ) from exc
+            semantic_capabilities_configured = True
+            self.semantic_capabilities_configured = True
+        serialized_maintenance = os.environ.get(SEMANTIC_MAINTENANCE_CONFIG_ENV)
+        environment_maintenance_configured = os.environ.get(
+            SEMANTIC_MAINTENANCE_CONFIGURED_ENV
+        )
+        if not semantic_maintenance_configured:
+            if environment_maintenance_configured not in (None, "1"):
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_MAINTENANCE_CONFIGURED_ENV} configuration"
+                )
+            if (
+                environment_maintenance_configured == "1"
+                and serialized_maintenance is None
+            ):
+                raise RuntimeError(
+                    f"{SEMANTIC_MAINTENANCE_CONFIGURED_ENV} requires "
+                    f"{SEMANTIC_MAINTENANCE_CONFIG_ENV}"
+                )
+        if not semantic_maintenance_configured and serialized_maintenance is not None:
+            try:
+                maintenance_config = json.loads(serialized_maintenance)
+                self.semantic_maintenance_limits = maintenance_limits_from_config(
+                    maintenance_config
+                )
+                self.semantic_maintenance_allow_prior_verified_snapshot = (
+                    maintenance_allows_prior_verified_snapshot(
+                        maintenance_config
+                    )
+                )
+            except (json.JSONDecodeError, SemanticMaintenanceError) as exc:
+                raise RuntimeError(
+                    f"Invalid {SEMANTIC_MAINTENANCE_CONFIG_ENV} configuration"
+                ) from exc
+            semantic_maintenance_configured = True
+            self.semantic_maintenance_configured = True
         if storage_path:
             agent_toml = Path(storage_path).parent / "kestrel.toml"
             if agent_toml.exists():
@@ -526,14 +990,98 @@ class KestrelAgent(
                         import tomli as tomllib  # type: ignore[import-not-found]
                     with open(agent_toml, "rb") as f:
                         toml_data = tomllib.load(f)
-                    self._privacy_computer_access = bool(
-                        toml_data.get("privacy", {}).get("computer_access", False)
-                    )
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     logging.warning(
-                        "Failed to read [privacy] from %s: %s",
+                        "Failed to read [privacy] or [semantic_inference] from %s: %s",
                         agent_toml, exc,
                     )
+                else:
+                    # Semantic inference is an explicit approval boundary, so
+                    # parse it independently from optional privacy settings.
+                    # A malformed [privacy] section cannot disable a valid
+                    # materialization profile, and an invalid explicit profile
+                    # always blocks startup.
+                    if (
+                        not semantic_inference_configured
+                        and "semantic_inference" in toml_data
+                    ):
+                        from kestrel_sovereign.knowledge.inference import (
+                            inference_limits_from_config,
+                            inference_profile_from_config,
+                            validate_inference_profile,
+                        )
+
+                        try:
+                            self.semantic_inference_profile = (
+                                inference_profile_from_config(
+                                    toml_data["semantic_inference"]
+                                )
+                            )
+                            self.semantic_inference_limits = (
+                                inference_limits_from_config(
+                                    toml_data["semantic_inference"]
+                                )
+                            )
+                            if self.semantic_inference_profile is not None:
+                                validate_inference_profile(
+                                    self.semantic_inference_profile
+                                )
+                        except InferenceError as exc:
+                            # Do not quietly disable a profile an operator
+                            # explicitly placed in the agent configuration.
+                            raise RuntimeError(
+                                f"Invalid [semantic_inference] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_inference_configured = True
+                        self.semantic_inference_configured = True
+
+                    if (
+                        not semantic_maintenance_configured
+                        and "semantic_maintenance" in toml_data
+                    ):
+                        try:
+                            self.semantic_maintenance_limits = (
+                                maintenance_limits_from_config(
+                                    toml_data["semantic_maintenance"]
+                                )
+                            )
+                            self.semantic_maintenance_allow_prior_verified_snapshot = (
+                                maintenance_allows_prior_verified_snapshot(
+                                    toml_data["semantic_maintenance"]
+                                )
+                            )
+                        except SemanticMaintenanceError as exc:
+                            raise RuntimeError(
+                                f"Invalid [semantic_maintenance] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_maintenance_configured = True
+                        self.semantic_maintenance_configured = True
+
+                    if (
+                        not semantic_capabilities_configured
+                        and "semantic_capabilities" in toml_data
+                    ):
+                        try:
+                            self.semantic_capabilities = semantic_capabilities_from_config(
+                                toml_data["semantic_capabilities"]
+                            )
+                        except SemanticCapabilityConfigurationError as exc:
+                            raise RuntimeError(
+                                f"Invalid [semantic_capabilities] configuration in {agent_toml}"
+                            ) from exc
+                        semantic_capabilities_configured = True
+                        self.semantic_capabilities_configured = True
+
+                    privacy = toml_data.get("privacy", {})
+                    if not isinstance(privacy, Mapping):
+                        logging.warning(
+                            "Ignoring malformed [privacy] configuration in %s: expected a table",
+                            agent_toml,
+                        )
+                    else:
+                        self._privacy_computer_access = bool(
+                            privacy.get("computer_access", False)
+                        )
 
         # Hybrid-aware identity load (Quantum Hardening epic, Wave 3 follow-up).
         # Reads the legacy ECDSA key, the new hybrid keys (Ed25519 + ML-DSA-65),
@@ -648,7 +1196,20 @@ class KestrelAgent(
 
         # Determine database backend
         self._db_backend = effective_db_backend
+        # Birth-record capability the runtime database could not be given and
+        # no retry can supply (#2871). Surfaced by the ``birth_record`` health
+        # check; empty on every healthy agent.
+        self._birth_record_shortfall: List[str] = []
+        self._birth_record_shortfall_retryable = False
         self._database_url = database_url or os.environ.get("KESTREL_DATABASE_URL")
+        # ``_database_url`` is deliberately the resolved storage setting, but
+        # a shared pool has an independent advisory-lock pool.  Preserve the
+        # constructor provenance so an ambient URL cannot discard a custom
+        # connector, SSL context, or other connection recipe copied from that
+        # pool.  A non-empty explicit ``database_url`` remains the backwards-
+        # compatible override for callers that intentionally configure the
+        # scheduler pool independently.
+        self._explicit_advisory_dsn = database_url or None
 
         # Storage will be initialized asynchronously.
         #
@@ -722,6 +1283,15 @@ class KestrelAgent(
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
         self.wallet = None  # Set by WalletFeature.initialize()
         self.sleep_hooks = []  # *SleepHook instances; features append in post_all_features_loaded()
+        # Declarative SDK contributions are wired lazily once the existing
+        # per-agent wait/signal registries exist.  The operator registry is the
+        # single service/workflow registry for this agent lifecycle.
+        from kestrel_sovereign.operator import OperatorRuntimeRegistry
+
+        self.operator_registry = OperatorRuntimeRegistry()
+        self.feature_contribution_runtime = None
+        self.permission_defaults_registry = None
+        self.setup_step_registry = None
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)
@@ -739,6 +1309,13 @@ class KestrelAgent(
         # that must scope to the active conversation read it (read_attachment;
         # request_restart's origin-session capture, #1809). None = no turn.
         self._active_session_id: Optional[str] = None
+        # The turn id that currently HOLDS the turn lock, set/cleared by
+        # `_turn_lifecycle`. Pairs with the task-local `_CURRENT_TURN_ID`
+        # ContextVar so a caller can tell "I own the live turn" from "my task
+        # inherited a finished turn's context" — the check that keeps a
+        # detached task from reading a concurrent turn's `_active_session_id`
+        # (#2877). Read via `get_turn_bound_session_id`, not directly.
+        self._live_turn_id: Optional[str] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -765,10 +1342,22 @@ class KestrelAgent(
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()
+        # If the bounded durable tail cannot wait for dispatcher release, this
+        # task owns the only safe successor: dispatcher drain followed by the
+        # matching storage close.  It deliberately does not live in
+        # ``_background_tasks`` because that set is cancelled at the start of
+        # the tail; cancelling it would revive the post-close durable-write
+        # race the continuation exists to prevent.
+        self._durable_shutdown_continuation: Optional[asyncio.Task] = None
+        self._durable_shutdown_continuation_lock = asyncio.Lock()
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
+        # A caller may retry the same id while its original delivery is still
+        # running. Keep lifecycle registration ownership per delivery so one
+        # completion cannot unregister the other.
+        self._active_request_counts: dict[str, int] = {}
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
@@ -1310,16 +1899,36 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"Cold-start restore from Lighthouse failed: {e}", exc_info=True)
 
+        # Assertion authority is minted only after this agent boot path has
+        # resolved its DID.  Passing an agent_id to AsyncStorage is ordinary
+        # resource scoping, not authority issuance; the opaque capability is
+        # required for the normalized semantic assertion store on every backend.
+        assertion_tenant_capability = (
+            _resolve_authenticated_agent_assertion_capability(self.did, self.identity)
+            if self.did
+            else None
+        )
+
         # Initialize async storage based on backend type
         if self._db_backend.lower() == "postgres" and (self.pg_pool or self._database_url):
             # PostgreSQL backend - reuse shared pool if available
             if self.pg_pool:
                 from kestrel_sovereign.storage.db.postgres import PostgresBackend
-                pg_backend = PostgresBackend.from_pool(self.pg_pool)
+                # A PostgreSQL scheduler effect holds a session advisory gate
+                # across target execution. Its bounded dedicated pool needs the
+                # same DSN, never the shared operational pool, or a waiting
+                # fence could consume the connection required for renewal/final
+                # CAS. A missing DSN fails clearly at the first scheduler gate.
+                pg_backend = PostgresBackend.from_pool(
+                    self.pg_pool,
+                    advisory_dsn=self._explicit_advisory_dsn,
+                )
                 self._raw_storage = AsyncStorage(
                     backend=pg_backend,
                     agent_id=self.did,
                     llm_service=self.llm_service,
+                    _assertion_tenant_capability=assertion_tenant_capability,
+                    semantic_capabilities=self.semantic_capabilities,
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
@@ -1328,6 +1937,8 @@ class KestrelAgent(
                     dsn=self._database_url,
                     agent_id=self.did,
                     llm_service=self.llm_service,
+                    _assertion_tenant_capability=assertion_tenant_capability,
+                    semantic_capabilities=self.semantic_capabilities,
                 )
                 logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
         else:
@@ -1336,6 +1947,8 @@ class KestrelAgent(
                 self.storage_path,
                 agent_id=self.did,
                 llm_service=self.llm_service,
+                _assertion_tenant_capability=assertion_tenant_capability,
+                semantic_capabilities=self.semantic_capabilities,
             )
             logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 
@@ -1351,6 +1964,18 @@ class KestrelAgent(
 
         # Wrap storage with privacy-enforcing layer
         self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
+
+        # Bring the birth record into the database this runtime reads (#2871)
+        # BEFORE anything downstream consults the agent node. This position is
+        # not a preference: the very next block treats a missing node as a
+        # genuinely new identity and lets it establish a fresh constitution
+        # anchor, and the block after it reads the agent's name. Reconciling
+        # later would leave the agent anchored to the wrong constitution and
+        # running as "Unnamed Agent" even once its record had arrived. It also
+        # keeps the refusal ahead of every feature side effect and SESSION_START
+        # hook, so a host that cannot produce a valid birth record does no
+        # durable startup work before it stops.
+        await self._reconcile_birth_record_with_runtime_database()
 
         # Distinguish a genuinely new identity from a legacy identity that
         # merely lacks the new runtime-state row. Only a genuine first boot
@@ -1615,6 +2240,7 @@ class KestrelAgent(
         # post_all_features_loaded; the generic `wait("<kind>:<handle>")`
         # tool resolves kinds here. Mirrors signal_registry.
         self.wait_registry = WaitRegistry()
+        self._ensure_feature_contribution_runtime()
         self.signal_log_store = signal_log_store
         self.dispatcher = SignalDispatcher(
             agent=self,
@@ -1622,6 +2248,15 @@ class KestrelAgent(
             lock_manager=self._lock_manager,
             store=signal_log_store,
         )
+        # Register teardown before durable initialization's first await.  That
+        # initialization starts owner liveness before it finishes startup
+        # recovery; a later boot-phase failure must cancel it and release even
+        # a partially registered owner before storage rolls back.
+        ctx.on_rollback("signal_dispatcher", self._boot_teardown_dispatcher)
+        # The outcome-only signal_log is initialized above.  Initialize the
+        # separate pending-delivery ledger during boot so external workflow
+        # consumers can safely register before the first signal arrives.
+        await self.dispatcher.initialize_durable_delivery()
 
         # Register the always-on core signal sources under an explicit
         # MANDATORY policy (#2522). These are boot-critical routing targets,
@@ -1634,6 +2269,8 @@ class KestrelAgent(
         #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
         #   a2a.question_answered— send_a2a_question resumption rail (#1444)
         #   wait.complete        — generic wait reconciler rail (#1860)
+        #   workflow rescue      — the six generic sources named by the
+        #                          Workflows built-in stalled_work_rescue
         from kestrel_sovereign.signals import RegistrationPolicy
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
@@ -1650,6 +2287,9 @@ class KestrelAgent(
         from kestrel_sovereign.signals.sources.wait import (
             build_wait_complete_registration,
         )
+        from kestrel_sovereign.signals.sources.workflow_rescue import (
+            build_workflow_rescue_registrations,
+        )
 
         core_source_registrations = [
             build_a2a_task_complete_registration(),
@@ -1657,6 +2297,12 @@ class KestrelAgent(
             build_stripe_deposit_registration(),
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),
+            # Core hosts these provider-neutral registrations because the
+            # Workflows built-in names them.  The sweep is deliberately the
+            # echo-only implementation: an installed domain feature may feed
+            # explicit candidates into a run, but it does not replace or own
+            # the generic registration lifecycle.
+            *build_workflow_rescue_registrations(),
         ]
         core_source_names = [reg.name for reg in core_source_registrations]
         self.signal_registry.register_batch(
@@ -1881,6 +2527,308 @@ class KestrelAgent(
             logging.info("Sync service disabled by configuration")
 
 
+    async def _ensure_agent_node_present(self) -> "GraphNode":
+        """Return the agent's identity node, fabricating it only when correct.
+
+        A missing node in the runtime database is fabricated ONLY for a
+        genuinely new agent. If on-disk identity material is present, an
+        inception happened and its birth record is in a DIFFERENT database
+        (#2878) — fabricating a placeholder here would mask the real identity
+        (unnamed agent, no ``bootstrap_state``, nothing in Constitutional RAG)
+        while every health surface still reports ok. Refuse loudly instead.
+        """
+        logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
+        agent_node = await self.storage.get_node(self.agent_id)
+        logging.info(f"Agent node retrieved: {agent_node is not None}")
+        if agent_node is not None:
+            return agent_node
+
+        self._refuse_if_birth_record_in_another_database()
+
+        from kestrel_sovereign.storage import GraphNode
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            acquire_control_plane_capability,
+        )
+        agent_node = GraphNode(
+            node_id=self.agent_id,
+            node_type="agent",
+            label=f"Agent {self.agent_id}",
+            properties={"initialBalance": "100.0"},
+        )
+        # Trusted control-plane write: agent identity node. The capability
+        # admits the durable identity write in a volatile mode (#2672).
+        await self.storage.add_node(
+            agent_node, capability=acquire_control_plane_capability()
+        )
+        logging.info("Agent node created")
+        return agent_node
+
+    def _refuse_if_birth_record_in_another_database(self) -> None:
+        """Refuse to fabricate an agent node when inception's birth record is
+        in a database the runtime is not reading (#2878).
+
+        The runtime just proved this agent's DID by loading its on-disk identity
+        material (keys + DID document). Those artifacts ARE the evidence that an
+        inception happened. If that inception's agent node is nonetheless absent
+        from the runtime's database, the birth record was written elsewhere —
+        classically a PostgreSQL host whose ``kestrel create`` wrote to the
+        per-agent SQLite file the runtime never opens. Fabricating a placeholder
+        node here would boot the agent unnamed, with no ``bootstrap_state`` and
+        nothing in Constitutional RAG, while ``/health`` still reports ok. Fail
+        loudly instead.
+
+        A genuinely new agent — no prior inception, so ``self.identity`` is None
+        — is unaffected: creating its node is correct, and this returns.
+        """
+        if self.identity is None:
+            return
+        agent_dir = (
+            str(Path(self.storage_path).parent) if self.storage_path else "(unknown)"
+        )
+        # Detailed operator context (directory + backend) goes to the log, not
+        # into the public-safe IdentityReadinessError message.
+        logging.error(
+            "Birth record missing from the configured runtime database "
+            "(backend=%s) for agent %s: on-disk identity material is present in "
+            "%s but its agent node is absent from the runtime database. "
+            "Inception wrote the birth record to a different database. Refusing "
+            "to boot with a fabricated placeholder identity.",
+            self._db_backend,
+            self.agent_id,
+            agent_dir,
+        )
+        from kestrel_sovereign.identity.runtime_identity import (
+            IdentityReadinessError,
+        )
+
+        raise IdentityReadinessError(
+            "birth_record", cause_type="BirthRecordDatabaseMismatch"
+        )
+
+    async def _reconcile_birth_record_with_runtime_database(self) -> None:
+        """Copy inception's birth record into the runtime database (#2871).
+
+        ``kestrel create`` writes the birth record into the SQLite it opens in
+        the agent's directory. A host configured for PostgreSQL then boots the
+        agent against PostgreSQL, where the record does not exist — the agent
+        came up unnamed, with no ``bootstrap_state`` and nothing in
+        Constitutional RAG, while ``/health`` reported ok. The local file stays
+        (twelve places read its existence as the fact that a directory IS an
+        agent); the record is copied out of it into the database the runtime
+        actually reads.
+
+        Runs on every boot, and is a no-op on every ordinary SQLite deployment
+        because there the runtime database and the anchor are the same file.
+        When a copy IS needed it is idempotent, so an interrupted pass is
+        finished by the next boot instead of stranding a half-written record —
+        which is why this lives here and not inside inception, where a failed
+        copy would leave the anchor on disk, the next ``kestrel create``
+        refusing, and nothing left to retry.
+
+        If the record still does not agree with the anchor after a copy, boot
+        stops with ``IdentityReadinessError("birth_record")`` rather than
+        continuing on the claim that the copy happened.
+        """
+        if self.identity is None:
+            # No prior inception, so there is no birth record to copy. Node
+            # creation for a genuinely new agent is correct and happens later.
+            return
+
+        from kestrel_sovereign.identity.birth_record import (
+            anchor_holds_birth_record,
+            diagnose_birth_record,
+            diagnose_runtime_birth_record,
+            local_anchor_path,
+            replicate_birth_record,
+            runtime_database_is_the_anchor,
+        )
+
+        anchor = local_anchor_path(self.storage_path)
+        if anchor is None:
+            return
+        runtime_db = getattr(self._raw_storage, "db", None)
+        if runtime_db is None:
+            return
+        if runtime_database_is_the_anchor(runtime_db, anchor):
+            return
+
+        from kestrel_sovereign.identity.runtime_identity import (
+            IdentityReadinessError,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        # Ask the runtime database first, and open the anchor only if it has
+        # something to answer. Opening the anchor runs its migrations and
+        # ownership backfills, so a corrupt, read-only or half-deleted
+        # kestrel_prime.db would otherwise refuse a boot whose runtime record is
+        # complete — a file this host does not need any more deciding whether it
+        # may start.
+        shortfall = await diagnose_runtime_birth_record(
+            runtime_db=runtime_db, agent_did=self.agent_id,
+        )
+        if not shortfall:
+            return
+
+        anchor_db = None
+        copy_committed = False
+        try:
+            # Opening the anchor brings its schema up to date, exactly as a
+            # SQLite host would at every boot. Its birth record is only read.
+            anchor_db = await AsyncDatabase.sqlite(str(anchor))
+            if not await anchor_holds_birth_record(
+                anchor_db=anchor_db, agent_did=self.agent_id
+            ):
+                # Nothing to copy. The verdict is decided by WHAT is short, not
+                # by whether an anchor happens to exist — identical damage must
+                # not boot on one host and refuse on another.
+                logging.warning(
+                    "Birth record for %s is incomplete in the runtime database "
+                    "(%s) and the local anchor %s holds no record to repair it "
+                    "from.",
+                    self.agent_id, shortfall.describe(), anchor,
+                )
+                self._record_birth_record_shortfall(shortfall)
+                return
+
+            # The shortfall drives the repair; this comparison is for the
+            # operator, naming which rows the anchor can supply. Gating on it
+            # instead would silently skip the one condition only the runtime
+            # check detects — a governing edge whose node is unreadable.
+            divergence = await diagnose_birth_record(
+                runtime_db=runtime_db,
+                anchor_db=anchor_db,
+                agent_did=self.agent_id,
+            )
+            logging.warning(
+                "Birth record for %s is incomplete in the runtime database "
+                "(%s); against the local anchor %s: %s. Replicating "
+                "(backend=%s).",
+                self.agent_id,
+                shortfall.describe(),
+                anchor,
+                divergence.describe() or "no rows missing",
+                self._db_backend,
+            )
+            result = await replicate_birth_record(
+                runtime_db=runtime_db,
+                anchor_db=anchor_db,
+                agent_did=self.agent_id,
+            )
+            copy_committed = True
+            logging.info(
+                "Replicated birth record for %s into the runtime database: %s",
+                self.agent_id,
+                result.describe(),
+            )
+
+            # Verify rather than assume. A pass that reports success but left
+            # the record incomplete is precisely the failure this whole cluster
+            # of issues is about — a durable claim nobody observed.
+            #
+            # Asked of the runtime alone, deliberately: the question is whether
+            # this agent can now be who it is, not whether it matches a frozen
+            # snapshot. Re-comparing against the anchor would refuse forever
+            # over differences replication correctly declines to make — a
+            # reanchored constitution, chunks already indexed here.
+            remaining = await diagnose_runtime_birth_record(
+                runtime_db=runtime_db, agent_did=self.agent_id,
+            )
+            self._record_birth_record_shortfall(remaining)
+        except IdentityReadinessError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # A failed copy is judged by the same rule as a completed one: what
+            # is the runtime database actually short of? Every raise site in
+            # replicate_birth_record is an ANCHOR-integrity problem — an
+            # unwitnessed edge, a file row with no bytes, the anchor failing to
+            # open — and so is a transient fault mid-copy. Refusing on all of
+            # them unconditionally would brick an agent whose own identity is
+            # intact and which boots on origin/main today, and would tell its
+            # operator to "re-incept against this backend", which for a dropped
+            # connection is destructive advice.
+            #
+            # ``shortfall`` is the pre-replication diagnosis, so it describes
+            # the runtime as this pass found it. Identity gaps still refuse.
+            logging.error(
+                "Could not replicate the birth record for %s from %s into the "
+                "configured runtime database (backend=%s): %s",
+                self.agent_id, anchor, self._db_backend, exc, exc_info=True,
+            )
+            # ``shortfall`` is the pre-replication diagnosis. It is exact for a
+            # raise inside the copy's transaction, which rolled back; for one
+            # after the commit it can name something already repaired, so
+            # re-diagnose when the copy is known to have landed.
+            verdict = shortfall
+            if copy_committed:
+                try:
+                    verdict = await diagnose_runtime_birth_record(
+                        runtime_db=runtime_db, agent_did=self.agent_id,
+                    )
+                except Exception:  # noqa: BLE001 - keep the older, safe verdict
+                    pass
+            self._record_birth_record_shortfall(verdict, retryable=True)
+        finally:
+            if anchor_db is not None:
+                await anchor_db.close()
+
+    def _record_birth_record_shortfall(self, divergence, *, retryable=False) -> None:
+        """Decide the verdict on WHAT is short, and leave a trace either way.
+
+        ``identity`` — no agent node, or a fabricated placeholder — is #2878's
+        condition, and boot refuses on it here rather than fifty lines later in
+        ``_ensure_agent_node_present``, which only ever inspects the node's
+        presence. Refusing here also keeps it ahead of every feature side
+        effect, and makes the verdict independent of whether a local anchor
+        exists: identical damage must not boot on one host and refuse on
+        another.
+
+        ``capability`` — no governing edge, an unreadable governing target, no
+        retrievable constitution chunks — is NOT refused. Replication has
+        already repaired whatever the anchor could supply; what is left is
+        unobtainable, and every retry produces the same result. Refusing would
+        turn an agent that boots today into one that never boots again, with no
+        verb to fix it. It is recorded instead, so ``/health/detailed`` names
+        the loss. #2871's defect was that this loss was SILENT; naming it is
+        the fix.
+
+        ``retryable`` distinguishes the two ways a capability can be short. A
+        completed pass that could not supply it means the anchor does not have
+        it and no restart will change that. A pass that DIED — a dropped
+        connection, a locked file — is usually transient, and telling the
+        operator it is unrepairable sends them to rebuild an anchor when a
+        restart would have fixed it.
+        """
+        self._birth_record_shortfall = list(getattr(divergence, "capability", []))
+        self._birth_record_shortfall_retryable = bool(retryable)
+        if self._birth_record_shortfall:
+            logging.error(
+                "Birth record for %s is still incomplete (%s). The agent will "
+                "boot without it. %s",
+                self.agent_id,
+                "; ".join(self._birth_record_shortfall),
+                (
+                    "The copy failed this pass; a restart may complete it."
+                    if retryable
+                    else "The local anchor cannot supply it, so no retry will "
+                    "— see /health/detailed."
+                ),
+            )
+        identity_failures = list(getattr(divergence, "identity", []))
+        if identity_failures:
+            from kestrel_sovereign.identity.runtime_identity import (
+                IdentityReadinessError,
+            )
+
+            logging.error(
+                "Birth record for %s does not establish its identity in the "
+                "configured runtime database (%s). Refusing to boot.",
+                self.agent_id,
+                "; ".join(identity_failures),
+            )
+            raise IdentityReadinessError(
+                "birth_record", cause_type="BirthRecordIdentityMissing"
+            )
+
     async def _boot_phase_identity_constitution_features(self, ctx: BootContext) -> None:
         """Phase 4 — identity name, constitution overlay verification (BEFORE feature discovery), feature discovery/enablement/registration, the durable agent node, the startup constitution audit, and LLM payer policy."""
         # Resolve agent name BEFORE features so features can use it
@@ -1965,10 +2913,22 @@ class KestrelAgent(
         # every feature already initialized — each feature.initialize() may have
         # opened connections or started workers.
         ctx.on_rollback("features", self._boot_teardown_features)
-        for feature in discovered_features:
-            if feature.name in disabled_features:
-                continue
-            await self._register_feature(feature)
+        enabled_discovered_features = tuple(
+            feature
+            for feature in discovered_features
+            if feature.name not in disabled_features
+        )
+        prepared_contributions = self._prepare_feature_contribution_transition(
+            enabled_discovered_features
+        )
+        prepared_by_feature = {
+            id(item.feature): item for item in prepared_contributions
+        }
+        for feature in enabled_discovered_features:
+            await self._register_startup_feature(
+                feature,
+                prepared_contributions=prepared_by_feature[id(feature)],
+            )
         verify_mandatory_feature_set(
             self.features,
             stage="agent readiness",
@@ -2011,27 +2971,9 @@ class KestrelAgent(
                 HookEvent.SESSION_START, hook_input
             )
 
-        # Ensure agent graph node exists
-        logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")
-        agent_node = await self.storage.get_node(self.agent_id)
-        logging.info(f"Agent node retrieved: {agent_node is not None}")
-        if agent_node is None:
-            from kestrel_sovereign.storage import GraphNode
-            from kestrel_sovereign.storage.privacy_wrapper import (
-                acquire_control_plane_capability,
-            )
-            agent_node = GraphNode(
-                node_id=self.agent_id,
-                node_type="agent",
-                label=f"Agent {self.agent_id}",
-                properties={"initialBalance": "100.0"}
-            )
-            # Trusted control-plane write: agent identity node. The capability
-            # admits the durable identity write in a volatile mode (#2672).
-            await self.storage.add_node(
-                agent_node, capability=acquire_control_plane_capability()
-            )
-            logging.info("Agent node created")
+        # Ensure agent graph node exists (fabricates only for a genuinely new
+        # agent; refuses when a birth record exists in another database — #2878).
+        agent_node = await self._ensure_agent_node_present()
 
         # A missing durable row or an audit older than 24 hours must be
         # resolved before initialize() can make this agent visible as
@@ -2185,6 +3127,11 @@ class KestrelAgent(
             # so manual / scheduled consolidation can't leak user-derived
             # memory in a volatile privacy mode (#2672).
             privacy_storage=self.storage,
+            # Episode repair (#2856) checks the privacy mode and then awaits
+            # decryption and several durable writes. Without the same mutex a
+            # transition holds, a flip to EPHEMERAL / ISOLATED can land in that
+            # gap and the raw memory_episodes write persists regardless.
+            transition_lock=self._get_privacy_transition_lock(),
         )
         # Register teardown BEFORE initialize so a failure partway through
         # ``MemorySystem.initialize()`` (which may open stores / start workers)
@@ -2207,6 +3154,10 @@ class KestrelAgent(
             agent_data_path=agent_data_dir,
             db=self._raw_storage.db,
             agent_id=self.agent_id,
+            semantic_inference_profile=self.semantic_inference_profile,
+            semantic_inference_limits=self.semantic_inference_limits,
+            semantic_maintenance_limits=self.semantic_maintenance_limits,
+            semantic_answerability_gate=self.memory_system.retriever.answerability_gate,
         )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
@@ -2333,12 +3284,12 @@ class KestrelAgent(
 
         # Host sleep/wake resilience (#1545). The ResumeMonitor watches
         # for a wall-clock-vs-monotonic divergence (a host suspend) and
-        # dispatches one `system.resumed` ACTION signal; its handler
-        # re-anchors the dispatcher's throttling windows, which otherwise
-        # disagree about elapsed time across a sleep. The scheduler and
-        # heartbeat detect staleness on their own ticks, so they self-heal
-        # independently of this signal — the monitor is the observable
-        # spine plus the dispatcher's re-anchor trigger.
+        # re-anchors the dispatcher before it emits one auditable
+        # `system.resumed` ACTION signal. Reconciliation of volatile durable-
+        # delivery sidecars must not depend on that signal persisting.
+        # The scheduler and heartbeat detect staleness on their own ticks, so
+        # they self-heal independently of this signal — the monitor is the
+        # observable spine plus the dispatcher's re-anchor trigger.
         from kestrel_sovereign.resume_monitor import (
             ResumeMonitor,
             ResumeMonitorConfig,
@@ -2350,8 +3301,7 @@ class KestrelAgent(
 
         async def _resume_action_handler(payload: dict):
             gap = float(payload.get("gap_seconds", 0.0))
-            self.dispatcher.notify_resume(gap)
-            return {"re_anchored": True, "gap_seconds": gap}
+            return {"recorded": True, "gap_seconds": gap}
 
         self.signal_registry.register_with_policy(
             build_system_resumed_registration(handler=_resume_action_handler),
@@ -2367,6 +3317,11 @@ class KestrelAgent(
         async def _on_resume(gap_seconds: float) -> None:
             from kestrel_sdk.signals import Signal, SignalMode, Visibility
 
+            # This cleanup is safety-critical for volatile raw sidecars. A
+            # durable persistence failure is reported by dispatch_signal as a
+            # failed result rather than raised, so doing it in the ACTION
+            # handler would leave expiry timers frozen across a host suspend.
+            self.dispatcher.notify_resume(gap_seconds)
             signal = Signal(
                 source=RESUME_SOURCE_NAME,
                 kind="resumed",
@@ -2460,13 +3415,24 @@ class KestrelAgent(
     # Each releases exactly ONE resource a boot phase acquired and is
     # registered via ``ctx.on_rollback`` at the moment of acquisition, so the
     # BootContext can unwind them in reverse (LIFO) order on any phase failure.
-    # All are idempotent and guarded: they null their handle first so a later
-    # ``shutdown()`` (e.g. the AgentManager cleanup path) is a clean no-op, and
-    # they never raise past their own guard — the rollback driver logs and
-    # continues so one stubborn resource can't strand the others.
+    # Each clears its handle only after releasing the resource it protects. A
+    # durable dispatcher is the deliberate exception to eager handle clearing:
+    # a failed owner release retains both dispatcher and storage so a later
+    # lifecycle shutdown can retry safely. The rollback driver logs failures
+    # and continues with independent resources.
     # ------------------------------------------------------------------
     async def _boot_teardown_storage(self) -> None:
         """Close the primary DB connection and drop the privacy layer."""
+        # Dispatcher teardown owns a runtime-owner release against this very
+        # backend.  If its retryable release has not succeeded, retaining both
+        # handles is the only safe rollback state: closing here would strand a
+        # live owner or let its completion touch a closed SQLite worker.
+        if getattr(self, "dispatcher", None) is not None:
+            logging.error(
+                "boot rollback: retaining storage because durable dispatcher "
+                "teardown is still incomplete"
+            )
+            return
         raw = self._raw_storage
         self._raw_storage = None
         self.storage = None
@@ -2487,6 +3453,47 @@ class KestrelAgent(
         self._sync_service = None
         if svc is not None and getattr(svc, "is_running", False):
             await svc.stop()
+
+    async def _boot_teardown_dispatcher(self) -> None:
+        """Stop durable dispatcher liveness before its storage is released."""
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            return
+
+        cancelled = False
+        retried_failure = False
+        while True:
+            try:
+                await dispatcher.shutdown_durable_delivery()
+                break
+            except asyncio.CancelledError:
+                # BootContext guarantees a complete rollback, but this
+                # particular step owns the dispatcher-to-storage ordering.
+                # Do not let repeated cancellation leave its owner release
+                # alive while the next rollback action closes SQLite.
+                cancelled = True
+                continue
+            except Exception:
+                if retried_failure:
+                    raise
+                # Durable teardown is intentionally retryable.  A failure can
+                # land after an owner-release transaction has reached the
+                # driver, so retry the dispatcher-owned completion before
+                # deciding rollback is unsafe. A persistent failure leaves
+                # ``self.dispatcher`` intact, which keeps storage owned and
+                # open for a later lifecycle shutdown.
+                retried_failure = True
+                logging.warning(
+                    "boot rollback: durable dispatcher teardown failed; retrying "
+                    "before storage release",
+                    exc_info=True,
+                )
+
+        # Only a successfully released dispatcher may lose its public handle.
+        # The following storage rollback can now close the shared backend.
+        self.dispatcher = None
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _boot_teardown_features(self) -> None:
         """Reverse every feature registration made before the failure, LIFO.
@@ -2619,7 +3626,13 @@ class KestrelAgent(
                     allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
                 )
             self._pending_privacy_transition = None
-            return await self._apply_privacy_mode_locked(mode)
+            result = await self._apply_privacy_mode_locked(mode)
+            if result.retryable_conflict:
+                # Keep the consented target staged. Retrying confirmation after
+                # the active fact finishes must apply that same target, not
+                # silently become a "nothing pending" no-op.
+                self._pending_privacy_transition = mode
+            return result
 
     async def cancel_privacy_transition(self) -> PrivacyTransitionResult:
         """Discard a privacy transition previously staged as pending confirmation.
@@ -2724,8 +3737,22 @@ class KestrelAgent(
                     purge_failed=True,
                 )
 
+        # The storage wrapper owns the linearization guard against durable
+        # explicit-fact operations.  Ask it first: if a fact operation is in
+        # flight, the transition is refused without leaving the agent and its
+        # privacy policy in a split state.
+        try:
+            self.storage.set_privacy_mode(mode)
+        except PrivacyViolationError:
+            return PrivacyTransitionResult(
+                message=PRIVACY_TRANSITION_RETRY_MESSAGE,
+                allows_cloud_llm=privacy_mode_to_config(
+                    self._privacy_mode
+                ).allows_cloud_llm(),
+                applied=False,
+                retryable_conflict=True,
+            )
         self._privacy_mode = mode
-        self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
 
         config = privacy_mode_to_config(mode)
@@ -3175,6 +4202,80 @@ class KestrelAgent(
             return
         await store.clear(self.did, kind, name)
 
+    def _ensure_feature_contribution_runtime(self):
+        """Return the contribution controller bound to this agent's registries.
+
+        Bare lifecycle tests attach wait/signal registries after construction,
+        while a fully booted agent creates them in the durable-runtime phase.
+        Laziness supports both without creating a competing registry.
+        """
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionRuntime,
+        )
+        from kestrel_sovereign.signals import SourceRegistry
+        from kestrel_sovereign.waits import WaitRegistry
+
+        signal_registry = getattr(self, "signal_registry", None)
+        if signal_registry is None:
+            signal_registry = SourceRegistry()
+            self.signal_registry = signal_registry
+        wait_registry = getattr(self, "wait_registry", None)
+        if wait_registry is None:
+            wait_registry = WaitRegistry()
+            self.wait_registry = wait_registry
+
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is not None:
+            if (
+                runtime.wait_registry is wait_registry
+                and runtime.source_registry is signal_registry
+            ):
+                return runtime
+            if runtime.active_owners():
+                raise RuntimeError(
+                    "cannot replace contribution registries while features are active"
+                )
+
+        runtime = FeatureContributionRuntime(
+            operator_registry=self.operator_registry,
+            wait_registry=wait_registry,
+            source_registry=signal_registry,
+        )
+        self.feature_contribution_runtime = runtime
+        self.permission_defaults_registry = runtime.permission_defaults_registry
+        self.setup_step_registry = runtime.setup_step_registry
+        return runtime
+
+    def _prepare_feature_contribution_transition(self, features):
+        """Collect and prevalidate one complete feature activation transition."""
+        from kestrel_sovereign.features.contribution_runtime import (
+            FeatureContributionCollectionError,
+        )
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        try:
+            return self._ensure_feature_contribution_runtime().prepare_transition(
+                features
+            )
+        except FeatureContributionCollectionError as exc:
+            feature_class_name = type(exc.feature).__name__
+            cause = exc.__cause__
+            if feature_class_name in MANDATORY_FEATURES:
+                if exc.stage == "tool collection":
+                    stage = "registration"
+                    problem = "could not register its tools"
+                else:
+                    stage = "contribution registration"
+                    problem = "could not register its SDK contributions"
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    stage,
+                    problem,
+                ) from cause
+            if cause is None:  # Defensive: collection failures always chain.
+                raise
+            raise cause.with_traceback(cause.__traceback__) from cause.__cause__
+
     async def _shutdown_failed_feature(self, feature: Feature) -> None:
         """Drain EVERY registration of a feature whose registration failed mid-way.
 
@@ -3215,12 +4316,201 @@ class KestrelAgent(
                 exc,
             )
 
-    async def _register_feature(self, feature: Feature):
+    async def _apply_host_feature_config(self, feature: Feature) -> None:
+        """Hand a freshly initialized feature the config the operator declared.
+
+        A feature that declares a ``config_schema`` has, until now, had no
+        declarative way to be given values: the only route was an HTTP call to
+        the configuration endpoint. That is why extracting Talon silently broke
+        it on every existing agent — the package correctly requires the host to
+        supply explicit paths, and the host had no mechanism with which to
+        supply them (#3008). Features that needed configuration either read the
+        agent's TOML themselves, re-deriving a file location per feature, or
+        were simply unconfigurable without a control-panel visit.
+
+        Core cannot know what any feature's configuration means, and must never
+        import a feature package to find out. It does not need to: the registry
+        already maps a feature class to the package that owns it, so the block
+        is addressed by the *operator-facing* package name — ``[features.talon
+        .config]``, the name used by ``kestrel feature enable`` — rather than
+        by the class name, which is an implementation detail that happens to
+        leak through ``self.features``.
+
+        A declared block that will not apply is a capability gap rather than an
+        identity gap: the agent boots and says so, rather than refusing. It is
+        safe to be loud instead of fatal here precisely because an unconfigured
+        feature now reports itself unconfigured instead of claiming readiness.
+        """
+        schema = getattr(feature, "config_schema", None)
+        if schema is None:
+            return
+        # ``feature.name`` rather than the concrete class: an isolated feature
+        # is loaded as a ProxyFeature and only ``name`` carries the advertised
+        # registry class, so keying on type() would silently skip every
+        # isolated feature — reintroducing the exact silence this closes.
+        declared = self._declared_feature_config(getattr(feature, "name", "") or "")
+        if declared is None:
+            return
+        # An explicitly empty [features.X.config] means "clear it", which is a
+        # different instruction from "no block". Treating them alike would let
+        # an operator who deliberately emptied the table keep running the
+        # settings they just removed — and would skip required-field
+        # validation on the way past.
+        declared = dict(declared)
+        if isinstance(schema, dict):
+            # The same rule the HTTP configuration route applies. Validating
+            # here means a bad value is refused before any feature persists it.
+            validate_feature_config(declared, schema)
+        await feature.set_config(declared)
+
+    def _agent_toml_path(self) -> Optional[Path]:
+        """The per-agent TOML, beside the agent's database file."""
+        if not self.storage_path:
+            return None
+        return Path(self.storage_path).parent / "kestrel.toml"
+
+    def _declared_feature_config(
+        self, feature_class_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read ``[features.<package>.config]`` for one feature class.
+
+        Returns ``None`` when no block is declared, and a (possibly empty)
+        mapping when one is — the distinction is load-bearing.
+        """
+        path = self._agent_toml_path()
+        if path is None or not path.exists():
+            return None
+        from kestrel_sovereign.feature_registry import get_package_for_feature
+
+        package = get_package_for_feature(feature_class_name)
+        if package is None:
+            return None
+        try:
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ImportError:
+                import tomli as tomllib  # type: ignore[import-not-found]
+            with open(path, "rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, ValueError) as exc:
+            # Do NOT degrade to "no declaration". A malformed file is not an
+            # absent one: reporting it as absent lets an initialized feature
+            # keep configuration the operator believes they replaced, which is
+            # the silent divergence this mechanism exists to end.
+            raise HostFeatureConfigError(
+                f"Feature configuration in {path} could not be read: {exc}"
+            ) from exc
+        features = data.get("features")
+        if not isinstance(features, dict):
+            return None
+        entry = features.get(package.name)
+        if not isinstance(entry, dict):
+            # The confusable spelling is the class name, because that is what
+            # the HTTP configuration route and ``self.features`` are keyed by.
+            # A block written there would be silently ignored, which is the
+            # failure this whole mechanism exists to end — so say so.
+            mistaken = features.get(feature_class_name)
+            if isinstance(mistaken, dict) and "config" in mistaken:
+                logging.warning(
+                    "%s declares [features.%s.config], which is never read. "
+                    "Feature configuration is addressed by package name: use "
+                    "[features.%s.config].",
+                    path,
+                    feature_class_name,
+                    package.name,
+                )
+            return None
+        declared = entry.get("config")
+        return declared if isinstance(declared, dict) else None
+
+    async def _register_startup_feature(
+        self,
+        feature: Feature,
+        *,
+        prepared_contributions=None,
+    ) -> bool:
+        """Register one discovered feature, quarantining safe prep failures.
+
+        A transient OS failure, an ambiguous legacy/stable custody migration,
+        or unsafe process-wide feature configuration makes an optional isolated
+        feature unavailable, but does not weaken the rest of the agent.  True
+        namespace/ownership violations use the separate
+        ``IsolatedRuntimeNamespaceError`` hierarchy and continue to fail the
+        hosted agent closed.
+        """
+
+        try:
+            await self._register_feature(
+                feature,
+                prepared_contributions=prepared_contributions,
+            )
+        except Exception as exc:
+            # Do not import the optional isolated runtime while registering
+            # ordinary core features. An actual ProxyFeature proves the module
+            # is already loaded, so classify its narrow quarantine outcomes
+            # from that exact module and let every other exception propagate.
+            isolated_runtime = sys.modules.get(
+                "kestrel_sovereign.features.isolated_runtime"
+            )
+            proxy_type = getattr(isolated_runtime, "ProxyFeature", None)
+            configuration_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimeConfigurationError",
+                None,
+            )
+            preparation_error = getattr(
+                isolated_runtime,
+                "IsolatedRuntimePreparationError",
+                None,
+            )
+            is_isolated_feature = isinstance(proxy_type, type) and isinstance(
+                feature, proxy_type
+            )
+            if not is_isolated_feature:
+                raise
+            if isinstance(configuration_error, type) and isinstance(
+                exc, configuration_error
+            ):
+                # Derive text through the exception type's closed diagnostic
+                # map. Third-party code can raise this public type with an
+                # arbitrary base message, so logging ``exc`` could disclose
+                # values.
+                diagnostic = configuration_error.safe_diagnostic(exc)
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because %s; "
+                    "other agent features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                    diagnostic,
+                )
+                return False
+            if isinstance(preparation_error, type) and isinstance(
+                exc, preparation_error
+            ):
+                logging.error(
+                    "Optional isolated feature '%s' is unavailable because its "
+                    "agent-scoped runtime could not be prepared safely; other agent "
+                    "features will continue.",
+                    getattr(feature, "name", type(feature).__name__),
+                )
+                return False
+            raise
+        return True
+
+    async def _register_feature(
+        self,
+        feature: Feature,
+        *,
+        prepared_contributions=None,
+    ):
         """Register a feature with A2A TaskManager for unified command routing."""
         from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
         feature_class_name = type(feature).__name__
         mandatory = feature_class_name in MANDATORY_FEATURES
+        if prepared_contributions is None:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                (feature,)
+            )[0]
         try:
             await feature.initialize()
         except Exception as exc:
@@ -3232,7 +4522,51 @@ class KestrelAgent(
                     "could not initialize",
                 ) from exc
             raise
+        try:
+            await self._apply_host_feature_config(feature)
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so the handler below never
+            # sees it. initialize() has already run at this point and the
+            # feature is not yet in self.features, so boot rollback cannot
+            # find it — its tasks and signal sources would outlive the failed
+            # boot. Tear down, then let the cancellation continue.
+            with contextlib.suppress(Exception):
+                await self._shutdown_failed_feature(feature)
+            raise
+        except Exception as exc:
+            # Deliberately fatal to this feature. A rejected block does NOT
+            # leave the feature unconfigured — a feature that validates before
+            # replacing its active config (Talon does) keeps running its
+            # PREVIOUS configuration, so swallowing this would leave the agent
+            # dispatching with paths and policy the operator did not declare
+            # and believes they replaced. Silent divergence between declared
+            # and running configuration is the whole subject of #3008; it must
+            # not be reintroduced by its own fix.
+            await self._shutdown_failed_feature(feature)
+            logging.error(
+                "Feature '%s' rejected the configuration declared in %s: %s. "
+                "The feature is NOT loaded, so it cannot run with settings "
+                "other than the ones declared.",
+                feature_class_name,
+                self._agent_toml_path(),
+                exc,
+            )
+            raise
         self.features[feature.name] = feature
+
+        try:
+            self._ensure_feature_contribution_runtime().activate(
+                prepared_contributions
+            )
+        except Exception as exc:
+            await self._shutdown_failed_feature(feature)
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "contribution registration",
+                    "could not register its SDK contributions",
+                ) from exc
+            raise
 
         # Auto-register hooks from get_hooks() with the agent's HooksManager
         try:
@@ -3289,6 +4623,27 @@ class KestrelAgent(
                 f"'{feature.name}'"
             )
 
+    async def _register_runtime_feature_permissions(self, feature: "Feature") -> None:
+        """Apply one runtime-enabled feature's permissions before exposure.
+
+        Boot uses ``SecurityFeature.post_all_features_loaded`` once discovery
+        is complete. A soft-disabled feature's SDK contributions, however, are
+        absent from that pass and become active only during runtime enable.
+        Route that transition through SecurityFeature's same per-feature seam
+        after contribution activation and before hooks, A2A, or direct tools
+        are wired, so hard defaults cannot temporarily degrade to fallback ASK.
+        """
+        from kestrel_sovereign.features.security.feature import SecurityFeature
+
+        security = self.features.get("SecurityFeature")
+        if (
+            not isinstance(security, SecurityFeature)
+            or security is feature
+            or not bool(getattr(security, "enabled", True))
+        ):
+            return
+        await security.register_feature_tools(feature.name, feature)
+
     def _wire_feature_a2a(self, feature: "Feature") -> None:
         """Register a feature as an A2A agent with the TaskManager.
 
@@ -3339,7 +4694,12 @@ class KestrelAgent(
                 self._register_explored_feature_tools(feature)
                 self._pinned_features.add(feature.tool_name)
 
-    async def _activate_feature_runtime(self, feature: "Feature") -> None:
+    async def _activate_feature_runtime(
+        self,
+        feature: "Feature",
+        *,
+        prepared_contributions=None,
+    ) -> None:
         """Bring an already-loaded feature fully live — the inverse of
         :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
 
@@ -3347,23 +4707,24 @@ class KestrelAgent(
         performed, on the SAME feature instance, so a soft-disabled feature is
         restored end to end:
 
-        * ``initialize()`` — re-registers the feature's owned **signal sources**
-          (talon registers ``talon.job_complete`` etc. here);
+        * ``initialize()`` — re-registers the feature's owned **signal sources**;
+        * contributed permission defaults through SecurityFeature, before any
+          callable surface is exposed;
         * hooks from ``get_hooks()`` (via :meth:`_wire_feature_hooks`);
         * the ``on_enable`` lifecycle;
         * the A2A TaskManager agent registration (via :meth:`_wire_feature_a2a`);
         * startup-promoted **dynamic tools** (mirrors
           :meth:`_promote_startup_feature_tools`);
         * ``post_all_features_loaded()`` — re-registers the feature's owned
-          **wait providers** (``task:`` / ``talon:``);
+          **wait providers**;
         * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
           services are live (RestartCoordinator's post-restart wake sweep runs
           here, #1809). Runtime re-enable must fire it too or a re-enabled
           feature silently skips its ready work.
 
         Precondition: ``feature.initialize()`` must be idempotent — it is re-run
-        to restore signal sources a disable detached (talon / tasks are, and
-        document it). Atomic: on any failure BEFORE the commit, the partial
+        to restore signal sources a disable detached. Atomic: on any failure
+        BEFORE the commit, the partial
         activation is torn back down *softly* (``unload=False`` — the instance
         stays re-enable-able) and the error re-raised, so a failed enable never
         leaves half-registered state. ``on_agent_ready`` runs AFTER the commit
@@ -3373,8 +4734,20 @@ class KestrelAgent(
         :meth:`_register_feature` (which additionally handles first-load
         discovery and the mandatory-feature readiness contract).
         """
+        if prepared_contributions is None:
+            prepared_contributions = self._prepare_feature_contribution_transition(
+                (feature,)
+            )[0]
         try:
             await feature.initialize()
+            # initialize() can reset config a feature does not persist (a
+            # volatile-privacy host key, for example), so a disable/enable
+            # cycle would otherwise lose the declared value until restart.
+            await self._apply_host_feature_config(feature)
+            self._ensure_feature_contribution_runtime().activate(
+                prepared_contributions
+            )
+            await self._register_runtime_feature_permissions(feature)
             self._wire_feature_hooks(feature)
             await feature.on_enable()
             self._wire_feature_a2a(feature)
@@ -3458,6 +4831,19 @@ class KestrelAgent(
         )
         feature_tool_name = getattr(feature, "tool_name", feature_key)
         errors: List[Exception] = []
+
+        # Declarative contributions are exact lifecycle capabilities. Remove
+        # them independently even when the feature's imperative hooks fail.
+        try:
+            runtime = self._ensure_feature_contribution_runtime()
+            runtime.deactivate(feature)
+        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            errors.append(exc)
+            logging.exception(
+                "Feature '%s' SDK contribution teardown failed; "
+                "continuing with the remaining cleanup",
+                feature_key,
+            )
 
         # Lifecycle inverse of on_enable (run during activation). Independent of
         # every teardown step below, so its failure must not skip them.
@@ -3875,7 +5261,8 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None) -> str:
+    @bind_async_invocation("invocation_id")
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -3909,6 +5296,11 @@ Expected Duration: {expected_duration}
                                     persisted user-turn content.
             user_passphrase: Optional per-request passphrase for USER_BYOK agents.
                              Required for PayerKind.USER_BYOK to decrypt provider keys.
+            invocation_id: Opaque top-level operation identity. When omitted,
+                an id is generated and task-locally bound for tool provenance.
+            invocation_provenance: Endpoint-owned authenticated actor and
+                transport metadata. This is task-local only; tools cannot
+                provide or override it through their arguments.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -3949,14 +5341,13 @@ Expected Duration: {expected_duration}
             getattr(self, "_constitution_audit_pending", False) is True
         )
         if safe_mode or audit_pending:
-            safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
-            if user_input.startswith("!"):
-                cmd = user_input.split()[0]
-                if cmd not in safe_mode_commands:
+            command = prefixed_command_token(user_input)
+            if command is not None:
+                if command not in SAFE_MODE_COMMANDS:
                     return (
                         "🚨 SAFE MODE ACTIVE\\n\\n"
                         "The agent has detected an integrity issue and is operating in restricted mode.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status\\n\\n"
+                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
@@ -3991,10 +5382,23 @@ Expected Duration: {expected_duration}
 
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-                # Allow bootstrap commands to pass through
-                bootstrap_commands = ["!skip-discovery", "!restart-discovery", "!bootstrap-status"]
-                if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
+                command = prefixed_command_token(user_input)
+                if command in BOOTSTRAP_ALLOWED_COMMANDS:
                     pass  # Let command handler process these
+                elif command is not None:
+                    # Never feed command text into discovery. Bootstrap may
+                    # persist its input and response or even complete before it
+                    # returns, which would leave the operator's transcript out
+                    # of sync with durable state when we replace that response.
+                    logging.info(
+                        "[BOOTSTRAP] Command %s unavailable until onboarding completes",
+                        command,
+                    )
+                    return (
+                        f"❌ Command unavailable during bootstrap: {command}\n\n"
+                        "Complete onboarding first, or use !skip-discovery to "
+                        "finish bootstrap with the default personality."
+                    )
                 else:
                     bootstrap_response = await self._handle_bootstrap(
                         user_input, session_id,
@@ -4043,6 +5447,10 @@ Expected Duration: {expected_duration}
                 KESTREL_AGENT_NAME: self.agent_name,
                 "agent.did": self.did,
                 "agent.session_id": session_id or "",
+                # #2916: the key the fleet Timeline actually groups on. Omitted
+                # (None, not "") when the turn has no session, so a sessionless
+                # turn stays absent rather than carrying an empty attribute.
+                KESTREL_SESSION_ID: session_id or None,
                 "agent.input_length": len(user_input),
             }) as _otel_span:
                 # Lifecycle is already entered; call the locked body directly.
@@ -4223,6 +5631,7 @@ Expected Duration: {expected_duration}
         content: str,
         *,
         session_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
         response=None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
@@ -4234,6 +5643,8 @@ Expected Duration: {expected_duration}
             use_last_identity=use_last_identity or response is not None,
         )
         kwargs = {"session_id": session_id}
+        if metadata:
+            kwargs["metadata"] = metadata
         resolved_model = model or identity.get("model")
         resolved_provider = provider or identity.get("provider")
         if resolved_model is not None:
@@ -4476,7 +5887,10 @@ Expected Duration: {expected_duration}
             )
 
         try:
-            history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
+            history = await self.privacy_agent.get_conversation_history(
+                limit=CONTEXT_HISTORY_LIMIT,
+                session_id=session_id,
+            )
             logging.debug(
                 "Conversation history loaded: count=%d session_scoped=%s",
                 len(history),
@@ -4513,6 +5927,9 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Failed to fetch reflection guidance: {e}")
 
+        # Resolve the exact schemas before planning so wrapper/tool accounting
+        # and final pruning describe the same payload sent below.
+        feature_tools = self._build_all_tools()
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
@@ -4525,6 +5942,19 @@ Expected Duration: {expected_duration}
             system_prompt_addendum=system_prompt_addendum,
             system_prompt_budget_bytes=system_prompt_budget_bytes,
             anchored_doctrine=anchored_doctrine,
+            tools=feature_tools,
+            # Span attribution only (#2940): memory retrieval's answerability
+            # judge issues its own LLM call, and this is the only place the
+            # turn's session is in scope to name it. History filtering is
+            # already done — ``conversation_history`` above is the session's.
+            session_id=session_id,
+        )
+        from kestrel_sovereign.agent.semantic_recall import (
+            persistence_dependency_metadata,
+        )
+
+        semantic_recall_metadata = persistence_dependency_metadata(
+            getattr(context_result, "semantic_recall_dependencies", ())
         )
 
         # B / #1309 + C / #1311: degraded-mode fail-closed.
@@ -4602,7 +6032,7 @@ Expected Duration: {expected_duration}
         # internal instruction block — matching the live path, which shows only
         # the wake's response bubble and never the prompt. rendered_content is
         # untouched, so LLM replay + cache stability are unaffected.
-        user_meta = {"sent_form": True}
+        user_meta = {"sent_form": True, **semantic_recall_metadata}
         if signal_wake:
             user_meta["signal_wake"] = signal_wake
         try:
@@ -4637,9 +6067,8 @@ Expected Duration: {expected_duration}
         if not effective_model:
             effective_model = await self.check_solvency()
 
-        # Build feature tools for the orchestrator
-        # Includes feature dispatch tools + any direct tools from explored features
-        feature_tools = self._build_all_tools()
+        # ``feature_tools`` was snapshotted before context planning so the
+        # plan and provider call cannot observe different registry states.
 
         # Log tool availability via A2A ObservabilityStore
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []
@@ -4678,47 +6107,59 @@ Expected Duration: {expected_duration}
 
         logging.debug(f"[CONTEXT] Sending {len(messages)} messages to LLM (1 system + {len(context_result.messages)} history + 1 user)")
 
-        # Generate response with full conversation context. ``session_id``
-        # threads through to stateful adapters (e.g. CodexAdapter), letting
-        # them anchor on ``previous_response_id`` and preserve encrypted
-        # reasoning across turns. #806 / #821.
-        #
-        # ``tool_executor`` is required by adapters that run an inline tool
-        # loop inside one LLM turn (the codex app-server's
-        # ``item/tool/call`` RPC is the current consumer). Without it,
-        # openai:plan hard-fails when tools are advertised. Stateless
-        # adapters (anthropic, openai:api) ignore the callable, so passing
-        # it unconditionally is safe and keeps the non-streaming path
-        # parity with the streaming path (orchestrator_engine:1836).
-        # #2614: resolve the per-request correlation identity for THIS turn.
-        # Explicit ``invocation_context`` wins; otherwise fall back to the
-        # legacy ``set_observability_context`` ambient state, with the explicit
-        # ``session_id`` filling an empty session slot. Shared helper so the
-        # streaming path agrees on precedence.
-        resolved_context = resolve_turn_invocation_context(
-            self.llm_service, invocation_context, session_id
-        )
-        # #2674 finding 3: under an enforcing (fail-closed) POST_RESPONSE audit
-        # the assistant prose is withheld pending the verdict, so the main
-        # provider call's raw prompt/response must not land in durable llm_calls
-        # telemetry or the OTel LLM span before that verdict (and, on DENY,
-        # never). Carry the content-redaction flag on the FROZEN per-turn context
-        # (never global state); it also covers the follow-up tool-synthesis calls
-        # in ``_handle_orchestrator_response`` that reuse ``resolved_context``.
-        if audit_enforcing and isinstance(resolved_context, LLMInvocationContext):
-            resolved_context = _replace_dataclass(
-                resolved_context, redact_content=True
+        # #2530: the operator notice is INJECTED but not yet delivered. An
+        # inline system notice is ephemeral by construction (#2009), so it is
+        # only beyond loss once the provider has accepted the request — i.e.
+        # once this call returns. Anything that throws between here and there
+        # loses it, so it settles failed/cancelled and the producer requeues
+        # it for the next turn instead of recording a delivery that never
+        # happened.
+        try:
+            # Generate response with full conversation context. ``session_id``
+            # threads through to stateful adapters (e.g. CodexAdapter), letting
+            # them anchor on ``previous_response_id`` and preserve encrypted
+            # reasoning across turns. #806 / #821.
+            #
+            # ``tool_executor`` is required by adapters that run an inline tool
+            # loop inside one LLM turn (the codex app-server's
+            # ``item/tool/call`` RPC is the current consumer). Without it,
+            # openai:plan hard-fails when tools are advertised. Stateless
+            # adapters (anthropic, openai:api) ignore the callable, so passing
+            # it unconditionally is safe and keeps the non-streaming path
+            # parity with the streaming path (orchestrator_engine:1836).
+            # #2614: resolve the per-request correlation identity for THIS turn.
+            # Explicit ``invocation_context`` wins; otherwise fall back to the
+            # legacy ``set_observability_context`` ambient state, with the explicit
+            # ``session_id`` filling an empty session slot. Shared helper so the
+            # streaming path agrees on precedence.
+            resolved_context = resolve_turn_invocation_context(
+                self.llm_service, invocation_context, session_id
             )
-        response = await self.llm_service.generate_with_messages(
-            messages=messages,
-            force_local_only=force_local_only,
-            model_override=effective_model,
-            tools=feature_tools if feature_tools else None,
-            session_id=session_id,
-            keep_trailing_system=operator_turn.keep_trailing_system,
-            tool_executor=self._make_inline_tool_executor(session_id or ""),
-            invocation_context=resolved_context,
-        )
+            # #2674 finding 3: under an enforcing (fail-closed) POST_RESPONSE audit
+            # the assistant prose is withheld pending the verdict, so the main
+            # provider call's raw prompt/response must not land in durable llm_calls
+            # telemetry or the OTel LLM span before that verdict (and, on DENY,
+            # never). Carry the content-redaction flag on the FROZEN per-turn context
+            # (never global state); it also covers the follow-up tool-synthesis calls
+            # in ``_handle_orchestrator_response`` that reuse ``resolved_context``.
+            if audit_enforcing and isinstance(resolved_context, LLMInvocationContext):
+                resolved_context = _replace_dataclass(
+                    resolved_context, redact_content=True
+                )
+            response = await self.llm_service.generate_with_messages(
+                messages=messages,
+                force_local_only=force_local_only,
+                model_override=effective_model,
+                tools=feature_tools if feature_tools else None,
+                session_id=session_id,
+                keep_trailing_system=operator_turn.keep_trailing_system,
+                tool_executor=self._make_inline_tool_executor(session_id or ""),
+                invocation_context=resolved_context,
+            )
+        except BaseException as exc:
+            await operator_turn.settle_interrupted(exc)
+            raise
+        await operator_turn.settle_delivered()
 
         # Log LLM response timing
         llm_duration = int((time.time() - llm_start) * 1000)
@@ -4790,6 +6231,10 @@ Expected Duration: {expected_duration}
             session_id=session_id,
             tool_results=stop_tool_results,
             invocation_context=resolved_context,
+            # #2841: the same budgeted history this turn's FIRST provider call
+            # sent. Without it the post-tool continuation answered from a blank
+            # conversation while the first call had full context.
+            conversation_history=context_result.messages,
         )
 
         # #2675: assemble the SAME tool/narration evidence the streaming path
@@ -4874,7 +6319,10 @@ Expected Duration: {expected_duration}
 
         # Store agent response (linked to session for resumed conversations)
         await self._persist_assistant_conversation(
-            response_text, session_id=session_id, response=response,
+            response_text,
+            session_id=session_id,
+            metadata=semantic_recall_metadata,
+            response=response,
         )
 
         # Post-response memory pipeline:
@@ -5169,6 +6617,13 @@ Expected Duration: {expected_duration}
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
         """Start agent-owned background work and remove it when complete."""
         task = asyncio.create_task(coro, name=name)
+        # ``asyncio.Task`` carries no creation time, and age is what separates
+        # "busy" from "wedged" when something inspects this set — the restart
+        # coordinator's idle gate reports it so an operator can tell a task
+        # that appeared once from one stuck for hours (#2665). Stamped at the
+        # single chokepoint that owns the set, so nothing has to maintain a
+        # parallel map that could outlive the task.
+        task._kestrel_started_at = time.monotonic()  # type: ignore[attr-defined]
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
@@ -5184,6 +6639,148 @@ Expected Duration: {expected_duration}
 
         await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+    async def _complete_durable_shutdown_continuation(
+        self,
+        dispatcher,
+        storage,
+        storage_preclose,
+    ) -> None:
+        """Finish dispatcher release before touching its shared storage.
+
+        This task is created only after the bounded tail has spent its
+        dispatcher guard.  It is deliberately unbounded and joinable: the
+        durable dispatcher already owns a shielded, retryable release task,
+        and storage cannot safely close until that task has actually finished.
+        The production lifecycle owner joins this continuation before removing
+        the agent or releasing its budget.
+        """
+        await dispatcher.shutdown_durable_delivery()
+        wait_for_owner_release = getattr(
+            dispatcher, "wait_for_durable_shutdown_release", None
+        )
+        if callable(wait_for_owner_release):
+            await wait_for_owner_release()
+        if storage_preclose is not None:
+            await storage_preclose()
+        if storage is not None and hasattr(storage, "close"):
+            await storage.close()
+
+    async def _ensure_durable_shutdown_continuation(self, dispatcher) -> asyncio.Task:
+        """Return the single agent-owned dispatcher-to-storage continuation."""
+        async with self._durable_shutdown_continuation_lock:
+            continuation = self._durable_shutdown_continuation
+            if continuation is not None and not continuation.done():
+                return continuation
+            if continuation is not None and not continuation.cancelled():
+                # A completed successful continuation has already performed
+                # its storage close.  Reuse it so a second shutdown cannot
+                # duplicate that close.
+                if continuation.exception() is None:
+                    return continuation
+
+            storage = self.storage
+            continuation = asyncio.create_task(
+                self._complete_durable_shutdown_continuation(
+                    dispatcher,
+                    storage,
+                    _storage_preclose(storage),
+                ),
+                name=f"agent_durable_shutdown_continuation:{self.did}",
+            )
+            # Always retrieve an unjoined failure.  The task remains retained
+            # for a later lifecycle retry, rather than disappearing as an
+            # unobserved "Task exception was never retrieved" warning.
+            continuation.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
+            self._durable_shutdown_continuation = continuation
+            return continuation
+
+    async def wait_for_shutdown_completion(self) -> None:
+        """Join deferred durable cleanup before releasing this agent.
+
+        Normal shutdown has no continuation because its bounded tail closes
+        storage directly.  If dispatcher release outlives that guard, this
+        joins the agent-owned continuation that performs the only permitted
+        subsequent storage close.  ``shield`` preserves the work if an outer
+        lifecycle wait is cancelled; a later owner can join the same task.
+        """
+        retried_failure = False
+        while True:
+            continuation = self._durable_shutdown_continuation
+            if continuation is None:
+                return
+            try:
+                await asyncio.shield(continuation)
+                return
+            except asyncio.CancelledError:
+                # A continuation can itself be cancelled (for example while
+                # releasing the runtime owner).  That is a retryable cleanup
+                # failure.  A cancellation of *this* waiter, on the other
+                # hand, must remain visible to the outer lifecycle owner,
+                # which keeps the continuation alive with ``shield``.
+                if not continuation.done() or not continuation.cancelled():
+                    raise
+                failure: BaseException = asyncio.CancelledError()
+            except Exception as exc:
+                failure = exc
+
+            if retried_failure:
+                raise RuntimeError(
+                    "Durable shutdown continuation failed after its retry; "
+                    "dispatcher release and storage close are unconfirmed"
+                ) from failure
+
+            retried_failure = True
+            dispatcher = getattr(self, "dispatcher", None)
+            if dispatcher is None or not hasattr(
+                dispatcher, "shutdown_durable_delivery"
+            ):
+                raise RuntimeError(
+                    "Durable shutdown continuation failed without a dispatcher "
+                    "available for its required retry"
+                ) from failure
+            logging.warning(
+                "Durable shutdown continuation failed; retrying dispatcher "
+                "release and storage close before lifecycle exit",
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+
+    def handoff_shutdown_to_reaper(
+        self, shutdown_task: "asyncio.Future[object]"
+    ) -> "asyncio.Future[None]":
+        """Transfer a timed-out lifecycle join to a retained control-plane reaper.
+
+        A durable cognition turn can legally outlive the user-facing shutdown
+        deadline: its delivery lease and the storage connection it uses must
+        remain with that original execution until it either commits or is
+        safely retried.  Lifecycle callers nevertheless need a finite control
+        plane operation so they can withdraw routing and revoke a delegated
+        budget.  This method gives them one explicit handoff boundary.
+
+        The returned coroutine *never* closes storage early.  It first joins
+        the exact ``shutdown_task`` the caller already owns, then joins this
+        agent's continuation (if the bounded tail created one).  An
+        :class:`~kestrel_sovereign.multi_agent.agent_manager.AgentManager`
+        retains that coroutine in its observable quarantine registry rather
+        than awaiting it on the DELETE/restart path.
+        """
+        if not isinstance(shutdown_task, asyncio.Future):
+            raise TypeError("shutdown reaper handoff requires an asyncio future")
+
+        async def reap() -> None:
+            _cancelled, failure = await await_lifecycle_task_completion(shutdown_task)
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                raise failure
+            await self.wait_for_shutdown_completion()
+
+        return asyncio.create_task(
+            reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
+        )
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
@@ -5304,7 +6901,7 @@ Expected Duration: {expected_duration}
         Generate an AgentCard for this agent (for A2A discovery).
         Returns agent identity, capabilities, and available skills.
         """
-        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentSkill, AgentProvider
+        from kestrel_sovereign.a2a.agent_card import AgentCard, AgentCapabilities, AgentProvider
 
         # Get agent name from storage node if available
         agent_name = "Kestrel Agent"
@@ -5381,7 +6978,33 @@ Expected Duration: {expected_duration}
         own slice and cannot starve a later feature — or the durable tail.
         """
         loop = asyncio.get_running_loop()
-        prefix_budget, tail_reserve = _resolve_shutdown_budget()
+        dispatcher = getattr(self, "dispatcher", None)
+        inherited_durable_admission = getattr(
+            dispatcher, "has_live_durable_admission_in_current_context", None
+        )
+        if callable(inherited_durable_admission) and inherited_durable_admission():
+            # A signal handler can call agent.shutdown(), whose bounded tail
+            # creates child tasks.  ContextVars copy the parent dispatch's
+            # durable admission into those children, so allowing this shutdown
+            # to begin would make dispatcher teardown wait for the dispatch
+            # that is itself awaiting shutdown.  Refuse before any prefix or
+            # storage teardown runs; an external lifecycle owner may retry
+            # once the dispatch has released its admission.
+            raise RuntimeError(
+                "Cannot shut down an agent from a live durable signal operation"
+            )
+        storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        # A feature may lazily create a file-backed SQLAlchemy factory during
+        # its shutdown.  Reserve that backend-declared *potential* close
+        # window now, before the feature sweep can populate the cache.
+        storage_preclose_reservation = (
+            _minimum_storage_potential_preclose_timeout(self.storage)
+        )
+        prefix_budget, tail_reserve = _resolve_shutdown_budget(
+            self._durable_tail_minimum_budget(
+                storage_close_timeout, storage_preclose_reservation
+            )
+        )
         # Shared deadline for the fallible prefix. Reserve headroom so the
         # durable tail runs WITHIN the outer deadline rather than relying on
         # the outer wait_for cancellation to trigger it.
@@ -5529,8 +7152,35 @@ Expected Duration: {expected_duration}
             for feature_name, feature in remaining_features:
                 per_feature = _step_budget()
                 try:
+                    # Some lifecycle owners (notably isolated SDK facades)
+                    # must keep an exact stop coroutine alive after this
+                    # fair-share deadline: it may own the only subprocess
+                    # handle.  The optional wrapper gives such a feature the
+                    # canonical agent-deadline signal, so it can retain that
+                    # task and return cancellation promptly instead of
+                    # consuming later features' and the durable tail's time.
+                    # Look on the class, not the instance: test doubles and
+                    # dynamic adapters can fabricate arbitrary attributes,
+                    # which must not be mistaken for this lifecycle contract.
+                    bounded_shutdown = getattr(
+                        type(feature), "shutdown_with_agent_deadline", None
+                    )
+                    prepare_bounded_shutdown = getattr(
+                        type(feature), "prepare_shutdown_with_agent_deadline", None
+                    )
+                    if callable(prepare_bounded_shutdown):
+                        # A zero fair share is still a terminal shutdown
+                        # request.  Establish isolated runtime ownership
+                        # before wait_for can cancel its coroutine prior to
+                        # the first instruction in its async body.
+                        feature.prepare_shutdown_with_agent_deadline()
+                    shutdown_operation = (
+                        feature.shutdown_with_agent_deadline()
+                        if callable(bounded_shutdown)
+                        else feature.shutdown()
+                    )
                     await asyncio.wait_for(
-                        feature.shutdown(), timeout=per_feature
+                        shutdown_operation, timeout=per_feature
                     )
                 except asyncio.TimeoutError:
                     logging.warning(
@@ -5609,6 +7259,16 @@ Expected Duration: {expected_duration}
         except asyncio.CancelledError:
             shutdown_cancelled = True
         finally:
+            # Re-read the actual cache at the tail boundary.  The original
+            # potential reservation remains the floor, so a factory created
+            # by feature shutdown cannot spend the primary backend's worker
+            # close window.  This stays inside ``tail_reserve`` — and thus the
+            # production outer shutdown bound — because that reservation was
+            # composed before the prefix started.
+            storage_preclose_timeout = max(
+                storage_preclose_reservation,
+                _minimum_storage_preclose_timeout(self.storage),
+            )
             # Durable cleanup tail — safety-critical, always runs even under
             # cancellation. It has its OWN finite, honest deadline
             # (``tail_reserve``) so a tail step that hangs or suppresses
@@ -5616,10 +7276,41 @@ Expected Duration: {expected_duration}
             # branch unreachable. Returns whether cancellation was observed
             # and whether any step degraded (abandoned/errored).
             tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
-                tail_reserve
+                tail_reserve,
+                storage_close_timeout=storage_close_timeout,
+                storage_preclose_timeout=storage_preclose_timeout,
             )
             if tail_cancelled:
                 shutdown_cancelled = True
+
+        # A timed dispatcher guard transfers ownership of the remaining
+        # dispatcher-drain -> storage-close sequence to one agent-owned task.
+        # On an ordinary shutdown we join it here, so this method never reports
+        # completion while the shared SQLite worker remains open.  If an outer
+        # lifecycle timeout already cancelled us, leave the continuation
+        # shielded and let that lifecycle owner join it before removing the
+        # agent; re-raising below preserves the cancellation contract.
+        dispatcher_owner_fenced = bool(
+            getattr(dispatcher, "durable_shutdown_owner_fenced", False)
+        )
+        if not shutdown_cancelled and not dispatcher_owner_fenced:
+            try:
+                await self.wait_for_shutdown_completion()
+            except asyncio.CancelledError:
+                shutdown_cancelled = True
+        elif dispatcher_owner_fenced:
+            # The continuation owns storage close after the hostile cognition
+            # task settles. Returning degraded keeps shutdown bounded without
+            # making that live task peer-reclaimable in this process.
+            tail_degraded = True
+        elif (
+            self._durable_shutdown_continuation is not None
+            and not self._durable_shutdown_continuation.done()
+        ):
+            # We must propagate the caller's timeout, but must not describe
+            # shutdown as complete while its owned dispatcher-to-storage tail
+            # is still running.
+            tail_degraded = True
 
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer
@@ -5648,8 +7339,61 @@ Expected Duration: {expected_duration}
         else:
             logging.info("Kestrel Agent async shutdown complete.")
 
+    def _durable_tail_minimum_budget(
+        self,
+        storage_close_timeout: float,
+        storage_preclose_timeout: float = 0.0,
+    ) -> float:
+        """Return the durable-tail floor needed for a storage close contract.
+
+        SQLite's close must retain enough time for its aiosqlite worker to
+        exit.  The preceding durable operations retain their existing minimum
+        attempts, and this reservation makes their aggregate guards plus the
+        SQLite requirement fit inside the same bounded tail deadline.
+        """
+        if storage_close_timeout <= 0.0:
+            return 0.0
+
+        memory_system = getattr(self, "memory_system", None)
+        run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
+        sync_service = getattr(self, "_sync_service", None)
+        run_sync = bool(sync_service and sync_service.is_running)
+        dispatcher = getattr(self, "dispatcher", None)
+        run_dispatcher = bool(
+            dispatcher and hasattr(dispatcher, "shutdown_durable_delivery")
+        )
+        run_storage = hasattr(self.storage, "close")
+        if not run_storage:
+            return 0.0
+
+        # The cached SQLAlchemy factory is a separate, bounded pre-close
+        # operation.  Its own SQLite driver workers need their own declared
+        # reservation; it must not consume the primary close's reservation.
+        run_storage_preclose = _storage_preclose(self.storage) is not None
+        # The dispatcher releases runtime-owner liveness and any raw volatile
+        # handoffs before storage closes. It is a distinct guarded tail step,
+        # so its minimum must be reserved alongside background cleanup,
+        # memory, and the two sync phases.
+        preceding_steps = (
+            1 + int(run_dispatcher) + int(run_memory) + 2 * int(run_sync)
+        )
+        preclose_minimum = (
+            max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
+            if run_storage_preclose
+            else 0.0
+        )
+        return (
+            preceding_steps * KESTREL_SHUTDOWN_TAIL_MIN_STEP_S
+            + preclose_minimum
+            + storage_close_timeout
+        )
+
     async def _run_durable_shutdown_tail(
-        self, tail_reserve: float
+        self,
+        tail_reserve: float,
+        *,
+        storage_close_timeout: float | None = None,
+        storage_preclose_timeout: float | None = None,
     ) -> tuple[bool, bool]:
         """Run the safety-critical durable shutdown steps.
 
@@ -5677,9 +7421,6 @@ Expected Duration: {expected_duration}
           the caller must NOT describe the cleanup as "completed".
         """
         loop = asyncio.get_running_loop()
-        tail_deadline = loop.time() + max(
-            KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, tail_reserve
-        )
 
         state = {"cancelled": False, "degraded": False}
 
@@ -5689,22 +7430,81 @@ Expected Duration: {expected_duration}
         run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
         sync_service = getattr(self, "_sync_service", None)
         run_sync = bool(sync_service and sync_service.is_running)
+        dispatcher = getattr(self, "dispatcher", None)
+        run_dispatcher = bool(
+            dispatcher and hasattr(dispatcher, "shutdown_durable_delivery")
+        )
         run_storage = hasattr(self.storage, "close")
+        if storage_close_timeout is None:
+            storage_close_timeout = _minimum_storage_close_timeout(self.storage)
+        if storage_preclose_timeout is None:
+            storage_preclose_timeout = max(
+                _minimum_storage_potential_preclose_timeout(self.storage),
+                _minimum_storage_preclose_timeout(self.storage),
+            )
+        if not run_storage:
+            storage_close_timeout = 0.0
+            storage_preclose_timeout = 0.0
+
+        tail_minimum = self._durable_tail_minimum_budget(
+            storage_close_timeout, storage_preclose_timeout
+        )
+        # The normal (non-SQLite) path retains its existing fair-share
+        # allocation.  SQLite adds a declared reservation, which includes the
+        # preceding tail-step floors, so a short fair share cannot cancel the
+        # worker-exit wait before its own deadline.
+        # ``tail_reserve`` was already resolved and clamped against the
+        # production outer deadline.  It is the one authoritative tail
+        # deadline: never recompute a larger deadline here from a backend
+        # requirement, because that would silently discard the outer-budget
+        # clamp when a configuration cannot fit.
+        tail_deadline = loop.time() + max(0.0, tail_reserve)
         # The sync path makes TWO guarded steps (snapshot + stop), so it must
         # count as two in the fair-division denominator — otherwise sync-stop
         # runs at pending_steps==1 and claims the entire remaining budget,
         # starving the data-critical storage-close of its fair share.
-        pending_steps = 1 + int(run_memory) + 2 * int(run_sync) + int(run_storage)
+        storage_preclose = _storage_preclose(self.storage)
+        run_storage_preclose = storage_preclose is not None
+        pending_steps = (
+            1
+            + int(run_dispatcher)
+            + int(run_memory)
+            + 2 * int(run_sync)
+            + int(run_storage_preclose)
+            + int(run_storage)
+        )
+        reserved_minimum = tail_minimum
 
-        def _step_guard() -> float:
-            nonlocal pending_steps
+        def _step_guard(minimum: float = KESTREL_SHUTDOWN_TAIL_MIN_STEP_S) -> float:
+            nonlocal pending_steps, reserved_minimum
             remaining = max(0.0, tail_deadline - loop.time())
+            if storage_close_timeout > 0.0:
+                # Preserve every later step's minimum.  Giving an earlier tail
+                # operation an ordinary fair share could otherwise consume the
+                # SQLite close reservation before storage is reached.
+                excess = max(0.0, remaining - reserved_minimum)
+                share = excess / pending_steps if pending_steps > 0 else 0.0
+                # A required close reservation can exceed the total shutdown
+                # budget.  In that incoherent configuration the resolver
+                # gives the durable tail all available time; this live clamp
+                # keeps every individual guard inside that same deadline
+                # rather than creating a second, larger one here.
+                guard = min(remaining, max(0.0, minimum) + share)
+                reserved_minimum = max(0.0, reserved_minimum - minimum)
+                if pending_steps > 0:
+                    pending_steps -= 1
+                return guard
             share = remaining / pending_steps if pending_steps > 1 else remaining
             if pending_steps > 0:
                 pending_steps -= 1
             return max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, share)
 
-        def _harvest(task, label: str) -> str:
+        def _harvest(
+            task,
+            label: str,
+            *,
+            defer_failure_report: bool = False,
+        ) -> str:
             """Read a completed task's outcome, recording degradation."""
             if task.cancelled():
                 state["cancelled"] = True
@@ -5712,13 +7512,14 @@ Expected Duration: {expected_duration}
             exc = task.exception()
             if exc is None:
                 return "ok"
-            logging.warning(
-                "Durable shutdown step '%s' failed: %s",
-                label,
-                exc,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            state["degraded"] = True
+            if not defer_failure_report:
+                logging.warning(
+                    "Durable shutdown step '%s' failed: %s",
+                    label,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                state["degraded"] = True
             return "error"
 
         def _abandon(task) -> None:
@@ -5745,7 +7546,14 @@ Expected Duration: {expected_duration}
                 lambda t: None if t.cancelled() else t.exception()
             )
 
-        async def _bounded(coro, guard: float, label: str, *, shielded: bool = False):
+        async def _bounded(
+            coro,
+            guard: float,
+            label: str,
+            *,
+            shielded: bool = False,
+            defer_failure_report: bool = False,
+        ):
             """Run one tail step bounded by ``guard``.
 
             The coroutine is scheduled as a task and awaited only up to
@@ -5760,6 +7568,10 @@ Expected Duration: {expected_duration}
             ``force_snapshot`` so cancellation neither aborts it nor skips the
             following ``stop()``); it is still bounded by ``guard``.
             """
+            # Every guard and any cancellation grace shares the one live tail
+            # deadline.  In particular, an externally-cancelled shielded
+            # close must not receive a fresh full guard after the deadline.
+            guard = min(max(0.0, guard), max(0.0, tail_deadline - loop.time()))
             task = asyncio.ensure_future(coro)
             try:
                 done, _pending = await asyncio.wait({task}, timeout=guard)
@@ -5770,16 +7582,27 @@ Expected Duration: {expected_duration}
                 # steps are not aborted, then propagate via state["cancelled"].
                 state["cancelled"] = True
                 if shielded:
+                    cancellation_grace = min(
+                        guard, max(0.0, tail_deadline - loop.time())
+                    )
                     try:
-                        done, _pending = await asyncio.wait({task}, timeout=guard)
+                        done, _pending = await asyncio.wait(
+                            {task}, timeout=cancellation_grace
+                        )
                     except asyncio.CancelledError:
                         _abandon(task)
-                        state["degraded"] = True
+                        if not defer_failure_report:
+                            state["degraded"] = True
                         return "abandoned"
                     if task in done:
-                        return _harvest(task, label)
+                        return _harvest(
+                            task,
+                            label,
+                            defer_failure_report=defer_failure_report,
+                        )
                     _abandon(task)
-                    state["degraded"] = True
+                    if not defer_failure_report:
+                        state["degraded"] = True
                     return "abandoned"
                 _abandon(task)  # do NOT await — may suppress cancel
                 return "cancelled"
@@ -5788,21 +7611,56 @@ Expected Duration: {expected_duration}
                 # Exceeded the guard. Hard-terminate but do NOT await — the step
                 # may suppress cancellation and would otherwise hang us.
                 _abandon(task)
-                logging.warning(
-                    "Durable shutdown step '%s' exceeded %.2fs; abandoned "
-                    "(shutdown degraded).",
-                    label,
-                    guard,
-                )
-                state["degraded"] = True
+                if not defer_failure_report:
+                    logging.warning(
+                        "Durable shutdown step '%s' exceeded %.2fs; abandoned "
+                        "(shutdown degraded).",
+                        label,
+                        guard,
+                    )
+                    state["degraded"] = True
                 return "abandoned"
 
-            return _harvest(task, label)
+            return _harvest(
+                task,
+                label,
+                defer_failure_report=defer_failure_report,
+            )
 
         # Cancel agent-owned background work before storage/sync shutdown.
         await _bounded(
             self._shutdown_background_tasks(), _step_guard(), "background-tasks"
         )
+
+        # Durable signal events retain only their policy-safe projection, but
+        # the dispatcher can briefly hold a same-process live payload handoff
+        # for a worker that claims before restart.  It is never durable and
+        # must not outlive this agent instance.
+        dispatcher_shutdown_complete = True
+        if run_dispatcher:
+            dispatcher_shutdown_status = await _bounded(
+                dispatcher.shutdown_durable_delivery(),
+                _step_guard(),
+                "durable-signal-dispatcher",
+            )
+            dispatcher_shutdown_complete = dispatcher_shutdown_status == "ok"
+            if getattr(dispatcher, "durable_shutdown_owner_fenced", False):
+                await self._ensure_durable_shutdown_continuation(dispatcher)
+                logging.warning(
+                    "Durable cognition is still running after shutdown cancellation; "
+                    "keeping owner liveness and storage fenced until it settles."
+                )
+                # Other bounded shutdown work remains safe and useful (memory
+                # bookkeeping and sync workers do not own the retained
+                # delivery lease). The continuation observed below is the
+                # sole fence around shared storage close.
+                state["degraded"] = True
+                dispatcher_shutdown_complete = False
+            # The dispatcher owns an independent, shielded teardown task, so
+            # caller cancellation cannot strand committed work.  If its task
+            # outlives this guard, it may still be using the same backend;
+            # closing storage here would recreate the post-close audit-write
+            # race. The agent-owned continuation below joins it first.
 
         # Stop memory-owned bookkeeping before storage/sync shutdown.
         if run_memory:
@@ -5824,8 +7682,65 @@ Expected Duration: {expected_duration}
             if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
 
-        # Close storage — data-critical, gets its own nonzero guard.
+        # Another lifecycle caller may already have spent the dispatcher guard
+        # and installed the unique continuation while this tail was stopping
+        # memory/sync work.  That task owns the eventual close; a second tail
+        # must join or retry it rather than closing the same backend directly.
+        continuation = self._durable_shutdown_continuation
+        if continuation is not None:
+            if continuation.done() and (
+                continuation.cancelled() or continuation.exception() is not None
+            ):
+                continuation = await self._ensure_durable_shutdown_continuation(
+                    dispatcher
+                )
+            return state["cancelled"], state["degraded"]
+
+        if run_dispatcher and not dispatcher_shutdown_complete:
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            logging.warning(
+                "Durable signal dispatcher teardown exceeded the bounded "
+                "tail guard; an agent-owned continuation will close storage "
+                "after owner release."
+            )
+            return state["cancelled"], state["degraded"]
+
+        # Dispose an optional cached SQLAlchemy engine as its own bounded
+        # phase.  Otherwise a slow engine disposal can consume the guard that
+        # the following primary SQLite close requires to drain its worker.
+        storage_preclose_status = None
+        if storage_preclose is not None:
+            storage_preclose_status = await _bounded(
+                storage_preclose(),
+                _step_guard(
+                    max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, storage_preclose_timeout)
+                ),
+                "storage-sqla-pre-close",
+                shielded=storage_preclose_timeout > 0.0,
+                # The primary SQLite backend owns an independent worker.  It
+                # must receive its reserved close chance before a pre-close
+                # timeout/error is reported as degraded.
+                defer_failure_report=True,
+            )
+
+        # Close storage — SQLite gets its declared worker-exit reservation and
+        # keeps running through an external cancellation until that bounded
+        # contract completes.  Other backends retain the existing behavior.
         if run_storage:
-            await _bounded(self.storage.close(), _step_guard(), "storage-close")
+            await _bounded(
+                self.storage.close(),
+                _step_guard(storage_close_timeout),
+                "storage-close",
+                shielded=storage_close_timeout > 0.0,
+            )
+
+        if storage_preclose_status in {"error", "abandoned"}:
+            logging.warning(
+                "Durable shutdown step 'storage-sqla-pre-close' %s; primary "
+                "storage close was attempted before reporting shutdown "
+                "degraded.",
+                storage_preclose_status,
+            )
+            state["degraded"] = True
 
         return state["cancelled"], state["degraded"]

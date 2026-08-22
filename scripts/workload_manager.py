@@ -2,8 +2,8 @@
 """
 Workload Manager - Orchestrates all Mac Studio workloads.
 
-Single daemon that manages Kimi health, talon processing, LoRA batch
-training, embedding computation, and Emma self-improvement — all with
+Single daemon that manages Kimi health, LoRA batch training, embedding
+computation, and Emma self-improvement — all with
 memory-pressure-aware scheduling.
 
 Usage:
@@ -19,9 +19,7 @@ import asyncio
 import json
 import logging
 import logging.handlers
-import os
 import signal
-import subprocess
 import sys
 from datetime import datetime, time as dtime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -68,10 +66,6 @@ class WorkloadState:
         self.started_at = datetime.now(timezone.utc)
         self.kimi_healthy = False
         self.kimi_last_check: Optional[datetime] = None
-        self.talon_running = False
-        self.talon_pid: Optional[int] = None
-        self.talon_issues_today = 0
-        self.talon_current_issue: Optional[str] = None
         self.lora_running = False
         self.lora_pid: Optional[int] = None
         self.embeddings_running = False
@@ -90,12 +84,6 @@ class WorkloadState:
                 "healthy": self.kimi_healthy,
                 "last_check": self.kimi_last_check.isoformat() if self.kimi_last_check else None,
                 "port": 8001,
-            },
-            "talon": {
-                "running": self.talon_running,
-                "pid": self.talon_pid,
-                "issues_today": self.talon_issues_today,
-                "current_issue": self.talon_current_issue,
             },
             "lora": {
                 "running": self.lora_running,
@@ -231,40 +219,7 @@ async def run_workload_manager(verbose: bool = False):
 
     guard = MemoryGuard()
 
-    # Get GH token once
-    try:
-        result = subprocess.run(
-            ["gh", "auth", "token", "--user", "UncleSaurus"],
-            capture_output=True, text=True, timeout=10,
-        )
-        gh_token = result.stdout.strip() if result.returncode == 0 else ""
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        gh_token = os.environ.get("GITHUB_TOKEN", "")
-
-    talon_env = os.environ.copy()
-    talon_env["GH_TOKEN"] = gh_token
-    talon_env["GITHUB_TOKEN"] = gh_token
-    talon_env.pop("ANTHROPIC_API_KEY", None)
-
     # Subprocess managers
-    talon_config_path = project_root / "scripts/talon_daemon.toml"
-    talon_enabled = talon_config_path.exists()
-    if not talon_enabled:
-        example = project_root / "scripts/talon_daemon.example.toml"
-        logger.warning(
-            "Talon disabled: %s missing. Bootstrap once with: cp %s %s && $EDITOR %s",
-            talon_config_path, example, talon_config_path, talon_config_path,
-        )
-    talon = SubprocessManager(
-        name="talon-daemon",
-        cmd=[
-            sys.executable, str(project_root / "scripts/talon_daemon.py"),
-            "--config", str(talon_config_path),
-        ] + (["--verbose"] if verbose else []),
-        cwd=project_root,
-        env=talon_env,
-    )
-
     embeddings = SubprocessManager(
         name="embedding-worker",
         cmd=[sys.executable, str(project_root / "scripts/embedding_worker.py")],
@@ -305,29 +260,17 @@ async def run_workload_manager(verbose: bool = False):
                 # RED: stop everything except Kimi
                 logger.warning("RED pressure — stopping heavy workloads")
                 await lora_batch.stop()
-                await talon.stop()
                 # Keep embeddings if possible (very lightweight)
-                _state.talon_running = False
                 _state.lora_running = False
 
             elif is_sleep_time():
-                # Sleep window: stop talon and LoRA, let Emma reflect
-                if talon.is_running:
-                    logger.info("Sleep window — pausing talon")
-                    await talon.stop()
+                # Sleep window: stop LoRA and let Emma reflect
                 if lora_batch.is_running:
                     await lora_batch.stop()
-                _state.talon_running = False
                 _state.lora_running = False
 
             else:
                 # Normal operation
-
-                # Talon — always run during work hours if GREEN
-                if talon_enabled and mem_status.pressure == PressureLevel.GREEN and not talon.is_running:
-                    pid = await talon.start()
-                    _state.talon_pid = pid
-                _state.talon_running = talon.is_running
 
                 # LoRA batch — only during designated hours, GREEN pressure
                 if is_lora_time() and mem_status.pressure == PressureLevel.GREEN:
@@ -348,10 +291,6 @@ async def run_workload_manager(verbose: bool = False):
             _state.embeddings_running = embeddings.is_running
 
             # Check for crashed subprocesses and restart
-            if talon_enabled and talon.process and talon.process.returncode is not None and not is_sleep_time():
-                logger.warning(f"Talon exited (code {talon.process.returncode}), will restart next cycle")
-                talon.process = None
-
             if embeddings.process and embeddings.process.returncode is not None:
                 logger.warning(f"Embeddings exited (code {embeddings.process.returncode}), will restart")
                 embeddings.process = None
@@ -360,7 +299,6 @@ async def run_workload_manager(verbose: bool = False):
 
         except asyncio.CancelledError:
             logger.info("Workload Manager shutting down")
-            await talon.stop()
             await lora_batch.stop()
             await embeddings.stop()
             break

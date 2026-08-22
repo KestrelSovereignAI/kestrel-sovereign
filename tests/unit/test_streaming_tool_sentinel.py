@@ -5,9 +5,16 @@ Tool activity now rides the same in-band sentinel channel as REVISE/THINK
 tests pin the builder, the single-pass strip+extract parser (with position),
 and the strip helpers used by the persist + TTS paths.
 """
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kestrel_sovereign.agent.parts import build_part_sentinel
 from kestrel_sovereign.agent.streaming import (
     _build_tool_sentinel,
     _parse_stream_sentinels,
+    _rebase_events_onto_persisted_text,
     _strip_and_weld_revise_sentinels,
     _build_revise_sentinel,
     _tool_parts_to_events,
@@ -16,7 +23,7 @@ from kestrel_sovereign.agent.streaming import (
     is_only_sentinels,
     TOOL_SENTINEL_PREFIX,
 )
-import json
+from tests.unit.test_streaming_typed_parts import _bind, _make_agent
 
 
 def test_build_tool_sentinel_shape():
@@ -147,6 +154,182 @@ def test_stamp_positions_startless_error_keeps_own_pos():
     ]
     _stamp_tool_event_positions(tool_events, parts)
     assert [ev["pos"] for ev in tool_events] == [5, 5, 40]
+
+
+def test_rebase_event_in_retracted_pre_tool_text_pins_to_start():
+    events = [{"type": "start", "tool": "lookup", "pos": 4}]
+
+    rebased = _rebase_events_onto_persisted_text(events, 10, "answer")
+
+    assert rebased[0]["pos"] == 0
+    assert events[0]["pos"] == 4
+
+
+async def _persist_multi_iteration_tool_turn(*, with_part=False, emoji=False):
+    """Drive the orchestrated-tool persistence branch with position sentinels."""
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    persisted = []
+    agent = _make_agent(persisted)
+    pre_tool = "I need to inspect this."
+    boundary = (
+        "Only one permission is missing: administration: read.\n\n"
+        if not emoji else "🐢 Result ready.\n\n"
+    )
+    tail = "The header names it directly."
+
+    async def llm_stream(**kwargs):
+        yield pre_tool
+        yield ToolCallStarted(index=0, id="tc1", name="strategy_resolve_blocker")
+        yield LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="tc1", name="strategy_resolve_blocker", arguments={}),
+            ],
+        )
+
+    async def orchestrator_stream(tool_events, **kwargs):
+        tool_events.extend([
+            {"type": "start", "tool": "strategy_resolve_blocker"},
+            {"type": "complete", "tool": "strategy_resolve_blocker", "ms": 7},
+        ])
+        yield boundary
+        yield _build_tool_sentinel("start", "strategy_resolve_blocker", index=0)
+        yield _build_tool_sentinel(
+            "done", "strategy_resolve_blocker", index=0, ms=7,
+        )
+        if with_part:
+            yield build_part_sentinel({"type": "notice", "data": {"body": "same"}})
+        yield tail
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = llm_stream
+    agent._handle_orchestrator_response_streaming = orchestrator_stream
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("inspect", session_id="multi"):
+        pass
+
+    assistant = [row for row in persisted if row["role"] == "assistant"]
+    assert len(assistant) == 1
+    return assistant[0], boundary
+
+
+@pytest.mark.asyncio
+async def test_tool_positions_without_parts_index_persisted_post_tool_content():
+    """Non-empty retracted prose must not drift card offsets on persistence."""
+    assistant, boundary = await _persist_multi_iteration_tool_turn()
+    events = assistant["metadata"]["tool_events"]
+
+    assert assistant["content"] == boundary + "The header names it directly."
+    assert events
+    for event in events:
+        pos = event["pos"]
+        assert 0 <= pos <= len(assistant["content"])
+        assert assistant["content"][:pos] == boundary
+
+
+@pytest.mark.asyncio
+async def test_tool_positions_are_identical_with_and_without_component_parts():
+    without_parts, _ = await _persist_multi_iteration_tool_turn(with_part=False)
+    with_parts, _ = await _persist_multi_iteration_tool_turn(with_part=True)
+
+    assert [e["pos"] for e in without_parts["metadata"]["tool_events"]] == [
+        e["pos"] for e in with_parts["metadata"]["tool_events"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_positions_use_utf16_without_component_parts():
+    assistant, boundary = await _persist_multi_iteration_tool_turn(emoji=True)
+
+    expected = len(boundary.encode("utf-16-le")) // 2
+    assert [e["pos"] for e in assistant["metadata"]["tool_events"]] == [
+        expected,
+        expected,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_executed_tool_positions_rebase_without_component_parts():
+    """Codex inline execution removes ``inline_pre_len`` from card offsets."""
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    persisted = []
+    agent = _make_agent(persisted)
+    agent.observability_store.log_tool_dispatch = AsyncMock()
+    agent._make_inline_tool_executor = MagicMock(return_value=None)
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent.context_manager.build_context.return_value.degraded_mode = False
+    pre_tool = "I will inspect it."
+    boundary = "Inspection finished.\n\n"
+
+    async def stream(**kwargs):
+        yield pre_tool
+        yield ToolCallStarted(index=0, id="tc-inline", name="inspect")
+        yield boundary
+        yield _build_tool_sentinel("start", "inspect", index=0)
+        yield _build_tool_sentinel("done", "inspect", index=0, ms=3)
+        yield "The setting is correct."
+        response = LLMResponse(content="", tool_calls=None)
+        response.executed_tool_calls = [
+            {
+                "id": "tc-inline",
+                "name": "inspect",
+                "arguments": {},
+                "result": {"ok": True},
+            },
+        ]
+        yield response
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("inspect", session_id="inline"):
+        pass
+
+    assistant = [row for row in persisted if row["role"] == "assistant"][0]
+    assert assistant["content"] == boundary + "The setting is correct."
+    assert [e["pos"] for e in assistant["metadata"]["tool_events"]] == [
+        len(boundary),
+        len(boundary),
+    ]
+    agent.observability_store.log_tool_dispatch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_native_tool_positions_use_utf16_without_component_parts():
+    """The no-tool-call branch still converts native sentinel offsets."""
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    persisted = []
+    agent = _make_agent(persisted)
+    boundary = "🐢 Native result.\n\n"
+
+    async def stream(**kwargs):
+        yield boundary
+        yield _build_tool_sentinel("start", "web_search", index=0)
+        yield _build_tool_sentinel("done", "web_search", index=0, ms=4)
+        yield "Details follow."
+        yield LLMResponse(content="", tool_calls=[])
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("search", session_id="native"):
+        pass
+
+    assistant = [row for row in persisted if row["role"] == "assistant"][0]
+    expected = len(boundary.encode("utf-16-le")) // 2
+    assert assistant["content"] == boundary + "Details follow."
+    assert [e["pos"] for e in assistant["metadata"]["tool_events"]] == [
+        expected,
+        expected,
+    ]
 
 
 class _M:

@@ -23,7 +23,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from kestrel_sdk.signals import (
     AttentionPolicy,
     CausationFrame,
@@ -38,16 +37,17 @@ from kestrel_sdk.signals import (
     Urgency,
     Visibility,
 )
+
 from kestrel_sovereign.signals import (
+    DurableAdmissionDisposition,
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
     SignalWithPromptTemplateOverride,
-    SourceRegistry,
     SourceRegistrationWithPromptOverride,
+    SourceRegistry,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -910,6 +910,13 @@ async def test_enqueue_signal_returns_handle_immediately(dispatcher_components):
     await started.wait()
     assert not handle.done
 
+    # ACK-bearing ingress needs the earlier durable receipt, not this
+    # background handle. The event is committed before a slow handler runs.
+    receipt = await handle.wait_for_durable_admission()
+    assert receipt.disposition is DurableAdmissionDisposition.COMMITTED
+    assert receipt.signal_id == handle.signal_id
+    assert not handle.done
+
     can_finish.set()
     result = await handle.wait()
     assert result.status == Status.OK
@@ -926,6 +933,37 @@ async def test_enqueue_signal_uses_agent_background_tracker(dispatcher_component
     assert len(c.agent.background_tasks) >= 1
     # Wait so the test doesn't leak the task.
     await handle.wait()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_signal_reports_duplicate_and_terminal_durable_dispositions(
+    dispatcher_components,
+):
+    """An ACK source may checkpoint only durable commit, duplicate, or terminal refusal."""
+
+    c = dispatcher_components
+    c.registry.register(_action_reg("receipt"))
+    first = await c.dispatcher.enqueue_signal(
+        _signal("receipt"), source_event_id="telegram:v2:bot:42:update:301"
+    )
+    assert (
+        await first.wait_for_durable_admission()
+    ).disposition is DurableAdmissionDisposition.COMMITTED
+    await first.wait()
+
+    duplicate = await c.dispatcher.enqueue_signal(
+        _signal("receipt"), source_event_id="telegram:v2:bot:42:update:301"
+    )
+    assert (
+        await duplicate.wait_for_durable_admission()
+    ).disposition is DurableAdmissionDisposition.DUPLICATE
+    assert (await duplicate.wait()).status is Status.COALESCED
+
+    terminal = await c.dispatcher.enqueue_signal(_signal("unknown-source"))
+    assert (
+        await terminal.wait_for_durable_admission()
+    ).disposition is DurableAdmissionDisposition.TERMINAL
+    assert (await terminal.wait()).status is Status.DROPPED_VALIDATION
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1023,35 @@ async def test_action_acquires_declared_resources(dispatcher_components):
         ["start:A", "end:A", "start:B", "end:B"],
         ["start:B", "end:B", "start:A", "end:A"],
     ), order
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_labels_declared_resource_holder(dispatcher_components):
+    """A blocked operator can identify the source and kind that owns MEMORY."""
+    c = dispatcher_components
+    assert c.dispatcher.lock_manager is c.locks
+    labels: list[str] = []
+
+    async def handler(_payload):
+        labels.append(c.locks.holder(ResourceLock.MEMORY).label)
+        return {"ok": True}
+
+    c.registry.register(
+        SourceRegistration(
+            name="cron",
+            schema=dict,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+            resources=frozenset({ResourceLock.MEMORY}),
+        )
+    )
+
+    result = await c.dispatcher.dispatch_signal(_signal("cron", kind="sleep"))
+
+    assert result.status is Status.OK
+    assert labels == ["cron sleep"]
 
 
 # ---------------------------------------------------------------------------

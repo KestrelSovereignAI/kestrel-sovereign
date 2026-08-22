@@ -482,6 +482,16 @@ class EmbeddingService:
         profile = self.describe()
         return profile.profile_id if profile else None
 
+    def semantic_vector_destination(self) -> str:
+        """Return the trusted deployment class for assertion projection.
+
+        The legacy service is Ollama-only: it creates Ollama clients against
+        the configured host and has no cloud-provider routing path.  Reporting
+        this from the implementation (rather than a caller-provided provider
+        label) lets privacy-sensitive projections fail closed at resolution.
+        """
+        return "local"
+
 
 class ProviderEmbeddingService:
     """Embedding service backed by an initialized LLM provider route.
@@ -504,6 +514,22 @@ class ProviderEmbeddingService:
         self.provider = provider
         self.adapter = provider["adapter"]
         self.client = provider["client"]
+        # Capture the registry's route classification at construction.  Both
+        # booleans are required and must be exact complements: defaults or a
+        # vendor/name heuristic could silently turn an unknown third-party
+        # route into a privacy claim, while re-reading the mutable provider
+        # dict would let that claim change after this service was resolved.
+        is_local = provider.get("is_local")
+        is_cloud = provider.get("is_cloud")
+        self._semantic_vector_destination = (
+            "local"
+            if type(is_local) is bool and type(is_cloud) is bool
+            and is_local and not is_cloud
+            else "remote"
+            if type(is_local) is bool and type(is_cloud) is bool
+            and is_cloud and not is_local
+            else None
+        )
         capabilities = provider.get("capabilities") or {}
         self.model = capabilities.get("embedding_model")
         self.embedding_dim = capabilities.get("embedding_dim")
@@ -666,6 +692,17 @@ class ProviderEmbeddingService:
         """Convenience: ``describe().profile_id`` or ``None``."""
         profile = self.describe()
         return profile.profile_id if profile else None
+
+    def semantic_vector_destination(self) -> Optional[str]:
+        """Return the registry-captured route destination, or fail closed.
+
+        Provider names and adapter classes do not establish where a request is
+        sent (an OpenAI adapter may target localhost, for example).  The
+        provider registry resolves config into exact, complementary
+        ``is_local``/``is_cloud`` metadata; construction snapshots that route
+        fact and ambiguous or legacy third-party records remain unknown.
+        """
+        return self._semantic_vector_destination
 
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:

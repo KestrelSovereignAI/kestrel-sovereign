@@ -6,7 +6,62 @@ listener management, and background task notification queuing.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+# ---------------------------------------------------------------------------
+# emit_event delivery receipt (#2922)
+# ---------------------------------------------------------------------------
+#
+# ``emit_event`` used to return ``None`` unconditionally, and it swallows every
+# listener exception. A caller therefore could not tell "every SSE forwarder
+# failed" from "the event went out" — so the wait reconciler recorded a bare
+# ``ok`` for wakes that reached nobody, which is the self-reporting failure
+# #2877/#2922 exist to remove.
+#
+# The receipt reports the three outcomes an emitter can actually distinguish.
+# NONE of them means a human saw anything: ``ACCEPTED`` means a listener
+# callback returned without raising, which for the ``/notifications/sse``
+# forwarder means the event entered a server-side queue. The browser can still
+# discard it (``chat.js`` drops a wake whose ``session_id`` is not the pane's
+# open conversation). Server-side truth stops at acceptance; callers must not
+# promote it to "rendered".
+
+EVENT_BUFFERED = "buffered"
+EVENT_ACCEPTED = "accepted"
+EVENT_REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class EventDeliveryReceipt:
+    """Aggregate outcome of one :meth:`EventManagerMixin.emit_event` call.
+
+    Attributes:
+        listeners: Listeners the event was offered to (0 when buffered).
+        accepted: Listeners whose callback returned without raising.
+        rejected: Listeners whose callback raised (the failure is logged and
+            swallowed, so this counter is the only way a caller learns of it).
+        buffered: True when no listener was connected and the event was
+            buffered for replay to the next one (see ``get_pending_events``).
+    """
+
+    listeners: int
+    accepted: int
+    rejected: int
+    buffered: bool
+
+    @property
+    def outcome(self) -> str:
+        """``buffered`` / ``accepted`` / ``rejected`` — in that precedence.
+
+        ``accepted`` requires at least one listener to have taken the event;
+        an emit whose every listener raised is ``rejected``, never ``accepted``.
+        """
+        if self.buffered:
+            return EVENT_BUFFERED
+        if self.accepted > 0:
+            return EVENT_ACCEPTED
+        return EVENT_REJECTED
 
 
 def describe_background_task(task) -> Tuple[str, str]:
@@ -97,12 +152,12 @@ def background_task_identifiers(task) -> str:
     with task-registry records (#1526). The historical bug truncated this
     to an 8-char prefix that ``check_task_status`` could not resolve.
 
-    No scheduler ``execution_id`` is surfaced: that id is the
-    ``task_execution_log`` row id, generated *after* the scheduled run
-    completes (``features/scheduler/runner.py``), so it never exists on
-    the A2A task this callback receives. Correlation with scheduler
-    history instead flows through the ``cron/<task_name>`` label that
-    :func:`describe_background_task` derives from the causation chain.
+    No scheduler ``execution_id`` is surfaced. It is now claimed before
+    scheduler dispatch so target tools can use it for idempotency, but it
+    deliberately remains scheduler-local context rather than untrusted A2A
+    task metadata. Correlation with scheduler history instead flows through
+    the ``cron/<task_name>`` label that :func:`describe_background_task`
+    derives from the causation chain.
     """
     return f"task: {getattr(task, 'id', 'unknown')}"
 
@@ -115,7 +170,9 @@ class EventManagerMixin:
     # buffered events drop first once the cap is exceeded.
     _MAX_PENDING_EVENTS = 100
 
-    async def emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
+    async def emit_event(
+        self, event_type: str, data: Dict[str, Any]
+    ) -> EventDeliveryReceipt:
         """
         Emit an event to all registered listeners (for SSE notifications).
 
@@ -128,20 +185,50 @@ class EventManagerMixin:
         stream. That is the one transition that straddles the restart, so
         losing it defeated the issue's primary acceptance criterion (#1551).
 
+        A listener that raises is logged and skipped — one broken forwarder
+        must not deny the event to the others, and a UI notification is never
+        worth failing the work that produced it. But swallowing the failure
+        and returning ``None`` also left the caller unable to tell a total
+        delivery failure from a success (#2922): the wait reconciler read
+        "emit returned" as "the user can see it" and recorded a bare ``ok``
+        for wakes that reached nobody. So the aggregate outcome is RETURNED
+        rather than only logged.
+
         Args:
             event_type: Type of event (e.g., 'approval_request')
             data: Event data to send
+
+        Returns:
+            An :class:`EventDeliveryReceipt`. ``accepted`` counts listeners
+            that took the event without raising — for the SSE forwarder that
+            is server-side queue admission, NOT proof that anything rendered.
+            Callers must not report an accepted emit as "seen by the user".
         """
         if not self._event_listeners:
             self._buffer_pending_event(event_type, data)
-            return
-        for listener in self._event_listeners:
+            return EventDeliveryReceipt(
+                listeners=0, accepted=0, rejected=0, buffered=True
+            )
+        accepted = 0
+        rejected = 0
+        listeners = list(self._event_listeners)
+        for listener in listeners:
             try:
                 await listener(event_type, data)
             except (TypeError, AttributeError, ConnectionError) as e:
+                rejected += 1
                 logging.warning(f"Failed to emit event to listener: {e}")
             except Exception as e:
+                rejected += 1
                 logging.warning(f"Failed to emit event to listener: {e}", exc_info=True)
+            else:
+                accepted += 1
+        return EventDeliveryReceipt(
+            listeners=len(listeners),
+            accepted=accepted,
+            rejected=rejected,
+            buffered=False,
+        )
 
     def _buffer_pending_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """Buffer an event emitted while no listener was connected.
@@ -229,6 +316,9 @@ class EventManagerMixin:
             return
 
         try:
+            from kestrel_sovereign.signals.delivery import (
+                harvest_detached_delivery,
+            )
             from kestrel_sovereign.signals.sources.a2a import (
                 build_signal_for_completed_task,
             )
@@ -237,16 +327,21 @@ class EventManagerMixin:
                 task=task, target_agent=self.did
             )
 
-            # enqueue_signal is async (returns SignalHandle). We're in a
-            # sync callback (TaskManager._notify_status_update calls us
-            # synchronously). Wrap the await in a tracked coroutine \u2014
-            # the agent's background task tracker supervises the work
-            # so exceptions land in logs and shutdown drains it cleanly.
-            async def _enqueue():
-                await dispatcher.enqueue_signal(signal)
-
-            self._track_background_task(
-                _enqueue(), name=f"a2a_complete:{task_id[:8]}",
+            # enqueue_signal is async and returns a SignalHandle at
+            # *acceptance*; the terminal result only arrives via
+            # handle.wait(). We're in a sync callback (TaskManager
+            # ._notify_status_update calls us synchronously), and nothing
+            # durable advances on delivery here \u2014 the task row is already
+            # persisted, this signal is only the wake. So this is
+            # intentional detached dispatch (#2532): the agent's tracker
+            # owns the task so shutdown drains it, and the terminal result
+            # is harvested so a wake that silently failed shows up in the
+            # log instead of vanishing.
+            harvest_detached_delivery(
+                self._track_background_task,
+                lambda: dispatcher.enqueue_signal(signal),
+                label=f"a2a.task_complete[{task_id}]",
+                task_name=f"a2a_complete:{task_id[:8]}",
             )
         except Exception as e:
             # Never let a dispatcher failure break the SSE notification
@@ -289,6 +384,9 @@ class EventManagerMixin:
 
         task_id = getattr(task, "id", "<unknown>")
         try:
+            from kestrel_sovereign.signals.delivery import (
+                harvest_detached_delivery,
+            )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 build_signal_for_submitted_task,
             )
@@ -307,11 +405,16 @@ class EventManagerMixin:
                 sender=sender,
             )
 
-            async def _enqueue():
-                await dispatcher.enqueue_signal(signal)
-
-            self._track_background_task(
-                _enqueue(), name=f"a2a_submitted:{str(task_id)[:8]}",
+            # Detached dispatch, same posture as task_complete above
+            # (#2532): the TaskStore row is already persisted, so nothing
+            # durable rides on this wake and retrying is not this
+            # callback's job — but the task is owned and its terminal
+            # result harvested so a failed wake is observable.
+            harvest_detached_delivery(
+                self._track_background_task,
+                lambda: dispatcher.enqueue_signal(signal),
+                label=f"a2a.task_submitted[{task_id}]",
+                task_name=f"a2a_submitted:{str(task_id)[:8]}",
             )
         except Exception as e:
             # Same posture as task_complete: never let a dispatcher

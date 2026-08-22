@@ -17,10 +17,20 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
-from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    get_caller,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
+)
+from kestrel_sovereign.multi_agent.agent_manager import (
+    RuntimeOffboardingRetainedError,
+    public_exception_type_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +66,94 @@ def _get_service_key_db_or_none(agent):
 
 class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
-    name: str = Field(..., description="Agent name (alphanumeric, hyphens, underscores)", min_length=1, max_length=64)
+
+    name: str = Field(
+        ...,
+        description="Agent name (alphanumeric, hyphens, underscores)",
+        min_length=1,
+        max_length=64,
+    )
+
+
+def _grouped_runtime_retained_detail(
+    error: BaseExceptionGroup,
+) -> Optional[Dict[str, object]]:
+    """Extract a retained-runtime outcome without exposing exception text.
+
+    Agent removal can legitimately report secure-cleanup retention together
+    with a delegated-budget refund or cancellation outcome.  Flatten nested
+    groups, retain the machine-readable 409 contract, and summarize only
+    exception types/counts; messages can contain absolute host paths or
+    credentials and stay server-side.
+    """
+
+    leaves: List[BaseException] = []
+
+    def collect(candidate: BaseException) -> None:
+        if isinstance(candidate, BaseExceptionGroup):
+            for nested in candidate.exceptions:
+                collect(nested)
+            return
+        leaves.append(candidate)
+
+    collect(error)
+    retained = [
+        candidate
+        for candidate in leaves
+        if isinstance(candidate, RuntimeOffboardingRetainedError)
+    ]
+    if not retained:
+        return None
+    # Never turn process-control exceptions into an HTTP response. A grouped
+    # CancelledError is an expected manager terminal outcome, but an actively
+    # cancelling request is handled by the caller before this helper is used.
+    if any(
+        not isinstance(candidate, (Exception, asyncio.CancelledError))
+        for candidate in leaves
+    ):
+        return None
+
+    detail: Dict[str, object] = dict(retained[0].metadata)
+    retained_agents = sorted(
+        {
+            str(candidate.metadata["agent"])
+            for candidate in retained
+            if type(candidate.metadata.get("agent")) is str
+        },
+        key=str.casefold,
+    )
+    cleanup_states = {
+        str(candidate.metadata.get("runtime_cleanup_state", "retained"))
+        for candidate in retained
+    }
+    cleanup_pending = "pending" in cleanup_states
+    if cleanup_pending and cleanup_states != {"pending"}:
+        cleanup_state = "mixed"
+    elif cleanup_pending:
+        cleanup_state = "pending"
+    else:
+        cleanup_state = "retained"
+    retained_identities = {id(candidate) for candidate in retained}
+    additional = [
+        candidate for candidate in leaves if id(candidate) not in retained_identities
+    ]
+    detail.update(
+        {
+            "compound_outcome": True,
+            "retained_outcome_count": len(retained),
+            "retained_agents": retained_agents,
+            "runtime_cleanup_pending": cleanup_pending,
+            "runtime_cleanup_state": cleanup_state,
+            "additional_outcome_count": len(additional),
+            "additional_outcome_types": sorted(
+                {
+                    public_exception_type_name(candidate)
+                    for candidate in additional
+                }
+            ),
+        }
+    )
+    return detail
 
 
 @router.get("/api/agents")
@@ -267,10 +364,10 @@ async def create_agent(request: Request, body: CreateAgentRequest):
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
 async def delete_agent(request: Request, agent_name: str):
-    """Remove an agent from the multi-agent manager.
+    """Explicitly deprovision an agent from the multi-agent manager.
 
-    Shuts down the agent but does NOT delete its data directory.
-    The agent can be re-loaded by restarting the server.
+    Shuts down the agent and securely removes its hosted isolated-feature
+    runtime namespace. The primary agent storage directory is not deleted.
 
     Only available in multi-agent mode.
     """
@@ -282,7 +379,29 @@ async def delete_agent(request: Request, agent_name: str):
         )
 
     try:
-        removed = await agent_manager.remove_agent(agent_name)
+        removed = await agent_manager.remove_agent(
+            agent_name,
+            offboard_runtime=True,
+        )
+    except RuntimeOffboardingRetainedError as exc:
+        # Shutdown/unpublication succeeded, so this is neither a missing agent
+        # nor a generic server failure. Return an explicit custody outcome
+        # (pending or retained) without inviting a retry against a dead route.
+        raise HTTPException(status_code=409, detail=exc.metadata)
+    except BaseExceptionGroup as exc:
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise
+        detail = _grouped_runtime_retained_detail(exc)
+        if detail is None:
+            raise
+        logger.error(
+            "Agent '%s' was removed with retained runtime and additional "
+            "terminal outcomes",
+            agent_name,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=409, detail=detail)
     except ValueError as e:
         # remove_agent refuses to delete an agent that still has budgeted child
         # agents (#2113) — that teardown must go through terminate_child. Surface
@@ -2613,7 +2732,7 @@ def list_models_v1(request: Request):
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, http_response: Response):
     """Chat Completions-compatible endpoint.
 
     Respects the 'model' field from the request body. When a model is provided
@@ -2639,12 +2758,19 @@ async def chat_completions(request: Request):
 
         # Extract user_passphrase for USER_BYOK agents
         user_passphrase = data.get("user_passphrase")
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/v1/chat/completions",
+        )
 
         assistant_text = await agent.process_input(
             user_input,
             model_override=model_override,
             caller=get_caller(request),
             user_passphrase=user_passphrase,
+            invocation_id=request_id,
+            invocation_provenance=invocation_provenance,
         )
 
         # Report the model that was actually routed, not just what the
@@ -2670,6 +2796,7 @@ async def chat_completions(request: Request):
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent

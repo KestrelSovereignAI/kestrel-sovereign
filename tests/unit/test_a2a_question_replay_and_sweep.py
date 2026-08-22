@@ -14,6 +14,11 @@ Pins:
   - Already-terminal rows (raced by another resumption path) drop
     silently rather than firing a duplicate signal — the WAITING-only
     semantics of ``mark_expired`` carry this guarantee.
+  - Terminal delivery, not enqueue acceptance, is what retires the durable
+    WAITING row (#2532). Every dispatch here therefore hands back a REAL
+    ``SignalHandle`` resolving to a REAL ``SignalResult`` — a truthy handle
+    mock is always "successful" and would only prove the happy path can
+    happen, never that failure is handled.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 
 from kestrel_sovereign.features.peers.feature import PeersFeature
 from kestrel_sovereign.storage.async_pending_a2a_question_store import (
@@ -30,12 +36,58 @@ from kestrel_sovereign.storage.async_pending_a2a_question_store import (
 )
 
 
-def _make_feature_for_replay():
+def _signal_handle(
+    status: Status = Status.OK, *, error: str | None = None,
+) -> SignalHandle:
+    """A real ``SignalHandle`` whose task resolves to a real ``SignalResult``.
+
+    The dispatcher hands back the handle at *acceptance*; the terminal
+    ``Status`` only arrives via ``await handle.wait()``. Tests must drive the
+    real object so a non-``OK`` terminal state is actually exercised (#2532).
+    """
+
+    async def _terminal() -> SignalResult:
+        return SignalResult(
+            signal_id="sig-test",
+            status=status,
+            mode=SignalMode.COGNITION,
+            duration_ms=1,
+            error=error,
+        )
+
+    return SignalHandle(
+        signal_id="sig-test", task=asyncio.ensure_future(_terminal()),
+    )
+
+
+def _cancelled_signal_handle() -> SignalHandle:
+    """A handle whose dispatch task was cancelled out from under the caller."""
+
+    async def _never() -> SignalResult:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    task = asyncio.ensure_future(_never())
+    task.cancel()
+    return SignalHandle(signal_id="sig-test", task=task)
+
+
+def _make_feature_for_replay(*, run_tracked_tasks: bool = False):
     """Build a PeersFeature wired enough to exercise
     ``post_all_features_loaded`` / replay / sweep without a real DB or
     httpx client. ``_supervise_a2a_question`` is replaced with an
     AsyncMock so we can assert it was scheduled without driving the
-    SSE loop."""
+    SSE loop.
+
+    ``enqueue_signal`` returns a real ``SignalHandle`` that settles ``OK``, so
+    the default posture is "the wake actually landed". Tests that need a
+    different terminal state override ``side_effect`` with another
+    :func:`_signal_handle`.
+
+    ``run_tracked_tasks=True`` makes the tracker start real asyncio tasks
+    (still recorded in ``tracked``) instead of closing the coroutine, for the
+    boot-path tests that must drive the delivery supervisor to completion.
+    """
     feature = PeersFeature.__new__(PeersFeature)
     feature._host_url = "http://host:8888"
     feature._api_key = ""
@@ -44,10 +96,17 @@ def _make_feature_for_replay():
     agent = MagicMock()
     agent.did = "did:test:sender"
     agent.dispatcher = MagicMock()
-    agent.dispatcher.enqueue_signal = AsyncMock()
+
+    async def _enqueue_ok(_signal):
+        return _signal_handle(Status.OK)
+    agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue_ok)
     tracked: list = []
 
     def _track_bg(coro, *, name=""):
+        if run_tracked_tasks:
+            task = asyncio.ensure_future(coro)
+            tracked.append((task, name))
+            return task
         tracked.append((coro, name))
         # Close coroutines so they don't leak; tests assert on `tracked`.
         coro.close()
@@ -55,6 +114,20 @@ def _make_feature_for_replay():
     agent._track_background_task = _track_bg
     feature.agent = agent
     return feature, agent, tracked
+
+
+async def _drain(tracked, prefix: str) -> None:
+    """Await every started task whose name begins with ``prefix``."""
+    for task, name in tracked:
+        if name.startswith(prefix) and isinstance(task, asyncio.Task):
+            await asyncio.wait_for(task, timeout=5)
+
+
+def _started_tasks(tracked, prefix: str) -> list:
+    return [
+        obj for obj, name in tracked
+        if name.startswith(prefix) and isinstance(obj, asyncio.Task)
+    ]
 
 
 def _row(
@@ -138,6 +211,33 @@ class TestStartupReplay:
         assert "a2a_question_expiry_sweep" in spawn_names
 
     @pytest.mark.asyncio
+    async def test_replay_passes_persisted_stable_recipient_identity(self):
+        """A restart must route by the dispatched peer, not an old display name."""
+        feature, _agent, _tracked = _make_feature_for_replay()
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        row = PendingA2AQuestion(
+            task_id="task-stable-recipient",
+            recipient="Companion",
+            recipient_agent_id="did:test:original-companion",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+        )
+        store = MagicMock()
+        store.list_waiting = AsyncMock(return_value=[row])
+        feature._supervise_a2a_question = AsyncMock()
+
+        await feature._replay_pending_a2a_questions(store)
+
+        assert feature._supervise_a2a_question.call_args.kwargs[
+            "recipient_agent_id"
+        ] == "did:test:original-companion"
+
+    @pytest.mark.asyncio
     async def test_retry_payload_row_refires_captured_answer(self):
         feature, agent, tracked = _make_feature_for_replay()
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -170,7 +270,19 @@ class TestStartupReplay:
         assert sig.payload["state"] == "completed"
         assert sig.payload["reply_text"] == "Captured reply"
         spawn_names = [n for _, n in tracked]
-        assert not any("task-retry-answer" in n for n in spawn_names)
+        assert not any(
+            "a2a_question_supervisor" in n and "task-retry-answer" in n
+            for n in spawn_names
+        ), (
+            "A retry-payload row carries an already-observed terminal answer "
+            f"— it must never get an SSE supervisor. Got {spawn_names}."
+        )
+        # It DOES get a delivery supervisor: boot replay cannot await the
+        # resumed cognition turn inline, so the wait that decides whether the
+        # WAITING row stays retired is handed to a feature-owned task (#2532).
+        assert (
+            "a2a_question_answered_delivery:task-retry-answer" in spawn_names
+        ), spawn_names
 
     @pytest.mark.asyncio
     async def test_past_deadline_row_fires_expired_signal(self):
@@ -469,7 +581,7 @@ class TestHandleExpiredRow:
         agent.pending_a2a_questions = store
         agent.dispatcher.enqueue_signal.side_effect = [
             RuntimeError("dispatcher blip"),
-            None,
+            _signal_handle(Status.OK),
         ]
 
         async def _instant_sleep(_secs):
@@ -527,3 +639,297 @@ class TestHandleExpiredRow:
             agent.dispatcher.enqueue_signal.await_args.args[0]
             .payload["state"] == "expired"
         )
+
+
+# ---------------------------------------------------------------------------
+# Terminal delivery gates the durable WAITING row (#2532)
+#
+# The caller retires the row BEFORE firing (claim-first, so a racing sweep
+# can't double-fire). That makes terminal delivery the only thing entitled to
+# keep it retired: a wake the dispatcher accepted and then failed or dropped
+# leaves the asker blocked forever with a terminal row and nothing to replay.
+# ---------------------------------------------------------------------------
+
+class TestTerminalDeliveryGatesWaitingRow:
+    async def _expire_with(self, handle_factory):
+        """Run one sweep-path expiry whose wake settles per the factory."""
+        feature, agent, tracked = _make_feature_for_replay()
+
+        async def _enqueue(_sig):
+            return handle_factory()
+        agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        await feature._handle_expired_row(store, _row("gate-1", deadline=past))
+        return feature, agent, store, tracked
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [
+        Status.FAILED,
+        Status.DROPPED_RATE_LIMIT,
+        Status.DROPPED_QUIET_HOURS,
+        Status.DROPPED_CYCLE,
+        Status.DROPPED_VALIDATION,
+        Status.COALESCED,
+    ])
+    async def test_non_ok_terminal_state_restores_waiting_row(self, status):
+        _f, _a, store, _t = await self._expire_with(
+            lambda: _signal_handle(status)
+        )
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "gate-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_ok_terminal_state_keeps_row_retired(self):
+        _f, _a, store, _t = await self._expire_with(
+            lambda: _signal_handle(Status.OK)
+        )
+        store.mark_waiting_for_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_restores_waiting_row(self):
+        """The dispatch task was reaped. The asker was never woken, so the
+        row must go back to WAITING — this caller is healthy."""
+        _f, _a, store, _t = await self._expire_with(_cancelled_signal_handle)
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "gate-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_unobservable_handle_restores_waiting_row(self):
+        """No awaitable ``wait`` means delivery can never be observed.
+        Unobservable is undelivered, never success."""
+        _f, _a, store, _t = await self._expire_with(lambda: object())
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "gate-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_error_restores_waiting_row(self):
+        class _ExplodingHandle:
+            async def wait(self):
+                raise RuntimeError("dispatcher internals blew up")
+
+        _f, _a, store, _t = await self._expire_with(_ExplodingHandle)
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "gate-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_caller_cancelled_mid_delivery_still_restores_row(self):
+        """If this caller is torn down while waiting, its own ``if not fired``
+        restore never runs — CancelledError propagates past it. The obligation
+        is therefore the fire path's: restore under a shield, then re-raise."""
+        feature, agent, _tracked = _make_feature_for_replay()
+
+        started = asyncio.Event()
+
+        async def _never_settles():
+            started.set()
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+        async def _enqueue(_sig):
+            return SignalHandle(
+                signal_id="sig-test",
+                task=asyncio.ensure_future(_never_settles()),
+            )
+        agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
+
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        task = asyncio.ensure_future(
+            feature._handle_expired_row(store, _row("gate-cancel", deadline=past))
+        )
+        await started.wait()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "gate-cancel", state="expired", reply_text="",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Boot-path ownership boundary (#2532)
+#
+# Startup replay runs inline inside feature init: the cognition turn it is
+# dispatching cannot start until boot finishes, so awaiting terminal delivery
+# there would deadlock. The wait is handed to a feature-owned supervisor that
+# owns the restore instead — and that supervisor must actually run.
+# ---------------------------------------------------------------------------
+
+class TestBootReplayDeliverySupervisor:
+    async def _replay_with(self, handle_factory):
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
+
+        async def _enqueue(_sig):
+            return handle_factory()
+        agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        store.list_waiting = AsyncMock(
+            return_value=[_row("boot-1", deadline=past)]
+        )
+        agent.pending_a2a_questions = store
+
+        await feature._replay_pending_a2a_questions(store)
+        await _drain(tracked, "a2a_question_answered_delivery:")
+        return feature, agent, store, tracked
+
+    @pytest.mark.asyncio
+    async def test_boot_replay_does_not_block_on_delivery(self):
+        """The replay call itself must return while the wake is still
+        unsettled — blocking here would deadlock boot against the very agent
+        that has not finished initializing."""
+        feature, agent, tracked = _make_feature_for_replay(
+            run_tracked_tasks=True,
+        )
+        gate = asyncio.Event()
+
+        async def _slow():
+            await gate.wait()
+            return SignalResult(
+                signal_id="sig-test",
+                status=Status.OK,
+                mode=SignalMode.COGNITION,
+                duration_ms=1,
+            )
+
+        async def _enqueue(_sig):
+            return SignalHandle(
+                signal_id="sig-test", task=asyncio.ensure_future(_slow()),
+            )
+        agent.dispatcher.enqueue_signal = AsyncMock(side_effect=_enqueue)
+
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        store.list_waiting = AsyncMock(
+            return_value=[_row("boot-nonblock", deadline=past)]
+        )
+        agent.pending_a2a_questions = store
+
+        # Returns even though nothing has settled.
+        await asyncio.wait_for(
+            feature._replay_pending_a2a_questions(store), timeout=5,
+        )
+        supervisors = _started_tasks(tracked, "a2a_question_answered_delivery:")
+        assert len(supervisors) == 1
+        assert not supervisors[0].done()
+
+        gate.set()
+        await _drain(tracked, "a2a_question_answered_delivery:")
+        store.mark_waiting_for_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_restores_row_on_failed_delivery(self):
+        _f, _a, store, _t = await self._replay_with(
+            lambda: _signal_handle(Status.FAILED, error="turn blew up")
+        )
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "boot-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_supervisor_restores_row_on_dropped_delivery(self):
+        _f, _a, store, _t = await self._replay_with(
+            lambda: _signal_handle(Status.DROPPED_CYCLE)
+        )
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "boot-1", state="expired", reply_text="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_supervisor_keeps_row_retired_on_ok_delivery(self):
+        _f, _a, store, _t = await self._replay_with(
+            lambda: _signal_handle(Status.OK)
+        )
+        store.mark_waiting_for_retry.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# #2532 round-2: restoring the row on teardown must NOT also start a retry.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_teardown_restores_the_row_without_starting_a_retry(monkeypatch):
+    """Restore always. Retry only when the feature is still alive.
+
+    ``supervise_terminal_delivery`` calls ``on_undelivered`` on supervisor
+    cancellation so an optimistically-retired row goes back. But cancellation
+    means the feature is tearing down, and ``_cancel_owned_background_tasks``
+    has ALREADY captured its task list — so a retry started from here escapes
+    teardown entirely and can emit an A2A wake after Peers is disabled.
+
+    The restored WAITING row is the retry: the next boot's replay picks it up.
+    """
+    from kestrel_sovereign.signals import delivery as delivery_mod
+    from kestrel_sovereign.signals.delivery import (
+        STATUS_SUPERVISOR_CANCELLED,
+        DeliveryOutcome,
+    )
+
+    feat = PeersFeature.__new__(PeersFeature)
+    captured: dict = {}
+    restored: list = []
+
+    def _capture_supervisor(feature, handle, **kwargs):
+        captured["on_undelivered"] = kwargs["on_undelivered"]
+        return MagicMock()
+
+    async def _fake_restore(task_id, **kwargs):
+        restored.append(kwargs["schedule_retry"])
+
+    # The consumer imports this inside the method, so patch it at the source.
+    monkeypatch.setattr(
+        delivery_mod, "supervise_terminal_delivery", _capture_supervisor
+    )
+    monkeypatch.setattr(
+        feat, "_restore_pending_question_waiting", _fake_restore, raising=False
+    )
+    monkeypatch.setattr(
+        feat, "_build_question_answered_signal",
+        lambda **kw: MagicMock(), raising=False,
+    )
+    feat.agent = MagicMock()
+    feat.agent.dispatcher = MagicMock()
+    feat.agent.dispatcher.enqueue_signal = MagicMock(return_value=MagicMock())
+
+    await feat._fire_question_answered_signal(
+        task_id="q-1", recipient="did:peer:x", original_question="?",
+        sess_id="s", state="completed", reply_text="hi",
+        causation_chain=None, await_delivery=False, schedule_retry=True,
+    )
+
+    on_undelivered = captured.get("on_undelivered")
+    assert on_undelivered is not None, "supervisor was never armed"
+
+    # A genuine delivery failure while the feature is alive → retry is fine.
+    await on_undelivered(DeliveryOutcome(status="failed", delivered=False))
+    # Teardown → restore the row, start nothing.
+    await on_undelivered(
+        DeliveryOutcome(status=STATUS_SUPERVISOR_CANCELLED, delivered=False)
+    )
+
+    assert restored == [True, False], (
+        "a live-feature failure may schedule a retry; a cancelled supervisor "
+        f"must restore only. got {restored}"
+    )

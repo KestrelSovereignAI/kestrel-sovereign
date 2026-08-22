@@ -35,11 +35,23 @@ function rootDeclarations(source) {
     return values;
 }
 
+// Third-party documents shipped as pinned reference DATA — the offline
+// W3C/IETF specification registry — are not first-party UI. They arrive as
+// their generator's output (ReSpec), carrying its own stylesheet and token
+// vocabulary (--heading-text, --bg-color, ...) which this theme contract
+// deliberately does not own and must not be pressured into declaring.
+// Vendored trees are named one by one on purpose: a newly vendored corpus
+// lands outside this set and fails the scan until it is classified here.
+const vendoredAssetRoots = new Set([
+    join(repoRoot, 'kestrel_sovereign', 'data', 'semantic', 'standards'),
+]);
+
 function firstPartyAssets(directory) {
     const assets = new Map();
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) {
+            if (vendoredAssetRoots.has(path)) continue;
             for (const [nestedPath, source] of firstPartyAssets(path)) {
                 assets.set(nestedPath, source);
             }
@@ -135,13 +147,39 @@ test('required-token check rejects a synthetic unknown variable', () => {
     );
 });
 
-test('every shipped first-party var(--token) without a fallback is declared', () => {
-    const shippedAssets = new Map([
+function shippedFirstPartyAssets() {
+    return new Map([
         ...firstPartyAssets(join(repoRoot, 'kestrel_sovereign')),
         ...firstPartyAssets(join(repoRoot, 'control-panel')),
         ...firstPartyAssets(join(repoRoot, 'examples')),
     ]);
+}
+
+test('every shipped first-party var(--token) without a fallback is declared', () => {
     assert.doesNotThrow(
-        () => assertDeclaredRequiredTokens(shippedAssets, defaultTheme),
+        () => assertDeclaredRequiredTokens(shippedFirstPartyAssets(), defaultTheme),
+    );
+});
+
+// The vendored-root skip above is an exemption from a contract this repo owns,
+// so it has to stay exactly as wide as its justification. This pins both edges:
+// first-party UI outside static/ is still scanned, and only the vendored corpus
+// is dropped -- so widening the skip to swallow real UI fails here.
+test('the vendored skip drops only third-party data, never first-party UI', () => {
+    const scanned = [...shippedFirstPartyAssets().keys()];
+
+    for (const firstParty of [
+        join('kestrel_sovereign', 'static', 'index.css'),
+        join('kestrel_sovereign', 'static', 'js', 'approvals.js'),
+        join('kestrel_sovereign', 'features', 'spawn', 'static', 'spawn.js'),
+    ]) {
+        assert.ok(scanned.includes(firstParty), `${firstParty} is still scanned`);
+    }
+
+    const vendored = join('kestrel_sovereign', 'data', 'semantic', 'standards');
+    assert.equal(
+        scanned.filter((path) => path.startsWith(vendored)).length,
+        0,
+        'the pinned W3C/IETF specification corpus is not treated as first-party UI',
     );
 });

@@ -338,7 +338,7 @@ class IdentityExporter:
                       key_message_ids, emotional_arc, created_at, importance,
                       access_count
                FROM memory_episodes
-               WHERE agent_id = ?
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0
                ORDER BY created_at DESC""",
             (self.agent_id,)
         )

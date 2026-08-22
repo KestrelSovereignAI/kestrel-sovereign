@@ -1,23 +1,17 @@
 """
-Typed section/build plan shared by the two context assemblers.
+Typed section results and the canonical context-build plan.
 
-``ContextManager.build_context`` (the production LLM path) and
-``ContextBuilder.measure_context_breakdown`` (the read-only introspection
-path) historically each open-coded their own copy of the section
-vocabulary — memory/RAG wrappers, the ``<retrieved_context>`` envelope,
-episode/reflection formatting, the ``[Memory]`` / ``[Document]`` counters
-— and drifted (#2523 / #2534). This module is the *single* definition of
-that vocabulary plus the production-only stage primitives (lumpy history
-anchoring, tool-result microcompaction, elastic section finalization,
-durable-salvage span computation), so the two callers cannot disagree on
-the bytes each section contributes.
+``ContextManager.build_context_plan`` is the only context orchestrator.
+Production commits the plan's declared side effects before rendering it;
+status surfaces render the same plan in dry-run mode.  The legacy
+``ContextBuilder.measure_context_breakdown`` method is only a compatibility
+adapter over that plan (#2523 / #2534).
 
 Design contract (#2523 required invariant): context construction is a
 composition of explicit section results followed by one auditable
 finalization boundary. Every section reports content/messages, token
 cost, item count, provenance, and any required persistence. The
-coordinator (``build_context`` vs ``measure_context_breakdown``) applies
-budget/slack policy; the section *definitions* live here.
+coordinator applies budget/slack policy; the section *definitions* live here.
 
 Deliberately dependency-light: this module imports only the standard
 library so both ``context_manager`` and ``context_builder`` can import it
@@ -30,7 +24,6 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -45,7 +38,7 @@ _MESSAGE_OVERHEAD = 4
 
 
 # ---------------------------------------------------------------------------
-# Shared section-content vocabulary (consumed by BOTH assemblers)
+# Canonical section-content vocabulary
 # ---------------------------------------------------------------------------
 #
 # These strings are byte-load-bearing: downstream LLM prompt caches
@@ -65,9 +58,8 @@ def wrap_documents(text: str) -> str:
     return f"<documents>\n{text}\n</documents>"
 
 
-#: The empty ``<retrieved_context>`` envelope. ``measure_context_breakdown``
-#: counts this once as ``dynamic_context_overhead`` when at least one
-#: dynamic block is present, mirroring the single-wrapper behavior below.
+#: The empty ``<retrieved_context>`` envelope used to attribute the one shared
+#: dynamic wrapper without charging it once per retrieved section.
 RETRIEVED_CONTEXT_EMPTY_ENVELOPE = "<retrieved_context>\n\n</retrieved_context>"
 
 
@@ -97,8 +89,7 @@ def count_rag_chunks(text: str) -> int:
 def build_reflection_guidance_block(items: List[str]) -> str:
     """Render the ACTIVE REFLECTION GUIDANCE block from guidance lines.
 
-    Byte-identical to the two former in-line constructions in
-    ``build_context`` and ``measure_context_breakdown``.
+    Byte-identical to the former in-line constructions.
     """
     return (
         "\n--- ACTIVE REFLECTION GUIDANCE ---\n"
@@ -122,7 +113,30 @@ EPHEMERAL_NOTICE = (
 # ---------------------------------------------------------------------------
 
 
-class SectionDestination(Enum):
+class ContextBuildMode(str, Enum):
+    """How a context plan will be consumed.
+
+    Planning is read-only in both modes.  ``LIVE`` means the caller will
+    subsequently commit the plan's declared side effects before rendering it;
+    ``DRY_RUN`` means those requirements are only reported.
+    """
+
+    LIVE = "live"
+    DRY_RUN = "dry_run"
+
+
+class SectionStatus(str, Enum):
+    """Whether a section was measured and admitted to the model view."""
+
+    INCLUDED = "included"
+    EMPTY = "empty"
+    EXCLUDED = "excluded"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
+    ERROR = "error"
+
+
+class SectionDestination(str, Enum):
     """Where a section's produced bytes land in the final assembly."""
 
     #: Appended to the stable, cacheable system prompt (episodes).
@@ -131,6 +145,8 @@ class SectionDestination(Enum):
     DYNAMIC = "dynamic"
     #: Conversation history messages.
     HISTORY = "history"
+    #: Provider tool-schema payload, outside chat-message content.
+    TOOLS = "tools"
 
 
 @dataclass
@@ -160,6 +176,8 @@ class SectionResult:
     warning: Optional[str] = None
     #: Set by the coordinator when the section's bytes were committed.
     committed: bool = False
+    #: Content-free producer observability carried into the context plan.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -194,20 +212,165 @@ class ContextAssembly:
         return assemble_dynamic_user_context(self.dynamic_blocks)
 
 
+@dataclass
+class ContextSectionPlan:
+    """Final, model-visible decision for one section of a context plan.
+
+    ``tokens`` is ``None`` when the caller deliberately chose the cheap
+    measurement path.  This distinction is load-bearing: an omitted RAG or
+    memory lookup is unknown/skipped, never a measured zero.
+    """
+
+    name: str
+    destination: SectionDestination
+    status: SectionStatus
+    tokens: Optional[int]
+    budget: Optional[int] = None
+    items: Optional[int] = None
+    provenance: Tuple[str, ...] = ()
+    reason: Optional[str] = None
+    raw_tokens: Optional[int] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def included(self) -> bool:
+        return self.status is SectionStatus.INCLUDED
+
+
+@dataclass
+class ContextBuildPlan:
+    """Read-only description of one production context build.
+
+    The plan owns the exact rendered artifacts, prune decisions, section
+    accounting, provenance, warnings, and required writes for a turn.
+    ``ContextManager.build_context`` commits ``memory_access_ids`` and
+    ``salvage_requirement`` before rendering a live result; diagnostics render
+    the same object in :attr:`ContextBuildMode.DRY_RUN` without committing.
+    """
+
+    mode: ContextBuildMode
+    model: str
+    assembly: ContextAssembly
+    sections: Dict[str, ContextSectionPlan]
+    budget_summary: Dict[str, Any]
+    context_limit: int
+    response_reserve: int
+    total_budget: int
+    total_tokens: int
+    mandatory_system_tokens: int = 0
+    state_of_mind: Any = None
+    degraded_mode: bool = False
+    degraded_reason: Optional[str] = None
+    memory_access_ids: Tuple[int, ...] = ()
+    salvage_requirement: Optional["PrunedSpan"] = None
+    pruned_span: Optional["PrunedSpan"] = None
+    durable_salvage_enabled: bool = False
+    measurement_complete: bool = True
+    microcompacted_tool_results: int = 0
+
+    @property
+    def utilization_percent(self) -> float:
+        if self.total_budget <= 0:
+            return 0.0
+        return round(min(100.0, self.total_tokens / self.total_budget * 100.0), 1)
+
+    @property
+    def warnings(self) -> List[str]:
+        return self.assembly.warnings
+
+    def to_breakdown(self) -> Dict[str, Any]:
+        """Render the stable API measurement shape without artifact bodies."""
+
+        rendered: Dict[str, Dict[str, Any]] = {}
+        for name, section in self.sections.items():
+            row: Dict[str, Any] = {
+                "tokens": section.tokens,
+                "status": section.status.value,
+                "provenance": list(section.provenance),
+            }
+            if section.budget is not None:
+                row["budget"] = section.budget
+            if section.items is not None:
+                row["count"] = section.items
+            if section.raw_tokens is not None:
+                row["raw_tokens"] = section.raw_tokens
+            if section.reason:
+                row["reason"] = section.reason
+            row.update(section.details)
+            rendered[name] = row
+
+        pruned_span = self.pruned_span
+        salvage_requirement = self.salvage_requirement
+        unmappable_count = (
+            pruned_span.unmappable_count if pruned_span is not None else 0
+        )
+        if salvage_requirement is not None and unmappable_count:
+            salvage_status = "partial_required_not_committed"
+        elif salvage_requirement is not None:
+            salvage_status = "required_not_committed"
+        elif pruned_span is not None and self.durable_salvage_enabled:
+            salvage_status = "unavailable_no_persistent_ids"
+        elif pruned_span is not None:
+            salvage_status = "disabled"
+        else:
+            salvage_status = "not_required"
+
+        return {
+            "model": self.model,
+            "context_limit": self.context_limit,
+            "response_reserve": self.response_reserve,
+            "total_budget": self.total_budget,
+            "total_measured": self.total_tokens,
+            "utilization_percent": self.utilization_percent,
+            "budget_summary": self.budget_summary,
+            "sections": rendered,
+            "notes": list(self.warnings),
+            "measurement_complete": self.measurement_complete,
+            "dry_run": self.mode is ContextBuildMode.DRY_RUN,
+            "salvage": {
+                "feature_enabled": self.durable_salvage_enabled,
+                "required": salvage_requirement is not None,
+                "status": salvage_status,
+                "message_count": (
+                    len(salvage_requirement.dropped_ids)
+                    if salvage_requirement is not None
+                    else 0
+                ),
+                "pruned_message_count": (
+                    pruned_span.total_dropped_count
+                    if pruned_span is not None
+                    else 0
+                ),
+                "unmappable_message_count": unmappable_count,
+                "token_estimate": (
+                    salvage_requirement.token_estimate
+                    if salvage_requirement is not None
+                    else 0
+                ),
+                "silent_prune_possible": (
+                    pruned_span is not None
+                    and (
+                        not self.durable_salvage_enabled
+                        or unmappable_count > 0
+                    )
+                ),
+            },
+            "microcompacted_tool_results": self.microcompacted_tool_results,
+        }
+
+
 # ---------------------------------------------------------------------------
-# Shared section producers (consumed by BOTH assemblers)
+# Canonical section producers
 # ---------------------------------------------------------------------------
 #
 # These turn already-retrieved raw section content into a typed
 # :class:`SectionResult`: token cost (on the RAW block — the byte the
 # budget gate charges), item count, and the wrapped/append bytes that
-# actually land in the assembly. The *retrieval* differs between the two
-# callers (production runs the side-effectful ``MemoryManager``;
-# measurement runs a side-effect-free adapter), but the normalization
-# after retrieval — count, wrap, gate-input — is single-sourced here so
-# ``build_context`` and ``measure_context_breakdown`` cannot disagree on
-# the bytes/counts a section contributes (#2523 / #2534). Each caller
-# then applies its OWN budget/persistence policy to the returned result.
+# actually land in the assembly. Retrieval remains read-only while the plan is
+# built, and normalization after retrieval — count, wrap, gate-input — is
+# single-sourced here so the plan's bytes/counts cannot drift (#2523 / #2534).
+# The canonical coordinator applies budget policy and records any required
+# rehearsal/salvage effects on the plan for the live commit boundary.
 
 
 def build_memory_section(
@@ -371,12 +534,20 @@ def compute_lumpy_anchor(
 
 @dataclass
 class PrunedSpan:
-    """The leading history messages that left the model-visible slice."""
+    """The leading history messages that left the model-visible slice.
+
+    ``dropped_messages`` contains only rows with durable integer ids because
+    those are the only rows the salvage transaction can link.  The aggregate
+    counters preserve the full prune shape so diagnostics never describe a
+    mixed persistent/in-memory span as fully salvageable.
+    """
 
     dropped_messages: List[Dict[str, Any]]
     dropped_ids: List[int]
     token_estimate: int
     session_id: Optional[str]
+    total_dropped_count: int
+    unmappable_count: int
 
 
 def compute_pruned_span(
@@ -386,21 +557,26 @@ def compute_pruned_span(
 ) -> Optional[PrunedSpan]:
     """Identify the oldest span pruned from the model-visible history.
 
-    Returns ``None`` when nothing was dropped or when no dropped row
-    carries an ``id`` (legacy un-tagged rows have nothing durable to
-    salvage against). The session id is derived from the first dropped
-    row's own metadata so the salvage marker stays non-leaking across
-    sessions (#713).
+    Returns ``None`` only when nothing was dropped. Rows without durable
+    integer ids remain represented by ``unmappable_count`` but are excluded
+    from ``dropped_messages`` and the token estimate passed to the salvage
+    transaction. The session id is derived from the first dropped row carrying
+    it, including an id-less row, so a mixed span's marker stays scoped to the
+    already session-filtered acquisition input (#713).
     """
     if len(formatted_history) >= len(history):
         return None
     dropped_count = len(history) - len(formatted_history)
     dropped = history[:dropped_count]
-    dropped_ids = [m["id"] for m in dropped if m.get("id") is not None]
-    if not dropped_ids:
-        return None
+    mappable = [
+        m
+        for m in dropped
+        if isinstance(m.get("id"), int) and not isinstance(m.get("id"), bool)
+    ]
+    dropped_ids = [m["id"] for m in mappable]
     token_estimate = sum(
-        count_tokens(m.get("content", "") or "") + _MESSAGE_OVERHEAD for m in dropped
+        count_tokens(m.get("content", "") or "") + _MESSAGE_OVERHEAD
+        for m in mappable
     )
     session_id: Optional[str] = None
     for m in dropped:
@@ -411,10 +587,12 @@ def compute_pruned_span(
                 session_id = sid
                 break
     return PrunedSpan(
-        dropped_messages=dropped,
+        dropped_messages=mappable,
         dropped_ids=dropped_ids,
         token_estimate=token_estimate,
         session_id=session_id,
+        total_dropped_count=len(dropped),
+        unmappable_count=len(dropped) - len(mappable),
     )
 
 
@@ -464,8 +642,6 @@ def microcompact_tool_results(history: List[Dict], keep_recent: int) -> int:
     # Keep the last N, clear the rest
     to_clear = tool_indices[:-keep_recent]
     cleared = 0
-    now = datetime.now(timezone.utc).isoformat()
-
     for idx in to_clear:
         msg = history[idx]
         content = msg.get("content", "")
@@ -494,7 +670,10 @@ def microcompact_tool_results(history: List[Dict], keep_recent: int) -> int:
                 "cleared": True,
                 "tool_name": tool_name,
                 "summary": summary,
-                "cleared_at": now,
+                # Stable across live/dry planning and repeated turns.  A wall
+                # clock here made identical histories produce different
+                # model-visible bytes on every status poll.
+                "cleared_at": msg.get("created_at") or "context-plan",
             }
         )
         msg["content"] = marker

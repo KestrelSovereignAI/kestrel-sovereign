@@ -44,12 +44,12 @@ This is not WhatsApp-specific: any feature pulling a heavy/native dependency
 
 | System | What it is | Isolation mechanism |
 |---|---|---|
-| **Talon** (`kestrel-talon`) | external coding-agent runner | **separate repo + its own `.venv`**, invoked as a CLI; thin `TalonCoordinatorFeature` lives in core (`features/talon/coordinator.py`), discovery is env → PATH → sibling `.venv` |
+| **Talon** (`kestrel-feature-talon` + `kestrel-talon`) | external coding coordinator + standalone runner | Both are independently installed; the feature package owns `TalonCoordinatorFeature` and invokes the standalone CLI without a core implementation fallback. |
 | **MCP** (`kestrel-feature-mcp`) | third-party tool servers | external **subprocess/SSE servers** spoken to over the MCP protocol; `manager.py` runs a background session loop with reconnect |
 | **FeatureFeature** (`kestrel-feature-features`) | agents *authoring* new features | workflow-driven build/review/**publish** of feature *packages* — **authoring only, no runtime/venv concern** |
 
-There is **no first-class "a feature runs in its own venv" capability**. Talon
-and MCP each hand-roll discovery + subprocess supervision + IPC differently;
+There is **no first-class "a feature runs in its own venv" capability**. The
+Talon and MCP feature packages each hand-roll discovery + subprocess supervision + IPC differently;
 FeatureFeature covers only authoring. Building WhatsApp's isolation as another
 one-off would be a fourth snowflake.
 
@@ -69,8 +69,10 @@ one-off would be a fourth snowflake.
   dependency conflict and pay no IPC cost).
 - A remote/distributed feature mesh — this is **localhost, same-host**
   isolation. (Cross-host is A2A's job; see §6.)
-- Sandboxing/security isolation as a primary aim (that's a bonus, not the
-  driver — the driver is *dependency* isolation).
+- OS sandboxing/security isolation. The runtime provides dependency, lifecycle,
+  namespace-ownership, and accidental-path containment; it does not make
+  mutually hostile same-UID feature code safe (the driver is *dependency*
+  isolation).
 
 ## 3. Proposed design
 
@@ -116,6 +118,195 @@ feature, instead of importing the class it instantiates a **proxy `Feature`**:
 4. On-demand provision: `uv venv` + `uv pip install` of the service project
    (opt-in; gives true "feature brings its own venv" UX).
 
+#### Rolling config authority and operator boundary
+
+An isolated proxy's durable config is DID-scoped for new agents.  Older
+proxies used the unscoped `feature_config:<class-name>` row, however, so a
+same-agent visible legacy row remains the authority for the duration of a
+mixed-version rollout.  A proxy never copies that row to a scoped key: old and
+new replicas must contend on the same CAS row.
+
+The graph store cannot atomically compare an old binary's legacy key with the
+new scoped key.  The proxy checks for visible legacy authority before every
+scoped read and write, then again before an SDK lifecycle hook or traffic can
+continue.  If legacy appears after a scoped stage, it fences the transition and
+quarantines the proxy rather than promoting, deleting, or live-applying across
+two authorities.  This may leave an orphaned scoped *candidate* in the final
+cross-key race; a second read narrows that window but does not close it.
+
+After all old replicas have been drained, an operator must inspect the two
+same-agent rows, choose the intended active config, and remove or reconcile an
+orphan only in an exclusive maintenance window.  Do not delete a legacy row
+while an old replica may still write it, and never perform this cleanup against
+another tenant's invisible rows.  New proxies continue to converge on legacy
+for as long as that row is visible.
+
+#### Hosted runtime namespace contract
+
+A standalone filesystem agent continues to place isolated runtime data beside
+its storage database. This includes AgentManager's existing per-agent SQLite
+layout: upgrading Core does not move its feature state or WhatsApp credentials.
+A pathless/shared-database hosted factory must instead construct `KestrelAgent`
+with all three of:
+
+```python
+from kestrel_sovereign.features.isolated_runtime import (
+    derive_isolated_runtime_namespace,
+)
+
+KestrelAgent(
+    ...,
+    isolated_runtime_root=operator_runtime_root,
+    isolated_runtime_namespace=derive_isolated_runtime_namespace(
+        authenticated_user_id,
+        companion_did,
+    ),
+    isolated_runtime_hosted=True,
+)
+```
+
+The root is operator-owned; the namespace is a canonical relative path. The
+root's parent must already exist, so an absent volume mount cannot be replaced
+silently with ephemeral directories. Core may create the root leaf at `0700`.
+If the root already exists, Core verifies service-account ownership and rejects
+group/world-writable mode, but does not chmod operator state (a safe `0755`
+root remains `0755`).
+
+Core rejects traversal, aliases, reserved/case-colliding path components, and
+binds the namespace to the agent DID with a private ownership marker. Marker
+publication writes and fsyncs a same-directory temporary file, then installs it
+with exclusive link semantics and fsyncs the directory; a crash cannot expose
+a partial marker. An interrupted link/unlink tail is recovered only when the
+temporary name is a hard link to the complete marker. A missing, short, or
+otherwise corrupt visible marker is never guessed or automatically replaced:
+the operator must verify custody and remove the corrupt marker before retrying.
+Secure cleanup retains the valid ownership marker throughout its recursive
+sweep and removes it only as the final entry immediately before removing the
+namespace leaf. A partial filesystem failure therefore retains custody proof
+and can be retried after the operator corrects the underlying error.
+POSIX directory creation is descriptor-relative and no-follow, with inode/path
+binding checks before child launch. Multi-component namespaces are supported,
+but allocated namespace leaves must be prefix-free: secure cleanup refuses a
+tree containing any descendant ownership marker before deleting its contents.
+
+A namespace already bound to a different DID, an unsafe operator root, a
+symlink/path swap, or a corrupt marker is a containment/ownership violation and
+fails hosted agent discovery closed. Ordinary OS preparation failures such as
+ENOSPC or a transient descriptor limit instead make that optional isolated
+feature unavailable; they do not suppress the agent's mandatory features.
+
+`isolated_feature_data_dir` remains only a standalone compatibility input. It
+is not an adequate hosted containment boundary because it does not identify a
+trusted root separately from tenant-controlled namespace material. PostgreSQL
+agents constructed without a filesystem storage path are treated as hosted,
+so an old factory cannot silently recover the shared `agent_data/default`
+fallback.
+
+The default standalone/SQLite WhatsApp venv remains under
+`<agent>/feature_venvs/WhatsAppFeature/.venv`. Standalone launches preserve the
+historical child environment and cwd: `KESTREL_FEATURE_DATA_DIR` still takes
+precedence over `KESTREL_DATA_DIR`, which still takes precedence over the
+prebuilt/default venv's `sys.prefix.parent/whatsapp_service` fallback. Core does
+not inject its hosted canonical data-dir variable into a standalone child, so
+an upgrade neither relocates credentials nor changes Telegram/general feature
+HOME, TMPDIR, XDG, or relative-path behavior. Operators remain responsible for
+ensuring any process-wide standalone data-directory override is not shared by
+agents that require distinct mutable state.
+
+Every hosted feature receives a private mutable directory below that namespace
+for its working directory, home, temp, XDG config/data/cache, channel artifacts,
+provisioning manifest, and default venv. Hosted children inherit only a narrow
+execution/locale/CA/proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY`, including lowercase spellings); feature configuration and secrets
+travel in the per-agent initialize handshake. Process-wide legacy Telegram,
+Twilio, WhatsApp, or `KESTREL_FEATURE_<NAME>_*` configuration is not silently
+dropped or forwarded across tenants: hosted discovery names the offending keys
+and refuses that optional feature until the values are moved into the agent's
+persisted feature configuration. `..._BIN` and `..._VENV` remain host-side
+artifact-selection inputs and are never exposed to the child. An
+operator-selected prebuilt venv remains immutable and may be shared as an
+artifact, but the child process and all mutable paths remain namespace-distinct.
+
+The per-feature directory identity is a digest of the normalized distribution
+name and declared feature class. Entry-point module paths and service runner
+spellings are deployment details: refactoring either does not move tenant state
+or credentials. On the first startup with this stable identity, Core atomically
+renames a directory produced by the earlier distribution/class/entry-point/
+service digest before creating the stable workspace. If both old and stable
+trees exist, Core never merges or guesses between credential stores; it retains
+both and marks that optional feature unavailable pending operator custody
+reconciliation.
+
+Hosted venv SDK/distribution probes use the same narrow execution/locale/CA/
+proxy allowlist and receive no package credentials. `uv` provisioning and
+feature build backends additionally receive only explicit `PIP_INDEX_*`,
+`UV_*INDEX*`, and named `UV_INDEX_<NAME>_{USERNAME,PASSWORD}` package-index
+settings. They do not inherit API/channel/tenant secrets, config-file or
+keyring paths, SSH-agent authority, or the host process environment. Private
+VCS dependencies that require those broader capabilities must be materialized
+as an operator-owned prebuilt venv rather than widening the hosted subprocess
+boundary. Core resolves `uv` to a trusted absolute host executable after
+excluding the mutable feature venv from the search path, and provisioning uses
+an explicit private per-agent/per-feature `UV_CACHE_DIR` in a dedicated
+`provisioning_cache` directory. That cache is distinct from the child's
+`XDG_CACHE_HOME`, is not exported to the child, and never relies on `HOME`,
+passwd-database discovery, or an operator uv cache.
+
+Namespace creation and ownership binding happen only during isolated-feature
+startup. QR GETs resolve the cached path read-only and perform their filesystem
+stat off the event loop; QR events use the already-prepared cached directory and
+offload atomic file replacement/unlink work. A read or event therefore never
+materializes a missing tenant namespace.
+
+Explicit tenant offboarding is the runtime-state deletion boundary. Normal host
+shutdown, restart, lifespan teardown, and startup rollback stop/unpublish agents
+but retain every hosted namespace. Administrative DELETE/deprovision, explicit
+child termination, and rollback of an uncommitted spawn carry a separate
+destructive intent: after durable shutdown, AgentManager verifies the ownership
+marker against the removed DID and deletes the namespace with
+descriptor-relative, no-follow recursion. A foreign/corrupt or nested marker,
+unsafe path, or unsupported secure-deletion platform retains the tree and makes
+offboarding fail visibly. Filesystem deletion is admitted while removal is
+serialized but awaited only after manager, A2A, and scheduler lifecycle locks
+are released. The administrative wait is bounded by
+`KESTREL_RUNTIME_OFFBOARD_TIMEOUT_S`, whose default is 30 seconds independently
+of the ordinary five-second agent-shutdown bound. Timeout/cancellation
+unpublishes the stopped agent, retains the exact cleanup worker for terminal
+draining, and returns sanitized metadata with `runtime_cleanup_state=pending`:
+the cleanup may still finish, so this is not a claim of permanent retention.
+A completed cleanup failure instead reports `runtime_cleanup_state=retained`.
+Neither response exposes the host path. If shutdown is quarantined, its retained
+reaper deletes only when the original caller carried that explicit intent and
+durable shutdown later succeeds. The `terminate_child` tool reports this split
+outcome as partial success: the named child is stopped and must not be retried,
+while any named child or descendant with pending/retained runtime custody is
+identified separately for operator reconciliation.
+Storage-derived standalone/SQLite trees are outside hosted namespace cleanup
+and retain their existing storage lifecycle policy.
+Core-created standalone feature, workspace, and channel-artifact directories
+are private `0700`; a pre-existing storage parent (including process CWD) is
+operator-owned and its mode is never changed.
+
+#### Same-service-account trust boundary
+
+The hosted namespace contract is not an operating-system sandbox. Isolated
+feature subprocesses normally run as the same service account as Core and each
+other. POSIX `0700` prevents access by other UIDs; it cannot prevent a malicious
+same-UID child from traversing a sibling namespace once it learns or guesses a
+path. Absolute paths for only the child's own workspace are unavoidable launch
+inputs (`cwd`, HOME/XDG/temp, and the feature data directory), and Core does not
+publish the operator root, sibling paths, or retained host paths through its
+HTTP error metadata. Those paths are locations, not capabilities.
+
+Feature packages installed into one Core service must therefore be trusted at
+the service-account boundary. A hosted operator that runs mutually distrustful
+or tenant-supplied feature code must put each trust domain behind a real OS
+boundary—separate UID, container, VM, or an equivalent mandatory sandbox—and
+give it only its own mounted namespace. Namespace validation, no-follow file
+operations, ownership markers, and private modes remain defense in depth
+against traversal bugs, symlink swaps, accidental collision, and other Unix
+accounts; they are not claimed to isolate hostile peers sharing a UID.
+
 ### 3.3 IPC + lifecycle contract (SDK)
 
 A shared contract in `kestrel-sovereign-sdk` so every isolated feature (and,
@@ -138,7 +329,40 @@ over time, Talon/MCP) uses one substrate:
   WhatsApp message) are JSON-RPC notifications service → host, which the proxy
   routes into the normal path (`ChannelFeature.handle_inbound`, signals, etc.).
 - **State/secret ownership**: the service owns its own data dir / session DB
-  (e.g. WhatsApp linked-device credentials) under the agent data dir.
+  (e.g. WhatsApp linked-device credentials) under the standalone agent data
+  directory or the explicit hosted runtime namespace described above.
+
+#### External-ingress transition fence
+
+Some isolated services acknowledge input at an external producer before their
+stdio notification reaches Core (for example, a long-poll cursor).  Such a
+producer opts into a pre-gate lifecycle by advertising both private
+host-ingress names `external-ingress-quiesce` and `external-ingress-resume`.
+These are ordinary versioned SDK host-ingress capability names, not channel
+operations and never agent tools.
+
+For each config transition, Core generates a fresh opaque 256-bit
+`transition_id`, calls `external-ingress-quiesce` **while its traffic gate is
+still open**, and closes/drains that gate only after a strict `quiesced`
+acknowledgment. The service must stop its producer, cancel/reap a pending
+external receive, and wait for an already-started event callback to settle
+before returning that acknowledgment. On the shared stdio wire that callback's
+notification precedes the quiesce response; the SDK client serially delivers
+the notification before resolving the response, so the gate drain also covers
+it. This is an ordering handshake, not a sleep or a dropped-event workaround.
+
+If staging/promotion fails or the old child live-applies the change, Core
+invokes `external-ingress-resume` with the same id **while its traffic gate is
+still closed**. The service must return the strict `resumed` response before it
+starts polling or produces another callback; only after Core receives that
+response does it reopen the gate. A first callback produced immediately after
+the response is held by the closed-gate deferred-ingress path, so it cannot be
+lost in the response/reopen handoff. A replacement owns a new child and does
+not resume the retired producer. A mismatched id, malformed acknowledgment,
+timeout, cross-loop operation, or cancellation-ambiguous lifecycle result
+fails closed and leaves the exact child under the established terminal/reaping
+ownership rules. Services which do not advertise both names, including legacy
+SDK/services, keep the existing safe replacement path unchanged.
 
 ### 3.4 Layout (same repo, two venvs)
 
@@ -195,9 +419,10 @@ send + receive via neonize):
   same-host. **Resolved.**
 - **venv provisioning** → **resolved: per-agent, auto-provisioned**. Each agent
   gets its **own copy** of the feature venv, created on demand (`uv venv` +
-  `uv pip install` of the service project) under the agent data dir
-  (`<agent_data>/feature_venvs/<feature>/`). An explicit path override stays as
-  a dev convenience, but production provisions per agent. **Resolved.**
+  `uv pip install` of the service project) under its standalone data root or
+  explicit hosted namespace (`<runtime>/feature_venvs/<feature>/`). An explicit
+  path override stays as a dev convenience and is never mutated when it is an
+  operator-prebuilt environment. **Resolved.**
 - **Service scope** → **resolved: per-agent**. One service instance per agent
   (each owns its venv copy and its session DB, e.g. its own WhatsApp link).
   Per-host sharing is explicitly out for now. **Resolved.**

@@ -9,10 +9,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -391,11 +391,25 @@ def calculate_risk_score(findings: List[SecurityFinding]) -> int:
 
 ### 4.1 uv Executor (Python)
 
-For Python scripts, use `uv run` with isolated environments:
+For Python scripts, use `uv run` in a project-free ephemeral environment. In uv
+0.9, `--isolated` alone still discovers and installs the surrounding project,
+so the executor combines three controls: `--isolated` forces a fresh execution
+environment, `--no-project` prevents project/workspace discovery, and a
+concrete base-interpreter path anchors interpreter selection outside Kestrel's
+runtime as defense-in-depth against uv resolver changes. The real-process test
+demonstrates the fresh and project-free behavior; the explicit pin makes that
+choice independent of the caller-selected working directory rather than
+depending on uv's future interpreter-resolution semantics.
+Kestrel must itself run inside a Python `venv` or `virtualenv` so that base
+interpreter cannot be Kestrel's own runtime. A Conda environment alone does not
+provide the distinct `sys.prefix`/`sys.base_prefix` boundary required here.
+Deployment packaging must preserve that boundary: the shipped sovereign image
+creates `/app/.venv` and launches Kestrel with `/app/.venv/bin/python`; a system
+or `--user` Python installation leaves the uv executor unavailable by design.
 
 ```python
 class UvExecutor:
-    """Execute Python scripts in isolated uv environments."""
+    """Execute Python scripts in project-free ephemeral uv environments."""
     
     async def execute(
         self,
@@ -407,9 +421,10 @@ class UvExecutor:
         
         1. Create temporary directory
         2. Write script and requirements.txt
-        3. Run with `uv run --isolated`
-        4. Capture output
-        5. Clean up
+        3. Resolve the executable behind the Kestrel virtual environment
+        4. Run with `uv run --isolated --no-project --python <base-executable>`
+        5. Capture output
+        6. Clean up
         """
         with tempfile.TemporaryDirectory(prefix="kestrel_compute_") as tmpdir:
             script_path = Path(tmpdir) / "script.py"
@@ -419,13 +434,28 @@ class UvExecutor:
                 req_path = Path(tmpdir) / "requirements.txt"
                 req_path.write_text("\n".join(requirements))
             
+            base_python = self._get_base_python_path()
+            command = [
+                "uv", "run", "--isolated", "--no-project",
+                "--python", base_python,
+            ]
+            for requirement in requirements or []:
+                command.extend(["--with", requirement])
+            command.append(str(script_path))
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key in _SAFE_ENV_VARS
+            }
+            env.update(script.environment)
+            env.pop("PYTHONPATH", None)
+
             process = await asyncio.create_subprocess_exec(
-                "uv", "run", "--isolated",
-                str(script_path),
+                *command,
                 cwd=tmpdir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **script.environment}
+                env=env,
             )
             
             try:
@@ -445,6 +475,17 @@ class UvExecutor:
                 ...
             )
 ```
+
+`_get_base_python_path()` prefers Python's canonical `sys._base_executable`,
+then checks platform-appropriate executable names under `sys.base_prefix`
+(`python.exe` at the prefix root on Windows; versioned `bin/python*` names on
+POSIX). Every candidate must be an executable file. Resolution fails closed if
+Kestrel is not running in a Python `venv`/`virtualenv` (including when it is
+running in a Conda environment alone) or no base executable exists.
+The filtered child environment removes `PYTHONPATH`, and host `UV_*`/package
+index variables are not forwarded. Package installation remains limited to the
+requirements explicitly represented by repeated `--with` arguments on the
+reviewed script.
 
 ### 4.2 Docker Executor (Bash/Python)
 

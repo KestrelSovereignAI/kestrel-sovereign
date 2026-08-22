@@ -14,13 +14,12 @@ existing tables are modified.
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-logger = logging.getLogger(__name__)
+from kestrel_sovereign.storage.database_clock import database_now_sql
 
 
 # Terminal states — a request in any of these is locked. The
@@ -69,9 +68,23 @@ KNOWN_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 # a plain restart.
 KNOWN_OPERATIONS = frozenset({"restart_only", "update_then_restart"})
 
+# Stamped onto ``wake_dispatch_boot_id`` for rows already delivered when the
+# dispatch-observability columns were added (#2774). Reads as "delivered under
+# the old flow; whether a wake was actually dispatched is unrecoverable" — it
+# does NOT assert a dispatch happened, because some of those rows provably had
+# none: a host with no usable dispatcher marks a row delivered without sending
+# anything (see ``_deliver_restart_completed``). Its job is to keep '' meaning
+# "no wake was ever dispatched for this row", which is the negative evidence
+# #2774 needs.
+PRE_MIGRATION_BOOT_ID = "pre-migration"
+
 # Columns added after the original #1512 schema. Applied additively via
 # ALTER TABLE so a feature loading against a pre-existing table picks
 # them up without losing data.
+#
+# ORDER IS LOAD-BEARING: ``_COLUMN_BACKFILLS`` runs in this order, and the
+# wake_dispatch_boot_id backfill reads what the wake_delivered backfill
+# writes. Asserted at import time below.
 _ADDED_COLUMNS = (
     ("operation", "TEXT DEFAULT 'restart_only'"),
     ("update_repo_path", "TEXT DEFAULT ''"),
@@ -90,7 +103,72 @@ _ADDED_COLUMNS = (
     # flag, set once the COGNITION wake lands Status.OK). The sweep retries the
     # wake while this is 0; it never re-terminalizes an already-completed row.
     ("wake_delivered", "INTEGER DEFAULT 0"),
+    # When the post-restart wake was DISPATCHED, as distinct from when its
+    # turn completed (#2774). ``wake_delivered`` only flips once the woken
+    # cognition turn returns Status.OK, which is necessarily AFTER that turn
+    # ends — so the turn the wake itself woke can never observe the flag as
+    # true, and the row appears to contradict its own consumer. These columns
+    # are stamped just before the signal is handed to the dispatcher, so "did
+    # this boot try to wake this row, and when" is answerable during that turn
+    # and usable as negative evidence when a wake genuinely never fired.
+    ("wake_dispatched_at", "TEXT DEFAULT ''"),
+    ("wake_dispatch_boot_id", "TEXT DEFAULT ''"),
+    # How many completion wakes have been dispatched for this row. The #2738
+    # failure was ~18 re-emissions inside one boot; a count makes that storm
+    # visible in the row itself rather than only in the logs.
+    ("wake_dispatch_count", "INTEGER DEFAULT 0"),
+    # Start of the current uninterrupted busy deferral. This must not be
+    # inferred from requested_at: old pending rows may predate this policy by
+    # weeks and cannot become immediately escalation-eligible on upgrade.
+    ("first_blocked_at", "TEXT DEFAULT ''"),
+    # Legacy rows receive 0 from the additive migration. Fresh requests are
+    # inserted with 1 explicitly, so only a pre-upgrade backlog needs the
+    # one-time acknowledgement before bounded escalation may override idle.
+    ("escalation_acknowledged", "INTEGER DEFAULT 0"),
 )
+
+# One-time data backfills for legacy rows, keyed by the column whose addition
+# makes them necessary. Each runs in the same transaction as its ``ALTER``
+# (see ``AsyncDatabase.migrate_columns_once``), so the schema itself is the
+# marker: if the column is present, this backfill has already run or was never
+# needed.
+_COLUMN_BACKFILLS = {
+    "wake_delivered": (
+        # Pre-#1819 a row only reached 'completed' AFTER its wake was
+        # delivered — terminalization was delivery-gated.
+        # ``list_requests_needing_wake`` selects ``completed AND
+        # wake_delivered = 0``, so without this every historical completed
+        # restart is re-woken on the first post-upgrade sweep.
+        "UPDATE restart_requests SET wake_delivered = 1 "
+        "WHERE status = 'completed'",
+        (),
+    ),
+    "wake_dispatch_boot_id": (
+        # A row delivered before these columns existed carries no dispatch
+        # record. Stamp the sentinel rather than a fabricated timestamp.
+        #
+        # Keyed on wake_delivered, NOT on status: a row that is completed but
+        # undelivered has not had a wake land, so it must keep '' and stay
+        # eligible for the sweep's retry.
+        "UPDATE restart_requests SET wake_dispatch_boot_id = ? "
+        "WHERE wake_delivered = 1 AND wake_dispatch_boot_id = ''",
+        (PRE_MIGRATION_BOOT_ID,),
+    ),
+}
+
+# The sentinel backfill reads what the delivered backfill writes, and both are
+# driven off ``_ADDED_COLUMNS`` order. Not an ``assert``: this is load-bearing
+# and asserts are stripped under ``python -O``, which is exactly when a silent
+# miscompile would hurt.
+_backfill_order = [c for c, _ in _ADDED_COLUMNS if c in _COLUMN_BACKFILLS]
+if _backfill_order.index("wake_delivered") > _backfill_order.index(
+    "wake_dispatch_boot_id"
+):
+    raise RuntimeError(
+        "wake_delivered must be backfilled before the wake_dispatch_boot_id "
+        "sentinel that reads it"
+    )
+del _backfill_order
 
 # Canonical column order shared by every SELECT below and ``from_row``.
 _COLUMNS = (
@@ -98,7 +176,9 @@ _COLUMNS = (
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
     "update_allow_migrations, update_log, requester_request_id, "
-    "executing_boot_id, origin_session_id, wake_delivered"
+    "executing_boot_id, origin_session_id, wake_delivered, "
+    "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count, "
+    "first_blocked_at, escalation_acknowledged"
 )
 
 
@@ -138,6 +218,18 @@ class RestartRequest:
     # ``completed`` (restart finished) with ``wake_delivered=False`` while the
     # wake is still being retried.
     wake_delivered: bool = False
+    # When the wake was dispatched and from which boot (#2774). Set on
+    # dispatch acceptance, so it is already visible to the turn the wake
+    # woke — unlike ``wake_delivered``, which cannot be by construction.
+    wake_dispatched_at: str = ""
+    wake_dispatch_boot_id: str = ""
+    # Number of completion wakes dispatched for this row (#2738).
+    wake_dispatch_count: int = 0
+    # Start of the current continuous idle-policy deferral (#2900).
+    first_blocked_at: str = ""
+    # Fresh rows opt into bounded escalation. Migrated rows remain false until
+    # an explicit acknowledgement records acceptance of the new behavior.
+    escalation_acknowledged: bool = False
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -167,6 +259,11 @@ class RestartRequest:
             executing_boot_id=str(g(17) or ""),
             origin_session_id=str(g(18) or ""),
             wake_delivered=bool(int(g(19) or 0)),
+            wake_dispatched_at=str(g(20) or ""),
+            wake_dispatch_boot_id=str(g(21) or ""),
+            wake_dispatch_count=int(g(22) or 0),
+            first_blocked_at=str(g(23) or ""),
+            escalation_acknowledged=bool(int(g(24) or 0)),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -201,6 +298,14 @@ class RestartRequest:
             "executing_boot_id": self.executing_boot_id,
             "origin_session_id": self.origin_session_id,
             "wake_delivered": self.wake_delivered,
+            # Exposed so introspection can distinguish "no wake was ever sent"
+            # from "a wake was sent and its turn has not finished yet" (#2774).
+            # Reading only ``wake_delivered`` conflates the two.
+            "wake_dispatched_at": self.wake_dispatched_at,
+            "wake_dispatch_boot_id": self.wake_dispatch_boot_id,
+            "wake_dispatch_count": self.wake_dispatch_count,
+            "first_blocked_at": self.first_blocked_at,
+            "escalation_acknowledged": self.escalation_acknowledged,
         }
 
 
@@ -228,34 +333,20 @@ async def ensure_restart_requests_table(db) -> None:
             requester_request_id TEXT DEFAULT '',
             executing_boot_id TEXT DEFAULT '',
             origin_session_id TEXT DEFAULT '',
-            wake_delivered INTEGER DEFAULT 0
+            wake_delivered INTEGER DEFAULT 0,
+            wake_dispatched_at TEXT DEFAULT '',
+            wake_dispatch_boot_id TEXT DEFAULT '',
+            wake_dispatch_count INTEGER DEFAULT 0,
+            first_blocked_at TEXT DEFAULT '',
+            escalation_acknowledged INTEGER DEFAULT 0
         )
         """
     )
-    # Additively backfill the #1539 columns on a pre-existing table.
-    for col, col_def in _ADDED_COLUMNS:
-        try:
-            await db.execute(
-                f"ALTER TABLE restart_requests ADD COLUMN {col} {col_def}"
-            )
-        except Exception:
-            # Column already exists — expected on every non-first run.
-            continue
-        # The ALTER succeeded → this column was just added on THIS run.
-        # One-time data backfill for the new column:
-        if col == "wake_delivered":
-            # Pre-#1819, a row only reached 'completed' AFTER its wake was
-            # delivered (terminalization was delivery-gated). The new
-            # ``list_requests_needing_wake`` selects ``completed AND
-            # wake_delivered = 0``, so without this backfill every historical
-            # completed restart would be re-woken on the first post-upgrade
-            # sweep. Mark them delivered. This runs exactly once — on later
-            # boots the ALTER raises (column exists) and we skip, so a
-            # genuinely-undelivered new-flow wake still retries across reboots.
-            await db.execute(
-                "UPDATE restart_requests SET wake_delivered = 1 "
-                "WHERE status = 'completed'"
-            )
+    # The platform owns the mechanism (one transaction per ALTER + backfill,
+    # schema-as-marker, post-migration verification); this declares only what.
+    await db.migrate_columns_once(
+        "restart_requests", _ADDED_COLUMNS, _COLUMN_BACKFILLS,
+    )
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_status
@@ -288,43 +379,28 @@ async def insert_request(
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
-    now = datetime.now(timezone.utc).isoformat()
+    now_sql = database_now_sql(db)
     await db.execute(
-        """
+        f"""
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
             completed_at, operation, update_repo_path, update_target_ref,
             update_profile, update_allow_migrations, update_log,
-            requester_request_id, origin_session_id
+            requester_request_id, origin_session_id, escalation_acknowledged
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?, ?)
+        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
+                ?, ?, ?, ?, ?, '', ?, ?, 1)
         """,
-        (req_id, requested_by_agent, reason, now, desired_window,
+        (req_id, requested_by_agent, reason, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
          requester_request_id, origin_session_id),
     )
-    return RestartRequest(
-        id=req_id,
-        requested_by_agent=requested_by_agent,
-        reason=reason,
-        requested_at=now,
-        desired_window=desired_window,
-        urgency=urgency,
-        policy=policy,
-        status="pending",
-        status_reason="",
-        completed_at=None,
-        operation=operation,
-        update_repo_path=update_repo_path,
-        update_target_ref=update_target_ref,
-        update_profile=update_profile,
-        update_allow_migrations=update_allow_migrations,
-        update_log="",
-        requester_request_id=requester_request_id,
-        origin_session_id=origin_session_id,
-    )
+    inserted = await get_request(db, req_id)
+    if inserted is None:
+        raise RuntimeError("restart request insert did not become visible")
+    return inserted
 
 
 async def list_requests(
@@ -373,11 +449,76 @@ async def list_requests_needing_wake(
     return [RestartRequest.from_row(r) for r in rows]
 
 
-async def mark_wake_delivered(db, request_id: str) -> None:
-    """Flag a request's post-restart wake as delivered (#1819)."""
-    await db.execute(
+async def _write_landed(db, result: Any, request_id: str, verify) -> bool:
+    """Did an ``UPDATE`` actually change a row?
+
+    The single contract for this module. Extracted from ``update_status``,
+    which has always checked this correctly, so the two cannot drift: the
+    project's SQLite/Postgres backends return the integer rowcount directly
+    from ``execute``, and only a legacy cursor-style backend needs the
+    re-read. ``verify`` confirms the intended change on that last path.
+    """
+    if isinstance(result, int):
+        return result > 0
+    rowcount = getattr(result, "rowcount", None)
+    if isinstance(rowcount, int):
+        return rowcount > 0
+    row = await get_request(db, request_id)
+    return row is not None and verify(row)
+
+
+async def mark_wake_delivered(db, request_id: str) -> bool:
+    """Flag a request's post-restart wake as delivered (#1819).
+
+    Returns whether the write actually landed. It previously returned ``None``
+    and discarded the rowcount ``execute`` hands back — the same value its
+    sibling ``update_status`` treats as authoritative twenty lines away. So a
+    write that matched no row was indistinguishable from one that succeeded,
+    ``wake_delivered`` stayed 0 with nothing recorded anywhere, and the next
+    sweep rediscovered the row and re-emitted a completion wake the agent had
+    already consumed — once a minute, for eighteen minutes (#2738).
+    """
+    result = await db.execute(
         "UPDATE restart_requests SET wake_delivered = 1 WHERE id = ?",
         (request_id,),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.wake_delivered,
+    )
+
+
+async def mark_wake_dispatched(
+    db, request_id: str, *, dispatched_at: str, boot_id: str,
+) -> bool:
+    """Record that a post-restart wake was DISPATCHED (#2774).
+
+    Stamped immediately before the signal is handed to the dispatcher, which
+    is the last moment guaranteed to precede the woken turn — the dispatcher
+    starts the turn as soon as it has the signal, so any later write races the
+    reader it exists for. ``wake_delivered`` structurally cannot answer this:
+    it is only set once the woken turn returns ``Status.OK``, i.e. after the
+    turn that would read it has ended.
+
+    Every dispatch is recorded, not only the first: ``wake_dispatched_at``
+    means what its name says (when we last dispatched) and
+    ``wake_dispatch_count`` makes a re-emission storm countable from the row.
+    The original failure was ~18 re-emissions within a single boot (#2738), and
+    observability that kept only the first would have shown one timestamp for
+    the whole event.
+    """
+    result = await db.execute(
+        "UPDATE restart_requests SET wake_dispatched_at = ?, "
+        "wake_dispatch_boot_id = ?, "
+        "wake_dispatch_count = COALESCE(wake_dispatch_count, 0) + 1 "
+        "WHERE id = ?",
+        (dispatched_at, boot_id, request_id),
+    )
+    return await _write_landed(
+        db, result, request_id,
+        lambda row: (
+            row.wake_dispatched_at == dispatched_at
+            and row.wake_dispatch_boot_id == boot_id
+        ),
     )
 
 
@@ -389,6 +530,65 @@ async def get_request(db, request_id: str) -> Optional[RestartRequest]:
     if not rows:
         return None
     return RestartRequest.from_row(rows[0])
+
+
+async def mark_deferral_started(
+    db,
+    request_id: str,
+    *,
+    expected_current_status: str,
+    blocked_at: Optional[str] = None,
+) -> Optional[RestartRequest]:
+    """Persist the beginning of one uninterrupted busy deferral.
+
+    The conditional write preserves the first timestamp when multiple host
+    coordinators observe the same row. The status compare-and-set prevents a
+    stale coordinator from annotating a canceled or executing row. Returning
+    the authoritative row lets the caller distinguish an existing timestamp
+    from a lost lifecycle race.
+    """
+
+    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
+    params = (
+        (blocked_at, request_id, expected_current_status)
+        if blocked_at is not None
+        else (request_id, expected_current_status)
+    )
+    await db.execute(
+        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "WHERE id = ? AND status = ? "
+        "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
+        params,
+    )
+    return await get_request(db, request_id)
+
+
+async def clear_deferral_started(
+    db, request_id: str, *, expected_current_status: str,
+) -> bool:
+    """Clear a busy interval after fleet quiescence is observed."""
+
+    result = await db.execute(
+        "UPDATE restart_requests SET first_blocked_at = '' "
+        "WHERE id = ? AND status = ?",
+        (request_id, expected_current_status),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.first_blocked_at == "",
+    )
+
+
+async def acknowledge_escalation(db, request_id: str) -> bool:
+    """Acknowledge bounded escalation for one migrated pending request."""
+
+    result = await db.execute(
+        "UPDATE restart_requests SET escalation_acknowledged = 1 "
+        "WHERE id = ? AND status IN ('pending', 'approved')",
+        (request_id,),
+    )
+    return await _write_landed(
+        db, result, request_id, lambda row: row.escalation_acknowledged,
+    )
 
 
 async def record_update_log(db, request_id: str, update_log: str) -> None:
@@ -443,15 +643,7 @@ async def update_status(
         sql += " AND status = ?"
         params_final.append(expected_current_status)
     result = await db.execute(sql, tuple(params_final))
-    # The project SQLite/Postgres backends return the integer
-    # rowcount directly from ``execute``. Treat the int form as
-    # authoritative (>0 = updated, 0 = expected-status mismatch
-    # i.e. lost the race). Only fall back to SELECT for legacy
-    # cursor-style backends.
-    if isinstance(result, int):
-        return result > 0
-    rowcount = getattr(result, "rowcount", None)
-    if isinstance(rowcount, int):
-        return rowcount > 0
-    row = await get_request(db, request_id)
-    return row is not None and row.status == status
+    # >0 = updated; 0 = expected-status mismatch, i.e. lost the race.
+    return await _write_landed(
+        db, result, request_id, lambda row: row.status == status,
+    )

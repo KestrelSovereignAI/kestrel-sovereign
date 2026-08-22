@@ -119,6 +119,23 @@ exclude_repos = []
 # =============================================================================
 # Model Catalog - Manual Overrides Only
 # =============================================================================
+# Retrieval is intentionally default-off: semantic assertion recall requires a
+# current complete governed maintenance checkpoint for this agent.
+[retrieval]
+semantic_recall_enabled = false
+semantic_recall_candidate_limit = 32
+semantic_recall_candidate_scan_limit = 2000
+semantic_recall_embedding_batch_size = 64
+semantic_recall_work_limit = 24
+semantic_recall_result_limit = 8
+semantic_recall_max_tokens = 1200
+# Hard deadline for consolidation + forgetting. The coroutine abandons a
+# timed-out pass and releases its MEMORY lock context so queued work can run;
+# SQLite interruption and rollback are retained by the backend, though a Python
+# UDF or stalled VFS operation may still drain until it returns control to SQLite.
+# memory_consolidation_timeout_seconds = 1800
+
+# =============================================================================
 # Concrete discovered model lists live in model_discovery_cache.json.
 # This section is only for data that provider APIs do not return reliably.
 
@@ -621,6 +638,54 @@ role = "technical_reviewer"
 # max_turns = 50
 # skip_clarification = true
 # self_review = true
+#
+# Runtime paths (REQUIRED since Talon moved to the kestrel-feature-talon
+# package). The in-tree version derived these from its own installed location;
+# the extracted package deliberately does not — it consults no environment
+# variable and no package location for project paths, so an unset value is an
+# error rather than a guess.
+#
+# [talon.runtime]
+# engine_executable = "/opt/kestrel/bin/kestrel-talon"
+# project_parent = "/srv/kestrel/projects"
+# running_agent_source_root = "/srv/kestrel/kestrel-sovereign"
+#
+# NOTE: none of the [talon.*] tables above are read until the FEATURE is told
+# which file holds them, via its own `config_path` setting. Until that is set,
+# every Talon operation fails on unresolved configuration and the tables above
+# are inert — including `[talon.preference]`. See #3008.
+#
+# The pointer lives beside the AGENT's database, in the kestrel.toml next to
+# `kestrel_prime.db`:
+#
+#     [features.talon.config]
+#     config_path = "/srv/kestrel/kestrel.toml"
+#
+# Whether that is a different file from this one depends on the deployment,
+# and this is the easy mistake to make:
+#
+#   * Multi-agent, or any host with a separate agent data directory: the two
+#     are DIFFERENT files, both called kestrel.toml. The block above goes in
+#     `agent_data/<name>/kestrel.toml`; `[talon.runtime]` stays here, in the
+#     file `config_path` points AT.
+#
+#   * Default single-agent: the database is placed in `$KESTREL_DB_PATH` or
+#     the current directory, so when that is the project root they are the
+#     SAME file — and the block above belongs here, alongside
+#     `[talon.runtime]`.
+#
+# Feature configuration is addressed by PACKAGE name — `talon`, the name
+# `kestrel feature enable` uses — not by the feature's class name, which is
+# what the HTTP route keys on. A `[features.TalonCoordinatorFeature.config]`
+# block is never read (the loader logs a warning if it finds one).
+#
+# A bare `config_path` under `[talon]` cannot work in either layout — the
+# feature would have to already know where this file is in order to read it.
+# The pointer is always `[features.talon.config]`, in whichever kestrel.toml
+# sits beside the agent's database.
+#
+# Equivalent to the agent-file block, for a running agent, without a restart:
+#   PATCH /api/features/TalonCoordinatorFeature/config
 
 # =============================================================================
 # Amendment VIII: Emancipation (optional, default: dormant)
@@ -711,6 +776,20 @@ role = "technical_reviewer"
 # enabled = true
 # agents = ["Emma"]
 # max_tokens = 500
+
+
+# ---------------------------------------------------------------------------
+# Semantic inference — bounded RDFS / approved OWL 2 RL maintenance (#2746)
+# ---------------------------------------------------------------------------
+# A managed agent's approved profile belongs in that agent's
+# [agents.<name>.semantic_inference] block in multi_agent.toml; see
+# multi_agent.toml.example. The nightly sleep cycle runs incremental
+# materialization only; a full rebuild is an operator repair action. Every pin
+# is exact so a package upgrade cannot widen a tenant's inference rules or
+# ontology interpretation.
+#
+# A standalone agent may place the same [semantic_inference] block in its own
+# agent-data-directory/kestrel.toml.
 
 
 # ---------------------------------------------------------------------------

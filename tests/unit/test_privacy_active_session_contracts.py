@@ -149,6 +149,27 @@ async def test_privacy_transition_waits_for_active_stream_before_switching_modes
     transition = await transition_task
 
     assert chunks == ["hello", " world"]
+    assert agent.context_manager.build_context.await_args.kwargs["include_briefing"] is True
+    assert agent._session_briefed is True
     assert transition.allows_cloud_llm is False
     assert agent._privacy_mode == PrivacyMode.ISOLATED
     agent.storage.set_privacy_mode.assert_called_once_with(PrivacyMode.ISOLATED)
+
+
+@pytest.mark.asyncio
+async def test_streaming_omits_briefing_after_session_was_briefed():
+    agent = _make_streaming_agent()
+    agent._session_briefed = True
+    agent.llm_service.release.set()
+
+    chunks = [
+        chunk
+        async for chunk in agent.process_input_streaming(
+            "second turn",
+            session_id="session-1",
+        )
+    ]
+
+    assert chunks == ["hello", " world"]
+    assert agent.context_manager.build_context.await_args.kwargs["include_briefing"] is False
+    assert agent._session_briefed is True

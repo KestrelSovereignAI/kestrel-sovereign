@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
 
 logger = logging.getLogger(__name__)
 
@@ -189,12 +190,12 @@ class UnifiedStoreBase:
             dt: Datetime value (or None)
 
         Returns:
-            datetime for PostgreSQL, ISO string for SQLite
+            a typed TIMESTAMPTZ bind for PostgreSQL, ISO string for SQLite
         """
         if dt is None:
             return None
         if self.is_postgres:
-            return dt
+            return TimestamptzParameter(dt)
         return dt.isoformat()
 
     def from_timestamp_field(self, value: Any) -> Optional[datetime]:

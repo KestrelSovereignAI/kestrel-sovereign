@@ -11,7 +11,6 @@ Adapter for Google Cloud Vertex AI using the google-genai SDK with support for:
 Uses the new google-genai SDK (not deprecated google-generativeai or google-cloud-aiplatform).
 Authentication via Application Default Credentials (ADC).
 """
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -374,7 +373,12 @@ class VertexAIAdapter(LLMAdapter):
                 config["response_schema"] = response_format.model_json_schema()
 
             # Prepare tool config
-            tools_config = None
+            # BUG #2811: tools_config is built here and never passed to
+            # generate_content below, so Vertex is never told any tools exist
+            # and tool calling silently no-ops on every path through this
+            # adapter. Left in place deliberately as the evidence of the gap —
+            # do not delete it as an unused local; fix the wiring instead.
+            tools_config = None  # noqa: F841 - see #2811
             if tools:
                 function_declarations = self._convert_tools_to_vertex_format(tools)
                 if function_declarations:
@@ -482,7 +486,9 @@ class VertexAIAdapter(LLMAdapter):
                 config["response_schema"] = response_format.model_json_schema()
 
             # Prepare tool config
-            tools_config = None
+            # BUG #2811: as in get_response, tools_config never reaches the
+            # streaming call below. Kept as evidence of the gap, not dead weight.
+            tools_config = None  # noqa: F841 - see #2811
             if tools:
                 function_declarations = self._convert_tools_to_vertex_format(tools)
                 if function_declarations:

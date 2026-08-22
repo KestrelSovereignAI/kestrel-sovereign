@@ -4,8 +4,6 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.llm.model_metadata import ModelInfo
-from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +348,6 @@ class ModelAgent(Feature):
                     )
 
             # Record agent consent before applying the change
-            consent_failed = False
             consent = self.agent.features.get("ConsentFeature") if hasattr(self.agent, 'features') else None
             if consent:
                 try:
@@ -361,7 +358,6 @@ class ModelAgent(Feature):
                         {"from": current_model, "to": model_name, "vendor": vendor, "route": route},
                     )
                 except Exception as e:
-                    consent_failed = True
                     logger.warning(f"consent recording failed (non-blocking): {e}")
 
             # Safe to switch

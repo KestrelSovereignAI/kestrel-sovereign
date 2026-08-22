@@ -6,16 +6,13 @@ constraints, budget, and purpose. The mandate is signed by the parent's private
 key and can be verified by anyone with the parent's public key.
 """
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from cryptography.hazmat.primitives.asymmetric import ec, utils
-from cryptography.hazmat.primitives import hashes
-from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from kestrel_sovereign.inception_service import (
     create_did_document,

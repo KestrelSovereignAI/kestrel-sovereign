@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -46,6 +46,7 @@ class PendingA2AQuestion:
     resolved_at: Optional[str]
     retry_state: Optional[str] = None
     retry_reply_text: Optional[str] = None
+    recipient_agent_id: Optional[str] = None
 
 
 class PendingA2AQuestionStore:
@@ -79,6 +80,7 @@ class PendingA2AQuestionStore:
         origin_turn_id: Optional[str],
         origin_session_id: Optional[str],
         deadline: datetime,
+        recipient_agent_id: Optional[str] = None,
     ) -> None:
         """Record a freshly-POSTed question. ``deadline`` is the wall-clock
         UTC moment past which the hourly expiry sweep will mark this row
@@ -98,17 +100,23 @@ class PendingA2AQuestionStore:
         # Postgres path after the task had already been POSTed.
         if deadline.tzinfo is not None:
             deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+        if recipient_agent_id is not None and (
+            not isinstance(recipient_agent_id, str)
+            or not recipient_agent_id.strip()
+        ):
+            raise ValueError("recipient_agent_id must be a non-empty string or None")
         await self._db.execute(
             """
             INSERT OR IGNORE INTO pending_a2a_questions
-                (agent_id, task_id, recipient, original_question,
+                (agent_id, task_id, recipient, recipient_agent_id, original_question,
                  origin_turn_id, origin_session_id, deadline, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WAITING')
             """,
             (
                 self._agent_id,
                 task_id,
                 recipient,
+                recipient_agent_id,
                 original_question,
                 origin_turn_id,
                 origin_session_id,
@@ -122,7 +130,7 @@ class PendingA2AQuestionStore:
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at,
-                   retry_state, retry_reply_text
+                   retry_state, retry_reply_text, recipient_agent_id
             FROM pending_a2a_questions
             WHERE agent_id = ? AND task_id = ?
             """,
@@ -143,6 +151,7 @@ class PendingA2AQuestionStore:
             resolved_at=str(r[8]) if r[8] else None,
             retry_state=str(r[9]) if r[9] else None,
             retry_reply_text=str(r[10]) if r[10] else None,
+            recipient_agent_id=str(r[11]) if len(r) > 11 and r[11] else None,
         )
 
     async def mark_resolved(self, task_id: str) -> bool:
@@ -197,7 +206,7 @@ class PendingA2AQuestionStore:
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at,
-                   retry_state, retry_reply_text
+                   retry_state, retry_reply_text, recipient_agent_id
             FROM pending_a2a_questions
             WHERE agent_id = ? AND status = 'WAITING' AND deadline < ?
             """,
@@ -259,7 +268,7 @@ class PendingA2AQuestionStore:
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at,
-                   retry_state, retry_reply_text
+                   retry_state, retry_reply_text, recipient_agent_id
             FROM pending_a2a_questions
             WHERE agent_id = ? AND status = ?
             """,
@@ -281,4 +290,5 @@ class PendingA2AQuestionStore:
             resolved_at=str(r[8]) if r[8] else None,
             retry_state=str(r[9]) if len(r) > 9 and r[9] else None,
             retry_reply_text=str(r[10]) if len(r) > 10 and r[10] else None,
+            recipient_agent_id=str(r[11]) if len(r) > 11 and r[11] else None,
         )

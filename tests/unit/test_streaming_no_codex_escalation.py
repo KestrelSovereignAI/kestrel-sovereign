@@ -13,6 +13,7 @@ the existing rotate-to-next-provider semantics.
 
 Mirrors openclaw commit ``3a64dc7623`` ("keep turn timeouts inside Codex").
 """
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional
 from unittest.mock import MagicMock
 
@@ -21,6 +22,7 @@ import pytest
 from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerConnectionClosed,
     CodexAppServerError,
+    CodexAppServerFrameTooLarge,
     CodexAppServerTransportError,
 )
 from kestrel_sovereign.llm.streaming import (
@@ -70,6 +72,11 @@ def test_is_harness_owned_false_for_non_transport_codex_error():
     assert not _is_harness_owned_transport_error(
         CodexAppServerError("thread/start returned no thread id: None")
     )
+    assert not _is_harness_owned_transport_error(
+        CodexAppServerFrameTooLarge(
+            "codex app-server JSON-RPC frame exceeded the 64 MiB bridge limit"
+        )
+    )
 
 
 def test_is_harness_owned_false_for_generic_exceptions():
@@ -111,6 +118,11 @@ class _RecordingHost(StreamingMixin):
 
     def _check_policy(self) -> None:
         return None
+
+    @asynccontextmanager
+    async def _remote_route_attempt(self, **_kwargs):
+        """This provider-fallback harness has no managed private route."""
+        yield None
 
     def _available_providers(self):
         # Mirror LLMService: drop session-disabled routes. Tests don't

@@ -38,15 +38,18 @@ from kestrel_sovereign.security.multikey import (
 # Library smoke check
 # ---------------------------------------------------------------------------
 
-def test_pqcrypto_sphincs_installed_and_importable():
-    """If pqcrypto's SPHINCS+ binding is missing the entire suite is
+def test_pqcrypto_slh_dsa_installed_and_importable():
+    """If pqcrypto's SLH-DSA binding is missing the entire suite is
     unusable. Smoke check so a missing-dep failure produces a clear test
     failure rather than a confusing AttributeError elsewhere."""
-    from pqcrypto.sign import sphincs_sha2_128s_simple as slh
+    from pqcrypto.sign import slh_dsa_sha2_128s as slh
     assert slh.PUBLIC_KEY_SIZE == 32
     assert slh.SECRET_KEY_SIZE == 64
     assert slh.SIGNATURE_SIZE == 7856
-    assert slh.ALGORITHM == "sphincs_sha2_128s_simple"
+    # pqcrypto 1.0 ships FIPS 205 SLH-DSA and drops SPHINCS+ entirely. This
+    # is a different algorithm, not a rename: signatures do not cross-verify,
+    # and the sizes are identical so nothing else here would notice (#2966).
+    assert slh.ALGORITHM == "SlhDsaSha2_128s"
 
 
 # ---------------------------------------------------------------------------

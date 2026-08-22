@@ -1305,6 +1305,43 @@ nav {
     gap: 0.75rem;
 }
 
+/* #2909 "Jump to latest" affordance. Shown only when the reader has
+   scrolled off the tail AND content has arrived since — a chat that
+   silently stops following is otherwise indistinguishable from a chat
+   where nothing happened.
+
+   `position: sticky` (not absolute) because #chat-container IS the
+   scroll box: sticky pins the pill to the bottom of the scrollport
+   without assuming anything about the container's ancestors, which
+   embedders supply themselves. The `[hidden]` rule is explicit — the
+   UA sheet's `display: none` would otherwise lose to `display: flex`. */
+.chat-jump-to-latest {
+    position: sticky;
+    bottom: 0.5rem;
+    align-self: center;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.875rem;
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    font-family: inherit;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.chat-jump-to-latest[hidden] {
+    display: none;
+}
+
+.chat-jump-to-latest:hover {
+    background: var(--bg-tertiary);
+}
+
 .message {
     max-width: 80%;
     padding: 0.75rem 1rem;
@@ -1430,6 +1467,11 @@ nav {
     border-radius: 999px;
     border: 1px solid currentColor;
     opacity: 0.9;
+}
+
+.restart-status-state-escalated {
+    color: rgb(239, 68, 68);
+    font-weight: 700;
 }
 
 .restart-status-body {

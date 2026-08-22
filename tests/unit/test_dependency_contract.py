@@ -10,9 +10,9 @@ the declared and resolved graphs, and patched dependency floors cannot be
 silently lowered while refreshing ``uv.lock``.
 """
 
+import tomllib
 from pathlib import Path
 
-import tomllib
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -47,10 +47,44 @@ SECURITY_FLOORS = {
     "web3": "7.15.0",
 }
 
+# Private inference leases require the owner-scoped idle-renewal and absolute
+# lifetime-bound contracts, #2755 adds typed private host ingress, and 0.36
+# adds the public operator contribution contracts. This remains a Core-only
+# release gate: sibling packages are released from their own repositories, but
+# Core must never
+# silently lower its declared/locked line to accommodate an older Frinz or
+# observability constraint. Their compatible releases remain a documented
+# release-cascade prerequisite in README.md.
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.36.0"), ("<", "0.37")})
+SDK_RELEASE_CASCADE_CONTRACTS = {
+    "base": frozenset({"tracing"}),
+    "observability": frozenset({"metrics", "tracing"}),
+}
+SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
+    # These are release prerequisites, not declarations about sibling repos'
+    # current branches. Each downstream must publish/test this line before a
+    # Core release can be cut.
+    "frinz": ">=0.36.0,<0.37",
+    "observability fleet": ">=0.36.0,<0.37",
+}
 
 def _pyproject() -> dict:
     with open(REPO_ROOT / "pyproject.toml", "rb") as f:
         return tomllib.load(f)
+
+
+def _lock() -> dict:
+    with open(REPO_ROOT / "uv.lock", "rb") as f:
+        return tomllib.load(f)
+
+
+def _locked_root_package(lock: dict) -> dict:
+    return next(
+        package
+        for package in lock["package"]
+        if package["name"] == "kestrel-sovereign"
+        and package.get("source") == {"editable": "."}
+    )
 
 
 def _declared_dependency_lines(pyproject: dict):
@@ -89,13 +123,11 @@ def test_banned_packages_not_declared():
 
 
 def test_banned_packages_not_locked():
-    with open(REPO_ROOT / "uv.lock", "rb") as f:
-        lock = tomllib.load(f)
+    lock = _lock()
     locked = {pkg["name"].lower() for pkg in lock.get("package", [])}
     offenders = sorted(locked & {b.lower() for b in BANNED_PACKAGES})
     assert not offenders, (
-        f"Banned package present in uv.lock: {offenders}. "
-        f"Reasons: {BANNED_PACKAGES}"
+        f"Banned package present in uv.lock: {offenders}. Reasons: {BANNED_PACKAGES}"
     )
 
 
@@ -125,8 +157,7 @@ def test_security_floors_are_declared():
 
 
 def test_security_floors_are_locked():
-    with open(REPO_ROOT / "uv.lock", "rb") as f:
-        lock = tomllib.load(f)
+    lock = _lock()
 
     locked = {}
     for package in lock.get("package", []):
@@ -141,3 +172,129 @@ def test_security_floors_are_locked():
         assert all(version >= floor for version in versions), (
             f"uv.lock contains {package} below {floor}: {versions}"
         )
+
+
+def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
+    """Windows IANA scheduling cannot depend on optional Pandas/Phoenix trees."""
+
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "tzdata"
+    ]
+    assert len(direct) == 1
+    marker = direct[0].marker
+    assert marker is not None
+    assert marker.evaluate({"sys_platform": "win32"})
+    assert not marker.evaluate({"sys_platform": "linux"})
+
+    root = _locked_root_package(_lock())
+    locked_direct = [
+        dependency
+        for dependency in root["dependencies"]
+        if dependency["name"] == "tzdata"
+    ]
+    assert locked_direct == [{"name": "tzdata", "marker": "sys_platform == 'win32'"}]
+
+    locked_metadata = [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "tzdata"
+    ]
+    assert locked_metadata == locked_direct
+    assert any(package["name"] == "tzdata" for package in _lock()["package"])
+
+
+def test_asyncpg_runtime_probe_supports_current_minor_releases():
+    """Doctor uses asyncpg's public connection path, not a pinned parser shape."""
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "asyncpg"
+    ]
+    assert len(direct) == 1
+    assert Version("0.30") in direct[0].specifier
+    assert Version("0.31") in direct[0].specifier
+
+    root = _locked_root_package(_lock())
+    locked_metadata = [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "asyncpg"
+    ]
+    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
+
+
+def _sdk_contract_requirement(raw_requirements, *, extras):
+    requirements = [
+        Requirement(raw)
+        for raw in raw_requirements
+        if canonicalize_name(Requirement(raw).name)
+        == canonicalize_name("kestrel-sovereign-sdk")
+    ]
+    assert len(requirements) == 1
+    requirement = requirements[0]
+    assert requirement.extras == extras
+    assert {
+        (specifier.operator, specifier.version) for specifier in requirement.specifier
+    } == SDK_RELEASE_CASCADE_SPECIFIERS
+    return requirement
+
+
+def test_sdk_036_release_cascade_contract_is_declared():
+    """Core and its observability extra must declare the v0.36 SDK line.
+
+    This deliberately does not inspect sibling worktrees: their compatible
+    Frinz/observability releases are an external release prerequisite, while
+    this repository can reliably guard only its own published constraints.
+    """
+
+    pyproject = _pyproject()
+    _sdk_contract_requirement(
+        pyproject["project"]["dependencies"],
+        extras=SDK_RELEASE_CASCADE_CONTRACTS["base"],
+    )
+    _sdk_contract_requirement(
+        pyproject["project"]["optional-dependencies"]["observability"],
+        extras=SDK_RELEASE_CASCADE_CONTRACTS["observability"],
+    )
+
+    # The human release contract identifies downstream gates without probing
+    # their (possibly dirty or unavailable) repositories from Core CI.
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").casefold()
+    for downstream, specifier in SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS.items():
+        assert downstream in readme
+        assert f"kestrel-sovereign-sdk{specifier}" in readme
+
+
+def test_sdk_036_release_cascade_contract_is_locked():
+    """The resolved lock must carry the same v0.36 line before Core ships."""
+
+    root = _locked_root_package(_lock())
+    locked_contracts = {
+        (
+            frozenset(requirement.get("extras", [])),
+            requirement.get("marker"),
+            requirement.get("specifier"),
+        )
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "kestrel-sovereign-sdk"
+    }
+    assert locked_contracts == {
+        (SDK_RELEASE_CASCADE_CONTRACTS["base"], None, ">=0.36.0,<0.37"),
+        (
+            SDK_RELEASE_CASCADE_CONTRACTS["observability"],
+            "extra == 'observability'",
+            ">=0.36.0,<0.37",
+        ),
+    }
+
+    sdk_versions = [
+        Version(package["version"])
+        for package in _lock()["package"]
+        if package["name"] == "kestrel-sovereign-sdk"
+    ]
+    assert sdk_versions
+    assert all(
+        Version("0.36.0") <= version < Version("0.37.0") for version in sdk_versions
+    )

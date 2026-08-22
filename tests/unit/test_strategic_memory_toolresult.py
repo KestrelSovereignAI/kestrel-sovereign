@@ -21,13 +21,16 @@ import pytest
 
 from pathlib import Path
 
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.strategic_memory import StrategicMemoryFeature
 from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
 
 
-def _make_feature(data: dict | None = None) -> StrategicMemoryFeature:
-    feat = StrategicMemoryFeature(agent=MagicMock())
+def _make_feature(
+    data: dict | None = None, *, agent=None
+) -> StrategicMemoryFeature:
+    feat = StrategicMemoryFeature(agent=agent if agent is not None else MagicMock())
     feat._data = data if data is not None else {}
     # A strategy path IS configured; ``_save`` is stubbed to report a
     # successful persist so happy-path mutating tools return OK. Tests
@@ -172,85 +175,181 @@ async def test_session_log_success():
     assert result.data["session_id"] == "020"
 
 
-# ---------------------------------------------------------------------------
-# signal_dispatch fallback failure detection
-# ---------------------------------------------------------------------------
+
+
+def test_strategic_memory_exposes_provider_neutral_dispatch():
+    feature = _make_feature({})
+    tool_names = {tool.name for tool in feature.get_tools()}
+    assert "signal_dispatch" in tool_names
+
+
+_TOP_ISSUE = {
+    "repo": "owner/repo",
+    "issue_number": 42,
+    "issue_title": "Repair the boundary",
+    "priority": "high",
+    "context": "Milestone: extraction",
+}
+
+
+def _dispatch_agent(*, registration=None, runner_result=None):
+    operator_registry = SimpleNamespace(
+        get_workflow_registration=lambda name: registration
+    )
+    execute_named_tool = AsyncMock(
+        return_value=(
+            runner_result
+            if runner_result is not None
+            else ToolResult.ok(
+                "started",
+                data={"run_id": "run-42", "status": "pending"},
+            )
+        )
+    )
+    return SimpleNamespace(
+        operator_registry=operator_registry,
+        execute_named_tool=execute_named_tool,
+        get_turn_bound_session_id=lambda: "chat-7",
+    )
+
 
 @pytest.mark.asyncio
-async def test_signal_dispatch_fallback_failure_returns_partial():
-    """When no TalonCoordinatorFeature is wired and dispatch_to_talon
-    returns a "Failed to dispatch ..." or "Found issue to dispatch ...
-    but no multi_agent host URL" body, the wrapper must surface PARTIAL
-    so the LLM cannot narrate "dispatched" off a failure body."""
-    for failure_msg in (
-        "Failed to dispatch foo/bar#1 to talon: connection refused",
-        "Found issue to dispatch (foo/bar#1: bug) but no multi_agent host URL configured.",
-    ):
-        feat = _make_feature({})
-        with patch(
-            "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
-            new=AsyncMock(return_value=failure_msg),
-        ):
-            result = await feat.signal_dispatch(mode="execute")
-        assert result.status is ToolResultStatus.PARTIAL, failure_msg
-        assert "fallback dispatch" in result.error
-
-
-@pytest.mark.asyncio
-async def test_signal_dispatch_fallback_success_returns_ok():
-    feat = _make_feature({})
+async def test_signal_dispatch_suggest_never_requires_or_runs_capability():
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
     with patch(
-        "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
-        new=AsyncMock(return_value="Dispatched to talon: foo/bar#1 ..."),
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
     ):
-        result = await feat.signal_dispatch(mode="execute")
-    assert result.status is ToolResultStatus.OK
-    assert result.data["fallback"] is True
+        result = await feat.signal_dispatch(mode="preview")
 
-
-@pytest.mark.asyncio
-async def test_signal_dispatch_invalid_mode_rejected_not_dispatched():
-    """A typo'd/unknown mode must error, NOT fall through to live dispatch
-    (#1925). dispatch_to_talon is patched to blow up if it's ever reached."""
-    feat = _make_feature({})
-    boom = AsyncMock(side_effect=AssertionError("must not dispatch on bad mode"))
-    with patch(
-        "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
-        new=boom,
-    ):
-        # Genuine typos / ambiguous words must error (and list valid values).
-        # "run"/"apply"/"go" are deliberately NOT aliased to execute — a live
-        # dispatch requires the literal canonical value (#1923 asymmetry).
-        for bad in ("suggst", "run", "apply", "go", ""):
-            result = await feat.signal_dispatch(mode=bad)
-            assert result.status is ToolResultStatus.ERROR, bad
-            assert "Must be one of: execute, suggest" in result.error
-    boom.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_signal_dispatch_dryrun_synonyms_map_to_suggest_no_dispatch():
-    """Safe preview synonyms (dry-run, plan, preview) normalize to 'suggest'
-    and never reach live dispatch (#1923)."""
-    boom = AsyncMock(side_effect=AssertionError("suggest must not dispatch"))
-    for syn in ("dry-run", "dry_run", "plan", "preview", "PLAN"):
-        feat = _make_feature({})
-        with patch(
-            "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
-            new=boom,
-        ):
-            result = await feat.signal_dispatch(mode=syn)
-        assert result.status is ToolResultStatus.OK, syn
-        assert result.data["mode"] == "suggest", syn
-    boom.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_signal_dispatch_suggest_is_case_insensitive():
-    feat = _make_feature({})
-    result = await feat.signal_dispatch(mode="SUGGEST")
     assert result.status is ToolResultStatus.OK
     assert result.data["mode"] == "suggest"
+    assert result.data["dispatched"] is False
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_fails_closed_when_capability_is_absent():
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "DISPATCH_CAPABILITY_UNAVAILABLE"
+    assert result.data["dispatched"] is False
+    assert "Install and enable a feature" in result.error
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_routes_contributed_workflow_through_governed_runner():
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(registration=registration)
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["workflow_run_id"] == "run-42"
+    assert result.data["capability_owner"] == "feature:fixture-dispatch"
+    assert result.data["dispatched"] is True
+    agent.execute_named_tool.assert_awaited_once_with(
+        "workflow_run",
+        {
+            "name": "fleet_coding_pipeline",
+            "params": {
+                "repo": "owner/repo",
+                "issue": 42,
+                "issue_title": "Repair the boundary",
+                "priority": "high",
+                "context": "Milestone: extraction",
+            },
+        },
+        session_id="chat-7",
+        source="strategic_memory.signal_dispatch",
+    )
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_surfaces_runner_rejection_as_error():
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(
+        registration=registration,
+        runner_result=ToolResult.failed("definition is not loaded"),
+    )
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "WORKFLOW_RUN_REJECTED"
+    assert result.data["dispatched"] is False
+    assert "definition is not loaded" in result.error
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_identifies_missing_governed_runner_by_public_error():
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(registration=registration)
+    agent.execute_named_tool.side_effect = ToolNotRegisteredError(
+        "workflow_run is not registered with any enabled feature"
+    )
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "WORKFLOW_RUNNER_UNAVAILABLE"
+    assert result.data["dispatched"] is False
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_does_not_misclassify_provider_value_error():
+    """A registered runner's own validation failure is not tool absence."""
+
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(registration=registration)
+    agent.execute_named_tool.side_effect = ValueError("invalid workflow params")
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "WORKFLOW_RUNNER_FAILED"
+    assert result.data["dispatched"] is False
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_invalid_mode_never_selects_or_dispatches():
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(),
+    ) as select:
+        result = await feat.signal_dispatch(mode="run")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["dispatched"] is False
+    select.assert_not_awaited()
+    agent.execute_named_tool.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -7,11 +7,10 @@ Provides in-memory caching and disk-based cache for fast startup.
 """
 import asyncio
 import logging
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, Tuple, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .model_metadata import ModelInfo, ModelCategory
-from .model_catalog import get_catalog_service, ModelCatalogService
+from .model_catalog import get_catalog_service
 from .model_cache import get_shared_model_cache
 
 if TYPE_CHECKING:
@@ -1448,8 +1447,9 @@ class ModelDiscoveryMixin:
         """Pick one route per vendor to drive discovery.
 
         Discovery is per-vendor; routes share the catalog. We prefer routes
-        whose adapter actually implements ``list_models`` (subscription
-        adapters like ClaudeMaxAdapter/CodexAdapter raise NotImplementedError).
+        whose adapter actually implements ``list_models``. Codex subscription
+        routes cannot discover models, while Claude plan routes can use their
+        OAuth-authenticated Anthropic client.
         """
         if not hasattr(self, 'providers') or not isinstance(self.providers, list):
             return []
@@ -1464,7 +1464,8 @@ class ModelDiscoveryMixin:
 
         chosen: list[tuple[str, dict]] = []
         for vendor, routes in routes_by_vendor.items():
-            # Prefer a route whose adapter is not a subscription wrapper.
+            # Prefer canonical API routes when present. OAuth-only Claude plan
+            # installs still fall back to their plan route and discover there.
             non_sub = [r for r in routes if not isinstance(r.get("adapter"), (ClaudeMaxAdapter, CodexAdapter))]
             chosen.append((vendor, (non_sub or routes)[0]))
         return chosen

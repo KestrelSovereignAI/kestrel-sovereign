@@ -38,7 +38,10 @@ from cryptography.hazmat.primitives.serialization import (
 from cryptography.hazmat.backends import default_backend
 
 from kestrel_sovereign.security.exceptions import (
-    KeyStorageError,
+    # Redundant alias: this module republishes KeyStorageError (security/__init__
+    # and callers import it from here), so the binding must survive an
+    # unused-import sweep even though nothing in this file references it.
+    KeyStorageError as KeyStorageError,
     MasterKeyNotConfiguredError,
     DecryptionError as KeyDecryptionError,  # Alias for backward compat
 )

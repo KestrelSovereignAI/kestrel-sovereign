@@ -51,8 +51,21 @@ async def async_client(monkeypatch):
             genesis_audit_provenance="test:backup_e2e_fixture",
         )
 
-        # Use LifespanManager to properly handle app startup/shutdown
-        async with LifespanManager(app) as manager:
+        # Use LifespanManager to properly handle app startup/shutdown.
+        #
+        # The timeouts are explicit because asgi_lifespan defaults to 5s, and
+        # that is a wall-clock deadline on a FULL agent boot (storage, every
+        # feature, the scheduler, the signal dispatcher). Boot costs ~1.5s on
+        # an idle CI runner, so the default holds right up until the runner is
+        # loaded — a run where unrelated tests took 3-5x their usual time blew
+        # the deadline here and reported a `TimeoutError` at fixture setup,
+        # which reads like an agent-boot regression rather than a slow runner.
+        # The suite-level `--timeout=120` (see the CI integration step) remains
+        # the authority on a genuine hang; these bounds only stop a slow boot
+        # from being misreported as a broken one.
+        async with LifespanManager(
+            app, startup_timeout=60, shutdown_timeout=60
+        ) as manager:
             # Skip bootstrap for test agents
             from tests.integration.conftest import complete_bootstrap
             await complete_bootstrap(app.state.agent)

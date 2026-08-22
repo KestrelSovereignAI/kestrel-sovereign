@@ -12,7 +12,6 @@ constitutional hierarchy (Books I-IV), see kestrel_sovereign.constitution.hierar
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,13 @@ RESTRICTION_CONSTRAINTS = frozenset({
 # the prompt, so an unknown/free-text key can't reach the model as governing
 # text (see render_mandate_constitution_block).
 KNOWN_RESTRICTION_KEYS = frozenset(
-    {"behavioral_rules", "restricted_tools", "restricted_tool_args", "max_tokens"}
+    {
+        "allowed_tools",
+        "behavioral_rules",
+        "restricted_tools",
+        "restricted_tool_args",
+        "max_tokens",
+    }
 ) | RESTRICTION_CONSTRAINTS
 
 # The spawn tool turns a bare flag ("no_web") into ``{key: "true"}`` and accepts
@@ -133,13 +138,19 @@ def _sanitize_render_constraints(raw: dict) -> dict:
         if key == "behavioral_rules":
             if isinstance(value, (list, dict)) and value:
                 clean[key] = value
-        elif key == "restricted_tools":
+        elif key in {"allowed_tools", "restricted_tools"}:
+            if key == "allowed_tools" and not isinstance(
+                value, (list, tuple, set)
+            ):
+                continue
             items = value if isinstance(value, (list, tuple, set)) else [value]
             tools = [
                 str(t).strip() for t in items
                 if _SAFE_TOKEN_RE.match(str(t).strip())
             ]
-            if tools:
+            # An explicit empty allowed-tools list is meaningful: deny every
+            # tool. Keep it through rendering instead of treating it as absent.
+            if tools or key == "allowed_tools":
                 clean[key] = tools
         elif key == "restricted_tool_args":
             tool_args = _sanitize_tool_args(value)
@@ -236,6 +247,13 @@ class ScopedConstitution:
                 if not isinstance(value, list):
                     errors.append(
                         f"Constraint 'restricted_tools' must be a list, "
+                        f"got {type(value).__name__}"
+                    )
+            elif key == "allowed_tools":
+                # A positive ceiling can only narrow the tool surface.
+                if not isinstance(value, list):
+                    errors.append(
+                        f"Constraint 'allowed_tools' must be a list, "
                         f"got {type(value).__name__}"
                     )
             elif key == "restricted_tool_args":
@@ -340,6 +358,10 @@ class ScopedConstitution:
                     f"\nRestricted tools (not available): "
                     f"{', '.join(sorted(str(t) for t in tools))}"
                 )
+            elif key == "allowed_tools":
+                tools = value if isinstance(value, (list, tuple, set)) else []
+                rendered = ", ".join(sorted(str(t) for t in tools)) or "(none)"
+                parts.append(f"\nAllowed tools (hard ceiling): {rendered}")
             elif key == "restricted_tool_args":
                 if isinstance(value, dict):
                     for tool_name, arg_spec in sorted(

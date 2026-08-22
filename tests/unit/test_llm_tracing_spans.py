@@ -11,10 +11,11 @@ so the acceptance gate ``pytest -k "llm and (span or tracing or otel)"`` selects
 them. Spans are captured with an in-memory OTel exporter (no live LLM, no
 network); the provider call is stubbed.
 """
+import asyncio
 import json
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -26,6 +27,7 @@ from kestrel_sdk.tracing import KestrelTracer
 
 from kestrel_sovereign import telemetry
 from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import LLMService
 
 
@@ -34,6 +36,7 @@ OI_KIND = "openinference.span.kind"
 OI_INPUT = "input.value"
 OI_OUTPUT = "output.value"
 OI_MODEL = "llm.model_name"
+OI_SESSION = "session.id"
 KESTREL_AGENT_NAME = "kestrel.agent_name"
 
 
@@ -171,6 +174,137 @@ class TestLlmTracingDisabledNoOp:
 
 class TestLlmServiceChokepointSpan:
     """The single LLM span is emitted at the service entry-method chokepoint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "entry_point",
+        (
+            "get_response",
+            "get_response_with_model",
+            "generate",
+            "generate_with_messages",
+        ),
+    )
+    async def test_public_completion_path_stamps_resolved_session_otel(
+        self, otel_llm_exporter, entry_point
+    ):
+        """Every public completion path stamps its frozen virtual session."""
+        service = LLMService()
+        session_id = f"virtual-{entry_point}"
+        invocation_context = LLMInvocationContext(session_id=session_id)
+        service.get_last_response_identity = lambda: {"model": "test:api/model"}
+        try:
+            if entry_point == "get_response":
+                service._get_response_frozen = AsyncMock(return_value="ok")
+                await service.get_response(
+                    system_prompt="s",
+                    user_prompt="u",
+                    invocation_context=invocation_context,
+                )
+            elif entry_point == "get_response_with_model":
+                adapter = Mock()
+                adapter.create_messages.return_value = []
+                adapter.get_response.return_value = None
+                service.providers = [
+                    {
+                        "name": "test:api",
+                        "vendor": "test",
+                        "model": "model",
+                        "adapter": adapter,
+                        "client": None,
+                    }
+                ]
+                service._run_provider_attempt = AsyncMock(return_value="ok")
+                await service.get_response_with_model(
+                    "model",
+                    system_prompt="s",
+                    user_prompt="u",
+                    invocation_context=invocation_context,
+                )
+            elif entry_point == "generate":
+                service._get_response_frozen = AsyncMock(return_value="ok")
+                await service.generate(
+                    system_prompt="s",
+                    user_prompt="u",
+                    invocation_context=invocation_context,
+                )
+            else:
+                service._generate_with_messages_inner = AsyncMock(return_value="ok")
+                await service.generate_with_messages(
+                    messages=[{"role": "user", "content": "u"}],
+                    invocation_context=invocation_context,
+                )
+        finally:
+            await service.close()
+
+        span = _only_span(otel_llm_exporter)
+        assert span.name == f"llm.{entry_point}"
+        assert span.attributes[OI_SESSION] == session_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_id", (None, "", " \t"))
+    async def test_blank_or_absent_session_is_omitted_otel(
+        self, otel_llm_exporter, session_id
+    ):
+        """Background and blank-session calls do not invent a Phoenix session."""
+        service = LLMService()
+        try:
+            service._get_response_frozen = AsyncMock(return_value="ok")
+            await service.get_response(
+                system_prompt="s",
+                user_prompt="u",
+                invocation_context=LLMInvocationContext(session_id=session_id),
+            )
+        finally:
+            await service.close()
+
+        assert OI_SESSION not in _only_span(otel_llm_exporter).attributes
+
+    @pytest.mark.asyncio
+    async def test_concurrent_frozen_contexts_do_not_bleed_sessions_otel(
+        self, otel_llm_exporter
+    ):
+        """Concurrent calls on one service retain their own immutable session."""
+        service = LLMService()
+        first_started = asyncio.Event()
+        second_finished = asyncio.Event()
+
+        async def _interleaved_response(**kwargs):
+            session_id = kwargs["invocation_context"].session_id
+            if session_id == "virtual-a":
+                first_started.set()
+                await second_finished.wait()
+            else:
+                await first_started.wait()
+                second_finished.set()
+            return LLMResponse(content=session_id)
+
+        service._get_response_frozen = AsyncMock(side_effect=_interleaved_response)
+        service.get_last_response_identity = lambda: {"model": "test:api/model"}
+        try:
+            await asyncio.gather(
+                service.get_response(
+                    system_prompt="s",
+                    user_prompt="a",
+                    invocation_context=LLMInvocationContext(session_id="virtual-a"),
+                ),
+                service.get_response(
+                    system_prompt="s",
+                    user_prompt="b",
+                    invocation_context=LLMInvocationContext(session_id="virtual-b"),
+                ),
+            )
+        finally:
+            await service.close()
+
+        spans = otel_llm_exporter.get_finished_spans()
+        assert len(spans) == 2
+        assert {
+            span.attributes[OI_OUTPUT]: span.attributes[OI_SESSION] for span in spans
+        } == {
+            "virtual-a": "virtual-a",
+            "virtual-b": "virtual-b",
+        }
 
     @pytest.mark.asyncio
     async def test_get_response_emits_single_llm_span_otel(self, otel_llm_exporter):

@@ -100,22 +100,27 @@ async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[
 
 
 def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:
-    """Register the runtime restricted_tools deny hook for a mandate.
+    """Register the runtime tool-constraint hook for a mandate.
 
     Returns the number of distinct restricted tools enforced (0 = no-op, e.g. a
-    mandate with no ``restricted_tools`` or a missing hooks manager).
+    mandate with no tool constraints or a missing hooks manager).
     """
     constraints = getattr(mandate, "additional_constraints", None) or {}
     restricted = constraints.get("restricted_tools") or []
     restricted_args = constraints.get("restricted_tool_args") or {}
-    if (not restricted and not restricted_args) or hooks_manager is None:
+    allowed = constraints.get("allowed_tools") if "allowed_tools" in constraints else None
+    if (not restricted and not restricted_args and allowed is None) or hooks_manager is None:
         return 0
     hooks_manager.register(
-        MandateRestrictionHook(restricted, restricted_tool_args=restricted_args)
+        MandateRestrictionHook(
+            restricted,
+            allowed_tools=allowed,
+            restricted_tool_args=restricted_args,
+        )
     )
-    count = len(set(restricted)) + len(restricted_args)
+    count = len(set(restricted)) + len(restricted_args) + int(allowed is not None)
     logger.info(
-        "Registered MandateRestrictionHook for %d restricted tool(s)/arg-scope(s) (#2137, #2321).",
+        "Registered MandateRestrictionHook for %d tool constraint(s) (#2137, #2321).",
         count,
     )
     return count

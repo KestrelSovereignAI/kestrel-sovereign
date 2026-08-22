@@ -24,9 +24,20 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
+
 from kestrel_sovereign.hooks.manager import HooksManager
 
 logger = logging.getLogger(__name__)
+
+
+def _is_expected_termination_outcome(error: BaseException) -> bool:
+    """Accept lifecycle failures/cancellation, never process-control signals."""
+
+    if isinstance(error, (Exception, asyncio.CancelledError)):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return all(_is_expected_termination_outcome(item) for item in error.exceptions)
+    return False
 
 
 class SpawnStatus(str, Enum):
@@ -317,9 +328,22 @@ class SpawnedAgentLifecycle:
         Cascading: terminates all tracked children.
         """
         children = list(self._tracked.keys())
+        terminal_outcomes: list[BaseException] = []
         for child_name in children:
-            await self.terminate(child_name, reason="parent shutdown")
+            try:
+                await self.terminate(child_name, reason="parent shutdown")
+            except BaseException as exc:
+                if not _is_expected_termination_outcome(exc):
+                    raise
+                terminal_outcomes.append(exc)
         self._tracked.clear()
+        if len(terminal_outcomes) == 1:
+            raise terminal_outcomes[0]
+        if terminal_outcomes:
+            raise BaseExceptionGroup(
+                "One or more spawned children retained terminal cleanup",
+                terminal_outcomes,
+            )
 
     async def _ttl_monitor(self, child_name: str, ttl_seconds: int) -> None:
         """Background task that auto-terminates a child when TTL expires."""
@@ -347,9 +371,21 @@ class SpawnedAgentLifecycle:
             tracked.result = result
             self._results[child_name] = result
 
-            await self._terminate_and_cleanup(
-                child_name, SpawnStatus.TIMED_OUT, reason="TTL expired"
-            )
+            try:
+                await self._terminate_and_cleanup(
+                    child_name, SpawnStatus.TIMED_OUT, reason="TTL expired"
+                )
+            except BaseException as exc:
+                if not _is_expected_termination_outcome(exc):
+                    raise
+                # The local lifecycle record and ephemeral resources have
+                # already been reconciled. Keep the background TTL monitor
+                # terminal while preserving the manager outcome in logs.
+                logger.error(
+                    "TTL termination retained cleanup for child '%s': %s",
+                    child_name,
+                    exc,
+                )
 
     async def _terminate_and_cleanup(
         self,
@@ -369,14 +405,17 @@ class SpawnedAgentLifecycle:
             return
 
         # Terminate via AgentManager (handles cascading grandchildren)
+        termination_failure: BaseException | None = None
         try:
-            await self._agent_manager.terminate_child(
-                tracked.parent_did, child_name
-            )
-        except Exception as e:
+            await self._agent_manager.terminate_child(tracked.parent_did, child_name)
+        except BaseException as exc:
+            if not _is_expected_termination_outcome(exc):
+                raise
+            termination_failure = exc
             logger.error(
                 "Failed to terminate child '%s' via AgentManager: %s",
-                child_name, e,
+                child_name,
+                exc,
             )
 
         # Clean up ephemeral temp directory
@@ -385,12 +424,14 @@ class SpawnedAgentLifecycle:
                 shutil.rmtree(tracked.temp_dir, ignore_errors=True)
                 logger.info(
                     "Cleaned up ephemeral dir for '%s': %s",
-                    child_name, tracked.temp_dir,
+                    child_name,
+                    tracked.temp_dir,
                 )
             except Exception as e:
                 logger.error(
                     "Failed to clean up temp dir for '%s': %s",
-                    child_name, e,
+                    child_name,
+                    e,
                 )
 
         # Fire AGENT_TERMINATE hook
@@ -408,8 +449,12 @@ class SpawnedAgentLifecycle:
 
         logger.info(
             "Child '%s' lifecycle ended: status=%s, reason=%s",
-            child_name, status.value, termination_reason,
+            child_name,
+            status.value,
+            termination_reason,
         )
+        if termination_failure is not None:
+            raise termination_failure
 
     async def _fire_hook(
         self,

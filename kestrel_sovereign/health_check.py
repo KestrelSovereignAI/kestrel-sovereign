@@ -1,6 +1,5 @@
 import os
 import requests
-import sqlite3
 import sys
 
 from kestrel_sovereign.config import load_section

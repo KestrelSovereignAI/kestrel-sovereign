@@ -9,10 +9,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -60,7 +60,7 @@ graph TD
     B -->|storage=none| D[No Storage]
     B -->|storage=temp| E[Temporary Session]
     B -->|storage=pii_redacted| F[PII-Redacted Storage]
-    B -->|storage=deidentified| J[Deidentified Research Storage]
+    B -->|storage=deidentified| J[Evidence-backed De-identification Gate]
     
     B --> G{processing}
     G -->|local| H[Ollama Only]
@@ -142,6 +142,12 @@ the post-response memory pipeline on both response paths, so temporal
 patterns, concept-graph nodes, emotional memory metadata, and embeddings are
 never derived from the session's raw input until the user explicitly saves it.
 
+When a release changes a semantic projection, governed corpus, or optional
+learning adapter, the privacy evidence is an erasure drill from source through
+served eligibility—not a raw diagnostic dump. The required correlated,
+content-free release record and operator workflow are in
+[Semantic Knowledge Release Evidence](../testing/SEMANTIC_RELEASE_EVIDENCE.md).
+
 **Session Control Commands**:
 - `!save-session` - Make session permanent
 - `!discard-session` - Delete session without saving
@@ -198,7 +204,8 @@ Safe Harbor or Expert Determination assurance.
 
 **Use Case**: Clinical/research data that may be saved or exported only after
 de-identification.
-**Storage**: Deidentified persistent storage with evidence artifact required
+**Storage**: Fail-closed until an evidence-backed de-identification pipeline is
+available
 **Processing**: Trusted route only; generic cloud routing is not sufficient
 **Memory Anchoring**: Available for deidentified artifacts
 **Learning**: Research use without direct identifiers
@@ -209,12 +216,18 @@ knowledge that remaining information can identify the individual. Expert
 Determination is a separate path requiring a qualified expert's documented
 determination; Kestrel must not claim it without that evidence artifact.
 
+The current runtime therefore refuses persistent writes and cloud backups in
+this mode. It does not silently store raw or merely PII-redacted content while
+claiming Safe Harbor. The preset and routing restrictions exist today; durable
+deidentified storage remains gated on the missing transformation and evidence
+pipeline.
+
 ## 4. Custom Configurations
 
 Beyond presets, you can set flags directly for custom configurations:
 
 ```python
-from privacy import PrivacyConfig
+from kestrel_sovereign.privacy import PrivacyConfig
 
 # Want permanent storage but local-only processing?
 # (Not a preset, but perfectly valid)
@@ -247,7 +260,7 @@ agent.set_privacy(PrivacyConfig(
 ### Programmatic API
 
 ```python
-from privacy import PrivacyMode, PrivacyConfig, get_privacy_preset
+from kestrel_sovereign.privacy import PrivacyMode, PrivacyConfig, get_privacy_preset
 
 # Using presets (backward compatible)
 agent.privacy_agent.set_mode(PrivacyMode.EPHEMERAL)

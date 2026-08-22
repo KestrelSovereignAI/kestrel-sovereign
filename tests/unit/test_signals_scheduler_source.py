@@ -12,10 +12,13 @@ is what actually invokes the registered handlers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from kestrel_sdk.signals import (
     ResourceLock,
     Signal,
@@ -24,18 +27,23 @@ from kestrel_sdk.signals import (
     Trust,
     Visibility,
 )
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
     SourceRegistry,
 )
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.signals.sources.scheduler import (
     CRON_TASKS,
     build_cron_registrations,
     cron_source_name,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
@@ -44,11 +52,12 @@ from kestrel_sovereign.storage.db import SQLiteBackend
 # ---------------------------------------------------------------------------
 
 
-class _FakeAgent:
+class _FakeAgent(SleepMixin):
     did = "did:test:scheduler-phase4"
 
     def __init__(self):
         self.background_tasks = []
+        self.sleep_hooks = []
 
     async def process_input(self, prompt):  # unused for scheduler tests
         return ""
@@ -84,16 +93,18 @@ async def dispatcher_components(tmp_path):
 
 
 def test_all_cron_tasks_are_classified():
-    """Spec from #893 + #1510 + #1512: the canonical built-in cron task set.
+    """Canonical cron-capable task set, including user-scheduled tools.
+
     If a new one is added or one removed, this test fails loudly so
-    the classification table stays in sync with the scheduler's
-    defaults."""
+    the classification table stays in sync with the scheduler's supported
+    dispatch surface. Not every source here is auto-seeded.
+    """
     names = [t[0] for t in CRON_TASKS]
     assert sorted(names) == sorted([
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "morning_signal",
-        "signal_dispatch",
+        "signal_dispatch",  # user-schedulable; not a core auto-seed
         "trash_retention",
         "training_cycle",
         "reflect",
@@ -116,7 +127,7 @@ def test_action_vs_artifact_split_matches_design():
     assert by_mode[SignalMode.ACTION] == {
         "backup_snapshot",
         "bootstrap_timeout_check",  # #378 — bootstrap watchdog
-        "signal_dispatch",
+        "signal_dispatch",  # provider-neutral user-scheduled dispatch
         "trash_retention",
         "training_cycle",
         "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the
@@ -229,10 +240,16 @@ def test_builtin_handlers_override_tool_lookup():
 
 
 @pytest.mark.asyncio
-async def test_action_task_dispatches_through_handler(dispatcher_components):
-    """ACTION cron source → dispatcher invokes handler with payload →
-    result.action_result carries the return value."""
-    agent, registry, dispatcher, _ = dispatcher_components
+async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
+    dispatcher_components,
+):
+    """A custom dispatch schedule retains cron signal logging/dispatch.
+
+    Core no longer auto-seeds this task, but a user-created row still emits
+    ``cron.signal_dispatch`` and reaches the provider-neutral feature tool via
+    the ordinary ACTION handler.
+    """
+    agent, registry, dispatcher, backend = dispatcher_components
     captured = []
 
     async def fake_lookup(name, args):
@@ -253,6 +270,15 @@ async def test_action_task_dispatches_through_handler(dispatcher_components):
     assert result.status == Status.OK
     assert result.action_result == "ran:signal_dispatch"
     assert captured == [("signal_dispatch", {"mode": "execute"})]
+
+    pending = [task for task in agent.background_tasks if not task.done()]
+    if pending:
+        await asyncio.gather(*pending)
+    rows = await backend.fetch_all(
+        "SELECT source, status FROM signal_log WHERE source=?",
+        (cron_source_name("signal_dispatch"),),
+    )
+    assert rows == [("cron.signal_dispatch", Status.OK.value)]
 
 
 @pytest.mark.asyncio
@@ -283,11 +309,37 @@ async def test_artifact_task_dispatches_through_artifact_handler(
 
 
 @pytest.mark.asyncio
-async def test_handler_exception_becomes_failed_status(dispatcher_components):
-    """If a tool raises, the dispatcher captures it as Status.FAILED
-    with the error message — the runner translates this to
-    status='failed' in task_execution_log (verified separately by the
-    SchedulerFeature._translate_signal_result test)."""
+async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
+    dispatcher_components,
+):
+    """Only documented built-in JSON results carry scheduler semantics."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    artifact = json.dumps({"error": "quoted error text from a report"})
+
+    async def fake_lookup(name, args):
+        return artifact
+
+    for reg in build_cron_registrations(tool_lookup=fake_lookup):
+        registry.register(reg)
+
+    signal = Signal(
+        source=cron_source_name("morning_signal"),
+        kind="run",
+        mode=SignalMode.ARTIFACT,
+        payload={},
+        target_agent=agent.did,
+    )
+    result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.OK
+    assert result.artifact == artifact
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_becomes_failed_status(
+    dispatcher_components, caplog,
+):
+    """Raised tool details stay in trusted logs, not durable audit errors."""
     agent, registry, dispatcher, _ = dispatcher_components
 
     async def lookup_raises(name, args):
@@ -303,9 +355,71 @@ async def test_handler_exception_becomes_failed_status(dispatcher_components):
         payload={"iterations": 3},
         target_agent=agent.did,
     )
-    result = await dispatcher.dispatch_signal(signal)
+    with caplog.at_level(logging.ERROR):
+        result = await dispatcher.dispatch_signal(signal)
     assert result.status == Status.FAILED
-    assert "tool blew up" in (result.error or "")
+    assert "scheduled tool training_cycle raised" in (result.error or "")
+    assert "tool blew up" not in (result.error or "")
+    trusted_record = next(
+        record
+        for record in caplog.records
+        if record.message == "Scheduled tool training_cycle raised"
+    )
+    assert trusted_record.exc_info is not None
+    assert "tool blew up" in str(trusted_record.exc_info[1])
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_becomes_failed_status(
+    dispatcher_components, caplog,
+):
+    """The production lookup rejects failure before its JSON boundary."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    private_marker = "private-consolidation-detail-2907"
+    failed_tool = MagicMock()
+    failed_tool.name = "memory_consolidate"
+    failed_tool.execute = AsyncMock(
+        return_value=ToolResult.failed(private_marker).to_dict()
+    )
+    memory_feature = MagicMock()
+    memory_feature.enabled = True
+    memory_feature.get_tools.return_value = [failed_tool]
+    agent.features = {"MemoryFeature": memory_feature}
+    scheduler_feature = SchedulerFeature(agent)
+
+    for reg in build_cron_registrations(
+        tool_lookup=scheduler_feature._lookup_raw_tool_result
+    ):
+        registry.register(reg)
+
+    signal = Signal(
+        source=cron_source_name("memory_consolidate"),
+        kind="run",
+        mode=SignalMode.ARTIFACT,
+        payload={},
+        target_agent=agent.did,
+    )
+    with caplog.at_level(
+        logging.ERROR,
+        logger="kestrel_sovereign.signals.sources.scheduler",
+    ):
+        result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.FAILED
+    assert "scheduled tool memory_consolidate failed" in (result.error or "")
+    assert private_marker not in (result.error or "")
+    row = await backend.fetch_one(
+        "SELECT error FROM signal_log WHERE id = ?",
+        (signal.id,),
+    )
+    assert row is not None
+    assert private_marker not in (row[0] or "")
+    assert any(
+        private_marker in record.getMessage()
+        and "returned a failed result" in record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.signals.sources.scheduler"
+    )
 
 
 @pytest.mark.asyncio
@@ -339,6 +453,543 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
     assert result.status == Status.OK
     assert result.action_result is blocked
     assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    ("case", "task_name", "signal_status", "execution_status", "enabled"),
+    [
+        ("failed", "sleep", Status.FAILED, "failed", 1),
+        ("exception", "sleep", Status.FAILED, "failed", 1),
+        ("successful", "sleep", Status.OK, "success", 1),
+        ("blocked", "restart_coordinator", Status.OK, "blocked", 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
+    dispatcher_components,
+    case,
+    task_name,
+    signal_status,
+    execution_status,
+    enabled,
+):
+    """A cron result has one status meaning across dispatch and scheduling."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    agent.dispatcher = dispatcher
+
+    if case == "failed":
+        sleep_report = {
+            "success": False,
+            "error": "consolidation deadline expired",
+        }
+    else:
+        sleep_report = {"success": True}
+
+    class _SleepReport:
+        def to_dict(self):
+            return sleep_report
+
+    async def sleep(**kwargs):
+        if case == "exception":
+            raise RuntimeError("sleep exploded")
+        return _SleepReport()
+
+    blocked = ScheduledTaskOutcome.blocked(
+        task_name="restart_coordinator",
+        decision="ask",
+        reason="operator approval required",
+    )
+
+    async def lookup(name, args):
+        if name == "restart_coordinator":
+            return blocked
+        raise AssertionError(f"unexpected lookup for {name}")
+
+    agent.sleep = sleep
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+    for registration in build_cron_registrations(
+        tool_lookup=lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner._ensure_tables()
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    schedule_id = f"{case}-task"
+    await db.execute(
+        """
+        INSERT INTO scheduled_tasks
+            (id, agent_id, task_name, cron_expression, args_json,
+             enabled, next_run_at, created_at, scheduler_protocol_version)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+        """,
+        (
+            schedule_id,
+            agent.did,
+            task_name,
+            "@daily",
+            '{"skip_reflection": true}',
+            due_at,
+            due_at,
+        ),
+    )
+
+    await runner._tick()
+    pending = [task for task in agent.background_tasks if not task.done()]
+    if pending:
+        await asyncio.gather(*pending)
+
+    signal_row = await backend.fetch_one(
+        "SELECT status, error FROM signal_log WHERE source = ?",
+        (cron_source_name(task_name),),
+    )
+    execution_row = await db.fetchone(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+        (schedule_id,),
+    )
+    schedule_row = await db.fetchone(
+        "SELECT enabled FROM scheduled_tasks WHERE id = ?",
+        (schedule_id,),
+    )
+
+    assert signal_row is not None
+    assert signal_row[0] == signal_status.value
+    assert execution_row is not None
+    assert execution_row[0] == execution_status
+    assert schedule_row == (enabled,)
+    if case == "failed":
+        assert "scheduled task sleep returned failed" in (signal_row[1] or "")
+        assert "scheduled task sleep returned failed" in (execution_row[1] or "")
+        assert "consolidation deadline expired" not in (signal_row[1] or "")
+    elif case == "exception":
+        assert "scheduled task sleep returned failed" in (signal_row[1] or "")
+        assert "scheduled task sleep returned failed" in (execution_row[1] or "")
+        assert "sleep exploded" not in (signal_row[1] or "")
+    elif case == "blocked":
+        assert signal_row[1] is None
+        assert "operator approval required" in (execution_row[1] or "")
+
+
+@pytest.mark.parametrize(
+    ("case", "task_name", "signal_status", "execution_status"),
+    [
+        ("error", "trash_retention", Status.FAILED, "failed"),
+        ("success", "trash_retention", Status.OK, "success"),
+        ("blocked", "github_pr_watch", Status.OK, "success"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_builtin_json_envelopes_follow_scheduler_result_contract(
+    dispatcher_components,
+    case,
+    task_name,
+    signal_status,
+    execution_status,
+):
+    """Exercise the real built-ins that return JSON object strings.
+
+    A trash sweep exception is a failed occurrence, while successful sweep
+    summaries and expected watcher blocks remain ordinary recorded results.
+    """
+    agent, registry, dispatcher, backend = dispatcher_components
+    agent.dispatcher = dispatcher
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    class _TrashStorage:
+        async def purge_trash_older_than(self, *args, **kwargs):
+            if case == "error":
+                raise RuntimeError("DB locked")
+            return 4
+
+    agent.storage = _TrashStorage()
+
+    async def run_trash_retention(args):
+        with patch(
+            "kestrel_sovereign.storage.retention.load_trash_config",
+            return_value={"conversation_history_days": 30},
+        ):
+            return await feature._run_trash_retention(args)
+
+    async def fetch_blocked(*args, **kwargs):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            PRWatchNetworkError,
+        )
+
+        raise PRWatchNetworkError("GitHub timed out")
+
+    async def run_github_pr_watch(args):
+        with patch(
+            "kestrel_sovereign.features.strategic_memory.github_integration.get_github_token",
+            return_value="token",
+        ), patch(
+            "kestrel_sovereign.signals.sources.github_pr_watch.fetch_pr_state",
+            new=fetch_blocked,
+        ):
+            return await feature._run_github_pr_watch(args)
+
+    handler = (
+        run_github_pr_watch if task_name == "github_pr_watch"
+        else run_trash_retention
+    )
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={task_name: handler},
+    ):
+        registry.register(registration)
+
+    db = AsyncDatabase(backend)
+    runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
+    await runner._ensure_tables()
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    schedule_id = f"json-envelope-{case}"
+    args_json = (
+        '{"repo": "owner/repo", "pr": 2907}'
+        if case == "blocked"
+        else "{}"
+    )
+    await db.execute(
+        """
+        INSERT INTO scheduled_tasks
+            (id, agent_id, task_name, cron_expression, args_json,
+             enabled, next_run_at, created_at, scheduler_protocol_version)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+        """,
+        (
+            schedule_id,
+            agent.did,
+            task_name,
+            "@daily",
+            args_json,
+            due_at,
+            due_at,
+        ),
+    )
+
+    await runner._tick()
+    pending = [task for task in agent.background_tasks if not task.done()]
+    if pending:
+        await asyncio.gather(*pending)
+
+    signal_row = await backend.fetch_one(
+        "SELECT status, error FROM signal_log WHERE source = ?",
+        (cron_source_name(task_name),),
+    )
+    execution_row = await db.fetchone(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+        (schedule_id,),
+    )
+
+    assert signal_row is not None
+    assert signal_row[0] == signal_status.value
+    assert execution_row is not None
+    assert execution_row[0] == execution_status
+    if case == "error":
+        assert "scheduled tool trash_retention failed" in (signal_row[1] or "")
+        assert "scheduled tool trash_retention failed" in (execution_row[1] or "")
+        assert "DB locked" not in (signal_row[1] or "")
+    elif case == "success":
+        assert signal_row[1] is None
+        assert json.loads(execution_row[1])["rows_purged"] == 4
+    else:
+        assert signal_row[1] is None
+        blocked_result = json.loads(execution_row[1])
+        assert blocked_result["blocked"] == "network"
+        assert "GitHub timed out" in blocked_result["error"]
+
+
+@pytest.mark.asyncio
+async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
+    dispatcher_components,
+):
+    """The stock local install must not record its four-hour backup as failed."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._sync_service = None
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("backup_snapshot"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.OK
+    assert json.loads(result.action_result) == {
+        "skipped": True,
+        "reason": "no sync service configured",
+    }
+
+
+@pytest.mark.asyncio
+async def test_backup_without_targets_is_a_successful_skipped_dispatch(
+    dispatcher_components,
+):
+    """A live sync service with no targets is a no-op, not a failed backup."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._sync_service = SimpleNamespace(
+        snapshot_if_changed=AsyncMock(return_value={})
+    )
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("backup_snapshot"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.OK
+    assert json.loads(result.action_result) == {
+        "skipped": True,
+        "reason": "no sync targets configured",
+    }
+
+
+@pytest.mark.asyncio
+async def test_backup_with_failed_targets_is_a_failed_dispatch(
+    dispatcher_components,
+):
+    """A configured backup is successful only when every target succeeds."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    agent._sync_service = SimpleNamespace(
+        snapshot_if_changed=AsyncMock(return_value={
+            "gcs": SimpleNamespace(success=False, bytes_synced=0),
+            "ipfs": SimpleNamespace(success=False, bytes_synced=0),
+        })
+    )
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"backup_snapshot": feature._handle_backup_snapshot},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("backup_snapshot"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.FAILED
+    assert "scheduled tool backup_snapshot failed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
+    dispatcher_components, caplog,
+):
+    """Failure routing cannot copy governed/hook result maps into audit error."""
+    agent, registry, dispatcher, backend = dispatcher_components
+    private_marker = "private-semantic-assertion-2907"
+
+    class _IncompleteReport:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": None,
+                "semantic_maintenance": {
+                    "status": "partial",
+                    "raw_assertion": private_marker,
+                },
+                "hook_results": [{"third_party_payload": private_marker}],
+            }
+
+    agent.sleep = AsyncMock(return_value=_IncompleteReport())
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    signal = Signal(
+        source=cron_source_name("sleep"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={"skip_consolidation": True, "skip_reflection": True},
+        target_agent=agent.did,
+    )
+    with caplog.at_level(
+        logging.ERROR,
+        logger="kestrel_sovereign.signals.sources.scheduler",
+    ):
+        result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.FAILED
+    assert (result.error or "").endswith(
+        "scheduled task sleep returned failed"
+    )
+    assert private_marker not in (result.error or "")
+    row = await backend.fetch_one(
+        "SELECT error FROM signal_log WHERE id = ?",
+        (signal.id,),
+    )
+    assert row is not None
+    assert row[0].endswith("scheduled task sleep returned failed")
+    assert private_marker not in row[0]
+    assert any(
+        private_marker in record.getMessage()
+        and "returned failed" in record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.signals.sources.scheduler"
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["privacy_skip", "export_failure", "explicit_noop"],
+)
+@pytest.mark.asyncio
+async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
+    dispatcher_components,
+    case,
+):
+    """Drive SleepMixin through the real built-in registration wrapper."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    if case == "privacy_skip":
+        agent._consolidate_memories = AsyncMock(return_value={
+            "skipped": True,
+            "privacy_blocked": True,
+        })
+        args = {"skip_reflection": True}
+    elif case == "export_failure":
+        agent._consolidate_memories = AsyncMock(return_value={
+            "episodes_created": 1,
+        })
+        agent._export_sovereignty = AsyncMock(
+            side_effect=RuntimeError("remote backup unavailable")
+        )
+        args = {"skip_reflection": True, "skip_export": False}
+    else:
+        sweep = AsyncMock()
+        agent.storage = SimpleNamespace(
+            sweep_expired_governed_semantic_artifacts=sweep
+        )
+        agent._consolidate_memories = AsyncMock(
+            side_effect=AssertionError("consolidation must be skipped")
+        )
+        args = {"skip_reflection": True, "skip_consolidation": True}
+
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, task_args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("sleep"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload=args,
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.OK
+    payload = json.loads(result.action_result)
+    if case == "privacy_skip":
+        assert payload["success"] is False
+        assert payload["skipped"] is True
+        assert payload["error"] == "consolidation_skipped"
+    elif case == "export_failure":
+        assert payload["success"] is True
+        assert "Export failed: remote backup unavailable" in payload["error"]
+    else:
+        assert payload["skipped"] is True
+        assert payload["reason"] == "consolidation and export were both skipped"
+        assert payload["skip_reflection"] is True
+        agent._consolidate_memories.assert_not_awaited()
+        sweep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
+    dispatcher_components,
+):
+    """A privacy no-op is nonterminal only when no other sleep phase failed."""
+    agent, registry, dispatcher, _ = dispatcher_components
+
+    class _FailingSweepStorage:
+        async def sweep_expired_governed_semantic_artifacts(self):
+            raise RuntimeError("private storage detail")
+
+    agent.storage = _FailingSweepStorage()
+    agent._consolidate_memories = AsyncMock(return_value={
+        "skipped": True,
+        "privacy_blocked": True,
+    })
+    feature = SchedulerFeature(agent)
+    feature._agent_id = agent.did
+
+    async def unused_lookup(name, task_args):
+        raise AssertionError(f"unexpected tool lookup for {name}")
+
+    for registration in build_cron_registrations(
+        tool_lookup=unused_lookup,
+        builtin_handlers={"sleep": feature._handle_sleep},
+    ):
+        registry.register(registration)
+
+    result = await dispatcher.dispatch_signal(Signal(
+        source=cron_source_name("sleep"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={"skip_reflection": True},
+        target_agent=agent.did,
+    ))
+
+    assert result.status == Status.FAILED
+    assert (result.error or "").endswith(
+        "scheduled task sleep returned failed"
+    )
+    assert "private storage detail" not in (result.error or "")
 
 
 @pytest.mark.asyncio

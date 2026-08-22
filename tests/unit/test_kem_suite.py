@@ -51,8 +51,11 @@ def test_mlkem768_library_available():
     assert ml_kem_768.PUBLIC_KEY_SIZE == 1184
     assert ml_kem_768.SECRET_KEY_SIZE == 2400
     assert ml_kem_768.CIPHERTEXT_SIZE == 1088
-    assert ml_kem_768.PLAINTEXT_SIZE == 32
-    assert ml_kem_768.ALGORITHM == "ml_kem_768"
+    # 1.0 renamed this to SHARED_SECRET_SIZE; "plaintext" was always a
+    # misnomer for a KEM, which produces a shared secret rather than
+    # encrypting a caller's message (#2966).
+    assert ml_kem_768.SHARED_SECRET_SIZE == 32
+    assert ml_kem_768.ALGORITHM == "MlKem768"
 
 
 # ---------------------------------------------------------------------------

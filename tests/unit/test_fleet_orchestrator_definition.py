@@ -2,15 +2,16 @@
 
 The Fleet Orchestrator dispatches coding work ONLY by starting
 ``fleet_coding_pipeline`` workflow runs; it never edits code, approves its own
-consent gates, or invokes talon dispatch tools directly. These tests assert the
-definition's scoped tool allowlist DENIES write/edit tools and the talon
-dispatch tools, that its feature ceiling excludes code-editing features, and
+consent gates. These tests assert the definition's scoped tool allowlist DENIES
+write/edit tools, that its feature ceiling excludes code-editing features, and
 that its constitution + mandate are shaped so the existing spawn-mandate
 machinery (#2137 hard denial, #2226 feature ceiling, #2225 constitution
 surfacing) enforces all three.
 """
 
+import importlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,34 @@ from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 from kestrel_sovereign.spawn.mandate_reload import register_restriction_hook
 
 from kestrel_sovereign.fleet import orchestrator as fo
+from kestrel_sovereign.workflow_features import (
+    FEATURE_ENTRY_POINT_GROUP,
+    WORKFLOW_FEATURE_ENTRY_POINT_GROUP,
+    WorkflowFeatureResolutionError,
+)
+
+
+WORKFLOW_PROVIDER_FEATURE = "ExampleCodingFeature"
+WORKFLOW_PROVIDER_VALUE = "example_coding.feature:ExampleCodingFeature"
+WORKFLOW_PROVIDER_DISTRIBUTION = "kestrel-feature-example-coding"
+
+
+def _workflow_provider_entry_points():
+    distribution = SimpleNamespace(name=WORKFLOW_PROVIDER_DISTRIBUTION)
+    return [
+        SimpleNamespace(
+            group=WORKFLOW_FEATURE_ENTRY_POINT_GROUP,
+            name=fo.FLEET_CODING_WORKFLOW_NAME,
+            value=WORKFLOW_PROVIDER_VALUE,
+            dist=distribution,
+        ),
+        SimpleNamespace(
+            group=FEATURE_ENTRY_POINT_GROUP,
+            name=WORKFLOW_PROVIDER_FEATURE,
+            value=WORKFLOW_PROVIDER_VALUE,
+            dist=distribution,
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +71,6 @@ def test_friendly_name_and_slug():
 def test_feature_ceiling_has_the_dispatch_and_read_surface():
     for cls in (
         "WorkflowsFeature",
-        "TalonCoordinatorFeature",
         "GitHubFeature",
         "SchedulerFeature",
         "ReflectionFeature",
@@ -59,28 +87,30 @@ def test_feature_ceiling_excludes_write_edit_features():
     assert "ComputerUseFeature" not in fo.FEATURE_ALLOWLIST
 
 
+def test_mandatory_tool_floor_is_derived_from_real_feature_classes():
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURE_MODULES
+
+    expected = set()
+    for class_name, module_path in MANDATORY_FEATURE_MODULES.items():
+        feature_class = getattr(importlib.import_module(module_path), class_name)
+        registered = fo.registered_tool_names(feature_class)
+        assert registered, f"{class_name} must expose its mandatory tool surface"
+        expected.update(registered)
+
+    assert fo.MANDATORY_TOOL_ALLOWLIST == frozenset(expected)
+    assert expected <= fo.TOOL_ALLOWLIST
+
+
 # ---------------------------------------------------------------------------
-# The required test: the allowlist denies write/edit tools AND talon dispatch.
+# The required test: the allowlist denies write/edit tools and direct writes.
 # ---------------------------------------------------------------------------
 
 
-def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
+def test_allowlist_denies_write_edit_and_mutation_tools():
     # Write / edit / file / shell tools are denied.
     for tool in ("fs_edit", "fs_write", "shell", "write_script", "execute_command", "apply_patch"):
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
         assert not fo.is_tool_allowed(tool)
-
-    # Talon claim/dispatch tools are denied — including the #2581 bounded
-    # GitHub issue-write job, which mutates GitHub state directly.
-    for tool in (
-        "talon_claim",
-        "talon_file_and_claim",
-        "talon_batch",
-        "talon_setup_workspace",
-        "talon_schedule_work_rescue",
-        "talon_github_write",
-    ):
-        assert fo.is_tool_denied(tool), f"{tool} must be denied"
 
     # GitHub write tools are denied (real kestrel_feature_github @tool names).
     for tool in (
@@ -98,6 +128,7 @@ def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
     # Scheduler mutation tools are denied (P1 #2321).
     for tool in (
         "schedule_add",
+        "schedule_add_deadline",
         "schedule_remove",
         "schedule_pause",
         "schedule_resume",
@@ -110,6 +141,24 @@ def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
     for tool in ("workflow_cancel", "workflow_force_abort", "workflow_define"):
         assert fo.is_tool_denied(tool)
 
+    # Mandatory Features load regardless of the feature ceiling, but these
+    # concrete core tools would bypass Fleet's no-self-approval / workflow-only
+    # dispatch boundary and therefore remain explicitly denied.
+    assert fo.MANDATORY_MUTATION_TOOLS == frozenset(
+        {
+            "approve",
+            "deny",
+            "export_identity",
+            "import_identity",
+            "send_a2a_task",
+            "set_permission",
+        }
+    )
+    assert fo.MANDATORY_MUTATION_TOOLS <= fo.MANDATORY_TOOL_ALLOWLIST
+    for tool in fo.MANDATORY_MUTATION_TOOLS:
+        assert fo.is_tool_denied(tool)
+        assert not fo.is_tool_allowed(tool)
+
 
 def test_allowed_dispatch_and_read_tools_are_not_denied():
     # workflow_run is the ONLY dispatch surface — it must be allowed.
@@ -117,9 +166,16 @@ def test_allowed_dispatch_and_read_tools_are_not_denied():
     assert not fo.is_tool_denied("workflow_run")
     # Read tools across the surfaces are allowed (real feature @tool names).
     for tool in (
+        "ask_agent",
+        "constitution",
+        "lifecycle_status",
+        "list_permissions",
+        "pending_approvals",
+        "send_a2a_message",
+        "send_a2a_question",
+        "verify_identity",
+        "wait",
         "workflow_status",
-        "talon_status",
-        "talon_health",
         "list_github_issues",
         "get_github_repo_info",
     ):
@@ -129,13 +185,16 @@ def test_allowed_dispatch_and_read_tools_are_not_denied():
 
 def test_scheduler_read_status_tools_remain_available():
     """The Signals-view read/status scheduler tools are NOT denied — only the
-    cron-mutating tools are (P1 #2321)."""
+    schedule-mutating tools are (P1 #2321)."""
     for tool in ("schedule_list", "schedule_history", "schedule_engagement"):
         assert not fo.is_tool_denied(tool)
 
 
-def test_allowlist_and_denylist_are_disjoint():
-    assert not (fo.TOOL_ALLOWLIST & fo.RESTRICTED_TOOLS)
+def test_explicit_mandatory_mutations_are_the_only_allow_deny_overlap():
+    # The full mandatory floor is derived into TOOL_ALLOWLIST, then this
+    # explicit core mutation subset wins in is_tool_allowed and the runtime
+    # hook. No other positive classification may overlap a denial.
+    assert fo.TOOL_ALLOWLIST & fo.RESTRICTED_TOOLS == fo.MANDATORY_MUTATION_TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +272,6 @@ def test_reflection_mutation_tools_are_denied():
         assert not fo.is_tool_denied(tool)
 
 
-def test_talon_read_and_dispatch_tools_do_not_overlap():
-    assert not (fo.TALON_READ_TOOLS & fo.TALON_DISPATCH_TOOLS)
-
-
 # ---------------------------------------------------------------------------
 # Hard runtime enforcement via the EXISTING MandateRestrictionHook (#2137).
 # ---------------------------------------------------------------------------
@@ -229,12 +284,12 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
     assert HookEvent.PRE_TOOL_USE in hook.events
 
     for tool in (
-        "talon_claim",
         "fs_write",
         "shell",
         "create_github_pull_request",
         "workflow_cancel",
         "schedule_add",
+        "schedule_add_deadline",
     ):
         out = await hook.execute(
             HookInput(
@@ -246,9 +301,21 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
         )
         assert out.permission_decision == PermissionDecision.DENY, f"{tool} not denied"
 
+    # Loading the dynamically resolved workflow-owner Feature must not expose
+    # any of its direct tools unless core's generic Fleet policy classified the
+    # tool in the positive ceiling.
+    out = await hook.execute(
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="provider_direct_dispatch",
+            tool_input={},
+        )
+    )
+    assert out.permission_decision == PermissionDecision.DENY
+
     for tool, tool_input in (
         ("workflow_run", {"name": "fleet_coding_pipeline"}),
-        ("talon_status", {}),
         ("list_github_issues", {}),
     ):
         out = await hook.execute(
@@ -260,6 +327,82 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
             )
         )
         assert out.permission_decision != PermissionDecision.DENY, f"{tool} wrongly denied"
+
+
+@pytest.mark.asyncio
+async def test_build_and_reload_hooks_admit_mandatory_floor_only_within_ceiling():
+    direct_hook = fo.build_restriction_hook()
+    manager = HooksManager()
+    register_restriction_hook(
+        manager,
+        SimpleNamespace(additional_constraints=fo.additional_constraints()),
+    )
+
+    permitted_floor = fo.MANDATORY_TOOL_ALLOWLIST - fo.MANDATORY_MUTATION_TOOLS
+    for tool_name in sorted(permitted_floor):
+        tool_input = {}
+        direct = await direct_hook.execute(
+            HookInput(
+                session_id="t",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+        )
+        assert direct.permission_decision != PermissionDecision.DENY, tool_name
+
+        reloaded = await manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE,
+            HookInput(
+                session_id="t",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            ),
+        )
+        assert evaluate_blocking_decision(reloaded) is None, tool_name
+
+    for tool_name in sorted(fo.MANDATORY_MUTATION_TOOLS):
+        direct = await direct_hook.execute(
+            HookInput(
+                session_id="t",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input={},
+            )
+        )
+        assert direct.permission_decision == PermissionDecision.DENY, tool_name
+        reloaded = await manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE,
+            HookInput(
+                session_id="t",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input={},
+            ),
+        )
+        assert evaluate_blocking_decision(reloaded) is not None, tool_name
+
+    denied = await direct_hook.execute(
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="external_provider_direct_tool",
+            tool_input={},
+        )
+    )
+    assert denied.permission_decision == PermissionDecision.DENY
+
+    denied = await manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="external_provider_direct_tool",
+            tool_input={},
+        ),
+    )
+    assert evaluate_blocking_decision(denied) is not None
 
 
 @pytest.mark.asyncio
@@ -302,20 +445,20 @@ async def test_restriction_hook_scopes_workflow_run_to_fleet_coding_pipeline():
 async def test_reload_path_registers_the_deny_hook_from_constraints():
     """The mandate the definition builds carries restricted_tools +
     restricted_tool_args, so the real reload seam (register_restriction_hook)
-    installs a hook that blocks talon dispatch AND arg-scopes workflow_run via
+    installs a hook that blocks writes AND arg-scopes workflow_run via
     the HooksManager — the same path KestrelAgent.initialize uses."""
     manager = HooksManager()
     count = register_restriction_hook(
         manager, type("M", (), {"additional_constraints": fo.additional_constraints()})()
     )
-    assert count == len(fo.RESTRICTED_TOOLS) + len(fo.RESTRICTED_TOOL_ARGS)
+    assert count == len(fo.RESTRICTED_TOOLS) + len(fo.RESTRICTED_TOOL_ARGS) + 1
 
     out = await manager.execute_hooks(
         HookEvent.PRE_TOOL_USE,
         HookInput(
             session_id="t",
             hook_event_name=HookEvent.PRE_TOOL_USE.value,
-            tool_name="talon_claim",
+            tool_name="fs_write",
             tool_input={},
         ),
     )
@@ -343,7 +486,7 @@ async def test_reload_path_registers_the_deny_hook_from_constraints():
 
 
 def test_constitution_encodes_required_rules():
-    text = fo.constitution_text()
+    text = fo.constitution_text(entry_points=_workflow_provider_entry_points())
     # Dispatches ONLY via fleet_coding_pipeline workflow runs.
     assert "fleet_coding_pipeline" in text
     assert "workflow_run" in text
@@ -352,8 +495,8 @@ def test_constitution_encodes_required_rules():
     assert "Falconer" in text
     # Escalates uncertainty rather than guessing.
     assert "scalat" in text or "escalate" in text.lower()
-    # The restricted tools are surfaced as not-available.
-    assert "talon_claim" in text
+    # The restricted write tools are surfaced as not-available.
+    assert "create_github_issue" in text
     # The workflow_run argument scope is surfaced too.
     assert "workflow_run" in text
     assert "fleet_coding_pipeline" in text
@@ -362,14 +505,21 @@ def test_constitution_encodes_required_rules():
 def test_additional_constraints_only_narrow_and_validate():
     """behavioral_rules + restricted_tools are narrowing constraints the scoped
     constitution accepts; the feature ceiling is a subset of the parent's."""
-    parent_features = set(fo.FEATURE_ALLOWLIST) | {"ComputeFeature", "ComputerUseFeature"}
+    parent_features = set(fo.FEATURE_ALLOWLIST) | {
+        WORKFLOW_PROVIDER_FEATURE,
+        "ComputeFeature",
+        "ComputerUseFeature",
+    }
     scoped = fo.build_scoped_constitution(
-        base_constitution="BASE", parent_features=parent_features
+        base_constitution="BASE",
+        parent_features=parent_features,
+        entry_points=_workflow_provider_entry_points(),
     )
     ok, msg = scoped.validate_constraints()
     assert ok, msg
 
     constraints = fo.additional_constraints()
+    assert constraints["allowed_tools"] == sorted(fo.TOOL_ALLOWLIST)
     assert isinstance(constraints["behavioral_rules"], list)
     assert isinstance(constraints["restricted_tools"], list)
     # The argument-level narrowing is carried and scopes workflow_run.
@@ -386,7 +536,9 @@ def test_feature_ceiling_wider_than_parent_is_rejected():
     """Sanity: a ceiling naming a feature the parent lacks fails validation —
     proves the subset check is live for this definition's shape."""
     scoped = fo.build_scoped_constitution(
-        base_constitution="BASE", parent_features={"WorkflowsFeature"}
+        base_constitution="BASE",
+        parent_features={"WorkflowsFeature"},
+        entry_points=_workflow_provider_entry_points(),
     )
     ok, _ = scoped.validate_constraints()
     assert not ok
@@ -398,10 +550,15 @@ def test_feature_ceiling_wider_than_parent_is_rejected():
 
 
 def test_spawn_mandate_carries_ceiling_and_constraints():
-    mandate = fo.build_spawn_mandate("did:pkh:eip155:1:0xSovereign")
+    mandate = fo.build_spawn_mandate(
+        "did:pkh:eip155:1:0xSovereign",
+        entry_points=_workflow_provider_entry_points(),
+    )
     assert mandate.parent_did == "did:pkh:eip155:1:0xSovereign"
     assert mandate.purpose == "Fleet Orchestrator"
-    assert sorted(mandate.features_allowed) == sorted(fo.FEATURE_ALLOWLIST)
+    assert set(mandate.features_allowed) == (
+        set(fo.FEATURE_ALLOWLIST) | {WORKFLOW_PROVIDER_FEATURE}
+    )
     assert mandate.additional_constraints["restricted_tools"] == sorted(fo.RESTRICTED_TOOLS)
     assert mandate.additional_constraints["behavioral_rules"]
     assert (
@@ -413,10 +570,57 @@ def test_spawn_mandate_carries_ceiling_and_constraints():
 
 
 def test_local_agent_config_stamps_feature_ceiling():
-    cfg = fo.build_local_agent_config("agent_data/fleet-orchestrator", 8804)
+    cfg = fo.build_local_agent_config(
+        "agent_data/fleet-orchestrator",
+        8804,
+        entry_points=_workflow_provider_entry_points(),
+    )
     assert cfg.port == 8804
     assert cfg.autostart is True
-    assert set(cfg.features) == set(fo.FEATURE_ALLOWLIST)
+    assert set(cfg.features) == set(fo.FEATURE_ALLOWLIST) | {
+        WORKFLOW_PROVIDER_FEATURE
+    }
+
+
+def test_actual_fleet_ceilings_include_resolved_workflow_provider_feature():
+    """Every persisted Fleet definition carries its workflow capability owner."""
+
+    entry_points = _workflow_provider_entry_points()
+    expected = set(fo.FEATURE_ALLOWLIST) | {WORKFLOW_PROVIDER_FEATURE}
+    mandate = fo.build_spawn_mandate(
+        "did:pkh:eip155:1:0xSovereign",
+        entry_points=entry_points,
+    )
+    scoped = fo.build_scoped_constitution(
+        parent_features=expected,
+        entry_points=entry_points,
+    )
+    config = fo.build_local_agent_config(
+        "agent_data/fleet-orchestrator",
+        8804,
+        entry_points=entry_points,
+    )
+
+    assert set(mandate.features_allowed) == expected
+    assert set(scoped.features_allowed) == expected
+    assert set(config.features) == expected
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda: fo.build_spawn_mandate(
+            "did:pkh:eip155:1:0xSovereign", entry_points=[]
+        ),
+        lambda: fo.build_scoped_constitution(entry_points=[]),
+        lambda: fo.build_local_agent_config(
+            "agent_data/fleet-orchestrator", 8804, entry_points=[]
+        ),
+    ],
+)
+def test_persisted_ceiling_builders_fail_closed_without_workflow_provider(builder):
+    with pytest.raises(WorkflowFeatureResolutionError, match="no installed provider"):
+        builder()
 
 
 # ---------------------------------------------------------------------------

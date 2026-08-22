@@ -16,10 +16,13 @@
 //   registerPanel({
 //     panelId,            // stable id; the panel DOM is `#panel-<panelId>`
 //     label, labelKey,    // nav tab text (labelKey drives i18n re-hydration)
-//     icon,               // optional icon class for the nav tab
+//     icon,               // icon class for the nav tab; omitted falls back to
+//                         // DEFAULT_TAB_ICON so no contribution renders bare
 //     before,             // optional: insert the tab before this panelId's tab
 //     gate?(ctx),         // capability gate; an ungated-false panel shows no tab
-//     render?(bodyEl, ctx)// lazily invoked ONCE on first activation
+//     render?(bodyEl, ctx),// lazily invoked ONCE on first activation
+//     viewState?          // optional {key?, getState(), setState(s)} provider
+//                         // persisting the panel's own view state (#2802)
 //   })
 //
 // `render` preserves the existing lazy-load semantics (`setLazyLoaders`): a
@@ -40,6 +43,7 @@
 import { UI } from './registry.js';
 import bus from './bus.js';
 import { storeGet, storeSet } from '../ui_state.mjs';
+import { normalizeProvider, saveViewState, restoreViewState } from './view-state.js';
 
 /** @type {Map<string, object>} */
 const _panels = new Map();
@@ -49,6 +53,8 @@ const _rendered = new Set();
 let _navEl = null;
 let _hostEl = null;
 let _ctx = null;
+/** Panel id most recently passed to `activate` — the view-state snapshot source. */
+let _activePanelId = null;
 
 function _safe(fn, ...args) {
     try {
@@ -59,13 +65,9 @@ function _safe(fn, ...args) {
     }
 }
 
-function _escapeAttr(s) {
-    return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
+// `_escapeAttr` retired with the innerHTML tab builder (#2822): `_reconcileTab`
+// composes tabs through DOM APIs (className / textContent / setAttribute), so a
+// descriptor's label or icon can no longer reach an HTML parser at all.
 
 function _cssEscape(s) {
     if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(s);
@@ -82,6 +84,152 @@ function _gateOk(def) {
     return !!_safe(def.gate, _ctx || {});
 }
 
+// ---- Panel view-state provider lifecycle (#2802) ---------------------------
+//
+// Strictly additive: everything below is a no-op for a panel that declares no
+// `viewState` provider, and no existing event/subscriber observes any change.
+// The save side runs at the three moments the panel's live DOM is about to stop
+// being the source of truth — deactivation (`activate` switching away), a
+// re-gate that drops the body, and page unload — and the restore side runs once,
+// on the panel's first (re)render, which is exactly the remount boundary.
+
+let _unloadHookInstalled = false;
+
+/** The validated provider for a registered panel, or null. */
+function _providerFor(panelId) {
+    return normalizeProvider(_panels.get(panelId));
+}
+
+/**
+ * Snapshot a panel's view state into `ui_state.mjs`. Guarded on `_rendered` so a
+ * panel whose body never rendered cannot overwrite a good stored value with its
+ * uninitialized default.
+ */
+function _saveView(panelId) {
+    if (!panelId || !_rendered.has(panelId)) return false;
+    const provider = _providerFor(panelId);
+    if (!provider) return false;
+    return saveViewState(panelId, provider);
+}
+
+/** Reapply a panel's persisted view state after its body (re)rendered. */
+function _restoreView(panelId) {
+    const provider = _providerFor(panelId);
+    if (!provider) return false;
+    return restoreViewState(panelId, provider);
+}
+
+// `activate()` does not run on unload, so a full page reload would otherwise
+// lose whatever the active panel accumulated since the last tab switch. Wired
+// lazily — only once some panel actually registers a provider — so a console
+// with no view-state consumer attaches no listeners at all. `pagehide` is the
+// bfcache-safe spelling of unload; `visibilitychange`->hidden covers Safari/iOS,
+// which may background a tab without ever firing `pagehide`.
+function _ensureUnloadHook() {
+    if (_unloadHookInstalled) return;
+    try {
+        if (typeof window === 'undefined' || !window || typeof window.addEventListener !== 'function') return;
+        const flush = () => { _saveView(_activePanelId); };
+        window.addEventListener('pagehide', flush);
+        window.addEventListener('visibilitychange', () => {
+            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') flush();
+        });
+        _unloadHookInstalled = true;
+    } catch (err) {
+        // A host without a usable window (SSR, worker) simply gets no unload
+        // flush; the deactivation + re-gate snapshots still work.
+        console.error('[ui-ext panels] could not wire the view-state unload flush:', err);
+    }
+}
+
+// ---- Nav tab chrome (#2821, #2822) -----------------------------------------
+//
+// The descriptor is the single source of truth for a tab's icon and label. Both
+// tab paths — a registry-BUILT tab and an in-place tab declared in `index.html`
+// that the registry ADOPTS — run through `_reconcileTab`, so one edit to a
+// descriptor reaches the standalone console and every embed alike. Before this,
+// adoption only stamped the gating flag and never looked at the descriptor's
+// chrome, so the two surfaces silently diverged (the reason the `ki-check` typo
+// had to be fixed in two files).
+
+/**
+ * Icon for a contribution that declares none. Without a default, an
+ * out-of-tree panel (Observability today; any future feature panel) renders as
+ * bare text in an otherwise iconed strip — the ragged nav #2821 set out to fix,
+ * reintroduced from outside the repo. `puzzle` already reads as "extension"
+ * here (it is the Features tab's own icon).
+ *
+ * An embedder contributing `hostTabs` should declare a meaningful `icon`;
+ * this is the floor, not a recommendation.
+ */
+const DEFAULT_TAB_ICON = 'ki ki-puzzle';
+
+function _iconFor(def) {
+    return (def && def.icon) || DEFAULT_TAB_ICON;
+}
+
+/** Direct text-node content of an element, ignoring child elements (badges). */
+function _ownText(el) {
+    return Array.from(el.childNodes)
+        .filter((n) => n.nodeType === 3)
+        .map((n) => n.textContent)
+        .join('')
+        .trim();
+}
+
+/**
+ * Bring a tab's children in line with its descriptor: an icon span, a label
+ * span, then whatever else the tab already carried. Idempotent — it is the
+ * shared body of both the build and the adopt path.
+ *
+ * Two things it must not break:
+ *
+ *   - Badge elements (`#tasks-badge`, `#security-pending-badge`,
+ *     `#approvals-pending-badge`) live inside the button and are re-queried by
+ *     id from tasks.js / security.js / approvals.js. They are preserved BY
+ *     NODE, not re-created, so a count rendered before the first nav sync
+ *     survives.
+ *   - An already-hydrated (translated) label. The descriptor's `label` is the
+ *     English fallback; when a tab already carries label text, that text wins.
+ *     Only a tab with no label at all falls back to the descriptor.
+ */
+function _reconcileTab(tab, def) {
+    const labelKey = def.labelKey || '';
+
+    // `span.ki` / `span[data-label-key]` match the pre-#2821 in-place markup
+    // shape; the `nav-tab-*` classes match anything this function has already
+    // produced. A badge span has neither, so it is never mistaken for a label.
+    let icon = tab.querySelector('.nav-tab-icon, span.ki');
+    let label = tab.querySelector('.nav-tab-label, span[data-label-key]');
+    const preserved = Array.from(tab.children).filter((el) => el !== icon && el !== label);
+
+    if (!icon) icon = document.createElement('span');
+    // `nav-tab-icon` / `nav-tab-label` are the stable hooks the display-mode
+    // preference (#2823) toggles visibility on. They are structural, not
+    // cosmetic — the icon class itself is what carries the glyph.
+    icon.className = `nav-tab-icon ${_iconFor(def)}`;
+    // Decorative: the label span alongside it is the button's accessible name.
+    icon.setAttribute('aria-hidden', 'true');
+
+    if (!label) {
+        label = document.createElement('span');
+        // The plainest in-place shape is `<button data-label-key="tab_x">X</button>`
+        // — text directly on the button. Adopt that text so a locale already
+        // hydrated onto the button is not reverted to the English descriptor.
+        label.textContent = _ownText(tab) || def.label || def.panelId;
+    }
+    label.classList.add('nav-tab-label');
+    if (labelKey) label.setAttribute('data-label-key', labelKey);
+
+    // A `data-label-key` on the BUTTON is load-bearing damage once a tab has
+    // children: KestrelTheme._hydrate() assigns `el.textContent` for every
+    // `[data-label-key]`, which on a button replaces its whole subtree — icon
+    // and badge included. The key belongs on the label span alone.
+    tab.removeAttribute('data-label-key');
+
+    tab.replaceChildren(icon, document.createTextNode(' '), label, ...preserved);
+}
+
 function _buildTab(def) {
     const btn = document.createElement('button');
     btn.className = 'nav-tab';
@@ -89,11 +237,7 @@ function _buildTab(def) {
     // Mark registry-owned tabs so core's PANEL_CAPABILITIES re-gate
     // (reconcileNavigationCapabilities) leaves them to the registry's own gate.
     btn.dataset.panelRegistry = 'true';
-    const labelKey = def.labelKey || '';
-    const iconHtml = def.icon ? `<span class="${_escapeAttr(def.icon)}"></span> ` : '';
-    const keyAttr = labelKey ? ` data-label-key="${_escapeAttr(labelKey)}"` : '';
-    btn.innerHTML = `${iconHtml}<span${keyAttr}>${_escapeAttr(def.label || def.panelId)}</span>`;
-    if (labelKey) btn.dataset.labelKey = labelKey;
+    _reconcileTab(btn, def);
     return btn;
 }
 
@@ -133,6 +277,9 @@ function _syncNav() {
             existing.dataset.registryAdopted = 'true';
         }
         if (!_gateOk(def)) {
+            // Snapshot the panel's view state BEFORE its body is dropped (#2802):
+            // a re-gate is a remount, and re-enabling re-renders from scratch.
+            _saveView(def.panelId);
             if (tab) tab.remove();
             // Drop the panel body when the panel gates off at runtime (feature
             // disabled) or at boot (host opt-out), and forget its rendered state
@@ -169,6 +316,11 @@ function _syncNav() {
             // (reconcileNavigationCapabilities) leaves gating to this registry's
             // own `gate` — a single gating mechanism per tab (#2145).
             tab.dataset.panelRegistry = 'true';
+            // ...and bring its chrome in line with the descriptor (#2822), so
+            // adoption covers icon/label the way it already covers gating. A
+            // descriptor-only icon change previously reached embeds and not the
+            // standalone console, with nothing failing to say so.
+            _reconcileTab(tab, def);
         }
         _ensurePanelContainer(def);
     }
@@ -180,6 +332,12 @@ function _syncNav() {
  * is inserted immediately (so a late/feature registration appears without a
  * reload).
  *
+ * A contribution MAY declare an optional `viewState` provider
+ * ({@link import('./contract.js').PanelViewStateProvider}) — `{key?, getState(),
+ * setState(state)}` — and the registry persists its state through
+ * `ui_state.mjs`, restoring it on the panel's next render (#2802). Omitting it
+ * leaves the panel behaving exactly as before.
+ *
  * @param {object} def
  */
 export function registerPanel(def) {
@@ -187,8 +345,13 @@ export function registerPanel(def) {
         console.error('[ui-ext panels] registerPanel: contribution needs a string `panelId`');
         return;
     }
+    // Re-registration is the remount boundary (mountPanels re-registers every
+    // core panel on each mount), so snapshot the outgoing contribution's view
+    // state before `_rendered` is cleared and the body re-renders from scratch.
+    _saveView(def.panelId);
     _panels.set(def.panelId, def);
     _rendered.delete(def.panelId);
+    if (def.viewState) _ensureUnloadHook();
     if (_navEl) _syncNav();
 }
 
@@ -199,6 +362,9 @@ export function registerPanel(def) {
  */
 export function unregisterPanel(panelId) {
     if (!_panels.has(panelId)) return;
+    // Unregistration is a teardown boundary (a host destroying its mount), so
+    // snapshot before the contribution — and with it its provider — is dropped.
+    _saveView(panelId);
     _panels.delete(panelId);
     _rendered.delete(panelId);
     const tab = _tabFor(panelId);
@@ -242,6 +408,13 @@ export function syncNav() {
  */
 export function activate(panelId, ctx = {}) {
     const merged = { ...(_ctx || {}), ...ctx, panelId };
+    // Deactivation snapshot (#2802): the outgoing panel's live DOM stops being
+    // the source of truth here. This is deliberately NOT `panel:hidden` — that
+    // event is a teardown signal (spawn.js/database.js stop polling on it) and
+    // must keep firing only on a re-gate, so an ordinary tab switch stays
+    // behaviour-identical for every existing subscriber.
+    if (_activePanelId && _activePanelId !== panelId) _saveView(_activePanelId);
+    _activePanelId = panelId;
     const def = _panels.get(panelId);
     const root = document.getElementById(`panel-${panelId}`);
     if (def && !_rendered.has(panelId)) {
@@ -250,6 +423,10 @@ export function activate(panelId, ctx = {}) {
         if (typeof def.render === 'function' && body) {
             _safe(def.render, body, merged);
         }
+        // First render of this mount == the remount boundary, so reapply the
+        // persisted view state now that the panel's DOM exists. Subsequent
+        // activations skip this: the live body already holds the state.
+        _restoreView(panelId);
     }
     // Mount per-(panelId) sub-sections into the active panel's content. Gated by
     // ctx.panelId inside each contribution (PanelSectionContext).
@@ -265,6 +442,19 @@ export function panels() {
     return [..._panels.values()];
 }
 
+/**
+ * Persist a panel's view state right now (#2802). The registry already
+ * snapshots on deactivation, re-gate, re-registration, and page unload; this is
+ * the explicit escape hatch for a host that tears the whole mount down by
+ * another route (e.g. `mountPanels().destroy()` on agent switch).
+ *
+ * @param {string} [panelId] - defaults to the currently active panel.
+ * @returns {boolean} true when a value was written.
+ */
+export function flushViewState(panelId) {
+    return _saveView(panelId || _activePanelId);
+}
+
 /** Test/teardown affordance: forget all panels and unbind the nav/host. */
 export function _reset() {
     _panels.clear();
@@ -272,6 +462,7 @@ export function _reset() {
     _navEl = null;
     _hostEl = null;
     _ctx = null;
+    _activePanelId = null;
 }
 
 // ============================================================================
@@ -484,6 +675,7 @@ export const Panels = {
     syncNav,
     activate,
     panels,
+    flushViewState,
     initReveal,
     _reset,
 };

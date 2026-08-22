@@ -26,7 +26,6 @@ from kestrel_sdk.llm import ProviderCapabilities
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from .embedding_space import EmbeddingSpacePin, ParityResult
-from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from .provider_registry import (
@@ -55,7 +54,7 @@ from .invocation_context import (
     resolve_invocation_context,
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
-from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
+from .remote_backend import BackendType, RemoteBackendMixin
 from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
@@ -356,7 +355,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     # through :meth:`set_force_local_only_provider` (#1492).
     _force_local_only_provider: Optional[Callable[[], bool]] = None
 
-    def __init__(self, database_url: Optional[str] = None):
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        agent_data_dir: Optional[Any] = None,
+    ):
         """Initialize LLM service.
 
         Reads LLM configuration from the ``[llm]`` section of ``kestrel.toml``
@@ -368,9 +371,30 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             database_url: Optional PostgreSQL connection URL for usage tracking.
                          If provided, uses PostgreSQL. Otherwise checks env vars,
                          then falls back to SQLite.
-        """
-        load_dotenv()
+            agent_data_dir: The owning agent's data root. Multi-agent callers
+                         MUST pass this: one process hosts several agents, so
+                         the process environment cannot name each agent's data
+                         root and SQLite usage rows would otherwise all land in
+                         one agent's database (#2769).
 
+        Reads the process environment; does not load it. ``load_dotenv()`` used
+        to be the first statement here, so constructing a service — lazily, on
+        RAG chunking, inception, embedding, per-agent boot — wrote a ``.env``
+        back into ``os.environ``. ``override=False`` made that look safe: it
+        protects keys that are *set*, and silently resurrects keys that were
+        deliberately *unset*, so "run without this variable" was unenforceable
+        for the rest of the process (#2896).
+
+        And the file was the wrong one. A bare ``load_dotenv()`` resolves via
+        ``find_dotenv()``, which walks up from *this module's own file* — so it
+        picked up whatever ``.env`` sits above the package (the repo root in a
+        source clone, anything above ``site-packages`` in a pip install), never
+        the home of the agent being constructed.
+
+        Environment loading belongs at a process entry point, once, against a
+        named home: :func:`kestrel_sovereign.paths.load_project_env`. Same rule
+        as #2468, which removed the equivalent call from ``inception_service``.
+        """
         # default_model is derived from first provider in provider_priority
         # (see provider_registry and endpoints/models.py)
         self.default_model = None  # Deprecated: use providers[0] instead
@@ -418,7 +442,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self.disabled: bool = False
 
         # Database for model usage tracking (uses abstract data layer)
-        self._init_usage_tracking(database_url)
+        self._init_usage_tracking(database_url, agent_data_dir=agent_data_dir)
 
         # Constitutional profile service
         self._init_constitutional_profiles()
@@ -478,13 +502,31 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # ``passed=True`` has its shared space_id applied to member routes.
         self._verified_space_pins: Dict[str, "ParityResult"] = {}
 
-        # Remote GPU backend state (merged from BrainRouter)
+        # Provider-neutral private inference route. Infrastructure state lives
+        # in an external lease provider; only the validated, host-only route is
+        # retained here. The condition/refcount make route removal drain
+        # in-flight calls before provider capacity can be released.
         self._backend = BackendType.CLOUD
         self._default_backend = BackendType.CLOUD
-        self._remote_config: Optional[RemoteGPUConfig] = None
+        self._remote_lease = None
         self._remote_client: Optional[openai.AsyncOpenAI] = None
         self._remote_adapter = OpenAIAdapter()
         self._last_remote_error: Optional[str] = None
+        self._remote_route_condition = asyncio.Condition()
+        self._remote_inflight = 0
+        self._remote_accepting = False
+        self._remote_capabilities: frozenset[str] = frozenset()
+        self._remote_touch_lease = None
+        # Bumped on every route teardown. A call that renews its lease outside
+        # the route condition cannot detect a teardown by comparing observable
+        # route state, because a concurrent re-activation restores state that
+        # compares equal. The epoch makes "this route was torn down while I was
+        # renewing" observable even when it was immediately rebuilt.
+        self._remote_route_epoch = 0
+        # Set once by ``close()``. Shutdown drains the route and then returns;
+        # any activation after that point would rebuild a client nothing will
+        # ever close.
+        self._remote_route_closed = False
 
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization
@@ -692,6 +734,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         user_prompt: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         model_override: Optional[str] = None,
+        session_id: Optional[str] = None,
         redact: bool = False,
     ):
         """Open the single OpenInference LLM span for one public entry call.
@@ -710,20 +753,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         skipped entirely when no exporter is configured, so an unset OTLP
         endpoint costs only the guard.
         """
-        if not telemetry.llm_tracing_enabled():
+        tracing_enabled = telemetry.llm_tracing_enabled()
+        span_attributes = None
+        if not tracing_enabled:
             span_input = None
-        elif redact:
-            # #2674 finding 3: contentless input marker — never serialize the
-            # withheld prompt into the exported span.
-            span_input = _redacted_content_marker(
-                user_prompt if user_prompt is not None else (messages or "")
-            )
         else:
-            span_input = telemetry.serialize_llm_input(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                messages=messages,
-            )
+            if redact:
+                # #2674 finding 3: contentless input marker — never serialize the
+                # withheld prompt into the exported span.
+                span_input = _redacted_content_marker(
+                    user_prompt if user_prompt is not None else (messages or "")
+                )
+            else:
+                span_input = telemetry.serialize_llm_input(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    messages=messages,
+                )
+            # Both session keys, from the one resolver every span type shares
+            # (#2940): the fleet Timeline groups a lane on ``kestrel.session_id``,
+            # Phoenix's session view on ``session.id``. Stamping only the latter
+            # left every ``llm.*`` span in its own Timeline band. Blank and
+            # sentinel values yield no attribute at all rather than an empty one.
+            span_attributes = telemetry.session_span_attributes(session_id) or None
         with telemetry.llm_span(
             f"llm.{method}",
             input_value=span_input,
@@ -731,6 +783,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # getattr: tests construct LLMService via __new__ (skipping __init__,
             # see test_discovery_hang_regression), so the attribute may not exist.
             agent_name=getattr(self, "_agent_display_name", None),
+            attributes=span_attributes,
         ) as span:
             yield span
 
@@ -3648,6 +3701,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         metadata: Optional[Dict[str, Any]] = None,
         tools_used: Optional[bool] = None,
         publish_identity: bool = True,
+        error_message_override: Optional[str] = None,
     ) -> Any:
         """Await and finalize one provider call, successful or failed."""
 
@@ -3665,7 +3719,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 path=path,
                 invocation_context=invocation_context,
                 duration_ms=int((time.monotonic() - started) * 1000),
-                error=exc,
+                error=(
+                    LLMServiceError(error_message_override)
+                    if error_message_override is not None
+                    else exc
+                ),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=tools,
@@ -3954,10 +4012,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     @staticmethod
     def _scrub_auto(model_override: Optional[str]) -> Optional[str]:
         """Normalize the ``"auto"`` sentinel to ``None``. Used by entry
-        points that bypass :meth:`resolve_provider_routing` — chiefly the
-        remote-GPU fast path which reads ``model_override`` directly via
-        ``model_override or self._remote_config.model``. See #1408 for
-        why ``"auto"`` must never reach a provider client."""
+        points that bypass :meth:`resolve_provider_routing` — including the
+        inference-lease route. See #1408 for why ``"auto"`` must never reach
+        a provider client."""
         return None if model_override == "auto" else model_override
 
     def _resolve_concrete_model(
@@ -4360,6 +4417,7 @@ No other text or formatting.
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            session_id=frozen_context.session_id,
             redact=_redact,
         ) as span:
             result = await self._get_response_frozen(
@@ -4571,6 +4629,7 @@ No other text or formatting.
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model_override=model_id,
+                session_id=invocation_context.session_id,
                 redact=_redact,
             ) as span:
                 response = await self._run_provider_attempt(
@@ -4652,18 +4711,26 @@ No other text or formatting.
             except Exception as e:
                 logger.warning(f"Unexpected error closing {provider.get('name')} client: {e}", exc_info=True)
 
-        # Close remote GPU client if active
-        if self._remote_client:
+        # Stop accepting remote calls and drain them before discarding route
+        # credentials. Provider capacity is deliberately NOT released here:
+        # the durable provider reconciler owns expiry/release after host death.
+        # Latch the closed flag first, under the route condition, so an
+        # in-flight traffic-driven renewal cannot re-activate the route behind
+        # the drain that is about to run.
+        async with self._remote_route_condition:
+            self._remote_route_closed = True
+        if self._remote_lease is not None:
             try:
-                await asyncio.wait_for(self._remote_client.close(), timeout=CLIENT_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, asyncio.CancelledError, ConnectionError, OSError):
-                pass
-            except (RuntimeError, AttributeError) as e:
-                logger.debug(f"Error closing remote client: {e}", exc_info=True)
-            except Exception as e:
-                logger.debug(f"Error closing remote client: {e}", exc_info=True)
-            finally:
-                self._remote_client = None
+                await self.deactivate_inference_lease(
+                    self._remote_lease.lease_id,
+                    require_active=False,
+                )
+            except LLMServiceError as exc:
+                logger.warning(
+                    "Private inference route cleanup did not complete during "
+                    "LLMService shutdown (%s)",
+                    type(exc).__name__,
+                )
 
         # Close the async usage tracking database
         try:
@@ -4682,6 +4749,7 @@ No other text or formatting.
         model_override: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
+        session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
@@ -4701,73 +4769,97 @@ No other text or formatting.
             model_override: Override model selection
             tools: Optional tools for function calling
             response_format: Optional Pydantic model for structured output
+            session_id: Chat session this call belongs to, mirroring
+                ``generate_with_messages``. Without it this entry point could
+                not name its session at all, so every ``llm.generate`` span
+                exported sessionless and became its own Timeline band (#2940).
+                Callers with genuinely no session (the sleep-cycle memory
+                attestation, the salvage janitor) pass nothing and stay
+                unstamped rather than stamping an empty value.
 
         Returns:
             String content or LLMResponse (if tools/structured output)
         """
         self._check_policy()
-        invocation_context = self._resolve_invocation_context(invocation_context)
+        invocation_context = self._resolve_invocation_context(
+            invocation_context,
+            session_id=session_id,
+        )
         _redact = invocation_context.redact_content
         with self._llm_request_span(
             "generate",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_override=model_override,
+            session_id=invocation_context.session_id,
             redact=_redact,
         ) as span:
-            # Try remote GPU first when active AND routing isn't pinned.
-            # A persisted mandate or vendor-prefixed model_override must
-            # beat the remote shortcut — see #734 and _remote_first_allowed.
-            if (
-                self._backend == BackendType.REMOTE_GPU
-                and self._remote_client
-                and not force_local_only
-                and self._remote_first_allowed(model_override)
-            ):
-                try:
-                    self._ensure_remote_active()
-                    messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
-                    model = self._scrub_auto(model_override) or self._remote_config.model
-                    response = await self._run_provider_attempt(
-                        self._remote_adapter.get_response(
-                            client=self._remote_client,
-                            model=model,
-                            messages=messages,
+            async with self._remote_route_attempt(
+                force_local_only=force_local_only,
+                model_override=model_override,
+                required_capabilities=(
+                    "chat",
+                    *(("tools",) if tools else ()),
+                    *(("structured_output",) if response_format else ()),
+                ),
+            ) as remote_route:
+                if remote_route is None:
+                    remote_response = None
+                else:
+                    try:
+                        messages = messages_for(
+                            remote_route.adapter,
+                            user_prompt=user_prompt,
+                            system_prompt=system_prompt,
+                        )
+                        model = self._scrub_auto(model_override) or remote_route.model
+                        remote_response = await self._run_provider_attempt(
+                            remote_route.adapter.get_response(
+                                client=remote_route.client,
+                                model=model,
+                                messages=messages,
+                                tools=tools,
+                                response_format=response_format,
+                                cancel_token=cancel_token,
+                            ),
+                            "remote_gpu",
+                            model,
+                            path="generate.remote_gpu",
+                            invocation_context=invocation_context,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
                             tools=tools,
                             response_format=response_format,
-                            cancel_token=cancel_token,
-                        ),
-                        "remote_gpu",
-                        model,
-                        path="generate.remote_gpu",
-                        invocation_context=invocation_context,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        tools=tools,
-                        response_format=response_format,
-                        force_local_only=force_local_only,
+                            force_local_only=force_local_only,
+                            error_message_override=(
+                                self._managed_remote_failure_message
+                            ),
+                        )
+                    except Exception as exc:
+                        # Adapter implementations can raise provider-specific
+                        # exception types. The boundary intentionally catches
+                        # them all, exposes only a safe category, and never
+                        # falls through to a different provider.
+                        self._raise_managed_remote_failure(exc)
+
+            if remote_route is not None:
+                if tools is not None or response_format is not None:
+                    return self._annotate_and_return(
+                        span,
+                        remote_response,
+                        redact=_redact,
                     )
-                    if tools is not None or response_format is not None:
-                        return self._annotate_and_return(span, response, redact=_redact)
-                    if isinstance(response, LLMResponse):
-                        return self._annotate_and_return(span, response.content or "", redact=_redact)
-                    return self._annotate_and_return(span, response, redact=_redact)
-                except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU network error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except LLMServiceError as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU service error: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
-                except Exception as exc:
-                    self._last_remote_error = str(exc)
-                    logger.warning(f"Remote GPU failed: {exc}, falling back to providers", exc_info=True)
-                    self._deactivate_remote_backend(reason=str(exc))
+                if isinstance(remote_response, LLMResponse):
+                    return self._annotate_and_return(
+                        span,
+                        remote_response.content or "",
+                        redact=_redact,
+                    )
+                return self._annotate_and_return(
+                    span,
+                    remote_response,
+                    redact=_redact,
+                )
 
             # Fall back to standard provider chain
             result = await self._get_response_frozen(
@@ -4823,6 +4915,7 @@ No other text or formatting.
             "generate_with_messages",
             messages=messages,
             model_override=model_override,
+            session_id=invocation_context.session_id,
             redact=invocation_context.redact_content,
         ) as span:
             return await self._generate_with_messages_inner(
@@ -4866,54 +4959,61 @@ No other text or formatting.
         # span's output.value under an enforcing audit (input.value was already
         # blanked when the span opened).
         _redact = invocation_context.redact_content
-        # Try remote GPU first when active AND routing isn't pinned — #734.
-        if (
-            self._backend == BackendType.REMOTE_GPU
-            and self._remote_client
-            and not force_local_only
-            and self._remote_first_allowed(model_override)
-        ):
-            try:
-                self._ensure_remote_active()
-                model = self._scrub_auto(model_override) or self._remote_config.model
-                response = await self._run_provider_attempt(
-                    self._remote_adapter.get_response(
-                        client=self._remote_client,
-                        model=model,
-                        messages=messages,
+        async with self._remote_route_attempt(
+            force_local_only=force_local_only,
+            model_override=model_override,
+            required_capabilities=(
+                "chat",
+                *(("tools",) if tools else ()),
+                *(("structured_output",) if response_format else ()),
+            ),
+        ) as remote_route:
+            if remote_route is None:
+                remote_response = None
+            else:
+                try:
+                    model = self._scrub_auto(model_override) or remote_route.model
+                    remote_response = await self._run_provider_attempt(
+                        remote_route.adapter.get_response(
+                            client=remote_route.client,
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            response_format=response_format,
+                            cancel_token=cancel_token,
+                        ),
+                        "remote_gpu",
+                        model,
+                        path="generate_with_messages.remote_gpu",
+                        invocation_context=invocation_context,
                         tools=tools,
                         response_format=response_format,
-                        cancel_token=cancel_token,
-                    ),
-                    "remote_gpu",
-                    model,
-                    path="generate_with_messages.remote_gpu",
-                    invocation_context=invocation_context,
-                    tools=tools,
-                    response_format=response_format,
-                    force_local_only=force_local_only,
+                        force_local_only=force_local_only,
+                        error_message_override=(
+                            self._managed_remote_failure_message
+                        ),
+                    )
+                except Exception as exc:
+                    self._raise_managed_remote_failure(exc)
+
+        if remote_route is not None:
+            if tools is not None or response_format is not None:
+                return self._annotate_and_return(
+                    span,
+                    remote_response,
+                    redact=_redact,
                 )
-                if tools is not None or response_format is not None:
-                    return self._annotate_and_return(span, response, redact=_redact)
-                if isinstance(response, LLMResponse):
-                    return self._annotate_and_return(span, response.content or "", redact=_redact)
-                return self._annotate_and_return(span, response, redact=_redact)
-            except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU API error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU network error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except LLMServiceError as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU service error: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
-            except Exception as exc:
-                self._last_remote_error = str(exc)
-                logger.warning(f"Remote GPU failed: {exc}, falling back", exc_info=True)
-                self._deactivate_remote_backend(reason=str(exc))
+            if isinstance(remote_response, LLMResponse):
+                return self._annotate_and_return(
+                    span,
+                    remote_response.content or "",
+                    redact=_redact,
+                )
+            return self._annotate_and_return(
+                span,
+                remote_response,
+                redact=_redact,
+            )
 
         # Fall back to standard providers (skip any disabled by auth failure).
         providers = self._available_providers()
@@ -5117,4 +5217,4 @@ No other text or formatting.
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin
 
-    # _ensure_remote_active is provided by RemoteBackendMixin
+    # Private inference lease routing is provided by RemoteBackendMixin.

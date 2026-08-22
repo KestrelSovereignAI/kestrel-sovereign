@@ -225,6 +225,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
     class FakeManager:
         init_failures = []
 
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
         async def load_from_config(self, config):
             assert config is fake_config
             events.append("agents-load")
@@ -308,9 +311,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert events == [
             "agents-load",
             "context-build",
+            "host-start",
             "host-router-mount",
             "host-ui-mount",
-            "host-start",
         ]
 
     assert events[-5:] == [

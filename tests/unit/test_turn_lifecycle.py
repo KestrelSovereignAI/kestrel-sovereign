@@ -18,7 +18,11 @@ from datetime import datetime, timezone
 import pytest
 
 from kestrel_sdk.signals import CausationFrame, ResourceLock
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.turn_lifecycle import (
+    TurnLifecycleMixin,
+    bind_turn_session,
+    capture_turn_session_binding,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 
 
@@ -29,6 +33,15 @@ class _StubAgent(TurnLifecycleMixin):
 
     def __init__(self) -> None:
         self._lock_manager = OrderedLockManager()
+
+
+class _PrivateAccessorOnlyAgent(_StubAgent):
+    """Agent shape supported during the public-accessor migration window."""
+
+    get_turn_bound_session_id = None
+
+    def _get_turn_bound_session_id(self):
+        return self._active_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +310,274 @@ async def test_clear_without_token_falls_back_safely():
     agent._set_current_chain([_frame("a", "x", 1)])
     agent._clear_current_chain(None)
     assert agent._get_current_chain() is None
+
+
+# ---------------------------------------------------------------------------
+# Turn-bound session resolution (#2877)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_turn_bound_session_is_the_live_turns_session():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        assert agent.get_turn_bound_session_id() == "chat-A"
+
+
+@pytest.mark.asyncio
+async def test_no_turn_means_no_session():
+    """Out-of-turn work (a cron tick, a CLI-filed request) has no chat window,
+    even if a turn left a value behind."""
+    agent = _StubAgent()
+    assert agent.get_turn_bound_session_id() is None
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+    assert agent.get_turn_bound_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_child_task_of_the_live_turn_sees_the_session():
+    """Tools run in tasks the turn creates and awaits — they must still
+    resolve the turn's session, or every tool-side capture breaks."""
+    agent = _StubAgent()
+
+    async def tool():
+        return agent.get_turn_bound_session_id()
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        assert await asyncio.create_task(tool()) == "chat-A"
+
+
+@pytest.mark.asyncio
+async def test_detached_task_does_not_inherit_a_later_turns_session():
+    """#2877 P1: a ContextVar is COPIED into child tasks, so a task detached
+    from turn A keeps reporting turn A's id after A exits. Pairing it with the
+    agent-global `_active_session_id` — as a naive capture does — hands that
+    task whatever turn is live *now*, cross-wiring background work into an
+    unrelated chat window. Ownership of the LIVE turn is the discriminator.
+    """
+    agent = _StubAgent()
+    turn_b_running = asyncio.Event()
+    seen: dict = {}
+
+    async def detached():
+        await turn_b_running.wait()
+        seen["turn_id"] = agent._get_current_turn_id()
+        seen["session"] = agent.get_turn_bound_session_id()
+        seen["agent_global"] = agent._active_session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        task = asyncio.create_task(detached())
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-B"
+        turn_b_running.set()
+        await task
+
+    assert seen["turn_id"], "precondition: the detached task still reports turn A"
+    assert seen["agent_global"] == "chat-B", "precondition: turn B owns the agent"
+    assert seen["session"] is None
+
+
+@pytest.mark.asyncio
+async def test_stale_explicit_binding_vetoes_ambient_turn_authority():
+    """A callback carrying turn A's binding cannot borrow later turn B."""
+    agent = _StubAgent()
+    callback_ready = asyncio.Event()
+    read_now = asyncio.Event()
+
+    async def callback():
+        callback_ready.set()
+        await read_now.wait()
+        captured = capture_turn_session_binding(agent)
+        return agent.get_turn_bound_session_id(), captured.session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        binding = capture_turn_session_binding(agent)
+        with bind_turn_session(binding):
+            # The callback copies turn A's explicit binding but never enters a
+            # turn of its own. It must retain that authority boundary while an
+            # unrelated turn B is live.
+            task = asyncio.create_task(callback())
+            await callback_ready.wait()
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-B"
+        read_now.set()
+        assert await task == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_inherited_binding_is_cleared_when_descendant_owns_new_turn():
+    """A signal task spawned under turn A owns its later wake turn B."""
+    agent = _StubAgent()
+
+    async def woken_turn():
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "wake-session-B"
+            captured = capture_turn_session_binding(agent)
+            return agent.get_turn_bound_session_id(), captured.session_id
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        binding = capture_turn_session_binding(agent)
+        with bind_turn_session(binding):
+            # SignalDispatcher creates its background dispatch task while the
+            # inline tool's binding is active. The task waits for turn A's
+            # conversation lock, then enters and owns wake turn B.
+            task = asyncio.create_task(woken_turn())
+
+    assert await task == ("wake-session-B", "wake-session-B")
+
+
+@pytest.mark.asyncio
+async def test_explicit_unbound_binding_vetoes_matching_ambient_turn():
+    """An off-turn callback stays unbound even on its matching copied turn."""
+    agent = _StubAgent()
+    binding = capture_turn_session_binding(agent)
+
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "unrelated-chat"
+        with bind_turn_session(binding):
+            nested = capture_turn_session_binding(agent)
+            assert agent.get_turn_bound_session_id() is None
+
+    assert nested.turn_id is None
+    assert nested.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_session_less_and_blank_sessions_resolve_to_none():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = None
+        assert agent.get_turn_bound_session_id() is None
+        agent._active_session_id = "   "
+        assert agent.get_turn_bound_session_id() is None
+
+
+@pytest.mark.asyncio
+async def test_private_turn_session_accessor_is_a_compatibility_alias():
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "chat-A"
+        with pytest.warns(DeprecationWarning, match="removed in 0.54.0"):
+            assert (
+                agent._get_turn_bound_session_id()
+                == agent.get_turn_bound_session_id()
+            )
+
+
+@pytest.mark.asyncio
+async def test_capture_supports_private_turn_session_accessor_compatibility():
+    """Cross-task capture matches the direct feature-read compatibility path."""
+    agent = _PrivateAccessorOnlyAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = "  chat-compat  "
+        binding = capture_turn_session_binding(agent)
+
+    assert binding.agent is agent
+    assert binding.turn_id is not None
+    assert binding.session_id == "chat-compat"
+
+
+@pytest.mark.asyncio
+async def test_live_turn_id_is_cleared_even_when_the_turn_raises():
+    agent = _StubAgent()
+    with pytest.raises(RuntimeError):
+        async with agent._turn_lifecycle():
+            agent._active_session_id = "chat-A"
+            raise RuntimeError("boom")
+    assert agent._live_turn_id is None
+    assert agent.get_turn_bound_session_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Stall observability (#2770)
+# ---------------------------------------------------------------------------
+
+
+class _NamedAgent(_StubAgent):
+    """Carries ``agent_name`` like a real KestrelAgent, so the lock label is
+    attributable to a specific agent rather than to "some turn"."""
+
+    def __init__(self, agent_name: str) -> None:
+        super().__init__()
+        self.agent_name = agent_name
+
+
+@pytest.mark.asyncio
+async def test_turn_boundaries_log_at_info(caplog):
+    """#2770: a turn that stalled inside this region left ``process_input
+    called`` as the agent's last record — begin/end were DEBUG and therefore
+    invisible in production. Both boundaries must be visible at INFO."""
+    import logging
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        async with agent._turn_lifecycle():
+            pass
+
+    assert "turn_lifecycle: Nellie turn_" in caplog.text
+    assert "begin" in caplog.text
+    assert "end after" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_exit_line_carries_the_turn_duration(caplog):
+    """Duration on the exit line so a slow turn is measurable from the log
+    alone, instead of correlating two timestamps by hand."""
+    import logging
+    import re
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        async with agent._turn_lifecycle():
+            await asyncio.sleep(0.05)
+
+    assert re.search(r"end after \d+\.\ds", caplog.text)
+
+
+@pytest.mark.asyncio
+async def test_lock_holder_is_labelled_with_agent_and_turn():
+    """The holder label is what a blocked waiter reports, so it must identify
+    the agent AND the specific turn."""
+    agent = _NamedAgent("Nellie")
+
+    async with agent._turn_lifecycle() as turn_id:
+        holder = agent._lock_manager.holder(ResourceLock.CONVERSATION)
+        assert holder is not None
+        assert holder.label == f"Nellie {turn_id}"
+
+
+@pytest.mark.asyncio
+async def test_label_degrades_gracefully_without_an_agent_name():
+    """Callers that bypass ``__init__`` (tests using ``__new__``) still get a
+    usable label rather than an AttributeError inside the lock path."""
+    agent = _StubAgent()
+
+    async with agent._turn_lifecycle() as turn_id:
+        holder = agent._lock_manager.holder(ResourceLock.CONVERSATION)
+        assert holder.label == f"agent {turn_id}"
+
+
+@pytest.mark.asyncio
+async def test_boundaries_still_log_when_the_turn_raises(caplog):
+    """A turn that dies must still close its region in the log, otherwise an
+    exception looks identical to a stall."""
+    import logging
+
+    agent = _NamedAgent("Nellie")
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError):
+            async with agent._turn_lifecycle():
+                raise RuntimeError("boom")
+
+    assert "begin" in caplog.text
+    assert "end after" in caplog.text
+    assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)

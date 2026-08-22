@@ -25,7 +25,6 @@ from ..types import (
     GenerationState,
 )
 from ..protocol import (
-    TrainingProviderError,
     ProviderNotAvailableError,
     TrainingSubmissionError,
     DownloadError,

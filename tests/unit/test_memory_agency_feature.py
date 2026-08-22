@@ -10,10 +10,14 @@ Verifies:
 - Pinning a nonexistent message returns an error
 """
 
-import json
-import pytest
+import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 class FakeDB:
@@ -339,11 +343,394 @@ class FakeGraphStore:
         self.edges.append((source_id, target_id, label))
 
 
-def _make_feature(fake_db, agent_id="test-agent", graph_store=None):
+class FakeCanonicalFactStorage:
+    """Narrow governed-storage double for MemoryAgencyFeature receipts."""
+
+    def __init__(self, tenant_id="did:example:memory-agency"):
+        from kestrel_sovereign.knowledge import Visibility
+        from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+
+        self.binding = SemanticAssertionBinding(
+            tenant_id=tenant_id,
+            owning_agent_id=tenant_id,
+            privacy_classification="normal",
+            release_policy_reference="policy:privacy:normal-v1",
+            visibility=Visibility.PRIVATE,
+        )
+        self.current = []
+        self.sources = {}
+        self.operations = {}
+        self.supersession_operations = {}
+        self.restoration_operations = {}
+        self.delete_operations = {}
+        self.forget_noop_operations = set()
+        self.revisions = {}
+        self.assertion_currents = {}
+        self.put_calls = []
+        self.supersede_calls = []
+        self.append_calls = []
+        self.restore_calls = []
+        self.delete_calls = []
+        from kestrel_sovereign.privacy import PrivacyMode
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            PrivacyEnforcingStorage,
+        )
+
+        self._governed = PrivacyEnforcingStorage(self, PrivacyMode.NORMAL)
+
+    def semantic_assertion_binding(self):
+        return self.binding
+
+    async def save_explicit_fact(self, **kwargs):
+        return await self._governed.save_explicit_fact(**kwargs)
+
+    async def forget_explicit_fact(self, **kwargs):
+        return await self._governed.forget_explicit_fact(**kwargs)
+
+    async def _replay_governed_assertion_operation(self, operation_id, *_replay_binding):
+        if operation_id in self.operations:
+            return SimpleNamespace(
+                operation="put",
+                report=self._report(),
+                assertion=self.operations[operation_id],
+                predecessor=None,
+            )
+        if operation_id in self.supersession_operations:
+            predecessor, replacement = self.supersession_operations[operation_id]
+            return SimpleNamespace(
+                operation="supersede",
+                report=self._report(),
+                assertion=replacement,
+                predecessor=predecessor,
+            )
+        if operation_id in self.restoration_operations:
+            predecessor, replacement = self.restoration_operations[
+                operation_id
+            ]
+            return SimpleNamespace(
+                operation="restore",
+                report=self._report(),
+                assertion=replacement,
+                predecessor=predecessor,
+            )
+        return None
+
+    async def _terminalize_legacy_erased_explicit_fact_operation(
+        self,
+        operation_id,
+        binding,
+    ):
+        return None
+
+    async def _replay_explicit_fact_forget_operation(
+        self,
+        operation_id,
+        *_selector,
+    ):
+        deletion = self.delete_operations.get(operation_id)
+        if deletion is not None:
+            return SimpleNamespace(
+                deleted=True,
+                deletion=deletion,
+                idempotent=True,
+            )
+        if operation_id in self.forget_noop_operations:
+            return SimpleNamespace(
+                deleted=False,
+                deletion=None,
+                idempotent=True,
+            )
+        return None
+
+    async def _record_explicit_fact_forget_noop(
+        self,
+        operation_id,
+        subject,
+        predicate,
+    ):
+        from kestrel_sovereign.storage.async_assertion_store import (
+            AssertionConflictError,
+        )
+
+        if operation_id in self.forget_noop_operations:
+            return SimpleNamespace(
+                deleted=False,
+                deletion=None,
+                idempotent=True,
+            )
+        if any(
+            assertion.subject == subject and assertion.predicate == predicate
+            for assertion in self.current
+        ):
+            raise AssertionConflictError(
+                "explicit fact selector gained a current assertion before no-op commit"
+            )
+        self.forget_noop_operations.add(operation_id)
+        return SimpleNamespace(
+            deleted=False,
+            deletion=None,
+            idempotent=False,
+        )
+
+    async def query_assertions(self, query):
+        return [
+            assertion for assertion in self.current
+            if assertion.subject == query.subject and assertion.predicate == query.predicate
+        ]
+
+    async def list_assertion_sources(self, assertion_id):
+        return list(self.sources.get(assertion_id, ()))
+
+    @staticmethod
+    def _report():
+        return SimpleNamespace(
+            state=SimpleNamespace(value="conforms"),
+            action=SimpleNamespace(value="accept"),
+            report_id="validation-report",
+        )
+
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        self.put_calls.append((assertion, source_occurrences, operation_id))
+        if operation_id in self.operations:
+            return SimpleNamespace(
+                accepted=True,
+                assertion=self.operations[operation_id],
+                report=self._report(),
+                idempotent=True,
+            )
+        self.operations[operation_id] = assertion
+        self.current = [assertion]
+        self.assertion_currents[assertion.assertion_id] = assertion
+        self.sources[assertion.assertion_id] = list(source_occurrences)
+        self.revisions[assertion.revision_id] = assertion
+        return SimpleNamespace(
+            accepted=True,
+            assertion=assertion,
+            report=self._report(),
+            idempotent=False,
+        )
+
+    async def put_validated_assertion(
+        self,
+        assertion,
+        *,
+        source_occurrences,
+        operation_id,
+    ):
+        return await self.put_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def supersede_assertion(self, revision_id, assertion, *, source_occurrences, operation_id):
+        self.supersede_calls.append((revision_id, assertion, source_occurrences, operation_id))
+        if operation_id in self.supersession_operations:
+            predecessor, replacement = self.supersession_operations[operation_id]
+            return SimpleNamespace(
+                accepted=True,
+                predecessor=predecessor,
+                replacement=replacement,
+                report=self._report(),
+                idempotent=True,
+            )
+        predecessor = self.current[0]
+        predecessor_state = replace(
+            predecessor,
+            revision_id=f"superseded:{predecessor.revision_id}",
+            status=type(predecessor.status).SUPERSEDED,
+            supersedes_revision_id=predecessor.revision_id,
+        )
+        replacement = replace(
+            assertion,
+            supersedes_revision_id=predecessor_state.revision_id,
+        )
+        self.current = [replacement]
+        self.assertion_currents[predecessor.assertion_id] = predecessor_state
+        self.assertion_currents[replacement.assertion_id] = replacement
+        self.sources.setdefault(assertion.assertion_id, []).extend(
+            source_occurrences
+        )
+        self.revisions[predecessor_state.revision_id] = predecessor_state
+        self.revisions[replacement.revision_id] = replacement
+        self.supersession_operations[operation_id] = (
+            predecessor_state,
+            replacement,
+        )
+        return SimpleNamespace(
+            accepted=True,
+            predecessor=predecessor_state,
+            replacement=replacement,
+            report=self._report(),
+            idempotent=False,
+        )
+
+    async def supersede_validated_assertion(
+        self,
+        revision_id,
+        assertion,
+        *,
+        source_occurrences,
+        operation_id,
+    ):
+        return await self.supersede_assertion(
+            revision_id,
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def append_assertion_source(
+        self,
+        revision_id,
+        assertion,
+        *,
+        source_occurrences,
+        operation_id,
+    ):
+        self.append_calls.append(
+            (revision_id, assertion, source_occurrences, operation_id)
+        )
+        return await self.supersede_assertion(
+            revision_id,
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        revision_id,
+        assertion,
+        *,
+        source_occurrences,
+        operation_id,
+    ):
+        self.restore_calls.append(
+            (revision_id, assertion, source_occurrences, operation_id)
+        )
+        if operation_id in self.restoration_operations:
+            predecessor, replacement = self.restoration_operations[
+                operation_id
+            ]
+            return SimpleNamespace(
+                accepted=True,
+                predecessor=predecessor,
+                replacement=replacement,
+                report=self._report(),
+                idempotent=True,
+            )
+        predecessor = next(
+            item
+            for item in self.assertion_currents.values()
+            if item.revision_id == revision_id
+        )
+        replacement = replace(
+            assertion,
+            supersedes_revision_id=predecessor.revision_id,
+        )
+        self.current = [replacement]
+        self.assertion_currents[replacement.assertion_id] = replacement
+        self.sources.setdefault(assertion.assertion_id, []).extend(
+            source_occurrences
+        )
+        self.revisions[replacement.revision_id] = replacement
+        self.restoration_operations[operation_id] = (
+            predecessor,
+            replacement,
+        )
+        return SimpleNamespace(
+            accepted=True,
+            predecessor=predecessor,
+            replacement=replacement,
+            report=self._report(),
+            idempotent=False,
+        )
+
+    async def get_assertion_revision(self, revision_id):
+        return self.revisions.get(revision_id)
+
+    async def get_assertion(self, assertion_id, *, include_inactive=False):
+        assertion = self.assertion_currents.get(assertion_id)
+        if assertion is None:
+            return None
+        if include_inactive or assertion.status.value == "active":
+            return assertion
+        return None
+
+    async def _delete_explicit_fact_assertion(
+        self,
+        assertion_id,
+        revision_id,
+        *,
+        operation_id,
+        explicit_fact_selector=None,
+    ):
+        self.delete_calls.append((assertion_id, revision_id, operation_id))
+        if operation_id in self.delete_operations:
+            return self.delete_operations[operation_id]
+        target = self.current.pop()
+        deleted = replace(
+            target,
+            revision_id=f"deleted:{target.revision_id}",
+            status=type(target.status).DELETED,
+            supersedes_revision_id=None,
+        )
+        self.assertion_currents[deleted.assertion_id] = deleted
+        self.revisions[deleted.revision_id] = deleted
+        result = SimpleNamespace(deleted=deleted, idempotent=False)
+        self.delete_operations[operation_id] = result
+        return result
+
+
+class PrivacyBlockedCanonicalFactStorage(FakeCanonicalFactStorage):
+    """Models the wrapper's fail-closed anonymous semantic policy."""
+
+    async def save_explicit_fact(self, **kwargs):
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+        raise PrivacyViolationError("canonical assertion operation blocked by privacy policy")
+
+    async def forget_explicit_fact(self, **kwargs):
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyViolationError
+
+        raise PrivacyViolationError("canonical assertion operation blocked by privacy policy")
+
+
+class ErasedCanonicalFactStorage(FakeCanonicalFactStorage):
+    """Models a blinded terminal replay after physical assertion erasure."""
+
+    async def _replay_governed_assertion_operation(self, operation_id, *_replay_binding):
+        return SimpleNamespace(
+            operation="put",
+            generation=7,
+            terminal_erased=True,
+        )
+
+
+class ValidationRejectedCanonicalFactStorage(FakeCanonicalFactStorage):
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        self.put_calls.append((assertion, source_occurrences, operation_id))
+        report = SimpleNamespace(
+            state=SimpleNamespace(value="nonconformant"),
+            action=SimpleNamespace(value="reject"),
+            report_id="rejected-report",
+        )
+        return SimpleNamespace(accepted=False, report=report, idempotent=False)
+
+
+class ValidationUnavailableCanonicalFactStorage(FakeCanonicalFactStorage):
+    async def put_assertion(self, assertion, *, source_occurrences, operation_id):
+        from kestrel_sovereign.knowledge.shacl_validation import ShaclCapabilityUnavailable
+
+        raise ShaclCapabilityUnavailable("the pinned SHACL profile is unavailable")
+
+
+def _make_feature(fake_db, agent_id="test-agent", graph_store=None, semantic_storage=None):
     """Create a MemoryAgencyFeature with a mocked agent and fake database."""
     from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature, PIN_QUOTA_DEFAULT
 
-    storage = MagicMock()
+    storage = semantic_storage or MagicMock()
     storage.db = fake_db
     storage.agent_id = agent_id
     storage.graph = graph_store
@@ -700,62 +1087,394 @@ async def test_pin_preserves_existing_metadata():
 
 
 # --------------------------------------------------------------------------
-# save_fact tests
+# save_fact canonical assertion tests
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_save_fact_creates_kg_node():
-    """save_fact should create a learned_fact node in the knowledge graph."""
+async def test_save_fact_creates_canonical_receipt_without_graph_write():
+    """The explicit tool has one mutation route: the governed assertion facade."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, graph_store=graph, semantic_storage=canonical)
 
     result = await feature.save_fact(
-        subject="user", predicate="favorite_number", value="445"
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
     )
 
     assert result.status is ToolResultStatus.OK
     assert result.data["saved"] is True
     assert result.data["subject"] == "user"
-    assert result.data["predicate"] == "favorite_number"
-    assert result.data["value"] == "445"
+    assert result.data["predicate"] == "preferred_deploy_region"
+    assert result.data["value"] == "us-central1"
+    assert result.data["assertion_id"].startswith("urn:kestrel:assertion:sha256:")
+    assert result.data["revision_id"]
+    assert result.data["validation_disposition"] == "conforms:accept"
+    assert result.data["provenance_reference"].startswith("source:memory-agency-save-fact-v1:")
+    assert result.data["provenance_digest"].startswith("sha256:")
 
-    # Verify KG node was created
-    fact_id = result.data["node_id"]
-    assert fact_id in graph.nodes
-    node = graph.nodes[fact_id]
-    assert node.node_type == "learned_fact"
-    assert node.label == "Favorite Number: 445"
-    assert node.properties["subject"] == "user"
-    assert node.properties["predicate"] == "favorite_number"
-    assert node.properties["value"] == "445"
-    assert node.properties["confidence"] == 1.0
-    assert node.properties["source"] == "agent_tool"
-
-    # Verify edge was created
-    assert ("test-agent", fact_id, "knows") in graph.edges
+    assertion, sources, operation_id = canonical.put_calls[0]
+    assert assertion.tenant_id == canonical.binding.tenant_id
+    assert assertion.owning_agent_id == canonical.binding.owning_agent_id
+    assert assertion.subject.value.endswith(":principal:user")
+    assert assertion.predicate.value == "https://kestrel.ai/vocab/preferredDeployRegion"
+    assert assertion.object.datatype_iri == "http://www.w3.org/2001/XMLSchema#string"
+    assert assertion.ontology_version.namespace == "https://kestrel.ai/vocab/"
+    assert assertion.ontology_version.version == "1.0.0"
+    assert assertion.ontology_version.content_digest == "db708b6790e5212bcbfd5040a1d7883da1161b05e73c809ee8d924c31b2a8044"
+    assert sources[0].locator == f"tool:memory_agency.save_fact#{operation_id}"
+    assert sources[0].actor == canonical.binding.owning_agent_id
+    assert "us-central1" not in sources[0].locator
+    assert "us-central1" not in sources[0].content_digest
+    assert graph.nodes == {}
+    assert graph.edges == []
 
 
 @pytest.mark.asyncio
-async def test_save_fact_upserts_same_subject_predicate():
-    """Saving the same subject+predicate should update the existing node."""
+async def test_save_fact_erased_replay_exposes_only_terminal_disposition():
+    """A stale retry cannot recover erased content or semantic identifiers."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    feature = _make_feature(
+        FakeDB(),
+        semantic_storage=ErasedCanonicalFactStorage(),
+    )
+    result = await feature.save_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="secret-region",
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data == {
+        "saved": False,
+        "assertion_id": None,
+        "revision_id": None,
+        "validation_disposition": "erased:terminal",
+        "validation_report_id": None,
+        "provenance_reference": None,
+        "provenance_digest": None,
+        "operation_id": result.data["operation_id"],
+        "idempotent": True,
+        "superseded_assertion_id": None,
+    }
+    assert "secret-region" not in repr(result.data)
+    assert "preferred_deploy_region" not in repr(result.data)
+
+
+@pytest.mark.asyncio
+async def test_save_fact_retries_idempotently_and_supersedes_changed_value():
+    """Retries retain provenance; changed values use the canonical lifecycle."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
 
-    await feature.save_fact(subject="user", predicate="favorite_color", value="blue")
-    result = await feature.save_fact(subject="user", predicate="favorite_color", value="green")
+    with invocation_scope("request-1"):
+        first = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="us-central1"
+        )
+        replay = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="us-central1"
+        )
+    with invocation_scope("request-2"):
+        replacement = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value="europe-west4"
+        )
 
-    assert result.status is ToolResultStatus.OK
+    assert first.status is ToolResultStatus.OK
+    assert replay.status is ToolResultStatus.OK
+    assert replay.data["idempotent"] is True
+    assert replay.data["assertion_id"] == first.data["assertion_id"]
+    assert replacement.status is ToolResultStatus.OK
+    assert replacement.data["superseded_assertion_id"] == first.data["assertion_id"]
+    assert replacement.data["assertion_id"] != first.data["assertion_id"]
+    assert len(canonical.supersede_calls) == 1
+    assert canonical.current[0].object.value == "europe-west4"
+
+
+@pytest.mark.asyncio
+async def test_save_fact_is_idempotent_after_a_percent_encoded_header_echo():
+    """An invoke response header can be retried verbatim without new evidence.
+
+    The ID has both a literal percent and text that resembles a percent escape;
+    decode-once is required to preserve both as opaque operation material.
+    """
+    from kestrel_sovereign.agent.invocation import (
+        invocation_id_from_request_header,
+        invocation_id_response_header,
+        invocation_scope,
+    )
+
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+    request_id = "teach ☃ / 100% %E2%98%83?copy=1#retry"
+    header_echo = invocation_id_response_header(request_id)
+
+    assert invocation_id_from_request_header(header_echo) == request_id
+    # A second application would mutate the semantic retry key; pin that the
+    # wire boundary applies exactly one decode and no more.
+    assert invocation_id_from_request_header("%2525E2%2525") == "%25E2%25"
+
+    with invocation_scope(invocation_id_from_request_header(header_echo)):
+        first = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+    with invocation_scope(invocation_id_from_request_header(header_echo)):
+        replay = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+
+    assert replay.data["idempotent"] is True
+    assert replay.data["assertion_id"] == first.data["assertion_id"]
+    assert len(canonical.sources[first.data["assertion_id"]]) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_fact_distinct_same_value_invocation_appends_governed_provenance():
+    """Only an exact retry is idempotent; another request retains its evidence."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
+
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+
+    with invocation_scope("teach-a"):
+        first = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+    with invocation_scope("teach-b"):
+        second = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+        replay = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+
+    assert first.data["assertion_id"] == second.data["assertion_id"]
+    assert second.data["idempotent"] is False
+    assert second.data["provenance_reference"] is not None
+    assert len(canonical.append_calls) == 1
+    assert len(canonical.sources[first.data["assertion_id"]]) == 2
+    assert replay.data["idempotent"] is True
+    assert replay.data["provenance_reference"] == second.data["provenance_reference"]
+    assert len(canonical.sources[first.data["assertion_id"]]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "retracted",
+        "quarantined",
+        "superseded",
+    ],
+)
+async def test_save_fact_does_not_restore_non_deleted_terminal_shells(
+    terminal_status,
+):
+    """Ordinary teaching cannot undo deliberate non-delete lifecycle state."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        FactLifecycleError,
+    )
+    from kestrel_sovereign.knowledge import AssertionStatus, EpistemicState
+
+    canonical = FakeCanonicalFactStorage()
+    with invocation_scope("terminal-shell-first"):
+        first = await canonical._governed.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+        )
+    active = canonical.current.pop()
+    status = AssertionStatus(terminal_status)
+    shell = replace(
+        active,
+        revision_id=f"{terminal_status}:{active.revision_id}",
+        status=status,
+        epistemic_state=(
+            EpistemicState.RETRACTED
+            if status is AssertionStatus.RETRACTED
+            else active.epistemic_state
+        ),
+        supersedes_revision_id=(
+            active.revision_id
+            if status is AssertionStatus.SUPERSEDED
+            else None
+        ),
+    )
+    canonical.assertion_currents[first.assertion_id] = shell
+    canonical.revisions[shell.revision_id] = shell
+
+    with invocation_scope(f"terminal-shell-{terminal_status}-retry"):
+        with pytest.raises(
+            FactLifecycleError,
+            match="cannot revive",
+        ):
+            await canonical._governed.save_explicit_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value="us-central1",
+                confidence=0.9,
+            )
+
+    assert canonical.restore_calls == []
+    assert canonical.current == []
+
+
+@pytest.mark.asyncio
+async def test_save_fact_logs_neither_taught_content_nor_canonical_identifiers():
+    """Operator logs retain only fixed outcome metadata for explicit facts."""
+    taught_value = "PRIVATE_FACT_VALUE_DO_NOT_LOG"
+    feature = _make_feature(FakeDB(), semantic_storage=FakeCanonicalFactStorage())
+
+    with patch("kestrel_sovereign.features.memory_agency.feature.logger.info") as info:
+        result = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=taught_value,
+        )
+
+    assert result.data["assertion_id"] is not None
+    log_text = " ".join(
+        str(part)
+        for call in info.call_args_list
+        for part in (*call.args, *call.kwargs.values())
+    )
+    assert taught_value not in log_text
+    assert result.data["assertion_id"] not in log_text
+
+
+@pytest.mark.asyncio
+async def test_save_fact_uses_task_local_invocation_not_agent_global_request_id():
+    """Concurrent turns retain their own canonical operation provenance."""
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        _operation_material,
+    )
+
+    async def teach(invocation_id, value):
+        canonical = FakeCanonicalFactStorage()
+        feature = _make_feature(FakeDB(), semantic_storage=canonical)
+        # This is deliberately wrong for both turns. Provenance must never use
+        # the shared lifecycle fallback.
+        feature.agent._current_request_id = "wrong-shared-request-id"
+        with invocation_scope(invocation_id):
+            await asyncio.sleep(0)
+            result = await feature.save_fact(
+                subject="user",
+                predicate="preferred_deploy_region",
+                value=value,
+            )
+        return result, _operation_material(
+            action="save",
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=value,
+            confidence_requested=1.0,
+            invocation_id=invocation_id,
+        )[0]
+
+    first, second = await asyncio.gather(
+        teach("turn-a", "us-central1"),
+        teach("turn-b", "europe-west4"),
+    )
+
+    assert first[0].data["operation_id"] == first[1]
+    assert second[0].data["operation_id"] == second[1]
+    assert first[0].data["operation_id"] != second[0].data["operation_id"]
+
+
+@pytest.mark.asyncio
+async def test_save_fact_uses_authenticated_task_local_provenance_not_agent_owner():
+    """The tool cannot choose actor/source fields; the trusted turn can."""
+    from kestrel_sovereign.agent.invocation import (
+        invocation_scope,
+        request_provenance,
+    )
+
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+    provenance = request_provenance(
+        actor="owner@example.test",
+        source_kind="http_request",
+        source_locator="POST:/v1/chat/completions",
+        received_at="2026-07-26T12:00:00+00:00",
+    )
+
+    with invocation_scope("openai-retry-2765", provenance=provenance):
+        result = await feature.save_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+        )
+
     assert result.data["saved"] is True
-    assert result.data["value"] == "green"
+    _, sources, _ = canonical.put_calls[0]
+    source = sources[0]
+    assert source.actor == "owner@example.test"
+    assert source.source_kind == "http_request"
+    assert source.locator.startswith(
+        "POST:/v1/chat/completions#tool:memory_agency.save_fact#"
+    )
+    assert source.received_at.value == "2026-07-26T12:00:00Z"
+    assert source.actor != canonical.binding.owning_agent_id
 
-    # Should still be one node (upserted)
-    fact_id = "fact:test-agent:user:favorite_color"
-    assert graph.nodes[fact_id].label == "Favorite Color: green"
-    assert graph.nodes[fact_id].properties["value"] == "green"
+
+def test_nested_invocation_keeps_trusted_request_provenance_for_command_delegation():
+    """Streaming command delegation must not clear the outer HTTP context."""
+    from kestrel_sovereign.agent.invocation import (
+        current_invocation_provenance,
+        invocation_scope,
+        request_provenance,
+    )
+
+    provenance = request_provenance(
+        actor="owner@example.test",
+        source_kind="http_request",
+        source_locator="POST:/api/agent/stream",
+        received_at="2026-07-26T12:00:00Z",
+    )
+    with invocation_scope("outer-retry-2765", provenance=provenance):
+        with invocation_scope("nested-command"):
+            assert current_invocation_provenance() is provenance
+
+
+@pytest.mark.asyncio
+async def test_save_fact_without_a_turn_generates_fresh_direct_invocation_ids():
+    """Non-HTTP producers no longer share the permanent ``direct`` identity."""
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(FakeDB(), semantic_storage=canonical)
+
+    first = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    second = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="europe-west4"
+    )
+    third = await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+
+    assert first.data["saved"] is True
+    assert second.data["saved"] is True
+    assert third.data["saved"] is True
+    assert first.data["operation_id"] != second.data["operation_id"]
+    assert second.data["operation_id"] != third.data["operation_id"]
+    assert len(canonical.supersede_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -763,20 +1482,22 @@ async def test_save_fact_clamps_confidence():
     """Out-of-range confidence is clamped and surfaced as PARTIAL."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
 
     result = await feature.save_fact(
-        subject="user", predicate="test", value="x", confidence=2.5
+        subject="user", predicate="preferred_deploy_region", value="x", confidence=2.5
     )
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["confidence"] == 1.0
     assert result.data["confidence_requested"] == 2.5
     assert result.data["confidence_clamped"] is True
     assert "clamped" in result.error
+    assert "assertion_id=" in result.confirmation
+    assert "provenance_reference=" in result.confirmation
 
     result = await feature.save_fact(
-        subject="user", predicate="test2", value="y", confidence=-0.5
+        subject="user", predicate="preferred_deploy_region", value="y", confidence=-0.5
     )
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["confidence"] == 0.0
@@ -784,16 +1505,437 @@ async def test_save_fact_clamps_confidence():
 
 
 @pytest.mark.asyncio
-async def test_save_fact_without_graph_returns_error():
-    """save_fact should return error if graph store is not available."""
+async def test_save_fact_rejects_unsupported_or_ambiguous_legacy_terms():
+    """The adapter never turns free-form local strings into new ontology terms."""
     from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
-    feature = _make_feature(db, graph_store=None)
+    feature = _make_feature(db, semantic_storage=FakeCanonicalFactStorage())
 
-    result = await feature.save_fact(subject="user", predicate="name", value="Alice")
+    result = await feature.save_fact(
+        subject="us\u00e9r", predicate="preferred_deploy_region", value="Berlin"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported subject" in result.error
+
+    result = await feature.save_fact(
+        subject="urn:kestrel:agent:forged-tenant:principal:user",
+        predicate="preferred_deploy_region",
+        value="Berlin",
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported subject" in result.error
+
+    result = await feature.save_fact(
+        subject="user", predicate="https://example.test/adversarial", value="Berlin"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "unsupported predicate" in result.error
+
+
+@pytest.mark.asyncio
+async def test_save_fact_keeps_unicode_as_a_typed_literal_not_an_iri():
+    """Unicode values are explicit literal data, never inferred semantic terms."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+
+    result = await feature.save_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="東京-中央",
+    )
+
+    assert result.status is ToolResultStatus.OK
+    assertion = canonical.put_calls[0][0]
+    assert assertion.object.lexical_form == "東京-中央"
+    assert assertion.object.datatype_iri == "http://www.w3.org/2001/XMLSchema#string"
+
+
+@pytest.mark.asyncio
+async def test_save_fact_surfaces_validation_rejection_and_unavailability_honestly():
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    rejected = _make_feature(
+        db,
+        semantic_storage=ValidationRejectedCanonicalFactStorage(),
+    )
+    result = await rejected.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["assertion_id"] is None
+    assert result.data["validation_disposition"] == "nonconformant:reject"
+
+    unavailable = _make_feature(
+        db,
+        semantic_storage=ValidationUnavailableCanonicalFactStorage(),
+    )
+    result = await unavailable.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "SHACL profile is unavailable" in result.error
+
+
+@pytest.mark.asyncio
+async def test_forget_fact_uses_canonical_delete_for_the_current_adapter_fact():
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+
+    result = await feature.forget_fact("user", "preferred_deploy_region")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["deleted"] is True
+    assert len(canonical.delete_calls) == 1
+    assert canonical.current == []
+
+
+@pytest.mark.asyncio
+async def test_forget_fact_refuses_a_current_foreign_lifecycle_target():
+    """Matching local terms never let this adapter delete another producer's fact."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    db = FakeDB()
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    await feature.save_fact(
+        subject="user", predicate="preferred_deploy_region", value="us-central1"
+    )
+    canonical.current = [
+        replace(canonical.current[0], confidence_method="other-producer-v1")
+    ]
+
+    result = await feature.forget_fact("user", "preferred_deploy_region")
 
     assert result.status is ToolResultStatus.ERROR
-    assert "not available" in result.error
+    assert "outside save_fact" in result.error
+    assert canonical.delete_calls == []
+
+
+async def _finish_fact_after_refused_privacy_transition(
+    canonical,
+    task,
+    entered,
+    release,
+):
+    """Prove the fact lease wins before allowing a restrictive transition."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyViolationError,
+    )
+
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    wrapper = canonical._governed
+    with pytest.raises(PrivacyViolationError, match="in flight"):
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert wrapper.privacy_mode is PrivacyMode.NORMAL
+
+    release.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    # Cancellation, errors, and ordinary returns all release the same lease.
+    # This successful retry proves the completed path did not leak it.
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+    return result
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_is_linearized_with_save_fact_replay():
+    """A replay cannot return durable content after a successful mode flip."""
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    first = await wrapper.save_explicit_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="us-central1",
+        confidence=0.9,
+        invocation_id="privacy-lease-save-replay",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = canonical._replay_governed_assertion_operation
+
+    async def blocked_replay(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    canonical._replay_governed_assertion_operation = blocked_replay
+    task = asyncio.create_task(
+        wrapper.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="privacy-lease-save-replay",
+        )
+    )
+
+    replay = await _finish_fact_after_refused_privacy_transition(
+        canonical,
+        task,
+        entered,
+        release,
+    )
+    assert replay.idempotent is True
+    assert replay.assertion_id == first.assertion_id
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_is_linearized_with_legacy_terminalization():
+    """The legacy-erasure check cannot race a later durable fact commit."""
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = (
+        canonical._terminalize_legacy_erased_explicit_fact_operation
+    )
+
+    async def blocked_terminalization(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    canonical._terminalize_legacy_erased_explicit_fact_operation = (
+        blocked_terminalization
+    )
+    task = asyncio.create_task(
+        wrapper.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="privacy-lease-legacy-terminalization",
+        )
+    )
+
+    result = await _finish_fact_after_refused_privacy_transition(
+        canonical,
+        task,
+        entered,
+        release,
+    )
+    assert result.saved is True
+    assert len(canonical.put_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_is_linearized_with_forget_fact_replay():
+    """A delete replay cannot disclose identifiers after a successful flip."""
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    await wrapper.save_explicit_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="us-central1",
+        confidence=0.9,
+        invocation_id="privacy-lease-forget-source",
+    )
+    first = await wrapper.forget_explicit_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        invocation_id="privacy-lease-forget-replay",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = canonical._replay_explicit_fact_forget_operation
+
+    async def blocked_replay(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    canonical._replay_explicit_fact_forget_operation = blocked_replay
+    task = asyncio.create_task(
+        wrapper.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="privacy-lease-forget-replay",
+        )
+    )
+
+    replay = await _finish_fact_after_refused_privacy_transition(
+        canonical,
+        task,
+        entered,
+        release,
+    )
+    assert replay.deleted is True
+    assert replay.idempotent is True
+    assert replay.assertion_id == first.assertion_id
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_is_linearized_with_absent_forget_noop():
+    """An absent-target receipt is not persisted after a restrictive flip."""
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = canonical._record_explicit_fact_forget_noop
+
+    async def blocked_noop(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    canonical._record_explicit_fact_forget_noop = blocked_noop
+    task = asyncio.create_task(
+        wrapper.forget_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            invocation_id="privacy-lease-absent-forget",
+        )
+    )
+
+    result = await _finish_fact_after_refused_privacy_transition(
+        canonical,
+        task,
+        entered,
+        release,
+    )
+    assert result.deleted is False
+    assert result.idempotent is False
+    assert len(canonical.forget_noop_operations) == 1
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_is_linearized_with_fact_restoration():
+    """Restoring a deleted fact remains within one privacy-mode epoch."""
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    await wrapper.save_explicit_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        value="us-central1",
+        confidence=0.9,
+        invocation_id="privacy-lease-restore-source",
+    )
+    await wrapper.forget_explicit_fact(
+        subject="user",
+        predicate="preferred_deploy_region",
+        invocation_id="privacy-lease-restore-delete",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = canonical._restore_explicit_fact_assertion
+
+    async def blocked_restore(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    canonical._restore_explicit_fact_assertion = blocked_restore
+    task = asyncio.create_task(
+        wrapper.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="privacy-lease-restore-new-teaching",
+        )
+    )
+
+    result = await _finish_fact_after_refused_privacy_transition(
+        canonical,
+        task,
+        entered,
+        release,
+    )
+    assert result.saved is True
+    assert result.idempotent is False
+    assert len(canonical.restore_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fact_operation_releases_privacy_transition_lease():
+    """Cancellation cannot permanently block later privacy transitions."""
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_replay(*_args, **_kwargs):
+        entered.set()
+        await never_release.wait()
+
+    canonical._replay_governed_assertion_operation = blocked_replay
+    task = asyncio.create_task(
+        wrapper.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="us-central1",
+            confidence=0.9,
+            invocation_id="privacy-lease-cancelled-save",
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    assert wrapper.privacy_mode is PrivacyMode.EPHEMERAL
+
+
+def test_nested_fact_leases_release_exactly_once_before_transition():
+    """Nested same-task leases cannot leak or release each other early."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyViolationError,
+    )
+
+    wrapper = FakeCanonicalFactStorage()._governed
+    wrapper._acquire_explicit_fact_lease()
+    wrapper._acquire_explicit_fact_lease()
+    with pytest.raises(PrivacyViolationError, match="in flight"):
+        wrapper.set_privacy_mode(PrivacyMode.ISOLATED)
+
+    wrapper._release_explicit_fact_lease()
+    with pytest.raises(PrivacyViolationError, match="in flight"):
+        wrapper.set_privacy_mode(PrivacyMode.ISOLATED)
+
+    wrapper._release_explicit_fact_lease()
+    wrapper.set_privacy_mode(PrivacyMode.ISOLATED)
+    assert wrapper.privacy_mode is PrivacyMode.ISOLATED
+
+
+@pytest.mark.asyncio
+async def test_restrictive_transition_wins_before_fact_lease_acquisition():
+    """If the mode flip linearizes first, fact code never reaches raw storage."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import (
+        PrivacyViolationError,
+    )
+
+    canonical = FakeCanonicalFactStorage()
+    wrapper = canonical._governed
+    wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+
+    with pytest.raises(PrivacyViolationError, match="durable"):
+        await wrapper.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="do-not-persist",
+            confidence=0.9,
+            invocation_id="privacy-transition-won-first",
+        )
+
+    assert canonical.put_calls == []
+    assert canonical.operations == {}
 
 
 # --------------------------------------------------------------------------
@@ -854,50 +1996,43 @@ async def test_memory_pinned_excludes_trashed_pin():
 
 
 @pytest.mark.asyncio
-async def test_save_fact_blocked_in_isolated_privacy_mode():
-    """save_fact must not persist to the KG when persistent memory is hidden (F213)."""
+@pytest.mark.parametrize("storage_mode", ["none", "temp", "deidentified"])
+async def test_save_fact_blocked_in_volatile_privacy_modes(storage_mode):
+    """EPHEMERAL, ISOLATED, and DEIDENTIFIED never reach semantic storage."""
     from kestrel_sdk.tools.result import ToolResultStatus
     from kestrel_sovereign.privacy import PrivacyConfig
 
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
-    # ISOLATED uses temporary session storage (storage="temp").
-    feature.agent.privacy_config = PrivacyConfig(storage="temp", llm_location="local")
+    canonical = FakeCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
+    feature.agent.privacy_config = PrivacyConfig(storage=storage_mode, llm_location="local")
 
     result = await feature.save_fact(
-        subject="user", predicate="secret", value="do-not-persist"
+        subject="user", predicate="preferred_deploy_region", value="do-not-persist"
     )
 
     assert result.status is ToolResultStatus.ERROR
     assert "privacy mode" in result.error
-    # Nothing was written to the persistent graph store.
-    assert graph.nodes == {}
-    assert graph.edges == []
+    assert canonical.put_calls == []
 
 
 @pytest.mark.asyncio
-async def test_save_fact_anonymized_under_anonymous_mode():
-    """Under ANONYMOUS, save_fact anonymizes fields before persisting (F213)."""
+async def test_save_fact_anonymous_mode_fails_closed_without_a_redacted_assertion_pipeline():
+    """String redaction is not a semantics-preserving canonical transformation."""
     from kestrel_sdk.tools.result import ToolResultStatus
     from kestrel_sovereign.privacy import PrivacyConfig
 
     db = FakeDB()
-    graph = FakeGraphStore()
-    feature = _make_feature(db, graph_store=graph)
-    # ANONYMOUS redacts PII before persistence (storage="pii_redacted").
+    canonical = PrivacyBlockedCanonicalFactStorage()
+    feature = _make_feature(db, semantic_storage=canonical)
     feature.agent.privacy_config = PrivacyConfig(
         storage="pii_redacted", llm_location="local"
     )
 
     result = await feature.save_fact(
-        subject="user", predicate="email", value="jane@example.com"
+        subject="user", predicate="preferred_deploy_region", value="jane@example.com"
     )
 
-    assert result.status is ToolResultStatus.OK
-    fact_id = result.data["node_id"]
-    node = graph.nodes[fact_id]
-    # The raw email must not have been persisted.
-    assert "jane@example.com" not in node.properties["value"]
-    assert "[EMAIL_REDACTED]" in node.properties["value"]
-    assert "jane@example.com" not in result.data["value"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "privacy" in result.error
+    assert canonical.put_calls == []

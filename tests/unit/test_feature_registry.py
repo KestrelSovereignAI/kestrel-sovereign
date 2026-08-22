@@ -13,6 +13,8 @@ from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
     InstalledFeatureRuntime,
+    PackageBoundary,
+    RegistryValidationError,
     SkillInfo,
     discover_installed_feature_runtimes,
     get_all_skills,
@@ -22,8 +24,10 @@ from kestrel_sovereign.feature_registry import (
     get_skills_for_package,
     load_registry,
     resolve_status,
+    validate_registry,
     REGISTRY_PATH,
 )
+from kestrel_sovereign.features import discover_local_feature_class_names
 
 
 class TestLoadRegistry:
@@ -42,13 +46,19 @@ class TestLoadRegistry:
         assert len(registry) >= 18, f"Expected >=18 packages, got {len(registry)}: {sorted(registry.keys())}"
 
     def test_each_entry_has_required_fields(self):
-        """Every entry has package, git, features, description."""
+        """Every entry has common catalog fields and boundary-specific names."""
         registry = load_registry()
         for name, info in registry.items():
             assert info.package, f"{name} missing package"
             assert info.git, f"{name} missing git"
-            assert len(info.features) > 0, f"{name} has no features"
             assert info.description, f"{name} missing description"
+            if info.boundary in {
+                PackageBoundary.BUNDLED,
+                PackageBoundary.FEATURE_PACKAGE,
+            }:
+                assert info.features, f"{name} has no Feature lifecycle classes"
+            else:
+                assert info.features == [], f"{name} conflates non-Feature classes"
 
     def test_each_entry_has_tags_and_icon(self):
         """Every entry has tags and icon for UI rendering."""
@@ -93,7 +103,9 @@ class TestLoadRegistry:
         """The published xAI provider distribution is installable by registry."""
         voice_xai = load_registry()["voice_xai"]
         assert voice_xai.package == "kestrel-voice-xai"
-        assert set(voice_xai.features) == {
+        assert voice_xai.boundary is PackageBoundary.PROVIDER_PACKAGE
+        assert voice_xai.features == []
+        assert set(voice_xai.provider_classes) == {
             "XAITTSProvider",
             "XAISTTProvider",
             "XAIRealtimeConversationProvider",
@@ -118,6 +130,99 @@ class TestLoadRegistry:
             "SpawnFeature", "ObservabilityFeature",
         }
         assert expected.issubset(all_classes), f"Missing: {expected - all_classes}"
+
+    def test_talon_models_external_feature_and_standalone_companion(self):
+        registry = load_registry()
+
+        coordinator = registry["talon"]
+        assert coordinator.boundary is PackageBoundary.FEATURE_PACKAGE
+        assert coordinator.package == "kestrel-feature-talon"
+        assert coordinator.features == ["TalonCoordinatorFeature"]
+        assert coordinator.companion == "talon_cli"
+        assert coordinator.core is False
+
+        companion = registry["talon_cli"]
+        assert companion.boundary is PackageBoundary.STANDALONE_TOOL
+        assert companion.package == "kestrel-talon"
+        assert companion.command == "kestrel-talon"
+        assert companion.features == []
+
+    def test_privacy_is_bundled_but_not_a_feature_lifecycle_class(self):
+        privacy = load_registry()["privacy"]
+
+        assert privacy.boundary is PackageBoundary.BUNDLED_COMPONENT
+        assert privacy.package == "kestrel-sovereign"
+        assert privacy.features == []
+        assert privacy.bundled_components == ["PrivacyAgent"]
+
+    def test_bundled_registry_exactly_matches_in_tree_discovery(self):
+        registry = load_registry()
+        validate_registry(
+            registry,
+            bundled_feature_classes=discover_local_feature_class_names(),
+        )
+
+    @pytest.mark.parametrize(
+        ("info", "message"),
+        [
+            (
+                FeaturePackageInfo(
+                    name="bad-bundle",
+                    package="external-package",
+                    git="https://example.com",
+                    features=["BadFeature"],
+                    description="bad",
+                    core=True,
+                    boundary=PackageBoundary.BUNDLED,
+                ),
+                "bundled rows must be owned",
+            ),
+            (
+                FeaturePackageInfo(
+                    name="bad-provider",
+                    package="provider-package",
+                    git="https://example.com",
+                    features=["NotAFeature"],
+                    description="bad",
+                    boundary=PackageBoundary.PROVIDER_PACKAGE,
+                    provider_classes=["Provider"],
+                    entry_point_groups=["kestrel_feature_voice_providers"],
+                ),
+                "provider implementations belong",
+            ),
+            (
+                FeaturePackageInfo(
+                    name="bad-tool",
+                    package="standalone",
+                    git="https://example.com",
+                    features=[],
+                    description="bad",
+                    boundary=PackageBoundary.STANDALONE_TOOL,
+                ),
+                "must declare their command",
+            ),
+        ],
+    )
+    def test_validation_rejects_ambiguous_boundary_combinations(
+        self, info, message
+    ):
+        with pytest.raises(RegistryValidationError, match=message):
+            validate_registry({info.name: info})
+
+    def test_registry_toml_requires_explicit_boundary(self, tmp_path):
+        path = tmp_path / "registry.toml"
+        path.write_text(
+            """
+[ambiguous]
+package = "some-package"
+git = "https://example.com"
+features = ["SomeFeature"]
+description = "Ambiguous"
+""".strip()
+        )
+
+        with pytest.raises(RegistryValidationError, match="missing required"):
+            load_registry(path)
 
 
 class TestResolveStatus:
@@ -159,8 +264,13 @@ class TestResolveStatus:
                 name="voice_xai",
                 package="kestrel-voice-xai",
                 git="https://example.com/voice-xai.git",
-                features=["XAIRealtimeConversationProvider"],
+                features=[],
                 description="xAI realtime voice",
+                boundary=PackageBoundary.PROVIDER_PACKAGE,
+                provider_classes=["XAIRealtimeConversationProvider"],
+                entry_point_groups=[
+                    "kestrel_sovereign.conversation_providers"
+                ],
             ),
         }
         ep = _FakeEntryPoint(
@@ -176,6 +286,60 @@ class TestResolveStatus:
             resolve_status(registry)
 
         assert registry["voice_xai"].status == FeatureStatus.INSTALLED
+
+    def test_standalone_distribution_marks_tool_installed(self):
+        registry = {
+            "tool": FeaturePackageInfo(
+                name="tool",
+                package="standalone-tool",
+                git="https://example.com/tool.git",
+                features=[],
+                description="Standalone",
+                boundary=PackageBoundary.STANDALONE_TOOL,
+                command="standalone-tool",
+            ),
+        }
+
+        with patch(
+            "kestrel_sovereign.feature_registry._is_distribution_installed",
+            return_value=True,
+        ):
+            resolve_status(registry)
+
+        assert registry["tool"].status == FeatureStatus.INSTALLED
+
+    def test_provider_class_in_feature_group_does_not_mark_provider_installed(
+        self,
+    ):
+        registry = {
+            "provider": FeaturePackageInfo(
+                name="provider",
+                package="provider-package",
+                git="https://example.com/provider.git",
+                features=[],
+                description="Provider",
+                boundary=PackageBoundary.PROVIDER_PACKAGE,
+                provider_classes=["SharedName"],
+                entry_point_groups=[
+                    "kestrel_sovereign.conversation_providers"
+                ],
+            ),
+        }
+        ep = _FakeEntryPoint(
+            name="SharedName",
+            value="feature:SharedName",
+            dist=_FakeDistribution("wrong-feature-package", None),
+        )
+
+        with patch(
+            "kestrel_sovereign.feature_registry.iter_extension_entry_points",
+            return_value=[
+                ("kestrel_sovereign.features", ep),
+            ],
+        ):
+            resolve_status(registry)
+
+        assert registry["provider"].status == FeatureStatus.AVAILABLE
 
     def test_extension_groups_cover_current_and_legacy_voice_packages(self):
         assert "kestrel_feature_voice_providers" in EXTENSION_ENTRY_POINT_GROUPS

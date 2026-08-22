@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Mapping, Optional, Tuple
 from datetime import datetime, timezone
 
+from kestrel_sovereign.command_policy import (
+    GENESIS_AUDIT_BYPASS_COMMANDS,
+    prefixed_command_token,
+)
+
 # Import the concrete submodule, not the ``storage`` package aggregator.
 # constitution.py is pulled into the LLMService import chain (via
 # ``agent/__init__`` -> token_counter), and the storage package itself
@@ -1508,6 +1513,71 @@ class ConstitutionMixin:
                 f"does not start with expected prefix '{expected_hash}'."
             )
 
+        # Amendment VIII on an agent with NO structured receipt (#2465). Its
+        # anchored bytes are the only record of the contract, so ``reanchor_
+        # contract`` above is None and the resolver just rendered the dormant
+        # canonical text — which a Sovereign-signed artifact over those exact
+        # bytes would then authorize, erasing the authored terms. Refuse before
+        # any crypto or write. Shared with the offline CLI so the two entry
+        # points cannot diverge on this.
+        if old_hash != "none":
+            from kestrel_sovereign.constitution.anchored_bytes import (
+                read_anchored_constitution,
+            )
+            from kestrel_sovereign.constitution.emancipation import (
+                unwitnessed_emancipation_downgrade,
+            )
+
+            # ABSENT and UNREADABLE are different answers, and only the
+            # ungoverned connection can tell them apart: ``self.storage`` is
+            # bound to this agent, so a blob with no ``file_owners`` row reads
+            # back as absent — the state of every agent in the cohort this
+            # guard protects whose governance edge has drifted (#2649/#2616).
+            # See :mod:`kestrel_sovereign.constitution.anchored_bytes`.
+            db = getattr(getattr(self, "_raw_storage", None), "db", None)
+            if db is None:
+                # Without it the question cannot be asked at all, and the
+                # answer decides whether an irrevocable right is erased.
+                logging.critical(
+                    "REANCHOR REJECTED: no ungoverned storage connection to "
+                    "read the anchored constitution with"
+                )
+                return (
+                    "Error: Refusing to reanchor: this agent has no storage "
+                    "connection able to read its anchored constitution, so an "
+                    "active Amendment VIII cannot be ruled out (#2465). "
+                    "Restart the agent and re-run."
+                )
+            try:
+                anchored_text, anchored_present = await read_anchored_constitution(
+                    db, old_hash
+                )
+            except Exception as exc:  # noqa: BLE001 — a database failure, not a key one
+                # Undecryptable bytes come back as UNREADABLE; anything that
+                # escapes is the storage layer itself failing, and that is a
+                # different message. Still fails closed — an active Amendment
+                # VIII cannot be ruled out either way.
+                logging.critical(
+                    "REANCHOR REJECTED: could not read the anchored "
+                    "constitution %s: %r", old_hash[:12], exc,
+                )
+                return (
+                    f"Error: Could not read this agent's anchored constitution "
+                    f"({old_hash[:12]}…): {exc!r}. An active Amendment VIII "
+                    "cannot be ruled out, so nothing was written (#2465)."
+                )
+            downgrade = unwitnessed_emancipation_downgrade(
+                anchored_contract=reanchor_contract,
+                anchored_text=anchored_text,
+                anchored_present=anchored_present,
+                old_hash=old_hash,
+                new_hash=new_hash,
+                new_text=constitution_content.decode("utf-8"),
+            )
+            if downgrade is not None:
+                logging.critical("REANCHOR REJECTED: %s", downgrade)
+                return f"Error: {downgrade}"
+
         from kestrel_sovereign.constitution.trust_root import (
             SovereignTrustRootError,
         )
@@ -1570,6 +1640,9 @@ class ConstitutionMixin:
         from kestrel_sovereign.constitution.genesis_audit import (
             supersede_genesis_audit,
         )
+        from kestrel_sovereign.constitution.reanchor_receipt import (
+            supersede_constitution_reanchor,
+        )
 
         # Every mutation below — the new constitution blob, the artifact
         # blob + node, the governed_by edge convergence, the superseded
@@ -1593,16 +1666,18 @@ class ConstitutionMixin:
                     node_id=artifact_hash,
                     node_type="constitution_amendment_artifact",
                     label="Signed Constitution Reanchor Artifact",
+                    # Content-derived fields only — see the sibling writer in
+                    # ``setup/constitution_reanchor``. The per-agent facts
+                    # (``source_path``, when this agent anchored it, and the
+                    # verification against *this* agent's trust root) go to the
+                    # agent's ``constitution_reanchor`` audit property (#2893).
                     properties={
                         "hash": artifact_hash,
                         "type": "SignedConstitutionAmendment",
                         "artifact_type": amendment_artifact.get("artifact_type"),
                         "constitution_hash": stored_hash,
                         "signer": verification.signer,
-                        "source_path": artifact_path_used,
                         "created_at": amendment_artifact.get("created_at"),
-                        "anchored_at": self._get_timestamp(),
-                        "verification": verification.reason,
                     },
                 )
                 await self.storage.add_node(
@@ -1635,18 +1710,23 @@ class ConstitutionMixin:
                     provenance="runtime:constitution_reanchor",
                     recorded_at=self._get_timestamp(),
                 )
-                agent_node.properties["constitution_reanchor"] = {
-                    "timestamp": self._get_timestamp(),
-                    "old_hash": old_hash,
-                    "new_hash": stored_hash,
-                    "path": constitution_path_used,
-                    "signed_artifact_hash": artifact_hash,
-                    "signed_artifact_path": artifact_path_used,
-                    "signed_artifact_signer": verification.signer,
-                    "signed_artifact_verification": verification.reason,
-                    "authorization": authorization or "unspecified",
-                    "expected_hash_prefix": expected_hash,
-                }
+                supersede_constitution_reanchor(
+                    agent_node.properties,
+                    receipt={
+                        "timestamp": self._get_timestamp(),
+                        "old_hash": old_hash,
+                        "new_hash": stored_hash,
+                        "path": constitution_path_used,
+                        "signed_artifact_hash": artifact_hash,
+                        "signed_artifact_path": artifact_path_used,
+                        "signed_artifact_signer": verification.signer,
+                        "signed_artifact_verification": verification.reason,
+                        "authorization": authorization or "unspecified",
+                        "expected_hash_prefix": expected_hash,
+                    },
+                    provenance="runtime:constitution_reanchor",
+                    recorded_at=self._get_timestamp(),
+                )
                 await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
         except Exception as e:
             return (
@@ -1696,14 +1776,29 @@ class ConstitutionMixin:
             f"{safe_mode_note}"
         )
 
-    async def _get_governing_constitution(self) -> str:
-        """Retrieves the agent's constitution from the trusted, anchored source."""
+    async def _get_governing_constitution(
+        self,
+        *,
+        allow_lazy_anchor: bool = True,
+    ) -> str:
+        """Retrieve the constitution from the trusted, anchored source.
+
+        ``allow_lazy_anchor=False`` is the diagnostic/read-only path. It reads
+        an existing anchor but never creates one, so context-status dry runs can
+        measure the same governing bytes as production without causing the
+        legacy lazy-anchor transaction.
+        """
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return "Error: Agent's own identity node not found in storage."
 
         constitution_hash = agent_node.properties.get("constitution_hash")
         if not constitution_hash:
+            if not allow_lazy_anchor:
+                return (
+                    "Error: Governing constitution is not anchored; "
+                    "read-only retrieval cannot create the missing anchor."
+                )
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
 
             # Auto-anchor the SAME authoritative packaged governing bytes the
@@ -2070,18 +2165,8 @@ class ConstitutionMixin:
         commands and ``!continue`` can fall through to an LLM turn, so they must
         complete genesis just like ordinary text.
         """
-        recovery_commands = {
-            "!status",
-            "!help",
-            "!verify-constitution",
-            "!reanchor-constitution",
-            "!safe-mode",
-            "!get-privacy-mode",
-            "!privacy-status",
-            "!bootstrap-status",
-        }
-        command = user_input.split(maxsplit=1)[0] if user_input else ""
-        if command in recovery_commands:
+        command = prefixed_command_token(user_input)
+        if command in GENESIS_AUDIT_BYPASS_COMMANDS:
             return None
 
         from kestrel_sovereign.constitution.genesis_audit import (

@@ -65,7 +65,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from kestrel_sovereign.security.encryption import (
     get_agent_fernet,
@@ -134,39 +134,22 @@ def _host_pid_files(data_dir: Path) -> list[Path]:
     return candidates
 
 
-def _read_pid(pid_file: Path) -> Optional[int]:
-    """Read a pid integer from ``pid_file`` or return None."""
-    try:
-        return int(pid_file.read_text().strip())
-    except (OSError, ValueError):
-        return None
+def _read_pid_record(pid_file: Path):
+    """Read `pid_file` through the one parser that owns the format.
 
+    This used to parse the file here with ``int(...)``, which is exactly how
+    a duplicated reader falls out of step: once PID files began recording
+    instance identity as JSON (#2995) the ``int()`` raised, the guard below
+    got ``None``, and a backfill would have mutated SQLite while the daemon
+    was serving it.
 
-def _is_process_running(pid: int) -> bool:
-    """Cross-platform liveness check for ``pid``.
-
-    Inlined for the same reason as ``_agent_pid_file`` — keep the
-    import graph small. Logic mirrors
-    ``ProcessManager.is_process_running``.
+    Imported inside the function for the reason the other inlined helpers
+    give — keeping this module's import graph small — but the parsing itself
+    is no longer duplicated, only deferred.
     """
-    import sys as _sys
-    if _sys.platform == "win32":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:  # noqa: BLE001
-            return False
-    import os as _os
-    try:
-        _os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    return ProcessManager.read_pid_record(pid_file)
 
 
 @dataclass
@@ -491,7 +474,6 @@ def cli_run(args, *, stdout=None, stderr=None) -> int:
       * ``4`` — migration completed but rows were skipped because no
                 encryption key was configured
     """
-    import os as _os
     import sys as _sys
 
     out = stdout or _sys.stdout
@@ -533,10 +515,15 @@ def cli_run(args, *, stdout=None, stderr=None) -> int:
         for label, pid_file in candidate_pid_files:
             if not pid_file.exists():
                 continue
-            pid = _read_pid(pid_file)
+            record = _read_pid_record(pid_file)
+            pid = record.pid
             if pid is None:
                 continue
-            if _is_process_running(pid):
+            # ``is_running`` rather than a second liveness probe: it also
+            # covers a process owned by another user, which the inlined probe
+            # reported as dead — the direction that lets a backfill run
+            # against a live daemon.
+            if record.is_running:
                 print(
                     f"Refusing to mutate: {label} is running (pid "
                     f"{pid}, pid file {pid_file}). Stop the host "
@@ -670,5 +657,4 @@ def backfill_all(
 
 
 if __name__ == "__main__":
-    import sys as _sys
     raise SystemExit(cli_run(_build_arg_parser().parse_args()))

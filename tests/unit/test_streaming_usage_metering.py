@@ -13,6 +13,7 @@ bypassed metering. Two halves of the fix are pinned here:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import AsyncMock, MagicMock
@@ -186,6 +187,10 @@ class _RoutingService(StreamingMixin):
 
     def _check_policy(self):
         pass
+
+    @asynccontextmanager
+    async def _remote_route_attempt(self, **_kwargs):
+        yield None
 
     def resolve_provider_routing(self, **kwargs):
         providers = [{"name": "anthropic", "client": object(),

@@ -14,12 +14,17 @@ from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
-    PART_SENTINEL_SUFFIX,
     build_part_sentinel,
     drain_parts,
     part_collector,
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
+from kestrel_sovereign.agent.invocation import (
+    bind_async_generator_invocation,
+    current_invocation_id,
+)
+from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.security.input_guardrails import (
@@ -28,6 +33,7 @@ from kestrel_sovereign.security.input_guardrails import (
 )
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
+    KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
     start_span,
@@ -98,6 +104,21 @@ REVISE_SENTINEL_SUFFIX = "\x1e"
 # hash). Keep peak memory for one turn's pasted images bounded.
 _MAX_EAGER_IMAGES = 6
 _MAX_EAGER_IMAGE_BYTES = 12 * 1024 * 1024  # 12 MB (a touch over the 10 MB upload cap)
+
+
+def _with_semantic_recall_metadata(
+    metadata: Optional[Dict[str, Any]],
+    semantic_recall_metadata: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Attach trusted, content-free recall lineage to an assistant artifact.
+
+    Semantic lineage is intentionally applied last: model/tool metadata is
+    response-derived and must not replace the exact assertion relationship
+    emitted by the committed context plan.
+    """
+    if not semantic_recall_metadata:
+        return metadata
+    return {**(metadata or {}), **semantic_recall_metadata}
 
 
 def _looks_like_image(data: bytes) -> bool:
@@ -313,19 +334,22 @@ def _utf16_offset(text: str, cp_offset: int) -> int:
     return len(text[:cp_offset].encode("utf-16-le")) // 2
 
 
-def _rebase_events_for_parts(events: list, base: int, text: str) -> list:
-    """Rebase ``tool_events`` onto the persisted post-tool ``text`` (subtract the
-    retracted pre-half length ``base``) and convert each ``pos`` to a UTF-16
-    offset — so tool cards share the SAME origin AND unit as the component parts
-    persisted alongside them (#1914). The reload renderer merges both by ``pos``,
-    so a mixed unit/origin would mis-order or split the bubbles (e.g. after an
-    emoji). Applied ONLY when a turn carries parts, so the tool-card-only persist
-    path is unchanged. Returns a new list; non-dict / posless events pass through.
+def _rebase_events_onto_persisted_text(events: list, base: int, text: str) -> list:
+    """Make every ``tool_events[*].pos`` index persisted ``text`` in UTF-16.
+
+    Event positions are initially stamped in the complete streamed-text
+    coordinate space. Subtract ``base`` to remove any pre-tool prose that is
+    stored separately from the assistant content, then convert the resulting
+    Python code-point offset to the UTF-16 code-unit offset used by JavaScript
+    ``String.slice``. Returns a new list; non-dict / posless events pass through.
     """
     out = []
     for ev in events or []:
         if isinstance(ev, dict) and isinstance(ev.get("pos"), int):
-            ev = {**ev, "pos": _utf16_offset(text, max(0, ev["pos"] - base))}
+            # An event stamped in retracted pre-tool prose has no corresponding
+            # persisted character; deliberately pin its card to the start.
+            persisted_offset = max(0, ev["pos"] - base)
+            ev = {**ev, "pos": _utf16_offset(text, persisted_offset)}
         out.append(ev)
     return out
 
@@ -889,6 +913,7 @@ class StreamingMixin:
             images.append(data)
         return images
 
+    @bind_async_generator_invocation("request_id")
     async def process_input_streaming(
         self,
         user_input: str,
@@ -899,6 +924,7 @@ class StreamingMixin:
         request_id: Optional[str] = None,
         attachments: Optional[list] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
+        invocation_provenance=None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -950,6 +976,8 @@ class StreamingMixin:
                 explicit values — the global is overwritten by the next
                 ``register_active_request`` call and races between
                 overlapping streams can otherwise misroute events.
+            invocation_provenance: Endpoint-owned authenticated actor and
+                transport metadata bound task-locally for governed tools.
         """
         # Match process_input's retryable pre-initialization behavior. Without
         # storage there is no durable genesis receipt to inspect yet.
@@ -1044,6 +1072,7 @@ class StreamingMixin:
                     session_id=session_id,
                     caller=caller,
                     invocation_context=invocation_context,
+                    invocation_id=current_invocation_id(),
                 )
                 yield result
                 release_parts = not getattr(result, "denied", False) and not (
@@ -1066,6 +1095,10 @@ class StreamingMixin:
             KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
             "agent.did": self.did,
             "agent.session_id": session_id or "",
+            # #2916: the key the fleet Timeline actually groups on. Omitted
+            # (None, not "") when the turn has no session, so a sessionless
+            # turn stays absent rather than carrying an empty attribute.
+            KESTREL_SESSION_ID: session_id or None,
             "agent.input_length": len(user_input),
             "agent.streaming": True,
         })
@@ -1182,7 +1215,10 @@ class StreamingMixin:
         privacy_mode = self.privacy_agent.privacy_mode.name
 
         # Get session-filtered conversation history
-        history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
+        history = await self.privacy_agent.get_conversation_history(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
 
         # Get constitution the same way as process_input
         constitution = await self._get_governing_constitution()
@@ -1216,15 +1252,24 @@ class StreamingMixin:
             except Exception:
                 pass  # Non-critical — log already handled in feature
 
+        # Snapshot tool schemas before planning so dry/live accounting and the
+        # eventual provider payload use identical registry bytes.
+        feature_tools = self._build_all_tools()
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
-            include_briefing=True,
+            include_briefing=not getattr(self, "_session_briefed", False),
             include_memories=True,
             include_rag=True,
             privacy_mode=privacy_mode,
             conversation_history=history,
             reflection_guidance=reflection_guidance,
+            tools=feature_tools,
+            # Span attribution only (#2940) — same as the non-streaming path.
+            session_id=session_id,
+        )
+        semantic_recall_metadata = persistence_dependency_metadata(
+            getattr(context_result, "semantic_recall_dependencies", ())
         )
 
         # B / #1309 + C / #1311 degraded-mode fail-closed (streaming
@@ -1249,6 +1294,11 @@ class StreamingMixin:
             )
             return
 
+        # Keep streaming and non-streaming context inputs identical: the
+        # session briefing is admitted once, after a non-degraded plan, before
+        # the provider call starts.
+        self._session_briefed = True
+
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix
         # is stable across turns and prompt caches can hit (see issue #703).
@@ -1267,7 +1317,7 @@ class StreamingMixin:
         # #1662: persist attachment refs on the user turn so the composer's
         # images/docs survive reload (and a later turn can resolve them). The
         # bytes live in the encrypted file store; only the refs ride here.
-        _user_meta = {"sent_form": True}
+        _user_meta = {"sent_form": True, **semantic_recall_metadata}
         if attachments:
             _user_meta["attachments"] = attachments
         await self.privacy_agent.add_conversation(
@@ -1300,9 +1350,7 @@ class StreamingMixin:
         if not effective_model:
             effective_model = await self.check_solvency()
 
-        # Build feature tools for the orchestrator (A2A pattern)
-        # Includes feature dispatch tools + any direct tools from explored features
-        feature_tools = self._build_all_tools()
+        # ``feature_tools`` was captured before context planning.
 
         # Log tool availability
         tool_names = [t['function']['name'] for t in feature_tools] if feature_tools else []
@@ -1328,11 +1376,9 @@ class StreamingMixin:
         lazy_hint = self._lazy_attachment_hint(attachments)
         messages.append({"role": "user", "content": prompt + lazy_hint})
 
-        operator_turn = await inject_operator_turn(
-            self, messages, context_result, session_id, effective_model, force_local_only
-        )
-
-        logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
+        # #2530: the operator notice is collected and injected LAST, right
+        # before the provider call — see the injection site below for why the
+        # turn setup between here and there must not sit inside that window.
 
         # Single streaming call with tool detection
         llm_start = time.time()
@@ -1437,19 +1483,60 @@ class StreamingMixin:
         if buffer_audit and isinstance(resolved_context, LLMInvocationContext):
             resolved_context = replace(resolved_context, redact_content=True)
 
-        async for item in self.llm_service.stream_with_tool_detection(
-            messages=messages,
-            tools=feature_tools if feature_tools else None,
-            force_local_only=force_local_only,
-            model_override=effective_model,
-            system_prompt=system_prompt,
-            session_id=session_id,
-            tool_executor=self._make_inline_tool_executor(session_id),
-            images=eager_images or None,
-            keep_trailing_system=operator_turn.keep_trailing_system,
-            cancel_token=cancel_token,
-            invocation_context=resolved_context,
-        ):
+        # #2530: collect and inject the operator notice LAST, immediately
+        # before the provider call it rides on. Collecting DRAINS the
+        # producer's pending auto-mode queue and advances its budget/governance
+        # dedupe state, so every ``await`` between that drain and the delivery
+        # boundary is a window in which a raised exception loses the notice
+        # permanently. The non-streaming path closes its window by wrapping the
+        # provider call (kestrel_agent.py). Here the turn setup that used to
+        # sit in between — tool-call logging, eager image resolution,
+        # invocation-context resolution — reads none of this, so it runs FIRST
+        # and the window is closed by construction rather than merely guarded.
+        # Keep it that way: anything added below this line and above the
+        # iteration must be settle-safe.
+        inline_tool_executor = self._make_inline_tool_executor(session_id)
+        operator_turn = await inject_operator_turn(
+            self, messages, context_result, session_id, effective_model, force_local_only
+        )
+
+        logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
+
+        # #2530: ``watch_stream`` settles the injected operator notice from
+        # this stream's own lifecycle — delivered on the first chunk (the
+        # provider accepted the request, so the model provably saw an inline
+        # notice), failed/cancelled if the stream dies or closes before one
+        # arrives. A stop-button cancel AFTER the first chunk deliberately
+        # stays delivered: the notice was carried, and requeuing it would
+        # re-report the same fact on the next turn.
+        #
+        # Constructing the stream is guarded even though nothing above it
+        # awaits today. The invariant is "an injected notice always reaches a
+        # terminal state", and an invariant that holds only because of the
+        # current statement order is one edit away from being false;
+        # ``watch_stream`` can only settle from INSIDE the iteration, so the
+        # construction needs its own guard.
+        try:
+            operator_stream = operator_turn.watch_stream(
+                self.llm_service.stream_with_tool_detection(
+                    messages=messages,
+                    tools=feature_tools if feature_tools else None,
+                    force_local_only=force_local_only,
+                    model_override=effective_model,
+                    system_prompt=system_prompt,
+                    session_id=session_id,
+                    tool_executor=inline_tool_executor,
+                    images=eager_images or None,
+                    keep_trailing_system=operator_turn.keep_trailing_system,
+                    cancel_token=cancel_token,
+                    invocation_context=resolved_context,
+                )
+            )
+        except BaseException as exc:
+            await operator_turn.settle_interrupted(exc)
+            raise
+
+        async for item in operator_stream:
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this
             # check existed, /api/agent/stop only set a flag that the
@@ -1462,6 +1549,15 @@ class StreamingMixin:
             # ``full_response`` flows through to the no-tools persist
             # path below and the cancellation marker lands in metadata.
             if request_id and self.is_request_cancelled(request_id):
+                # #2530: close the stream explicitly rather than dropping the
+                # reference and waiting on the async-generator finalizer. The
+                # provider stream holds the cancel token and the upstream
+                # connection, and ``operator_stream`` is a named local that
+                # stays alive to the end of this turn, so "stop" must release
+                # it here. This does NOT un-deliver the notice — it already
+                # settled ``delivered`` on the first chunk and the first
+                # terminal settle wins.
+                await operator_stream.aclose()
                 break
             # #1914: accumulate any part an inline tool emitted while the adapter
             # was resumed to produce THIS item. They flush right before the next
@@ -1658,6 +1754,15 @@ class StreamingMixin:
                 invocation_context=resolved_context,
                 buffer_audit=buffer_audit,
                 strict_timeout_state=strict_timeout_state,
+                # #2841: the same budgeted history this turn's FIRST provider
+                # call sent. Without it the post-tool synthesis — the text the
+                # user actually reads — was written from a blank conversation.
+                conversation_history=context_result.messages,
+                # ...and the same rendered last-user bytes it sent, so the
+                # continuation carries THIS turn's memories/RAG too. Kept
+                # separate from ``user_message`` above, which stays raw user
+                # speech for dispatched subagents.
+                continuation_user_content=prompt + lazy_hint,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:
@@ -1834,13 +1939,11 @@ class StreamingMixin:
             component_parts = _finalize_component_parts(
                 component_parts, tool_final_text, keep_hook_parts=not audit_denied,
             )
-            # #1914: when this turn carries parts, rebase the tool cards onto the
-            # same post-tool UTF-16 origin so the reload merge orders both
-            # streams consistently (``post_base`` is the retracted pre half).
-            if component_parts:
-                tool_events = _rebase_events_for_parts(
-                    tool_events, post_base, tool_final_text,
-                )
+            # #2942: persisted tool-card positions always index the persisted
+            # post-tool content in UTF-16, whether or not typed parts ride along.
+            tool_events = _rebase_events_onto_persisted_text(
+                tool_events, post_base, tool_final_text,
+            )
             # tool_results carry the structured call/result envelopes;
             # persisting them alongside tool_events means a future
             # conversation-history reader can reconstruct *which tools
@@ -1889,7 +1992,11 @@ class StreamingMixin:
             if buffer_audit:
                 meta = None
             await self._persist_assistant_turn_safely(
-                tool_final_text, metadata=meta, session_id=session_id,
+                tool_final_text,
+                metadata=_with_semantic_recall_metadata(
+                    meta, semantic_recall_metadata
+                ),
+                session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
             )
@@ -2073,12 +2180,11 @@ class StreamingMixin:
             inline_post_components = _finalize_component_parts(
                 inline_post_components, final_text, keep_hook_parts=not inline_denied,
             )
-            # #1914: when parts ride along, rebase the tool cards onto the same
-            # post-tool UTF-16 origin so the reload merge stays consistent.
-            if inline_post_components:
-                synth_tool_events = _rebase_events_for_parts(
-                    synth_tool_events, inline_pre_len, final_text,
-                )
+            # #2942: persisted tool-card positions always index the persisted
+            # post-tool content in UTF-16, whether or not typed parts ride along.
+            synth_tool_events = _rebase_events_onto_persisted_text(
+                synth_tool_events, inline_pre_len, final_text,
+            )
             # See parallel comment in the has_tool_calls branch above:
             # tool_results in the persisted metadata preserves the
             # actual call envelopes (id, name, arguments, summarized
@@ -2110,7 +2216,9 @@ class StreamingMixin:
                 inline_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata=inline_meta,
+                metadata=_with_semantic_recall_metadata(
+                    inline_meta, semantic_recall_metadata
+                ),
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
             )
@@ -2189,11 +2297,11 @@ class StreamingMixin:
                 no_tool_components, final_text, keep_hook_parts=not no_tool_denied,
             )
             _no_tool_events = _tool_parts_to_events(tool_parts)
-            # #1914: with parts present, convert the tool cards to the same
-            # UTF-16 origin (base 0 here — no pre-tool retraction) so the reload
-            # merge orders both consistently.
-            if no_tool_components:
-                _no_tool_events = _rebase_events_for_parts(_no_tool_events, 0, final_text)
+            # #2942: base 0 means no prose was retracted on this path, but the
+            # unconditional conversion still puts every position in UTF-16.
+            _no_tool_events = _rebase_events_onto_persisted_text(
+                _no_tool_events, 0, final_text,
+            )
             # #1914: a turn can emit component parts without dispatching tools
             # (e.g. a feature emitting a card from a hook). Persist them here so
             # those bubbles survive reload too. ``final_text`` is the clean
@@ -2213,7 +2321,9 @@ class StreamingMixin:
                 _no_tool_meta = None
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata=_no_tool_meta,
+                metadata=_with_semantic_recall_metadata(
+                    _no_tool_meta, semantic_recall_metadata
+                ),
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,

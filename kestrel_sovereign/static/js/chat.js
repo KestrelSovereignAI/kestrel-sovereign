@@ -15,6 +15,15 @@ import {
     mountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
+import {
+    installScrollFollow,
+    getFollowState,
+    setFollowState,
+    maybeScrollToBottom,
+    forceScrollToBottom,
+    notePaneAppend,
+    notePaneUserAction,
+} from './chat_scroll.js';
 
 let _deps = {
     api: null,
@@ -234,6 +243,29 @@ function buildToolSegmentsByPos(content, cards) {
     let cursor = 0;
     let i = 0;
     const clamp = (p) => Math.max(0, Math.min(len, p == null ? len : p));
+    const snapAwayFromWordInterior = (rawPos) => {
+        const pos = clamp(rawPos);
+        const isWordCharacter = (char) => (
+            char !== undefined && /[\p{L}\p{N}]/u.test(char)
+        );
+        if (
+            pos === 0
+            || pos === len
+            || !isWordCharacter(text[pos - 1])
+            || !isWordCharacter(text[pos])
+        ) {
+            return pos;
+        }
+        // Defense in depth for stale persisted offsets inside a word. Preserve
+        // valid punctuation boundaries (for example, "." followed by "The").
+        // Keep the correction local so a badly wrong offset does not jump across
+        // unrelated prose; if no whitespace is nearby, retain the raw position.
+        const searchStart = Math.max(0, pos - 32);
+        for (let j = pos - 1; j >= searchStart; j -= 1) {
+            if (/\s/.test(text[j])) return j + 1;
+        }
+        return pos;
+    };
     // Prose that opens right after a tools batch leads with the orchestrator's
     // `\n---\n` wire delimiter (still emitted for multi-iteration turns). It is
     // protocol, not content — drop it (and surrounding blank lines) without
@@ -248,15 +280,18 @@ function buildToolSegmentsByPos(content, cards) {
         if (t.trim()) segments.push({ kind: 'prose', text: t });
     };
     while (i < sorted.length) {
-        const pos = clamp(sorted[i].pos);
+        // Form the batch from the original coordinate before snapping. Cards
+        // sharing a persisted position must remain together and in wire order.
+        const rawPos = clamp(sorted[i].pos);
+        const batch = [];
+        while (i < sorted.length && clamp(sorted[i].pos) === rawPos) {
+            batch.push(sorted[i]);
+            i += 1;
+        }
+        const pos = snapAwayFromWordInterior(rawPos);
         if (pos > cursor) {
             pushProse(text.slice(cursor, pos));
             cursor = pos;
-        }
-        const batch = [];
-        while (i < sorted.length && clamp(sorted[i].pos) === pos) {
-            batch.push(sorted[i]);
-            i += 1;
         }
         segments.push({ kind: 'tools', cards: batch });
     }
@@ -1240,6 +1275,64 @@ function getChatContainer() {
 }
 
 /**
+ * #2909: the single seam every append in this module uses to tell the
+ * stick-to-bottom controller that content landed.
+ *
+ * There are two destinations and the caller does not have to know which.
+ * A write into the MOUNTED pane is the live scroll box's business, so it
+ * goes to `maybeScrollToBottom` / `forceScrollToBottom` and the box's own
+ * geometry decides. A write into a DETACHED pane — a backgrounded agent
+ * that is still streaming, a task notification pinned to the stream's
+ * agent, a history repaint into a conversation the reader switched away
+ * from — must not touch the box at all: that state belongs to whatever
+ * conversation is on screen, and moving it (or raising "Jump to latest"
+ * over it) would answer for content that is not in it. It is recorded on
+ * the detached pane's own record instead, so the announcement is waiting
+ * when the reader comes back rather than having never been made.
+ *
+ * `force` marks a user-originated write (their send, their queued
+ * follow-up): the user just acted, so following re-engages either way.
+ */
+function noteChatAppend(target, { force = false } = {}) {
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        if (force) forceScrollToBottom(c);
+        else maybeScrollToBottom(c);
+        return;
+    }
+    const pane = resolveDetachedPane(target, c);
+    if (!pane) return;
+    if (force) notePaneUserAction(pane);
+    else notePaneAppend(pane);
+}
+
+/**
+ * Find the pane record a detached write landed in, so `noteChatAppend`
+ * can record against the right conversation.
+ *
+ * Matched by element identity rather than the pane element's
+ * ``dataset.agent``, because the standalone null-key pane carries no
+ * dataset at all (see getOrCreateChatPane). Returns null for a write
+ * nested INSIDE the mounted pane: the container is the authority there
+ * and the pane's saved fields are stale until it detaches, so writing
+ * them would plant state that the next detach overwrites anyway.
+ */
+function resolveDetachedPane(target, container) {
+    if (!target) return null;
+    const panes = deps().state.chatPanes;
+    if (!panes || typeof panes.values !== 'function') return null;
+    for (const pane of panes.values()) {
+        const el = pane && pane.element;
+        if (!el) continue;
+        const hit = el === target
+            || (typeof el.contains === 'function' && el.contains(target));
+        if (!hit) continue;
+        return (container && el.parentNode === container) ? null : pane;
+    }
+    return null;
+}
+
+/**
  * Resolve the chat pane element a write should target. When called
  * with no arg, defaults to the currently-mounted agent's pane — this
  * is what no-arg consumers (e.g. the aside-reply pipe) rely on so a single
@@ -1297,6 +1390,16 @@ export function mountChatPane(agentName) {
         }
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
+            // #2909: follow state rides with the pane exactly like
+            // scrollPos — otherwise switching away from a scrolled-up
+            // conversation and back re-engages tail-following by accident.
+            // Both halves travel: `unseenTail` is the reader's unacknowledged
+            // "content arrived below you" (the Jump-to-latest pill), and
+            // dropping it would silently retract an announcement this
+            // conversation had already made.
+            const follow = getFollowState(container);
+            current.followLive = follow.following;
+            current.unseenTail = follow.unseenTail;
             current.element.remove();
         }
     }
@@ -1310,6 +1413,22 @@ export function mountChatPane(agentName) {
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
+    // #2909: and the follow state that went with it. A pane left at the
+    // tail comes back at the tail — content may have streamed in while it
+    // was detached, so the saved pixel offset is no longer the bottom.
+    // (`installScrollFollow` here rather than only in initChat: embedders
+    // mount panes into a container this module never wired otherwise.)
+    installScrollFollow(container);
+    if (target.followLive === false) {
+        setFollowState(container, {
+            following: false,
+            unseenTail: target.unseenTail === true,
+        });
+    } else {
+        // Following: the mount snaps to the tail, so by definition
+        // nothing is left unseen — force clears the flag for us.
+        forceScrollToBottom(container);
+    }
     if (messageInput) {
         messageInput.value = target.draftText || '';
         autosizeComposer();
@@ -1332,6 +1451,27 @@ export function mountChatPane(agentName) {
     // #1662: attachments stage per-pane; show the now-mounted agent's tray.
     renderAttachmentTray();
     return target;
+}
+
+/**
+ * Mark (or unmark) a pane as awaiting the session of a new conversation the
+ * user just asked for.
+ *
+ * An empty pane is ambiguous: it is either cold — nothing has claimed it, so
+ * #714 may auto-load the most recent conversation into it — or freshly
+ * cleared by the user, whose new session is still being minted. Those look
+ * identical in the DOM, and they only ever behaved differently because every
+ * new-conversation path left a placeholder card behind, making the pane
+ * non-empty by accident. This flag says which one it is, so the answer does
+ * not depend on decoration.
+ *
+ * Set it before the mint request goes out and clear it once the session is
+ * adopted or the attempt fails — a flag left set would suppress auto-load on
+ * that pane for the rest of the session.
+ */
+export function setPaneAwaitingNewSession(agentName, awaiting) {
+    const pane = deps().getOrCreateChatPane(agentName);
+    pane.awaitingNewSession = !!awaiting;
 }
 
 /**
@@ -1364,6 +1504,15 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.queuedMessage = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
+    // #2909: a cleared pane is a fresh conversation — follow its tail,
+    // with nothing unread behind the reader (the content the pill would
+    // have pointed at just went away with the innerHTML reset).
+    pane.followLive = true;
+    pane.unseenTail = false;
+    const container = getChatContainer();
+    if (container && pane.element.parentNode === container) {
+        setFollowState(container, { following: true });
+    }
 }
 
 // ============================================================================
@@ -1559,6 +1708,9 @@ export function initChat() {
         }
         chatContainer.appendChild(initialPane.element);
         deps().state.mountedChatAgent = initialAgent;
+        // #2909: the scroll listener that owns the stick-to-bottom flag.
+        // Standalone hosts never call mountChatPane, so wire it here too.
+        installScrollFollow(chatContainer);
     }
 
     // Event listeners
@@ -1849,12 +2001,13 @@ function scheduleReconnect() {
 /**
  * Show a task notification in the chat interface.
  *
- * Notifications target the visible (mounted) agent's pane — task
- * notifications come over a single SSE stream pinned to the selected
- * agent, so by definition the visible pane is the right destination.
- * Per-agent task notifications for non-visible agents would require
- * one SSE per loaded agent and is out of scope for the parallel-chat
- * change.
+ * Notifications target the pane of the agent the SSE stream was opened
+ * for (`notificationAgent`), NOT whatever pane is mounted now — switch
+ * agents mid-turn and the earlier agent's task results must keep landing
+ * in its own conversation. That pane is therefore frequently detached,
+ * which is why the append below goes through `noteChatAppend` rather than
+ * touching the viewport directly. Per-agent notification streams for every
+ * loaded agent remain out of scope for the parallel-chat change.
  */
 function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
@@ -1909,8 +2062,11 @@ function showTaskNotification(message, type) {
     `;
 
     paneElement.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: the notification stream is pinned to `notificationAgent`, which
+    // is NOT necessarily the mounted agent — the bubble above may have landed
+    // in a detached pane, whose follow state noteChatAppend records without
+    // touching the viewport the reader is actually watching.
+    noteChatAppend(paneElement);
 
     // Also show a Toast notification
     deps().toast.show(message, type === 'failed' ? 'error' : 'info');
@@ -1939,10 +2095,20 @@ const renderedWakeSignalIds = new Set();
  *     ACTION-mode side effects don't.
  *   - non-empty `result_summary` — metadata-only emits have nothing to
  *     paint (the body lives in chat history instead).
+ *   - `session_id` matches the destination pane's conversation, when the
+ *     wake declares one (#2877).
  *
  * The notifications SSE stream is pinned to the selected agent (same as
- * task notifications), so the visible pane is the correct destination —
- * no session_id matching required.
+ * task notifications), so the agent's pane is the correct destination.
+ * That is not sufficient on its own: a wake bound to an originating chat
+ * session (#2877 routes a Talon job completion back into the session that
+ * dispatched it, as #1809 does for restarts) persists into THAT
+ * conversation, and the pane may have been switched to another one while
+ * the job ran. Painting it there would show the reader a turn that is not
+ * in the transcript they are looking at — and that reappears in the other
+ * conversation on reload. A session-less wake (unattended cron/CLI work)
+ * still renders into the pane, the pre-#2877 behavior; so does one that
+ * arrives before the pane has bound a conversation.
  */
 export async function handleSignalCompleted(payload) {
     if (!payload || typeof payload !== 'object') return;
@@ -1951,13 +2117,18 @@ export async function handleSignalCompleted(payload) {
     const body = payload.result_summary;
     if (!body) return;
 
+    const paneObject = notificationPaneObject();
+    const paneSession = (paneObject && paneObject.sessionId) || null;
+    const wakeSession = payload.session_id || null;
+    if (wakeSession && paneSession && wakeSession !== paneSession) return;
+
     const sigId = payload.signal_id;
     if (sigId) {
         if (renderedWakeSignalIds.has(sigId)) return;
         renderedWakeSignalIds.add(sigId);
     }
 
-    const target = notificationPaneElement();
+    const target = (paneObject && paneObject.element) || notificationPaneElement();
     if (!target) return;
 
     const div = document.createElement('div');
@@ -1978,10 +2149,7 @@ export async function handleSignalCompleted(payload) {
 
     target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
 }
 
 /**
@@ -2045,6 +2213,7 @@ export function renderSignalWakeChip(msg, target = null) {
 // State → accent colour for the restart-status bubble's left border.
 const RESTART_STATE_ACCENTS = {
     pending: 'rgba(59, 130, 246, 0.8)',    // blue — filed / deferred
+    escalated: 'rgba(239, 68, 68, 0.95)',  // red — busy bound overridden
     updating: 'rgba(168, 85, 247, 0.8)',   // purple — update profile running
     executing: 'rgba(245, 158, 11, 0.9)',  // amber — restart dispatched
     completed: 'rgba(34, 197, 94, 0.9)',   // green — landed
@@ -2202,8 +2371,11 @@ export function handleRestartStatus(payload, targetEl = null) {
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: `target` is the notification agent's pane (possibly detached)
+    // or an explicit `targetEl` from a history repaint — neither is
+    // necessarily what the reader is looking at, which is exactly the
+    // discrimination noteChatAppend makes.
+    noteChatAppend(target);
 }
 
 
@@ -2238,6 +2410,33 @@ function renderRestartStatusBody(div, payload) {
         rows.push(['Requested by', requestedByName || requestedByAgent]);
     }
     if (payload.reason) rows.push(['Reason', String(payload.reason)]);
+    const rawRequestAge = payload.request_age_seconds;
+    const requestAge = Number(rawRequestAge);
+    if (rawRequestAge !== null && rawRequestAge !== undefined
+        && Number.isFinite(requestAge) && requestAge >= 0) {
+        rows.push(['Request age', `${Math.round(requestAge)}s`]);
+    }
+    const rawDeferralAge = payload.deferral_age_seconds;
+    const deferralAge = Number(rawDeferralAge);
+    if (rawDeferralAge !== null && rawDeferralAge !== undefined
+        && Number.isFinite(deferralAge) && deferralAge >= 0) {
+        rows.push(['Continuous deferral', `${Math.round(deferralAge)}s`]);
+    }
+    const blocker = payload.blocker && typeof payload.blocker === 'object'
+        ? payload.blocker : null;
+    if (blocker) {
+        if (blocker.kind) rows.push(['Blocker kind', String(blocker.kind)]);
+        if (blocker.count !== null && blocker.count !== undefined) {
+            rows.push(['Blocker count', String(blocker.count)]);
+        }
+        const rawOldestAge = blocker.oldest_age_seconds;
+        const oldestAge = Number(rawOldestAge);
+        if (rawOldestAge !== null && rawOldestAge !== undefined
+            && Number.isFinite(oldestAge) && oldestAge >= 0) {
+            rows.push(['Blocker oldest', `${Math.round(oldestAge)}s`]);
+        }
+    }
+    if (payload.escalated) rows.push(['Escalation', 'busy deferral bound reached']);
     if (deferralReason) rows.push(['Deferred', deferralReason]);
     else if (statusReason) rows.push(['Detail', statusReason]);
 
@@ -2449,13 +2648,12 @@ function renderQueuedChip(pane, agentName, text) {
     pane.element.appendChild(chip);
     // Scroll the real viewport, not pane.element: `.chat-container-pane`
     // is `display: contents` so it has no scroll box. Mirror the
-    // addMessage/updateStreamingMessage pattern — only scroll when this
-    // pane is the one actually mounted into #chat-container, so a chip
-    // queued for a backgrounded agent doesn't yank the visible pane.
-    const c = getChatContainer();
-    if (c && pane.element.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    // addMessage/updateStreamingMessage pattern — a chip queued for a
+    // backgrounded agent must not yank the visible pane. The chip is the
+    // user's OWN follow-up, so it forces (#2909): the user just acted, put
+    // them where the action landed — or, for a detached pane, make sure it
+    // is at that action when they return to it.
+    noteChatAppend(pane.element, { force: true });
 }
 
 /** Remove the queued-message chip from a pane, if present. */
@@ -3193,6 +3391,13 @@ export async function updateContextStatus(expectedAgent = deps().api.getHostAgen
         ) return;
         const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
         const modelLabel = formatContextModelLabel(status);
+        const measurementComplete = status.breakdown?.measurement_complete !== false;
+        const partialLabel = measurementComplete
+            ? ''
+            : ' <span style="opacity:0.75;font-size:0.65rem;">partial</span>';
+        const partialTooltip = measurementComplete
+            ? ''
+            : '\nMemory and RAG were deliberately not measured in this cheap poll; the percentage is a lower-bound projection.';
 
         // #1844: on openai:plan, codex holds the conversation thread
         // server-side while Kestrel sends only incremental turns — so
@@ -3307,8 +3512,8 @@ export async function updateContextStatus(expectedAgent = deps().api.getHostAgen
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}% <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(partialTooltip)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}%${partialLabel} <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -3358,8 +3563,9 @@ function showContextWarning(warnings, paneElement = null) {
         <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    // #2909: same routing as the other renderers — an explicit `paneElement`
+    // may be detached, and only the mounted pane may move the viewport.
+    noteChatAppend(target);
 }
 
 /**
@@ -3377,10 +3583,10 @@ function showContextWarning(warnings, paneElement = null) {
  *   Retrieval / RAG — chunks + "estimated" badge, "skipped" when poll
  *   Reserve / Overhead — dynamic_context_overhead + response_reserve
  *
- * UI honesty invariant (Emma): never imply "compaction saved this"
- * when only the silent-prune path executed. While #1311 is unshipped,
- * the popup unconditionally surfaces "silently-pruned path still
- * active" — the auto-detect invariant from the design doc.
+ * UI honesty invariant: never imply "compaction saved this" when only the
+ * silent-prune path executed. The popup surfaces the plan's salvage
+ * disposition whenever automatic salvage is disabled or a pruned row has no
+ * persistent id.
  */
 window.openContextBreakdownPopup = async function () {
     const sessionId = deps().state.currentSessionId || null;
@@ -3465,7 +3671,7 @@ function formatContextModelLabel(status) {
 }
 
 /** Render the layered breakdown HTML for ``openContextBreakdownPopup``. */
-function renderContextBreakdown(status) {
+export function renderContextBreakdown(status) {
     const fmt = (n) => Number(n || 0).toLocaleString();
     const breakdown = status.breakdown;
     if (!breakdown) {
@@ -3486,8 +3692,12 @@ function renderContextBreakdown(status) {
 
     // ``sectionRow`` ``name`` is hard-coded by callers; ``extras`` is
     // assembled from safe badge() output + escaped fragments; ``warning``
-    // is renderer-supplied static text. Tokens are coerced to Number.
-    const sectionRow = (name, tokens, extras = '', warning = '') => `
+    // is renderer-supplied static text. Null tokens stay visibly unmeasured.
+    const sectionRow = (name, tokens, extras = '', warning = '') => {
+        const measured = tokens !== null && tokens !== undefined;
+        const tokenLabel = measured ? fmt(tokens) : '—';
+        const percentLabel = measured ? `(${pct(tokens)}%)` : '(not measured)';
+        return `
         <div style="display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; border-bottom:1px solid var(--border-color);">
             <div>
                 <span style="font-weight:500">${name}</span>
@@ -3495,10 +3705,11 @@ function renderContextBreakdown(status) {
                 ${warning ? `<div style="font-size:0.7rem;color:#f97316;margin-top:0.15rem">${_esc(warning)}</div>` : ''}
             </div>
             <div style="font-variant-numeric: tabular-nums; color: var(--text-secondary);">
-                <span style="color:var(--text-primary); font-weight:500">${fmt(tokens)}</span>
-                <span style="margin-left:0.5rem; font-size:0.75rem">(${pct(tokens)}%)</span>
+                <span style="color:var(--text-primary); font-weight:500">${tokenLabel}</span>
+                <span style="margin-left:0.5rem; font-size:0.75rem">${percentLabel}</span>
             </div>
         </div>`;
+    };
 
     // System sub-rows. Mandatory vs optional split per Emma's
     // taxonomy: anything in MANDATORY_SYSTEM_SUBSECTIONS (from B) is
@@ -3523,13 +3734,8 @@ function renderContextBreakdown(status) {
         ${fmt(hist.messages_kept_after_pruning || 0)} of ${fmt(hist.messages_total || 0)} messages kept after pruning ·
         raw ${fmt(hist.raw_tokens || 0)} tokens
     </div>`;
-    // Per Emma's canonical taxonomy and the design doc's UI honesty
-    // invariant, the conversation row can show four state badges
-    // depending on what the section reports. ``pending fold`` and
-    // ``failed fold`` are reserved for C/#1311 (durable salvage); the
-    // slots render unconditionally so the popup is ready when C ships,
-    // and a "silently-pruned path still active" warning fires while
-    // C is unshipped (auto-detect invariant).
+    // The conversation row can show the durable-salvage state badges already
+    // recorded for prior spans, plus the current dry-run plan's disposition.
     // C / #1311: salvage-state badges come from
     // ``history.salvages`` which the endpoint attaches once C's
     // feature flag is enabled. Until then ``hist.salvages`` is
@@ -3572,7 +3778,7 @@ function renderContextBreakdown(status) {
     const warningParts = [];
     if (status.silently_pruned_path_active) {
         warningParts.push(
-            'silently-pruned path still active — older messages may have been dropped without a durable summary (until #1311 ships)'
+            'silently-pruned path active — automatic salvage is disabled or this projected prune contains in-memory/id-less messages that cannot be durably linked'
         );
     }
     const warnThreshold = salv.warn_threshold || 10;
@@ -3589,16 +3795,29 @@ function renderContextBreakdown(status) {
         : '';
 
     const mem = sections.memories || {};
-    const memBadge = mem.wired ? '' : badge('not counted', '#64748b');
+    const memBadge = mem.status === 'unknown'
+        ? badge('unknown (cheap poll)', '#64748b')
+        : (mem.status === 'skipped'
+            ? badge('skipped', '#64748b')
+            : (mem.wired ? '' : badge('not counted', '#64748b')));
     const memExcluded = mem.excluded ? badge('excluded — over budget', '#dc2626') : '';
-    const memExtras = (mem.wired
+    const memExtras = (mem.status === 'unknown' || mem.status === 'skipped'
+        ? memBadge
+        : mem.wired
         ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${mem.count || 0} memories</span>`
         : memBadge) + memExcluded;
 
     const rag = sections.rag || {};
-    const ragBadge = rag.skipped
-        ? badge('skipped (cheap poll)', '#64748b')
-        : (rag.excluded ? badge('excluded — over budget', '#dc2626') : badge('estimated', '#0891b2'));
+    let ragBadge;
+    if (rag.status === 'unknown') {
+        ragBadge = badge('unknown (cheap poll)', '#64748b');
+    } else if (rag.skipped) {
+        ragBadge = badge('skipped', '#64748b');
+    } else if (rag.excluded) {
+        ragBadge = badge('excluded — over budget', '#dc2626');
+    } else {
+        ragBadge = badge('estimated', '#0891b2');
+    }
     // Codex round 1 P2 caught the empty-query gap: the popup's
     // ``full=true`` call runs RAG against the last user turn (so the
     // figure matches what the next LLM turn would see). If we couldn't
@@ -3620,10 +3839,10 @@ function renderContextBreakdown(status) {
         ${sectionRow('System / Governance', sys.tokens || 0)}
         ${sysSubs}
         ${sectionRow('Tools', tools.tokens || 0, toolsBadge + (tools.count ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${tools.count} ${tools.count === 1 ? 'tool' : 'tools'}</span>` : ''))}
-        ${sectionRow('Conversation', hist.tokens || 0, histExtrasFull, histWarning)}
-        ${sectionRow('Memories — episodes', ep.tokens || 0, epExtras)}
-        ${sectionRow('Memories — retrieved', mem.tokens || 0, memExtras)}
-        ${sectionRow('Retrieval / RAG', rag.tokens || 0, ragExtras)}
+        ${sectionRow('Conversation', hist.tokens, histExtrasFull, histWarning)}
+        ${sectionRow('Memories — episodes', ep.tokens, epExtras)}
+        ${sectionRow('Memories — retrieved', mem.tokens, memExtras)}
+        ${sectionRow('Retrieval / RAG', rag.tokens, ragExtras)}
         ${overheadRow}
     `;
 
@@ -3777,6 +3996,13 @@ window.compactContext = async function() {
  * (mounted) agent's pane so single-agent and background-pane call sites
  * continue to work without modification. Scroll-syncs only when the
  * write lands on the currently-mounted pane.
+ *
+ * `role` is not decorative: voice/ui.js `ensureUserTurn` streams the
+ * USER's own turn through here (the "Transcribing..." bubble), so the
+ * same rule as addMessage applies — a user bubble is the user's own
+ * action and forces the tail back into view. Without that, speaking
+ * while scrolled up appends the reader's own words off-screen and
+ * announces them as unseen content.
  */
 export function addMessageStreaming(role, paneElement = null) {
     const target = resolvePaneElement(paneElement);
@@ -3790,10 +4016,7 @@ export function addMessageStreaming(role, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) {
         target.appendChild(div);
-        const c = getChatContainer();
-        if (c && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
-        }
+        noteChatAppend(target, { force: role === 'user' });
     }
 
     return div;
@@ -3873,12 +4096,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         mountToolRenderers(contentDiv);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
-        // detached panes update their `scrollPos` lazily on remount.
+        // detached panes update their `scrollPos` lazily on remount, and
+        // their follow state through noteChatAppend.
         const target = paneElement || msgDiv.parentNode;
-        const c = getChatContainer();
-        if (c && target && target.parentNode === c) {
-            c.scrollTop = c.scrollHeight;
-        }
+        noteChatAppend(target);
     }
 }
 
@@ -3952,7 +4173,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         pane.hasUnrenderedMermaid = true;
     }
 
-    if (mounted && c) c.scrollTop = c.scrollHeight;
+    noteChatAppend(paneEl);
 }
 
 /**
@@ -4009,10 +4230,10 @@ export async function addMessage(role, content, paneElement = null, attachments 
     }
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    // #2909: a user bubble is the user's own send — snap to it and re-engage
+    // following. Correct for history replay too: a freshly loaded pane starts
+    // engaged, so replay still ends at the bottom.
+    noteChatAppend(target, { force: role === 'user' });
     return div;
 }
 
@@ -4028,10 +4249,7 @@ export function addTextMessage(role, content, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
     return div;
 }
 
@@ -4127,10 +4345,7 @@ export function appendMessagePart(type, data, paneElement = null) {
     div.appendChild(contentDiv);
     if (target) target.appendChild(div);
 
-    const c = getChatContainer();
-    if (c && target && target.parentNode === c) {
-        c.scrollTop = c.scrollHeight;
-    }
+    noteChatAppend(target);
     return div;
 }
 
@@ -4689,16 +4904,18 @@ function selectHighlightedCommand() {
 function clearChat() {
     if (!chatContainer) return;
 
+    const host = deps().api.getHostAgent();
+    // Claim the pane from this instant, not from when the mint starts: the
+    // delegation below crosses a dynamic import, and a conversation-list
+    // refresh resolving in that gap would find an empty, session-less pane
+    // and auto-load history straight back into the chat the user just
+    // cleared. Whoever mints the session owns clearing this.
+    setPaneAwaitingNewSession(host, true);
+
     // Clear ONLY the visible agent's pane and bump that agent's
     // pane-local generation. Other agents' panes (and their in-flight
-    // streams) are untouched.
-    wipeAgentChatPane(deps().api.getHostAgent(), `
-        <div class="message agent-message">
-            <div class="message-content">
-                <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
-            </div>
-        </div>
-    `);
+    // streams) are untouched. The pane is left empty — no placeholder.
+    wipeAgentChatPane(host);
 
     // Clear message input
     if (messageInput) {
@@ -4710,10 +4927,19 @@ function clearChat() {
     // Optionally start a new conversation in the backend
     import('./history.js').then(module => {
         if (window.startNewConversation) {
+            // Owns the claim from here — it clears it when the session lands
+            // or the mint fails.
             window.startNewConversation();
+        } else {
+            // Nothing will mint a session, so nothing else will clear the
+            // claim; releasing it here keeps auto-load from being suppressed
+            // on this pane for the rest of the session.
+            setPaneAwaitingNewSession(host, false);
         }
     }).catch(() => {
-        // history.js not loaded, that's OK
+        // history.js not loaded, that's OK — but the claim must not outlive
+        // the attempt.
+        setPaneAwaitingNewSession(host, false);
     });
 
     deps().toast.success('Chat cleared');

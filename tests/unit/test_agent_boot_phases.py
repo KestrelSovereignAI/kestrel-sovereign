@@ -17,6 +17,8 @@ uses) and assert the #2522 boot-state-machine contract end to end:
 
 import asyncio
 import contextlib
+import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +26,8 @@ import pytest
 
 from kestrel_sovereign.agent.boot import AgentBootError, BootContext, BootPhaseState
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.signals import DurableSignalStore
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
 # Phase method names in boot order — the injected-failure matrix patches one
@@ -47,15 +51,84 @@ PHASE_NAMES = [
 ]
 
 
+def _durable_backend_double() -> MagicMock:
+    """Provide the transactional backend contract used during signal boot."""
+    backend = MagicMock()
+    backend.backend_type = "sqlite"
+    backend.execute_script = AsyncMock()
+    backend.execute = AsyncMock(return_value=1)
+
+    async def fetch_one(query, params=()):
+        if "FROM sqlite_master" in query and "COLLATE NOCASE" in query:
+            return (
+                "index",
+                DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                DurableSignalStore.EVENTS,
+            )
+        return None
+
+    backend.fetch_one = AsyncMock(side_effect=fetch_one)
+
+    async def fetch_all(query, params=()):
+        if query.strip() == "PRAGMA table_info(durable_signal_events)":
+            # Signal boot's normal path now trusts the same catalog evidence
+            # as a real freshly-created SQLite ledger. Keep this production-
+            # wiring double honest instead of making it resemble a partially
+            # migrated database whose history would need scanning.
+            return [
+                (0, "caller_identity", "TEXT", 0, None, 0),
+                (1, "source_sequence", "BIGINT", 1, None, 0),
+            ]
+        if "FROM sqlite_master" in query and "type = 'trigger'" in query:
+            return [
+                (name, "durable_signal_events", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_GUARDS
+            ] + [
+                (name, "durable_signal_source_sequences", ddl)
+                for name, ddl in DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCES
+            ]
+        if query.startswith("PRAGMA index_list"):
+            return [
+                (
+                    0,
+                    DurableSignalStore.SOURCE_SEQUENCE_SCOPE_INDEX,
+                    1,
+                    "c",
+                    0,
+                )
+            ]
+        if query.startswith("PRAGMA index_xinfo"):
+            return [
+                (0, 0, "agent_id", 0, "BINARY", 1),
+                (1, 1, "source", 0, "BINARY", 1),
+                (2, 2, "source_sequence", 0, "BINARY", 1),
+                (3, -1, None, 0, "BINARY", 0),
+            ]
+        return []
+
+    backend.fetch_all = AsyncMock(side_effect=fetch_all)
+    backend.fetch_val = AsyncMock(return_value=None)
+
+    @contextlib.asynccontextmanager
+    async def transaction(*, immediate: bool = False):
+        yield
+
+    backend.transaction = transaction
+    return backend
+
+
 @contextlib.contextmanager
 def _boot_mocks():
     """Patch the heavy boot collaborators; yield handles for leak assertions.
 
     Mirrors the doubles the existing ``TestInitialize`` tests rely on: real
-    ``initialize()`` runs, but storage / memory / task-manager are mocks so
-    the whole sequence completes without a live DB or LLM. ``close`` /
+    ``initialize()`` runs, but storage / memory / task-manager are mocks and
+    ambient remote-service configuration is cleared so the boot phases neither
+    cold-restore from remote storage nor mint live provider credentials.
+    ``close`` /
     ``shutdown`` are ``AsyncMock``s so a rollback's teardown calls are
-    observable.
+    observable. Constructor-time LLM disk-cache isolation lives in
+    ``_make_agent`` because construction precedes this context manager.
     """
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.kestrel_agent.discover_features", return_value=[]
@@ -63,13 +136,22 @@ def _boot_mocks():
         "kestrel_sovereign.kestrel_agent.MemorySystem"
     ) as MockMemorySystem, patch(
         "kestrel_sovereign.kestrel_agent.TaskManager"
-    ) as MockTaskManager:
+    ) as MockTaskManager, patch.dict(
+        os.environ,
+        {
+            "GCS_BACKUP_BUCKET": "",
+            "LIGHTHOUSE_API_KEY": "",
+            "OPENROUTER_MANAGEMENT_API_KEY": "",
+            "SOVEREIGN_IPFS_URL": "",
+        },
+    ):
         storage = AsyncMock()
         storage.initialize = AsyncMock()
         storage.get_node = AsyncMock(return_value=None)
         storage.add_node = AsyncMock()
         storage.db = MagicMock()
         storage.close = AsyncMock()
+        storage._backend = _durable_backend_double()
         MockStorage.return_value = storage
 
         memory = AsyncMock()
@@ -110,9 +192,76 @@ async def _cleanup(agent: KestrelAgent) -> None:
 
 
 def _make_agent(tmp_path) -> KestrelAgent:
-    # No llm_service → the default LLMService is created, which passes the
-    # phase-6 provider-reachability check (same as the existing init tests).
-    return KestrelAgent(did="did:test:boot", storage_path=str(tmp_path / "boot.db"))
+    # Keep the real default LLMService used by the phase-6 readiness check, but
+    # prevent its constructor (which runs before _boot_mocks) from reading the
+    # operator's process-wide on-disk model catalog. Model discovery itself is
+    # lazy and is not called by these boot phases.
+    with patch(
+        "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
+        return_value=False,
+    ) as load_disk_cache:
+        agent = KestrelAgent(
+            did="did:test:boot",
+            storage_path=str(tmp_path / "boot.db"),
+            db_backend="sqlite",
+            sync_enabled=True,
+        )
+    load_disk_cache.assert_called_once_with()
+    return agent
+
+
+async def _wait_for_boot_phase_start(
+    agent: KestrelAgent,
+    boot_task: asyncio.Task,
+    started: asyncio.Event,
+    phase_name: str,
+    *,
+    guard_seconds: float = 10.0,
+) -> None:
+    """Wait for an instrumented phase with actionable deadlock diagnostics.
+
+    The timeout is a deadlock guard over locally mocked boot work, not a
+    performance budget over network I/O. If the phase is not reached, report
+    the boot state and committed phase journal and cancel the boot task before
+    failing so the test cannot leak an in-progress initializer.
+    """
+    started_task = asyncio.create_task(started.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {started_task, boot_task},
+            timeout=guard_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if started_task in done:
+            return
+
+        ctx = agent._boot_context
+        state = agent._boot_state.value
+        committed = list(ctx.committed_phases) if ctx is not None else []
+        if boot_task in done:
+            if boot_task.cancelled():
+                outcome = "was cancelled"
+            else:
+                error = boot_task.exception()
+                outcome = f"raised {error!r}" if error is not None else "completed"
+            pytest.fail(
+                f"boot {outcome} before entering phase {phase_name!r}; "
+                f"state={state}, committed={committed}"
+            )
+
+        boot_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await boot_task
+        pytest.fail(
+            f"boot did not enter phase {phase_name!r} within the "
+            f"{guard_seconds:g}s deadlock guard; "
+            f"state={state}, committed={committed}"
+        )
+    finally:
+        if not started_task.done():
+            started_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await started_task
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +290,11 @@ async def test_clean_boot_reaches_ready(tmp_path):
         with _boot_mocks():
             await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+        from kestrel_sovereign.signals.sources.workflow_rescue import SOURCE_NAMES
+
+        # The Workflows built-in is registrable without Talon or any other
+        # domain feature: core hosts its six provider-neutral source contracts.
+        assert all(name in agent.signal_registry for name in SOURCE_NAMES)
     finally:
         await _cleanup(agent)
 
@@ -156,6 +310,54 @@ async def test_second_initialize_when_ready_is_a_noop(tmp_path):
         # before touching AsyncStorage, so this neither raises nor re-runs.
         await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_resume_callback_reconciles_sidecars_when_audit_persistence_fails(tmp_path):
+    """Volatile handoff expiry cannot depend on `system.resumed` persistence."""
+    from kestrel_sdk.signals import Status
+    from kestrel_sovereign.signals.dispatcher import _TransientDurableHandoff
+
+    agent = _make_agent(tmp_path)
+    try:
+        with _boot_mocks():
+            await agent.initialize()
+
+        dispatcher = agent.dispatcher
+        now = datetime.now(timezone.utc)
+        dispatcher._transient_durable_handoffs["expired-resume-handoff"] = (
+            _TransientDurableHandoff(
+                payload={"raw": "must-not-survive-resume"},
+                consumer_id="workflow-wait",
+                created_at=now - timedelta(minutes=2),
+                retention_until=now + timedelta(days=1),
+                expires_at=now - timedelta(seconds=1),
+                initial_lease_token="live-only-capability",
+            )
+        )
+        dispatcher._durable_store.persist_signal = AsyncMock(
+            side_effect=RuntimeError("forced resumed-signal persistence failure")
+        )
+        original_dispatch_signal = dispatcher.dispatch_signal
+        results = []
+
+        async def capture_failed_dispatch(*args, **kwargs):
+            result = await original_dispatch_signal(*args, **kwargs)
+            results.append(result)
+            return result
+
+        dispatcher.dispatch_signal = capture_failed_dispatch
+
+        # `dispatch_signal` encodes this persistence error as Status.FAILED;
+        # it does not raise to the resume callback. The sidecar must already
+        # be reconciled by the direct callback path.
+        await agent.resume_monitor._on_resume(3600.0)
+
+        assert "expired-resume-handoff" not in dispatcher._transient_durable_handoffs
+        dispatcher._durable_store.persist_signal.assert_awaited_once()
+        assert [result.status for result in results] == [Status.FAILED]
     finally:
         await _cleanup(agent)
 
@@ -230,6 +432,130 @@ async def test_failed_boot_never_started_periodic_services(tmp_path):
         assert getattr(agent, "resume_monitor", None) is None
     finally:
         await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_later_boot_failure_tears_down_durable_dispatcher_before_storage(tmp_path):
+    """Phase-2 owner liveness cannot outlive a phase-3 boot failure."""
+    agent = _make_agent(tmp_path)
+    captured = {}
+
+    async def fail_after_dispatcher(_ctx: BootContext) -> None:
+        captured["dispatcher"] = agent.dispatcher
+        raise RuntimeError("injected after dispatcher initialization")
+
+    try:
+        with _boot_mocks() as mocks:
+            with patch.object(
+                agent, "_boot_phase_providers_payer_sync", fail_after_dispatcher
+            ):
+                with pytest.raises(RuntimeError, match="after dispatcher"):
+                    await agent.initialize()
+
+            dispatcher = captured["dispatcher"]
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent.dispatcher is None
+            assert dispatcher._runtime_owner_heartbeat_timer is None
+            assert dispatcher._durable_runtime_owner_registered is False
+            # The owner release happens before the phase-1 storage close in
+            # LIFO rollback order, rather than leaving timer work on a closed
+            # database backend.
+            release_calls = [
+                call
+                for call in mocks.storage._backend.execute.await_args_list
+                if "stopped_at" in str(call)
+            ]
+            assert release_calls
+            mocks.storage.close.assert_awaited()
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_boot_rollback_stops_owner_registered_at_sqlite_commit_cancellation(
+    tmp_path,
+):
+    """Boot teardown releases an owner whose registration await never returned.
+
+    ``aiosqlite`` can complete ``commit`` on its worker before cancellation is
+    raised back into the caller.  Exercise that concrete boundary, then drive
+    the real boot rollback seam (rather than only dispatcher shutdown) to
+    prove an ambiguous registration cannot leave a live runtime owner behind.
+    """
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+    from kestrel_sovereign.storage.db import SQLiteBackend
+
+    agent = _make_agent(tmp_path)
+    backend = SQLiteBackend(str(tmp_path / "boot-owner-commit-boundary.db"))
+    await backend.connect()
+    log_store = SignalLogStore(backend)
+    await log_store.initialize()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=SourceRegistry(),
+        lock_manager=OrderedLockManager(),
+        store=log_store,
+    )
+    # Keep schema setup outside the armed registration transaction.
+    await dispatcher._durable_store.initialize()
+    connection = backend._connection
+    assert connection is not None
+    original_commit = connection.commit
+    original_register = dispatcher._durable_store.register_runtime_owner
+    registration_in_flight = False
+
+    async def cancel_after_committed_owner_registration():
+        await original_commit()
+        if registration_in_flight:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    async def register_with_armed_commit(*args, **kwargs):
+        nonlocal registration_in_flight
+        registration_in_flight = True
+        try:
+            return await original_register(*args, **kwargs)
+        finally:
+            registration_in_flight = False
+
+    try:
+        connection.commit = cancel_after_committed_owner_registration
+        dispatcher._durable_store.register_runtime_owner = register_with_armed_commit
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher.initialize_durable_delivery()
+
+        assert dispatcher._durable_initialized is False
+        assert dispatcher._durable_runtime_owner_registered is False
+        assert dispatcher._durable_runtime_owner_registration_started is True
+
+        # This is the callback registered before durable initialization's first
+        # await. It must release the ambiguous owner before boot storage closes.
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        agent.dispatcher = dispatcher
+        await agent._boot_teardown_dispatcher()
+
+        assert agent.dispatcher is None
+        owner = await backend.fetch_one(
+            "SELECT stopped_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert owner is not None and owner[0] is not None
+        assert dispatcher._durable_runtime_owner_registration_started is False
+    finally:
+        connection.commit = original_commit
+        dispatcher._durable_store.register_runtime_owner = original_register
+        if not dispatcher._durable_shutdown:
+            await dispatcher.shutdown_durable_delivery()
+        await backend.close()
 
 
 # ---------------------------------------------------------------------------
@@ -538,8 +864,15 @@ async def test_feature_source_unregistered_when_its_own_init_fails_after_registe
 
 @pytest.mark.asyncio
 async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
+    """Cancellation rolls back local resources, including an active sync worker."""
     agent = _make_agent(tmp_path)
     started = asyncio.Event()
+    sync_service = MagicMock()
+    sync_service.has_work = True
+    sync_service.is_running = True
+    sync_service.add_remote_target = MagicMock(return_value=True)
+    sync_service.start = AsyncMock()
+    sync_service.stop = AsyncMock()
 
     async def hang(ctx: BootContext) -> None:
         started.set()
@@ -547,12 +880,24 @@ async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
 
     try:
         with _boot_mocks() as mocks:
-            # Hang in the final phase, AFTER storage/a2a/memory committed.
-            with patch.object(
+            # Exercise sync rollback without constructing a real GCS client or
+            # allowing cleanup to upload a snapshot. _boot_mocks deliberately
+            # blanks every ambient remote target for all other boot tests.
+            with patch.dict(
+                os.environ, {"GCS_BACKUP_BUCKET": "unit-test-bucket"}
+            ), patch(
+                "kestrel_sovereign.storage.sync.service.SyncService",
+                return_value=sync_service,
+            ), patch.object(
                 agent, "_boot_phase_periodic_services_readiness", hang
             ):
-                task = asyncio.ensure_future(agent.initialize())
-                await asyncio.wait_for(started.wait(), timeout=3.0)
+                # Hang in the final phase, AFTER storage/a2a/sync/memory
+                # committed. The guard below observes that named phase and
+                # reports the phase journal if deterministic boot work wedges.
+                task = asyncio.create_task(agent.initialize())
+                await _wait_for_boot_phase_start(
+                    agent, task, started, "periodic_services_readiness"
+                )
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -562,8 +907,12 @@ async def test_boot_cancelled_mid_phase_unwinds_all_resources(tmp_path):
             mocks.storage.close.assert_awaited()
             mocks.task_manager.close.assert_awaited()
             mocks.memory.shutdown.assert_awaited()
+            sync_service.add_remote_target.assert_called_once()
+            sync_service.start.assert_awaited_once()
+            sync_service.stop.assert_awaited_once()
             assert agent._raw_storage is None
             assert agent.task_manager is None
+            assert agent._sync_service is None
 
             # Retry refused after a cancelled/partial boot.
             with pytest.raises(AgentBootError):
@@ -589,8 +938,10 @@ async def test_concurrent_initialize_is_refused(tmp_path):
     first = None
     try:
         with patch.object(agent, "_boot_phase_storage_privacy", hang_storage):
-            first = asyncio.ensure_future(agent.initialize())
-            await asyncio.wait_for(entered.wait(), timeout=3.0)
+            first = asyncio.create_task(agent.initialize())
+            await _wait_for_boot_phase_start(
+                agent, first, entered, "storage_privacy"
+            )
             assert agent._boot_state is BootPhaseState.IN_PROGRESS
             # A second concurrent call while the first is IN_PROGRESS is refused.
             with pytest.raises(AgentBootError, match="already in progress"):
@@ -613,36 +964,149 @@ async def test_concurrent_initialize_is_refused(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_storage_phase_uses_shared_postgres_pool():
+async def test_storage_phase_uses_shared_postgres_pool(tmp_path):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+
+    credentials = await create_kestrel_identity_async(
+        str(tmp_path),
+        identity_method="did:pkh",
+        agent_name="Shared pool semantic authority test",
+    )
     pool = MagicMock()
     agent = KestrelAgent(
-        did="did:test:pg",
+        did=credentials.agent_did,
+        storage_path=str(tmp_path / "kestrel_prime.db"),
         db_backend="postgres",
         pg_pool=pool,
+        database_url="postgresql://scheduler-test/kestrel",
         llm_service=MagicMock(),
     )
+    assert agent.identity is not None
     ctx = BootContext()
+    # ``storage.db`` is a REAL database, not a MagicMock: this agent has an
+    # on-disk inception whose birth record lives in a different database, so
+    # the phase now reconciles it (#2871) and a duck-typed double would fail on
+    # the first await. The runtime database is deliberately a second file so
+    # the reconciliation path is the one production takes.
+    runtime_db = await AsyncDatabase.sqlite(str(tmp_path / "runtime.db"))
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.storage.db.postgres.PostgresBackend"
     ) as MockPGBackend:
         storage = AsyncMock()
         storage.initialize = AsyncMock()
         storage.get_node = AsyncMock(return_value=None)
-        storage.db = MagicMock()
+        storage.db = runtime_db
         storage.close = AsyncMock()
         MockStorage.return_value = storage
         pg_backend = MagicMock()
         MockPGBackend.from_pool.return_value = pg_backend
 
-        await agent._boot_phase_storage_privacy(ctx)
+        try:
+            await agent._boot_phase_storage_privacy(ctx)
+        finally:
+            await runtime_db.close()
 
         # The shared pool was adopted (not a fresh DSN connection).
-        MockPGBackend.from_pool.assert_called_once_with(pool)
+        MockPGBackend.from_pool.assert_called_once_with(
+            pool,
+            advisory_dsn="postgresql://scheduler-test/kestrel",
+        )
         _, kwargs = MockStorage.call_args
         assert kwargs.get("backend") is pg_backend
+        capability = kwargs.get("_assertion_tenant_capability")
+        assert capability is not None and capability.tenant_id == agent.did
     assert agent._raw_storage is storage
     # Storage teardown was registered for reverse-order rollback.
     assert "storage" in ctx.rollback_labels
+
+
+@pytest.mark.asyncio
+async def test_storage_phase_keeps_pool_recipe_when_database_url_is_ambient(
+    monkeypatch,
+):
+    """An ambient URL must not replace a custom pool's advisory connector."""
+
+    async def custom_connector(*_args, **_kwargs):
+        return None
+
+    ssl_context = object()
+
+    class CustomConnectorPool:
+        _connect_args = ()
+        _connect_kwargs = {"ssl": ssl_context}
+        _connect = staticmethod(custom_connector)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 3
+
+    pool = CustomConnectorPool()
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://ambient/kestrel")
+    agent = KestrelAgent(
+        did="did:test:pg-ambient-url",
+        db_backend="postgres",
+        pg_pool=pool,
+        llm_service=MagicMock(),
+    )
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        await agent._boot_phase_storage_privacy(ctx)
+
+    backend = MockStorage.call_args.kwargs["backend"]
+    assert agent._database_url == "postgresql://ambient/kestrel"
+    assert backend._advisory_dsn is None
+    assert backend._advisory_connect_args == ()
+    assert backend._advisory_connect_kwargs["connect"] is custom_connector
+    assert backend._advisory_connect_kwargs["ssl"] is ssl_context
+
+
+@pytest.mark.asyncio
+async def test_storage_phase_supports_pool_only_postgres_embedding():
+    """A pool-only embedder retains an independent scheduler gate recipe."""
+
+    class PoolOnlyAsyncpgDouble:
+        _connect_args = ("postgresql://pool-only/kestrel",)
+        _connect_kwargs = {"server_settings": {"application_name": "host"}}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 3
+
+    pool = PoolOnlyAsyncpgDouble()
+    agent = KestrelAgent(
+        did="did:test:pg-pool-only",
+        db_backend="postgres",
+        pg_pool=pool,
+        llm_service=MagicMock(),
+    )
+    ctx = BootContext()
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        storage = AsyncMock()
+        storage.initialize = AsyncMock()
+        storage.get_node = AsyncMock(return_value=None)
+        storage.db = MagicMock()
+        storage.close = AsyncMock()
+        MockStorage.return_value = storage
+
+        await agent._boot_phase_storage_privacy(ctx)
+
+    backend = MockStorage.call_args.kwargs["backend"]
+    assert backend._pool is pool
+    assert backend._advisory_connect_args == ("postgresql://pool-only/kestrel",)
+    assert backend._advisory_connect_kwargs["server_settings"] == {
+        "application_name": "host"
+    }
+    assert backend._advisory_max_pool_size == 3
 
 
 @pytest.mark.asyncio

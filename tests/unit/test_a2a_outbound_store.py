@@ -18,6 +18,8 @@ Pins:
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,9 +29,15 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.a2a.outbound_store import (
     OutboundTask,
+    OutboundTaskRouteAmbiguousError,
+    ROUTE_STATE_AMBIGUOUS,
+    ROUTE_STATE_RESERVED,
+    ROUTE_STATE_ROUTABLE,
     ensure_a2a_outbound_tasks_table,
+    get_outbound_task,
     list_outbound_tasks,
     record_outbound_dispatch,
+    rekey_outbound_task,
     update_outbound_terminal_state,
 )
 from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -92,6 +100,20 @@ def _mock_post_response(task_id="t1", session_id="s1", state="submitted"):
     return response
 
 
+def _mock_directory_response():
+    response = MagicMock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "agents": [
+            {"id": "emma", "name": "emma", "routing_name": "emma"},
+            {"id": "claw", "name": "claw", "routing_name": "claw"},
+            {"id": "nellie", "name": "nellie", "routing_name": "nellie"},
+            {"id": "meridian", "name": "meridian", "routing_name": "meridian"},
+        ],
+    }
+    return response
+
+
 def _async_client_with(post_resp=None, get_resp=None):
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -99,7 +121,11 @@ def _async_client_with(post_resp=None, get_resp=None):
     if post_resp is not None:
         client.post.return_value = post_resp
     if get_resp is not None:
-        client.get.return_value = get_resp
+        client.get.side_effect = [
+            _mock_directory_response(), _mock_directory_response(), get_resp,
+        ]
+    else:
+        client.get.return_value = _mock_directory_response()
     return client
 
 
@@ -122,6 +148,7 @@ async def test_record_outbound_dispatch_returns_full_row(tmp_path):
         agent_id='emma',
         task_id="abc123",
         recipient="claw",
+        recipient_agent_id="did:test:claw",
         verb="task",
         session_id="s1",
         dispatch_tool="send_a2a_task",
@@ -131,12 +158,19 @@ async def test_record_outbound_dispatch_returns_full_row(tmp_path):
     assert isinstance(row, OutboundTask)
     assert row.task_id == "abc123"
     assert row.recipient == "claw"
+    assert row.recipient_agent_id == "did:test:claw"
     assert row.verb == "task"
     assert row.dispatch_tool == "send_a2a_task"
     assert row.skill_id == "soul_alignment"
     assert row.message_summary == "please align SOUL.md"
+    assert row.route_state == ROUTE_STATE_ROUTABLE
     assert row.terminal_state is None
     assert row.error is None
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="abc123",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:test:claw"
 
 
 @pytest.mark.asyncio
@@ -198,12 +232,374 @@ limit=10)
 
 
 @pytest.mark.asyncio
+async def test_rekey_outbound_task_moves_only_its_reserved_stable_binding(tmp_path):
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="local-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+
+    rekeyed = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="local-task-id",
+        new_task_id="peer-echoed-id",
+        recipient_agent_id="did:tenant-a:companion",
+    )
+
+    assert rekeyed == 1
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="peer-echoed-id",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:tenant-a:companion"
+
+
+@pytest.mark.asyncio
+async def test_hosted_rekey_activates_reserved_route_even_when_peer_echoes_id(tmp_path):
+    """A hosted reservation is non-routable until peer acceptance commits."""
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="sender-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+        route_state=ROUTE_STATE_RESERVED,
+    )
+
+    assert reserved.route_state == ROUTE_STATE_RESERVED
+    activated = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="sender-task-id",
+        new_task_id="sender-task-id",
+        recipient_agent_id="did:tenant-a:companion",
+        activate=True,
+    )
+
+    assert activated == 1
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="sender-task-id",
+    )
+    assert retained is not None
+    assert retained.route_state == ROUTE_STATE_ROUTABLE
+
+
+@pytest.mark.asyncio
+async def test_rekey_outbound_task_rejects_existing_task_id_collision(tmp_path):
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="local-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+    await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="claimed-id",
+        recipient="replacement",
+        recipient_agent_id="did:tenant-a:replacement",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+
+    rekeyed = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="local-task-id",
+        new_task_id="claimed-id",
+        recipient_agent_id="did:tenant-a:companion",
+    )
+
+    assert rekeyed == 0
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="local-task-id",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:tenant-a:companion"
+
+
+@pytest.mark.asyncio
+async def test_rekey_outbound_task_requires_the_reserved_recipient_identity(tmp_path):
+    """A stale/replayed response cannot move another peer's reservation."""
+    db = await _backend(tmp_path)
+    reserved = await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="local-task-id",
+        recipient="companion",
+        recipient_agent_id="did:tenant-a:companion",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+    )
+
+    rekeyed = await rekey_outbound_task(
+        db,
+        record_id=reserved.id,
+        agent_id="emma",
+        old_task_id="local-task-id",
+        new_task_id="peer-echoed-id",
+        recipient_agent_id="did:tenant-a:replacement",
+    )
+
+    assert rekeyed == 0
+    retained = await get_outbound_task(
+        db, agent_id="emma", task_id="local-task-id",
+    )
+    assert retained is not None
+    assert retained.recipient_agent_id == "did:tenant-a:companion"
+
+
+@pytest.mark.asyncio
+async def test_outbound_lookup_fails_closed_for_historical_duplicate_task_ids(tmp_path):
+    """Never select one recipient arbitrarily from a corrupt legacy collision."""
+    db = await _backend(tmp_path)
+    await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="historical-collision",
+        recipient="first",
+        recipient_agent_id="did:tenant-a:first",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+        route_state=ROUTE_STATE_AMBIGUOUS,
+    )
+    await record_outbound_dispatch(
+        db,
+        agent_id="emma",
+        task_id="historical-collision",
+        recipient="second",
+        recipient_agent_id="did:tenant-a:second",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+        route_state=ROUTE_STATE_AMBIGUOUS,
+    )
+
+    with pytest.raises(OutboundTaskRouteAmbiguousError):
+        await get_outbound_task(
+            db, agent_id="emma", task_id="historical-collision",
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_quarantines_legacy_duplicate_canonical_routes(tmp_path):
+    """Upgrade preserves old rows but makes their retained key unusable."""
+    raw = SQLiteBackend(str(tmp_path / "legacy-outbound.db"))
+    await raw.connect()
+    db = AsyncDatabase(raw)
+    try:
+        # Simulate the pre-route-state schema which allowed a historical
+        # duplicate.  The upgrade must not delete audit history merely to add
+        # the unique canonical-route index.
+        await db.execute(
+            """
+            CREATE TABLE a2a_outbound_tasks (
+                id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                recipient TEXT NOT NULL, recipient_agent_id TEXT, verb TEXT NOT NULL,
+                session_id TEXT NOT NULL, skill_id TEXT, dispatch_tool TEXT NOT NULL,
+                message_summary TEXT, created_at TEXT NOT NULL, terminal_state TEXT,
+                terminal_at TEXT, error TEXT
+            )
+            """
+        )
+        for row_id, recipient in (("legacy-a", "first"), ("legacy-b", "second")):
+            await db.execute(
+                """
+                INSERT INTO a2a_outbound_tasks (
+                    id, agent_id, task_id, recipient, recipient_agent_id, verb,
+                    session_id, dispatch_tool, created_at
+                ) VALUES (?, ?, 'legacy-collision', ?, ?, 'task', 's',
+                          'send_a2a_task', '2026-07-24T00:00:00+00:00')
+                """,
+                (row_id, "emma", recipient, f"did:tenant-a:{recipient}"),
+            )
+
+        await ensure_a2a_outbound_tasks_table(db)
+
+        states = await db.fetchall(
+            """
+            SELECT route_state FROM a2a_outbound_tasks
+            WHERE agent_id = 'emma' AND task_id = 'legacy-collision'
+            ORDER BY id
+            """
+        )
+        assert states == [(ROUTE_STATE_AMBIGUOUS,), (ROUTE_STATE_AMBIGUOUS,)]
+        with pytest.raises(OutboundTaskRouteAmbiguousError):
+            await get_outbound_task(
+                db, agent_id="emma", task_id="legacy-collision",
+            )
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_runs_even_when_route_state_already_exists(tmp_path):
+    """The quarantine is deliberately NOT a column-keyed backfill (#2791).
+
+    ``migrate_columns_once`` runs a backfill only when it is the call adding
+    that column. The unique canonical-route index below DEPENDS on the
+    quarantine having run, so keying it on ``route_state`` would break exactly
+    this database: one whose column predates the index — a build between the
+    two changes, or a crash between them. The quarantine would be skipped as
+    "already migrated" and the index would then fail to create, because the
+    collisions it exists to clear are still routable.
+
+    Running it unconditionally costs a grouped scan per init. That is the
+    trade, and this test is what makes it visible if someone later "optimises"
+    it into a keyed backfill.
+    """
+    raw = SQLiteBackend(str(tmp_path / "column-without-index.db"))
+    await raw.connect()
+    db = AsyncDatabase(raw)
+    try:
+        # route_state present, canonical-route index absent, collisions live.
+        await db.execute(
+            """
+            CREATE TABLE a2a_outbound_tasks (
+                id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                recipient TEXT NOT NULL, recipient_agent_id TEXT, verb TEXT NOT NULL,
+                session_id TEXT NOT NULL, skill_id TEXT, dispatch_tool TEXT NOT NULL,
+                message_summary TEXT, created_at TEXT NOT NULL,
+                route_state TEXT NOT NULL DEFAULT 'routable',
+                terminal_state TEXT, terminal_at TEXT, error TEXT
+            )
+            """
+        )
+        for row_id, recipient in (("dup-a", "first"), ("dup-b", "second")):
+            await db.execute(
+                """
+                INSERT INTO a2a_outbound_tasks (
+                    id, agent_id, task_id, recipient, recipient_agent_id, verb,
+                    session_id, dispatch_tool, created_at, route_state
+                ) VALUES (?, ?, 'unindexed-collision', ?, ?, 'task', 's',
+                          'send_a2a_task', '2026-07-28T00:00:00+00:00', 'routable')
+                """,
+                (row_id, "emma", recipient, f"did:tenant-a:{recipient}"),
+            )
+
+        await ensure_a2a_outbound_tasks_table(db)
+
+        states = await db.fetchall(
+            """
+            SELECT route_state FROM a2a_outbound_tasks
+            WHERE agent_id = 'emma' AND task_id = 'unindexed-collision'
+            ORDER BY id
+            """
+        )
+        assert states == [(ROUTE_STATE_AMBIGUOUS,), (ROUTE_STATE_AMBIGUOUS,)], (
+            "the quarantine must run against a database whose route_state "
+            "column predates the canonical-route index"
+        )
+        # Note this cannot fail independently: if the quarantine is skipped,
+        # ``ensure_a2a_outbound_tasks_table`` above already raised on
+        # CREATE UNIQUE INDEX against the still-routable collision. Kept as
+        # the explicit statement of what the call was supposed to achieve.
+        index = await db.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND "
+            "name='uq_a2a_outbound_tasks_canonical_route'"
+        )
+        assert index is not None
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_concurrent_rekeys_have_exactly_one_canonical_route_owner(db_backend):
+    """The database invariant, not a read predicate, resolves a rekey race.
+
+    The barrier makes both writers contend for the same peer-returned id.  On
+    PostgreSQL they use separate autocommit connections from the shared pool;
+    exactly one must activate and the uniqueness conflict must leave the other
+    reservation non-routable.  SQLite exercises the same contract through its
+    serialized writer.
+    """
+    db = AsyncDatabase(db_backend)
+    await ensure_a2a_outbound_tasks_table(db)
+    suffix = uuid.uuid4().hex
+    agent_id = f"did:test:outbound-race:{suffix}"
+    target_task_id = f"peer-task:{suffix}"
+    first = await record_outbound_dispatch(
+        db,
+        agent_id=agent_id,
+        task_id=f"sender-first:{suffix}",
+        recipient="first",
+        recipient_agent_id=f"did:test:first:{suffix}",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+        route_state=ROUTE_STATE_RESERVED,
+    )
+    second = await record_outbound_dispatch(
+        db,
+        agent_id=agent_id,
+        task_id=f"sender-second:{suffix}",
+        recipient="second",
+        recipient_agent_id=f"did:test:second:{suffix}",
+        verb="task",
+        session_id="s",
+        dispatch_tool="send_a2a_task",
+        route_state=ROUTE_STATE_RESERVED,
+    )
+    barrier = asyncio.Barrier(2)
+
+    async def _activate(reservation, stable_recipient_id):
+        await barrier.wait()
+        return await rekey_outbound_task(
+            db,
+            record_id=reservation.id,
+            agent_id=agent_id,
+            old_task_id=reservation.task_id,
+            new_task_id=target_task_id,
+            recipient_agent_id=stable_recipient_id,
+            activate=True,
+        )
+
+    outcomes = await asyncio.gather(
+        _activate(first, first.recipient_agent_id),
+        _activate(second, second.recipient_agent_id),
+    )
+
+    assert sorted(outcomes) == [0, 1]
+    canonical = await get_outbound_task(
+        db, agent_id=agent_id, task_id=target_task_id,
+    )
+    assert canonical is not None
+    assert canonical.route_state == ROUTE_STATE_ROUTABLE
+    rows = await list_outbound_tasks(db, agent_id=agent_id)
+    assert sum(row.route_state == ROUTE_STATE_ROUTABLE for row in rows) == 1
+    assert sum(row.route_state == ROUTE_STATE_RESERVED for row in rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_list_outbound_filters_by_recipient(tmp_path):
     db = await _backend(tmp_path)
-    for recipient in ("claw", "nellie", "claw", "meridian"):
+    for index, recipient in enumerate(("claw", "nellie", "claw", "meridian")):
         await record_outbound_dispatch(
             db,
-        agent_id='emma', task_id=f"t-{recipient}", recipient=recipient,
+        agent_id='emma', task_id=f"t-{recipient}-{index}", recipient=recipient,
             verb="task", session_id="s", dispatch_tool="send_a2a_task",
         )
     rows_claw = await list_outbound_tasks(db,         agent_id='emma',
@@ -307,6 +703,7 @@ async def test_dispatch_transport_failure_writes_audit_row_with_error(
     client = AsyncMock()
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
+    client.get.return_value = _mock_directory_response()
     client.post.side_effect = httpx.ConnectError("peer down")
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",

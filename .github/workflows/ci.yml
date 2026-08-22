@@ -3,7 +3,8 @@ name: Kestrel CI
 on:
   push:
     branches:
-      - 'main'     # Run on main pushes — lint-and-imports only (see `if:` on heavier jobs)
+      - 'main'     # Run on main pushes — lint, unit and the 3.14 install check.
+                   # integration-tests and llm-tests skip themselves (see their `if:`).
       - 'issue-*'  # Run on kestrel-talon feature branches
   pull_request:
     branches: [main, 'epic/**']  # Run on PRs targeting main and epic branches
@@ -55,13 +56,137 @@ jobs:
         with:
           fail-on-severity: high
 
-  # Fast checks first
+  # Fast checks first — and the host for the duplicate-run gate, because
+  # every test tier depends on this job.
+  #
+  # A `kestrel-talon` branch is named `issue-<n>-…`, which matches the
+  # `issue-*` push trigger above, so once its PR is open every commit fires
+  # TWO complete CI runs on the identical SHA — one `push`, one
+  # `pull_request`. They do not dedupe because the `concurrency:` group keys
+  # on `github.ref`, which differs between them (`refs/heads/issue-…` vs
+  # `refs/pull/N/merge`). Measured over 100 runs: 22 of 43 `issue-*` SHAs
+  # built twice, ~4,300 wasted runner-minutes a month. See #2800.
+  #
+  # This is hygiene, NOT a cost saving: kestrel-sovereign is public, so its
+  # Linux minutes are fully discounted and bill $0 (2026-07: 20,016 minutes,
+  # $120.10 gross, $0.00 net). clean-install.yml documents the same cost
+  # shape. The value is cleaner signal, fewer duplicated minutes, and
+  # insurance if this repo ever goes private.
+  #
+  # It recovers about two-thirds of that waste, not all of it: the gate
+  # suppresses integration-tests + llm-tests (13.5 of the ~19.9 job-minutes a
+  # full run costs), while lint-and-imports, unit-tests and
+  # python-314-install-check still run twice. So ~2,800 of the ~4,300
+  # duplicated minutes. Gating the rest would mean conditioning the required
+  # status checks, and a skipped job still posts a check run — not a trade
+  # worth making on the merge gate.
+  #
+  # It is a step here rather than its own job for two reasons: a separate job
+  # rounds up to a whole runner-minute on every run to do three seconds of
+  # work,
+  # and it would be one more job the test tiers could be orphaned by. This
+  # job is the root of the graph, so every tier can read its output no matter
+  # how the tiers are wired to each other.
   lint-and-imports:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For `gh pr list` in the dedupe gate below. It works anonymously today
+      # because the repo is public; stating it keeps the gate working if that
+      # ever changes, instead of silently 403ing into its fail-open path.
+      pull-requests: read
+    outputs:
+      run_expensive: ${{ steps.dedupe-gate.outputs.run_expensive }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
+
+      # Decides whether the expensive tiers (integration-tests, and llm-tests
+      # through its `needs:`) should run. Fails OPEN: every unexpected state
+      # runs them. Exercised by tests/unit/test_ci_duplicate_run_gate.py,
+      # which extracts this script out of the workflow and runs it directly.
+      #
+      # Expressions go through `env:` rather than being interpolated into the
+      # script body, so a hostile branch name cannot inject shell.
+      - id: dedupe-gate
+        name: Decide whether the expensive tiers are a duplicate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          decide() { echo "run_expensive=$1" >> "$GITHUB_OUTPUT"; echo "run_expensive=$1 ($2)"; exit 0; }
+
+          # Only a branch push can be a duplicate; every other event is
+          # either the PR run itself or a release/dispatch gate.
+          [ "$EVENT_NAME" = "push" ] || decide true "event is $EVENT_NAME, not a duplicate"
+
+          # A tag push is publish.yml's release gate calling this workflow.
+          # It must never be gated: `gh pr list --head` takes a BRANCH name,
+          # and a tag sharing a name with some branch would otherwise skip
+          # the integration tier inside the release gate and let a partial
+          # run report success before publishing to PyPI. Anchor on
+          # refs/heads/ so only real branch pushes reach the PR lookup.
+          case "$REF" in
+            refs/heads/*) ;;
+            *) decide true "ref $REF is not a branch" ;;
+          esac
+
+          [ "$REF" != "refs/heads/main" ] || decide true "main push"
+
+          # An open PR only makes this push redundant when a `pull_request`
+          # run will actually cover the SHA. Three things have to hold, and
+          # `gh pr list --head` alone establishes none of them:
+          #
+          #   base       — the pull_request trigger is filtered to `main` and
+          #                `epic/**`; a PR onto any other base (a stacked PR
+          #                onto another issue-* branch, say) produces no run
+          #   same repo  — `--head` matches on branch NAME only and cannot be
+          #                scoped with owner:branch, so on a public repo any
+          #                fork can open a PR from an identically-named
+          #                branch and suppress our run
+          #   mergeable  — a CONFLICTING PR has no computable merge ref, so
+          #                its run cannot be the fallback for this push
+          #
+          # UNKNOWN mergeability is treated as covered, and that is a real if
+          # bounded exposure rather than a free choice. GitHub computes the
+          # merge ref lazily, so UNKNOWN is the normal answer immediately
+          # after the push that triggered this gate — treating it as
+          # conflicting would run the duplicate nearly every time. But if the
+          # PR then turns out to conflict, no pull_request run is created and
+          # that commit gets no integration or llm coverage. Neither is a
+          # required check and the conflict-resolving push re-runs everything,
+          # so the window is one commit wide.
+          # Reads REPO_OWNER from the environment rather than interpolating it,
+          # so this stays a single-quoted string with no escaping. Covered
+          # directly by TestPrQueryFilter, which runs it under real jq.
+          pr_filter='.[]
+            | select(.headRepositoryOwner.login == env.REPO_OWNER)
+            | select(.mergeable != "CONFLICTING")
+            | .baseRefName'
+
+          prs=$(gh pr list --repo "$REPO" --head "$REF_NAME" --state open \
+                  --json baseRefName,headRepositoryOwner,mergeable \
+                  --jq "$pr_filter") || \
+            decide true "could not query PRs — failing open"
+
+          covered=no
+          for base in $prs; do
+            case "$base" in
+              main|epic/*) covered=yes ;;
+            esac
+          done
+
+          [ "$covered" = yes ] || \
+            decide true "no open same-repo, mergeable PR onto a covered base (bases: ${prs:-none})"
+
+          decide false "a pull_request run already covers this commit"
+
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
@@ -87,6 +212,12 @@ jobs:
   # Unit tests (no services needed)
   unit-tests:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -114,12 +245,38 @@ jobs:
 
       - name: Run unit tests
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
-        # (already a dev dep). Local benchmark on the unit suite: ~5 min
-        # serial → ~45 sec under -n auto on a 16-core runner. The
-        # PYTHONHASHSEED env at the workflow level keeps parametrize
-        # ordering deterministic across workers.
+        # (already a dev dep). Note that ``auto`` resolves to **2 workers**
+        # on the standard GitHub-hosted runner, not the 16 an earlier
+        # revision of this comment assumed — 12.4k tests take ~5 min across
+        # five observed runs (one outlier at 8). Runner sizing is tracked in
+        # #2795. The PYTHONHASHSEED env at the workflow level keeps
+        # parametrize ordering deterministic across workers.
+        #
+        # No ``-m "not bench"`` here, deliberately — but only because the
+        # tier's one benchmark
+        # (test_50k_nodes_per_agent_query_under_50ms) costs 0.4s locally,
+        # under 0.3% of this job. It is not worth filtering out.
+        #
+        # Do NOT read that as "it guards the JSON-path indexes". Verified by
+        # mutation: with every SQLite JSON-path index removed, that
+        # benchmark still passes, and so does the structural
+        # TestIndexUsage::test_agent_status_query_uses_index. The only tests
+        # that fail are the by-name existence checks in TestJsonPathIndexes.
+        # See #2798. The integration tier does exclude benchmarks; below.
         run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
-        timeout-minutes: 10
+        # 10 was too tight and started killing PASSING runs. The tier was
+        # measured at 7:43 on the 2-core runner (#2795) and has since grown —
+        # #2465, #2890 and #2902 added ~1.2k lines of tests in one week. The
+        # median push still lands at 5.6-6.7 min, but the distribution now
+        # crosses 10 and which side you land on is runner luck: 0.51.0's
+        # release PR timed out twice on a tree whose `main` push had passed in
+        # 6.4 min, stalling at 97% and then 88% — different points, so not a
+        # hung test.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` above is what
+        # catches those; the job wall clock only decides how much passing work
+        # gets thrown away. Runner sizing — the real fix — stays in #2795.
+        timeout-minutes: 20
         env:
           KESTREL_AUDIT_MODE: skip
 
@@ -129,8 +286,83 @@ jobs:
           tests/js/test_voice_playback.mjs
           tests/js/test_voice_playback_worklet.mjs
 
+  # Fail-fast across the parallel tiers.
+  #
+  # The tiers used to be chained (`integration-tests: needs: unit-tests`), so
+  # a red unit tier meant the 12.8-minute integration tier never started.
+  # Running them in parallel takes a PR from ~19 min to ~14, but on its own it
+  # gives that up: integration would run to completion beside a unit tier that
+  # already failed. This job restores the property.
+  #
+  # It fires the moment unit-tests fails, and cancels the whole run — which
+  # is the only granularity the API offers; there is no per-job cancel.
+  #
+  # Deliberately ONE-DIRECTIONAL: cheap failure kills the expensive tier, not
+  # the reverse. Of 11 failures in the last 100 runs, 8 were integration-tests
+  # itself. Measured, those eight took 10.9-13.5 min while the longest
+  # concurrent unit run was 5.8, so unit-tests had already concluded in all
+  # eight — a reverse cancel would have had nothing left to cancel, and would
+  # only risk discarding a unit result that was still in flight.
+  #
+  # A separate job rather than a step inside unit-tests, so unit-tests has
+  # already concluded `failure` before the cancel lands. A cancel issued from
+  # within a still-running job marks that job `cancelled`, which would hide
+  # which tier actually broke. Verified live (run 30465204112): unit-tests
+  # kept `failure`, integration-tests was cancelled at 5.9 min instead of
+  # running 12.4, and the run finished in 6.8 min instead of 15.5.
+  #
+  # Two consequences of using the cancel API, both real and neither obvious:
+  #
+  #   * This job cancels ITSELF along with the run, so it reports `cancelled`
+  #     rather than `success`. The POST lands first, so the cancel still
+  #     happens. It is not a required check, so nothing is blocked by it.
+  #   * The RUN's conclusion becomes `cancelled`, not `failure`. Anyone whose
+  #     Actions notifications are set to "only notify for failed workflows"
+  #     gets no notification for a run that ended this way. That is a real
+  #     downgrade in signal on main-branch pushes; the required `unit-tests`
+  #     check still reports `failure`, so PR mergeability is unaffected.
+  #
+  # `always() && needs.unit-tests.result == 'failure'`, not `failure()`. An
+  # `if:` with no status function is implicitly ANDed with `success()`, so the
+  # bare condition would never fire; and `failure()` walks TRANSITIVE
+  # ancestors, so a lint-and-imports failure — which already skips every tier
+  # through `needs:` — would cancel the run for no benefit and convert a clean
+  # `failure` conclusion into `cancelled`.
+  #
+  # `inputs.ref == ''` excludes publish.yml's release gate. Jobs of a called
+  # workflow belong to the CALLER's run, so `github.run_id` there is
+  # publish.yml's: cancelling would also kill the in-flight clean-install
+  # matrix, which is the only place the macOS/Windows axis runs per release.
+  # (Those SKUs cost ~10x Linux per minute gross, but net $0.00 on this public
+  # repo like everything else — 2026-07: macOS 82 min / $5.08 gross / $0.00
+  # net. The reason not to cancel it is losing the cross-platform result for
+  # that tag, not money.) On a tag push publish.yml passes the tag ref, so this is
+  # non-empty exactly when we are the release gate.
+  cancel-expensive-tiers-when-unit-fails:
+    needs: unit-tests
+    if: >-
+      always()
+      && needs.unit-tests.result == 'failure'
+      && inputs.ref == ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write  # cancelling a run is an Actions write
+    steps:
+      - name: Cancel the run so integration-tests stops
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh api --method POST "repos/$REPO/actions/runs/$RUN_ID/cancel"
+
   python-314-install-check:
     runs-on: ubuntu-latest
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
     needs: lint-and-imports
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -163,14 +395,62 @@ jobs:
   # the squash-merge adds cost without new signal. The integration +
   # llm-tests suite is also the heaviest (services, GPUs, API credits),
   # more suited to local verification and special cases. See #682.
+  #
+  # Depends on lint-and-imports, not unit-tests, so the test tiers run in
+  # parallel. The saving is structurally the unit tier's duration, since the
+  # chained path was lint + unit + integration and the parallel one is lint +
+  # max(unit, integration): ~19 min becomes ~14, saving ~5. The chain's
+  # purpose — don't run the 12.8-minute tier beside an already-red unit tier
+  # — is preserved by cancel-expensive-tiers-when-unit-fails above, which
+  # kills the run the moment unit-tests fails.
+  #
+  # Sizing that gate honestly: of 11 failures in the last 100 runs, 8 were
+  # this job itself and only 3 were unit-tests, so it spares a wasted run
+  # about a quarter of the time.
+  #
+  # To be clear about what the chain was and wasn't worth: it is about runner
+  # time and signal, not money. Linux minutes on kestrel-sovereign bill $0 —
+  # public repo, fully discounted (2026-07: 20,016 minutes, $120.10 gross,
+  # $0.00 net), and so do macOS and Windows here despite their higher gross
+  # rate. An earlier revision of this comment claimed $69/month by misreading
+  # org-wide billing rollups as this repo's; see #2793. The remaining lever
+  # on PR wall clock is this job's own 12.8 min — #2794.
+  #
+  # Both halves of the `if:` below are load-bearing. The `github.ref` half
+  # skips main-branch pushes. The `github.event_name` half is what keeps a
+  # manual `workflow_dispatch` release working: publish.yml calls this
+  # workflow as its release gate, and when dispatched from main the ref IS
+  # `refs/heads/main`. Reducing this to `github.ref != 'refs/heads/main'`
+  # would silently skip both test tiers inside the release gate, which
+  # would then report success on a partial run and publish to PyPI.
+  #
+  # The dedupe clause is `!= 'false'`, not `== 'true'`, deliberately. The gate
+  # script fails open, and the wiring must match: if the output is ever empty
+  # — a renamed step id, a moved `outputs:` key, a step that never wrote —
+  # `== 'true'` would silently skip this tier on EVERY trigger, including
+  # publish.yml's release gate, where skipped jobs still let the `ci` job
+  # report success. `!= 'false'` means only an explicit skip decision skips.
   integration-tests:
     runs-on: ubuntu-latest
-    needs: unit-tests
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
+    needs: lint-and-imports
     if: >-
-      github.event_name != 'push' || github.ref != 'refs/heads/main'
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
     services:
       postgres:
-        image: pgvector/pgvector:pg15
+        # PostgreSQL 16 is the floor, not a preference: the #2958
+        # conversation_history.session_id backfill guards its cast with
+        # `pg_input_is_valid(metadata,'jsonb')`, which is 16+. `IS JSON` is
+        # not a substitute — it returns true for a NUL escape and for a lone
+        # surrogate, both of which `::jsonb` then rejects, and a raise there
+        # aborts the migration and the boot.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: kestrel_user
           POSTGRES_PASSWORD: kestrel_password
@@ -215,10 +495,17 @@ jobs:
 
       - name: Run integration tests
         # NOT parallelized: integration tests share a single Postgres
-        # database and Redis instance, and most don't isolate state per-test.
-        # A follow-up PR can introduce per-worker schemas / databases and
-        # add ``-n auto`` here once the isolation work is done.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource"
+        # database and Redis instance. Measured scope of that sharing is
+        # narrower than it looks — 151 of the 1249 selected tests, in 9
+        # files — so the per-worker-database work needed to add ``-n auto``
+        # here is tractable. Tracked in #2794.
+        #
+        # ``not bench`` excludes test_performance_vs_cloud, a wall-clock
+        # throughput assertion costing ~33s (4.5% of this tier). Timing
+        # thresholds are the least trustworthy thing to assert on a shared
+        # runner. It still runs weekly via weekly-analysis.yml, which
+        # invokes run_tests.py with no marker filter.
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
         timeout-minutes: 20
         env:
           KESTREL_AUDIT_MODE: skip
@@ -234,9 +521,46 @@ jobs:
           GITHUB_PAT: ${{ secrets.GH_PAT }}
 
   # LLM integration tests (require API keys)
+  #
+  # The `if:` below must stay byte-identical to integration-tests'. This job
+  # used to declare `needs: integration-tests` and was skipped on main-branch
+  # pushes only as a *side effect* — a job whose dependency is skipped is
+  # itself skipped, and integration-tests carries that condition. Now that it
+  # depends on lint-and-imports so the tiers run in parallel, both clauses
+  # have to be stated outright, or this job would start running on main
+  # pushes and stop honouring the duplicate-run gate.
+  #
+  # It runs 193 tests in ~10 seconds, and under the old chain it waited ~21
+  # minutes to do so.
+  #
+  # This job costs nothing in API credits today, and it is worth being
+  # precise about why: none of the provider secrets referenced below
+  # (OPENAI_API_KEY, TAVILY_API_KEY, REPLICATE_API_TOKEN, RUNPOD_API_KEY)
+  # are actually configured on this repository. They expand to the empty
+  # string and every credential-gated test skips — hence "123 passed,
+  # 70 skipped in 9.88s".
+  #
+  # That is a property of the current secret configuration, NOT of the test
+  # suite's design. Seven tests gate on a bare `OPENAI_API_KEY` check
+  # without also requiring KESTREL_LIVE_TESTS — three in
+  # tests/llm/test_token_tracking.py, four in
+  # tests/llm/test_streaming_tool_detection.py. If someone adds
+  # OPENAI_API_KEY as a repo secret, those start issuing real provider
+  # calls on every PR. Gate them properly before adding the secret. (The
+  # pair in test_openai_adapter.py is already correctly gated on
+  # KESTREL_LIVE_TESTS=1 as well.)
   llm-tests:
     runs-on: ubuntu-latest
-    needs: integration-tests
+    # Explicit `contents: read` so this job does NOT inherit the wider grant
+    # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
+    # caller's permissions when they declare none, which would hand this
+    # `actions: write` during a release. See test_ci_workflow_permissions.py.
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

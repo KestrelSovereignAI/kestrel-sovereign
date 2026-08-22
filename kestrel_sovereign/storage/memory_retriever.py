@@ -233,6 +233,7 @@ class MemoryRetriever:
         min_score: float = 0.1,
         min_relevance: float = 0.2,
         read_only: bool = False,
+        session_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories with human-like weighting.
@@ -248,6 +249,10 @@ class MemoryRetriever:
             read_only: When True, skip access-count update scheduling so
                 callers can estimate the memory block without rehearsal-effect
                 writes.
+            session_id: Chat session of the turn this retrieval serves. Pure
+                span attribution (#2940) for the answerability judge's LLM
+                call below — it selects nothing and scopes nothing. ``None``
+                for retrieval outside a turn.
 
         Returns:
             List of message dicts with 'score' field added,
@@ -431,6 +436,13 @@ class MemoryRetriever:
             content = msg.get("content", "")
             metadata = msg.get("metadata", {}) or {}
 
+            # A canonical fact deletion marks only its exact derived turn
+            # artifacts as excluded. Candidate sources above intentionally
+            # include history, salient, lexical, and vector-hydrated rows, so
+            # this central gate is the final backstop for every retrieval path.
+            if metadata.get("excluded_from_context"):
+                continue
+
             # Operator/signal transport and explicit commands are control
             # plane records, not autobiographical memories. They can contain
             # vocabulary that spuriously dominates kNN (especially the query
@@ -530,7 +542,9 @@ class MemoryRetriever:
             and self.answerability_enabled
             and self._answerability_required()
         ):
-            scored = await self._filter_answerable(query, scored)
+            scored = await self._filter_answerable(
+                query, scored, session_id=session_id
+            )
 
         # Sort competitive candidates by human-like salience score.
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -563,6 +577,8 @@ class MemoryRetriever:
         self,
         query: str,
         scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]],
+        *,
+        session_id: Optional[str] = None,
     ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
         semantic_order = sorted(
             scored, key=lambda item: item[2]["semantic"], reverse=True
@@ -583,6 +599,7 @@ class MemoryRetriever:
                 )
                 for item in semantic_order
             ],
+            session_id=session_id,
         )
         self.answerability_stats["calls"] += 1
         self.answerability_stats["total_latency_ms"] += decision.latency_ms

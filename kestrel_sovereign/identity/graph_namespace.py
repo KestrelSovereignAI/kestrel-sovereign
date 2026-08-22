@@ -47,16 +47,6 @@ def strip_imported_record_namespace(agent_id: str, record_id: str) -> str:
     return record_id
 
 
-def imported_graph_node_prefix(agent_id: str) -> str:
-    """Compatibility name for the shared identity-import namespace."""
-    return imported_record_prefix(agent_id)
-
-
 def namespace_imported_graph_node(agent_id: str, raw_id: object) -> str:
     """Namespace one package-supplied graph id for ``agent_id``."""
     return namespace_imported_record(agent_id, raw_id)
-
-
-def strip_imported_graph_namespace(agent_id: str, node_id: str) -> str:
-    """Compatibility name for stripping a graph record's import namespace."""
-    return strip_imported_record_namespace(agent_id, node_id)

@@ -18,15 +18,179 @@ Architecture:
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+_SAFE_AGENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def _flatten_terminal_outcomes(error: BaseException) -> list[BaseException]:
+    """Flatten a lifecycle exception group without inspecting error text."""
+
+    if isinstance(error, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for nested in error.exceptions:
+            leaves.extend(_flatten_terminal_outcomes(nested))
+        return leaves
+    return [error]
+
+
+def _safe_retained_agent_name(error: object) -> str | None:
+    """Return only a canonical public agent name from retained metadata."""
+
+    metadata = getattr(error, "metadata", None)
+    candidate = metadata.get("agent") if isinstance(metadata, dict) else None
+    if type(candidate) is str and _SAFE_AGENT_NAME_RE.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def _termination_partial_result(
+    *,
+    child_name: str,
+    manager: object,
+    error: BaseException,
+    retained_error_type: type[BaseException],
+    reconciliation_error_type: type[BaseException],
+    public_exception_type_name: Callable[[BaseException], str],
+) -> ToolResult | None:
+    """Build a safe terminal tool outcome, or decline unsupported failures.
+
+    Only manager-typed custody/reconciliation outcomes and cancellation may be
+    summarized. Arbitrary exceptions are re-raised by the caller because they
+    do not prove that shutdown/unpublication completed and may represent a
+    programmer or security-boundary failure.
+    """
+
+    leaves = _flatten_terminal_outcomes(error)
+    retained = [item for item in leaves if isinstance(item, retained_error_type)]
+    reconciliation = [
+        item for item in leaves if isinstance(item, reconciliation_error_type)
+    ]
+    supported = (
+        retained_error_type,
+        reconciliation_error_type,
+        asyncio.CancelledError,
+    )
+    if any(not isinstance(item, supported) for item in leaves):
+        return None
+    current_task = asyncio.current_task()
+    if any(isinstance(item, asyncio.CancelledError) for item in leaves) and (
+        current_task is not None and current_task.cancelling()
+    ):
+        return None
+    # Cancellation alone must retain normal task-cancellation semantics. A
+    # typed reconciliation error is independently sufficient proof of removal;
+    # otherwise this helper is specifically the retained-custody contract.
+    if not retained and (not reconciliation or len(reconciliation) != len(leaves)):
+        return None
+
+    get_agent = getattr(manager, "get_agent", None)
+    if not callable(get_agent):
+        return None
+    try:
+        named_child_removed = get_agent(child_name) is None
+    except Exception:
+        return None
+    if not named_child_removed:
+        return None
+
+    retained_agents: list[str] = []
+    for item in retained:
+        agent_name = _safe_retained_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name not in retained_agents:
+            retained_agents.append(agent_name)
+    retained_agents.sort(key=str.casefold)
+    named_child_retained = any(
+        name.casefold() == child_name.casefold() for name in retained_agents
+    )
+
+    additional = [
+        item for item in leaves if not isinstance(item, retained_error_type)
+    ]
+    additional_types = sorted(
+        {public_exception_type_name(item) for item in additional}
+    )
+    cause_types = sorted(
+        {
+            str(item.metadata["cause_type"])
+            for item in retained
+            if isinstance(getattr(item, "metadata", None), dict)
+            and type(item.metadata.get("cause_type")) is str
+        }
+    )
+    cleanup_states = {
+        item.metadata.get("runtime_cleanup_state", "retained")
+        for item in retained
+        if isinstance(getattr(item, "metadata", None), dict)
+    }
+    cleanup_pending = "pending" in cleanup_states
+    if cleanup_pending and cleanup_states != {"pending"}:
+        cleanup_state = "mixed"
+    elif cleanup_pending:
+        cleanup_state = "pending"
+    else:
+        cleanup_state = "retained"
+
+    data: Dict[str, Any] = {
+        "terminated": True,
+        "child_name": child_name,
+        "agent_removed": True,
+        "runtime_retained": bool(retained),
+        "named_child_runtime_retained": named_child_retained,
+        "named_child_runtime_removed": not named_child_retained,
+        "runtime_cleanup_pending": cleanup_pending,
+        "runtime_cleanup_state": cleanup_state if retained else "removed",
+        "operator_action_required": True,
+        "retry_termination": False,
+        "retained_outcome_count": len(retained),
+        "retained_agents": retained_agents,
+        "additional_outcome_count": len(additional),
+        "additional_outcome_types": additional_types,
+    }
+    if len(retained_agents) == 1:
+        data["retained_agent"] = retained_agents[0]
+    if retained:
+        data["runtime_custody_code"] = "runtime_offboarding_retained"
+        data["retained_cause_types"] = cause_types
+        if len(cause_types) == 1:
+            data["retained_cause_type"] = cause_types[0]
+    if reconciliation:
+        data["tracking_reconciled"] = False
+
+    if cleanup_pending:
+        custody_message = (
+            "Secure runtime cleanup is still pending for "
+            f"{', '.join(retained_agents)} and may complete in manager-owned "
+            "cleanup. Do not retry termination; an operator must reconcile "
+            "the final custody state."
+        )
+    elif retained:
+        custody_message = (
+            "Secure runtime custody was retained for "
+            f"{', '.join(retained_agents)}. Do not retry termination; an "
+            "operator must reconcile the retained tree."
+        )
+    else:
+        custody_message = (
+            "The child was removed, but lifecycle bookkeeping requires "
+            "operator reconciliation. Do not retry termination."
+        )
+    return ToolResult.partial(
+        f"Terminated child '{child_name}'.",
+        custody_message,
+        data=data,
+    )
 
 
 def _coerce_constraint_value(value: str):
@@ -547,6 +711,9 @@ class SpawnFeature(Feature):
 
         Returns:
             ToolResult.ok when the child was actually terminated.
+            ToolResult.partial when the child was stopped/unpublished but its
+            isolated runtime cleanup is pending/retained or its manager
+            bookkeeping needs operator reconciliation.
             ERROR when there's no AgentManager, the named agent is
             not a child of this parent, or the underlying terminate
             call returned False.
@@ -571,15 +738,39 @@ class SpawnFeature(Feature):
         self._child_results.pop(child_name, None)
 
         # Remove from manager (handles shutdown + cascading child termination)
+        from kestrel_sovereign.multi_agent.agent_manager import (
+            ChildTerminationReconciliationError,
+            RuntimeOffboardingRetainedError,
+            public_exception_type_name,
+        )
+
         lifecycle = self._get_lifecycle(manager)
-        if lifecycle is not None:
-            result = await lifecycle.terminate(
+        try:
+            if lifecycle is not None:
+                result = await lifecycle.terminate(
+                    child_name=child_name,
+                    reason="explicit termination",
+                )
+                removed = result is not None
+            else:
+                removed = await manager.terminate_child(parent_did, child_name)
+        except BaseException as exc:
+            # Manager-typed terminal outcomes prove that routing withdrawal
+            # succeeded even when custody/reconciliation did not. Flatten
+            # those groups into one truthful, path-free PARTIAL. Anything else
+            # remains exceptional: converting an arbitrary programming or
+            # namespace-security failure into a tool ERROR would mask it.
+            partial = _termination_partial_result(
                 child_name=child_name,
-                reason="explicit termination",
+                manager=manager,
+                error=exc,
+                retained_error_type=RuntimeOffboardingRetainedError,
+                reconciliation_error_type=ChildTerminationReconciliationError,
+                public_exception_type_name=public_exception_type_name,
             )
-            removed = result is not None
-        else:
-            removed = await manager.terminate_child(parent_did, child_name)
+            if partial is None:
+                raise
+            return partial
         if removed:
             return ToolResult.ok(
                 f"Terminated child '{child_name}'.",

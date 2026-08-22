@@ -21,6 +21,17 @@ privacy: public
 
 Source: subagent lane review, read-only, 2026-05-30.
 
+> **Resolution recorded 2026-07-25:** this snapshot's recommendation was
+> implemented by rewriting
+> [CONTEXT_SYSTEM_DESIGN.md](../../../architecture/CONTEXT_SYSTEM_DESIGN.md) as
+> the active canonical current-state contract and demoting
+> [CONTEXT_C_DURABLE_SALVAGE.md](../../../architecture/CONTEXT_C_DURABLE_SALVAGE.md)
+> to aspirational design. The source/runtime discrepancy identified here was
+> resolved by
+> [#2534](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2534)
+> with one live/dry Kestrel build plan. Provider-native framing remains outside
+> that plan.
+
 ## Scope Reviewed
 
 - Context lane docs and generated feature docs.
@@ -38,7 +49,9 @@ Source: subagent lane review, read-only, 2026-05-30.
 - `docs/architecture/CONTEXT_SYSTEM_DESIGN.md` says "No code in this branch," describes static/adaptive budget as current, says `/api/agent/context-status` is history-only, and says tool schema tokens are unmeasured. Current code has whole-window measurement, route-cap-aware model identity, tool-schema token estimates, elastic budget in live context assembly, and diagnostic breakdowns.
 - `docs/architecture/CONTEXT_SYSTEM_DESIGN.md` says C remains design-first/unimplemented. Code now has `kestrel_sovereign/agent/salvage.py`, salvage worker lifecycle, and feature-flagged sync salvage in `ContextManager.build_context`.
 - `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` says async summarization rides on `SignalDispatcher`. Current implementation appears to use `SalvageWorker` background asyncio tasks plus janitor state in `kestrel_sovereign/agent/salvage.py`.
-- `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` says popup unconditionally surfaces `silently-pruned path still active` because C has not shipped. Endpoint now computes this from `not is_durable_salvage_enabled()`.
+- The former popup contract surfaced `silently-pruned path still active` from
+  feature-flag state alone. The resolved endpoint derives it from the typed
+  plan's flag and unmappable-row projection.
 - `docs/generated/FEATURES_developer.md` is stale. It reports 34 core modules and includes old inventory such as `voice`, while the current inventory differs and includes newer entries such as `cli` and `skills`.
 - Context docs understate or omit the canonical/raw vs rendered transport split: user `content` is canonical raw/clean form, while `rendered_content` plus `metadata.sent_form` is the byte-stable LLM transport form.
 
@@ -74,11 +87,12 @@ Source: subagent lane review, read-only, 2026-05-30.
 ## Open Questions
 
 - Is durable salvage considered shipped when the feature flag is off by default, or only available?
-- Should `measure_context_breakdown()` be changed to use the same elastic budget, lumpy anchor, and relevance/trivial-turn gates as `ContextManager.build_context`, or should docs explicitly state the remaining approximation?
+- Resolved by #2534: `measure_context_breakdown()` is a compatibility adapter
+  over `ContextManager.build_context_plan()`, which owns the elastic budget,
+  lumpy anchor, and relevance/trivial-turn gates.
 - Should salvage async work intentionally remain `SalvageWorker`, or should code eventually move to `SignalDispatcher` as the C design says?
 - Where should the canonical/raw vs rendered transport split live canonically: context doc, storage doc, or both?
 
 ## Suggested First PR Slice
 
 Documentation-only: add a current-state context spec or rewrite the top/status/current-behavior sections of `CONTEXT_SYSTEM_DESIGN.md`, update `CONTEXT_C_DURABLE_SALVAGE.md` status/substrate claims, and regenerate the generated feature docs.
-

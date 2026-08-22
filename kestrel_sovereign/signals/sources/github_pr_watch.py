@@ -1,10 +1,9 @@
 """Signal source for GitHub PR/issue activity (#1618).
 
-Talon's ``talon.job_complete`` source wakes the agent when a *Talon
-background job* finishes. It does NOT cover PR-only activity that lands
-after the Talon job has exited — a reviewer leaving a comment, CI turning
-red, the PR getting merged or closed. Before this source the only way to
-notice that was a manual ``talon_status``/``gh pr view`` poll.
+Provider-owned completion signals cover the job lifecycle, but not PR-only
+activity that lands after a coding job exits — a reviewer leaving a comment,
+CI turning red, or the PR getting merged or closed. This source removes the
+need for a manual provider-status or ``gh pr view`` poll.
 
 The polling half is the ``github_pr_watch`` ACTION cron task (wired in
 ``signals/sources/scheduler.py`` and handled by

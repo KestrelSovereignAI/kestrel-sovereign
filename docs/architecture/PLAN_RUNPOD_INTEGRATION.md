@@ -9,8 +9,8 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: historical
 owner: architecture
 canonical: false
 generated: false
@@ -26,6 +26,15 @@ privacy: public
 > - No active development since early April 2026; last substantive commits were maintenance (CI fixes, dependency strip)
 >
 > Treat the rest of this document as design intent, not a description of a polished feature.
+>
+> **Superseded 2026-08-02:** the in-core `features/ollama` manager, arbitrary
+> `manage_gpu` surface, and direct `switch_backend(REMOTE_GPU, url)` path have
+> been retired. The maintained design is the provider-neutral
+> `InferenceLeaseProvider` SDK contract: core owns bounded acquire/status/release
+> tools and readiness-gated `LLMService` routing, while installed provider
+> packages own Runpod/Vast/Vertex lifecycle state and credentials. See
+> [kestrel-sovereign#2844](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2844)
+> and the parent [kestrel-cloud-runpod#7](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/7).
 
 ## 1. Overview
 This document outlines the architecture for integrating ephemeral GPU compute (RunPod) into the Kestrel Sovereign Agent. The goal is to allow the agent to "upgrade its brain" on demand, moving from local/cloud inference to a high-performance private GPU pod for complex tasks or image generation, while maintaining full sovereignty and control.
@@ -272,4 +281,3 @@ RUNPOD_REFERRAL_CODE=your_referral_code_here
 3. **Enterprise Volume**: Negotiate custom rates for high-volume users
 
 *See [Provider Economics](PROVIDER_ECONOMICS.md) for cross-provider strategy.*
-

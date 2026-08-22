@@ -7,10 +7,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-26T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -18,11 +18,19 @@ privacy: public
 # Kestrel Storage Architecture
 
 **Status:** Active implementation snapshot
-**Last updated:** 2026-05-31
+**Last updated:** 2026-07-26
 
 This document describes the storage stack that is in the current repository.
 Older versions of this page described a pre-async, pre-SQLAlchemy migration plan;
 that plan is no longer the source of truth.
+
+> **Semantic knowledge boundary:** The current graph, RAG, saved-item, memory,
+> and vector surfaces described here are implementation storage surfaces; they
+> are not competing semantic truth stores. The design-of-record for the planned
+> canonical assertion layer, standards profiles, lifecycle, privacy, and
+> migration boundary is [Semantic Knowledge Architecture](SEMANTIC_KNOWLEDGE_ARCHITECTURE.md).
+> Nothing in this page claims that its current tables already implement that
+> layer.
 
 ## Current Shape
 
@@ -38,6 +46,24 @@ Kestrel storage has three layers:
 The default local backend is SQLite. PostgreSQL is supported through the async
 backend layer by setting `KESTREL_DB_BACKEND=postgres` and a PostgreSQL DSN
 through `KESTREL_DATABASE_URL` or explicit configuration.
+
+**PostgreSQL 16 is the floor** (#2988). The `conversation_history.session_id`
+backfill (#2958) has to *skip* metadata it cannot cast rather than raise on it:
+a raise inside a startup migration rolls back the whole migration, and because
+the schema is the marker, the next boot retries from the same row and fails
+identically. The guard that makes skipping possible is
+`pg_input_is_valid(metadata, 'jsonb')` — 16+, and it answers "would this cast
+succeed?" without performing the cast.
+
+Nothing weaker works, because the documents `jsonb` rejects cannot be
+enumerated from outside the parser. `IS JSON OBJECT` (also 16+) returns *true*
+for both a NUL escape and a lone surrogate, and `::jsonb` then raises on each —
+measured on 16.14. `IS JSON OBJECT` is still in the statement, for the
+different job of proving the document is an object before `json_object_keys` is
+asked about it.
+
+On PostgreSQL 15 the backfill fails during schema initialization rather than
+degrading quietly. CI and the devcontainer pin `pgvector/pgvector:pg16`.
 
 ## Backend Layer
 
@@ -87,8 +113,9 @@ provider route when that route advertises embedding support:
 - OpenAI defaults to `text-embedding-3-small` at 1536 dimensions.
 - Google/Gemini and Vertex default to `text-embedding-004` at 768 dimensions.
 - Ollama defaults to `nomic-embed-text` at 768 dimensions.
-- Anthropic and OpenRouter currently advertise no embedding API, so storage
-  falls back to text/BM25/LIKE search.
+- Anthropic advertises no embedding API. OpenRouter is disabled by default and
+  advertises embeddings only for a route with an explicit `embedding_model`
+  and `embedding_dim`; otherwise storage falls back to text/BM25/LIKE search.
 
 The provider adapter boundary is a common Python shape, not a common semantic
 space: `Optional[list[float]]` for one embedding and one batch result slot per
@@ -106,6 +133,7 @@ migrations from `storage/sqla/migrations.py`:
 - `conversation_history.embedding_vec`
 - `conversation_history.rendered_content`
 - `conversation_history.deleted_at`
+- `conversation_history.session_id`
 
 On PostgreSQL, vector migrations create the `vector` extension where needed and
 add HNSW indexes. On SQLite, vector columns are `BLOB`s and use the pure-Python
@@ -113,6 +141,45 @@ backend.
 
 Failures in vector migrations are non-fatal for startup. The affected feature
 falls back to the legacy search path and logs the failure for the next boot.
+
+### The derived `session_id` column
+
+`conversation_history.session_id` is a **derived duplicate** of
+`metadata.session_id`, added so sessions can be indexed (#2958). Metadata stays
+authoritative; the column exists to be queried. Its one invariant is:
+
+> The column may be NULL where session grouping is canonical.
+> It may never disagree.
+
+Which values may be copied into it is decided in exactly one place —
+`storage/session_id_column.py` — and compiled into three renderings that have to
+agree: Python for the write paths, SQLite and PostgreSQL for the two halves of
+the legacy backfill. The rule is deliberately narrower than the grouper's, so
+anything the three readers would spell differently (a non-string JSON value, a
+non-ASCII identifier, a NUL, an id too long for a B-tree entry, or a
+`session_id` key that appears twice in one document) lands as NULL rather than
+as a value one backend agrees with and another does not.
+
+After insertion, `update_message_metadata` is the one door that can rewrite
+`metadata.session_id`, so it moves the column in the same statement. The column
+follows the metadata down to NULL wherever the JSON merge cannot speak for the
+whole document — and both engines have a shape where they decline to merge
+while still reporting success. A metadata root that is not an object (`42`,
+`[]`, `"text"`, JSON `null`) comes back from SQLite's `json_set` with nothing
+added to it, and is *concatenated into an array* rather than merged by
+PostgreSQL's `jsonb ||`; on SQLite a document carrying `session_id` twice keeps
+the second occurrence, which is the one session grouping reads. None of those
+rows ends up carrying the incoming id, so none of them may have it stamped. A
+SQL `NULL` metadata column is not one of these cases — it is an absence, the
+merge's `COALESCE` makes it `{}`, and it stamps normally.
+
+Indexes for these migrations go through `AsyncDatabase.ensure_index`, not a bare
+`CREATE INDEX IF NOT EXISTS`: that spelling is idempotent in sequence but races
+in parallel, and `_init_schema` runs on every `from_pool()`. `ensure_index`
+returns only once the named index really exists on the named table, and raises
+otherwise — `IF NOT EXISTS` is satisfied by the name alone, which is unique per
+database on SQLite and per schema on PostgreSQL, so a same-named index on
+another table would otherwise make the DDL a silent no-op.
 
 ## Retrieval Surfaces
 
@@ -123,14 +190,29 @@ falls back to the legacy search path and logs the failure for the next boot.
 | Saved items | `saved_items` | Embedding search through SQLAlchemy/vector backend with legacy fallback. |
 | A2A task archive | A2A memory service tables | Full-text search for archived task transcripts. |
 
+These retrieval surfaces return stored material or ranked candidates. A vector
+hit, property-graph node, conversation summary, or RAG chunk is not a canonical
+semantic assertion merely because it is retrieved. The future assertion layer
+will filter lifecycle and privacy state before ranking these projections; see
+[Semantic Knowledge Architecture](SEMANTIC_KNOWLEDGE_ARCHITECTURE.md).
+
 ## Privacy And Encryption Notes
 
 - `EPHEMERAL` privacy mode avoids persistent conversation storage.
+- `DEIDENTIFIED` is a current fail-closed preset: `PrivacyEnforcingStorage`
+  denies durable user-derived writes until a Safe Harbor or Expert
+  Determination transformation and evidence pipeline exists. It is not a
+  synonym for `NORMAL` or `ANONYMOUS`; the target `storage=deidentified`
+  setting alone does not authorize a semantic, graph, vector, memory, export,
+  or training write.
 - Conversation content can be encrypted at rest through the conversation store.
 - The SQLAlchemy vector backends operate on precomputed embedding columns and do
   not decrypt `content` / `rendered_content`.
 - Export/import and backup behavior is owned by sovereignty/storage-tier code,
   not by the vector backend.
+- `AsyncGraphStore` ownership ledgers constrain current graph rows by agent;
+  they do not supply the planned assertion revision, provenance, ontology, or
+  inference-retraction contract. That contract is intentionally additive.
 
 ## Operational Notes
 

@@ -5,7 +5,7 @@ Defines interfaces for agents without importing concrete implementations,
 breaking circular dependencies.
 """
 
-from typing import Protocol, Any, Dict, List, Optional
+from typing import Protocol, Any, Dict, Optional
 
 
 class AgentProtocol(Protocol):

@@ -1,8 +1,15 @@
 """Shared helpers for endpoint modules."""
 
-from typing import Optional
+from typing import Mapping
 
 from fastapi import HTTPException, Request
+
+from kestrel_sovereign.agent.invocation import (
+    InvocationProvenance,
+    request_provenance,
+    resolve_transport_invocation_id,
+)
+from kestrel_sovereign.api_errors import ApiHTTPException
 
 
 def get_caller(request: Request):
@@ -20,6 +27,51 @@ def get_caller(request: Request):
     rejects as non-sovereign.
     """
     return getattr(request.state, "caller", None)
+
+
+def resolve_request_invocation_id(
+    request: Request,
+    body: Mapping[str, object] | object | None,
+) -> str:
+    """Resolve the shared retry id for every HTTP turn-producing route."""
+    try:
+        return resolve_transport_invocation_id(
+            body,
+            request.headers.get("X-Request-ID"),
+        )
+    except ValueError as error:
+        raise ApiHTTPException(
+            status_code=400,
+            code="invalid_request_id",
+            message=(
+                "request_id must be a non-empty valid Unicode string no "
+                f"longer than 256 characters: {error}"
+            ),
+        ) from error
+
+
+def request_invocation_provenance(
+    request: Request,
+    *,
+    source_locator: str,
+    fallback_actor: str | None = None,
+) -> InvocationProvenance:
+    """Bind authenticated actor and transport provenance for one HTTP turn.
+
+    Payload fields such as a bridge ``sender_id`` are intentionally excluded:
+    they are gateway content, not an authenticated authority claim. A missing
+    authenticated identity remains ``None`` unless an endpoint supplies a
+    fixed, trusted service principal for its own authentication lane.
+    """
+    caller = get_caller(request)
+    actor = getattr(caller, "identity", None)
+    if not isinstance(actor, str) or not actor:
+        actor = fallback_actor
+    return request_provenance(
+        actor=actor,
+        source_kind="http_request",
+        source_locator=source_locator,
+    )
 
 
 def get_agent(request: Request):

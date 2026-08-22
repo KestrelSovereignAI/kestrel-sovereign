@@ -30,7 +30,6 @@ read its master from HostKeyStorage at first agent init).
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any, Mapping
 
 from kestrel_sdk.payer_policy import (
@@ -38,9 +37,6 @@ from kestrel_sdk.payer_policy import (
     PayerPolicy,
     PayerSpec,
     ResourceClass,
-    SupportStatus,
-    is_offerable,
-    status_for,
     supported_kinds_for,
 )
 

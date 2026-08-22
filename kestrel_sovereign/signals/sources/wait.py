@@ -5,10 +5,8 @@ reaches a terminal :class:`~kestrel_sdk.tools.Outcome`, the generic wait
 reconciler (Wave 2 of #1860) emits one COGNITION signal so the agent wakes
 and can act on the result without having held a turn or explicitly waited.
 
-This is the generic successor to ``talon.job_complete`` — the talon source
-stays for talon jobs (TalonWaitable declares ``signal = "talon.job_complete"``
-so the reconciler still routes there), and ``wait.complete`` is the fallback
-for every provider that does NOT declare its own signal name.
+``wait.complete`` is the fallback for every provider that does not declare its
+own feature-owned signal name.
 
 Idempotency: the reconciler records ``last_signaled_outcome`` per
 ``(kind, handle)`` in the ``wait_signal_state`` table and only emits when the
@@ -86,7 +84,7 @@ def build_wait_complete_registration() -> SourceRegistration:
         # Rate limit is defense-in-depth against a runaway reconciler;
         # a fleet of many waitables all reaching terminal in one tick is
         # a legitimate burst, so the cap sits well above any plausible
-        # real-world burst (mirrors talon.job_complete). The reconciler
+        # real-world burst. The reconciler
         # records last_signaled_outcome BEFORE confirming delivery, so a
         # rate-limit drop would be re-detected and retried next tick.
         rate_limit=RateLimit(per_minute=120, per_hour=600),

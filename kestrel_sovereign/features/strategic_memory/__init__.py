@@ -5,5 +5,6 @@ Re-exports StrategicMemoryFeature for backward compatibility with:
 """
 
 from .feature import StrategicMemoryFeature
+from .issue_selection import pick_top_issue
 
-__all__ = ["StrategicMemoryFeature"]
+__all__ = ["StrategicMemoryFeature", "pick_top_issue"]

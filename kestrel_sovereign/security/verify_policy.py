@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, List, Mapping, Optional
 
-from .crypto_suite import _REGISTRY, CryptoSuite, get_suite
+from .crypto_suite import _REGISTRY
 
 
 # ---------------------------------------------------------------------------

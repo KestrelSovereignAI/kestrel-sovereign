@@ -783,6 +783,34 @@ class TestMemoryRetriever:
         assert results[0]["relevance_score"] == pytest.approx(0.7)
 
     @pytest.mark.asyncio
+    async def test_retrieve_filters_excluded_derivative_from_every_candidate_source(self):
+        """An excluded semantic-recall answer cannot re-enter via memory RAG."""
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [
+            {
+                "role": "assistant",
+                "id": 1,
+                "content": "The saved region is kite-2748-region-7f3b.",
+                "metadata": {"excluded_from_context": True},
+                "created_at": "2026-07-27T00:00:00+00:00",
+            },
+            {
+                "role": "assistant",
+                "id": 2,
+                "content": "The saved region is kite-2748-region-7f3b.",
+                "metadata": {},
+                "created_at": "2026-07-27T00:00:01+00:00",
+            },
+        ]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="saved region", agent_id="test-agent", min_score=0.0
+        )
+
+        assert [row["id"] for row in results] == [2]
+
+    @pytest.mark.asyncio
     async def test_mixed_vector_corpus_merges_old_lexical_exact_match(self):
         """#2334: non-empty kNN must not hide rows outside its profile."""
         store = AsyncMock()
@@ -1231,6 +1259,11 @@ class TestMemoryConsolidatorEpisodeCreation:
             f"Expected at least 1 episode from 5 unenriched messages, "
             f"got {len(episodes)}; skipped={skipped}"
         )
+        # asyncpg rejects ISO strings for TIMESTAMP parameters. The nightly
+        # consolidator must preserve the native timestamp through this query.
+        cutoff = mock_db.fetchall.await_args_list[0].args[1][1]
+        assert isinstance(cutoff, datetime)
+        assert cutoff.tzinfo is not None
 
     @pytest.mark.asyncio
     async def test_automatic_episode_summary_contains_conversation_topics(self, _now):

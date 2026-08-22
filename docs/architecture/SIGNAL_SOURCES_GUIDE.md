@@ -413,6 +413,94 @@ included in the `signal_completed` SSE payload AND persisted to
 `signal_log.result_summary`. Consumers can render it inline. The raw
 artifact / action_result is NEVER on the wire.
 
+### Session-bound wakes (routing authority is local)
+
+A COGNITION wake with no `Signal.session_id` opens a *fresh* chat
+session — "no session" means "mint one". For work the agent started
+from a chat turn, that stranded the wake outside the window the user
+was watching, so autonomous progress ran invisibly while
+`delivery_status` still read `ok` (#2877; #1809 is the same fix for
+restarts, and #2922 is why that status can no longer read `ok` for a
+wake nobody saw — see rule 5). Set `session_id` to the session that
+REGISTERED the work and the dispatcher resumes it.
+
+Five rules:
+
+1. **Bind AND surface.** `session_id` alone puts the turn in the right
+   transcript but leaves it `INTERNAL`, so the dispatcher never emits
+   `signal_completed` and the open chat stays blank until a manual
+   refresh. A bound wake must also be `USER_VISIBLE` *and* register a
+   `result_summary` callback — the frontend requires both to paint it.
+   An unattended (session-less) wake stays `INTERNAL`: the
+   notifications stream is pinned to the agent, not to a session, so
+   emitting would paint a turn into whichever pane happens to be open.
+
+2. **Never take the session from caller-influenceable data.** The wait
+   reconciler resolves it through the provider's `origin_session_id(handle)`
+   method — a *local* lookup on the provider's own record, written when
+   the work was dispatched — and never from the `WaitStatus.data` it
+   spreads into the payload. `A2AWaitable` spreads a peer's returned
+   task result into that dict, so a payload key would let a remote peer
+   choose which local chat session a wake resumes into and, since a
+   bound wake renders `USER_VISIBLE`, get its text painted there. The
+   reconciler overwrites the payload's `origin_session_id` with the
+   resolved value so an untrusted one cannot even survive into the log.
+
+3. **Capture through the turn lifecycle, not `_active_session_id`.**
+   Use the public `agent.get_turn_bound_session_id()` accessor. The attribute is
+   agent-global and the turn id is a ContextVar copied into child
+   tasks, so each read lies on its own: out-of-turn work (a cron tick)
+   sees whatever chat turn is concurrently in flight, and a task
+   detached from a finished turn still reports that turn's id forever.
+   The accessor accepts only one of two authorities: the calling task owns the
+   *live* turn, or the task carries a binding captured on that owning turn with
+   `capture_turn_session_binding()` and re-presented with
+   `bind_turn_session()`. A captured binding remains valid only while that exact
+   turn is live, so unrelated background work still reads as unattended instead
+   of hijacking a stranger's window. A present explicit binding is authoritative
+   even when unbound or stale; callback code never replaces captured authority
+   with an ambient turn copied into the invoking task. The carve-out is turn
+   entry itself: a task that enters `_turn_lifecycle` owns that new turn outright,
+   so the lifecycle clears any binding inherited from the callback or tool that
+   spawned it. If a source callback runs on a task created before the turn (for
+   example, a transport reader or app-server handler), the accessor alone returns
+   `None`: capture while building the callback on the owning turn and bind inside
+   the callback across the task boundary. See
+   `OrchestratorEngineMixin._make_inline_tool_executor` and
+   `Feature._make_feature_inline_tool_executor` for the two in-tree examples.
+
+4. **Don't register session-bound work on a rail that can't wake it.**
+   The binding is only as good as the completion path that carries it. Choose
+   a provider rail whose durable completion reconciler reads the captured
+   origin. A captured origin that no completion path reads is worse than none,
+   because it looks bound.
+
+5. **Persisted is not surfaced — say which one you mean (#2922).**
+   `wait_signal_state.last_delivery_status` no longer records the bare
+   dispatcher status. It composes the dispatch result with a
+   *visibility* verdict, so there is no path that writes a bare `ok`:
+
+   | Recorded state | Meaning |
+   |---|---|
+   | `ok_queued` | The turn ran AND the `signal_completed` event was accepted by ≥1 live listener. |
+   | `ok_unsurfaced` | The turn ran; the emit demonstrably reached no consumer (buffered with nobody connected, every listener raised, the emit raised, no emitter). |
+   | `ok_unbound` | The turn ran; no origin session resolved, so the wake was `INTERNAL` and never had a window to surface into. |
+   | `ok_visibility_unknown` | The turn ran; the dispatcher reported no verdict (foreign dispatcher, receipt-less `emit_event`, record lost to a restart). |
+
+   `coalesced_*` mirrors the same four. The raw dispatcher observation
+   is kept alongside in `last_surface_status`.
+
+   **`queued` is the ceiling, and it is not a render.** It means the
+   event entered a server-side `asyncio.Queue`; `chat.js` still
+   discards a wake whose `session_id` is not the open pane's
+   conversation. No server-side state can prove a render, so nothing
+   here is named "surfaced" and anything unobserved is reported as
+   unknown rather than guessed in the flattering direction. The
+   producer side of this is
+   `EventManagerMixin.emit_event`, which now returns an
+   `EventDeliveryReceipt` (buffered / accepted / rejected) instead of
+   swallowing listener failures into a bare `None`.
+
 ### Cron expressions are the rate limit
 
 Cron sources (in `signals/sources/scheduler.py`) set

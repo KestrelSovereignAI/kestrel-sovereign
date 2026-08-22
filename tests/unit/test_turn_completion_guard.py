@@ -136,7 +136,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
     )
     agent._execute_tool_batch = AsyncMock()
     agent._build_all_tools = MagicMock(return_value=[])
-    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools: msgs)
+    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
     result = await handler(
@@ -244,7 +244,7 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
     )
     agent._execute_tool_batch = AsyncMock()
     agent._build_all_tools = MagicMock(return_value=[])
-    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools: msgs)
+    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
     tools_as_text = (
         '<function_calls><invoke name="todo_add">'
@@ -342,7 +342,7 @@ async def test_feature_subagent_tool_history_preserves_provider_reasoning():
 @pytest.mark.asyncio
 async def test_feature_subagent_no_tool_continuation_gets_repair_step():
     tool = MagicMock()
-    tool.name = "talon_claim"
+    tool.name = "launch_job"
     tool.execute = AsyncMock(return_value={"success": True, "claimed": 1237})
 
     agent = MagicMock()
@@ -352,22 +352,24 @@ async def test_feature_subagent_no_tool_continuation_gets_repair_step():
         side_effect=[
             LLMResponse(
                 content=None,
-                tool_calls=[ToolCall(id="call_1", name="talon_claim", arguments={})],
+                tool_calls=[ToolCall(id="call_1", name="launch_job", arguments={})],
             ),
-            LLMResponse(content="Talon claimed the issue.", tool_calls=None),
+            LLMResponse(content="The job was launched.", tool_calls=None),
         ]
     )
     feature = _FeatureForTurnCompletion(agent)
     feature.get_tools = MagicMock(return_value=[tool])
 
     result = await feature._handle_feature_tool_calls(
-        response=LLMResponse(content="Let me use Talon for that.", tool_calls=None),
-        tools=[_tool_schema("talon_claim")],
+        response=LLMResponse(
+            content="Let me use the job launcher for that.", tool_calls=None
+        ),
+        tools=[_tool_schema("launch_job")],
         system_prompt="sys",
         user_prompt="Task: claim issue 1237",
     )
 
-    assert result == "Talon claimed the issue."
+    assert result == "The job was launched."
     assert agent.llm_service.generate_with_messages.await_count == 2
     repair_call = agent.llm_service.generate_with_messages.await_args_list[0].kwargs
     assert repair_call["messages"][1] == {

@@ -53,7 +53,7 @@ algorithm migration tests and the future SLH-DSA hash-based path
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Iterable, List, Mapping, Tuple
 
 from kestrel_sovereign.security.crypto_suite import (
     ALG_ED25519,

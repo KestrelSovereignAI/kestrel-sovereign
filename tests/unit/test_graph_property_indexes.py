@@ -293,7 +293,10 @@ class TestIndexUsage:
 
 # =====================================================================
 # Benchmark: 50k action_item nodes across 10 agents
-# Marked 'bench' — excluded from default CI via `-m "not bench"`.
+# Marked 'bench', but this one DOES run in CI's unit tier: it costs
+# ~0.4s locally / ~0.9s on a runner, and it is the only automated guard
+# on the "<50ms per-agent query over 50k nodes" index SLA. The `bench`
+# exclusion in ci.yml applies to the integration tier only.
 # =====================================================================
 
 

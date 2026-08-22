@@ -75,7 +75,7 @@ The existing `emit_event` / `add_event_listener` ([agent/event_manager.py:15-33]
 
 | Mode | Definition | LLM involvement | Enters conversation history | Implementation contract | Examples |
 |---|---|---|---|---|---|
-| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `signal_dispatch` |
+| **ACTION** | Deterministic side effect | None | No | `handler(payload)` | `trash_retention`, `backup_snapshot`, `wait_reconcile` |
 | **ARTIFACT** | Produces an artifact (text, JSON, etc.); does not enter a turn. May internally fetch data, mutate feature state, make one or more LLM calls. | Maybe (handler decides) | No | `artifact_handler(signal) -> ArtifactResult` | `morning_signal`, `reflect`, `memory_consolidate` |
 | **COGNITION** | Full agent turn — enters conversation history, may invoke tools, may emit further signals | Yes | Yes | Renders `prompt_template` → `process_input` (or streaming variant) | Heartbeat tick, A2A task-complete, webhook-driven decisions |
 
@@ -96,7 +96,6 @@ async def template_artifact_handler(template_path: Path) -> ArtifactHandler:
 | Heartbeat tick | COGNITION | Already a turn |
 | Cron `morning_signal` | ARTIFACT | Feature workflow; returns briefing text |
 | Cron `reflect` | ARTIFACT | LLM-authored, no follow-up cognition |
-| Cron `signal_dispatch` | ACTION | Existing side-effect tool |
 | Cron `trash_retention` | ACTION | Pure ops |
 | Cron `backup_snapshot` | ACTION | Pure ops |
 | Cron `memory_consolidate` | ARTIFACT (likely) | Feature owner confirms during migration |
@@ -227,6 +226,328 @@ async def enqueue_signal(self, signal: Signal) -> SignalHandle: ...
 
 **Raw `asyncio.create_task(dispatch_signal(...))` at call sites is forbidden.** The point of `enqueue_signal` is supervised lifetime; ad-hoc tasks defeat that.
 
+### Durable consumer delivery
+
+`signal_log` is an **outcome audit**, not a queue.  A durable consumer uses
+the dispatcher-owned ledger when it must resume a workflow trigger or wait
+after process loss:
+
+```python
+await dispatcher.register_durable_consumer(
+    DurableConsumerRegistration(
+        consumer_id="workflows:wait:run-42",
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector="payload.message_id=provider-msg-123",  # optional
+        max_attempts=5,
+        lease_seconds=60,
+    )
+)
+
+delivery = await dispatcher.claim_durable_delivery(
+    consumer_id="workflows:wait:run-42", executor_id="workflows-worker-1"
+)
+if delivery is not None:
+    try:
+        await resume_workflow(delivery.event)
+    except RetryableFailure as exc:
+        await dispatcher.nack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+            error=str(exc),
+        )
+    else:
+        await dispatcher.ack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+        )
+```
+
+#### Atomic source boundaries for external effects
+
+An external workflow that starts an effect and later waits for a matching
+signal must capture **and durably persist** the source boundary immediately
+before dispatching that effect. Keeping the boundary in a local variable is
+not sufficient: the process can die after the external system accepts the
+effect and before workflow state records the eligibility cursor.
+
+```python
+boundary = await dispatcher.capture_durable_source_boundary(
+    source="channel.message"
+)
+# This commit must finish before external dispatch. Store the complete record,
+# never only its scalar sequence, so restart preserves tenant/source authority.
+await workflow_store.persist_source_boundary(
+    run_id="run-42",
+    boundary=boundary.to_dict(),
+)
+await dispatch_external_effect(idempotency_key="run-42")
+
+# A restarted worker rehydrates the persisted record before racing a signal
+# against a deadline or inspecting any claimed delivery.
+boundary = DurableSourceBoundary.from_dict(
+    await workflow_store.load_source_boundary(run_id="run-42")
+)
+
+delivery = await dispatcher.claim_durable_delivery(
+    consumer_id="workflows:wait:run-42",
+    executor_id="workflows-worker-1",
+)
+if delivery is not None:
+    if not boundary.is_event_eligible(delivery.event):
+        # This claimed history predates the effect. Dispose of its exact lease
+        # terminally; merely skipping it would strand the lease until expiry
+        # and make the same ineligible delivery claimable again.
+        disposed = await dispatcher.nack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+            error="delivery predates external-effect source boundary",
+            terminal=True,
+        )
+        if disposed is None:
+            # The lease-token CAS lost to expiry, reclaim, or terminalization.
+            # Re-read both delivery and wait state; do not advance or complete
+            # this wait from a capability this worker no longer owns.
+            await reread_delivery_and_wait_state(delivery.delivery_id)
+    else:
+        # Persist only an idempotent, non-terminal resume preparation here.
+        # Advancing/completing the wait is conditional on owning the ACK CAS.
+        prepared = await prepare_workflow_resume(delivery.event)
+        acknowledged = await dispatcher.ack_durable_delivery(
+            consumer_id="workflows:wait:run-42",
+            delivery_id=delivery.delivery_id,
+            lease_token=delivery.lease_token,
+        )
+        if not acknowledged:
+            await discard_workflow_resume(prepared)
+            await reread_delivery_and_wait_state(delivery.delivery_id)
+        else:
+            await advance_workflow_wait_from_acknowledged_delivery(
+                prepared, delivery.delivery_id
+            )
+```
+
+Both terminal NACK and ACK are lease-token compare-and-set operations, so their
+results are load-bearing. A lost CAS never authorizes a workflow transition:
+the worker leaves the wait unadvanced, re-reads the durable delivery and wait
+records, and either observes the winner's terminal state or safely retries from
+a newly claimed lease. The eligible path's preparation must be idempotent and
+must not itself advance or complete the wait. Its final transition is keyed by
+the acknowledged `delivery_id`, so restart reconciliation can finish an ACK
+that committed immediately before a process loss without replaying the effect.
+
+The ordering above is a required workflow transaction boundary:
+
+- A crash before boundary persistence leaves no authority to dispatch the
+  effect. Restart must capture and persist a boundary before dispatch.
+- A crash after boundary persistence but before dispatch leaves a conservative,
+  reusable cursor. The workflow may retry the effect with its stable
+  idempotency key; it must not silently replace the stored boundary.
+- A crash after the external system accepts the effect is reconciled with that
+  same idempotency key and the already-persisted boundary. Re-capturing here
+  could exclude the response that should resume the wait.
+- A signal-vs-deadline winner must be committed with the downstream workflow's
+  own lease/CAS protocol. Core exposes the serializable boundary and durable
+  delivery lease, but does not own workflow wait/deadline state. The Workflows
+  feature therefore owns real crash/restart tests for signal-before-deadline,
+  deadline-before-signal, and process loss immediately after either winning
+  CAS. Core tests cover boundary serialization/rehydration, source isolation,
+  and delivery ACK/NACK lease semantics.
+
+Core persists a positive, monotonically increasing `source_sequence` for each
+exact `(agent_id, source)` scope. Boundary capture and event sequencing acquire
+the same source handoff lock in the same database transaction domain. Their
+linearization invariant is exact: **an event is eligible for a captured
+boundary if and only if its committed `source_sequence` is strictly greater
+than the boundary's `sequence`.** This holds whether ingress committed before
+or after consumer registration and whether a later registration materialized
+the delivery through backfill.
+
+`DurableSignalEvent.source_sequence` and `DurableDelivery.source_sequence`
+expose that evidence. `committed_at` remains audit metadata and must never be
+used for boundary eligibility: it can reflect an ingress host's clock, while
+the source sequence is committed by the database ordering domain. Delivery
+IDs, registration timestamps, and row insertion order are likewise not
+boundary evidence.
+
+The dispatcher capture API intentionally accepts only `source`; it always uses
+the dispatcher's own agent DID. A `DurableSourceBoundary` rejects comparisons
+against another agent or source. This is a user-agent tenant boundary, not A2A
+authority. The additive migration assigns stable positive sequences to legacy
+events before the first boundary is returned and retains exact high-water
+evidence after event-retention cleanup, so sequences never move backward or get
+reused. Capture and ingress validate the locked primary counter against the
+retained per-scope maximum through the scope-sequence index and reconcile it
+with two
+independent exact ledgers: the recovery watermark and a retention-independent
+high-water row. The high-water row is not referenced by event-retention cleanup.
+Thus the adverse order `commit 1..3 → purge event 3 → lose
+seen/primary/recovery rows` still repairs to 3 and allocates 4, never retained
+maximum 2 and reused 3.
+
+An immutable per-scope "seen" row is written with the first positive sequence.
+If a seen scope lacks positive evidence in both independent exact ledgers, the
+scope fails closed even when zero-valued rows or retained history remain: after
+arbitrary retention deletion, neither zero nor retained history can justify
+resetting the scope. It also fails closed if retained history exceeds every
+exact ledger, including when the seen row was lost too. Only the pre-boundary
+additive migration may reconstruct from that lower bound, because no
+external-effect boundary existed yet. A scope with no exact evidence, no seen
+row, and no history is genuinely fresh and begins at boundary zero. Database
+event triggers mirror valid sequences into recovery, high-water, and seen, and
+reject mixed-writer event changes for a seen scope without positive independent
+high-water evidence. A second database trigger family fences the legacy
+primary-counter API: an insert into a missing primary row is seeded from the
+greatest independent exact value before the statement exposes it, a lower
+update is clamped, and every primary-only advance is mirrored back to both
+exact ledgers. Inserts and updates for a seen scope with no positive independent
+high-water evidence are rejected rather than recreating or advancing from zero.
+This continues to protect old replicas after primary table or row loss during a
+rolling upgrade.
+PostgreSQL uses separately fingerprinted INSERT and UPDATE statement triggers
+with transition tables for event mirroring; each function groups one statement
+by exact `(agent_id, source)` and mirrors its `MAX(source_sequence)`. SQLite
+retains its definition-fingerprinted row trigger pair because it has no
+transition tables.
+PostgreSQL commits the short additive-column/`NOT VALID` write-fence DDL phase
+before it scans or assigns history. It builds or repairs the final
+scope-sequence uniqueness proof with `CREATE UNIQUE INDEX CONCURRENTLY` before
+assignment (PostgreSQL unique indexes admit multiple `NULL` keys), so every
+retained-maximum reconciliation is indexed throughout migration. Bootstrap
+validates its exact keys, immediate uniqueness, default `NULLS DISTINCT`
+semantics, access method, live/ready/valid catalog flags, per-key effective
+column collations, and default btree operator classes;
+an interrupted or equality-mutated owned-name index is removed and rebuilt.
+Exact-counter scopes and unsequenced legacy event IDs are copied into narrow
+durable primary-key work tables. Adoption removes one ordered scope per
+transaction. Every PostgreSQL scope repair takes the same transaction-scoped
+handoff lock as live capture/ingress before locking primary, recovery, or
+high-water rows; scopes are selected in `(agent_id, source)` order. Event
+assignment removes at most 256 queued IDs for one scope per transaction,
+bounding PostgreSQL's whole-row transition relation even for wide payloads
+without globally probing, filtering, or sorting the event ledger again for
+every batch.
+
+Queue seed markers and removals commit with their work, so restart resumes from
+the remaining rows. A seed bit is not trusted as proof that its independently
+mutable work table is complete: if the event queue drains while NULL history
+remains, bootstrap transactionally enqueues every missing immutable event
+identity again. This converges after partial row loss or work-table recreation;
+the write fence makes the source finite and each subsequent update remains
+bounded by the queue primary key and 256-row batch. The durable completion
+marker flips only after both queues drain and final NULL/nonpositive checks
+succeed. Check validation commits separately, and a final
+fresh catalog and marker recheck makes `SET NOT NULL` the only operation in the
+short `ACCESS EXCLUSIVE` metadata phase. Completion invalidation atomically
+clears both seed proofs and queues whenever the write fence or recovery mirror
+loses its trusted shape, so a restart cannot mistake a validated constraint
+alone for completed counters or legacy history.
+SQLite performs the same migration atomically under its reserved writer and
+retains definition-fingerprinted insert/update triggers as the fence. Bootstrap
+validates catalog shape and atomically retires superseded trigger/function
+families; names alone are not completion evidence. SQLite recovery adoption
+locks primary scope rows before it touches recovery and high-water. PostgreSQL
+converges one scope per transaction in the same handoff-before-counter order as
+live ingress. While PostgreSQL's global migration marker is incomplete,
+boundary capture additionally rejects an exact scope that still contains a
+NULL legacy sequence; it can succeed once that scope's repair commits.
+Consequently, a pre-boundary Core replica
+may finish an already-running commit before the fence is acquired, but once
+the fence commits its later inserts fail closed instead of creating ambiguous
+history. Upgrade every durable-ingress replica promptly; an old replica
+rejected by this fence is unavailable for ingress, never silently compatible.
+
+When the owning workflow wait reaches a terminal outcome, it must use the
+dispatcher lifecycle boundary rather than reaching into the durable store:
+
+```python
+found = await dispatcher.deactivate_durable_consumer(
+    consumer_id="workflows:wait:run-42"
+)
+```
+
+This agent-scoped call returns `False` only for an unknown consumer; repeating
+it for an existing inactive consumer returns `True`. It atomically marks the
+registration inactive and converts pending, retrying, initially reserved, and
+leased deliveries to retained terminal `failed` evidence. The transition
+serializes with event persistence on the registration's `(agent_id, source)`
+handoff: events committed first leave terminalized evidence, while events
+committed after deactivation create no delivery. Stale ACK/NACK/release or
+initial-reservation capabilities cannot recreate work. Re-registration cannot
+change an inactive consumer back to active; a new workflow wait needs a new
+consumer ID.
+
+The dispatcher permits durable registrations only for its own `agent.did`.
+Every claim, acknowledgement, retry, and observation query is selected by
+that scope in storage; scope is therefore an authorization boundary for a
+shared PostgreSQL backend, not a caller-side filter.  The event's
+`target_agent` remains canonical envelope metadata, but the durable scope is
+always the dispatcher owner — setting a foreign target cannot enqueue work
+for another tenant.
+
+`correlation_selector` is deliberately a small declarative exact-match
+language, not SQL: `payload.<path>=<value>`, `session_id=<value>`, or
+`kind=<value>`.  It is evaluated only against the canonical post-sanitization
+envelope.  A missing selector subscribes to every event from the registered
+source for that agent.
+
+For provider retry de-duplication, inbound bridges pass their stable provider
+ID through `dispatch_signal(..., source_event_id=...)` or
+`enqueue_signal(..., source_event_id=...)`.  The durable event identity is
+unique on `(agent_id, source, source_event_id)`.  A repeat returns a
+`COALESCED` result, does not route the signal again, and creates no second
+delivery.  `channel.message` passes its `ChannelMessage.id` this way.
+
+The delivery guarantee is **at least once**.  Claim is an atomic conditional
+lease transition and returns an unguessable `lease_token`; only that live
+token can ack or nack.  A crash after a side effect but before ack causes a
+lease-expiry retry, so workflow side effects must be idempotent on
+`event_id`/`delivery_id`.  Bounded attempts move exhausted deliveries to the
+observable terminal `failed` state.  `pending`, `initial_reserved`, `leased`,
+`retry`, `acknowledged`, and `failed` are observable through
+`list_durable_deliveries`.
+
+The normalized envelope and matching delivery rows commit atomically **before
+the normal route executes**.  After restart an active registration backfills
+any retained event that lacks a delivery, then claims it normally.  This is
+implemented with ordinary conditional updates and scoped predicates, so it
+has the same contract on standalone SQLite and hosted PostgreSQL; the latter
+does not rely on a process-local application lock.
+
+For payload-eliding privacy modes, the durable event contains only the privacy
+marker. Its initially matched deliveries are instead inserted as
+`initial_reserved` capabilities owned by the emitting dispatcher in that same
+transaction. An initial reservation has **no delivery lease deadline** and is
+not eligible for generic claim or lease recovery. Before commit makes it
+visible, the dispatcher installs a process-local raw-payload sidecar and holds
+its local handoff lock through the commit boundary. Only after
+`persist_signal` returns from that actual commit does the owner atomically
+activate the reservation into a real lease and calculate its deadline; an
+initial local claim can then transfer that lease to a worker. A peer sharing
+the database therefore cannot steal a just-emitted marker-only delivery before
+its owner consumes the live payload, even if commit was paused longer than the
+consumer lease.
+
+Runtime-owner heartbeats make recovery owner-aware: graceful shutdown releases
+only that dispatcher's unactivated reservations to ordinary marker-only retry
+work. Startup recovery and later owner-heartbeat sweeps do the same only for a
+stopped, missing, or stale runtime generation; a just-crashed owner that is
+still fresh at restart is reconsidered after it crosses the stale threshold.
+Recovery never releases a concurrent live dispatcher's
+reservation. The sidecar is discarded on rollback, acknowledgement, terminal
+failure, lease expiry, and shutdown; after a crash or expired lease, normal
+replay intentionally receives only the persisted marker. Raw payload is never
+written to the durable ledger.
+
+Registration and persistence also serialize their handoff at the
+`(agent_id, source)` scope.  Thus an event racing a new workflow subscription
+is either committed first and backfilled by that registration, or sees the
+committed consumer and creates its delivery directly; it cannot fall between
+the two transactions.
+
 ```python
 @dataclass
 class SignalResult:
@@ -246,15 +567,16 @@ The dispatcher pipeline:
 
 1. **Validate** against registration. Unknown source → `DROPPED_VALIDATION`. Mode not in `allowed_modes` → `DROPPED_VALIDATION`. Schema fail → `DROPPED_VALIDATION`. UNTRUSTED with no sanitizer for non-ACTION mode → `DROPPED_VALIDATION`.
 2. **Append-and-cycle-check** — see Concern #6 for exact rules.
-3. **Quiet-hours-check** against the source's `attention_policy`. `urgency >= attention_policy.urgency_override` bypasses.
-4. **Coalesce** by `dedupe_key` within `coalescing_window` (or global default).
-5. **Acquire registered resource locks** in lexicographic order of lock name (single ordered lock manager — see Concern #2). `CONVERSATION` is **never** in this set; it is acquired downstream by the turn lifecycle for COGNITION (see Concern #1).
-6. **Route**:
+3. **Persist durable event/deliveries** — commit the sanitized, schema-normalized envelope and every matching scoped consumer delivery. A duplicate explicit `source_event_id` stops here as `COALESCED`.
+4. **Quiet-hours-check** against the source's `attention_policy`. `urgency >= attention_policy.urgency_override` bypasses.
+5. **Coalesce** by `dedupe_key` within `coalescing_window` (or global default).
+6. **Acquire registered resource locks** in lexicographic order of lock name (single ordered lock manager — see Concern #2). `CONVERSATION` is **never** in this set; it is acquired downstream by the turn lifecycle for COGNITION (see Concern #1).
+7. **Route**:
    - ACTION → `await registration.handler(payload)`
    - ARTIFACT → `await registration.artifact_handler(signal)`
    - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
-7. **Release locks** in reverse acquisition order.
-8. **Log** per the source's redaction policy.
+8. **Release locks** in reverse acquisition order.
+9. **Log** the routed outcome per the source's redaction policy.
 
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 
@@ -286,6 +608,31 @@ signal_log
 - **Prompt-template provenance** is stored for COGNITION dispatches after prompt render. The hash covers the exact template body chosen for that dispatch, including per-signal overrides.
 
 If a registration doesn't specify a redaction policy, the dispatcher refuses to register the source. No defaults; this is too important to default.
+
+### Audit persistence is not pending-delivery durability
+
+`signal_log` is appended after a route succeeds or fails.  It remains the
+backwards-compatible audit/outcome surface and does not participate in claim,
+lease, acknowledgement, or replay.
+
+The separate `durable_signal_events`, `durable_signal_consumers`, and
+`durable_signal_deliveries` tables are the pending-delivery ledger.  They
+retain the normalized/sanitized payload because a consumer needs the canonical
+event to resume; sources must therefore expose only data their registered
+consumer contract is permitted to receive.  This is deliberately different
+from `signal_log`'s optional trusted raw-payload retention policy.  Raw
+`caller` routing identity is not copied into the durable envelope: a consumer
+uses only fields the source normalized into `payload` (plus the validated
+envelope metadata).
+
+`registration.retention_days` bounds durable event history too.  Retention
+cleanup deletes an event (and its acknowledged/failed deliveries) only after
+the deadline and only when every delivery is terminal; it never silently
+deletes pending, retriable, or leased work.  Consumers are long-lived
+registrations and are not removed by the event cleanup sweep.  The existing
+`trash_retention` maintenance rail invokes this cleanup alongside its
+conversation sweep; a durable-ledger cleanup error is logged but does not
+prevent the independent conversation-retention operation.
 
 ## Concerns
 

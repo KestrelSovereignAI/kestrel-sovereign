@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TextIO
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -199,6 +200,23 @@ def _agent_port(agent_name: str) -> int | None:
     return ((multi_agent.get("agents") or {}).get(agent_name) or {}).get("port")
 
 
+def _run_captured(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a command with locale-independent, loss-preserving text capture."""
+    return subprocess.run(
+        command,
+        capture_output=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+    )
+
+
+def _write_captured(stream: TextIO, output: str) -> None:
+    """Write captured text without assuming the destination stream is UTF-8."""
+    encoding = stream.encoding or "utf-8"
+    printable = output.encode(encoding, errors="backslashreplace").decode(encoding)
+    stream.write(printable)
+
+
 def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     """Invoke the kestrel CLI via the current Python interpreter.
 
@@ -207,10 +225,8 @@ def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     ``kestrel`` on Unix and ``kestrel.exe`` on Windows; the module
     invocation is identical on every OS.
     """
-    return subprocess.run(
+    return _run_captured(
         [sys.executable, "-m", "kestrel_sovereign.cli", *args],
-        capture_output=True,
-        text=True,
     )
 
 
@@ -243,8 +259,8 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
     print(f"Agent port from multi_agent.toml: {port}")
 
     start = _kestrel("start", args.agent_name)
-    sys.stdout.write(start.stdout)
-    sys.stderr.write(start.stderr)
+    _write_captured(sys.stdout, start.stdout)
+    _write_captured(sys.stderr, start.stderr)
     if start.returncode != 0:
         return _fail(f"kestrel start exited {start.returncode}")
 
@@ -259,8 +275,8 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
         # Always try to stop, even if the health check failed — leaves
         # the runner clean for the DID-persistence step.
         stop = _kestrel("stop", args.agent_name)
-        sys.stdout.write(stop.stdout)
-        sys.stderr.write(stop.stderr)
+        _write_captured(sys.stdout, stop.stdout)
+        _write_captured(sys.stderr, stop.stderr)
 
     return _ok(f"Health endpoint verified on port {port}")
 
@@ -331,8 +347,8 @@ def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
     print(f"Host port from multi_agent.toml: {port}")
 
     start = _kestrel("start")  # no agent name → multi-agent host
-    sys.stdout.write(start.stdout)
-    sys.stderr.write(start.stderr)
+    _write_captured(sys.stdout, start.stdout)
+    _write_captured(sys.stderr, start.stderr)
     if start.returncode != 0:
         return _fail(f"kestrel start (host mode) exited {start.returncode}")
 
@@ -359,8 +375,8 @@ def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
             )
     finally:
         stop = _kestrel("stop")
-        sys.stdout.write(stop.stdout)
-        sys.stderr.write(stop.stderr)
+        _write_captured(sys.stdout, stop.stdout)
+        _write_captured(sys.stderr, stop.stderr)
 
     return _ok(
         f"Top-level /v1/chat/completions on host:{port} returned 503 with "

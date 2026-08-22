@@ -1,8 +1,7 @@
 import asyncio
 import inspect
 import logging
-import os
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -12,6 +11,15 @@ from datetime import datetime
 from kestrel_sovereign.storage import GraphNode
 
 logger = logging.getLogger(__name__)
+
+# Typed refusal codes carried on ``ToolResult.failed(data={"refusal": ...})``.
+# A refusal is the caller asking for something this host cannot honour — NOT a
+# server fault — so HTTP callers map these codes to a 4xx instead of
+# substring-sniffing the human-readable message (#2918). Endpoint mapping lives
+# in ``kestrel_sovereign/endpoints/sovereignty.py``.
+REFUSAL_ENCRYPTION_KEY_UNAVAILABLE = "encryption_key_unavailable"
+REFUSAL_INSUFFICIENT_FUNDS = "insufficient_funds"
+
 
 class SovereigntyFeature(Feature):
     """
@@ -54,7 +62,8 @@ class SovereigntyFeature(Feature):
 
         Args:
             storage_tier: 'local', 'ipfs', or 'filecoin' (default: 'ipfs')
-            encrypt: Whether to encrypt the backup (default: True)
+            encrypt: Whether to encrypt the backup (default: True). Honoured
+                on every tier, local included; requires KESTREL_DATA_KEY.
             on_progress: Optional callback(bytes_sent, total_bytes). Not
                 LLM-supplied (an LLM can't pass a callable); retained for
                 internal callers and the export-progress SSE pipeline,
@@ -64,8 +73,9 @@ class SovereigntyFeature(Feature):
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
             when a non-local tier produced no IPFS CID (backup hashed
             locally but not actually pushed to the network), or
-            ToolResult.failed when a paid storage tier cannot be accounted
-            for through a wallet.
+            ToolResult.failed when requested encryption cannot be honoured
+            or a paid storage tier cannot be accounted for through a wallet.
+            Refusals carry a typed ``data["refusal"]`` code.
         """
         # Validate storage_tier explicitly. The old code resolved this via
         # ``tier_map.get(storage_tier.lower(), StorageTier.IPFS)``, so a
@@ -105,8 +115,32 @@ class SovereigntyFeature(Feature):
             )
         tier_enum = tier_map[tier_key]
 
-        # Don't encrypt for local storage (no point, and complicates retrieval)
-        encrypt = encrypt and tier_enum != StorageTier.LOCAL_ONLY
+        # Encryption is honoured on EVERY tier, local included. The old code
+        # coerced ``encrypt`` to False for LOCAL_ONLY ("no point, and
+        # complicates retrieval") and silently wrote a plaintext backup of the
+        # whole database (#2872). Both halves of that rationale were wrong:
+        # ``FilecoinAdapter.store_content`` encrypts BEFORE it branches on
+        # tier, and ``retrieve_content`` re-derives the portable per-content
+        # key from KESTREL_DATA_KEY + the content hash (no sidecar), so a local
+        # export decrypts through the identical path as a remote one.
+        #
+        # The one request that cannot be honoured is encryption with no master
+        # key configured. Refuse it BEFORE the backup blob, the adapter, and
+        # any wallet debit, and carry a typed refusal code so HTTP callers can
+        # tell a refusal from a server fault (#2918).
+        if encrypt:
+            from kestrel_sovereign.security.encryption import get_master_key_bytes
+
+            if not get_master_key_bytes():
+                return ToolResult.failed(
+                    error=(
+                        "encrypt=True requires KESTREL_DATA_KEY, but no master "
+                        "encryption key is configured; no sovereignty backup "
+                        "was created. Set KESTREL_DATA_KEY, or re-run with "
+                        "encrypt=False to accept a plaintext backup."
+                    ),
+                    data={"refusal": REFUSAL_ENCRYPTION_KEY_UNAVAILABLE},
+                )
 
         wallet = getattr(self.agent, "wallet", None)
 
@@ -123,7 +157,10 @@ class SovereigntyFeature(Feature):
                     )
                 )
             if not wallet.can_afford(fee_main):
-                return ToolResult.failed(error="Insufficient funds for backup.")
+                return ToolResult.failed(
+                    error="Insufficient funds for backup.",
+                    data={"refusal": REFUSAL_INSUFFICIENT_FUNDS},
+                )
 
         # Create backup blob
         backup_blob = await self.agent.storage.create_backup_blob(include_db=True)

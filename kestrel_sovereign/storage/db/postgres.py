@@ -25,9 +25,12 @@ ADVANCED MODE:
 import asyncio
 import contextvars
 import logging
+from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
+
+from kestrel_sovereign._async_ownership import await_owned_task
 
 from .interface import (
     ConnectionError,
@@ -38,6 +41,7 @@ from .interface import (
     TransactionError,
 )
 from .placeholder import sqlite_to_postgres
+from .timestamp import TimestamptzParameter
 from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,7 @@ logger = logging.getLogger(__name__)
 _CONCURRENT_UPDATE_MARKER = "tuple concurrently updated"
 _CONCURRENT_WRITE_RETRIES = 4
 _CONCURRENT_WRITE_BACKOFF_S = 0.02
+_ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
 
 
 def _is_concurrent_update_error(exc: BaseException) -> bool:
@@ -127,6 +132,23 @@ class PostgresBackend(DatabaseBackend):
         self._password = password
         self._min_pool_size = min_pool_size
         self._max_pool_size = max_pool_size
+        # Session advisory locks protect scheduler effects for their whole
+        # external-work span. Keep a *bounded*, separate pool for those gates:
+        # a waiter must not consume the last operational connection needed by
+        # an admitted effect's lease renewal/final CAS, and an unbounded direct
+        # connection per waiter would merely trade a deadlock for connection
+        # exhaustion. Four sessions are enough for distinct-DID concurrency;
+        # smaller operational pools keep the same cap.
+        self._advisory_max_pool_size = max(1, min(max_pool_size, 4))
+        self._advisory_dsn = dsn
+        self._advisory_connect_args: tuple[Any, ...] = (dsn,) if dsn else ()
+        self._advisory_connect_kwargs: dict[str, Any] = {}
+        self._advisory_recipe_available = self._has_advisory_connection_recipe(
+            self._advisory_connect_args,
+            self._advisory_connect_kwargs,
+        )
+        self._advisory_pool: Optional[asyncpg.Pool] = None
+        self._advisory_pool_lock = asyncio.Lock()
         
         self._pool: Optional[asyncpg.Pool] = None
         # PER-TASK transaction connection (#1726). Previously a single shared
@@ -144,7 +166,13 @@ class PostgresBackend(DatabaseBackend):
         self._owns_pool = True  # We own pools we create
     
     @classmethod
-    def from_pool(cls, pool: "asyncpg.Pool") -> "PostgresBackend":
+    def from_pool(
+        cls,
+        pool: "asyncpg.Pool",
+        *,
+        advisory_dsn: Optional[str] = None,
+        advisory_connect_kwargs: Optional[dict[str, Any]] = None,
+    ) -> "PostgresBackend":
         """
         Create a PostgresBackend from an existing asyncpg pool.
 
@@ -155,11 +183,19 @@ class PostgresBackend(DatabaseBackend):
 
         Args:
             pool: Existing asyncpg.Pool instance
+            advisory_dsn: Optional explicit DSN for the bounded dedicated
+                advisory-lock pool. When omitted, connection construction
+                settings are copied from asyncpg's pool construction context.
+            advisory_connect_kwargs: Connection options for the dedicated
+                advisory-lock pool, such as a non-default ``search_path``.
 
         Returns:
             PostgresBackend wrapping the pool
         """
         instance = cls.__new__(cls)
+        # Preserve the wrapped pool's no-DSN contract for unrelated consumers
+        # (for example SQLAlchemy session factories). The scheduler-only
+        # dedicated advisory pool has its own explicit connection source.
         instance._dsn = None
         instance._host = None
         instance._port = 5432
@@ -168,10 +204,112 @@ class PostgresBackend(DatabaseBackend):
         instance._password = None
         instance._min_pool_size = 2
         instance._max_pool_size = 10
+        try:
+            operational_max = int(pool.get_max_size())
+        except (AttributeError, TypeError, ValueError):
+            operational_max = 4
+        instance._advisory_max_pool_size = max(1, min(operational_max, 4))
+        pool_args, pool_kwargs = cls._advisory_settings_from_pool(pool)
+        if advisory_dsn is not None:
+            pool_args = (advisory_dsn,)
+            # An explicit scheduler connection source must not inherit the
+            # wrapped pool's host/password/SSL options. Retain only protocol
+            # classes, while callers supply any intended advisory overrides.
+            pool_kwargs = {
+                key: value
+                for key, value in pool_kwargs.items()
+                if key in {"connection_class", "record_class"}
+            }
+        instance._advisory_dsn = advisory_dsn
+        instance._advisory_connect_args = pool_args
+        instance._advisory_connect_kwargs = {
+            **pool_kwargs,
+            **dict(advisory_connect_kwargs or {}),
+        }
+        instance._advisory_recipe_available = cls._has_advisory_connection_recipe(
+            instance._advisory_connect_args,
+            instance._advisory_connect_kwargs,
+        )
+        instance._advisory_pool = None
+        instance._advisory_pool_lock = asyncio.Lock()
         instance._pool = pool
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
         instance._owns_pool = False  # Mark that we don't own the pool
         return instance
+
+    @staticmethod
+    def _advisory_settings_from_pool(
+        pool: "asyncpg.Pool",
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Copy the independent connection recipe from an asyncpg pool.
+
+        asyncpg deliberately does not offer a public DSN accessor for a live
+        pool. It does retain the immutable arguments used to construct that
+        pool, which are the only safe pool-only embedding seam for a fresh
+        advisory session: borrowing the shared operational pool for a
+        long-lived scheduler lock can starve the lease/finalization path.
+        Treat malformed third-party doubles as having no derivable recipe so
+        the advisory gate still fails closed rather than guessing credentials.
+        """
+
+        raw_args = getattr(pool, "_connect_args", ())
+        raw_kwargs = getattr(pool, "_connect_kwargs", {})
+        if (
+            not isinstance(raw_args, SequenceABC)
+            or isinstance(raw_args, (str, bytes, bytearray))
+            or not isinstance(raw_kwargs, dict)
+        ):
+            return (), {}
+        connect_args = tuple(raw_args)
+        kwargs = dict(raw_kwargs)
+        connect_factory = getattr(pool, "_connect", None)
+        if callable(connect_factory):
+            kwargs.setdefault("connect", connect_factory)
+        connection_class = getattr(pool, "_connection_class", None)
+        if connection_class is not None:
+            kwargs.setdefault("connection_class", connection_class)
+        record_class = getattr(pool, "_record_class", None)
+        if record_class is not None:
+            kwargs.setdefault("record_class", record_class)
+        return connect_args, kwargs
+
+    @staticmethod
+    def _has_advisory_connection_recipe(
+        connect_args: tuple[Any, ...],
+        connect_kwargs: dict[str, Any],
+    ) -> bool:
+        """Whether copied asyncpg settings can create an isolated session."""
+
+        # ``Pool`` stores ``connection.connect`` as ``_connect`` when callers
+        # do not provide ``connect=``.  That default needs a DSN or complete
+        # keyword credentials and must not authorize a fresh connection from
+        # ambient configuration.  A distinct factory, however, is itself the
+        # caller-provided connection recipe (and may keep its credentials in a
+        # closure), so preserve it for the dedicated advisory pool.
+        connect_factory = connect_kwargs.get("connect")
+        if (
+            callable(connect_factory)
+            and asyncpg is not None
+            and connect_factory is not asyncpg.connection.connect
+        ):
+            return True
+        if connect_args and connect_args[0] is not None:
+            return isinstance(connect_args[0], str) and bool(connect_args[0])
+        host = connect_kwargs.get("host")
+        database = connect_kwargs.get("database")
+        if not isinstance(database, str) or not database:
+            return False
+        if isinstance(host, str):
+            return bool(host)
+        # asyncpg accepts list/tuple hosts for ordered multi-host failover.
+        # Limit copied wrapped-pool recipes to those concrete containers so an
+        # arbitrary sequence or ambient asyncpg configuration cannot authorize
+        # a dedicated advisory connection.
+        return (
+            isinstance(host, (list, tuple))
+            and bool(host)
+            and all(isinstance(candidate, str) and bool(candidate) for candidate in host)
+        )
 
     def _current_txn_conn(self):
         """This task's open transaction connection, or None (#1726).
@@ -226,24 +364,118 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
     
     async def close(self) -> None:
-        """Close connection pool (only if we own it)."""
-        if self._pool is not None:
-            if self._owns_pool:
-                try:
-                    await self._pool.close()
-                    logger.debug("Closed PostgreSQL connection pool")
-                finally:
-                    self._pool = None
+        """Close every owned pool before surfacing a close failure or cancel.
+
+        The advisory pool is a separate owned resource even when the primary
+        pool was supplied by ``from_pool``.  Keep each handle until its own
+        close task reaches a successful terminal state, so a failure or an
+        owned-task cancellation remains retryable instead of stranding a
+        dedicated advisory session behind a cleared reference.
+        """
+
+        pending_cancellation: asyncio.CancelledError | None = None
+        failures: list[BaseException] = []
+
+        advisory_pool = self._advisory_pool
+        if advisory_pool is not None:
+            outcome = await await_owned_task(
+                asyncio.create_task(advisory_pool.close()),
+                pending_cancellation,
+            )
+            pending_cancellation = outcome.cancellation
+            if outcome.error is None:
+                if self._advisory_pool is advisory_pool:
+                    self._advisory_pool = None
             else:
-                # We don't own the pool (from from_pool), just release reference
+                failures.append(outcome.error)
+
+        primary_pool = self._pool
+        if primary_pool is not None:
+            if self._owns_pool:
+                outcome = await await_owned_task(
+                    asyncio.create_task(primary_pool.close()),
+                    pending_cancellation,
+                )
+                pending_cancellation = outcome.cancellation
+                if outcome.error is None:
+                    if self._pool is primary_pool:
+                        self._pool = None
+                    logger.debug("Closed PostgreSQL connection pool")
+                else:
+                    failures.append(outcome.error)
+            else:
+                # We don't own the pool (from from_pool), just release our
+                # reference even when advisory cleanup failed or was cancelled.
                 logger.debug("Released PostgreSQL pool reference (not owned)")
-                self._pool = None
+                if self._pool is primary_pool:
+                    self._pool = None
+
+        if pending_cancellation is not None:
+            if failures:
+                pending_cancellation.add_note(
+                    "PostgreSQL pool cleanup also failed: "
+                    + "; ".join(str(error) for error in failures)
+                )
+                raise pending_cancellation from failures[0]
+            raise pending_cancellation
+        if failures:
+            if len(failures) > 1:
+                failures[0].add_note(
+                    "Additional PostgreSQL pool cleanup failures: "
+                    + "; ".join(str(error) for error in failures[1:])
+                )
+            raise failures[0]
     
     def _ensure_connected(self) -> asyncpg.Pool:
         """Ensure we have an active pool."""
         if self._pool is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
+
+    async def _ensure_advisory_pool(self) -> "asyncpg.Pool":
+        """Return the bounded pool used only for long advisory-lock gates."""
+
+        # Retain the normal backend lifecycle check: an advisory pool is not a
+        # hidden replacement for a closed primary database backend.
+        self._ensure_connected()
+        if self._advisory_pool is not None:
+            return self._advisory_pool
+        async with self._advisory_pool_lock:
+            if self._advisory_pool is not None:
+                return self._advisory_pool
+            kwargs = dict(self._advisory_connect_kwargs)
+            try:
+                if self._advisory_recipe_available:
+                    pool = await asyncpg.create_pool(
+                        *self._advisory_connect_args,
+                        min_size=0,
+                        max_size=self._advisory_max_pool_size,
+                        **kwargs,
+                    )
+                else:
+                    if not self._host or not self._database:
+                        raise ConnectionError(
+                            "Dedicated PostgreSQL advisory locks require connection "
+                            "parameters, advisory_dsn, or a valid wrapped-pool recipe"
+                        )
+                    pool = await asyncpg.create_pool(
+                        host=self._host,
+                        port=self._port,
+                        database=self._database,
+                        user=self._user,
+                        password=self._password,
+                        min_size=0,
+                        max_size=self._advisory_max_pool_size,
+                        **kwargs,
+                    )
+            except ConnectionError:
+                raise
+            except Exception as exc:
+                raise ConnectionError(
+                    f"Failed to create dedicated PostgreSQL advisory-lock pool: {exc}"
+                ) from exc
+            self._advisory_pool = pool
+            return pool
     
     def _convert_query(self, query: str) -> str:
         """Convert SQLite-style ? placeholders to PostgreSQL $N style."""
@@ -252,17 +484,27 @@ class PostgresBackend(DatabaseBackend):
 
     @staticmethod
     def _strip_tz(params: Params) -> Tuple[Any, ...]:
-        """Strip timezone info from datetime params.
+        """Adapt timestamp parameters without changing their SQL contract.
 
-        The schema uses TIMESTAMP (naive), not TIMESTAMPTZ. asyncpg
-        raises errors when mixing offset-naive and offset-aware datetimes,
-        so we strip tzinfo from any aware datetime params.
+        Legacy callers bind to genuinely timezone-naive ``TIMESTAMP`` columns,
+        where asyncpg requires a naive datetime. Unified stores that declare
+        ``TIMESTAMPTZ`` use :class:`TimestamptzParameter` explicitly; preserve
+        an aware value there (normalizing to UTC) so its absolute instant does
+        not become process-local wall time before asyncpg sees it.
         """
-        return tuple(
-            p.replace(tzinfo=None) if isinstance(p, datetime) and p.tzinfo is not None
-            else p
-            for p in params
-        )
+        adapted: list[Any] = []
+        for param in params:
+            if isinstance(param, TimestamptzParameter):
+                value = param.value
+                if value.tzinfo is not None and value.utcoffset() is not None:
+                    adapted.append(value.astimezone(timezone.utc))
+                else:
+                    adapted.append(value)
+            elif isinstance(param, datetime) and param.tzinfo is not None:
+                adapted.append(param.replace(tzinfo=None))
+            else:
+                adapted.append(param)
+        return tuple(adapted)
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
@@ -427,12 +669,132 @@ class PostgresBackend(DatabaseBackend):
                 raise TransactionError(f"Transaction failed: {e}") from e
             finally:
                 self._txn_conn_var.reset(token)
+
+    @asynccontextmanager
+    async def advisory_locks(
+        self, keys: Sequence[Tuple[int, int]], *, shared: bool = False
+    ) -> AsyncIterator[None]:
+        """Hold multiple session advisory locks on one bounded-pool connection.
+
+        A multi-tenant bootstrap can need to drain effects for more than one
+        DID. Acquiring those locks on separate connections risks needless
+        connection growth, while using the ordinary query pool can deadlock an
+        admitted effect's lease renewal or target writes. Keep every named lock
+        on one bounded advisory-pool session instead. ``shared=True`` admits
+        concurrent readers and is paired with an exclusive writer using the
+        same keys.
+
+        Callers must provide keys in their established global order when more
+        than one process can acquire an overlapping set.  Each pair uses
+        PostgreSQL's signed two-int advisory-lock form.
+        """
+        normalized_keys = tuple(keys)
+        for namespace, key in normalized_keys:
+            if not isinstance(namespace, int) or not isinstance(key, int):
+                raise TypeError("PostgreSQL advisory lock keys must be integers")
+        if not normalized_keys:
+            # A dynamic hosted scheduler can legitimately have no tenants
+            # during bootstrap. Do not pin a spare pool connection just to
+            # represent that empty exclusion set.
+            yield
+            return
+        lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
+        unlock_function = (
+            "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
+        )
+        advisory_pool = await self._ensure_advisory_pool()
+        # Pool acquisition queues outside the operational query pool.  A
+        # cancellation while waiting therefore cannot strand an operational
+        # connection that an admitted effect still needs.
+        async with advisory_pool.acquire() as conn:
+            acquired: list[Tuple[int, int]] = []
+            try:
+                for namespace, key in normalized_keys:
+                    await conn.execute(
+                        f"SELECT {lock_function}($1, $2)", namespace, key
+                    )
+                    acquired.append((namespace, key))
+                yield
+            except BaseException:
+                # A cancellation can race PostgreSQL granting a blocking lock
+                # after asyncpg has sent the cancellation request. Terminating
+                # this dedicated connection is the only unconditional release
+                # in that race; the bounded pool discards it and never returns
+                # a possibly locked session to another scheduler operation.
+                conn.terminate()
+                raise
+            else:
+                try:
+                    # ``pg_advisory_unlock`` must run on the same session that
+                    # acquired the lock. The normal path returns the clean,
+                    # unlocked connection to the bounded advisory pool.
+                    for namespace, key in reversed(acquired):
+                        await conn.execute(
+                            f"SELECT {unlock_function}($1, $2)", namespace, key
+                        )
+                except BaseException:
+                    conn.terminate()
+                    raise
+
+    @asynccontextmanager
+    async def polled_advisory_lock(
+        self, key: Tuple[int, int]
+    ) -> AsyncIterator[None]:
+        """Hold one session lock without leaving a blocked statement snapshot.
+
+        ``CREATE INDEX CONCURRENTLY`` waits for transactions with older
+        snapshots. A second initializer blocked inside ``pg_advisory_lock`` is
+        itself such a transaction, which forms a cycle with the first
+        initializer's concurrent build. Polling ``pg_try_advisory_lock`` lets
+        every unsuccessful statement finish before sleeping in Python, so a
+        waiter owns no virtual XID or snapshot while the winner builds.
+        """
+
+        namespace, lock_key = key
+        if not isinstance(namespace, int) or not isinstance(lock_key, int):
+            raise TypeError("PostgreSQL advisory lock keys must be integers")
+        advisory_pool = await self._ensure_advisory_pool()
+        async with advisory_pool.acquire() as conn:
+            acquired = False
+            try:
+                while not acquired:
+                    acquired = bool(
+                        await conn.fetchval(
+                            "SELECT pg_try_advisory_lock($1, $2)",
+                            namespace,
+                            lock_key,
+                        )
+                    )
+                    if not acquired:
+                        await asyncio.sleep(_ADVISORY_LOCK_POLL_INTERVAL_S)
+                yield
+            except BaseException:
+                conn.terminate()
+                raise
+            else:
+                try:
+                    unlocked = await conn.fetchval(
+                        "SELECT pg_advisory_unlock($1, $2)",
+                        namespace,
+                        lock_key,
+                    )
+                    if not unlocked:
+                        raise RuntimeError(
+                            "PostgreSQL polled advisory lock disappeared"
+                        )
+                except BaseException:
+                    conn.terminate()
+                    raise
     
     async def table_exists(self, table_name: str) -> bool:
-        """Check if a table exists."""
-        row = await self.fetch_one(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name=?",
-            (table_name,)
-        )
-        return row is not None
+        """Check whether an unqualified relation resolves on this connection.
+
+        ``to_regclass`` follows PostgreSQL's active ``search_path``.  That
+        preserves the normal production ``public`` behavior while allowing a
+        transaction-local schema to be inspected on the connection that owns
+        it, rather than accidentally observing an unrelated public table.
+        """
+        return bool(await self.fetch_val(
+            "SELECT to_regclass(?) IS NOT NULL",
+            (table_name,),
+        ))

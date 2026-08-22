@@ -28,9 +28,13 @@ class TestStreamingBasics:
             chunks.append(chunk)
 
         mock_agent._maybe_audit.assert_called_once()
-        mock_agent.process_input.assert_called_once_with(
-            "!help", None, session_id=None, caller=None, invocation_context=None,
-        )
+        mock_agent.process_input.assert_called_once()
+        args, kwargs = mock_agent.process_input.call_args
+        assert args == ("!help", None)
+        assert kwargs["session_id"] is None
+        assert kwargs["caller"] is None
+        assert kwargs["invocation_context"] is None
+        assert isinstance(kwargs["invocation_id"], str)
         assert "Command executed" in "".join(chunks)
 
     @pytest.mark.asyncio
@@ -182,6 +186,10 @@ class TestRealStreaming:
             '_build_feature_tools',
             '_visible_features_by_tool_name',
             '_visible_known_tool_names',
+            '_known_tool_names',
+            '_registered_tool_names',
+            '_registered_features_by_tool_name',
+            '_feature_supports_subagent_dispatch',
             '_hidden_context_features',
             '_hidden_context_tools',
             '_feature_hidden_from_context',
@@ -2181,7 +2189,9 @@ def _bind_real_orchestrator(agent):
         "_dispatch_tool_call", "_dispatch_feature_tool", "_dispatch_direct_tool",
         "_get_denied_tools", "_handle_feature_error", "_prune_orchestrator_messages",
         "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_hidden_context_features",
+        "_visible_known_tool_names", "_known_tool_names",
+        "_registered_tool_names", "_registered_features_by_tool_name",
+        "_feature_supports_subagent_dispatch", "_hidden_context_features",
         "_hidden_context_tools", "_feature_hidden_from_context",
         "_direct_tool_hidden_from_context", "_build_assistant_tool_history_msg",
         "_append_executed_tool_breadcrumbs", "_make_inline_tool_executor",

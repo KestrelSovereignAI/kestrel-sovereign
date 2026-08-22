@@ -9,10 +9,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -96,6 +96,12 @@ humans), related messages are grouped into narrative episodes with titles,
 summaries, and emotional arcs. These episodes give the agent a high-level
 understanding of the relationship's history without needing to re-read
 every message.
+
+Semantic assertion maintenance is a separate governed path: it may reconcile
+assertion-derived projections during sleep, but it does not promote narrative
+summaries into semantic facts. Its immutable release-gate catalog and
+content-free maintenance diagnostics are documented in
+[Semantic Knowledge Release Evidence](testing/SEMANTIC_RELEASE_EVIDENCE.md).
 
 The result: when a user says "I'm feeling down about my mom," the agent
 does not respond with "You mentioned your mom on March 15th. She lives
@@ -666,6 +672,19 @@ during sleep. It performs three operations.
 > in that PR; consolidation now runs nightly at 04:00 when the
 > `MemoryFeature` is loaded.
 
+Both the nightly sleep cycle and the manual tool route through
+`MemorySystem.consolidate()`, the single bounded maintenance chokepoint. Set
+`retrieval.memory_consolidation_timeout_seconds` to change its positive,
+finite deadline (default: 1,800 seconds). Expiry raises
+`MemoryConsolidationTimeoutError`; the caller must report failure rather than
+claiming a completed pass. The coroutine and its `ResourceLock.MEMORY` context
+unwind in the same task. An aiosqlite statement already running in the driver's
+worker thread is not stopped by coroutine cancellation itself. The SQLite
+backend hands the abandoned operation to a retained `sqlite3_interrupt()` plus
+rollback drain, but a Python UDF or stalled VFS operation may not observe that
+interrupt until it returns control to SQLite and can therefore keep draining
+after the lock context is released.
+
 ### 1. Episode Creation
 
 Related messages are grouped into narrative episodes:
@@ -932,6 +951,12 @@ if deleted:
         (message_id, agent_id)
     )
 ```
+
+For semantic assertions and their corpus/projection consumers, deletion needs
+the additional catalog-correlated canonical-to-served erasure drill described in
+[Semantic Knowledge Release Evidence](testing/SEMANTIC_RELEASE_EVIDENCE.md).
+The evidence artifact records only spec-bound aggregate, content-free outcomes;
+it is not a substitute for the privacy wrapper's actual deletion enforcement.
 
 ---
 

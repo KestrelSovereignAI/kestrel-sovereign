@@ -12,46 +12,82 @@ Shared, test-patched helpers (``_get_project_dir``,
 here through the ``cli`` module object at call time, so existing
 ``patch("kestrel_sovereign.cli.<helper>")`` test seams keep working unchanged.
 """
-import json
+import functools
+import os
+import re
+import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from packaging.utils import canonicalize_name
-
-# Non-patched constant — import directly. (``MultiAgentConfig`` itself is
+# Non-patched constants — import directly. (``MultiAgentConfig`` itself is
 # referenced as ``cli.MultiAgentConfig`` because the test suite patches it.)
+# ``feature_reconcile`` holds the pure planning types and imports nothing from
+# the CLI, so naming the core distribution here is not a cycle.
+from kestrel_sovereign.feature_reconcile import (
+    CORE_DISTRIBUTION,
+    canonical_package,
+    package_for_label,
+    resolve_registry_name,
+)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+
+# Return code for "core drifted and could not be repaired". Distinct from the
+# generic ``1`` so callers can tell an unrepaired SAFETY failure from an
+# ordinary package failure: `--continue-on-error` may wave the latter through,
+# never this (issue #2949). See :meth:`CoreInstallGuard.verify`.
+CORE_UNSAFE = 2
+
+# Return code for "core is on its declared path but was NOT updated" — a
+# declared editable checkout whose pull failed. Distinct from CORE_UNSAFE (core
+# is the wrong install) and from a plain package failure, and like CORE_UNSAFE
+# it is NOT continuable: `--continue-on-error` is documented for an optional
+# package that would not install, and restarting the fleet onto stale core code
+# while reporting success is not that (issue #2949).
+CORE_STALE = 3
+
+# Exit-code severity, worst first. `max()` on the raw ints is WRONG (CORE_STALE
+# is 3 and CORE_UNSAFE is 2), which is exactly why ranking these by hand at each
+# assignment site kept losing the stronger code.
+_RC_SEVERITY = (CORE_UNSAFE, CORE_STALE, 1, 0)
+
+
+def _worst_rc(*codes: int) -> int:
+    """Fold several exit codes into the most severe one.
+
+    ``cmd_feature_sync`` tracks two INDEPENDENT facts: did some package fail to
+    install, and is core in a state a restart must not proceed over. They shared
+    a single ``rc``, so an optional feature failing *after* a failed core pull
+    overwrote :data:`CORE_STALE` with ``1`` — a code `--continue-on-error`
+    ignores by contract, which restarted the fleet onto stale core code and
+    reported success. That is the very outcome CORE_STALE was added to prevent
+    (issue #2949).
+
+    Two facts get two variables, and the ranking lives in one place so a new
+    assignment site cannot forget it.
+    """
+    for rank in _RC_SEVERITY:
+        if rank in codes:
+            return rank
+    # An unrecognised non-zero code still outranks success.
+    return next((code for code in codes if code), 0)
+
+# A ``file:`` URL path that is really a Windows drive: ``/C:/src`` — or the
+# legacy bar spelling ``/C|/src`` that older tools still emit.
+_DRIVE_URL_PATH = re.compile(r"^/[A-Za-z][:|](/|$)")
 
 
 def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
+    """Resolve a user-provided name to a registry short name.
+
+    The implementation lives in
+    :func:`kestrel_sovereign.feature_reconcile.resolve_registry_name` so the
+    reconcile planner resolves manifest names by exactly these rules; this is
+    the CLI's long-standing name (and patch seam) for it.
     """
-    Resolve a user-provided name to a registry short name.
-
-    Accepts a registry short name ("voice"), registered distribution name
-    ("kestrel-feature-voice"), or feature/provider class name
-    ("VoiceFeature"). Package-style names use Python's normalized-name rules,
-    so case and runs of ``-``, ``_``, or ``.`` are equivalent.
-    """
-    # Preserve the cheapest and most common exact registry-key lookup.
-    if name in registry:
-        return name
-
-    normalized = canonicalize_name(name)
-    for pkg_name, info in registry.items():
-        if (
-            canonicalize_name(pkg_name) == normalized
-            or canonicalize_name(info.package) == normalized
-        ):
-            return pkg_name
-
-    # Feature class name match
-    for pkg_name, info in registry.items():
-        if name in info.features:
-            return pkg_name
-
-    return None
+    return resolve_registry_name(name, registry)
 
 
 def _status_icon(status) -> str:
@@ -194,17 +230,23 @@ def cmd_feature_install(args) -> int:
     package = info.package
     print(f"Installing {package}...")
 
-    result = _extension_install_run([package])
+    # This package depends on kestrel-sovereign, so the install can resolve core
+    # from the index and replace the operator's core with a wheel copy. Same
+    # guard as `feature sync` / `update`'s reconcile — a single command is not
+    # a safer path than a batch (issue #2949).
+    guard = CoreInstallGuard.snapshot()
+
+    result = guard.run([package])
 
     if result.returncode != 0:
         # Try git URL as fallback
         if info.git:
             print(f"pip install failed, trying git: {info.git}")
-            result = _extension_install_run([f"git+{info.git}"])
+            result = guard.run([f"git+{info.git}"])
 
     if result.returncode == 0:
         print(f"Installed {package}")
-        return 0
+        return guard.verify()
     else:
         print(f"Failed to install {package}")
         if result.stderr:
@@ -212,7 +254,239 @@ def cmd_feature_install(args) -> int:
             lines = result.stderr.strip().split("\n")
             for line in lines[-5:]:
                 print(f"  {line}")
-        return 1
+        if guard.constraints:
+            print(
+                f"  note: core is pinned to {guard.constraints[0]} for this "
+                "install so a feature cannot silently replace it. If this is a "
+                "version conflict, move core to a version the feature accepts "
+                "— do not remove the pin."
+            )
+        # A failed install can be the very thing that broke the link. An
+        # unrepaired core outranks the install failure: the caller must be able
+        # to tell "this package did not install" from "the venv's core is not
+        # the declared one", because only the second forbids a restart.
+        return guard.verify() or 1
+
+
+def _file_url_to_path(url: str) -> str:
+    """Decode a PEP 610 ``file:`` URL into a filesystem path.
+
+    ``direct_url.json`` records a URL, not a path: a checkout under
+    ``/src/My Project`` arrives as ``file:///src/My%20Project``, and one on
+    Windows as ``file:///C:/src/kestrel`` (``file://server/share/...`` for a UNC
+    share). Chopping the scheme off textually leaves ``/src/My%20Project`` or
+    ``/C:/src/kestrel`` — paths that do not exist, which here is worse than
+    merely untidy: :class:`CoreInstallGuard` captures this value as the checkout
+    core must be restored *from*, so a mangled path turns a recoverable swap
+    into an unrecoverable one (issue #2949).
+
+    The URL's own shape picks the conversion, not the host platform, so a record
+    decodes to the path whoever wrote it meant, wherever it is read. A
+    Windows-authored path read on POSIX then simply does not exist there, which
+    is the honest answer — synthesising ``/C:/src/kestrel`` instead invites a
+    match against something that was never the checkout.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    parts = urlsplit(url)
+    path = unquote(parts.path)
+    host = unquote(parts.netloc)
+    if host and host.lower() != "localhost":
+        # RFC 8089 non-local authority: a Windows UNC share.
+        return "\\\\" + host + path.replace("/", "\\")
+    if _DRIVE_URL_PATH.match(path):
+        # urlsplit keeps the URL's leading slash on ``/C:/src`` (and on the
+        # legacy ``/C|/src`` spelling); the drive letter is the real root.
+        return path[1] + ":" + (path[3:].replace("/", "\\") or "\\")
+    return path
+
+
+#: Outcomes of re-reading ``direct_url.json`` that are not file contents.
+_ABSENT = object()
+_UNREADABLE = object()
+
+
+def _reread_direct_url(dist):
+    """Read ``direct_url.json`` ourselves, distinguishing absent from unreadable.
+
+    ``Distribution.read_text`` returns None for both, by design — it suppresses
+    ``FileNotFoundError`` and ``PermissionError`` together. The guard needs them
+    apart: absent is the positive evidence of an index install, unreadable is
+    the state where nothing may be inferred.
+
+    Returns the file's text, :data:`_ABSENT`, or :data:`_UNREADABLE`. A
+    distribution whose metadata directory we cannot identify reads as ABSENT:
+    index installs (which have no such file) are the overwhelming majority, so
+    treating an unlocatable file as unknown would hold every ordinary core on
+    any layout we cannot follow.
+
+    Anchors on ``_path`` — the metadata directory — because that is where
+    ``read_text`` looks and therefore where the file is. ``locate_file`` is the
+    tempting public alternative and it is the WRONG anchor: it resolves against
+    ``_path.parent`` (site-packages) because it exists to find *package* files,
+    so a re-read through it silently checks a path the file was never at, and
+    every unreadable file comes back "absent" — the exact fail-open this
+    function was added to close.
+    """
+    base = getattr(dist, "_path", None)
+    if base is None:
+        return _ABSENT
+    try:
+        return base.joinpath("direct_url.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _ABSENT
+    except (OSError, ValueError, AttributeError):
+        # PermissionError, IsADirectoryError, a decode failure, or a path object
+        # that does not support reading: the file's status was never established,
+        # so nothing may be concluded from it.
+        return _UNREADABLE
+
+
+def _direct_url_provenance(dist_name: str):
+    """Read *dist_name*'s PEP 610 provenance. Returns a :class:`Provenance`.
+
+    ``direct_url.json`` is written by every install that named its source
+    directly — a VCS ref, a local path, a remote archive, an editable checkout.
+    An install resolved from a package index writes no such file, so its absence
+    is the only positive evidence of an index install (issue #2949).
+
+    Returns the value object rather than a tuple deliberately: the third state
+    (metadata that exists but will not read) has to be impossible to drop, and
+    a caller destructuring three positional values can drop it. Every "did this
+    come from an index?" question goes through :attr:`Provenance.is_from_index`,
+    which already fails closed on unknown.
+
+    ``url`` is normalized to a filesystem path for ``file:`` URLs and kept
+    verbatim otherwise.
+    """
+    import importlib.metadata as md
+    import json
+
+    from kestrel_sovereign.feature_reconcile import Provenance
+
+    try:
+        dist = md.distribution(dist_name)
+    except md.PackageNotFoundError:
+        # Not installed, so there is no provenance to have. Absent, and known.
+        return Provenance.from_index_install()
+    except Exception:
+        # The distribution is there but unreadable — that is not "no file".
+        return Provenance.unknown()
+    try:
+        raw = dist.read_text("direct_url.json")
+    except Exception:
+        return Provenance.unknown()
+    if raw is None:
+        # `read_text` cannot be trusted to mean "absent". The stdlib's
+        # PathDistribution suppresses FileNotFoundError, PermissionError,
+        # IsADirectoryError, NotADirectoryError and KeyError alike and returns
+        # None for all of them — so a direct_url.json that EXISTS but cannot be
+        # read arrives here identical to one that was never written, and would
+        # be reported as positive evidence of an index install. That is the
+        # fail-open this reader exists to close, reintroduced by trusting an
+        # API that is documented to swallow the difference.
+        #
+        # So re-read it ourselves and classify by what actually goes wrong.
+        raw = _reread_direct_url(dist)
+        if raw is _ABSENT:
+            return Provenance.from_index_install()  # genuinely not there
+        if raw is _UNREADABLE:
+            return Provenance.unknown()
+    if not raw.strip():
+        return Provenance.unknown()  # present but empty is damage, not an index
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return Provenance.unknown()
+    if not isinstance(data, dict):
+        return Provenance.unknown()
+    # PEP 610 REQUIRES ``url``. A file that parses but omits it, leaves it
+    # empty, or gives a non-string is damaged — and damaged is unknown, not an
+    # index install. Deriving "no url, therefore no direct URL" reproduced the
+    # fail-open one layer down, where the type could no longer help.
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return Provenance.unknown()
+    dir_info = data.get("dir_info")
+    editable = bool(dir_info.get("editable")) if isinstance(dir_info, dict) else False
+
+    # The rest of the identity lives OUTSIDE ``url``. PEP 610 puts a VCS
+    # revision in ``vcs_info``, an archive's hashes in ``archive_info``, and the
+    # subdirectory alongside them — so two commits of one repository, or two
+    # builds of one archive path, carry the same url. Comparing urls alone
+    # reports a real replacement as no change, which is the version-pin mistake
+    # this whole change exists to correct, one field further in.
+    def _text(value):
+        return value if isinstance(value, str) and value.strip() else None
+
+    vcs_info = data.get("vcs_info")
+    revision = None
+    vcs_kind = None
+    if isinstance(vcs_info, dict):
+        # `vcs` is REQUIRED by PEP 610 and lives outside `url`, which carries
+        # only the transport address. Dropping it made the same address served
+        # by two different VCS at one revision string compare identical.
+        vcs_kind = _text(vcs_info.get("vcs"))
+        # commit_id is the resolved pin; requested_revision is what was asked
+        # for (a branch or tag, which moves). Prefer the resolved one.
+        revision = _text(vcs_info.get("commit_id")) or _text(
+            vcs_info.get("requested_revision")
+        )
+
+    archive_info = data.get("archive_info")
+    archive_hash = None
+    if isinstance(archive_info, dict):
+        hashes = archive_info.get("hashes")
+        if isinstance(hashes, dict):
+            # Sorted so an equal set of hashes always compares equal, whatever
+            # order the writer happened to emit.
+            archive_hash = ",".join(
+                f"{name}={digest}"
+                for name, digest in sorted(hashes.items())
+                if _text(digest)
+            ) or None
+        if archive_hash is None:
+            archive_hash = _text(archive_info.get("hash"))  # legacy single field
+
+    if url.startswith("file:"):
+        path = _file_url_to_path(url)
+        if not path:
+            return Provenance.unknown()  # a file: URL that will not resolve
+        url = path
+    return Provenance.direct(
+        url,
+        editable=editable,
+        revision=revision,
+        subdirectory=_text(data.get("subdirectory")),
+        archive_hash=archive_hash,
+        vcs=vcs_kind,
+    )
+
+
+def _from_index(dist_name: str) -> bool:
+    """Did *dist_name* come from a package index?
+
+    The one question a ``pypi`` source declaration actually asks. An index
+    resolution records no PEP 610 ``direct_url.json``; every other way of naming
+    a source — editable checkout, VCS ref, local path, remote archive — records
+    one. So this is the whole predicate, and ``not is_editable`` is not a
+    substitute for it: a git-installed package is non-editable too, and used to
+    satisfy a declaration it violates (issue #2949).
+
+    A distribution that is not installed has no direct URL, so it reads as
+    "from an index" here; callers check presence separately.
+
+    **Fails closed on unknown.** Unreadable or damaged provenance answers False,
+    because this predicate is asked in order to decide whether a declared source
+    is satisfied, and "we could not tell" is not a yes. The cost of failing
+    closed is a reinstall that was not strictly needed; the cost of failing open
+    is the wrong source silently passing — which is the whole defect.
+
+    Read through ``cli.`` so provenance has exactly ONE patchable seam: a test
+    that stubs where a package came from must not be able to leave this helper
+    answering from the developer's real venv.
+    """
+    return cli._direct_url_provenance(dist_name).is_from_index
 
 
 def _editable_install_path(dist_name: str) -> Optional[str]:
@@ -221,24 +495,16 @@ def _editable_install_path(dist_name: str) -> Optional[str]:
     PEP 660 editable installs record ``direct_url.json`` with
     ``dir_info.editable == true``. Editable installs track a local checkout, so
     pip cannot meaningfully "upgrade" them.
-    """
-    import importlib.metadata as md
-    import json
 
-    try:
-        raw = md.distribution(dist_name).read_text("direct_url.json")
-    except Exception:
-        return None
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    if not data.get("dir_info", {}).get("editable"):
-        return None
-    url = data.get("url", "")
-    return url[len("file://") :] if url.startswith("file://") else url or None
+    Narrower than :func:`_direct_url_provenance` on purpose: callers asking
+    "can I upgrade this?" want the editable checkout only. Callers asking
+    "where did this come from?" must use the provenance reader, because this
+    one returns None for a non-editable direct URL exactly as it does for an
+    index wheel.
+    """
+    # Unknown provenance is not an editable checkout: this answers "is there a
+    # checkout to pull/relink?", and there is no path to hand back.
+    return _direct_url_provenance(dist_name).editable_path
 
 
 def _installed_extension_distributions() -> list:
@@ -276,18 +542,35 @@ def _installed_extension_distributions() -> list:
     return sorted(by_dist.values(), key=lambda e: e["dist"])
 
 
-def _parse_pip_installed_version(stdout: str, dist_name: str) -> Optional[str]:
-    """Extract the post-upgrade version from pip's 'Successfully installed' line."""
-    normalized = dist_name.lower().replace("_", "-")
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("Successfully installed"):
-            continue
-        for token in line.split()[2:]:
-            pkg, _, ver = token.rpartition("-")
-            if pkg.lower().replace("_", "-") == normalized:
-                return ver
-    return None
+def _installed_version(dist_name: str) -> Optional[str]:
+    """The version of *dist_name* installed in THIS venv, right now.
+
+    Asked after an install to report what that install actually did — and read
+    from the venv, never from the installer's output. The backend is uv
+    whenever uv is on PATH (:func:`_install_backend_argv`), and the two
+    backends describe an install in prose that does not match: uv writes
+    ``+ pkg==ver`` to stderr, pip writes ``Successfully installed pkg-ver`` to
+    stdout. Parsing pip's line made every upgrade on the DEFAULT backend read
+    as "up to date", which also swallowed the restart notice that only prints
+    when something moved (issue #2949).
+
+    Lookup is by :func:`canonical_package`, so the three spellings of one
+    distribution (the operator's, the registry's, and the package's own
+    ``Name:``) resolve to one answer — including the dotted form PEP 503 folds
+    and a dash/underscore swap does not.
+
+    ``invalidate_caches`` because the install ran in a subprocess after this
+    process started: the import system's directory caches predate it, and a
+    package installed since then is otherwise invisible without re-execing.
+    """
+    import importlib
+    import importlib.metadata as md
+
+    importlib.invalidate_caches()
+    try:
+        return md.version(canonical_package(dist_name))
+    except md.PackageNotFoundError:
+        return None
 
 
 def cmd_feature_upgrade(args) -> int:
@@ -303,15 +586,25 @@ def cmd_feature_upgrade(args) -> int:
 
     requested = getattr(args, "names", None) or []
     registry = load_registry()
-    git_urls = {info.package: info.git for info in registry.values() if info.package}
+    # Three spellings of one distribution meet here: what the operator typed,
+    # what the registry catalogues, and what the package's own METADATA wrote
+    # (``ep.dist.name`` — ``Kestrel_Feature_Voice`` is legal for the project the
+    # registry calls ``kestrel-feature-voice``). PEP 503 says those are the same
+    # distribution, so every comparison and lookup is keyed on the canonical
+    # form; matching raw strings reported an installed package missing and lost
+    # its git fallback (issue #2949).
+    git_urls = {
+        canonical_package(info.package): info.git
+        for info in registry.values() if info.package
+    }
 
     if requested:
         wanted = set()
         for name in requested:
             pkg = _resolve_feature_name(name, registry)
-            wanted.add(registry[pkg].package if pkg else name)
-        unmatched = wanted - {d["dist"] for d in dists}
-        dists = [d for d in dists if d["dist"] in wanted]
+            wanted.add(canonical_package(registry[pkg].package if pkg else name))
+        unmatched = wanted - {canonical_package(d["dist"]) for d in dists}
+        dists = [d for d in dists if canonical_package(d["dist"]) in wanted]
         for name in sorted(unmatched):
             print(f"Skipping '{name}': not an installed extension package")
         if not dists:
@@ -326,6 +619,12 @@ def cmd_feature_upgrade(args) -> int:
         return 0
 
     dry_run = getattr(args, "dry_run", False)
+
+    # `--upgrade` is the most likely command to drag core forward: pip is free
+    # to satisfy the newer feature's core requirement from the index, replacing
+    # the operator's core. Guard the whole batch (issue #2949).
+    guard = CoreInstallGuard.snapshot()
+
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -342,18 +641,24 @@ def cmd_feature_upgrade(args) -> int:
             print(f"  {name:<34} {current:<10} would upgrade")
             continue
 
-        result = _extension_install_run(["--upgrade", name])
-        if result.returncode != 0 and git_urls.get(name):
-            result = _extension_install_run(["--upgrade", f"git+{git_urls[name]}"])
+        git_url = git_urls.get(canonical_package(name))
+        result = guard.run(["--upgrade", name])
+        if result.returncode != 0 and git_url:
+            result = guard.run(["--upgrade", f"git+{git_url}"])
 
         if result.returncode != 0:
             rc = 1
             print(f"  {name:<34} {current:<10} FAILED")
             for line in (result.stderr or "").strip().splitlines()[-3:]:
                 print(f"      {line}")
+            if guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]}; a "
+                    "version conflict here is a real skew, not the pin's fault."
+                )
             continue
 
-        new_version = _parse_pip_installed_version(result.stdout, name)
+        new_version = _installed_version(name)
         if new_version and new_version != current:
             upgraded += 1
             print(f"  {name:<34} {current:<10} upgraded -> {new_version}")
@@ -365,6 +670,14 @@ def cmd_feature_upgrade(args) -> int:
         print(f"  {upgraded} package(s) upgraded.")
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
+        # Detection half: an upgrade that bypassed the pin can't leave the
+        # command reporting success over a replaced core. CORE_UNSAFE is
+        # returned verbatim rather than folded into rc — see verify().
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
+            rc = 1
     return rc
 
 
@@ -437,6 +750,31 @@ def _load_host_manifest(path: Path) -> list:
                 f"manifest '{label}': 'pypi' must be a string version spec "
                 "(e.g. \">=0.3,<0.4\" or \"\" for any)"
             )
+        if pypi:
+            # Reject a malformed specifier HERE, where the operator can see
+            # which line is wrong. Downstream it fails silently and expensively:
+            # `version_satisfies` conservatively answers True when a spec will
+            # not evaluate, so every installed version "satisfies" a garbage
+            # window — and the constraint rendered from it is `<pkg><spec>`,
+            # which for `banana` is the package NAME `kestrel-sovereignbanana`
+            # and so constrains nothing at all. A guard that pins an unrelated
+            # package and then reports conformity is worse than no guard,
+            # because it reports success (issue #2949).
+            # The GUARD's validator, not `SpecifierSet` directly — they are
+            # deliberately not the same question. `===` parses but carries no
+            # version operand, so it matches nothing: accepted here it becomes
+            # an installer requirement the backend rejects, or a core policy
+            # that can never conform. Validating with a laxer rule than the
+            # consumer applies is how the two sides come to disagree, which is
+            # the defect pattern this whole change exists to remove.
+            from kestrel_sovereign.feature_reconcile import spec_is_valid
+
+            if not spec_is_valid(pypi):
+                raise ValueError(
+                    f"manifest '{label}': 'pypi' is not a usable PEP 440 version "
+                    f"spec: {pypi!r}. Use e.g. \">=0.3,<0.4\", or \"\" for any "
+                    "version from the index."
+                )
         if editable is not None and pypi is not None:
             raise ValueError(
                 f"manifest '{label}': 'editable' and 'pypi' are mutually "
@@ -478,21 +816,862 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _extension_install_run(pip_args: list):
-    """Install via uv when available, else the interpreter's own pip.
+def _have_uv() -> bool:
+    """Is uv the installer backend on this host?
+
+    The two backends are not interchangeable for the core guard: uv can scope a
+    reinstall to one package, pip cannot (see :func:`_extension_install_run`).
+    One predicate so the argv builder and the reinstall-scoping logic can never
+    disagree about which backend is about to run.
+    """
+    import shutil
+
+    return shutil.which("uv") is not None
+
+
+def _install_backend_argv(pip_args: list, extra_args=()) -> list:
+    """The exact argv an extension install runs as.
 
     uv-created virtualenvs frequently ship without ``pip``, so a bare
     ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
     (pinned to *this* interpreter so a worktree can't retarget the wrong env),
     and fall back to ``python -m pip install`` only when uv isn't on PATH.
-    """
-    import shutil
 
-    if shutil.which("uv"):
-        cmd = ["uv", "pip", "install", "--python", sys.executable, *pip_args]
-    else:
-        cmd = [sys.executable, "-m", "pip", "install", *pip_args]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    Split out of :func:`_extension_install_run` because the recovery command the
+    guard hands an operator after a failed automatic repair must be the command
+    that actually ran. Rendering ``uv pip install ...`` unconditionally
+    advertises a uv this host may not have, and drops ``--python``, so running
+    the advertised "fix" by hand could mutate a different environment — the
+    retargeting this guard exists to prevent (issue #2949).
+    """
+    if _have_uv():
+        return [
+            "uv", "pip", "install", "--python", sys.executable,
+            *extra_args, *pip_args,
+        ]
+    return [sys.executable, "-m", "pip", "install", *extra_args, *pip_args]
+
+
+def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
+    """Every argv one install runs as, in order.
+
+    One function so the executor and the recovery command the guard prints can
+    never describe different operations: a printed fix that drops the scoping
+    the real install used is issue #2949, re-opened by hand.
+
+    Without *reinstall* an install is one command. With it — a source switch,
+    where a plain install is a no-op because the already-linked version
+    satisfies the spec — the two backends diverge:
+
+    * uv scopes a reinstall to one package (``--reinstall-package``), so the
+      switch stays a single command and no dependency is ever a candidate.
+    * pip has no such flag; its ``--force-reinstall`` is all-or-nothing and
+      cascades to every resolved dependency, core included. So the switch
+      splits in two, and the ORDER is the protection:
+
+      1. ``--upgrade`` (non-forcing) resolves the requested version from the
+         index *with* its dependencies. A requirement the core pin forbids has
+         no solution and fails HERE — while the package on disk is still the
+         one that was working. Non-forcing, so a satisfying editable core keeps
+         its link.
+      2. ``--force-reinstall --no-deps`` replaces the package itself and only
+         it. This is the destructive pass, and it runs last: after the resolve
+         it depends on has already succeeded. It is needed because pass 1 is a
+         no-op when the index publishes the same version the checkout builds —
+         the case that motivated all of this.
+
+      Running those two the other way round is a bug, not a style choice: the
+      wheel lands, the dependency resolve then fails, and the caller reports a
+      failure over an environment it has already changed.
+    """
+    extra = list(extra_args)
+    if not reinstall:
+        return [_install_backend_argv(pip_args, extra)]
+    if _have_uv():
+        return [
+            _install_backend_argv(pip_args, [*extra, "--reinstall-package", reinstall]),
+        ]
+    return [
+        _install_backend_argv(pip_args, [*extra, "--upgrade"]),
+        _install_backend_argv(pip_args, [*extra, "--force-reinstall", "--no-deps"]),
+    ]
+
+
+def _is_windows() -> bool:
+    """Whether a command printed for the operator needs Windows quoting."""
+    return os.name == "nt"
+
+
+#: The Windows shell :func:`_render_command` quotes for. One string cannot serve
+#: both of Windows' shells: PowerShell needs the ``&`` call operator before a
+#: quoted program, and a leading ``&`` is a syntax error to ``cmd.exe``. So the
+#: operator is told which shell the printed command is quoted for rather than
+#: handed a coin flip. PowerShell is the choice because it is what Windows
+#: presents by default (Windows Terminal, the Start-menu entry) and what this
+#: project's own Windows guidance in ``README.md`` already assumes.
+WINDOWS_SHELL = "PowerShell"
+
+#: Tokens PowerShell's argument-mode parser passes through verbatim, so the
+#: common ``-m`` / ``--python`` / ``C:\\venv\\python.exe`` stay readable.
+#: Deliberately narrow: everything else — including ``,`` (array operator),
+#: ``@`` (splat), ``$``, and the redirection pair — is quoted.
+_PS_BARE_TOKEN = re.compile(r"^[A-Za-z0-9_.:=+/\\-]+$")
+
+
+def _powershell_quote(arg: str) -> str:
+    """Quote *arg* as a PowerShell literal string.
+
+    Single quotes suppress every parse rule PowerShell would otherwise apply —
+    ``$`` expansion, the backtick escape, and the argument-mode metacharacters
+    ``< > | & , ; @ ( ) { }`` — so a requirement such as
+    ``kestrel-sovereign>=0.52,<0.53`` survives as ONE argument. A literal
+    single quote doubles, which is PowerShell's only escape inside them.
+    """
+    if _PS_BARE_TOKEN.match(arg):
+        return arg
+    return "'" + arg.replace("'", "''") + "'"
+
+
+def _render_command(argv: list) -> str:
+    """Render *argv* as a command the operator's shell will run as this argv.
+
+    A recovery command exists solely to be pasted after an automatic repair
+    failed, so one the shell rejects is worth no more than printing nothing —
+    and one the shell silently reads as something ELSE is worse than both.
+
+    ``shlex.join`` speaks POSIX ``sh`` only, and :func:`subprocess.list2cmdline`
+    is not its Windows counterpart: it quotes for the MS C runtime the *child*
+    parses, not for the shell that reads the line first. It leaves a version
+    window like ``kestrel-sovereign>=0.52,<0.53`` bare, and ``<`` / ``>`` are
+    shell syntax before they are ever an argument — PowerShell refuses the line
+    outright, ``cmd.exe`` redirects into a file instead of passing the pin. Both
+    ends of that are the retargeting this guard exists to prevent (issue #2949),
+    re-entered through the printed fix.
+
+    Windows therefore gets :data:`WINDOWS_SHELL` quoting: literal single-quoted
+    arguments, behind the ``&`` call operator so a quoted interpreter path is
+    RUN rather than echoed back as a string.
+    """
+    if _is_windows():
+        return "& " + " ".join(_powershell_quote(a) for a in argv)
+    return shlex.join(argv)
+
+
+def _render_commands(argvs: list) -> str:
+    """Render a whole install SEQUENCE as one line the operator's shell runs.
+
+    A single command renders exactly as :func:`_render_command` — the common
+    case, and the only one on a uv host. A pip source switch is two passes
+    (see :func:`_install_commands`) and both have to reach the operator:
+    printing only the first advertises a repair that does half the job.
+
+    The ORDER is the protection (:func:`_install_commands`), so the rendered
+    line has to carry it: pass 2 replaces the package with ``--no-deps`` and is
+    only correct once the resolve in pass 1 has succeeded. POSIX gets ``&&``,
+    which says exactly that.
+
+    Windows PowerShell 5.1 — what ships with Windows — has no ``&&``, and a
+    line the shell refuses is worth nothing to someone whose core is already
+    off its declared source. Joining with ``;`` parses, but it runs pass 2
+    whatever pass 1 did: the destructive pass lands after the resolve that
+    forbade it, which is the ordering hazard :func:`_install_commands` exists
+    to prevent, handed to the operator as the fix for it. So each following
+    pass is nested inside ``if ($?) { ... }`` — PowerShell sets ``$?`` from a
+    native command's exit code, and nesting rather than chaining keeps every
+    pass conditional on every pass before it.
+    """
+    rendered = [_render_command(argv) for argv in argvs]
+    if not _is_windows():
+        return " && ".join(rendered)
+    line = rendered[-1]
+    for earlier in reversed(rendered[:-1]):
+        line = f"{earlier}; if ($?) {{ {line} }}"
+    return line
+
+
+def _render_shell() -> Optional[str]:
+    """Name the shell :func:`_render_command` just quoted for, when it matters.
+
+    ``None`` on POSIX: ``sh`` quoting is what a POSIX operator's shell reads
+    anyway, so naming it would be noise. On Windows the name is load-bearing —
+    it is the difference between a command that runs and one that errors.
+    """
+    return WINDOWS_SHELL if _is_windows() else None
+
+
+def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeout=None):
+    """Install via uv when available, else the interpreter's own pip.
+
+    Prefer :meth:`CoreInstallGuard.run` — it decides ``constraints`` for you and
+    verifies the result. ``constraints`` is keyword-only and REQUIRED so a new
+    caller has to make the core-guard decision explicitly instead of inheriting
+    a silent default that reopens issue #2949; pass ``None`` only when core
+    itself is the install target (it is never constrained against itself).
+
+    ``reinstall`` names the ONE package a caller wants force-reinstalled (used
+    when a feature switches source, e.g. an editable checkout → a PyPI wheel,
+    where a plain install is a no-op because the linked version already
+    satisfies the spec). Never append a bare ``--force-reinstall`` to
+    *pip_args* instead: that flag cascades to every resolved dependency, and
+    core is a dependency of every feature package, so it reinstalls core from
+    the index as a wheel over the editable link — issue #2949 on the path most
+    likely to hit it. A version constraint cannot stop that, because the index
+    carries the same version the checkout builds and a same-version wheel
+    satisfies the pin exactly.
+
+    The backend (uv, else this interpreter's pip) and the argv sequence it runs
+    as come from :func:`_install_commands` — one command on uv, two on pip,
+    which the guard also renders its recovery command from. They run in order
+    and stop at the first failure, so the result returned is always the one
+    that decided the outcome. ``timeout`` bounds each installer subprocess (it
+    is :func:`subprocess.run`'s), so a two-pass pip switch can take up to twice
+    it; every path is still bounded, which is what a caller with nobody
+    watching needs.
+
+    ``uv pip`` vs ``uv sync`` — do NOT "fix" this by switching installers.
+    ``uv pip`` is uv's *pip-compatible* layer: it operates on a bare virtualenv
+    and deliberately does not read ``uv.lock`` or the project config. That is
+    exactly what we want here, because feature packages are intentionally NOT
+    declared in ``pyproject.toml`` (declaring them would invert the open-core
+    dependency direction) — ``uv sync`` would prune every one of them.
+
+    The cost of project-blindness is that uv never learns the lock declares the
+    root as ``source = { editable = "." }``. It sees an ordinary dependency
+    named ``kestrel-sovereign``, and when the installed version fails a
+    feature's pin it resolves one from the index — silently replacing the
+    editable checkout with a wheel copy (issue #2949). ``constraints`` closes
+    that hole: a list of PEP 508 requirement strings written to a temporary
+    constraints file and passed as ``-c``. Callers pin core to the version it is
+    installed at, so a real version skew fails the resolve loudly instead of
+    swapping the install underneath the operator. The pin bounds core's
+    VERSION; ``reinstall`` is what keeps its SOURCE — the two holes are
+    different and need both.
+
+    ``--no-deps`` is NOT the fix for either: on its own it stops feature
+    dependencies resolving at all and hides the version-skew signal rather than
+    surfacing it. The pip source switch does use it — but only in a pass that
+    follows one which resolved those dependencies, and fails if they do not
+    resolve (:func:`_install_commands`).
+    """
+    import tempfile
+
+    constraint_file = None
+    extra_args: list = []
+    if constraints:
+        fd, constraint_file = tempfile.mkstemp(
+            prefix="kestrel-constraints-", suffix=".txt",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(constraints) + "\n")
+        extra_args = ["-c", constraint_file]
+
+    try:
+        result = None
+        for cmd in _install_commands(pip_args, extra_args, reinstall):
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                break
+        return result
+    finally:
+        if constraint_file:
+            try:
+                os.unlink(constraint_file)
+            except OSError:
+                pass
+
+
+def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedProcess:
+    """A timed-out install, shaped like the result its callers already read.
+
+    ``TimeoutExpired`` is not a variant of "the installer finished badly" that
+    every reporting path would have to learn: it carries the output captured
+    before the kill, and the only extra fact is WHY that output stops where it
+    does. Folding it into a failed :class:`~subprocess.CompletedProcess` with
+    that fact in ``stderr`` keeps one shape flowing to the operator.
+    """
+    def text(stream) -> str:
+        if stream is None:
+            return ""
+        return stream if isinstance(stream, str) else stream.decode(errors="replace")
+
+    return subprocess.CompletedProcess(
+        expired.cmd,
+        returncode=1,
+        stdout=text(expired.stdout),
+        stderr=f"timed out after {expired.timeout}s\n{text(expired.stderr)}".strip(),
+    )
+
+
+def _core_install_shape():
+    """Snapshot how ``kestrel-sovereign`` is installed in this venv.
+
+    Returns a :class:`~kestrel_sovereign.feature_reconcile.CoreInstallShape`.
+    Read through ``cli.`` so the test suite's patch seams apply.
+
+    The version comes from :func:`_installed_version` — the same live read the
+    upgrade report uses — because this snapshot is taken *after* installer
+    subprocesses have run and has to see what they left behind.
+    """
+    from kestrel_sovereign.feature_reconcile import CoreInstallShape
+
+    return CoreInstallShape(
+        version=_installed_version(CORE_DISTRIBUTION),
+        provenance=cli._direct_url_provenance(CORE_DISTRIBUTION),
+    )
+
+
+@dataclass
+class CoreGuardOutcome:
+    """What the guard found after a batch of installs, and what it did about it.
+
+    ``drift is None`` is the only state that needs no operator attention.
+    Otherwise the batch left core somewhere it was not declared to be:
+    ``repaired`` says whether reinstalling from the declared source put it back,
+    and ``command`` is what the operator must run by hand if it did not.
+    """
+
+    drift: Optional[str] = None
+    # Core matched its policy at the batch's baseline, so this batch is what
+    # moved it — a swap, as opposed to a core that never conformed to begin with.
+    replaced: bool = False
+    repaired: bool = False
+    # Was a repair even ATTEMPTED? An interrupted install is checked but never
+    # repaired — an abort must not start installing — so "we tried and failed"
+    # and "we did not try" are different facts and must not print the same
+    # sentence (issue #2962).
+    attempted: bool = True
+    command: Optional[str] = None
+    # Which shell ``command`` is quoted for, captured with it (see
+    # :func:`_render_shell`). ``None`` where the platform has only one answer.
+    shell: Optional[str] = None
+    output: str = ""  # tail of a failed repair's stderr/stdout
+
+    @property
+    def conforming(self) -> bool:
+        """Does core match its declared source RIGHT NOW?
+
+        The question every caller must answer before reporting success. A drift
+        that was repaired is conforming again; one that could not be repaired
+        leaves the host running a core nobody declared.
+        """
+        return self.drift is None or self.repaired
+
+    @property
+    def headline(self) -> str:
+        return (
+            f"{CORE_DISTRIBUTION} was replaced during the install batch" if self.replaced
+            else f"{CORE_DISTRIBUTION} is not installed from its declared source"
+        )
+
+    @property
+    def restore_instruction(self) -> str:
+        """The 'we could not put it back, here is how' line — worded once.
+
+        The CLI prints it and the HTTP surface embeds it via :meth:`describe`,
+        so it lives here rather than at both call sites: an operator comparing
+        the two must not have to wonder whether they mean the same thing. Names
+        the shell when :attr:`shell` says the quoting is specific to one, since
+        a command pasted into the other shell is not the command that ran.
+        """
+        if not self.command:
+            # No DECLARED source, so no command to offer — which is not the same
+            # thing as "the source is unknown". A core installed from a known git
+            # ref that no manifest declares reaches here too, and `resolve()`
+            # names that ref in the detail immediately above. Claiming ignorance
+            # over a line that states the source contradicts itself in front of
+            # the operator. The wording has to be true of both cases, and what is
+            # true of both is that nothing declared where core belongs.
+            return (
+                "NOT REPAIRED — no declared source to restore from, so there is "
+                "no command that could put it back. See the detail above."
+            )
+        where = f" in {self.shell}" if self.shell else ""
+        if not self.attempted:
+            # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
+            # would report an attempt that never happened, and an operator who
+            # believes a repair ran is exactly the one who will not run this.
+            return (
+                "NOT RESTORED — the install was interrupted, so no repair was "
+                f"attempted. Run `{self.command}`{where} by hand."
+            )
+        return f"RESTORE FAILED — run `{self.command}`{where} by hand."
+
+    def describe(self) -> str:
+        """One operator-readable block: what moved, and what was done about it.
+
+        Same facts the CLI prints to stderr, flattened for a log line or an
+        HTTP ``detail`` — including why a failed repair failed, which is the
+        one thing the operator cannot see from the response otherwise.
+        """
+        if self.drift is None:
+            return ""
+        lines = [f"{self.headline}.", self.drift]
+        if self.repaired:
+            lines.append(f"restored: {self.command}")
+        else:
+            lines.append(self.restore_instruction)
+            lines.extend(self.output.splitlines()[-3:])
+        return "\n".join(lines)
+
+
+class CoreInstallGuard:
+    """The one way to install a feature package (issue #2949).
+
+    Every ``kestrel-feature-*`` depends on ``kestrel-sovereign``, and the
+    installer is project-blind (see :func:`_extension_install_run`), so any
+    unguarded feature install can resolve core from the index and replace the
+    operator's declared core — most visibly by dropping an editable checkout for
+    a wheel copy, invisibly, because ``cwd=checkout`` keeps shadowing
+    ``site-packages`` for anything started from inside it.
+
+    Guarding is four steps that only work together, so one object owns all four
+    and every install command holds one. A caller that reaches for the raw
+    installer instead gets prevention without detection — the half-fix that let
+    #2949 stay silent:
+
+    1. **snapshot** how core is installed, before anything runs;
+    2. **resolve the policy** — the source map's explicit ``kestrel-sovereign``
+       entry if there is one, else the live editable link;
+    3. **constrain** every install in the batch to that policy;
+    4. **verify** afterwards, and repair + fail loudly if core moved anyway.
+
+    Step 3 cannot cover a path that bypasses the constraint file (a feature's
+    own build step, a direct ``pip`` call), which is exactly why step 4 is not
+    optional.
+    """
+
+    def __init__(self, policy, before):
+        self.policy = policy
+        # ``before`` is the pre-batch state, reported verbatim so the operator
+        # sees where core started. ``_baseline`` is the last state the batch
+        # deliberately put core in (it advances when the batch installs core
+        # itself) and is what decides whether a later drift is "replaced" or
+        # "never got there".
+        self.before = before
+        self._baseline = before
+        self._constraints = self._derive(before)
+
+    @classmethod
+    def snapshot(cls, source_index=None):
+        """Capture the live core install and the policy that governs it.
+
+        *source_index* is the ``{package: SourceEntry}`` map from the host
+        manifest when the caller has one (``feature sync``, ``update``'s
+        reconcile). Commands with no manifest in their contract
+        (``feature install`` / ``upgrade``, the install endpoint) pass nothing
+        and guard whatever the venv actually has.
+        """
+        from kestrel_sovereign import feature_reconcile as fr
+
+        before = cli._core_install_shape()
+        # The whole shape, not just its editable path: "core is a plain index
+        # wheel with nothing to protect" and "core's provenance would not read"
+        # both reduce to editable_path is None, and only the resolver can tell
+        # them apart. Passing the narrowed value let a damaged venv run entirely
+        # unguarded — no constraint, no verification (issue #2949).
+        policy = fr.resolve_core_policy(source_index or {}, before)
+        return cls(policy, before)
+
+    @classmethod
+    def unguarded(cls):
+        """A guard that constrains and verifies nothing.
+
+        For callers that provably have no core to protect — and for tests that
+        exercise install plumbing rather than the guard itself.
+        """
+        from kestrel_sovereign.feature_reconcile import CoreInstallShape, CoreSourcePolicy
+
+        return cls(CoreSourcePolicy(), CoreInstallShape())
+
+    def _derive(self, shape) -> list:
+        from kestrel_sovereign import feature_reconcile as fr
+
+        return fr.core_install_constraints(shape, self.policy)
+
+    @property
+    def constraints(self) -> list:
+        """The constraint lines applied to each guarded install (may be empty)."""
+        return list(self._constraints)
+
+    def run(self, pip_args: list, *, reinstall=None, timeout=None):
+        """Install a FEATURE package with core held inside the policy.
+
+        *reinstall* names the feature package to force-reinstall when the
+        install is a source switch (see :func:`_extension_install_run`). It is
+        the guard's business because a bare ``--force-reinstall`` in *pip_args*
+        would reinstall core from the index straight through the constraint —
+        same version, wheel instead of link.
+        """
+        return self._install(
+            pip_args,
+            constraints=self._constraints or None,
+            reinstall=reinstall,
+            timeout=timeout,
+        )
+
+    def install_core(self, pip_args: list, *, reinstall=None, timeout=None):
+        """Install CORE itself — the operator deliberately moving core's source.
+
+        Never constrained against itself, and the constraints for the rest of
+        the batch are re-derived afterwards: a batch that switches core to a new
+        checkout (or a new pin) must go on to pin the version core actually
+        became, not the one it was before the switch.
+
+        *reinstall* is scoped the same way as :meth:`run`'s, even though core is
+        the target here: reinstalling core does not require rebuilding core's
+        own dependency tree, and a blanket flag would.
+        """
+        result = self._install(
+            pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+        )
+        self.refresh()
+        return result
+
+    def refresh(self):
+        """Re-read the live core install; re-derive constraints and baseline."""
+        shape = cli._core_install_shape()
+        self._baseline = shape
+        self._constraints = self._derive(shape)
+        return shape
+
+    def conforms_now(self) -> bool:
+        """Is core on its declared source at this moment? Non-mutating.
+
+        A deliberate exception to :meth:`_check`'s privacy, and narrow: this
+        answers a BATCH-CONTROL question — "may the rest of these installs run
+        against this core?" — not a detection question. Detection is unaffected;
+        :meth:`verify` still runs unconditionally at the end of the batch and is
+        still the only thing that reports and repairs.
+
+        Needed because "the core action failed" and "core is off its declared
+        source" are not the same thing. A conforming core that declares extras
+        yields an `ensure` action, and a failed optional extra says nothing
+        about core's source — treating that as a failed transition skipped every
+        remaining entry in the batch.
+        """
+        return self._check() is None
+
+    def _check(self) -> Optional[str]:
+        """Describe how core drifted from the policy, or None if it conforms.
+
+        Private on purpose: asking without acting is prevention without
+        detection, the exact half-fix that let #2949 stay silent. Callers go
+        through :meth:`resolve` (or :meth:`verify`), which cannot look without
+        also repairing and reporting.
+        """
+        from kestrel_sovereign.feature_reconcile import describe_core_change
+
+        if not self.policy.guarded:
+            return None
+        return describe_core_change(self.before, cli._core_install_shape(), self.policy)
+
+    def _unrestorable(self, drift, replaced, *, attempted=True):
+        """The outcome for a drift with no declared source to restore from.
+
+        A hold policy means core did not come from an index and NOBODY declared
+        where it should come from. The drift is real and must be reported, but
+        there is no declared source to reinstall from — so refuse to guess one.
+        Reinstalling core from a source nobody declared is the retargeting this
+        guard exists to prevent, and committing it *as the repair* would be the
+        worst possible place.
+
+        The two cases say different things to an operator: one can be told
+        exactly where core came from, the other cannot be told anything.
+
+        Shared by :meth:`resolve` and the interrupt path so both surfaces say it
+        the same way; only *attempted* differs between them.
+        """
+        held = self.policy.hold_provenance
+        cause = (
+            f"core was installed from {held.describe()}, which no manifest "
+            "entry declares"
+            if held is not None and held.known
+            else "core's install source could not be read"
+        )
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=False,
+            attempted=attempted,
+            command="",
+            shell="",
+            output=(
+                f"{cause}, so there is no declared source to restore from. "
+                "Reinstall core yourself, or declare its source in "
+                ".kestrel-host-features.toml."
+            ),
+        )
+
+    def _install(self, pip_args, *, constraints, reinstall, timeout, repairing=False):
+        """Run the installer — the ONE place a subprocess is started.
+
+        Every install this guard performs goes through here (:meth:`run`,
+        :meth:`install_core`, :meth:`_repair`), which is what makes interrupt
+        handling a property of the guard rather than something each of the four
+        CLI paths has to remember (issue #2962).
+
+        A ``KeyboardInterrupt`` never returns, so neither the success nor the
+        failure branch above it runs and the post-check is skipped entirely —
+        while a killed installer can already have replaced core. That is the
+        #2949 failure with nobody told. Report what moved, then let the
+        interrupt continue on its way.
+
+        *repairing* is passed by :meth:`_repair` alone, and only it can know:
+        a Ctrl-C that lands inside the automatic restore interrupted a repair
+        that WAS attempted, and telling the operator "no repair was attempted"
+        there is the same false report this path exists to prevent.
+        """
+        try:
+            return cli._extension_install_run(
+                pip_args,
+                constraints=constraints,
+                reinstall=reinstall,
+                timeout=timeout,
+            )
+        except KeyboardInterrupt:
+            self._report_interrupt(repairing=repairing)
+            raise
+
+    def _interrupt_outcome(self, *, attempted):
+        """Non-mutating counterpart to :meth:`resolve`: describe, never repair.
+
+        Returns None when core still conforms — an interrupt is not by itself
+        evidence that anything moved.
+        """
+        from kestrel_sovereign.feature_reconcile import core_install_matches
+
+        drift = self._check()
+        if drift is None:
+            return None
+        replaced = core_install_matches(self._baseline, self.policy)
+        if not self.policy.source_is_verifiable:
+            return self._unrestorable(drift, replaced, attempted=attempted)
+        _, _, rendered, shell = self._restore_plan()
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=False,
+            attempted=attempted,
+            command=rendered,
+            shell=shell,
+        )
+
+    def _report_interrupt(self, *, repairing=False) -> None:
+        """Name any drift an interrupted installer left behind. REPORTS ONLY.
+
+        Deliberately does not repair. A repair runs another installer, and an
+        abort must not start unbounded work: the operator's second Ctrl-C would
+        land inside it, and a repair that hangs turns an abort into a wedge.
+        Everything here is a metadata read, so it is bounded by construction —
+        which is why this is the one place allowed to ask :meth:`_check` without
+        also acting on the answer.
+
+        Never raises. A diagnostic that fails must not replace the interrupt
+        with its own traceback — the operator pressed Ctrl-C and is entitled to
+        get Ctrl-C. ``KeyboardInterrupt`` is a ``BaseException``, so a SECOND
+        one passes straight through this handler rather than being swallowed.
+        """
+        if not self.policy.guarded:
+            return
+        try:
+            outcome = self._interrupt_outcome(attempted=repairing)
+            if outcome is None:
+                return
+            # The WRITES are inside the guard too, not just the lookup: stderr
+            # can be a closed fd or a pipe whose reader already exited, and a
+            # BrokenPipeError escaping here would replace the operator's Ctrl-C
+            # with a traceback about the diagnostic that was trying to help.
+            print(
+                f"• core: INTERRUPTED — {outcome.headline}.",
+                file=sys.stderr,
+            )
+            for line in (outcome.drift or "").splitlines():
+                print(f"    {line}", file=sys.stderr)
+            print(f"    {outcome.restore_instruction}", file=sys.stderr)
+            for line in outcome.output.splitlines()[-3:]:
+                print(f"      {line}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 - see docstring: never mask the interrupt
+            return
+
+    def _restore_plan(self):
+        """The exact install that would put core back — rendered, NOT run.
+
+        Returns ``(pip_args, reinstall, rendered, shell)``.
+
+        One derivation with two consumers: :meth:`_repair` runs it, and the
+        interrupt path prints it without running anything (issue #2962).
+        Deriving it twice is how a printed restore command starts describing a
+        different install than the one the guard would actually perform — the
+        precise failure :meth:`_repair` already documents for the *rendering*,
+        now true of the argv as well.
+        """
+        if self.policy.editable:
+            checkout = str(Path(self.policy.editable).expanduser())
+            pip_args = ["-e", checkout]
+            # Installing from a local path replaces whatever holds the name, so
+            # the link comes back without forcing anything.
+            reinstall = None
+        else:
+            # Declared from the index. A reinstall is needed to displace any
+            # install the resolver would otherwise consider done: an editable
+            # link, and equally a non-editable direct-URL copy (VCS, local path,
+            # archive) whose version already satisfies the spec — pip and uv
+            # judge "already satisfied" by VERSION, so re-resolving the spec is
+            # a no-op and the wrong source survives.
+            #
+            # Detection and repair must ask the SAME question. Asking only
+            # "is it editable?" here while _check() asks "is it from an index?"
+            # makes a drift this guard now names one it can never fix: a
+            # permanent CORE_UNSAFE, plus a printed manual command that no-ops
+            # for the operator exactly as the automatic repair did.
+            #
+            # A version outside the window is still fixed by resolving the spec
+            # again. Scoped to core, never blanket: a repair that reinstalls
+            # "everything resolved" would drop an editable SDK (or any other
+            # editable dependency of core) for an index wheel — issue #2949
+            # committed by the code that exists to undo it.
+            spec = f"{CORE_DISTRIBUTION}{self.policy.pypi}"
+            pip_args = [spec]
+            reinstall = (
+                None if cli._core_install_shape().from_index else CORE_DISTRIBUTION
+            )
+        return (
+            pip_args,
+            reinstall,
+            _render_commands(_install_commands(pip_args, reinstall=reinstall)),
+            _render_shell(),
+        )
+
+    def _repair(self, *, timeout=None):
+        """Reinstall core from its declared source.
+
+        Returns ``(ok, command, shell, result)`` — ``shell`` naming what
+        ``command`` is quoted for, captured here so the label can never describe
+        a different rendering than the one it travels with.
+
+        ``ok`` is decided by RE-READING core afterwards, in both directions —
+        the installer's exit code is evidence about the installer, not about
+        where core ended up. A nonzero exit does not mean core is still wrong:
+        a pip repair is two passes (:func:`_install_commands`) and the first
+        one restores core before the second can fail, and a subprocess killed
+        by *timeout* is killed wherever it had got to, which may be after the
+        write that put core back. Trusting the code there reports RESTORE
+        FAILED over a core that is already home — sending an operator to redo
+        an install that happened, and failing an HTTP install for a host that
+        conforms.
+
+        ``command`` is rendered from the SAME argv sequence the repair just ran
+        (:func:`_install_commands`) — backend, interpreter, and reinstall
+        scoping included — quoted for THIS host's shell
+        (:func:`_render_commands`). An operator only
+        sees it when the automatic restore failed, which is precisely when a
+        command naming a uv this host lacks — or omitting ``--python`` and so
+        landing in whichever environment is active — would retarget core
+        somewhere new instead of putting it back, and when a command their shell
+        will not parse at all leaves them with nothing.
+
+        *timeout* bounds the repair's own installer subprocess — see
+        :meth:`resolve`. A repair killed by it is reported as an ordinary failed
+        repair (``ok=False``) rather than raised: the operator still needs the
+        restore command, and the caller still needs to report whatever brought
+        it here.
+        """
+        pip_args, reinstall, rendered, shell = self._restore_plan()
+        try:
+            result = self._install(
+                pip_args, constraints=None, reinstall=reinstall, timeout=timeout,
+                repairing=True,
+            )
+        except subprocess.TimeoutExpired as expired:
+            result = _killed_process(expired)
+        ok = self._check() is None
+        if ok:
+            # Core is where the policy wants it: that is the state this batch
+            # now measures later drift against.
+            self.refresh()
+        return ok, rendered, shell, result
+
+    def resolve(self, *, timeout=None) -> CoreGuardOutcome:
+        """Check core against the policy, and repair it if it drifted.
+
+        The one place that decides what a drift means and what to do about it,
+        so the CLI (:meth:`verify`) and the HTTP install endpoint cannot answer
+        that question differently — a divergence there is how one surface ends
+        up reporting success over a core the other would have refused.
+
+        Repair success is judged by RE-CHECKING core, not by the installer's
+        exit code, and that cuts both ways: a reinstall that returned 0 and
+        still left core off its declared source is not a repair, and one that
+        exited nonzero — or was killed by *timeout* — after core was already
+        back is not a failure. The installer's output is diagnostic; core
+        itself is the authority.
+
+        *timeout* bounds the repair's installer subprocess. It defaults to
+        unlimited for the CLI, where an operator is watching the run and can
+        interrupt it; a caller with nobody at the other end MUST pass one. The
+        HTTP install endpoint is the case in point: it bounds the install
+        itself, and the resolver or network problem that hung that install hangs
+        the repair the same way — an unbounded repair turns the intended 504
+        into a request that never returns. A repair that hits the bound without
+        restoring core is an unrepaired core
+        (:attr:`CoreGuardOutcome.conforming` is False) carrying the manual
+        restore command, exactly like any other failed repair.
+        """
+        from kestrel_sovereign.feature_reconcile import core_install_matches
+
+        drift = self._check()
+        if drift is None:
+            return CoreGuardOutcome()
+
+        # Distinguish "the batch broke it" from "it never got there": both are
+        # failures, but only the first is a swap.
+        replaced = core_install_matches(self._baseline, self.policy)
+
+        if not self.policy.source_is_verifiable:
+            return self._unrestorable(drift, replaced)
+
+        repaired, rendered, shell, result = self._repair(timeout=timeout)
+        return CoreGuardOutcome(
+            drift=drift,
+            replaced=replaced,
+            repaired=repaired,
+            command=rendered,
+            shell=shell,
+            output="" if repaired else (result.stderr or result.stdout or "").strip(),
+        )
+
+    def verify(self) -> int:
+        """Assert core survived the batch; repair and report if it did not.
+
+        Three states, because two of them are not equally safe:
+
+        * ``0`` — core conforms (or nothing is guarded).
+        * ``1`` — core moved and was **repaired**. Still an error, so no command
+          reports success over a core that was replaced; but the venv is correct
+          again, so a caller told to tolerate failures may go on.
+        * :data:`CORE_UNSAFE` — core moved and the repair **failed**. The venv is
+          left running a core the manifest does not declare.
+
+        The last one is a safety assertion, not a package-level failure, and
+        must not be reachable through ``--continue-on-error`` — a flag whose
+        contract is "tolerate an optional package that would not install".
+        Folding it into ``1`` let ``kestrel update --continue-on-error`` restart
+        every agent onto an undeclared core and exit 0 (issue #2949).
+        """
+        outcome = self.resolve()
+        if outcome.drift is None:
+            return 0
+
+        print(f"• core: ERROR — {outcome.headline}.", file=sys.stderr)
+        for line in outcome.drift.splitlines():
+            print(f"    {line}", file=sys.stderr)
+        if outcome.repaired:
+            print(f"    restored: {outcome.command}", file=sys.stderr)
+            return 1
+        print(f"    {outcome.restore_instruction}", file=sys.stderr)
+        for line in outcome.output.splitlines()[-3:]:
+            print(f"      {line}", file=sys.stderr)
+        return CORE_UNSAFE
 
 
 def _capture_host_manifest(path: Path) -> int:
@@ -502,6 +1681,12 @@ def _capture_host_manifest(path: Path) -> int:
     host never hand-authors the file. Editable installs are recorded with
     their checkout path; extras can't be recovered from metadata, so the user
     adds those by hand if needed.
+
+    ``kestrel-sovereign`` itself is captured too when it is editable-installed:
+    core registers no extension entry-points, so live discovery cannot see it,
+    yet every feature depends on it and can pull a wheel over the link. A
+    first-class entry makes the intended source of core explicit rather than
+    assumed (issue #2949).
     """
     dists = cli._installed_extension_distributions()
 
@@ -514,7 +1699,24 @@ def _capture_host_manifest(path: Path) -> int:
         "# Restore with:     kestrel feature sync",
         "",
     ]
+
+    captured = 0
+    core = cli._core_install_shape()
+    if core.is_editable:
+        captured += 1
+        lines.extend([
+            "# The core distribution. Declared so feature installs cannot",
+            "# quietly resolve it from PyPI over the editable checkout.",
+            "[[feature]]",
+            f"name = {_toml_basic_string(CORE_DISTRIBUTION)}",
+            f"editable = {_toml_basic_string(core.editable_path)}",
+            "",
+        ])
+
     for d in dists:
+        if d["dist"] == CORE_DISTRIBUTION:
+            continue  # already emitted above
+        captured += 1
         lines.append("[[feature]]")
         lines.append(f'name = {_toml_basic_string(d["dist"])}')
         if d["editable_path"]:
@@ -522,7 +1724,7 @@ def _capture_host_manifest(path: Path) -> int:
         lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
-    return len(dists)
+    return captured
 
 
 def _registry_info_for(label: str, registry: dict):
@@ -539,19 +1741,13 @@ def _registry_info_for(label: str, registry: dict):
 def _version_satisfies(version: str, spec: str) -> bool:
     """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
 
-    An empty spec means "any version". When the spec can't be evaluated
-    (``packaging`` missing or a malformed value) we conservatively return True
-    so sync doesn't churn-reinstall on an unparseable pin.
+    One implementation, shared with the core-guard's policy check — a second
+    copy is how "installed satisfies the pin" and "core satisfies the pin" drift
+    apart.
     """
-    if not spec:
-        return True
-    try:
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import Version
+    from kestrel_sovereign.feature_reconcile import version_satisfies
 
-        return Version(version) in SpecifierSet(spec)
-    except Exception:  # noqa: BLE001
-        return True
+    return version_satisfies(version, spec)
 
 
 def _resolve_manifest_action(entry: dict, registry: dict):
@@ -565,8 +1761,9 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     """
     import importlib.metadata as md
 
-    info = _registry_info_for(entry["name"], registry)
-    target = info.package if info else entry["name"]
+    # Same resolver the source index keys on, so "this entry is core" and
+    # "this is core's declared source" can never disagree (issue #2949).
+    target = package_for_label(entry["name"], registry)
     extras = entry["extras"]
     editable_want = entry["editable"]
     pypi_want = entry.get("pypi")
@@ -589,7 +1786,19 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         # leave the venv pointed at a local checkout the manifest no longer
         # declares (codex round 8 P2) — or when a non-empty pin is violated
         # (codex round 2 P2). Both rather than a false `present`.
-        if cli._editable_install_path(target) or not _version_satisfies(current, pypi_want):
+        #
+        # "Not from an index" covers the editable case and the direct-URL one
+        # (VCS ref, local path, remote archive) in a single question — the same
+        # question execution and the core guard ask, so a preview can never
+        # promise `present` for something the run reinstalls.
+        #
+        # This applies to FEATURES as well as core, and deliberately so: sync's
+        # git fallback is gated on `pypi_want is None`, so a declared entry
+        # never falls back and there is no reinstall loop to avoid. Without it,
+        # a feature that reached the venv from a git URL by some other path
+        # would sit there forever while the manifest said it comes from the
+        # index.
+        if not cli._from_index(target) or not _version_satisfies(current, pypi_want):
             action = "reinstall"
         elif extras:
             action = "ensure"
@@ -600,6 +1809,21 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     else:
         action = "present"
     return target, current, action
+
+
+def _core_entry_first(entries: list, registry: dict) -> list:
+    """Manifest order, with any ``kestrel-sovereign`` entry moved to the front.
+
+    Core's declared source has to be applied before the batch derives its pin
+    from the installed state, and before any feature can drag core somewhere the
+    manifest didn't declare. Order among the remaining entries is preserved so
+    the operator's file still reads the way it runs (issue #2949).
+    """
+    def is_core(entry) -> bool:
+        return package_for_label(entry["name"], registry) == CORE_DISTRIBUTION
+
+    core = [e for e in entries if is_core(e)]
+    return core + [e for e in entries if not is_core(e)] if core else entries
 
 
 def cmd_feature_sync(args) -> int:
@@ -630,14 +1854,39 @@ def cmd_feature_sync(args) -> int:
         return 0
 
     registry = load_registry()
-    git_urls = {info.package: info.git for info in registry.values() if info.package}
+    # Keyed on the same canonical identity ``_resolve_manifest_action`` resolves
+    # an entry's target to, so the lookup can't miss on spelling alone.
+    git_urls = {
+        canonical_package(info.package): info.git
+        for info in registry.values() if info.package
+    }
     dry_run = getattr(args, "dry_run", False)
+
+    # Every kestrel-feature-* depends on kestrel-sovereign, so any of these
+    # installs can resolve core from the index and replace the declared core.
+    # Hold core inside the manifest's policy for the whole batch (prevention)
+    # and re-check it afterwards (detection) — issue #2949.
+    from kestrel_sovereign import feature_reconcile as fr
+
+    guard = CoreInstallGuard.snapshot(fr.build_source_index(entries, registry))
+
+    # The manifest is a declaration, not a program: its order says nothing about
+    # dependency order. Core is what every other entry depends on, so its
+    # declared source must be applied BEFORE the batch derives a pin from the
+    # installed state — otherwise an operator who moves core to a new checkout
+    # and lists it last pins every earlier install to the version core had
+    # *before* the switch.
+    entries = _core_entry_first(entries, registry)
 
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
 
-    rc = 0
+    # Two INDEPENDENT facts, deliberately not sharing one int (see
+    # `_worst_rc`): `package_rc` is "some package failed to install",
+    # `core_state` is "core is in a state a restart must not proceed over".
+    package_rc = 0
+    core_state = 0
     installed = 0
     for entry in entries:
         target, current, action = _resolve_manifest_action(entry, registry)
@@ -661,39 +1910,143 @@ def cmd_feature_sync(args) -> int:
             print(f"  {target:<34} {current or '-':<10} would {action} ({how})")
             continue
 
+        reinstall = None
         if editable_want:
-            pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
-        elif pypi_want is not None and cli._editable_install_path(target):
-            # Switching a currently-editable install to a PyPI source needs a
-            # force reinstall; a plain pip install leaves the satisfying
-            # editable link in place, so the source switch never takes effect
-            # (codex round 10 P2).
-            pip_args = ["--force-reinstall", install_target]
+            checkout = Path(editable_want).expanduser()
+            if canonical_package(target) == CORE_DISTRIBUTION:
+                # A declared editable CORE must be pulled before it is linked,
+                # or `kestrel update` restarts the fleet on stale contents.
+                #
+                # Nothing else covers it. Step 1 of `update` pulls the checkout
+                # the *currently installed* core lives in — which is None when
+                # core is an index wheel, and the wrong checkout when the
+                # manifest declares a different one. Reconcile pulls every
+                # editable entry it installs, but core is excluded from
+                # reconcile because it is bundled. So core is the one editable
+                # source on the host that nothing pulls.
+                #
+                # A failed pull does NOT fail the sync: a dirty core checkout is
+                # an ordinary dev state, and refusing to link over it would be
+                # hostile. It is printed instead, so the operator learns the
+                # code did not move rather than being told nothing.
+                from kestrel_sovereign import cli_lifecycle
+
+                rc_pull, out_pull = cli_lifecycle._editable_git_pull(
+                    checkout, allow_dirty=getattr(args, "allow_dirty", False),
+                )
+                for line in (out_pull or "").strip().splitlines():
+                    print(f"      {line}")
+                if rc_pull != 0:
+                    # Reported AND non-zero. Linking an unpulled checkout is
+                    # still the right end state — refusing over local edits
+                    # would be hostile, and a dirty core checkout is an ordinary
+                    # dev state — but `kestrel update` must not then restart and
+                    # return SUCCESS over code that never moved. The operator
+                    # asked for an update; they got a link. Those are different
+                    # outcomes and the exit status has to say so.
+                    #
+                    # `--allow-dirty` is honoured above, so the operator who
+                    # means "link over my edits" has a way to say it.
+                    # CORE_STALE, not the generic 1: `--continue-on-error`
+                    # ignores 1, restarts, and returns success — which is the
+                    # exact outcome this was added to prevent. Reporting is not
+                    # enough if the report is then discarded.
+                    core_state = CORE_STALE
+                    print(
+                        f"      note: {target} was linked but NOT updated — the "
+                        "checkout above is what will run after a restart."
+                    )
+            pip_args = ["-e", _pip_spec(str(checkout), extras)]
         else:
             pip_args = [install_target]
+            if pypi_want is not None and not cli._from_index(target):
+                # Switching to a PyPI source needs a scoped reinstall: pip and
+                # uv judge "already satisfied" by VERSION, so a plain install
+                # leaves the satisfying non-index copy in place and the source
+                # switch never takes effect (codex round 10 P2).
+                #
+                # "Not from an index", not "is editable" — a direct-URL copy
+                # (VCS, local path, archive) is equally satisfying and equally
+                # wrong. Asking the narrower question here made sync's own
+                # install a no-op, left the final guard to do the real repair,
+                # and so failed `feature sync` and `kestrel update` with rc=1
+                # over a run that had reached exactly the declared state.
+                #
+                # Scoped to THIS package: a blanket --force-reinstall cascades
+                # to core and swaps its editable link for a same-version index
+                # wheel, straight through the pin.
+                reinstall = target
 
-        result = cli._extension_install_run(pip_args)
+        # Core is never constrained against itself — a `kestrel-sovereign`
+        # manifest entry IS the operator deliberately moving core's source.
+        # `install_core` re-derives the batch pin from what core became.
+        is_core = target == fr.CORE_DISTRIBUTION
+        run = functools.partial(
+            guard.install_core if is_core else guard.run, reinstall=reinstall,
+        )
+        result = run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
-        # `feature install`). Editable installs have no remote fallback. A
-        # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
-        # with no version constraint, which would silently violate the pin.
+        # `feature install`) — but ONLY the legacy entry that declares no source
+        # at all, which has always meant "wherever this package comes from".
+        # The git URL installs repo HEAD with no version constraint, so it is
+        # both a different SOURCE and an unpinned one: substituting it for a
+        # declared source is the same silent retargeting this ticket exists to
+        # stop. `editable` has no remote form; `pypi = ">=x,<y"` would be moved
+        # outside its pin; and `pypi = ""` names the index as the source — "any
+        # version" is a statement about the VERSION, not a waiver of where the
+        # package comes from — so `""` must be told apart from "absent", which a
+        # truthiness test cannot do. (An empty `editable` is the other way
+        # round: it names no checkout, so it declares nothing — which is how the
+        # rest of this function reads it too.)
         # Carry extras across via PEP 508 form (``pkg[extra] @ git+url``) so a
         # git fallback doesn't silently drop the local-pipeline deps.
         if (
             result.returncode != 0
             and not editable_want
-            and not pypi_want
+            and pypi_want is None
             and git_urls.get(target)
         ):
             git_ref = f"git+{git_urls[target]}"
             git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
-            result = cli._extension_install_run([git_spec])
+            result = run([git_spec])
 
         if result.returncode != 0:
-            rc = 1
+            # A package failure NEVER touches `core_state`: it must not be able
+            # to downgrade a CORE_STALE recorded earlier in this same batch.
+            package_rc = 1
             print(f"  {target:<34} {current or '-':<10} FAILED")
             for line in (result.stderr or "").strip().splitlines()[-3:]:
                 print(f"      {line}")
+            if not is_core and guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]} for "
+                    "this install so a feature cannot silently replace it. If "
+                    "this is a version conflict, move core to a version the "
+                    "feature accepts — do not remove the pin."
+                )
+            # A failed core action stops the batch only when core is ACTUALLY
+            # off its declared source. `_resolve_manifest_action` returns
+            # `ensure` for a conforming core that declares extras, and a failed
+            # optional extra says nothing about core's source — treating it as a
+            # failed transition skipped every remaining manifest entry, so
+            # `--continue-on-error` restarted with packages still pruned.
+            if is_core and not guard.conforms_now():
+                # `install_core` has
+                # already refreshed the guard from whatever core is NOW — the
+                # old version, or a partial write — so every remaining feature
+                # would resolve and pin against a core the manifest says is
+                # wrong. The final repair may then move core to the declared
+                # version those features were never resolved against, and
+                # `--continue-on-error` would restart the fleet onto that
+                # combination. Verification still runs below; it is installing
+                # everything else that must not proceed.
+                print(
+                    "      note: core did not reach its declared source, so the "
+                    "rest of this batch is skipped — installing features "
+                    "against the wrong core is what produces a venv no single "
+                    "step reports as broken."
+                )
+                break
             continue
 
         installed += 1
@@ -705,7 +2058,20 @@ def cmd_feature_sync(args) -> int:
         print(f"  {installed} package(s) installed/restored.")
         if installed:
             print("  Restart the host/agents to load the synced features.")
-    return rc
+        # Constraints prevent the common swap; this catches every other path
+        # (a feature's own build step, a direct pip call) so sync can never
+        # report success over a core that was replaced (issue #2949).
+        # CORE_UNSAFE is returned verbatim — `kestrel update` gates its restart
+        # on this rc under --continue-on-error exactly as reconcile does, so
+        # collapsing it into 1 would reopen the same hole one step earlier.
+        #
+        # `verify()` is a second reading of CORE state, so it is RANKED against
+        # the first rather than assigned over it — a repaired-core `1` must not
+        # erase a CORE_STALE recorded by the pull above.
+        core_state = _worst_rc(core_state, guard.verify())
+        if core_state == CORE_UNSAFE:
+            return CORE_UNSAFE
+    return _worst_rc(core_state, package_rc)
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +2115,16 @@ def _query_agent_feature_catalog(base_url: str, api_key: str):
     for f in feats:
         pkg = f.get("package") if isinstance(f, dict) else None
         if isinstance(pkg, str) and pkg:
-            out[pkg] = f.get("status")
+            # Keyed on the canonical spelling, because the lookup side is.
+            # The agent reports whatever its installed METADATA says, and
+            # `Kestrel_Feature_Voice` is a legal Name: for the distribution the
+            # registry calls `kestrel-feature-voice`. `_resolve_manifest_action`
+            # canonicalizes its target, so keying this side raw makes the two
+            # miss each other and `feature status` shows an enabled feature as
+            # not loaded. Two spellings that canonicalize alike ARE one
+            # distribution, so collapsing them is the right answer rather than a
+            # collision (issue #2949).
+            out[canonical_package(pkg)] = f.get("status")
     return out
 
 
@@ -769,20 +2144,36 @@ def cmd_feature_status(args) -> int:
             return 1
 
     # Resolve each manifest entry to its install action (shared with `sync`)
-    # plus whether it's a loadable Feature vs a provider. Feature-vs-provider
-    # is decided from the registry by class-name convention (Feature classes
-    # end in "Feature"; providers like OpenAITTSProvider do not) — independent
-    # of install state, so a not-yet-installed feature still gets an agent row.
+    # plus whether it participates in the Feature lifecycle. The registry's
+    # explicit package boundary owns this decision; class-name suffixes do not.
+    from kestrel_sovereign.feature_registry import PackageBoundary
+
     targets = []
     for entry in entries:
         info = _registry_info_for(entry["name"], registry)
         target, current, action = _resolve_manifest_action(entry, registry)
-        is_feature = bool(info) and any(
-            c.endswith("Feature") for c in (info.features or [])
-        )
+        if target == CORE_DISTRIBUTION:
+            # A `kestrel-sovereign` manifest entry (written by `sync --capture`
+            # since #2949) declares where CORE comes from. It is a source
+            # policy, not one lifecycle feature, and it cannot be rendered as
+            # one: dozens of bundled features share the `kestrel-sovereign`
+            # package, so `_registry_info_for` resolves the entry to whichever
+            # bundled row the registry happens to list first (`identity`) and
+            # the agent's catalog collapses every bundled feature's status under
+            # that one package key, last-writer-wins. A per-agent column here
+            # would report an arbitrary bundled feature's state under core's
+            # name. Its install state IS shown — in the host table below, which
+            # is the level a source policy lives at.
+            display, is_feature = CORE_DISTRIBUTION, False
+        else:
+            display = info.name if info else entry["name"]
+            is_feature = bool(info) and info.boundary in {
+                PackageBoundary.BUNDLED,
+                PackageBoundary.FEATURE_PACKAGE,
+            }
         targets.append(
             {
-                "display": info.name if info else entry["name"],
+                "display": display,
                 "package": target,
                 "current": current,
                 "action": action,
@@ -972,6 +2363,7 @@ def cmd_feature_info(args) -> int:
     print(f"  {'─' * 40}")
     print(f"  Description:  {info.description}")
     print(f"  Package:      {info.package}")
+    print(f"  Boundary:     {info.boundary.value}")
     print(f"  Status:       {info.status.value}")
     print(f"  Core:         {'yes' if info.core else 'no'}")
     print(f"  Git:          {info.git}")
@@ -981,6 +2373,10 @@ def cmd_feature_info(args) -> int:
 
     if info.features:
         print(f"  Features:     {', '.join(info.features)}")
+    if info.provider_classes:
+        print(f"  Providers:    {', '.join(info.provider_classes)}")
+    if info.command:
+        print(f"  Command:      {info.command}")
 
     if info.skills:
         print(f"\n  Skills:")
@@ -1170,6 +2566,14 @@ def add_feature_subparser(subparsers) -> None:
         "--dry-run",
         action="store_true",
         help="Show what would be installed/restored without changing anything",
+    )
+    feat_sync.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "Pull a declared editable checkout even when it has modified "
+            "tracked files (same meaning as on `kestrel update`)"
+        ),
     )
 
     feat_status = feature_sub.add_parser(

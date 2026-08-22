@@ -1,9 +1,51 @@
 """Contracts for optional/extracted feature boundaries in core."""
 
 from pathlib import Path
+import tomllib
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _registry():
+    path = PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml"
+    return tomllib.loads(path.read_text())
+
+
+def test_registry_distinguishes_feature_provider_and_standalone_packages():
+    registry = _registry()
+
+    assert registry["voice"]["boundary"] == "feature-package"
+    assert registry["voice"]["features"] == ["VoiceFeature"]
+
+    assert registry["voice_openai"]["boundary"] == "provider-package"
+    assert registry["voice_openai"]["features"] == []
+    assert registry["voice_openai"]["provider_classes"] == [
+        "OpenAITTSProvider",
+        "OpenAISTTProvider",
+    ]
+
+    assert registry["talon_cli"]["boundary"] == "standalone-tool"
+    assert registry["talon_cli"]["features"] == []
+    assert registry["talon_cli"]["command"] == "kestrel-talon"
+
+
+def test_bundled_rows_never_advertise_an_external_install_target():
+    registry = _registry()
+    bundled = {
+        name: entry
+        for name, entry in registry.items()
+        if isinstance(entry, dict)
+        and entry.get("boundary") in {"bundled", "bundled-component"}
+    }
+
+    assert bundled
+    assert all(entry["package"] == "kestrel-sovereign" for entry in bundled.values())
+    assert registry["talon"]["companion"] == "talon_cli"
+    assert registry["talon"]["boundary"] == "feature-package"
+    assert registry["talon"]["package"] == "kestrel-feature-talon"
+    assert registry["talon"]["core"] is False
+    assert "extracted_replacement_package" not in registry["talon"]
 
 
 def test_feature_proof_matrix_marks_mcp_as_external_package_boundary():

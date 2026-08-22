@@ -11,7 +11,6 @@ Database tables (created on initialize):
 - bridge_log: audit log of all bridge invocations
 """
 
-import json
 import logging
 import time
 import uuid

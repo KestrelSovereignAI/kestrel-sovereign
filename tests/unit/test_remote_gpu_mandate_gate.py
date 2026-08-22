@@ -7,8 +7,8 @@ could be silently ignored while the answer came from the remote pod.
 
 The gate lives in :meth:`LLMService._remote_first_allowed`.  These tests
 pin its contract (when it returns False, the remote-first branch skips).
-Visual inspection of the five call sites confirms all of them now wrap
-the ``_remote_client`` check with this guard:
+The five call sites all enter ``_remote_route_attempt``; that one routing
+boundary applies this mandate gate before exposing a host-only lease route:
 
 - ``service.generate``                 (generate text)
 - ``service.generate_with_messages``   (multi-turn tool calling)
@@ -19,7 +19,7 @@ the ``_remote_client`` check with this guard:
 
 from unittest.mock import MagicMock
 
-from kestrel_sovereign.llm.remote_backend import BackendType, RemoteGPUConfig
+from kestrel_sovereign.llm.remote_backend import BackendType
 
 
 def _service_with_remote_active():
@@ -27,15 +27,13 @@ def _service_with_remote_active():
 
     We don't instantiate the real LLMService here because its dependency
     graph is huge and the helper under test only touches three attributes:
-    ``_backend``, ``_remote_client``, ``_mandate_preference``.  A minimal
+    ``_backend`` and ``_mandate_preference``.  A minimal
     stand-in keeps the tests tight and the failure surface clear.
     """
     from kestrel_sovereign.llm.service import LLMService
 
     svc = LLMService.__new__(LLMService)
     svc._backend = BackendType.REMOTE_GPU
-    svc._remote_client = MagicMock()
-    svc._remote_config = RemoteGPUConfig(base_url="http://pod", model="local-model")
     svc._remote_adapter = MagicMock()
     svc._mandate_preference = {"model": None, "vendor": None, "route": None}
     svc._last_remote_error = None
@@ -129,49 +127,28 @@ def test_remote_first_allowed_override_beats_mandate():
 
 
 def test_all_remote_gpu_call_sites_are_gated():
-    """Every ``BackendType.REMOTE_GPU`` check that also tests
-    ``self._remote_client`` is a remote-first shortcut site, and each one
-    must be paired with a call to ``self._remote_first_allowed(...)``.
-
-    If someone adds a sixth remote-first branch without the guard, this
-    test fails with a clear pointer to the file.  Defining the helper
-    itself adds one extra reference in service.py (the ``def`` line) —
-    we allow for that.
-    """
-    import re
+    """Every remote call enters the one lease/mandate gate."""
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[2]
     files_expected = {
         "kestrel_sovereign/llm/service.py": {
-            "trigger_expected": 2,  # generate(), generate_with_messages()
-            "helper_defined_here": True,  # def _remote_first_allowed lives here
+            "route_attempts": 2,  # generate(), generate_with_messages()
         },
         "kestrel_sovereign/llm/streaming.py": {
-            "trigger_expected": 3,  # generate_stream, stream_with_messages, stream_with_tool_detection
-            "helper_defined_here": False,
+            "route_attempts": 3,
         },
     }
 
     for rel, info in files_expected.items():
         text = (repo / rel).read_text(encoding="utf-8")
-        # Count the remote-first branch signature: a REMOTE_GPU check that
-        # gates on _remote_client in the same condition.  Fuzzy on whitespace
-        # so reflowing with a linter doesn't break the assertion.
-        trigger_pattern = re.compile(
-            r"BackendType\.REMOTE_GPU\b[^{}]{0,200}?self\._remote_client",
-            re.DOTALL,
+        count = text.count("self._remote_route_attempt(")
+        assert count == info["route_attempts"], (
+            f"{rel}: expected {info['route_attempts']} managed route calls, "
+            f"found {count}; all remote paths must use the lease boundary"
         )
-        trigger_count = len(trigger_pattern.findall(text))
 
-        # Subtract the helper definition's own reference (not a call site).
-        guard_calls = text.count("self._remote_first_allowed(")
-        assert trigger_count == info["trigger_expected"], (
-            f"{rel}: expected {info['trigger_expected']} remote-first branches, "
-            f"found {trigger_count}. Layout changed — update this test."
-        )
-        assert guard_calls == trigger_count, (
-            f"{rel}: {trigger_count} remote-first branches but only "
-            f"{guard_calls} _remote_first_allowed guards. A branch was "
-            f"added without the #734 gate."
-        )
+    boundary = (repo / "kestrel_sovereign/llm/remote_backend.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self._remote_first_allowed(model_override)" in boundary

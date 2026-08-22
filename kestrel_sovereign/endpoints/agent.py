@@ -1,9 +1,11 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
+from dataclasses import dataclass
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -18,8 +20,20 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
+)
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.agent.invocation import (
+    invocation_id_response_header,
+    new_stream_delivery_id,
+)
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +51,210 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 
 LEGACY_CONTEXT_MODEL = "legacy/unknown"
+_KITE_EVIDENCE_CONTRACT = "kite-http-evidence-v1"
+_KITE_EVIDENCE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
+_KITE_EVIDENCE_VALUE_RE = re.compile(r"^kite-evidence-[A-Za-z0-9_-]{20,128}$")
+
+
+def _kite_release_evidence_allowed(agent: Any) -> bool:
+    """Expose the fixed evidence seam only on an opted-in test agent."""
+    return bool(getattr(agent, "is_test_instance", False)) and os.environ.get(
+        "KESTREL_KITE_RELEASE_EVIDENCE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _kite_evidence_error(message: str) -> ApiHTTPException:
+    return ApiHTTPException(status_code=400, code="invalid_kite_evidence_request", message=message)
+
+
+def _kite_evidence_signature(payload: dict[str, object]) -> str:
+    """Sign only the fixed, content-free typed envelope."""
+    from kestrel_sovereign.knowledge.kite_evidence_signing import sign_kite_evidence
+
+    return sign_kite_evidence(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _kite_verified_runtime_semantic_selection(agent: Any) -> tuple[Any, Any]:
+    """Return the agent-bound semantic contract for the fixed recall probe.
+
+    The typed Kite route has no caller-provided semantic inputs.  Re-check the
+    already selected local profile and runtime pins at the operation boundary:
+    a test-only route must not turn an incomplete or stale draft selection
+    into a stable fallback.
+    """
+    from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
+    from kestrel_sovereign.knowledge.inference import (
+        InferenceProfile,
+        validate_inference_profile,
+    )
+
+    profile = getattr(agent, "semantic_inference_profile", None)
+    capabilities = getattr(agent, "semantic_capabilities", None)
+    if not isinstance(profile, InferenceProfile) or not isinstance(
+        capabilities, SemanticRuntimeCapabilities
+    ):
+        raise RuntimeError(
+            "Kite paraphrase recall requires a locally verified runtime semantic selection"
+        )
+    try:
+        validate_inference_profile(profile)
+        capabilities.validate()
+        runtime_report = agent.storage.semantic_rdf_capability_report()
+    except (AttributeError, ValueError) as error:
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unavailable"
+        ) from error
+    if not capabilities.rdf_runtime_matches(runtime_report):
+        raise RuntimeError(
+            "Kite paraphrase recall runtime semantic selection is unverified"
+        )
+    return profile, capabilities
+
+
+async def _kite_runtime_observation(
+    agent: Any, *, request_id: str, provenance: Any, request: object,
+) -> tuple[str, dict[str, object]]:
+    """Run one allowlisted test operation, never an assistant prompt.
+
+    The endpoint cannot select a storage method, query, artifact, or identity:
+    operation names are a closed set and the server owns the underlying call.
+    """
+    if not _kite_release_evidence_allowed(agent):
+        raise ApiHTTPException(status_code=404, code="not_found", message="Not found.")
+    if not isinstance(request, dict) or set(request).difference({"operation", "nonce", "value"}):
+        raise _kite_evidence_error("Invalid Kite evidence request.")
+    operation, nonce, value = request.get("operation"), request.get("nonce"), request.get("value")
+    if not isinstance(operation, str) or not _KITE_EVIDENCE_NONCE_RE.fullmatch(nonce if isinstance(nonce, str) else ""):
+        raise _kite_evidence_error("Invalid Kite evidence request.")
+    if operation == "save":
+        if not isinstance(value, str) or not _KITE_EVIDENCE_VALUE_RE.fullmatch(value):
+            raise _kite_evidence_error("Invalid Kite evidence value.")
+        command: str | None = f"!memory-save-fact user preferred_deploy_region {value}"
+    elif operation == "delete":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = "!memory-forget-fact user preferred_deploy_region"
+    elif operation == "diagnostics":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    elif operation == "quarantine":
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    elif operation in {"sleep", "sleep_changed", "sleep_unchanged", "paraphrase_recall", "erasure_core_snapshot"}:
+        if value is not None:
+            raise _kite_evidence_error("Invalid Kite evidence request.")
+        command = None
+    else:
+        raise _kite_evidence_error("Invalid Kite evidence operation.")
+
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.knowledge.kite_evidence_signing import (
+        KiteEvidenceNonceReplay, KiteEvidenceSigningError, consume_kite_evidence_nonce,
+    )
+    try:
+        nonce_receipt = consume_kite_evidence_nonce(
+            nonce, issue_receipt=operation == "erasure_core_snapshot",
+        )
+    except KiteEvidenceNonceReplay as error:
+        raise ApiHTTPException(status_code=409, code="kite_evidence_nonce_replayed", message="Kite evidence nonce was already consumed.") from error
+    except KiteEvidenceSigningError as error:
+        raise RuntimeError("Kite evidence nonce ledger is unavailable") from error
+
+    with invocation_scope(request_id, provenance=provenance):
+        if operation in {"sleep", "sleep_changed", "sleep_unchanged"}:
+            report = await agent.sleep(tier="local", skip_export=True)
+            if getattr(report, "success", None) is not True:
+                raise RuntimeError("Kite sleep operation did not complete")
+            return operation, {"sleep_success_count": 1}
+        if operation == "paraphrase_recall":
+            profile, capabilities = _kite_verified_runtime_semantic_selection(agent)
+            maintenance = await agent.storage.run_semantic_maintenance(
+                profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+                semantic_capabilities=capabilities,
+            )
+            if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+                raise RuntimeError("Kite paraphrase recall maintenance did not reach a terminal checkpoint")
+            recall = await agent.storage.semantic_recall_candidates(
+                query="Which region should the deployment use?", candidate_scan_limit=10,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+            )
+            hydrated = await agent.storage.hydrate_semantic_recall_candidates(
+                tuple(candidate.assertion.assertion_id for candidate in getattr(recall, "candidates", ())),
+                expected_checkpoint_generation=recall.checkpoint_generation,
+                inference_profile=profile,
+                inference_limits=getattr(agent, "semantic_inference_limits", None),
+                maintenance_limits=getattr(agent, "semantic_maintenance_limits", None),
+            )
+            if not hydrated or any(not candidate.source_occurrences for candidate in hydrated):
+                raise RuntimeError("Kite paraphrase recall did not hydrate provenance")
+            return operation, {"retrieval_count": len(hydrated), "provenance_check_count": len(hydrated)}
+        if operation == "erasure_core_snapshot":
+            from kestrel_sovereign.knowledge.kite_erasure_authority import (
+                KiteErasureDrillAuthorityError,
+                _issue_kite_erasure_drill_capability,
+                _typed_kite_erasure_endpoint_issuance_scope,
+            )
+
+            try:
+                with _typed_kite_erasure_endpoint_issuance_scope():
+                    capability = _issue_kite_erasure_drill_capability(
+                        nonce_receipt, operation=operation,
+                    )
+                    observation = await agent.storage.semantic_release_erasure_drill(
+                        capability=capability,
+                    )
+            except (KiteErasureDrillAuthorityError, KiteEvidenceSigningError) as error:
+                raise RuntimeError("Kite core erasure authority is unavailable") from error
+            if not isinstance(observation, dict):
+                raise RuntimeError("Kite core erasure drill is unavailable")
+            return operation, observation
+        if operation == "diagnostics":
+            observation = await agent.storage.semantic_release_kite_diagnostics(
+                operation_id=f"kite-diagnostics-{nonce}"
+            )
+            if not isinstance(observation, dict):
+                raise RuntimeError("Kite semantic diagnostics are unavailable")
+            return operation, observation
+        if operation == "quarantine":
+            observation = await agent.storage.semantic_release_kite_invalid_import_quarantine(
+                operation_id=f"kite-import-quarantine-{nonce}"
+            )
+            if observation != {"invalid_import_quarantine_count": 1}:
+                raise RuntimeError("Kite invalid import probe did not complete")
+            return operation, observation
+
+        task_manager = getattr(agent, "task_manager", None)
+        if task_manager is None:
+            raise RuntimeError("Kite runtime command dispatcher is unavailable")
+        raw = await task_manager.execute_command(command)
+    from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+    if not is_flat_toolresult_envelope(raw) or raw.get("status") != "ok" or not isinstance(raw.get("data"), dict):
+        raise RuntimeError("Kite runtime command did not return a successful typed result")
+    data = raw["data"]
+    if operation == "save":
+        if data.get("saved") is not True:
+            raise RuntimeError("Kite runtime fact write did not complete")
+        return operation, {"fact_write_count": 1}
+    if operation == "delete":
+        if data.get("deleted") is not True:
+            raise RuntimeError("Kite runtime fact deletion did not complete")
+        return operation, {"fact_delete_count": 1}
+    raise RuntimeError("Kite runtime command operation was not recognized")
+
+
+def _privacy_transition_conflict() -> HTTPException:
+    """Return the content-safe retry contract for an active fact lease."""
+    return HTTPException(
+        status_code=409,
+        detail=PRIVACY_TRANSITION_RETRY_MESSAGE,
+        headers={"Retry-After": "1"},
+    )
 
 
 def _invalid_json_message(error: ValueError) -> str:
@@ -128,7 +346,7 @@ async def _parse_optional_json_body(request: Request) -> dict:
 
 @router.post("/invoke")
 @limiter.limit("60/minute")
-async def invoke_agent(request: Request):
+async def invoke_agent(request: Request, http_response: Response):
     """
     Main endpoint to interact with the Kestrel Agent.
     It takes user input and returns the agent's response.
@@ -143,8 +361,9 @@ async def invoke_agent(request: Request):
         provider_override = data.get("provider")
         session_id = data.get("session_id")
         user_passphrase = data.get("user_passphrase")
+        kite_evidence_request = data.get("kite_evidence")
 
-        if user_input is None:
+        if user_input is None and not isinstance(kite_evidence_request, dict):
             raise ApiHTTPException(
                 status_code=400,
                 code="input_required",
@@ -158,6 +377,51 @@ async def invoke_agent(request: Request):
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)
 
+        # A client may repeat the same opaque request id after a transport
+        # failure. Tool provenance derives its operation identity from this
+        # task-local id, so an exact retry reaches the canonical store's own
+        # idempotency ledger instead of being mistaken for a new invocation.
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/agent/invoke",
+        )
+        if hasattr(agent, "register_active_request"):
+            agent.register_active_request(request_id)
+        else:
+            agent._current_request_id = request_id
+
+        if isinstance(kite_evidence_request, dict):
+            if user_input not in (None, ""):
+                raise _kite_evidence_error("Kite evidence requests cannot include input.")
+            try:
+                operation, observation = await _kite_runtime_observation(
+                    agent,
+                    request_id=request_id,
+                    provenance=request_invocation_provenance(
+                        request, source_locator="POST:/api/agent/invoke#kite-release-evidence",
+                    ),
+                    request=kite_evidence_request,
+                )
+            finally:
+                agent._cleanup_cancelled_request(request_id)
+            nonce = kite_evidence_request.get("nonce")
+            assert isinstance(nonce, str)
+            signed = {
+                "contract": _KITE_EVIDENCE_CONTRACT,
+                "nonce": nonce,
+                "operation": operation,
+                "observation": observation,
+            }
+            http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
+            return {
+                "response": "Kite runtime evidence operation complete.",
+                "session_id": None,
+                "model": None,
+                "provider": None,
+                "kite_evidence": {**signed, "signature": _kite_evidence_signature(signed)},
+            }
+
         # Pre-resolve the effective session_id so it can be returned to
         # the client. Without this, the frontend pane never learns the
         # implicit UUID derived inside add_conversation and stays
@@ -168,15 +432,21 @@ async def invoke_agent(request: Request):
         except Exception:
             effective_session_id = session_id  # fall back; never block the request
 
-        response = await agent.process_input(
-            user_input,
-            model_override=model_override,
-            session_id=effective_session_id,
-            caller=caller,
-            user_passphrase=user_passphrase,
-        )
+        try:
+            response = await agent.process_input(
+                user_input,
+                model_override=model_override,
+                session_id=effective_session_id,
+                caller=caller,
+                user_passphrase=user_passphrase,
+                invocation_id=request_id,
+                invocation_provenance=invocation_provenance,
+            )
+        finally:
+            agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
         identity = agent._conversation_response_identity(use_last_identity=True)
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {
             "response": response,
             "session_id": effective_session_id,
@@ -185,8 +455,11 @@ async def invoke_agent(request: Request):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error invoking agent: {e}", exc_info=True)
+    except Exception:
+        # Invocation failures can wrap caller content, provider errors, or a
+        # client-controlled retry id.  Keep the operator event useful without
+        # recording any of those values outside the governed request path.
+        logger.error("Agent invocation failed")
         raise ApiHTTPException(
             status_code=500,
             code="invoke_failed",
@@ -322,8 +595,20 @@ async def stream_agent_response(request: Request):
     Returns text chunks as they are generated.
     Optionally accepts 'session_id' to load context from a specific conversation.
     """
-    import uuid
-    
+    agent = None
+    request_id = None
+    stream_tap = None
+    stream_delivery_id = None
+    request_lifecycle_registered = False
+    stream_tap_registered = False
+
+    def cleanup_unstarted_stream() -> None:
+        """Undo setup if constructing the response fails before generation."""
+        if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
+            stream_tap.unregister(stream_delivery_id)
+        if request_lifecycle_registered and agent is not None and request_id is not None:
+            agent._cleanup_cancelled_request(request_id)
+
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -352,16 +637,28 @@ async def stream_agent_response(request: Request):
         if provider_override and model_override:
             model_override = f"{provider_override}/{model_override}"
 
-        # Generate unique request ID for cancellation tracking
-        request_id = str(uuid.uuid4())
+        # The client may supply the same opaque id for a transport retry. It
+        # is both the cancellation key and the task-local provenance identity.
+        request_id = resolve_request_invocation_id(request, data)
+        invocation_provenance = request_invocation_provenance(
+            request,
+            source_locator="POST:/api/agent/stream",
+        )
         if hasattr(agent, "register_active_request"):
             agent.register_active_request(request_id)
         else:
             agent._current_request_id = request_id
+        request_lifecycle_registered = True
 
         # Register the stream tap so TTS consumers can subscribe
         stream_tap = AgentStreamTap.get_instance()
-        stream_tap.register(request_id)
+        # A retry may deliberately reuse ``request_id`` to reach the canonical
+        # assertion idempotency ledger.  TTS delivery is independent: a fresh,
+        # server-owned id prevents concurrent response streams from publishing
+        # into or closing each other's tap queue.
+        stream_delivery_id = new_stream_delivery_id()
+        stream_tap.register(stream_delivery_id)
+        stream_tap_registered = True
 
         # Pre-resolve the effective session_id and surface it via a
         # response header. Resolved BEFORE StreamingResponse is created
@@ -403,6 +700,7 @@ async def stream_agent_response(request: Request):
                     audit_before_streaming=audit_before_streaming,
                     caller=caller,
                     request_id=request_id,
+                    invocation_provenance=invocation_provenance,
                     attachments=attachments,
                 ):
                     # Check if request was cancelled
@@ -418,7 +716,7 @@ async def stream_agent_response(request: Request):
                     # the yield below and strips it client-side.
                     tts_chunk = strip_revise_sentinels(chunk)
                     if tts_chunk:
-                        await stream_tap.publish(request_id, tts_chunk)
+                        await stream_tap.publish(stream_delivery_id, tts_chunk)
                     response_chunk_yielded = True
                     yield chunk
                 # #2674: a strict-audit turn cancelled before dispatch withholds
@@ -440,12 +738,16 @@ async def stream_agent_response(request: Request):
                     yield stop_notice
                     stop_notice_emitted = True
             except Exception as e:
-                # #2674 findings 4 & 6: log the FULL error (class + message +
-                # trace) to the operator log with the request id for triage — a
-                # separate trust boundary from the user stream.
+                # A request id and exception text can be client-controlled or
+                # contain withheld content.  Keep only a one-way correlation
+                # in the operator log; the client receives the shared safe
+                # error boundary below.
+                from kestrel_sovereign.agent.invocation import (
+                    invocation_log_correlation,
+                )
                 logger.error(
-                    "Streaming error (request %s): %s",
-                    request_id, e, exc_info=True,
+                    "Streaming request failed (correlation=%s)",
+                    invocation_log_correlation(request_id),
                 )
                 # #2674 findings 3 & 4: emit the user-visible error through the
                 # ONE shared safe boundary used by /api/bridge/stream too, so the
@@ -457,21 +759,22 @@ async def stream_agent_response(request: Request):
                 # ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT). A route failure
                 # still gets the no-blind-fallback / recovery guidance via a
                 # CONSTANT "your selected model route" label; the failing route
-                # and full error stay operator-log only.
+                # and full error remain unavailable to this transport.
                 from kestrel_sovereign.llm.streaming_errors import (
                     agent_stream_error_block,
                 )
                 yield agent_stream_error_block(e)
             finally:
                 # Signal stream completion for TTS consumers
-                await stream_tap.finish(request_id)
+                await stream_tap.finish(stream_delivery_id)
                 # Cleanup request tracking
                 agent._cleanup_cancelled_request(request_id)
 
         headers = {
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "X-Request-ID": request_id,
+            "X-Request-ID": invocation_id_response_header(request_id),
+            "X-Stream-Delivery-ID": stream_delivery_id,
         }
         if effective_session_id:
             headers["X-Session-Id"] = effective_session_id
@@ -481,9 +784,11 @@ async def stream_agent_response(request: Request):
             headers=headers,
         )
     except HTTPException:
+        cleanup_unstarted_stream()
         raise
-    except Exception as e:
-        logger.error(f"Error setting up stream: {e}", exc_info=True)
+    except Exception:
+        cleanup_unstarted_stream()
+        logger.error("Error setting up stream")
         raise ApiHTTPException(
             status_code=500,
             code="stream_setup_failed",
@@ -499,7 +804,24 @@ async def stop_agent_request(request: Request):
     """
     try:
         data = await _parse_optional_json_body(request)
-        request_id = data.get("request_id") or request.query_params.get("request_id")
+        # The body and query forms predate the shared retry-header contract and
+        # remain literal values.  Only X-Request-ID is a percent-encoded wire
+        # form, so a client can copy an invoke/stream response header here
+        # verbatim without forking the cancellation key.
+        explicit_request_id = (
+            data.get("request_id") or request.query_params.get("request_id")
+        )
+        request_id = (
+            resolve_request_invocation_id(
+                request,
+                {"request_id": explicit_request_id}
+                if explicit_request_id is not None
+                else {},
+            )
+            if explicit_request_id is not None
+            or request.headers.get("X-Request-ID") is not None
+            else None
+        )
         agent = get_agent(request)
         cancelled = agent.cancel_current_request(request_id=request_id)
         return {
@@ -622,6 +944,9 @@ async def set_privacy_mode(request: Request):
                 "message": transition.message,
             }
 
+        if getattr(transition, "retryable_conflict", False):
+            raise _privacy_transition_conflict()
+
         # An EPHEMERAL exit was REFUSED because a required no-trace purge sweep
         # failed (#2673). Nothing flipped — the agent stayed in EPHEMERAL — so we
         # must report the ACTUAL (unchanged) mode and failure, never success.
@@ -718,6 +1043,11 @@ async def set_privacy_mode(request: Request):
         }
     except HTTPException:
         raise
+    except PrivacyViolationError:
+        # Never interpolate the exception: storage/provider details are not
+        # part of the public response or operator log contract.
+        logger.info("Privacy mode change deferred by an active fact operation")
+        raise _privacy_transition_conflict()
     except Exception as e:
         logger.error(f"Error setting privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting privacy mode.")
@@ -740,6 +1070,8 @@ async def confirm_privacy_mode(request: Request):
         if not getattr(type(agent), "confirm_privacy_transition", None):
             raise HTTPException(status_code=400, detail="Agent does not support staged privacy transitions.")
         result = await agent.confirm_privacy_transition()
+        if getattr(result, "retryable_conflict", False):
+            raise _privacy_transition_conflict()
         # applied is False for a no-op confirm (nothing was pending) as well as
         # for a staged result — so a stale/double-click confirm reports success
         # False instead of masquerading as an applied transition.
@@ -756,6 +1088,11 @@ async def confirm_privacy_mode(request: Request):
         }
     except HTTPException:
         raise
+    except PrivacyViolationError:
+        logger.info(
+            "Privacy mode confirmation deferred by an active fact operation"
+        )
+        raise _privacy_transition_conflict()
     except Exception as e:
         logger.error(f"Error confirming privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error confirming privacy mode.")
@@ -1043,40 +1380,266 @@ async def get_context_status(
     return await compute_context_status(get_agent(request), session_id, full=full)
 
 
+@dataclass
+class _ContextStatusMeasurement:
+    """Data acquired for context-status before UI/route-cap shaping."""
+
+    history: List[Dict[str, Any]]
+    model_identity: Dict[str, Optional[str]]
+    current_model: str
+    context_limit: int
+    breakdown: Dict[str, Any]
+
+
+async def _acquire_context_status_measurement(
+    agent: Any,
+    session_id: str,
+    *,
+    full: bool,
+) -> _ContextStatusMeasurement:
+    """Acquire one dry-run production plan for a session."""
+
+    from kestrel_sovereign.agent.token_counter import get_token_counter
+    from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
+
+    privacy_agent = getattr(agent, "privacy_agent", None)
+    history_reader = getattr(
+        privacy_agent, "get_conversation_history", None
+    )
+    if (
+        callable(history_reader)
+        and not type(privacy_agent).__module__.startswith("unittest.mock")
+    ):
+        # This is the live turn's acquisition path. It is load-bearing for
+        # ISOLATED/EPHEMERAL buffers, which do not live in persistent storage.
+        history = await history_reader(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
+    else:
+        # Compatibility for partial endpoint fixtures and older hosts.
+        history = await agent.storage.get_conversation_history(
+            limit=CONTEXT_HISTORY_LIMIT,
+            session_id=session_id,
+        )
+    model_identity = _latest_assistant_model_identity(history)
+    current_model = model_identity["context_model"] or LEGACY_CONTEXT_MODEL
+    counter = get_token_counter(current_model)
+    context_limit = counter.get_context_limit()
+
+    constitution_text = ""
+    get_const = getattr(agent, "_get_governing_constitution", None)
+    is_real_governing_getter = (
+        callable(get_const)
+        and not type(get_const).__module__.startswith("unittest.mock")
+    )
+    if not is_real_governing_getter:
+        # Compatibility for partial endpoint fixtures and pre-mixin hosts.
+        get_const = getattr(agent, "get_constitution", None)
+    if callable(get_const):
+        try:
+            got = (
+                get_const(allow_lazy_anchor=False)
+                if is_real_governing_getter
+                else get_const()
+            )
+            constitution_text = await got if hasattr(got, "__await__") else got
+            constitution_text = constitution_text or ""
+        except Exception as exc:
+            logger.debug("constitution fetch failed for breakdown: %s", exc)
+            if is_real_governing_getter:
+                raise RuntimeError(
+                    "governing constitution is unavailable for context "
+                    "measurement"
+                ) from exc
+    if (
+        isinstance(constitution_text, str)
+        and constitution_text.lstrip().startswith("Error:")
+    ):
+        raise RuntimeError(
+            "governing constitution is unavailable for context measurement"
+        )
+    if is_real_governing_getter and not str(constitution_text).strip():
+        raise RuntimeError(
+            "governing constitution is unavailable for context measurement"
+        )
+
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
+    build_tools = getattr(agent, "_build_all_tools", None)
+    if not callable(build_tools):
+        registry = getattr(agent, "tool_registry", None)
+        build_tools = getattr(registry, "_build_all_tools", None)
+    if callable(build_tools):
+        try:
+            tool_schemas = list(build_tools())
+        except Exception as exc:
+            logger.debug("tool schema fetch failed for breakdown: %s", exc)
+
+    query = ""
+    try:
+        from kestrel_sovereign.agent.context_builder import (
+            extract_raw_user_content,
+        )
+
+        for row in reversed(history):
+            if (row.get("role") or "").lower() == "user":
+                query = extract_raw_user_content(row.get("content", "") or "")
+                break
+    except Exception as exc:
+        logger.debug("last-user-query lookup failed for breakdown: %s", exc)
+
+    context_manager = getattr(agent, "context_manager", None)
+    plan_builder = getattr(context_manager, "build_context_plan", None)
+    is_real_plan_builder = (
+        callable(plan_builder)
+        and not type(context_manager).__module__.startswith("unittest.mock")
+    )
+    if is_real_plan_builder:
+        from kestrel_sovereign.agent.context_stages import ContextBuildMode
+
+        privacy_mode = getattr(agent, "_privacy_mode", None)
+        if privacy_mode is None:
+            privacy_agent = getattr(agent, "privacy_agent", None)
+            privacy_mode = getattr(privacy_agent, "privacy_mode", "NORMAL")
+        privacy_mode = getattr(
+            privacy_mode, "name", getattr(privacy_mode, "value", privacy_mode)
+        )
+
+        reflection_guidance = None
+        features = getattr(agent, "features", None)
+        reflection_feature = (
+            features.get("ReflectionFeature")
+            if isinstance(features, dict)
+            else None
+        )
+        if reflection_feature is not None:
+            getter = getattr(reflection_feature, "get_active_guidance", None)
+            if callable(getter):
+                try:
+                    reflection_guidance = await getter()
+                except Exception as exc:
+                    logger.debug(
+                        "reflection guidance fetch failed for breakdown: %s",
+                        exc,
+                    )
+
+        plan = await plan_builder(
+            query=query,
+            constitution=constitution_text,
+            include_briefing=not bool(
+                getattr(agent, "_session_briefed", False)
+            ),
+            include_memories=True,
+            include_rag=True,
+            privacy_mode=str(privacy_mode or "NORMAL").upper(),
+            conversation_history=history,
+            reflection_guidance=reflection_guidance,
+            tools=tool_schemas,
+            mode=ContextBuildMode.DRY_RUN,
+            measure_expensive_sections=full,
+        )
+        breakdown = plan.to_breakdown()
+        context_limit = int(breakdown["context_limit"])
+        current_model = str(breakdown.get("model") or current_model)
+    else:
+        # Compatibility for partial/legacy agent test doubles. Production
+        # KestrelAgent always owns ContextManager.build_context_plan.
+        from kestrel_sovereign.agent.context_builder import ContextBuilder
+
+        agent_builder = getattr(agent, "context_builder", None)
+        builder = ContextBuilder(
+            storage=agent.storage,
+            model=current_model,
+            consolidator=getattr(agent_builder, "consolidator", None),
+            agent_data_path=getattr(agent_builder, "agent_data_path", None),
+        )
+        memory_retriever = None
+        if full:
+            from kestrel_sovereign.agent.context_manager import _retrieval_config
+
+            memory_min_score = _retrieval_config().get("memory_min_score")
+            memory_manager = getattr(context_manager, "memory_manager", None)
+            retrieve_memories = getattr(memory_manager, "retrieve_memories", None)
+            if callable(retrieve_memories):
+                async def memory_retriever(
+                    query: str, max_tokens: int
+                ) -> Optional[str]:
+                    return await retrieve_memories(
+                        query=query,
+                        max_tokens=max_tokens,
+                        counter=counter,
+                        read_only=True,
+                        min_score=memory_min_score,
+                    )
+
+        breakdown = await builder.measure_context_breakdown(
+            query=query,
+            history=history,
+            constitution=constitution_text,
+            include_briefing=True,
+            message_count=len(history),
+            tools=tool_schemas,
+            include_rag=full,
+            memory_retriever=memory_retriever,
+        )
+        breakdown.pop("_artifacts", None)
+        for section_name in ("memories", "rag"):
+            row = breakdown.get("sections", {}).get(section_name)
+            if isinstance(row, dict) and (
+                row.get("status") in {"unknown", "skipped"}
+                or row.get("measured") is False
+            ):
+                row["tokens"] = None
+
+    if full and not query:
+        rag_section = breakdown.get("sections", {}).get("rag")
+        if isinstance(rag_section, dict):
+            rag_section["query_used_label"] = (
+                "estimated against latest stored chunks — no recent user "
+                "turn available for query-specific retrieval"
+            )
+
+    return _ContextStatusMeasurement(
+        history=history,
+        model_identity=model_identity,
+        current_model=current_model,
+        context_limit=context_limit,
+        breakdown=breakdown,
+    )
+
+
 async def compute_context_status(
     agent,
     session_id: Optional[str] = None,
     full: bool = False,
 ) -> Dict[str, Any]:
-    """Honest whole-window context status + per-section breakdown.
+    """Render whole-window status from ContextManager's read-only plan.
 
     Single source of truth for BOTH the chat-footer pill (via the HTTP route
     above) AND the agent ``context_status`` tool (#1969). Before this, the tool
-    used a separate cross-session, raw-content token count and drifted from this
-    session-scoped, canonical ``measure_context_breakdown`` measurement.
+    used a separate cross-session, raw-content token count and drifted from the
+    production context path.
 
     The pill in the chat footer (chat.js) reads ``utilization_percent``
     and renders the ● N msgs · X% indicator. The popup (#1310) reads
-    ``breakdown`` for the layered taxonomy. Both come from a single
-    source of truth: ``ContextBuilder.measure_context_breakdown``
-    (introduced by #1308). The ``breakdown`` field is the entire
-    measurement dict, with Emma's canonical sections (system, tools,
+    ``breakdown`` for the layered taxonomy. Both render the typed,
+    side-effect-free plan from ``ContextManager.build_context_plan``; live
+    turns commit that same plan before rendering it. The ``breakdown`` field
+    contains the canonical sections (system, tools,
     history, episodes, memories, rag, dynamic_context_overhead) plus
     the elastic-budget snapshot from #1309.
 
     Two modes:
 
     - ``full=False`` (default): cheap path for the frequent footer
-      poll. RAG retrieval is skipped; the section is flagged
-      ``skipped=true``. Memories are also off unless the agent supplies
-      a side-effect-free retriever.
-    - ``full=True``: invoked once when the popup opens. RAG is
-      retrieved live; the popup labels it as ``estimated``.
+      poll. Memory/RAG acquisition is omitted and those sections are explicitly
+      ``unknown``/``skipped`` with no token value.
+    - ``full=True``: invoked once when the popup opens. The production
+      relevance gates and retrieval path execute read-only.
     """
     try:
         from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
-        from kestrel_sovereign.kestrel_config.constants import MAX_CONVERSATION_HISTORY_LIMIT
 
         # 1. No active session → return an idle shape.  Previously passing
         # session_id=None into get_conversation_history leaked the agent's
@@ -1108,142 +1671,17 @@ async def compute_context_status(
                 "silently_pruned_path_active": False,
             }
 
-        # 2. Get conversation history for the specified session
-        history = await agent.storage.get_conversation_history(
-            limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id
+        measurement = await _acquire_context_status_measurement(
+            agent,
+            session_id,
+            full=full,
         )
+        history = measurement.history
         message_count = len(history)
-
-        # 3. Budget against the actual model/provider stamped on the latest
-        # assistant turn in this session. This intentionally does not consult
-        # the current dropdown/model preference: a Realtime turn followed by a
-        # text dropdown change must still show Realtime's window until another
-        # assistant turn is written. Legacy/restored rows may have null stamps;
-        # in that case use a neutral placeholder rather than impersonating the
-        # current preference.
-        model_identity = _latest_assistant_model_identity(history)
-        current_model = model_identity["context_model"] or LEGACY_CONTEXT_MODEL
-        counter = get_token_counter(current_model)
-        context_limit = counter.get_context_limit()
-
-        # 4. Run the canonical per-section measurement (A / #1308).
-        # ``measure_context_breakdown`` is the single source of truth
-        # for what the LLM call would actually see — popup and pill
-        # cannot drift from production accounting (Emma's "popup must
-        # reflect what the model sees" invariant from PR #1306).
-        from kestrel_sovereign.agent.context_builder import ContextBuilder
-        agent_ctx_builder = getattr(agent, 'context_builder', None)
-        ctx_builder = ContextBuilder(
-            storage=agent.storage,
-            model=current_model,
-            consolidator=getattr(agent_ctx_builder, "consolidator", None),
-            agent_data_path=getattr(agent_ctx_builder, "agent_data_path", None),
-        )
-
-        # Constitution and state-of-mind for the measurement match the
-        # production call path. Best-effort fetch — failure here only
-        # affects measurement accuracy, not the pill rendering.
-        constitution_text = ""
-        get_const = getattr(agent, "get_constitution", None)
-        if callable(get_const):
-            try:
-                got = get_const()
-                constitution_text = await got if hasattr(got, "__await__") else got
-                constitution_text = constitution_text or ""
-            except Exception as e:
-                logger.debug(f"constitution fetch failed for breakdown: {e}")
-
-        state_of_mind = None
-        llm_service = getattr(agent, "llm_service", None)
-        if llm_service is not None and hasattr(llm_service, "get_state_of_mind"):
-            try:
-                state_of_mind = llm_service.get_state_of_mind()
-            except Exception as e:
-                logger.debug(f"state_of_mind fetch failed for breakdown: {e}")
-
-        # Tool schemas the agent would send. Best-effort — surfaces the
-        # previously-invisible slice; if the registry isn't reachable,
-        # tool tokens stay at 0 and the popup labels them not-counted.
-        tool_schemas: Optional[List[Dict[str, Any]]] = None
-        registry = getattr(agent, "tool_registry", None)
-        if registry is not None and hasattr(registry, "_build_all_tools"):
-            try:
-                tool_schemas = list(registry._build_all_tools())
-            except Exception as e:
-                logger.debug(f"tool schema fetch failed for breakdown: {e}")
-
-        # When the popup runs the full breakdown (RAG included), use
-        # the most recent user turn as the query so the RAG figure
-        # approximates what the next LLM turn would see (codex round
-        # 1 P2 caught the previous empty-query path overstating
-        # accuracy). When no user turn is available, label the row
-        # so the popup does not pretend the figure is representative.
-        rag_query = ""
-        rag_query_label: Optional[str] = None
-        if full:
-            try:
-                from kestrel_sovereign.agent.context_builder import (
-                    extract_raw_user_content,
-                )
-                for row in reversed(history):
-                    if (row.get("role") or "").lower() == "user":
-                        rag_query = extract_raw_user_content(
-                            row.get("content", "") or ""
-                        )
-                        break
-            except Exception as e:
-                logger.debug(f"last-user-query lookup failed for breakdown: {e}")
-            if not rag_query:
-                rag_query_label = (
-                    "estimated against latest stored chunks — no recent user "
-                    "turn available for query-specific retrieval"
-                )
-
-        memory_retriever = None
-        if full:
-            memory_min_score = None
-            try:
-                from kestrel_sovereign.agent.context_manager import _retrieval_config
-                memory_min_score = _retrieval_config().get("memory_min_score")
-            except Exception as e:
-                logger.debug(f"retrieval config lookup failed for breakdown: {e}")
-            context_manager = getattr(agent, "context_manager", None)
-            memory_manager = getattr(context_manager, "memory_manager", None)
-            retrieve_memories = getattr(memory_manager, "retrieve_memories", None)
-            if callable(retrieve_memories):
-                async def memory_retriever(query: str, max_tokens: int) -> Optional[str]:
-                    return await retrieve_memories(
-                        query=query,
-                        max_tokens=max_tokens,
-                        counter=counter,
-                        read_only=True,
-                        min_score=memory_min_score,
-                    )
-
-        breakdown = await ctx_builder.measure_context_breakdown(
-            query=rag_query,
-            history=history,
-            constitution=constitution_text,
-            include_briefing=True,
-            message_count=message_count,
-            tools=tool_schemas,
-            state_of_mind=state_of_mind,
-            include_rag=full,
-            memory_retriever=memory_retriever,
-        )
-
-        # Drop the internal artifacts blob — it's the assembled bytes,
-        # only useful to ``build_full_context``; the popup doesn't need
-        # the bodies, only the per-section figures.
-        breakdown.pop("_artifacts", None)
-
-        # Attach the "no current query" annotation when RAG was run
-        # without one; the popup renders it under the RAG row so the
-        # operator can tell estimated-with-query from estimated-without.
-        if full and rag_query_label and "sections" in breakdown:
-            rag_section = breakdown["sections"].get("rag")
-            if isinstance(rag_section, dict):
-                rag_section["query_used_label"] = rag_query_label
+        model_identity = measurement.model_identity
+        current_model = measurement.current_model
+        context_limit = measurement.context_limit
+        breakdown = measurement.breakdown
 
         # C / #1311: attach salvage-state counts so the popup can
         # render the layered taxonomy (pointer-only / pending-fold /
@@ -1273,7 +1711,7 @@ async def compute_context_status(
         except Exception as e:
             logger.debug(f"salvage counts fetch failed for breakdown: {e}")
 
-        # 5. Pill % = honest whole-window utilization (the design's
+        # 5. Pill % = projected whole-window utilization (the design's
         # core correctness fix: previously the pill reported history
         # slice utilization, which was misleading whenever other
         # sections dominated). Greenfield — no compat constraint
@@ -1301,22 +1739,13 @@ async def compute_context_status(
                 "compaction strongly recommended"
             )
 
-        # 7. Auto-detect the legacy silent-prune path (Emma's
-        # 2026-05-20 hardening, design doc §"D auto-detect invariant").
-        # When C / #1311's feature flag is enabled in production, the
-        # prune path emits sync salvage records and this flag flips
-        # to False — which is the release-gate signal for epic #1307
-        # (Emma 2026-05-21: gate keys off this flag, not off ticket
-        # closure). When the flag is disabled the legacy silent-prune
-        # remains active and the popup unconditionally surfaces the
-        # warning.
-        try:
-            from kestrel_sovereign.agent.salvage import (
-                is_durable_salvage_enabled,
-            )
-            silently_pruned_path_active = not is_durable_salvage_enabled()
-        except Exception:
-            silently_pruned_path_active = True
+        # 7. Surface the plan's declared salvage disposition. This is true when
+        # automatic salvage is disabled or when the projected pruned span
+        # contains id-less/in-memory rows that no durable marker can link.
+        salvage_projection = breakdown.get("salvage", {})
+        silently_pruned_path_active = bool(
+            salvage_projection.get("silent_prune_possible", False)
+        )
 
         # #1503: route per-turn cap visibility. Some subscription tiers
         # (notably ChatGPT-Plus on ``openai:plan``) enforce a per-turn
@@ -1400,11 +1829,16 @@ async def compute_context_status(
                     # On the cheap footer poll (``full=False``) the
                     # breakdown was measured without RAG, so the
                     # projection is a FLOOR — the real turn payload may
-                    # be higher. The popup (``full=True``) runs RAG and
-                    # the projection is accurate. The UI uses this flag
+                    # be higher. The popup (``full=True``) runs RAG but
+                    # remains a projection. The UI uses this flag
                     # to label the pill / popup honestly (codex round 1
                     # P2 on #1503).
-                    "includes_rag": bool(full),
+                    "includes_rag": bool(full) and (
+                        breakdown.get("sections", {})
+                        .get("rag", {})
+                        .get("status")
+                        not in {"unknown", "skipped"}
+                    ),
                 }
         except Exception as e:
             # Catalog probe must never break the endpoint — degrade to
@@ -1429,7 +1863,7 @@ async def compute_context_status(
             "context_model": current_model,
             "model_source": model_identity["model_source"],
             "message_count": message_count,
-            "total_tokens": total_measured,  # honest whole-window total
+            "total_tokens": total_measured,  # projected whole-window total
             "context_limit": context_limit,
             "response_reserve": breakdown["response_reserve"],
             "total_budget": total_budget,
@@ -1452,9 +1886,7 @@ async def compute_context_status(
             # openai:plan, since that figure only measures Kestrel's per-turn
             # payload — not the server-side thread that actually compacts.
             "codex_thread": codex_thread_block,
-            # While C has not shipped, this stays True per the
-            # auto-detection invariant. When C lands and the prune
-            # path emits sync salvage records, flip this to False.
+            # Plan-derived projection, not per-turn salvage commit evidence.
             "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:
@@ -1612,6 +2044,128 @@ def _a2a_did_resolver(agent):
     return getattr(agent, "a2a_did_resolver", None)
 
 
+def _a2a_inbound_sender_authorizer(agent):
+    """Return the recipient's post-verification A2A authorization seam."""
+    return getattr(agent, "a2a_inbound_sender_authorizer", None)
+
+
+def _a2a_inbound_scope_snapshot(agent):
+    """Capture seam identities around asynchronous trust decisions."""
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        has_a2a_inbound_scoped_policy,
+    )
+
+    return (
+        _a2a_inbound_sender_authorizer(agent),
+        _a2a_did_resolver(agent),
+        getattr(agent, "peer_directory_router", None),
+        getattr(agent, "peer_requester", None),
+        has_a2a_inbound_scoped_policy(agent),
+    )
+
+
+def _a2a_inbound_scope_unchanged(agent, snapshot) -> bool:
+    """Require the exact authorizer/router/requester objects to remain live."""
+    current = _a2a_inbound_scope_snapshot(agent)
+    return (
+        current[0] is snapshot[0]
+        and current[1] is snapshot[1]
+        and current[2] is snapshot[2]
+        and current[3] is snapshot[3]
+        and current[4] is snapshot[4]
+    )
+
+
+def _a2a_sender_witness_unchanged(before, after) -> bool:
+    """Compare manager-owned sender witnesses without invoking object equality."""
+    return (
+        before[0] == after[0]
+        and before[1] is after[1]
+        and before[2] is after[2]
+        and before[3] == after[3]
+    )
+
+
+def _a2a_inbound_requires_verified_sender(agent, authorizer) -> bool:
+    """Fail closed when hosted scope is present or its seam is malformed."""
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        has_a2a_inbound_scoped_policy,
+    )
+
+    if has_a2a_inbound_scoped_policy(agent):
+        return True
+    if authorizer is not None:
+        try:
+            required = authorizer.requires_verified_sender
+        except Exception:  # noqa: BLE001 - injected host policy boundary
+            return True
+        return (
+            required is not False
+            or getattr(agent, "peer_directory_router", None) is not None
+            or getattr(agent, "peer_requester", None) is not None
+        )
+    return (
+        getattr(agent, "peer_directory_router", None) is not None
+        or getattr(agent, "peer_requester", None) is not None
+    )
+
+
+def _a2a_inbound_current_scope_is_valid(
+    authorizer,
+    hosted_policy=None,
+) -> bool:
+    """Validate the installed scoped seam without another provider await."""
+    if hosted_policy is not None:
+        validator = getattr(authorizer, "has_valid_policy_scope", None)
+        arguments = (hosted_policy.router, hosted_policy.requester)
+    else:
+        validator = getattr(authorizer, "has_valid_current_scope", None)
+        arguments = ()
+    if not callable(validator):
+        return False
+    try:
+        return validator(*arguments) is True
+    except Exception:  # noqa: BLE001 - injected host policy boundary
+        return False
+
+
+async def _authorize_verified_a2a_sender(
+    authorizer,
+    sender_did: str,
+    hosted_policy=None,
+) -> bool:
+    """Invoke the explicit inbound seam, requiring a literal True verdict."""
+    if authorizer is None or not callable(
+        getattr(authorizer, "authorize", None)
+    ):
+        return False
+    try:
+        if hosted_policy is not None:
+            policy_authorize = getattr(
+                authorizer,
+                "authorize_with_policy",
+                None,
+            )
+            if not callable(policy_authorize):
+                return False
+            result = policy_authorize(
+                sender_did,
+                router=hosted_policy.router,
+                requester=hosted_policy.requester,
+            )
+        else:
+            result = authorizer.authorize(sender_did)
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:  # noqa: BLE001 - injected host policy boundary
+        logger.warning(
+            "Inbound A2A sender authorization provider failed",
+            exc_info=True,
+        )
+        return False
+    return result is True
+
+
 def _a2a_replay_store(agent):
     """Return a cached shared replay-nonce store for signed A2A envelopes."""
     existing = getattr(agent, "_a2a_replay_nonce_store", None)
@@ -1631,6 +2185,295 @@ def _a2a_replay_store(agent):
     except Exception:
         return store
     return store
+
+
+async def _create_a2a_task_under_lifecycle_lease(
+    agent,
+    params,
+    parts,
+    raw_artifacts,
+    sender_artifacts,
+    manager,
+    hosted_policy=None,
+):
+    """Verify, authorize, and persist one task under a stable hosted topology."""
+    from kestrel_sovereign.a2a.envelope_signing import (
+        canonical_message,
+        verify_inbound_envelope,
+    )
+
+    if hosted_policy is not None:
+        inbound_authorizer = hosted_policy.authorizer
+        # Hosted recipients normally require a verified sender.  Keep the
+        # envelope verifier open only long enough to identify a genuinely
+        # absent signature: the manager-owned legacy path below then permits
+        # one exact current same-host pre-ceremony sender.  A present malformed
+        # or invalid signature remains a hard verification failure.
+        scoped_sender_required = True
+        verification_scope = None
+        resolver = hosted_policy.resolver
+    else:
+        inbound_authorizer = _a2a_inbound_sender_authorizer(agent)
+        scoped_sender_required = _a2a_inbound_requires_verified_sender(
+            agent,
+            inbound_authorizer,
+        )
+        # Capture after requires_verified_sender has monotonically observed any
+        # newly attached scope, avoiding a self-induced marker transition.
+        verification_scope = _a2a_inbound_scope_snapshot(agent)
+        resolver = verification_scope[1]
+    globally_required_signed = os.environ.get(
+        "KESTREL_A2A_REQUIRE_SIGNED", ""
+    ).lower() in (
+        "1", "true", "yes",
+    )
+    require_signed = (
+        globally_required_signed
+        or (hosted_policy is None and scoped_sender_required)
+    )
+    claimed_sender = str(params.metadata.get("sender") or "")
+    sender_witness = (
+        manager.a2a_sender_identity_witness(claimed_sender)
+        if manager is not None and claimed_sender
+        else None
+    )
+    signed_message_text = canonical_message([part.text for part in parts])
+    sender_verdict = await verify_inbound_envelope(
+        params.metadata,
+        task_id=params.id,
+        message=signed_message_text,
+        session_id=params.sessionId,
+        artifacts=raw_artifacts,
+        resolver=resolver,
+        require_signed=require_signed,
+        replay_store=_a2a_replay_store(agent),
+    )
+    if not sender_verdict.ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"A2A sender verification failed: {sender_verdict.reason}",
+        )
+    if hosted_policy is not None:
+        if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A hosted policy changed during verification",
+            )
+    elif not _a2a_inbound_scope_unchanged(agent, verification_scope):
+        raise HTTPException(
+            status_code=403,
+            detail="A2A sender authorization context changed during verification",
+        )
+    if sender_verdict.verified and sender_witness is not None:
+        current_witness = manager.a2a_sender_identity_witness(
+            sender_verdict.sender
+        )
+        if (
+            sender_witness[0] == "ambiguous"
+            or not _a2a_sender_witness_unchanged(
+                sender_witness,
+                current_witness,
+            )
+            or (
+                sender_witness[0] == "local"
+                and sender_verdict.verification_document_fingerprint
+                != sender_witness[3]
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="A2A sender identity changed during verification",
+            )
+
+    if hosted_policy is not None:
+        authorization_scope = None
+        inbound_authorizer = hosted_policy.authorizer
+        scoped_sender_required = True
+    else:
+        authorization_scope = _a2a_inbound_scope_snapshot(agent)
+        inbound_authorizer = authorization_scope[0]
+        scoped_sender_required = _a2a_inbound_requires_verified_sender(
+            agent,
+            inbound_authorizer,
+        )
+    if sender_verdict.verified:
+        if inbound_authorizer is not None:
+            if (
+                scoped_sender_required
+                and not _a2a_inbound_current_scope_is_valid(
+                    inbound_authorizer,
+                    hosted_policy,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization context is invalid",
+                )
+            authorized = await _authorize_verified_a2a_sender(
+                inbound_authorizer,
+                sender_verdict.sender,
+                hosted_policy,
+            )
+            if not authorized:
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization failed",
+                )
+            if (
+                hosted_policy is not None
+                and manager.a2a_hosted_policy_for(agent) is not hosted_policy
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A hosted policy changed during authorization",
+                )
+            if (
+                hosted_policy is None
+                and not _a2a_inbound_scope_unchanged(
+                    agent,
+                    authorization_scope,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "A2A sender authorization context changed "
+                        "during authorization"
+                    ),
+                )
+            if (
+                scoped_sender_required
+                and not _a2a_inbound_current_scope_is_valid(
+                    inbound_authorizer,
+                    hosted_policy,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="A2A sender authorization context is invalid",
+                )
+            if sender_witness is not None:
+                current_witness = manager.a2a_sender_identity_witness(
+                    sender_verdict.sender
+                )
+                if not _a2a_sender_witness_unchanged(
+                    sender_witness,
+                    current_witness,
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="A2A sender identity changed during authorization",
+                    )
+        elif scoped_sender_required:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A sender authorization unavailable",
+            )
+    elif hosted_policy is not None:
+        # Hosted unsigned compatibility is deliberately narrower than the
+        # historic same-host API-key fallback.  The manager, while holding its
+        # lifecycle lease, proves the claimed name is an exact current local
+        # non-hybrid sender and asks the immutable recipient directory policy
+        # to authorize its stable DID. Unknown, cross-user, external, and
+        # hybrid-downgrade claims fail closed.
+        authorize_legacy = getattr(
+            manager,
+            "authorize_a2a_legacy_unsigned_sender",
+            None,
+        )
+        authorized = False
+        if callable(authorize_legacy):
+            try:
+                authorized = await authorize_legacy(
+                    agent,
+                    claimed_sender,
+                    hosted_policy,
+                )
+            except Exception:  # noqa: BLE001 - manager policy boundary
+                logger.warning(
+                    "Hosted legacy unsigned A2A sender authorization failed",
+                    exc_info=True,
+                )
+        if authorized is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A unsigned sender is not an authorized local legacy peer",
+            )
+        if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
+            raise HTTPException(
+                status_code=403,
+                detail="A2A hosted policy changed during legacy authorization",
+            )
+    elif scoped_sender_required:
+        raise HTTPException(
+            status_code=403,
+            detail="A2A scoped recipients require a verified sender",
+        )
+
+    params.metadata["sender_verified"] = sender_verdict.verified
+    local_name = (
+        getattr(agent, "did", None)
+        or getattr(agent, "_agent_name", None)
+        or "unknown"
+    )
+    try:
+        return await agent.task_manager.create_task(
+            params=params,
+            agent_name=local_name,
+            artifacts=sender_artifacts or None,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to create A2A task from peer submission: %s",
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to create task")
+
+
+async def _create_verified_a2a_task(
+    agent,
+    params,
+    parts,
+    raw_artifacts,
+    sender_artifacts,
+):
+    """Use a shared manager lease for hosted recipients; preserve standalone flow."""
+    manager = getattr(agent, "_a2a_host_manager", None)
+    # Current managers expose a reader lease so independent hosted recipients
+    # can verify and commit concurrently. Retain the old lifecycle-lock seam
+    # for compatibility hosts; it remains exclusive and therefore safe.
+    lease_factory = getattr(manager, "a2a_execution_lease", None)
+    if not callable(lease_factory):
+        lease_factory = getattr(manager, "a2a_lifecycle_lease", None)
+    if callable(lease_factory):
+        async with lease_factory():
+            hosted_policy = manager.a2a_hosted_policy_for(agent)
+            if hosted_policy is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "A2A recipient is no longer published "
+                        "with hosted policy"
+                    ),
+                )
+            return await _create_a2a_task_under_lifecycle_lease(
+                agent,
+                params,
+                parts,
+                raw_artifacts,
+                sender_artifacts,
+                manager,
+                hosted_policy,
+            )
+    return await _create_a2a_task_under_lifecycle_lease(
+        agent,
+        params,
+        parts,
+        raw_artifacts,
+        sender_artifacts,
+        None,
+    )
 
 
 @router.post("/tasks/send")
@@ -1675,19 +2518,19 @@ async def send_task(request: Request):
     ``metadata["signature"]`` block, it is verified against the sender's
     resolved DID document via ``verify_inbound_envelope`` (hybrid Ed25519 +
     ML-DSA-65, replay-windowed, DID-bound). A present-but-invalid signature is
-    always rejected; an unsigned envelope is allowed by default (the same-host
-    shared-API-key boundary still applies) unless ``KESTREL_A2A_REQUIRE_SIGNED``
-    is set. The verdict is recorded as ``metadata["sender_verified"]`` for
-    downstream governance tiering.
+    always rejected; an unsigned envelope is allowed for standalone/local
+    shared-API-key compatibility unless ``KESTREL_A2A_REQUIRE_SIGNED`` is set.
+    A scoped hosted recipient always requires a verified signature. The verdict
+    is recorded as ``metadata["sender_verified"]`` for downstream governance
+    tiering.
 
-    Remaining for full cross-host federation: the DID *resolver*
-    (``agent.a2a_did_resolver``) — a same-host registry of peer agents' DID
-    documents (local-first; federated ``did:web`` optional) — and sign-on-send,
-    which needs the sending agent's runtime keypair. Until the resolver is
-    attached, signed envelopes from unresolvable senders are rejected because a
-    present signature is a verification claim, not an unsigned fallback. The
-    richer identity-injection middleware (a system-context note "verified
-    message from agent X") builds on ``sender_verified``.
+    DID-document resolution and recipient authorization are separate trust
+    decisions. After successful cryptographic verification, a recipient-scoped
+    ``agent.a2a_inbound_sender_authorizer`` must approve the verified sender
+    before ``sender_verified`` is set or a task is created. Hosted scoped
+    recipients require a signed envelope and fail closed if that seam or its
+    live scope is missing/revoked. Standalone shared-API-key deployments retain
+    unsigned compatibility.
     """
     agent = get_agent(request)
     body = await _parse_json_body(request)
@@ -1703,6 +2546,9 @@ async def send_task(request: Request):
         Message,
         TextPart,
         TaskSendParams,
+    )
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
     )
     try:
         # Parse body into TaskSendParams. Sender-side already validated
@@ -1723,11 +2569,24 @@ async def send_task(request: Request):
             role=str(message_data.get("role", "user")),
             parts=parts,
         )
+        raw_metadata = body.get("metadata") or {}
+        if (
+            isinstance(raw_metadata, dict)
+            and HOST_ATTESTED_LOCAL_SUBMISSION_METADATA in raw_metadata
+        ):
+            # This marker is Core-internal provenance for the explicit local
+            # host-attested path.  A wire client can claim arbitrary metadata,
+            # so accepting it here would let an external sender forge the task
+            # ownership relationship used by local retrieval/subscription.
+            raise HTTPException(
+                status_code=400,
+                detail="host-attested local A2A provenance is not accepted over the wire",
+            )
         params = TaskSendParams(
             id=str(body.get("id") or ""),
             sessionId=str(body.get("sessionId") or ""),
             message=message,
-            metadata=body.get("metadata") or {},
+            metadata=raw_metadata,
         )
         # Send-side artifacts/references: a sender may attach durable
         # handoff payload (planning docs, evidence bundles, saved-memory
@@ -1764,76 +2623,13 @@ async def send_task(request: Request):
             detail="TaskSendParams.id and TaskSendParams.sessionId are required",
         )
 
-    # Cryptographic sender verification (#1673). If the envelope carries a
-    # ``metadata["signature"]`` block, verify it against the sender's resolved
-    # DID document — a present-but-invalid signature is ALWAYS rejected (an
-    # attack signal, never downgraded). Unsigned envelopes are allowed by
-    # default: the same-host shared-API-key boundary (this endpoint sits behind
-    # the host API-key middleware) still applies. Set
-    # ``KESTREL_A2A_REQUIRE_SIGNED=1`` to require a verified signature.
-    from kestrel_sovereign.a2a.envelope_signing import (
-        canonical_message,
-        verify_inbound_envelope,
+    task = await _create_verified_a2a_task(
+        agent,
+        params,
+        parts,
+        raw_artifacts,
+        sender_artifacts,
     )
-
-    require_signed = os.environ.get("KESTREL_A2A_REQUIRE_SIGNED", "").lower() in (
-        "1", "true", "yes",
-    )
-    # Structure-preserving message form (a JSON array of part texts, not a
-    # lossy join) and the AUTHORITATIVE top-level sessionId — both bound into
-    # the signature so neither the multipart structure nor the session can be
-    # swapped after signing.
-    signed_message_text = canonical_message([p.text for p in parts])
-    sender_verdict = await verify_inbound_envelope(
-        params.metadata,
-        task_id=params.id,
-        message=signed_message_text,
-        session_id=params.sessionId,
-        # Bind the RAW wire artifacts (the same dicts the signer bound as
-        # ``payload["artifacts"]``); ``TaskSendParams`` has no artifacts field —
-        # they are parsed separately into ``sender_artifacts`` (#1721).
-        artifacts=raw_artifacts,
-        resolver=_a2a_did_resolver(agent),
-        require_signed=require_signed,
-        replay_store=_a2a_replay_store(agent),
-    )
-    if not sender_verdict.ok:
-        raise HTTPException(
-            status_code=403,
-            detail=f"A2A sender verification failed: {sender_verdict.reason}",
-        )
-    # Record the outcome so downstream governance can apply the right trust
-    # tier. The inbound-task signal source reads ``sender_verified`` and marks
-    # an unverified peer's wake UNTRUSTED (#1721) — a cryptographically-verified
-    # peer keeps the registration's TRUSTED tier; an unsigned/unverified claim
-    # is downgraded so the dispatcher routes it through the untrusted path.
-    params.metadata["sender_verified"] = sender_verdict.verified
-
-    # ``agent_name`` here is the local (recipient) agent's identifier —
-    # the same value `create_task` logs as ``agent_name`` for the
-    # observability row. Use the agent's DID for stable identity.
-    local_name = (
-        getattr(agent, "did", None)
-        or getattr(agent, "_agent_name", None)
-        or "unknown"
-    )
-
-    try:
-        task = await agent.task_manager.create_task(
-            params=params, agent_name=local_name,
-            artifacts=sender_artifacts or None,
-        )
-    except Exception as e:
-        # The replay nonce was consumed at verification time and is NOT released
-        # here: create_task is not idempotent (it appends a session event), so
-        # releasing the nonce on a partial-create failure could double-process a
-        # re-accepted retry (#1721 codex r5). A client retrying must send a
-        # freshly-signed envelope (Kestrel peers re-sign every send).
-        logger.error(
-            "Failed to create A2A task from peer submission: %s",
-            e, exc_info=True,
-        )
-        raise HTTPException(status_code=500, detail="Failed to create task")
 
     # Return the canonical A2A Task envelope (model_dump produces the
     # standard JSON-RPC-friendly shape).

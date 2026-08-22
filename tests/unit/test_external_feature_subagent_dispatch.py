@@ -9,6 +9,8 @@ lean ``kestrel_sdk`` base that external packages subclass.
 
 from __future__ import annotations
 
+import ast
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -111,6 +113,68 @@ def test_dispatch_method_closure_is_present_on_sovereign_base():
     """
     for name in _DISPATCH_METHODS:
         assert callable(getattr(SovereignFeature, name, None)), name
+
+
+def test_subagent_dispatch_closure_is_complete():
+    """The other direction: every ``self.x(...)`` the cluster makes is borrowable.
+
+    ``test_dispatch_method_closure_is_present_on_sovereign_base`` only checks
+    that listed names exist; it cannot notice a name that was never listed. That
+    is the drift that actually happens — #2940 added a ``self._turn_session_id()``
+    call inside ``execute_as_subagent`` and the omission surfaced only as an
+    ``AttributeError`` swallowed into ``success: False`` at runtime. Walk the
+    listed methods' source transitively and require every helper they call on
+    ``self`` to be provided by the SDK base (external features already have it)
+    or to be borrowed too.
+    """
+    pending = list(_DISPATCH_METHODS)
+    checked: set[str] = set()
+    unborrowable: dict[str, str] = {}
+    while pending:
+        name = pending.pop()
+        if name in checked:
+            continue
+        checked.add(name)
+        static = inspect.getattr_static(SovereignFeature, name, None)
+        func = (
+            static.__func__
+            if isinstance(static, (staticmethod, classmethod))
+            else getattr(SovereignFeature, name, None)
+        )
+        if func is None:
+            continue
+        for called in _self_call_names(func):
+            if getattr(SdkFeature, called, None) is not None:
+                continue  # the lean SDK base already provides it
+            if called in _DISPATCH_METHODS:
+                pending.append(called)
+            elif getattr(SovereignFeature, called, None) is not None:
+                unborrowable[called] = name
+
+    assert not unborrowable, (
+        "sovereign-only helpers called by the dispatch cluster but missing from "
+        f"_DISPATCH_METHODS: {unborrowable}"
+    )
+
+
+def _self_call_names(func) -> set[str]:
+    """Names invoked as ``self.<name>(...)`` in ``func``'s own source.
+
+    Parsed under a synthetic block header rather than dedented: these methods
+    embed prompt literals whose continuation lines sit at a shallower indent
+    than the ``def``, so ``textwrap.dedent`` finds no common prefix and slicing
+    a fixed width off every line would eat real characters out of the literal.
+    Indentation inside a string literal is just content to the tokenizer.
+    """
+    tree = ast.parse("if True:\n" + inspect.getsource(func))
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 """Sovereignty export/import and file browser endpoints."""
 import asyncio
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pathlib import Path
 import json
@@ -13,8 +13,12 @@ from typing import Any, Dict
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    get_caller,
     privacy_hides_persisted,
+    request_invocation_provenance,
+    resolve_request_invocation_id,
 )
+from kestrel_sovereign.agent.invocation import invocation_id_response_header
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,35 @@ ALLOWED_TIERS = {"local", "ipfs", "filecoin"}
 
 # CID format: alphanumeric characters only (covers CIDv0 Qm... and CIDv1 bafy...)
 CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')
+
+
+def _export_error_status(envelope, err: str) -> int:
+    """Map an ERROR export envelope to an HTTP status code.
+
+    A refusal — the caller asking for something this host cannot honour —
+    carries an explicit ``data["refusal"]`` code from the feature layer, so it
+    resolves to a 4xx instead of falling through to the catch-all 500 that made
+    "I asked for something impossible" indistinguishable from "the server
+    broke" (#2918). An unset ``KESTREL_DATA_KEY`` is a host-configuration
+    conflict the caller cannot fix by changing parameters, hence 409 rather
+    than 400. Anything without a known refusal code stays a 500; the legacy
+    ``Insufficient funds`` substring check is kept as a fallback for envelopes
+    minted without the typed code.
+    """
+    from kestrel_sovereign.features.sovereignty.feature import (
+        REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
+        REFUSAL_INSUFFICIENT_FUNDS,
+    )
+
+    refusal_status = {
+        REFUSAL_ENCRYPTION_KEY_UNAVAILABLE: 409,
+        REFUSAL_INSUFFICIENT_FUNDS: 402,
+    }
+    data = envelope.data if isinstance(envelope.data, dict) else {}
+    status_code = refusal_status.get(data.get("refusal"))
+    if status_code is not None:
+        return status_code
+    return 402 if "Insufficient funds" in err else 500
 
 
 def _read_metadata_file(meta_path: Path):
@@ -225,10 +258,11 @@ async def trigger_sovereignty_export(request: Request):
         from kestrel_sdk.tools.result import ToolResultStatus
         if envelope.status is ToolResultStatus.ERROR:
             err = envelope.error or "Export failed"
-            # Wallet-affordability refusal -> 402 Payment Required.
-            # Everything else (provider blow-ups, etc.) -> 500.
-            status_code = 402 if "Insufficient funds" in err else 500
-            raise HTTPException(status_code=status_code, detail=err)
+            # Typed refusals -> 4xx (402 wallet, 409 unsatisfiable
+            # encryption); genuine faults (provider blow-ups, etc.) -> 500.
+            raise HTTPException(
+                status_code=_export_error_status(envelope, err), detail=err
+            )
         message = envelope.confirmation or envelope.error or ""
         body: Dict[str, Any] = {
             "success": True,
@@ -250,7 +284,7 @@ async def trigger_sovereignty_export(request: Request):
 
 
 @router.post("/sovereignty/import")
-async def trigger_sovereignty_import(request: Request):
+async def trigger_sovereignty_import(request: Request, http_response: Response):
     """Trigger a sovereignty import via the agent's !import-sovereignty command."""
     try:
         data = await request.json()
@@ -265,8 +299,18 @@ async def trigger_sovereignty_import(request: Request):
 
         agent = get_agent(request)
         cmd = f"!import-sovereignty {cid}"
-        result = await agent.process_input(cmd)
+        request_id = resolve_request_invocation_id(request, data)
+        result = await agent.process_input(
+            cmd,
+            caller=get_caller(request),
+            invocation_id=request_id,
+            invocation_provenance=request_invocation_provenance(
+                request,
+                source_locator="POST:/api/sovereignty/import",
+            ),
+        )
 
+        http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return {"success": True, "message": result}
     except HTTPException:
         raise

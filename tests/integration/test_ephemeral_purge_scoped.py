@@ -59,6 +59,7 @@ async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path):
         "conversation_history": 0,
         "graph_nodes": 0,
         "channel_messages": 0,
+        "session_projection": 0,
     }, (
         "Scoped purge must not touch rows authored before EPHEMERAL entry"
     )

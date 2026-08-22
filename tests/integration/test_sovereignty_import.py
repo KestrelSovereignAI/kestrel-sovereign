@@ -186,6 +186,55 @@ async def test_export_import_roundtrip(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_import_rederives_the_session_id_column(temp_db):
+    """#2958: an imported row is indistinguishable from one the backfill lifted.
+
+    The import DELETEs the agent's history and reinserts it from the package's
+    shards, with hand-spelled SQL that does not go through the store's insert
+    helper — so the derived ``session_id`` column is only populated because
+    this path stamps it deliberately. A package exported before the column
+    existed still restores with it populated, because the source is the
+    ``metadata`` the package already carries.
+
+    Both halves of the rule are exercised: an id inside the column's contract
+    lands in it, and one outside stays in metadata with the column NULL, which
+    is the state Phase C must tolerate.
+    """
+    agent_did = "did:pkh:eip155:1:test_import_session_column"
+    stampable = "9d2f5c31-6b0a-4e7d-8c14-000000000042"
+
+    async with Storage(db_path=temp_db) as storage:
+        await storage.add_conversation(
+            "user", "inside the contract", session_id=stampable
+        )
+        await storage.add_conversation(
+            "user", "outside the contract", session_id="did:x:1"
+        )
+
+        adapter = SovereignStorageAdapter(storage.db, user_secret="session-column")
+        cid = await adapter.export_agent(
+            agent_did, storage_tier=StorageTier.LOCAL_ONLY
+        )
+        # Blank the column so a stale value cannot masquerade as a fresh
+        # stamp; the DELETE + reinsert would replace the rows anyway, but
+        # this makes the claim independent of that.
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET session_id = NULL"
+        )
+
+        result = await adapter.import_agent(cid)
+        assert result.success, result.status
+
+        rows = await storage.db.fetchall(
+            "SELECT metadata, session_id FROM conversation_history ORDER BY id"
+        )
+        assert [row[1] for row in rows] == [stampable, None]
+        assert [json.loads(row[0])["session_id"] for row in rows] == [
+            stampable, "did:x:1",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_import_with_wrong_key_fails(temp_db):
     """
     Verify that import with the wrong encryption key is *rejected*

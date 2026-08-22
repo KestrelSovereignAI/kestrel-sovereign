@@ -1,0 +1,417 @@
+# This is the sole version/digest registry for the semantic-KB boundary.
+# Every `package_resource` is read locally through importlib.resources; no
+# runtime path dereferences `uri` or resolves owl:imports from the network.
+
+[registry]
+contract_version = "semantic-kb-v1"
+manifest_version = 1
+
+[resource.assertion-term-v1-rdf11-subset]
+version = "1.0.0"
+namespace = "https://kestrel.ai/semantic/profiles/assertion-term-v1-rdf11-subset"
+package_resource = "data/semantic/profiles/assertion-term-v1-rdf11-subset.json"
+sha256 = "81b359f3bab4e6df78f687353b262e643606749ecc1df2253f9a8c917f2b418c"
+maturity = "stable"
+kind = "normalization-profile"
+uri = "https://kestrel.ai/semantic/profiles/assertion-term-v1-rdf11-subset/1.0.0"
+published_date = "2026-07-26"
+description = "Closed RDF 1.1-compatible assertion-term algebra; RDF 1.2-only terms are excluded."
+selected_terms = ["IRI", "typed literal", "rdf:langString"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["term-profile:assertion-term-v1-rdf11-subset"]
+
+[resource.iri-normalization-v1-rfc3986-200501]
+version = "1.0.0"
+namespace = "https://kestrel.ai/semantic/profiles/iri-normalization-v1-rfc3986-200501"
+package_resource = "data/semantic/profiles/iri-normalization-v1-rfc3986-200501.json"
+sha256 = "bb2383b8a2937ced879589206563ef56997c299ef8fca4f93b15de94c324cee2"
+maturity = "stable"
+kind = "normalization-profile"
+uri = "https://kestrel.ai/semantic/profiles/iri-normalization-v1-rfc3986-200501/1.0.0"
+published_date = "2026-07-26"
+description = "Closed RFC 3986 IRI normalization profile used before assertion identity hashing."
+selected_terms = ["RFC 3986 sections 3", "5.2.4", "6.2.2"]
+imports = ["rfc3986-200501@1.0.0"]
+capabilities = ["iri-profile:iri-normalization-v1-rfc3986-200501"]
+
+[resource.rfc3986-200501]
+version = "1.0.0"
+namespace = "https://www.rfc-editor.org/rfc/rfc3986"
+package_resource = "data/semantic/standards/rfc3986-200501.txt"
+sha256 = "fbc12a08fd679056dfedd436833397bf5f975283423e13bddd99fa07f009fc7f"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.rfc-editor.org/rfc/rfc3986.txt"
+published_date = "2005-01-01"
+description = "Dated RFC 3986 source pin for the closed IRI normalization profile; no URI dereference is permitted."
+selected_terms = ["RFC 3986 sections 3", "5.2.4", "6.2.2"]
+imports = []
+capabilities = ["standard:rfc3986-200501"]
+
+[resource.literal-v1-xsd11-20120405]
+version = "1.0.0"
+namespace = "https://kestrel.ai/semantic/profiles/literal-v1-xsd11-20120405"
+package_resource = "data/semantic/profiles/literal-v1-xsd11-20120405.json"
+sha256 = "dacdbab3468fc845f5b359ff66596ba48f2af082643f79acfd00ba397b91eb06"
+maturity = "stable"
+kind = "normalization-profile"
+uri = "https://kestrel.ai/semantic/profiles/literal-v1-xsd11-20120405/1.0.0"
+published_date = "2026-07-26"
+description = "Closed XSD 1.1 literal canonicalization profile for semantic-kb-v1."
+selected_terms = ["xsd:string", "xsd:boolean", "xsd:integer", "xsd:decimal", "xsd:date", "xsd:time", "xsd:dateTime", "xsd:dateTimeStamp"]
+imports = ["xsd11-datatypes-20120405@1.0.0"]
+capabilities = ["literal-profile:literal-v1-xsd11-20120405"]
+
+[resource.rdf11-concepts-20140225]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/"
+package_resource = "data/semantic/standards/rdf11-concepts-20140225.html"
+sha256 = "6daaf1c8d3cefe2ea3c12bbf80883179ae34662a55b9c1c90436c28f02b7820f"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.w3.org/TR/2014/REC-rdf11-concepts-20140225/"
+published_date = "2014-02-25"
+description = "Mandatory RDF 1.1 term, triple, dataset, and dated-syntax interoperability baseline."
+selected_terms = ["IRI", "literal", "triple", "named graph", "dataset"]
+imports = []
+capabilities = ["rdf-profile:rdf11"]
+
+[resource.turtle-20140225]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2014/REC-turtle-20140225/"
+package_resource = "data/semantic/standards/turtle-20140225.html"
+sha256 = "899521564c207bb8e53b5be655a44b08f1cbf310e12530f4eab5e4d5626ca4b3"
+maturity = "stable"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2014/REC-turtle-20140225/"
+published_date = "2014-02-25"
+description = "Dated Turtle 1.1 import and export syntax profile on the RDF 1.1 baseline."
+selected_terms = ["Turtle 1.1"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["serialization:turtle-20140225"]
+
+[resource.ntriples-20140225]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2014/REC-n-triples-20140225/"
+package_resource = "data/semantic/standards/ntriples-20140225.html"
+sha256 = "bfe0aeed06e7cb08aec6ea439a864cf6911bee373e97306facec7646a2f56b09"
+maturity = "stable"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2014/REC-n-triples-20140225/"
+published_date = "2014-02-25"
+description = "Dated N-Triples 1.1 import and export syntax profile on the RDF 1.1 baseline."
+selected_terms = ["N-Triples 1.1"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["serialization:ntriples-20140225"]
+
+[resource.nquads-20140225]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2014/REC-n-quads-20140225/"
+package_resource = "data/semantic/standards/nquads-20140225.html"
+sha256 = "fe82c3a9f67e679150be0845e979d67daa5446257d73a6ac2c38fc40153d0c68"
+maturity = "stable"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2014/REC-n-quads-20140225/"
+published_date = "2014-02-25"
+description = "Dated N-Quads 1.1 import and export syntax profile on the RDF 1.1 baseline."
+selected_terms = ["N-Quads 1.1"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["serialization:nquads-20140225"]
+
+[resource.trig-20140225]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2014/REC-trig-20140225/"
+package_resource = "data/semantic/standards/trig-20140225.html"
+sha256 = "b45bd73e9abc332241a03e9cd1e5cd3d89009bfc3482b2e3dd91a34d6a1b346e"
+maturity = "stable"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2014/REC-trig-20140225/"
+published_date = "2014-02-25"
+description = "Dated TriG 1.1 import and export syntax profile on the RDF 1.1 baseline."
+selected_terms = ["TriG 1.1"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["serialization:trig-20140225"]
+
+[resource.xsd11-datatypes-20120405]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2012/REC-xmlschema11-2-20120405/datatypes.html"
+package_resource = "data/semantic/standards/xsd11-datatypes-20120405.html"
+sha256 = "f453ea20b4fa608bf42358689f020fe2666e1cddb97a47ab18168537b0f8ef00"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.w3.org/TR/2012/REC-xmlschema11-2-20120405/datatypes.html"
+published_date = "2012-04-05"
+description = "Dated XML Schema 1.1 Part 2 Datatypes source for the closed Kestrel literal profile."
+selected_terms = ["XML Schema 1.1 Part 2: Datatypes"]
+imports = []
+capabilities = ["standard:xsd11-datatypes-20120405"]
+
+[resource.rdfs-20140225]
+version = "1.0.0"
+namespace = "http://www.w3.org/2000/01/rdf-schema#"
+package_resource = "data/semantic/vocabularies/rdfs-20140225.ttl"
+sha256 = "e362812917fddab7cfab3dc35553ad292725e8f264e05f376077340e91034db5"
+maturity = "stable"
+kind = "ontology"
+uri = "https://www.w3.org/TR/2014/REC-rdf-schema-20140225/"
+published_date = "2014-02-25"
+description = "RDFS selected vocabulary and modeling baseline with no remote vocabulary fetch."
+selected_terms = ["rdfs:subClassOf", "rdfs:subPropertyOf", "rdfs:domain", "rdfs:range"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["vocabulary:rdfs11"]
+
+[resource.rdfs-v1]
+version = "1.0.0"
+namespace = "https://kestrel.ai/semantic/rules/rdfs-v1"
+package_resource = "data/semantic/profiles/rdfs-v1.json"
+sha256 = "a8a700e4d9e2a2b840a30b85b4cceea400a3e77001171b0ed71e0a581ce429cc"
+maturity = "stable"
+kind = "rule-profile"
+uri = "https://kestrel.ai/semantic/rules/rdfs-v1/1.0.0"
+published_date = "2026-07-26"
+description = "Bounded forward-only RDFS entailment profile."
+selected_terms = ["rdfs:subClassOf", "rdfs:subPropertyOf", "rdfs:domain", "rdfs:range"]
+imports = ["rdfs-20140225@1.0.0"]
+capabilities = ["reasoning-profile:rdfs-v1"]
+
+[resource.rdf-canon-20240521]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2024/REC-rdf-canon-20240521/"
+package_resource = "data/semantic/standards/rdf-canon-20240521.html"
+sha256 = "896d0a73c267135b6e6afb48ea98b65239eb77cd6e2ca8a01e079bcae240a8b1"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.w3.org/TR/2024/REC-rdf-canon-20240521/"
+published_date = "2024-05-21"
+description = "Optional RDF dataset canonicalization for signed or reproducible source digests."
+selected_terms = ["RDF Dataset Canonicalization"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["dataset-canonicalization:rdf-canon-20240521"]
+
+[resource.rdf12-cr-20260407]
+version = "0.1.0"
+namespace = "https://www.w3.org/TR/2026/CR-rdf12-concepts-20260407/"
+package_resource = "data/semantic/standards/rdf12-cr-20260407.html"
+sha256 = "11d4de7160a60a52fd08bd2cc873f48b7d4e2914d6b1d3d64b58832be4fbd75e"
+maturity = "experimental"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2026/CR-rdf12-concepts-20260407/"
+published_date = "2026-04-07"
+description = "Snapshot-pinned RDF 1.2 transport recognition only; it does not extend canonical terms."
+selected_terms = ["RDF 1.2 source syntax"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["rdf-profile:rdf12-cr-20260407-experimental"]
+
+[resource.rdf12-ntriples-wd-20260515]
+version = "0.1.0"
+namespace = "https://www.w3.org/TR/2026/WD-rdf12-n-triples-20260515/"
+package_resource = "data/semantic/standards/rdf12-ntriples-wd-20260515.html"
+sha256 = "4685007eee220450b298b75bc17a8154fa47778590d8ac30f67633d4827bd884"
+maturity = "experimental"
+kind = "transport-profile"
+uri = "https://www.w3.org/TR/2026/WD-rdf12-n-triples-20260515/"
+published_date = "2026-05-15"
+description = "Snapshot-pinned RDF 1.2 N-Triples transport recognition only."
+selected_terms = ["RDF 1.2 N-Triples"]
+imports = ["rdf12-cr-20260407@0.1.0"]
+capabilities = ["serialization:rdf12-ntriples-wd-20260515-experimental"]
+
+[resource.owl2rl-kestrel-v1]
+version = "1.0.0"
+namespace = "https://kestrel.ai/semantic/rules/owl2rl-kestrel-v1"
+package_resource = "data/semantic/rules/owl2rl-kestrel-v1.json"
+sha256 = "7401404fef7e4d8910e813cfb9710f62ab8491f0cf83cd3ac52c5ae8ed8a5c2f"
+maturity = "stable"
+kind = "rule-profile"
+uri = "https://kestrel.ai/semantic/rules/owl2rl-kestrel-v1/1.0.0"
+published_date = "2026-07-26"
+description = "Tightly allowlisted forward-only OWL 2 RL rules; imports, sameAs, and authorization effects are forbidden."
+selected_terms = ["owl:equivalentClass", "owl:equivalentProperty", "owl:inverseOf", "owl:TransitiveProperty", "owl:SymmetricProperty", "owl:propertyChainAxiom"]
+imports = ["rdfs-v1@1.0.0", "owl2-profiles-20121211@1.0.0"]
+capabilities = ["reasoning-profile:owl2rl-kestrel-v1"]
+
+[resource.owl2-profiles-20121211]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2012/REC-owl2-profiles-20121211/"
+package_resource = "data/semantic/standards/owl2-profiles-20121211.html"
+sha256 = "65edf030b736ed4f1f84d0b907b1d605d7820076bee261e4bcf8deea4bddaebb"
+maturity = "stable"
+kind = "standard-snapshot"
+uri = "https://www.w3.org/TR/2012/REC-owl2-profiles-20121211/"
+published_date = "2012-12-11"
+description = "Dated OWL 2 Profiles source for the explicitly bounded owl2rl-kestrel-v1 rule profile."
+selected_terms = ["OWL 2 RL"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["standard:owl2-profiles-20121211"]
+
+[resource.shacl-core-20170720]
+version = "1.0.0"
+namespace = "http://www.w3.org/ns/shacl#"
+package_resource = "data/semantic/standards/shacl-core-20170720.html"
+sha256 = "7c96c97cce81d154f72d267ec95695a002c3bf160f497996429e4afc0c94e791"
+maturity = "stable"
+kind = "validation-profile"
+uri = "https://www.w3.org/TR/2017/REC-shacl-20170720/"
+published_date = "2017-07-20"
+description = "Required SHACL Core validation baseline; results remain non-authorizing reports."
+selected_terms = ["sh:NodeShape", "sh:PropertyShape", "sh:targetClass", "sh:path", "sh:minCount", "sh:maxCount"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["validation-profile:shacl-core-20170720"]
+
+[resource.shacl12-core-20260602-experimental]
+version = "0.1.0"
+namespace = "https://www.w3.org/TR/2026/WD-shacl12-core-20260602/"
+package_resource = "data/semantic/standards/shacl12-core-20260602.html"
+sha256 = "970d74e57ea97cd4c87ce9fc5ad0b5ed10dea3436535f10ddfc4812cd4a95a51"
+maturity = "experimental"
+kind = "validation-profile"
+uri = "https://www.w3.org/TR/2026/WD-shacl12-core-20260602/"
+published_date = "2026-06-02"
+description = "Sandboxed, snapshot-pinned SHACL 1.2 Core experiment; never default acceptance."
+selected_terms = ["SHACL 1.2 Core"]
+imports = ["shacl-core-20170720@1.0.0"]
+capabilities = ["validation-profile:shacl12-core-20260602-experimental"]
+
+[resource.shacl12-sparql-20260130-experimental]
+version = "0.1.0"
+namespace = "https://www.w3.org/TR/2026/WD-shacl12-sparql-20260130/"
+package_resource = "data/semantic/standards/shacl12-sparql-20260130.html"
+sha256 = "345941fb4472d3b35e1802debb4339318f2481ab14a515c1226b3caf2b8a2df8"
+maturity = "experimental"
+kind = "validation-profile"
+uri = "https://www.w3.org/TR/2026/WD-shacl12-sparql-20260130/"
+published_date = "2026-01-30"
+description = "Sandboxed, snapshot-pinned SHACL 1.2 SPARQL extension experiment."
+selected_terms = ["SHACL 1.2 SPARQL extensions"]
+imports = ["shacl12-core-20260602-experimental@0.1.0"]
+capabilities = ["validation-profile:shacl12-sparql-20260130-experimental"]
+
+[resource.sparql11-readonly]
+version = "1.0.0"
+namespace = "https://www.w3.org/TR/2013/REC-sparql11-query-20130321/"
+package_resource = "data/semantic/standards/sparql11-query-20130321.html"
+sha256 = "e01e372d1f43edf7a300188d61e95caf9e30d4dbf5d531f8377d84d08b4d66d2"
+maturity = "stable"
+kind = "query-profile"
+uri = "https://www.w3.org/TR/2013/REC-sparql11-query-20130321/"
+published_date = "2013-03-21"
+description = "Optional read-only SPARQL 1.1 capability over a tenant-filtered semantic view."
+selected_terms = ["SPARQL 1.1 query"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["query-profile:sparql11-readonly"]
+
+[resource.sparql12-20260605-experimental]
+version = "0.1.0"
+namespace = "https://www.w3.org/TR/2026/WD-sparql12-query-20260605/"
+package_resource = "data/semantic/standards/sparql12-query-20260605.html"
+sha256 = "8e0fffb7f56ea6d9330c77daac9b61c835335eee728ce5ce5997f2eb2a2ab87b"
+maturity = "experimental"
+kind = "query-profile"
+uri = "https://www.w3.org/TR/2026/WD-sparql12-query-20260605/"
+published_date = "2026-06-05"
+description = "Budgeted opt-in SPARQL 1.2 read-only experiment; updates and network functions are forbidden."
+selected_terms = ["SPARQL 1.2 query"]
+imports = ["rdf12-cr-20260407@0.1.0"]
+capabilities = ["query-profile:sparql12-20260605-experimental"]
+
+[resource.skos-20090818]
+version = "1.0.0"
+namespace = "http://www.w3.org/2004/02/skos/core#"
+package_resource = "data/semantic/vocabularies/skos-20090818.ttl"
+sha256 = "abe5a3dd635682530a2ad79fd7f1d170634f3d1d0ae8aebfdbe12bb299eeee2a"
+maturity = "stable"
+kind = "ontology"
+uri = "https://www.w3.org/TR/2009/REC-skos-reference-20090818/"
+published_date = "2009-08-18"
+description = "Optional controlled concepts, labels, and mappings; labels never normalize identifiers."
+selected_terms = ["skos:Concept", "skos:prefLabel", "skos:altLabel", "skos:exactMatch", "skos:closeMatch"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["vocabulary:skos"]
+
+[resource.prov-o-20130430]
+version = "1.0.0"
+namespace = "http://www.w3.org/ns/prov#"
+package_resource = "data/semantic/vocabularies/prov-o-20130430.ttl"
+sha256 = "78715c21ae8f5480ea2a31648ee1c38be503d3abb422114cf9d6baca68fd9d23"
+maturity = "stable"
+kind = "ontology"
+uri = "https://www.w3.org/TR/2013/REC-prov-o-20130430/"
+published_date = "2013-04-30"
+description = "Optional RDF projection of source occurrences and derivation lineage, never a substitute for transactional lineage."
+selected_terms = ["prov:Entity", "prov:Activity", "prov:Agent", "prov:wasDerivedFrom", "prov:wasGeneratedBy", "prov:wasAttributedTo"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["vocabulary:prov-o"]
+
+[resource.owl-time-20171019]
+version = "1.0.0"
+namespace = "http://www.w3.org/2006/time#"
+package_resource = "data/semantic/vocabularies/owl-time-20171019.ttl"
+sha256 = "75ac519ddb7c42fdeabefa9c20ac655e1cfc8162e6df1a8e3a81b3ed846fb1d2"
+maturity = "stable"
+kind = "ontology"
+uri = "https://www.w3.org/TR/2017/REC-owl-time-20171019/"
+published_date = "2017-10-19"
+description = "Optional RDF projection of valid and observed temporal intervals using the dated Recommendation."
+selected_terms = ["time:TemporalEntity", "time:Interval", "time:Instant", "time:hasBeginning", "time:hasEnd"]
+imports = ["rdf11-concepts-20140225@1.0.0"]
+capabilities = ["vocabulary:owl-time"]
+
+[resource.kestrel-vocab]
+version = "1.0.0"
+namespace = "https://kestrel.ai/vocab/"
+package_resource = "data/semantic/ontologies/kestrel-vocab-1.0.0.ttl"
+sha256 = "db708b6790e5212bcbfd5040a1d7883da1161b05e73c809ee8d924c31b2a8044"
+maturity = "stable"
+kind = "ontology"
+uri = "https://kestrel.ai/vocab/1.0.0"
+published_date = "2026-07-26"
+description = "Versioned Kestrel ontology for assertions, revisions, source occurrences, confidence, and temporal projection; it grants no authority."
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:preferredDeployRegion"]
+imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
+capabilities = ["ontology:kestrel-vocab"]
+
+[resource.kestrel-vocab-1-1]
+# The TOML table name is version-qualified so two immutable releases of the
+# same logical ontology can coexist. `identifier` remains the durable logical
+# name used by imports and exact capability pins.
+identifier = "kestrel-vocab"
+version = "1.1.0"
+namespace = "https://kestrel.ai/vocab/"
+package_resource = "data/semantic/ontologies/kestrel-vocab-1.1.0.ttl"
+sha256 = "2d14444f4f42fd8beda98f8da5b052e44652a624755943a0a6e7927fef395ebb"
+maturity = "stable"
+kind = "ontology"
+uri = "https://kestrel.ai/vocab/1.1.0"
+published_date = "2026-07-26"
+description = "Versioned Kestrel ontology for the RDF assertion codec's lossless assertion, provenance, and temporal projection; it grants no authority."
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:projectedTenantId", "kestrel:lineagePosition"]
+imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
+capabilities = ["ontology:kestrel-vocab-1.1"]
+
+[resource.kestrel-assertion-shapes]
+version = "1.0.0"
+namespace = "https://kestrel.ai/shapes/"
+package_resource = "data/semantic/shapes/kestrel-assertions-1.0.0.ttl"
+sha256 = "639f9198b26d27801623a40da4101282e4f004da3b833fb899efbb826e1b6ca3"
+maturity = "stable"
+kind = "shape-set"
+uri = "https://kestrel.ai/shapes/1.0.0"
+published_date = "2026-07-26"
+description = "Pinned Kestrel assertion shape set for validation reports; shapes cannot authorize tools or policy decisions."
+selected_terms = ["kshape:AssertionRevisionShape", "sh:minCount"]
+imports = ["kestrel-vocab@1.0.0", "shacl-core-20170720@1.0.0"]
+capabilities = ["shape-set:kestrel-assertions"]
+
+[resource.kestrel-assertion-shapes-shacl12-experimental]
+version = "0.1.0"
+namespace = "https://kestrel.ai/shapes/experimental/shacl12/"
+package_resource = "data/semantic/shapes/kestrel-assertions-1.0.0.ttl"
+sha256 = "639f9198b26d27801623a40da4101282e4f004da3b833fb899efbb826e1b6ca3"
+maturity = "experimental"
+kind = "shape-set"
+uri = "https://kestrel.ai/shapes/experimental/shacl12/0.1.0"
+published_date = "2026-07-31"
+description = "Pinned Kestrel assertion shape-set experiment bound only to the selected SHACL 1.2 Core snapshot; it does not migrate canonical assertions."
+selected_terms = ["kshape:AssertionRevisionShape", "sh:minCount"]
+imports = ["kestrel-vocab@1.0.0", "shacl12-core-20260602-experimental@0.1.0"]
+capabilities = ["shape-set:kestrel-assertions-shacl12-experimental"]

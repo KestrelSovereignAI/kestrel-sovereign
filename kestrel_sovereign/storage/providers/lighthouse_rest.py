@@ -14,7 +14,7 @@ Lighthouse REST API reference:
 
 import logging
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 

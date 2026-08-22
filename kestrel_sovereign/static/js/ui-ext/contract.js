@@ -217,6 +217,56 @@
  */
 
 /**
+ * OPTIONAL per-panel view-state provider (#2802). A panel contribution declares
+ * one to have the framework persist its own view — active sub-tab, zoom/pan,
+ * scroll offset, drill/selection — across a body remount (tab switch that
+ * re-renders, a re-gate, a host destroy/remount) and a full page reload. It is
+ * the sanctioned replacement for a feature hand-rolling raw `localStorage`.
+ *
+ * Persistence goes through `ui_state.mjs` only. The FRAMEWORK composes the
+ * storage key as `kestrel:ui:panel:<panelId>:<key>`, so two panels cannot
+ * collide however they name their provider; `key` is a per-panel sub-namespace
+ * (default `'view'`). Keys are fleet-shared, NOT agent-scoped — a panel that
+ * genuinely wants per-agent state folds the agent id into its own `key`.
+ *
+ * Lifecycle, all handled by `panels.js`:
+ *   - `getState()` is called when the panel stops being the source of truth —
+ *     the registry activates a different panel, the panel's gate closes, the
+ *     contribution is re-registered/unregistered, or the page unloads
+ *     (`pagehide` / `visibilitychange`→hidden). Returning `undefined` writes
+ *     nothing, so "not ready yet" never clobbers a good stored value.
+ *   - `setState(state)` is called once per mount, right after the panel's
+ *     `render`. A missing key, a corrupt stored value, or an unavailable
+ *     `localStorage` means `setState` is simply NOT called and the panel keeps
+ *     its own default. Neither callback may break activation: a throw is logged
+ *     and isolated.
+ *
+ * @typedef {Object} PanelViewStateProvider
+ * @property {string}  [key='view'] - sub-namespace within this panel's keyspace.
+ * @property {() => any} getState   - serializable snapshot; `undefined` = skip.
+ * @property {(state: any) => void} setState - reapply a previously stored snapshot.
+ */
+
+/**
+ * A whole nav-tab panel contribution — the argument to `panels.js`
+ * `registerPanel`. Distinct from the positional {@link UIContribution} zones
+ * above: this contract owns the `nav-tabs` + `panel-root` id-space pair.
+ *
+ * @typedef {Object} PanelContribution
+ * @property {string}   panelId    - stable id; the panel DOM is `#panel-<panelId>`.
+ * @property {string}  [label]     - nav tab text.
+ * @property {string}  [labelKey]  - i18n key driving label re-hydration.
+ * @property {string}  [icon]      - icon class for the nav tab.
+ * @property {string}  [before]    - insert this tab before the named panel's tab.
+ * @property {(ctx: SlotContext) => boolean} [gate]
+ *           - capability gate; a gated-off panel shows no tab and drops its body.
+ * @property {(bodyEl: HTMLElement, ctx: SlotContext & {panelId: string}) => void} [render]
+ *           - lazily invoked ONCE per mount, on the panel's first activation.
+ * @property {PanelViewStateProvider} [viewState]
+ *           - optional; persist/restore this panel's own view state (#2802).
+ */
+
+/**
  * The registry surface ticket 02 exposes (documented here so contributions
  * and core call sites share one shape). NOT implemented in this file.
  *

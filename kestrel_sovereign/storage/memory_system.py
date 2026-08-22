@@ -23,7 +23,9 @@ Usage:
     # Background maintenance:
     report = await memory.consolidate()
 """
+import asyncio
 import logging
+import math
 from typing import Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
@@ -38,6 +40,54 @@ from .async_storage import AsyncStorage
 from kestrel_sovereign.config import load_section
 
 logger = logging.getLogger(__name__)
+
+
+# Consolidation walks the active memory corpus and may backfill provider
+# embeddings, so allow substantially more time than an ordinary recall while
+# still bounding the single maintenance chokepoint.
+DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS = 30 * 60.0
+
+
+class MemoryConsolidationTimeoutError(TimeoutError):
+    """The configured consolidation deadline expired.
+
+    Distinct from provider/socket ``TimeoutError`` exceptions raised by work
+    inside consolidation. Callers may translate this deadline breach without
+    misreporting an unrelated I/O timeout as the global maintenance bound.
+    """
+
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            "Memory consolidation exceeded its configured deadline of "
+            f"{timeout_seconds:g} seconds; the pass was abandoned and "
+            "in-flight database work may still be draining"
+        )
+
+
+def _positive_timeout_seconds(
+    config: Dict[str, Any], key: str, default: float
+) -> float:
+    """Validate a positive finite timeout from the retrieval config."""
+    timeout = config.get(key, default)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+    ):
+        raise ValueError(f"retrieval.{key} must be positive")
+    return float(timeout)
+
+
+def _consolidation_timeout_seconds() -> float:
+    """Load and validate the global memory-consolidation deadline."""
+    config = load_section("retrieval") or {}
+    return _positive_timeout_seconds(
+        config,
+        "memory_consolidation_timeout_seconds",
+        DEFAULT_CONSOLIDATION_TIMEOUT_SECONDS,
+    )
 
 
 def _answerability_settings() -> tuple[bool, float, Optional[str]]:
@@ -85,6 +135,7 @@ class MemorySystem:
         agent_id: str,
         enable_spacy: bool = False,
         privacy_storage=None,
+        transition_lock=None,
     ):
         """
         Initialize the memory system.
@@ -102,10 +153,16 @@ class MemorySystem:
                 manual / scheduled consolidation cannot leak user-derived memory
                 into durable storage in a volatile privacy mode (#2672). ``None``
                 (raw storage, tests) leaves writes ungoverned, as before.
+            transition_lock: The agent's privacy-transition mutex, forwarded to
+                the consolidator so episode repair holds it across its
+                mode check and its durable writes (#2856). ``None`` runs
+                unguarded.
         """
         self.storage = storage
         self.agent_id = agent_id
         self._privacy_storage = privacy_storage
+        # Components are built in initialize(), so this has to survive __init__.
+        self._transition_lock = transition_lock
 
         # Initialize components
         self.tagger = EmotionalTagger(use_spacy=enable_spacy)
@@ -171,6 +228,14 @@ class MemorySystem:
             # manual / scheduled consolidation can't persist user-derived
             # episodes in a volatile mode (#2672).
             persist_policy=self._privacy_storage,
+            # #2850: the consolidator reads conversation_history with its own
+            # SQL, so it needs the store that owns decryption — without it the
+            # at-rest envelope was tokenized straight into episode topics.
+            conversation_store=self.storage.conversation,
+            # #2856: repair checks the privacy mode then awaits decryption and
+            # several writes; the lock keeps a transition from landing in that
+            # gap.
+            transition_lock=self._transition_lock,
         )
 
         # Schema-aware routing: promote extracted structure (action items,
@@ -541,23 +606,50 @@ class MemorySystem:
 
         Returns:
             Report dict with counts of each operation
+
+        Raises:
+            MemoryConsolidationTimeoutError: The configured consolidation and
+                forgetting deadline expired. Cancellation abandons the
+                coroutine, but an aiosqlite worker statement may still drain.
         """
         if not self.consolidator:
             logger.warning("Memory consolidator not initialized")
             return {"error": "Consolidator not initialized"}
 
-        report = dict(await self.consolidator.run_consolidation() or {})
-        # Only ride a SUCCESSFUL pass: run_consolidation reports many internal
-        # failures as {"error": ...} instead of raising, and destructive
-        # forgetting must never follow a failed/partial consolidation. A
-        # privacy-skipped pass (volatile mode, #2672) likewise short-circuits the
-        # forgetting tier — the whole durable path is gated, not just the writes.
-        report["episodes_deleted"] = (
-            0
-            if ("error" in report or report.get("skipped"))
-            else await self._forget_decayed_episodes()
-        )
-        return report
+        timeout_seconds = _consolidation_timeout_seconds()
+        deadline: Optional[asyncio.Timeout] = None
+        try:
+            # Keep the deadline at this single chokepoint so the nightly sleep
+            # cycle and every tool caller inherit identical bounds. This
+            # timeout cancels the current task; it does not create a child task
+            # that could outlive task-owned ResourceLock.MEMORY.
+            async with asyncio.timeout(timeout_seconds) as deadline:
+                report = dict(await self.consolidator.run_consolidation() or {})
+                # Only ride a SUCCESSFUL pass: run_consolidation reports many
+                # internal failures as {"error": ...} instead of raising, and
+                # destructive forgetting must never follow a failed/partial
+                # consolidation. A privacy-skipped pass (volatile mode, #2672)
+                # likewise short-circuits the forgetting tier — the whole
+                # durable path is gated, not just the writes.
+                report["episodes_deleted"] = (
+                    0
+                    if ("error" in report or report.get("skipped"))
+                    else await self._forget_decayed_episodes()
+                )
+                return report
+        except TimeoutError as exc:
+            if deadline is None or not deadline.expired():
+                raise
+            # Coroutine cancellation cannot interrupt an aiosqlite statement
+            # already executing in its worker thread. Be explicit that the
+            # maintenance pass is abandoned even though database work may
+            # still be draining after the caller's lock context unwinds.
+            logger.error(
+                "Memory consolidation timed out after %gs; the pass was "
+                "abandoned and in-flight database work may still be draining",
+                timeout_seconds,
+            )
+            raise MemoryConsolidationTimeoutError(timeout_seconds) from exc
 
     async def _forget_decayed_episodes(self) -> int:
         """Deletion tier of the forgetting curve (#1674).

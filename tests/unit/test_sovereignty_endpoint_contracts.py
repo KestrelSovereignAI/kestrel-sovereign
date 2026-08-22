@@ -160,6 +160,80 @@ def test_sovereignty_export_returns_402_on_insufficient_funds():
         _restore_app(app, original)
 
 
+def test_sovereignty_export_typed_refusal_returns_4xx_not_500():
+    """A pre-flight refusal is a caller/host conflict, not a server fault.
+
+    Before #2918 the endpoint mapped every non-wallet ERROR envelope to 500 by
+    substring-matching ``Insufficient funds``, so a caller asking for something
+    this host cannot honour (``encrypt=True`` with no ``KESTREL_DATA_KEY``)
+    could not tell "I asked for something impossible" from "the server broke".
+    The feature now carries a typed ``data["refusal"]`` code and the endpoint
+    maps it: 409 for the unsatisfiable host configuration, 402 for the wallet.
+    """
+    from kestrel_sdk.tools.result import ToolResult
+    from kestrel_sovereign.features.sovereignty.feature import (
+        REFUSAL_ENCRYPTION_KEY_UNAVAILABLE,
+        REFUSAL_INSUFFICIENT_FUNDS,
+    )
+
+    cases = [
+        (REFUSAL_ENCRYPTION_KEY_UNAVAILABLE, "encrypt=True requires KESTREL_DATA_KEY", 409),
+        (REFUSAL_INSUFFICIENT_FUNDS, "Insufficient funds for backup.", 402),
+    ]
+
+    for refusal, message, expected_status in cases:
+        sovereignty_feature = MagicMock()
+        sovereignty_feature.export_sovereignty = AsyncMock(
+            return_value=ToolResult.failed(error=message, data={"refusal": refusal})
+        )
+        agent = MagicMock(
+            storage=MagicMock(),
+            features={"SovereigntyFeature": sovereignty_feature},
+        )
+
+        app, original = _prepare_app(agent)
+        try:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/api/sovereignty/export",
+                        headers={"X-API-Key": "test-key"},
+                        json={"tier": "local", "encrypt": True},
+                    )
+            assert response.status_code == expected_status, refusal
+            assert message in response.json()["detail"]
+        finally:
+            _restore_app(app, original)
+
+
+def test_sovereignty_export_unrecognized_error_still_returns_500():
+    """A genuine fault (no refusal code, no wallet message) stays a 500."""
+    from kestrel_sdk.tools.result import ToolResult
+
+    sovereignty_feature = MagicMock()
+    sovereignty_feature.export_sovereignty = AsyncMock(
+        return_value=ToolResult.failed(error="provider exploded")
+    )
+    agent = MagicMock(
+        storage=MagicMock(),
+        features={"SovereigntyFeature": sovereignty_feature},
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/export",
+                    headers={"X-API-Key": "test-key"},
+                    json={"tier": "local"},
+                )
+        assert response.status_code == 500
+        assert "provider exploded" in response.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
 def test_sovereignty_export_partial_returns_200_with_caveat():
     """PARTIAL envelope (e.g. backup hashed but not pushed) must remain HTTP 200.
 
@@ -213,6 +287,34 @@ def test_sovereignty_import_rejects_invalid_cid():
                 )
         assert response.status_code == 400
         assert "Invalid CID format" in response.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_sovereignty_import_uses_shared_request_identity_for_agent_command():
+    """Every HTTP route that invokes the agent uses the retry/provenance seam."""
+    agent = MagicMock(storage=MagicMock())
+    agent.process_input = AsyncMock(return_value="imported")
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/sovereignty/import",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "sovereignty-retry-2765",
+                    },
+                    json={"cid": "bafyvalidcid2765"},
+                )
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] == "sovereignty-retry-2765"
+        _, kwargs = agent.process_input.await_args
+        assert kwargs["invocation_id"] == "sovereignty-retry-2765"
+        assert (
+            kwargs["invocation_provenance"].source_locator
+            == "POST:/api/sovereignty/import"
+        )
     finally:
         _restore_app(app, original)
 

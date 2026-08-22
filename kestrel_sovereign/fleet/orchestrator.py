@@ -12,14 +12,14 @@ Why a governed child, not a bare host agent
 The Fleet Orchestrator needs three narrowings that the coarse ``multi_agent.toml``
 ``features`` allowlist alone cannot express:
 
-1. **A feature ceiling** — it may load only the workflows / talon / GitHub /
-   reflection features, never a file/shell/computer-use feature. This is the
+1. **A feature ceiling** — it may load only the workflows / GitHub / scheduler /
+   reflection / memory features, never a coding, file, shell, or computer-use
+   feature. This is the
    ``features`` allowlist (feature-class granularity) — see
    :data:`FEATURE_ALLOWLIST`.
 2. **An intra-feature tool deny-list** — the ceiling features bundle read tools
-   *and* mutating tools in one class each: ``TalonCoordinatorFeature`` mixes
-   reads (``talon_status`` …) with dispatch tools (``talon_claim`` …);
-   ``WorkflowsFeature`` mixes ``workflow_run`` with mutating tools
+   *and* mutating tools in one class each: ``WorkflowsFeature`` mixes
+   ``workflow_run`` with mutating tools
    (``workflow_cancel`` …); ``GitHubFeature`` mixes reads with issue/PR writes;
    ``SchedulerFeature`` mixes status reads with cron-mutating tools
    (``schedule_add`` …); ``MemoryFeature`` mixes recall/search reads with
@@ -86,14 +86,17 @@ onto a host:
    ``schedule_add`` so it surfaces on ``/agent/reflection/status`` (the
    kestrel-claws Signals tab).
 
-Attribution contract (#2302): the friendly name ``Fleet Orchestrator`` is what
-the talon coordinator stamps as ``KESTREL_OBSERVABILITY_ORCHESTRATOR`` on every
-dispatch it drives (via ``fleet_coding_pipeline``). Do not rename the agent.
+Attribution contract (#2302): the friendly name ``Fleet Orchestrator`` is the
+orchestrator identity carried by every ``fleet_coding_pipeline`` run. Do not
+rename the agent.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import importlib
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from kestrel_sovereign.workflow_features import resolve_workflow_feature
 
 # Friendly name (rendered in /api/agents and stamped as the observability
 # orchestrator — #2302) and the multi-agent routing slug.
@@ -102,6 +105,41 @@ FLEET_ORCHESTRATOR_SLUG = "fleet-orchestrator"
 
 # The consent scope its dispatches gate on (mirrors fleet_coding_pipeline).
 CONSENT_SCOPE = "fleet_coding_pipeline_dispatch"
+FLEET_CODING_WORKFLOW_NAME = "fleet_coding_pipeline"
+
+
+def registered_tool_names(feature_cls: Any) -> frozenset[str]:
+    """Enumerate the ``@tool`` names a Feature class actually registers."""
+
+    names = set()
+    for attr in dir(feature_cls):
+        try:
+            member = getattr(feature_cls, attr)
+        except Exception:  # noqa: BLE001 — skip descriptors that error on access
+            continue
+        schema = getattr(member, "_tool_schema", None)
+        if isinstance(schema, dict) and schema.get("name"):
+            names.add(schema["name"])
+    return frozenset(names)
+
+
+def mandatory_feature_tool_names() -> frozenset[str]:
+    """Derive the tool floor provided by every mandatory core Feature.
+
+    Feature ceilings never suppress the mandatory sovereignty foundation, so a
+    positive tool ceiling must not suppress it either. The canonical class to
+    module mapping is shared with feature discovery; adding a new mandatory
+    Feature automatically brings its registered tools into this floor.
+    """
+
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURE_MODULES
+
+    names: set[str] = set()
+    for class_name, module_path in MANDATORY_FEATURE_MODULES.items():
+        module = importlib.import_module(module_path)
+        feature_class = getattr(module, class_name)
+        names.update(registered_tool_names(feature_class))
+    return frozenset(names)
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +154,32 @@ CONSENT_SCOPE = "fleet_coding_pipeline_dispatch"
 FEATURE_ALLOWLIST = frozenset(
     {
         "WorkflowsFeature",       # workflow_run + read tools (the dispatch surface)
-        "TalonCoordinatorFeature",  # talon READ tools (dispatch tools denied below)
         "GitHubFeature",          # GitHub read (list_issues / list_prs / get_repo_info)
         "SchedulerFeature",       # schedule_add + /agent/reflection/status surface
         "ReflectionFeature",      # the `reflect` triage-sweep task
         "MemoryFeature",          # reflection rides the sleep/consolidation cycle
     }
 )
+
+
+def effective_feature_allowlist(
+    *, entry_points: Optional[Iterable[Any]] = None
+) -> frozenset[str]:
+    """Return the persisted ceiling including the installed workflow owner.
+
+    The coding-workflow provider is an independently installed feature.  Its
+    class name is resolved from entry-point metadata rather than named in core,
+    so extracting or replacing that provider cannot leave the orchestrator with
+    a persisted ceiling that excludes the feature needed to run its only
+    permitted workflow.  Missing, duplicate, or cross-distribution claims fail
+    closed in :func:`resolve_workflow_feature`.
+    """
+
+    workflow_provider = resolve_workflow_feature(
+        FLEET_CODING_WORKFLOW_NAME,
+        entry_points=entry_points,
+    )
+    return frozenset((*FEATURE_ALLOWLIST, workflow_provider))
 
 # Where each ceiling feature class is imported from — the source of truth for the
 # derived deny-list audit (test_fleet_orchestrator_definition). Every ceiling
@@ -133,10 +190,6 @@ FEATURE_ALLOWLIST = frozenset(
 # skipped by the audit when not installed (they are covered wherever installed).
 FEATURE_TOOL_MODULES: Dict[str, Tuple[str, str]] = {
     "WorkflowsFeature": ("kestrel_feature_workflows", "WorkflowsFeature"),
-    "TalonCoordinatorFeature": (
-        "kestrel_sovereign.features.talon.coordinator",
-        "TalonCoordinatorFeature",
-    ),
     "GitHubFeature": ("kestrel_feature_github", "GitHubFeature"),
     "SchedulerFeature": (
         "kestrel_sovereign.features.scheduler.feature",
@@ -171,19 +224,6 @@ WORKFLOW_TOOLS = frozenset(
         "workflow_list_definitions",
         "workflow_list_builtin",
         "workflow_load_builtin",
-    }
-)
-
-# Talon coordinator READ tools only (verified against features/talon/coordinator.py):
-# status / logs / workspace / config / health / discovery scan. No claim/dispatch.
-TALON_READ_TOOLS = frozenset(
-    {
-        "talon_status",
-        "talon_job_log",
-        "talon_workspace_status",
-        "talon_get_config",
-        "talon_health",
-        "scan_stale_work",
     }
 )
 
@@ -253,41 +293,38 @@ REFLECTION_READ_TOOLS = frozenset(
     }
 )
 
+MANDATORY_TOOL_ALLOWLIST = mandatory_feature_tool_names()
+
+# Mandatory Features always load, but a handful of their tools would violate
+# the Fleet Orchestrator's narrower behavioral boundary. Identity import/export
+# mutates or publishes sovereign state; Security decisions change permission or
+# approval state; send_a2a_task is a second direct work-dispatch lane. Keep the
+# read, wait, and escalation surfaces while explicitly denying these mutations.
+# These names are stable core tool contracts, not extension-provider coupling.
+MANDATORY_MUTATION_TOOLS = frozenset(
+    {
+        "approve",
+        "deny",
+        "export_identity",
+        "import_identity",
+        "send_a2a_task",
+        "set_permission",
+    }
+)
+
 TOOL_ALLOWLIST = (
     WORKFLOW_TOOLS
-    | TALON_READ_TOOLS
     | GITHUB_READ_TOOLS
     | SCHEDULER_READ_TOOLS
     | MEMORY_READ_TOOLS
     | REFLECTION_READ_TOOLS
+    | MANDATORY_TOOL_ALLOWLIST
 )
 
 
 # ---------------------------------------------------------------------------
 # Tool deny-list (hard PRE_TOOL_USE denial via MandateRestrictionHook, #2137).
 # ---------------------------------------------------------------------------
-# Talon dispatch / write tools — the orchestrator never claims or dispatches
-# directly; it commissions all code changes through fleet_coding_pipeline.
-# ``talon_github_write`` (#2581) is the coordinator's bounded GitHub issue-write
-# job (close/reopen/comment/label/update): a mutation that pushes state back to
-# GitHub, so it belongs in the denied set — the orchestrator reads fleet repos
-# but never mutates them directly; issue lifecycle writes flow through the
-# fleet_coding_pipeline run, not a direct orchestrator call.
-TALON_DISPATCH_TOOLS = frozenset(
-    {
-        "talon_claim",
-        "talon_file_and_claim",
-        "talon_batch",
-        "talon_set_config",
-        "talon_verify",
-        "talon_setup_workspace",
-        "talon_schedule_work_rescue",
-        "talon_github_write",
-        "talon_pause",
-        "talon_resume",
-    }
-)
-
 # Workflow mutation tools beyond run/load/read — the orchestrator only *starts*
 # and *observes* runs; it does not cancel/abort/pause/resume/redefine them.
 WORKFLOW_MUTATION_TOOLS = frozenset(
@@ -326,14 +363,15 @@ GITHUB_WRITE_TOOLS = frozenset(
 # Scheduler mutation tools (verified against features/scheduler/feature.py @tool
 # names). SchedulerFeature is in the ceiling for the read/status surface
 # (schedule_list / schedule_history / schedule_engagement, which feed the
-# kestrel-claws Signals tab), but its cron-mutating tools would let the agent
-# create/alter scheduled tasks — including built-in signal sources — so they are
-# hard-denied. The `reflect` triage sweep (REFLECTION_SCHEDULE) is seeded by the
-# operator at materialization time, not by the agent, so denying schedule_add
-# here does not block it.
+# kestrel-claws Signals tab), but its schedule-mutating tools would let the
+# agent create/alter recurring or one-shot scheduled tasks — including built-in
+# signal sources — so they are hard-denied. The `reflect` triage sweep
+# (REFLECTION_SCHEDULE) is seeded by the operator at materialization time, not
+# by the agent, so denying schedule_add here does not block it.
 SCHEDULER_MUTATION_TOOLS = frozenset(
     {
         "schedule_add",
+        "schedule_add_deadline",
         "schedule_remove",
         "schedule_pause",
         "schedule_resume",
@@ -397,13 +435,13 @@ REFLECTION_MUTATION_TOOLS = frozenset(
 )
 
 RESTRICTED_TOOLS = (
-    TALON_DISPATCH_TOOLS
-    | WORKFLOW_MUTATION_TOOLS
+    WORKFLOW_MUTATION_TOOLS
     | GITHUB_WRITE_TOOLS
     | SCHEDULER_MUTATION_TOOLS
     | MEMORY_MUTATION_TOOLS
     | REFLECTION_MUTATION_TOOLS
     | WRITE_EDIT_FILE_TOOLS
+    | MANDATORY_MUTATION_TOOLS
 )
 
 
@@ -437,13 +475,12 @@ BEHAVIORAL_RULES: List[str] = [
         "files, or repository state directly."
     ),
     (
-        "Never invoke talon claim/dispatch tools (`talon_claim`, "
-        "`talon_file_and_claim`, `talon_batch`, …), GitHub write tools "
-        "(`create_github_issue`, `merge_github_pull_request`, …), scheduler "
+        "Never invoke GitHub write tools (`create_github_issue`, "
+        "`merge_github_pull_request`, …), scheduler "
         "mutation tools (`schedule_add`, `schedule_remove`, …), or any "
         "code-editing, filesystem, or shell tool directly. Commission every "
         "code change through the `fleet_coding_pipeline` workflow, which routes "
-        "the actual run through the coordinator's audited dispatch seam. "
+        "the actual run through the feature-owned audited dispatch seam. "
         "`workflow_run` may only start `fleet_coding_pipeline`, never any other "
         "workflow."
     ),
@@ -461,7 +498,7 @@ BEHAVIORAL_RULES: List[str] = [
     ),
     (
         "On each periodic triage sweep, survey the assigned fleet repositories "
-        "(GitHub read + talon read tools), identify actionable issues, and PLAN "
+        "with GitHub read tools, identify actionable issues, and PLAN "
         "`fleet_coding_pipeline` runs parked on the consent gate. Detected work "
         "is observational: never auto-dispatch it. For an on-demand directive "
         "(\"process milestone/label X\"), plan the corresponding "
@@ -496,6 +533,7 @@ def additional_constraints() -> Dict[str, Any]:
     accepts them.
     """
     return {
+        "allowed_tools": sorted(TOOL_ALLOWLIST),
         "behavioral_rules": list(BEHAVIORAL_RULES),
         "restricted_tools": sorted(RESTRICTED_TOOLS),
         "restricted_tool_args": {
@@ -503,26 +541,6 @@ def additional_constraints() -> Dict[str, Any]:
             for tool, spec in RESTRICTED_TOOL_ARGS.items()
         },
     }
-
-
-def registered_tool_names(feature_cls: Any) -> frozenset:
-    """Enumerate the @tool names a :class:`Feature` class actually registers.
-
-    Reads the ``_tool_schema["name"]`` the SDK ``@tool`` decorator stamps on each
-    decorated method (no instantiation required), so it reflects the tool names
-    the feature *actually* loads at runtime — the enumeration the derived-deny
-    audit reconciles against the allow/deny classification.
-    """
-    names = set()
-    for attr in dir(feature_cls):
-        try:
-            member = getattr(feature_cls, attr)
-        except Exception:  # noqa: BLE001 — skip descriptors that error on access
-            continue
-        schema = getattr(member, "_tool_schema", None)
-        if isinstance(schema, dict) and schema.get("name"):
-            names.add(schema["name"])
-    return frozenset(names)
 
 
 def unclassified_tool_names(feature_cls: Any) -> frozenset:
@@ -567,6 +585,7 @@ def build_spawn_mandate(
     child_did: Optional[str] = None,
     *,
     ttl_seconds: int = 365 * 24 * 3600,
+    entry_points: Optional[Iterable[Any]] = None,
 ):
     """Build the Fleet Orchestrator's :class:`SpawnMandate` (unsigned).
 
@@ -581,11 +600,12 @@ def build_spawn_mandate(
     """
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
+    feature_ceiling = effective_feature_allowlist(entry_points=entry_points)
     return SpawnMandate(
         parent_did=parent_did,
         child_did=child_did,
         additional_constraints=additional_constraints(),
-        features_allowed=sorted(FEATURE_ALLOWLIST),
+        features_allowed=sorted(feature_ceiling),
         purpose=FLEET_ORCHESTRATOR_NAME,
         ttl_seconds=ttl_seconds,
     )
@@ -594,6 +614,8 @@ def build_spawn_mandate(
 def build_scoped_constitution(
     base_constitution: str = "",
     parent_features: Optional[set] = None,
+    *,
+    entry_points: Optional[Iterable[Any]] = None,
 ):
     """Build the :class:`ScopedConstitution` wrapping ``base_constitution``.
 
@@ -603,22 +625,25 @@ def build_scoped_constitution(
     """
     from kestrel_sovereign.spawn.scoped_constitution import ScopedConstitution
 
+    feature_ceiling = effective_feature_allowlist(entry_points=entry_points)
     return ScopedConstitution(
         base_constitution=base_constitution,
         additional_constraints=additional_constraints(),
-        features_allowed=sorted(FEATURE_ALLOWLIST),
+        features_allowed=sorted(feature_ceiling),
         parent_features=set(parent_features) if parent_features else set(),
     )
 
 
-def constitution_text() -> str:
+def constitution_text(*, entry_points: Optional[Iterable[Any]] = None) -> str:
     """The governing constitution block (behavioral rules + restricted tools).
 
     Renders the ``--- SPAWN MANDATE CONSTRAINTS ---`` section only (no base
     constitution), the same text ``render_mandate_constitution_block`` surfaces
     into the orchestrator's governing constitution at prompt-build time (#2225).
     """
-    return build_scoped_constitution().constraints_section()
+    return build_scoped_constitution(
+        entry_points=entry_points
+    ).constraints_section()
 
 
 def build_restriction_hook():
@@ -632,6 +657,7 @@ def build_restriction_hook():
 
     return MandateRestrictionHook(
         sorted(RESTRICTED_TOOLS),
+        allowed_tools=sorted(TOOL_ALLOWLIST),
         restricted_tool_args={
             tool: {arg: list(values) for arg, values in spec.items()}
             for tool, spec in RESTRICTED_TOOL_ARGS.items()
@@ -644,6 +670,7 @@ def build_local_agent_config(
     port: int,
     *,
     autostart: bool = True,
+    entry_points: Optional[Iterable[Any]] = None,
 ):
     """Build the ``multi_agent.toml`` entry (:class:`LocalAgentConfig`).
 
@@ -654,9 +681,10 @@ def build_local_agent_config(
     """
     from kestrel_sovereign.multi_agent.config import LocalAgentConfig
 
+    feature_ceiling = effective_feature_allowlist(entry_points=entry_points)
     return LocalAgentConfig(
         data_dir=data_dir,
         port=port,
         autostart=autostart,
-        features=sorted(FEATURE_ALLOWLIST),
+        features=sorted(feature_ceiling),
     )

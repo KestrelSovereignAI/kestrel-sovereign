@@ -9,10 +9,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-25T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -250,6 +250,30 @@ Nothing in routing code hardcodes vendor or model names. The `_filter_providers_
 
 ---
 
+## Context payload boundary
+
+The LLM service owns route resolution and provider transformation; it does not
+own conversation selection, retrieval policy, or pruning. The canonical
+current contract for those stages is
+[Kestrel Context Management Contract](CONTEXT_SYSTEM_DESIGN.md).
+
+Before an LLM call, the selected route-qualified model identity is passed into
+context budgeting. A route cap can therefore constrain the input window even
+when the underlying model advertises a larger limit. Context assembly produces
+generic messages and tool schemas; the selected adapter then maps those inputs
+to provider-native system fields, roles, content blocks, cache controls, and
+stateful-thread semantics.
+
+This boundary is especially visible on `openai:plan`: Kestrel budgets and
+selects a turn payload, while Codex retains a separate server-side thread.
+Per-turn context projection and server thread occupancy are distinct
+measurements. `/api/agent/context-status` can report both when data is
+available. Its full dry-run is byte/token-equivalent to Kestrel's production
+context plan, but it is not a provider-payload receipt: provider framing and
+the stateful server-side thread remain outside that plan.
+
+---
+
 ## API surface
 
 | Endpoint | Returns / accepts |
@@ -309,8 +333,10 @@ Current execution truth as of 2026-05-31:
   Ollama-backed `EmbeddingService`, but saved-items and RAG now use
   `ProviderEmbeddingService` through `LLMService.get_embedding_service()`.
 - OpenAI, Google/Gemini, Vertex, and Ollama advertise embedding capability in
-  tree. Anthropic and OpenRouter do not; storage falls back to keyword/BM25/LIKE
-  search rather than silently using an unrelated embedding service.
+  tree. Anthropic does not. OpenRouter is disabled by default and advertises
+  embeddings only when its route explicitly configures `embedding_model` and
+  `embedding_dim`; otherwise storage falls back to keyword/BM25/LIKE search
+  rather than silently using an unrelated embedding service.
 - RAG and saved-item vector search consume embeddings through storage/vector
   backends once embeddings are written.
 - `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
@@ -368,6 +394,9 @@ New hits in service / adapter / endpoint code fail review.
 
 ## Related architecture docs
 
+- **[CONTEXT_SYSTEM_DESIGN.md](CONTEXT_SYSTEM_DESIGN.md)** — canonical
+  current-state context contract from conversation persistence through
+  budgeting, retrieval, pruning, provider rendering, and diagnostics.
 - **[llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md)** — adapter contract surface for third-party plugin authors. The `kestrel-sovereign-sdk` boundary, marker emission rules, conformance helpers.
 - **[llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md)** — streaming honesty enforcement: `ToolCallStarted` markers, in-band revise sentinel on `/api/agent/stream`, parallel SSE backup, deterministic narration check in the audit hook. Closes [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042).
 

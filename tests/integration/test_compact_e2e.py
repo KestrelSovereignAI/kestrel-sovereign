@@ -31,6 +31,7 @@ async def agent_with_messages(temp_dir):
     mock_llm = MagicMock()
     mock_llm.generate = AsyncMock(return_value="Summary: The user and assistant discussed various topics including greetings, preferences, and project details.")
     mock_llm.get_default_model = MagicMock(return_value="gpt-4")
+    mock_llm.close = AsyncMock()
 
     agent = KestrelAgent(
         did="did:test:compact-test-agent",
@@ -52,11 +53,22 @@ async def agent_with_messages(temp_dir):
                 content=f"Assistant response {i}: I understand and acknowledge test message {i}."
             )
 
-    yield agent
+    scheduler = agent.features.get("SchedulerFeature")
+    runner = getattr(scheduler, "_runner", None)
+    connection = getattr(agent._raw_storage.db.backend, "_connection", None)
+    sqlite_worker = getattr(connection, "_thread", connection)
+    try:
+        yield agent
+    finally:
+        await agent.shutdown()
 
-    # Cleanup
-    if hasattr(agent, 'storage') and agent.storage:
-        await agent.storage.close()
+    assert runner is None or (
+        runner._task is None
+        and runner._worker_task is None
+        and runner._telemetry_task is None
+    )
+    is_alive = getattr(sqlite_worker, "is_alive", None)
+    assert not callable(is_alive) or not is_alive()
 
 
 @pytest_asyncio.fixture
@@ -67,6 +79,7 @@ async def agent_with_few_messages(temp_dir):
     mock_llm = MagicMock()
     mock_llm.generate = AsyncMock(return_value="Brief summary")
     mock_llm.get_default_model = MagicMock(return_value="gpt-4")
+    mock_llm.close = AsyncMock()
 
     agent = KestrelAgent(
         did="did:test:compact-test-small",
@@ -84,10 +97,10 @@ async def agent_with_few_messages(temp_dir):
                 content=f"Short message {i}"
             )
 
-    yield agent
-
-    if hasattr(agent, 'storage') and agent.storage:
-        await agent.storage.close()
+    try:
+        yield agent
+    finally:
+        await agent.shutdown()
 
 
 class TestCompactCommand:

@@ -9,7 +9,7 @@ External packages can register search providers via entry_points::
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 
 class SearchProvider(ABC):

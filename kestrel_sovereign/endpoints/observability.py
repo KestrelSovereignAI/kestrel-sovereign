@@ -44,7 +44,6 @@ async def get_observability_summary(
         type_counts = {}
         error_count = 0
         errors = []
-        tool_call_count = 0
         avg_duration_ms = 0
         durations = []
         # Break metrics out by name so otherwise-"dark" forensic metrics

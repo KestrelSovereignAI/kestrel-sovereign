@@ -104,8 +104,8 @@
       "missing_links": [],
       "path": "docs/architecture/AGENT_IDENTITY_CONTRACT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Agent Identity Contract",
       "type": "Architecture Spec"
     },
@@ -114,7 +114,6 @@
         "kestrel_sovereign/features/security/approval_queue.py",
         "kestrel_sovereign/features/security/hooks.py",
         "kestrel_sovereign/features/security/permissions.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
         "kestrel_sovereign/llm/codex_adapter.py",
         "kestrel_sovereign/llm/codex_app_server.py",
         "kestrel_sovereign/security/auto_approve.py"
@@ -136,8 +135,8 @@
       "missing_links": [],
       "path": "docs/architecture/COMPUTE_FEATURE_DESIGN.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel Compute Feature - Architecture Design",
       "type": "Architecture Spec"
     },
@@ -164,48 +163,53 @@
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/agent/context_builder.py",
         "kestrel_sovereign/agent/context_manager.py",
-        "kestrel_sovereign/agent/conversation_manager.py",
-        "kestrel_sovereign/endpoints/agent.py",
-        "kestrel_sovereign/features/context/feature.py",
-        "kestrel_sovereign/signals/dispatcher.py",
-        "kestrel_sovereign/static/js/chat.js",
-        "kestrel_sovereign/storage/async_conversation_store.py",
-        "kestrel_sovereign/storage/memory_consolidator.py"
+        "kestrel_sovereign/agent/salvage.py",
+        "kestrel_sovereign/features/context/feature.py"
       ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
-      "title": "Context C \u2014 Unify Auto-Prune With Durable Compaction",
+      "render": "public",
+      "status": "aspirational",
+      "title": "Context C Durable Salvage Design Record",
       "type": "Architecture Spec"
     },
     {
       "existing_code_refs": [
+        "KESTREL_FEATURES.md",
         "kestrel_sovereign/agent/context_builder.py",
         "kestrel_sovereign/agent/context_manager.py",
-        "kestrel_sovereign/agent/conversation_manager.py",
+        "kestrel_sovereign/agent/context_stages.py",
+        "kestrel_sovereign/agent/salvage.py",
+        "kestrel_sovereign/agent/streaming.py",
         "kestrel_sovereign/agent/token_budget.py",
-        "kestrel_sovereign/agent/tool_context_manager.py",
+        "kestrel_sovereign/agent/token_counter.py",
         "kestrel_sovereign/endpoints/agent.py",
         "kestrel_sovereign/features/context/feature.py",
-        "kestrel_sovereign/static/js/chat.js",
-        "kestrel_sovereign/static/js/ui.js",
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/llm",
+        "kestrel_sovereign/llm/model_catalog.py",
         "kestrel_sovereign/storage/async_conversation_store.py",
-        "kestrel_sovereign/storage/memory_consolidator.py"
+        "tests/unit/test_canonical_transport_split.py",
+        "tests/unit/test_context_breakdown_measurement.py",
+        "tests/unit/test_context_management.py",
+        "tests/unit/test_context_stages_equivalence.py",
+        "tests/unit/test_conversation_sent_form.py",
+        "tests/unit/test_elastic_token_budget.py",
+        "tests/unit/test_lumpy_prune.py",
+        "tests/unit/test_model_catalog.py"
       ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/CONTEXT_SYSTEM_DESIGN.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
-      "title": "Kestrel Context System \u2014 Assessment & Redesign",
+      "render": "public",
+      "status": "active",
+      "title": "Kestrel Context Management Contract",
       "type": "Architecture Spec"
     },
     {
@@ -236,15 +240,16 @@
       "existing_code_refs": [
         "kestrel_sovereign/features/base.py",
         "kestrel_sovereign/kestrel_agent.py",
-        "kestrel_sovereign/prompts/system_prompt.md"
+        "kestrel_sovereign/prompts/system_prompt.md",
+        "tests/unit/test_tool_allowlist_registry.py"
       ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/DYNAMIC_TOOL_LOADING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Dynamic Tool Loading",
       "type": "Architecture Spec"
     },
@@ -262,8 +267,8 @@
       "missing_links": [],
       "path": "docs/architecture/FEATURE_CLI_ADAPTERS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Feature-Owned CLI Adapters",
       "type": "Architecture Spec"
     },
@@ -278,8 +283,8 @@
       "missing_links": [],
       "path": "docs/architecture/FILECOIN_WALLET.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Filecoin Wallet Integration",
       "type": "Architecture Spec"
     },
@@ -292,8 +297,8 @@
       "missing_links": [],
       "path": "docs/architecture/GITHUB_FEATURE_DESIGN.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "design-of-record",
       "title": "GitHub Feature Design",
       "type": "Architecture Spec"
     },
@@ -346,8 +351,8 @@
       "missing_links": [],
       "path": "docs/architecture/LLM_SERVICE_ARCHITECTURE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel LLM Service Architecture",
       "type": "Architecture Spec"
     },
@@ -358,8 +363,8 @@
       "missing_links": [],
       "path": "docs/architecture/MEMORY_OWNERSHIP.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Memory System Ownership Map",
       "type": "Architecture Spec"
     },
@@ -385,8 +390,8 @@
       "missing_links": [],
       "path": "docs/architecture/MEMORY_SYSTEM.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel Memory System",
       "type": "Architecture Spec"
     },
@@ -422,8 +427,8 @@
       "missing_links": [],
       "path": "docs/architecture/NIGHTLY_FORGETTING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Nightly Forgetting \u2014 Unified Cognition Maintenance",
       "type": "Architecture Spec"
     },
@@ -469,8 +474,8 @@
       "missing_links": [],
       "path": "docs/architecture/PLAN_RUNPOD_INTEGRATION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Plan: Sovereign GPU Integration (RunPod)",
       "type": "Architecture Spec"
     },
@@ -481,23 +486,60 @@
       "missing_links": [],
       "path": "docs/architecture/PROVIDER_ECONOMICS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Provider Economics: Middleman Architecture & Revenue Strategy",
       "type": "Architecture Spec"
     },
     {
       "existing_code_refs": [
         "KESTREL_FEATURES.md",
-        "scripts/generate_feature_docs.py"
+        "kestrel_sovereign/agent/constitution.py",
+        "kestrel_sovereign/agent/context_builder.py",
+        "kestrel_sovereign/agent/context_manager.py",
+        "kestrel_sovereign/agent/context_stages.py",
+        "kestrel_sovereign/agent/orchestrator_engine.py",
+        "kestrel_sovereign/agent/salvage.py",
+        "kestrel_sovereign/agent/sleep.py",
+        "kestrel_sovereign/agent/streaming.py",
+        "kestrel_sovereign/agent/token_budget.py",
+        "kestrel_sovereign/agent/tool_registry.py",
+        "kestrel_sovereign/cli_runpod.py",
+        "kestrel_sovereign/data/feature_registry.toml",
+        "kestrel_sovereign/endpoints/agent.py",
+        "kestrel_sovereign/features/base.py",
+        "kestrel_sovereign/features/privacy/feature.py",
+        "kestrel_sovereign/features/training/adapters/runpod_adapter.py",
+        "kestrel_sovereign/inception_service.py",
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/llm/provider_registry.py",
+        "kestrel_sovereign/privacy.py",
+        "kestrel_sovereign/retirement_service.py",
+        "kestrel_sovereign/security/crypto_suite.py",
+        "kestrel_sovereign/security/encryption.py",
+        "kestrel_sovereign/security/kem_suite.py",
+        "kestrel_sovereign/security/key_rotation.py",
+        "kestrel_sovereign/security/key_storage.py",
+        "kestrel_sovereign/security/narration_check.py",
+        "kestrel_sovereign/services/payer_resolver.py",
+        "kestrel_sovereign/storage/async_conversation_store.py",
+        "kestrel_sovereign/storage/async_rag_store.py",
+        "kestrel_sovereign/storage/memory_consolidator.py",
+        "kestrel_sovereign/storage/memory_retriever.py",
+        "kestrel_sovereign/storage/memory_system.py",
+        "kestrel_sovereign/storage/privacy_wrapper.py",
+        "kestrel_sovereign/storage/saved_items_store.py",
+        "kestrel_sovereign/storage/sovereign_adapter.py",
+        "kestrel_sovereign/tools/result_contract.py",
+        "run_tests.py"
       ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/README.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel Architecture Documentation",
       "type": "Architecture Spec"
     },
@@ -517,9 +559,21 @@
       "missing_links": [],
       "path": "docs/architecture/RUNPOD_LORA_TRAINING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "LoRA Training & Generation - Operational Guide",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/SCHEDULER_DURABILITY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Durable Scheduler Execution",
       "type": "Architecture Spec"
     },
     {
@@ -576,8 +630,8 @@
       "missing_links": [],
       "path": "docs/architecture/TRAINING_PROVIDER_ARCHITECTURE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Training Provider Architecture",
       "type": "Architecture Spec"
     },
@@ -588,8 +642,8 @@
       "missing_links": [],
       "path": "docs/architecture/USER_LIFECYCLE_MANAGEMENT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "User Lifecycle Management Architecture",
       "type": "Architecture Spec"
     },
@@ -606,24 +660,22 @@
       "missing_links": [],
       "path": "docs/architecture/VASTAI_TRAINING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "VastAI LoRA Training Architecture",
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
-      "findings": [
-        "missing_code_refs"
+      "existing_code_refs": [
+        "kestrel_sovereign/data/feature_registry.toml"
       ],
-      "missing_code_refs": [
-        "tests/integration/test_evm_transactions_e2e.py"
-      ],
+      "findings": [],
+      "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/WALLET_SYSTEM.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Kestrel Multi-Chain Wallet System",
       "type": "Architecture Spec"
     },
@@ -713,8 +765,8 @@
       "missing_links": [],
       "path": "docs/architecture/core/AGENT_ECOSYSTEM.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "PRD: The Kestrel Agent Ecosystem",
       "type": "Architecture Spec"
     },
@@ -742,8 +794,8 @@
       "missing_links": [],
       "path": "docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "PRD: Feature Agent Framework",
       "type": "Architecture Spec"
     },
@@ -756,8 +808,8 @@
       "missing_links": [],
       "path": "docs/architecture/core/INFRASTRUCTURE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Kestrel Development Infrastructure",
       "type": "Architecture Spec"
     },
@@ -786,10 +838,22 @@
       "missing_links": [],
       "path": "docs/architecture/core/MULTI_MODEL_SUPPORT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "PRD: Multi-Model Foundational Support",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/core/SCOPED_PEER_DIRECTORY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Scoped peer directories",
+      "type": "Architecture Note"
     },
     {
       "existing_code_refs": [
@@ -812,8 +876,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/AGENT_ECONOMICS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Agent Economics: Autonomous Economic Entities",
       "type": "Architecture Spec"
     },
@@ -824,8 +888,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/ECONOMICS_WORK_SESSION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Economics Work Session \u2013 Kestrel / Sovereign Agents",
       "type": "Architecture Spec"
     },
@@ -836,8 +900,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Economic Incentives Deep Dive - Constitutional AI System",
       "type": "Architecture Spec"
     },
@@ -848,8 +912,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Economic System & Buy-Out Mechanics - Practical Details",
       "type": "Architecture Spec"
     },
@@ -860,8 +924,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/SOVEREIGN_SOLVENCY.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Sovereign Solvency Protocol: The Economics of Existence",
       "type": "Architecture Spec"
     },
@@ -876,8 +940,8 @@
       "missing_links": [],
       "path": "docs/architecture/economics/WALLET_AGENT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "PRD: WalletAgent",
       "type": "Architecture Spec"
     },
@@ -940,8 +1004,8 @@
       "missing_links": [],
       "path": "docs/architecture/llm/HONESTY_LAYER.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Streaming Honesty Layer",
       "type": "Architecture Spec"
     },
@@ -954,8 +1018,8 @@
       "missing_links": [],
       "path": "docs/architecture/llm/PROVIDER_PLUGINS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Building a Kestrel LLM Provider Plugin",
       "type": "Architecture Spec"
     },
@@ -966,8 +1030,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/ANTI_CORRUPTION_ANALYSIS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Preventing Corruption in Kestrel's Integrity Audit System",
       "type": "Architecture Spec"
     },
@@ -980,8 +1044,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/CONSTITUTION_EMBEDDING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Kestrel Constitution Embedding Process",
       "type": "Architecture Spec"
     },
@@ -992,8 +1056,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "PRD: Cryptographic Log Anchoring",
       "type": "Architecture Spec"
     },
@@ -1036,8 +1100,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/CRYPTO_INVENTORY.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Cryptographic Inventory",
       "type": "Architecture Spec"
     },
@@ -1096,8 +1160,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Kestrel Integrity Audit System",
       "type": "Architecture Spec"
     },
@@ -1110,8 +1174,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/KEY_MANAGEMENT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Key Management Architecture",
       "type": "Architecture Spec"
     },
@@ -1122,10 +1186,47 @@
       "missing_links": [],
       "path": "docs/architecture/security/KEY_ROTATION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "Key Rotation Mechanism",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/storage/lexical_memory_index.py",
+        "tests/integration/test_saved_items_rag_smoke.py",
+        "tests/integration/test_storage_backend_parity.py",
+        "tests/unit/test_async_rag_store.py",
+        "tests/unit/test_embedding_reindex.py",
+        "tests/unit/test_key_rotation.py",
+        "tests/unit/test_rag_store_pgvector.py",
+        "tests/unit/test_saved_items.py",
+        "tests/unit/test_saved_items_pgvector.py",
+        "tests/unit/test_saved_items_sqla.py",
+        "tests/unit/test_saved_items_store.py"
+      ],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "tests/integration/test_memory_encryption_backup_restore.py",
+        "tests/integration/test_memory_encryption_migration_postgres.py",
+        "tests/unit/test_document_chunk_tenant_migration.py",
+        "tests/unit/test_identity_exporter.py",
+        "tests/unit/test_identity_importer.py",
+        "tests/unit/test_memory_content_codec.py",
+        "tests/unit/test_memory_content_failures.py",
+        "tests/unit/test_memory_content_keyring.py",
+        "tests/unit/test_memory_content_schema.py",
+        "tests/unit/test_memory_encryption_migration.py"
+      ],
+      "missing_links": [],
+      "path": "docs/architecture/security/MEMORY_CONTENT_ENCRYPTION.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "design-of-record",
+      "title": "Saved-item and RAG Content Encryption",
+      "type": "Architecture Decision Record"
     },
     {
       "existing_code_refs": [],
@@ -1152,8 +1253,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Post-Quantum Cryptography Migration \u2014 PRD v2",
       "type": "Architecture Spec"
     },
@@ -1166,8 +1267,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/PQ_THREAT_MODEL.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Post-Quantum Threat Model",
       "type": "Architecture Spec"
     },
@@ -1182,8 +1283,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/PRIVACY_AGENT.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "experimental",
       "title": "PRD: PrivacyAgent",
       "type": "Architecture Spec"
     },
@@ -1194,8 +1295,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/PRIVACY_MODES.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Privacy Modes: Complete Data Sovereignty",
       "type": "Architecture Spec"
     },
@@ -1247,8 +1348,8 @@
       "missing_links": [],
       "path": "docs/architecture/security/SERIALIZATION_COMPATIBILITY.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Serialization Compatibility Matrix",
       "type": "Architecture Spec"
     },
@@ -1291,8 +1392,8 @@
       "missing_links": [],
       "path": "docs/architecture/storage/DECENTRALIZED_STORAGE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "aspirational",
       "title": "Decentralized Storage Vision: IPFS & Filecoin Integration",
       "type": "Architecture Spec"
     },
@@ -1305,10 +1406,48 @@
       "missing_links": [],
       "path": "docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Human-Like Memory System",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/storage/RDF_ASSERTION_CODEC.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "RDF Assertion Codec Boundary",
+      "type": "Architecture Reference"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_ARCHITECTURE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "design-of-record",
+      "title": "Semantic Knowledge Architecture",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/data/semantic/registry.toml"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/storage/SEMANTIC_KNOWLEDGE_REGISTRY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Semantic Knowledge Registry",
+      "type": "Architecture Reference"
     },
     {
       "existing_code_refs": [
@@ -1322,8 +1461,8 @@
       "missing_links": [],
       "path": "docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Sovereignty Implementation",
       "type": "Architecture Spec"
     },
@@ -1334,8 +1473,8 @@
       "missing_links": [],
       "path": "docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Convergent Sharding & Merkle Forests: Kestrel Storage V2",
       "type": "Architecture Spec"
     },
@@ -1346,8 +1485,8 @@
       "missing_links": [],
       "path": "docs/architecture/storage/STORAGE_ARCHITECTURE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel Storage Architecture",
       "type": "Architecture Spec"
     },
@@ -1358,8 +1497,8 @@
       "missing_links": [],
       "path": "docs/architecture/subagent_isolation_audit.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "Subagent Isolation Audit",
       "type": "Architecture Spec"
     },
@@ -1393,30 +1532,45 @@
       "missing_links": [],
       "path": "docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "archive",
+      "status": "historical",
       "title": "LLM Router Enhancement - Comprehensive Testing Plan",
       "type": "Architecture Spec"
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/knowledge/release_evidence.py",
+        "tests/unit/test_semantic_release_evidence.py",
+        "tests/unit/test_sleep_observability.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/testing/SEMANTIC_RELEASE_EVIDENCE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Semantic Knowledge Release Evidence",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "run_tests.py",
-        "server.py"
+        "server.py",
+        "tests/unit/test_docs_verify.py"
       ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/testing/TESTING_GUIDE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Kestrel Test Strategy Guide",
       "type": "Architecture Spec"
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/features/talon/coordinator.py",
-        "kestrel_sovereign/features/talon/verification.py",
         "run_tests.py"
       ],
       "findings": [
@@ -1442,8 +1596,8 @@
       "missing_links": [],
       "path": "docs/architecture/tools/AGENT_TOOLS.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Agent Tools",
       "type": "Architecture Spec"
     },
@@ -1459,8 +1613,8 @@
       "missing_links": [],
       "path": "docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Agent Tools Architecture",
       "type": "Architecture Spec"
     },
@@ -1485,8 +1639,8 @@
       "missing_links": [],
       "path": "docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "active",
       "title": "Agent Tools Implementation",
       "type": "Architecture Spec"
     },
@@ -2341,12 +2495,15 @@
         "README.md",
         "kestrel_sovereign/data/feature_registry.toml",
         "kestrel_sovereign/features/__init__.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
         "pyproject.toml",
         "tests/unit/test_extracted_feature_boundary_contracts.py"
       ],
-      "findings": [],
-      "missing_code_refs": [],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "kestrel_sovereign/features/talon/coordinator.py"
+      ],
       "missing_links": [],
       "path": "docs/audit/documentation-2026-05/reports/package_boundaries_report.md",
       "privacy": "public",
@@ -2374,8 +2531,6 @@
         "kestrel_sovereign/data/feature_registry.toml",
         "kestrel_sovereign/features/channels/feature.py",
         "kestrel_sovereign/features/scheduler/feature.py",
-        "kestrel_sovereign/features/talon/coordinator.py",
-        "kestrel_sovereign/features/talon/runtime.py",
         "kestrel_sovereign/kestrel_agent.py",
         "kestrel_sovereign/signals/dispatcher.py",
         "kestrel_sovereign/signals/sources/scheduler.py",
@@ -2385,6 +2540,8 @@
         "missing_code_refs"
       ],
       "missing_code_refs": [
+        "kestrel_sovereign/features/talon/coordinator.py",
+        "kestrel_sovereign/features/talon/runtime.py",
         "kestrel_sovereign/features/workflows/models.py"
       ],
       "missing_links": [],
@@ -4148,6 +4305,7 @@
     },
     {
       "existing_code_refs": [
+        "KESTREL_FEATURES.md",
         "kestrel_sovereign/cli_extension_example.py",
         "kestrel_sovereign/data/feature_registry.toml",
         "pyproject.toml",

@@ -19,6 +19,15 @@ builder used to own:
   - no dispatcher → skipped, NOT marked signaled (#1510)
   - in-flight handle is not re-enqueued (#1528)
   - provider signal name routes the source; payload spreads WaitStatus.data
+
+``last_delivery_status`` composes the dispatch result with a VISIBILITY
+verdict since #2922, so the expectations here read ``ok_unbound`` /
+``ok_visibility_unknown`` rather than a bare ``ok``. ``_CapturingDispatcher``
+is deliberately left as a bare stub with no surface ledger — it is the
+"visibility is unobservable" case, and the tests assert the reconciler SAYS so
+instead of assuming success. The observable cases are covered against a real
+dispatcher and a real event manager in
+``tests/unit/test_wake_visibility_accounting.py``.
 """
 
 from __future__ import annotations
@@ -191,7 +200,7 @@ async def test_no_signal_for_pending_handles(make_agent):
 
 
 @pytest.mark.asyncio
-async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
+async def test_records_ok_as_persisted_and_locks_outcome(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
@@ -206,17 +215,24 @@ async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
     assert row.pending_signaled_target == "done"
 
     t2 = await rec.reconcile()
-    assert t2.data["signals_emitted"] == 1
+    assert t2.data["signals_persisted"] == 1
+    assert t2.data["signals_emitted"] == 1, "back-compat alias for persisted"
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
     assert row.last_delivery_attempts == 1
     assert row.pending_signal_id is None
-    assert t2.data["transitions"][0]["delivery_status"] == "ok"
+    # ``_FakeProvider`` exposes no ``origin_session_id``, so the wake is
+    # unattended and was built INTERNAL — persisted, never surfaced. Recording
+    # a bare ``ok`` here is the #2922 bug.
+    assert row.last_delivery_status == "ok_unbound"
+    assert t2.data["transitions"][0]["delivery_status"] == "ok_unbound"
+    assert t2.data["transitions"][0]["dispatch_status"] == "ok"
+    assert t2.data["signals_unbound"] == 1
+    assert t2.data["signals_queued"] == 0
 
 
 @pytest.mark.asyncio
-async def test_coalesced_counts_as_delivered(make_agent):
+async def test_coalesced_counts_as_persisted(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher(status_override=Status.COALESCED)
@@ -225,10 +241,10 @@ async def test_coalesced_counts_as_delivered(make_agent):
 
     await rec.reconcile()
     t = await rec.reconcile()
-    assert t.data["signals_emitted"] == 1
+    assert t.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "coalesced"
+    assert row.last_delivery_status == "coalesced_unbound"
 
 
 @pytest.mark.asyncio
@@ -299,10 +315,10 @@ async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent
     agent.dispatcher = _CapturingDispatcher()
     await rec.reconcile()
     harvest = await rec.reconcile()
-    assert harvest.data["signals_emitted"] == 1
+    assert harvest.data["signals_persisted"] == 1
     row = await rec._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
-    assert row.last_delivery_status == "ok"
+    assert row.last_delivery_status == "ok_unbound"
 
 
 @pytest.mark.asyncio
@@ -657,3 +673,167 @@ async def test_run_wait_reconcile_caches_singleton(make_agent):
     assert agent._wait_reconciler is rec1
     row = await rec1._store.get("fake", "h1")
     assert row.last_signaled_outcome == "done"
+
+
+# ---------------------------------------------------------------------------
+# #2877: origin-session binding + visibility
+#
+# A signal-woken cognition turn was landing in a freshly-minted session
+# instead of the one that registered the work, so autonomous progress became
+# invisible to the Sovereign while `delivery_status` still read `ok`. The
+# reconciler binds the wake to the registering session — but ONLY from a
+# provider-owned local lookup, never from the poll payload it spreads.
+# ---------------------------------------------------------------------------
+
+
+class _OriginProvider(_FakeProvider):
+    """A provider that records which chat session registered each handle.
+
+    Models TalonWaitable: the origin lives on the provider's own local job
+    record and is exposed through the dedicated `origin_session_id` method,
+    NOT smuggled through WaitStatus.data.
+    """
+
+    kind = "origin"
+
+    def __init__(self, origins=None, **kwargs):
+        super().__init__(**kwargs)
+        self._origins = origins or {}
+
+    async def origin_session_id(self, handle):
+        return self._origins.get(handle)
+
+
+@pytest.mark.asyncio
+async def test_wake_binds_to_registering_session(make_agent):
+    """The wake resumes the session that registered the work (#2877)."""
+    provider = _OriginProvider(origins={"h1": "chat-sess-1"})
+    provider.set("h1", Outcome.DONE, summary="job done")
+    dispatcher = _CapturingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    await rec.reconcile()
+    sig = dispatcher.signals[0]
+    assert sig.session_id == "chat-sess-1", (
+        "the wake must resume the dispatching session, not mint a new one"
+    )
+    assert sig.payload["origin_session_id"] == "chat-sess-1"
+
+
+@pytest.mark.asyncio
+async def test_bound_wake_is_user_visible_unbound_stays_internal(make_agent):
+    """Binding the session is only half of 'the user can see it': a bound
+    wake must also be USER_VISIBLE so the dispatcher emits signal_completed.
+    An unattended (origin-less) wake stays INTERNAL — there is no chat window
+    to surface into, and the notifications stream is agent-pinned."""
+    from kestrel_sdk.signals import Visibility
+
+    bound = _OriginProvider(origins={"h1": "chat-sess-1"})
+    bound.set("h1", Outcome.DONE)
+    d1 = _CapturingDispatcher()
+    rec1 = WaitReconciler(await make_agent(bound, d1))
+    await rec1.reconcile()
+    assert d1.signals[0].visibility == Visibility.USER_VISIBLE
+
+    unbound = _OriginProvider(origins={})
+    unbound.set("h1", Outcome.DONE)
+    d2 = _CapturingDispatcher()
+    rec2 = WaitReconciler(await make_agent(unbound, d2))
+    await rec2.reconcile()
+    assert d2.signals[0].visibility == Visibility.INTERNAL
+    assert d2.signals[0].session_id is None
+    assert d2.signals[0].payload["origin_session_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_poll_payload_cannot_supply_the_origin_session(make_agent):
+    """The routing session is NEVER read out of WaitStatus.data (#2877).
+
+    The reconciler spreads a provider's poll data into the signal payload
+    verbatim, and A2AWaitable spreads a *peer's* returned task result into
+    that dict. If a payload key were routing authority, a remote peer could
+    choose which local chat session a COGNITION wake resumes into — and,
+    because a bound wake renders USER_VISIBLE, get its text painted into that
+    window. A payload-supplied value must not bind, and must not survive into
+    the signal payload/log as if it had."""
+    from kestrel_sdk.signals import Visibility
+
+    provider = _FakeProvider()  # no origin_session_id method at all
+    provider.set(
+        "h1", Outcome.DONE,
+        data={"origin_session_id": "victim-chat-session"},
+    )
+    dispatcher = _CapturingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    sig = dispatcher.signals[0]
+    assert sig.session_id is None, (
+        "a peer-supplied payload key must never become routing authority"
+    )
+    assert sig.visibility == Visibility.INTERNAL
+    assert sig.payload["origin_session_id"] == "", (
+        "the untrusted value must be overwritten, not left in the signal log"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_origin_overrides_a_conflicting_payload_key(make_agent):
+    """When the provider DOES own an origin, that value wins over whatever
+    the poll payload happens to carry under the same key."""
+    provider = _OriginProvider(origins={"h1": "real-session"})
+    provider.set(
+        "h1", Outcome.DONE, data={"origin_session_id": "spoofed-session"},
+    )
+    dispatcher = _CapturingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    await rec.reconcile()
+    sig = dispatcher.signals[0]
+    assert sig.session_id == "real-session"
+    assert sig.payload["origin_session_id"] == "real-session"
+
+
+@pytest.mark.asyncio
+async def test_broken_origin_lookup_degrades_to_unattended_wake(make_agent):
+    """A provider bug in the origin lookup must not block the wake — it
+    degrades to the pre-#2877 behavior (system-initiated, fresh session)."""
+    from kestrel_sdk.signals import Visibility
+
+    provider = _OriginProvider(origins={})
+    provider.set("h1", Outcome.DONE)
+
+    async def _boom(handle):
+        raise RuntimeError("registry unreadable")
+
+    provider.origin_session_id = _boom
+    dispatcher = _CapturingDispatcher()
+    rec = WaitReconciler(await make_agent(provider, dispatcher))
+
+    t = await rec.reconcile()
+    assert t.data["signals_enqueued"] == 1
+    assert dispatcher.signals[0].session_id is None
+    assert dispatcher.signals[0].visibility == Visibility.INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_watched_handle_also_binds_its_origin(make_agent):
+    """Both wake sources route through _process_handle, so an explicitly
+    watched (poll-only) handle binds its origin the same way an auto-woken
+    one does."""
+    class _WatchOnly(_OriginProvider):
+        kind = "origin"
+
+        async def active_handles(self):
+            return []
+
+    provider = _WatchOnly(origins={"h9": "chat-sess-9"})
+    provider.set("h9", Outcome.FAILED)
+    dispatcher = _CapturingDispatcher()
+    agent = await make_agent(provider, dispatcher)
+    rec = WaitReconciler(agent)
+    await rec._store.start_watch("origin", "h9")
+
+    await rec.reconcile()
+    assert dispatcher.signals[0].session_id == "chat-sess-9"

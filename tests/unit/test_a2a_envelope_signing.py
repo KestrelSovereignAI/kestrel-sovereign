@@ -15,7 +15,6 @@ import pytest
 
 from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
 from kestrel_sovereign.identity.did_web import build_verification_methods
-from kestrel_sovereign.security.verify_policy import VerifyPolicy
 from kestrel_sovereign.a2a.envelope_signing import (
     canonical_signing_bytes,
     sign_envelope,
@@ -211,6 +210,26 @@ def test_signed_async_resolver_verifies():
 
     v = asyncio.run(verify_inbound_envelope(meta, task_id="t", message="m", resolver=resolver))
     assert v.ok is True and v.verified is True
+
+
+def test_signed_document_with_unpaired_surrogate_is_rejected_not_raised():
+    """Untrusted did:web JSON cannot turn canonicalization into a 500."""
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    doc["id"] = "did:web:example.com:\ud800"
+
+    verdict = asyncio.run(
+        verify_inbound_envelope(
+            meta,
+            task_id="t",
+            message="m",
+            resolver=lambda _did: doc,
+        )
+    )
+
+    assert verdict.ok is False
+    assert verdict.reason == "sender DID document is not canonically serializable"
 
 
 def test_signed_but_unresolvable_rejected_by_default():

@@ -7,7 +7,7 @@ broad exception catches throughout the LLM service code.
 import logging
 import time
 import asyncio
-from typing import Any, Callable, Optional, Type, Union, Dict
+from typing import Callable, Optional, Type, Dict
 from functools import wraps
 
 import openai

@@ -4,16 +4,19 @@ Tests for the Feature Discovery module.
 
 import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
+    FeatureDiscoveryAmbiguityError,
     MandatoryFeatureReadinessError,
     discover_features,
     discover_feature_class_by_name,
     resolve_feature_canonical_name,
     discover_feature_modules,
     discover_entrypoint_feature_classes,
+    discover_feature_selections,
     get_disabled_features,
     get_feature_by_name,
     find_feature_class,
@@ -21,6 +24,11 @@ from kestrel_sovereign.features import (
     FEATURE_ENTRY_POINT_GROUP,
 )
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeNamespaceError,
+    IsolatedRuntimePreparationError,
+)
+from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sdk.features.base import Feature as _SDKFeature
 
 
@@ -202,6 +210,80 @@ service = "isolated_service"
         proxy = next(feature for feature in features if feature.name == "HeavyFeature")
         assert proxy.runtime.runtime == "isolated-venv"
         assert ep.loaded is False
+
+    def test_core_only_discovery_never_imports_isolated_runtime(self, mock_agent):
+        """Mandatory/core discovery stays alive without the optional runtime."""
+
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        real_import_module = importlib.import_module
+        imported_modules = []
+
+        def guarded_import(name, *args, **kwargs):
+            imported_modules.append(name)
+            if name == "kestrel_sovereign.features.isolated_runtime":
+                raise AssertionError("core-only boot imported isolated runtime")
+            return real_import_module(name, *args, **kwargs)
+
+        with patch(
+            "kestrel_sovereign.features.discover_feature_selections",
+            return_value={},
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={},
+        ), patch(
+            "kestrel_sovereign.features.importlib.import_module",
+            side_effect=guarded_import,
+        ):
+            features = discover_features(mock_agent, allowed_features=set())
+
+        assert {feature.name for feature in features} == set(MANDATORY_FEATURES)
+        assert "kestrel_sovereign.features.isolated_runtime" not in imported_modules
+
+    def test_isolated_runtime_import_failure_skips_optional_entrypoint(
+        self, caplog, mock_agent
+    ):
+        """A broken optional runtime cannot take down mandatory feature boot."""
+
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        runtime = InstalledFeatureRuntime(
+            class_name="BrokenIsolatedFeature",
+            entry_point="broken.feature:BrokenIsolatedFeature",
+            distribution="broken-isolated-package",
+            runtime="isolated-venv",
+            service="broken-service",
+        )
+        real_import_module = importlib.import_module
+
+        def broken_optional_import(name, *args, **kwargs):
+            if name == "kestrel_sovereign.features.isolated_runtime":
+                raise ImportError("isolated SDK is unavailable")
+            return real_import_module(name, *args, **kwargs)
+
+        with patch(
+            "kestrel_sovereign.features.discover_feature_selections",
+            return_value={},
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ), patch(
+            "kestrel_sovereign.features.importlib.import_module",
+            side_effect=broken_optional_import,
+        ), caplog.at_level("ERROR"):
+            features = discover_features(
+                mock_agent,
+                allowed_features={runtime.class_name},
+            )
+
+        names = {feature.name for feature in features}
+        assert names == set(MANDATORY_FEATURES)
+        assert runtime.class_name not in names
+        assert (
+            "Error loading isolated entry_point feature BrokenIsolatedFeature"
+            in caplog.text
+        )
+        assert "isolated SDK is unavailable" in caplog.text
 
 
 class TestGetFeatureByName:
@@ -537,8 +619,8 @@ class TestEntryPointDiscovery:
 
         assert classes == {"ExternalFeature": ExternalFeature}
 
-    def test_local_features_win_on_duplicate(self):
-        """Test that local features take priority over entry_point features on name collision."""
+    def test_unrecognized_local_external_ambiguity_fails_actionably(self):
+        """A bundled/external collision must never resolve by enumeration order."""
         class DuplicateFeature(Feature):
             @property
             def tool_description(self):
@@ -549,6 +631,7 @@ class TestEntryPointDiscovery:
         ep = self._make_entry_point("HealthFeature", DuplicateFeature)
         # Rename the class to match a real local feature
         DuplicateFeature.__name__ = "HealthFeature"
+        ep.dist.name = "surprise-health-package"
         mock_eps = MagicMock()
         mock_eps.select.return_value = [ep]
 
@@ -556,14 +639,76 @@ class TestEntryPointDiscovery:
         agent.storage = Mock()
         agent.llm_service = Mock()
 
-        with patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=mock_eps):
-            features = discover_features(agent)
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), pytest.raises(FeatureDiscoveryAmbiguityError) as exc:
+            discover_features(agent)
 
-        # HealthFeature should be the LOCAL version, not the entry_point one
-        heartbeats = [f for f in features if f.__class__.__name__ == "HealthFeature"]
-        assert len(heartbeats) == 1
-        # The local HealthFeature won't be our DuplicateFeature class
-        assert heartbeats[0].__class__ is not DuplicateFeature
+        message = str(exc.value)
+        assert "HealthFeature" in message
+        assert "surprise-health-package" in message
+        assert "no extracted-over-bundled migration" in message
+        assert "feature_registry.toml" in message
+
+    def test_external_talon_loads_as_an_ordinary_entry_point(self):
+        """After cutover, Talon has no bundled predecessor to replace."""
+
+        class ExtractedTalonCoordinatorFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Extracted Talon"
+
+            async def initialize(self):
+                pass
+
+        ExtractedTalonCoordinatorFeature.__name__ = "TalonCoordinatorFeature"
+        ExtractedTalonCoordinatorFeature.__module__ = (
+            "kestrel_feature_talon.coordinator"
+        )
+        ep = self._make_entry_point(
+            "TalonCoordinatorFeature",
+            ExtractedTalonCoordinatorFeature,
+        )
+        ep.dist.name = "kestrel-feature-talon"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            selections = discover_feature_selections()
+
+        selected = selections["TalonCoordinatorFeature"]
+        assert selected.feature_class is ExtractedTalonCoordinatorFeature
+        assert selected.source == "entry-point"
+        assert selected.distribution == "kestrel-feature-talon"
+        assert selected.implementation_module.startswith("kestrel_feature_talon")
+
+    def test_no_external_talon_means_no_talon_feature(self):
+        """A core-only installation boots without a hidden fallback."""
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = []
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            selections = discover_feature_selections()
+
+        assert "TalonCoordinatorFeature" not in selections
+
+    def test_no_external_talon_alias_exists_in_core_only_install(self):
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = []
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            assert resolve_feature_canonical_name("talon") is None
+            assert resolve_feature_canonical_name("coordinator") is None
 
     def test_entrypoint_features_loaded_when_no_local_duplicate(self):
         """Test that entry_point features are loaded when there's no local duplicate."""
@@ -662,6 +807,304 @@ class TestEntryPointDiscovery:
     def test_entrypoint_group_constant(self):
         """Test that the entry_point group constant is correct."""
         assert FEATURE_ENTRY_POINT_GROUP == "kestrel_sovereign.features"
+
+    def test_isolated_external_talon_loads_proxy_without_bundled_predecessor(self):
+        runtime = InstalledFeatureRuntime(
+            class_name="TalonCoordinatorFeature",
+            entry_point=(
+                "kestrel_feature_talon.coordinator:TalonCoordinatorFeature"
+            ),
+            distribution="kestrel-feature-talon",
+            runtime="isolated-venv",
+            service="kestrel-feature-talon-service",
+        )
+        ep = _IsolatedEntryPoint(
+            runtime.class_name,
+            runtime.entry_point,
+            SimpleNamespace(name=runtime.distribution),
+        )
+        mock_eps = _IsolatedEntryPoints([ep])
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ):
+            selections = discover_feature_selections()
+            features = discover_features(Mock())
+
+        assert runtime.class_name not in selections
+        selected = next(feature for feature in features if feature.name == runtime.class_name)
+        assert selected.__class__.__name__ == "ProxyFeature"
+        assert ep.loaded is False
+
+    def test_discovery_gives_two_isolated_runtimes_distinct_stable_owners(self):
+        runtimes = {
+            class_name: InstalledFeatureRuntime(
+                class_name=class_name,
+                entry_point=f"isolated_package.feature:{class_name}",
+                distribution="shared-isolated-package",
+                runtime="isolated-venv",
+                service=f"{class_name.lower()}-service",
+            )
+            for class_name in ("FirstIsolatedFeature", "SecondIsolatedFeature")
+        }
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+                for runtime in runtimes.values()
+            ]
+        )
+        agent = Mock(did="did:test:isolated-discovery")
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=entry_points,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value=runtimes,
+        ):
+            features = discover_features(
+                agent,
+                allowed_features=set(runtimes),
+            )
+
+        proxies = [feature for feature in features if feature.name in runtimes]
+        assert {feature.name for feature in proxies} == set(runtimes)
+        assert len({feature.contribution_owner for feature in proxies}) == 2
+        assert all(entry_point.loaded is False for entry_point in entry_points)
+
+    def test_hosted_discovery_fails_closed_without_runtime_namespace(self):
+        runtime = InstalledFeatureRuntime(
+            class_name="HostedIsolatedFeature",
+            entry_point="hosted.feature:HostedIsolatedFeature",
+            distribution="hosted-isolated-package",
+            runtime="isolated-venv",
+            service="hosted-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+            ]
+        )
+        agent = SimpleNamespace(
+            did="did:test:hosted-without-scope",
+            storage_path=None,
+            isolated_runtime_hosted=True,
+        )
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=entry_points,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ), pytest.raises(IsolatedRuntimeNamespaceError, match="no explicit runtime"):
+            discover_features(agent, allowed_features={runtime.class_name})
+
+        assert entry_points[0].loaded is False
+
+    def test_hosted_optional_feature_preparation_error_does_not_abort_agent(
+        self, caplog, tmp_path
+    ):
+        runtime = InstalledFeatureRuntime(
+            class_name="HostedOptionalFeature",
+            entry_point="hosted.feature:HostedOptionalFeature",
+            distribution="hosted-optional-package",
+            runtime="isolated-venv",
+            service="hosted-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+            ]
+        )
+        agent = SimpleNamespace(
+            did="did:test:hosted-preparation-failure",
+            storage_path=None,
+            isolated_runtime_root=tmp_path / "runtime",
+            isolated_runtime_namespace="agent-optional",
+            isolated_runtime_hosted=True,
+        )
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=entry_points,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ), patch(
+            "kestrel_sovereign.features.isolated_runtime.agent_runtime_dir",
+            side_effect=IsolatedRuntimePreparationError("synthetic ENOSPC"),
+        ):
+            features = discover_features(
+                agent,
+                allowed_features={runtime.class_name},
+            )
+
+        assert all(feature.name != runtime.class_name for feature in features)
+        assert "synthetic ENOSPC" in caplog.text
+        assert entry_points[0].loaded is False
+
+    def test_malformed_optional_isolated_name_does_not_abort_other_features(
+        self, caplog, tmp_path
+    ):
+        malformed = InstalledFeatureRuntime(
+            class_name="whatsapp-channel",
+            entry_point="kestrel_channel_whatsapp",
+            distribution="malformed-channel-package",
+            runtime="isolated-venv",
+            service="malformed-service",
+        )
+        healthy = InstalledFeatureRuntime(
+            class_name="HealthyIsolatedFeature",
+            entry_point="healthy.feature:HealthyIsolatedFeature",
+            distribution="healthy-isolated-package",
+            runtime="isolated-venv",
+            service="healthy-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    malformed.class_name,
+                    malformed.entry_point,
+                    SimpleNamespace(name=malformed.distribution),
+                ),
+                _IsolatedEntryPoint(
+                    healthy.class_name,
+                    healthy.entry_point,
+                    SimpleNamespace(name=healthy.distribution),
+                ),
+            ]
+        )
+        agent = SimpleNamespace(
+            did="did:test:optional-metadata",
+            storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+            features={},
+        )
+
+        with (
+            patch(
+                "kestrel_sovereign.features.importlib.metadata.entry_points",
+                return_value=entry_points,
+            ),
+            patch(
+                "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+                return_value={
+                    malformed.class_name: malformed,
+                    healthy.class_name: healthy,
+                },
+            ),
+        ):
+            features = discover_features(
+                agent,
+                allowed_features={malformed.class_name, healthy.class_name},
+            )
+
+        assert malformed.class_name not in {feature.name for feature in features}
+        assert healthy.class_name in {feature.name for feature in features}
+        assert "safe canonical identifier" in caplog.text
+        assert all(entry_point.loaded is False for entry_point in entry_points)
+
+    def test_malformed_optional_name_cannot_mask_missing_hosted_scope(self):
+        runtime = InstalledFeatureRuntime(
+            class_name="malformed-feature",
+            entry_point="malformed_package",
+            distribution="malformed-package",
+            runtime="isolated-venv",
+            service="malformed-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+            ]
+        )
+        agent = SimpleNamespace(
+            did="did:test:malformed-missing-hosted-scope",
+            storage_path=None,
+            isolated_runtime_hosted=True,
+        )
+
+        with (
+            patch(
+                "kestrel_sovereign.features.importlib.metadata.entry_points",
+                return_value=entry_points,
+            ),
+            patch(
+                "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+                return_value={runtime.class_name: runtime},
+            ),
+            pytest.raises(IsolatedRuntimeNamespaceError, match="no explicit runtime"),
+        ):
+            discover_features(agent, allowed_features={runtime.class_name})
+
+    def test_broken_external_talon_does_not_fall_back_to_core(self):
+        runtime = InstalledFeatureRuntime(
+            class_name="TalonCoordinatorFeature",
+            entry_point=(
+                "kestrel_feature_talon.coordinator:TalonCoordinatorFeature"
+            ),
+            distribution="kestrel-feature-talon",
+            runtime="in-process",
+        )
+        ep = MagicMock()
+        ep.name = runtime.class_name
+        ep.value = runtime.entry_point
+        ep.dist.name = runtime.distribution
+        ep.load.side_effect = ImportError("broken extracted install")
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value={runtime.class_name: runtime},
+        ):
+            selections = discover_feature_selections()
+
+        assert "TalonCoordinatorFeature" not in selections
+
+    def test_external_lookup_aliases_use_implementation_module(self):
+        class ForecastFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Forecast"
+
+            async def initialize(self):
+                pass
+
+        ForecastFeature.__module__ = "vendor_weather.feature"
+        ep = self._make_entry_point("forecast-entry-alias", ForecastFeature)
+        ep.dist.name = "vendor-weather"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            assert discover_feature_class_by_name("vendor_weather") is ForecastFeature
+            assert discover_feature_class_by_name("forecast-entry-alias") is None
 
 
 class TestEntrypointClassName:

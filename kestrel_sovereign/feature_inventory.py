@@ -441,12 +441,14 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         "",
         "## Feature Module Inventory",
         "",
-        "Features come from two sources:",
+        "Feature lifecycle classes come from two sources:",
         "",
-        "1. **Core features** — discovered from `kestrel_sovereign/features/` via `discover_feature_modules()`.",
-        "2. **Package features** — installed packages registered with the `kestrel_sovereign.features` entry point group at runtime.",
+        "1. **Bundled Feature modules** — discovered from `kestrel_sovereign/features/` via `discover_feature_modules()`.",
+        "2. **Extracted Feature packages** — installed packages registered with the `kestrel_sovereign.features` entry point group at runtime.",
         "",
-        "The generated inventory below lists core features only: the in-tree surface discoverable from this checkout.",
+        "A bundled/external class-name collision fails closed unless the bundled registry row explicitly authorizes that exact extracted distribution and implementation-module prefix as a temporary migration replacement. Two external owners always fail.",
+        "",
+        "The generated inventory below lists bundled Feature lifecycle modules only: the in-tree surface discoverable from this checkout.",
         "Installed entry point feature classes are included in JSON output when present in the active environment.",
         "Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.",
         "",
@@ -460,6 +462,15 @@ def render_inventory_markdown(inventory: Inventory) -> str:
         lines.append("")
         lines.append(f"- Source: [`{feature.source}`]({feature.source})")
         lines.append(f"- Enablement state: `{feature.enablement_state}`")
+        if feature.module == "context":
+            lines.extend([
+                "- `context_status` is the cheap dry-run view of the same typed",
+                "  `ContextManager` plan used by `GET /api/agent/context-status` and",
+                "  production turns. Cheap mode marks omitted memory/RAG sections unknown;",
+                "  `full=true` executes the production retrieval and pruning policy read-only.",
+                "  It reads anchored governing policy without lazily creating missing state.",
+                "  Provider-native framing remains outside the Kestrel plan.",
+            ])
         if not feature.tools:
             lines.append("- Tools: none discovered")
             lines.append("")

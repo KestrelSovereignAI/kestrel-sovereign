@@ -106,8 +106,19 @@ class LLMAnswerabilityGate:
         self,
         query: str,
         candidates: Sequence[AnswerabilityCandidate],
+        *,
+        session_id: Optional[str] = None,
     ) -> AnswerabilityDecision:
-        """Return IDs directly supported by at most one bounded LLM call."""
+        """Return IDs directly supported by at most one bounded LLM call.
+
+        ``session_id`` names the chat turn whose retrieval asked for this
+        judgement, and is span attribution only (#2940): it never changes which
+        candidates are judged. The judge runs on almost every non-trivial turn
+        (:func:`_requires_answerability_gate` defaults to on for any embedding
+        model), so leaving it unnamed put one sessionless ``llm.generate`` root
+        beside every turn in the fleet Timeline. ``None`` — offline recall, a
+        retrieval outside any turn — stays unstamped.
+        """
         loop = asyncio.get_running_loop()
         started = loop.time()
         selected = list(candidates[:MAX_ANSWERABILITY_CANDIDATES])
@@ -132,6 +143,7 @@ class LLMAnswerabilityGate:
                     user_prompt=json.dumps(payload, ensure_ascii=False),
                     force_local_only=self._force_local_only(),
                     model_override=self.model_override,
+                    session_id=session_id,
                 )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             return self._failed(started, f"timeout: {exc}")

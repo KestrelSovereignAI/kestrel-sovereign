@@ -27,7 +27,10 @@ from kestrel_sovereign.llm.codex_adapter import (
     _result_to_codex_response,
     _usage_from,
 )
-from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
+from kestrel_sovereign.llm.codex_app_server import (
+    CodexAppServerError,
+    CodexAppServerFrameTooLarge,
+)
 from kestrel_sovereign.llm.provider_registry import ProviderRegistry
 from kestrel_sdk.llm import ToolCallStarted
 
@@ -890,6 +893,85 @@ class TestAdapterTextPath:
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1)
         assert closed == ["thr-1"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_frame_restarts_same_session_on_fresh_thread(self):
+        """A discarded frame leaves the original Codex turn unknowable.
+
+        The fake keeps the first thread active after reporting the bounded
+        bridge error. A reuse would make its next ``turn/start`` fail; the
+        adapter must instead issue a second ``thread/start`` for the same
+        Kestrel session.
+        """
+        class _AppWithActivePoisonedThread(_FakeAppServer):
+            def __init__(self):
+                super().__init__([])
+                self._next_thread = 0
+                self.active_threads = set()
+
+            async def request(self, method, params=None, *, timeout=120):
+                self.requests.append((method, params))
+                if method == "thread/start":
+                    self._next_thread += 1
+                    return {"thread": {"id": f"thr-{self._next_thread}"}}
+                if method == "turn/start":
+                    thread_id = params["threadId"]
+                    assert thread_id not in self.active_threads, (
+                        "the adapter reused a Codex thread with an active "
+                        "abandoned turn"
+                    )
+                    return {"turn": {"id": f"turn-{thread_id}"}}
+                return {}
+
+            async def iter_turn_events(
+                self, sink, *, idle_timeout=120, thread_id=None,
+                cancel_token=None,
+            ):
+                if thread_id == "thr-1":
+                    self.active_threads.add(thread_id)
+                    self.adapter._record_thread_occupancy("same-session", {
+                        "last": {"inputTokens": 123},
+                        "modelContextWindow": 1000,
+                    })
+                    raise CodexAppServerFrameTooLarge(
+                        "codex app-server JSON-RPC frame exceeded the "
+                        "64 MiB bridge limit"
+                    )
+                assert thread_id == "thr-2"
+                for event in _TEXT_TURN:
+                    yield event
+
+        adapter = CodexAdapter()
+        adapter._client = _AppWithActivePoisonedThread()
+        adapter._client.adapter = adapter
+
+        with pytest.raises(CodexAppServerFrameTooLarge, match="frame exceeded"):
+            await adapter.get_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "first"}],
+                session_id="same-session",
+            )
+
+        assert "same-session" not in adapter._session_threads
+        assert adapter.get_thread_occupancy("same-session") is None
+
+        response = await adapter.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "second"}],
+            session_id="same-session",
+        )
+
+        thread_starts = [
+            params for method, params in adapter._client.requests
+            if method == "thread/start"
+        ]
+        turn_starts = [
+            params for method, params in adapter._client.requests
+            if method == "turn/start"
+        ]
+        assert len(thread_starts) == 2
+        assert [params["threadId"] for params in turn_starts] == ["thr-1", "thr-2"]
+        assert response.content == "Hello"
 
 
 class TestThreadStartParams:

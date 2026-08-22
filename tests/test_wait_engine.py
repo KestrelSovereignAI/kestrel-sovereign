@@ -12,8 +12,19 @@ import asyncio
 import pytest
 
 from kestrel_sdk.tools import Outcome, ToolResultStatus, WaitStatus
-from kestrel_sovereign.waits import WaitRegistry, run_wait_loop
-from kestrel_sovereign.waits.engine import parse_ref
+from kestrel_sovereign.waits import (
+    MAX_HANDLE_WAIT_SECONDS,
+    WaitRegistry,
+    run_wait_loop,
+)
+from kestrel_sovereign.waits.engine import (
+    MAX_HANDLE_WAIT_SECONDS as ENGINE_MAX_HANDLE_WAIT_SECONDS,
+    parse_ref,
+)
+
+
+def test_max_handle_wait_seconds_is_part_of_public_wait_api():
+    assert MAX_HANDLE_WAIT_SECONDS == ENGINE_MAX_HANDLE_WAIT_SECONDS == 3600
 
 
 class _ScriptedProvider:

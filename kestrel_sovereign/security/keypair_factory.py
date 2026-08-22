@@ -29,8 +29,6 @@ from typing import Optional
 
 from .crypto_suite import (
     ALG_ECDSA_SECP256K1_SHA256,
-    CryptoSuite,
-    CryptoSuiteError,
     Keypair,
     get_suite,
     list_registered,

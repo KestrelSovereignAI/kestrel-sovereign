@@ -26,12 +26,27 @@ See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import logging
 import struct
-from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IndexedChunk:
+    """One stored chunk with the embedding already computed for it.
+
+    Carries the profile id alongside the vector because kNN filters by the
+    active embedding profile — a vector separated from the model that produced
+    it is not searchable, only storable.
+    """
+
+    content: str
+    embedding: List[float] = field(default_factory=list)
+    profile_id: Optional[str] = None
 
 
 def _get_embedding_service(llm_service: Optional[Any] = None):
@@ -271,6 +286,124 @@ class AsyncRAGStore:
 
         return len(chunks)
 
+    async def read_indexed_chunks(self, file_hash: str) -> List[IndexedChunk]:
+        """Return this tenant's chunks for ``file_hash`` with their embeddings.
+
+        The counterpart to :meth:`store_precomputed_chunks`. Together they move
+        an already-indexed document between databases without re-running the
+        embedding model — the chunk text, its vector and the profile that
+        produced the vector are carried verbatim, so the copy retrieves
+        identically to the original.
+
+        ``embedding_profile_id`` predates #1477 on some databases; a database
+        without the column still yields chunks, with ``profile_id`` None.
+        """
+        owner_scope, owner_params = self._owner_scope()
+        # Ask whether the column exists rather than letting a SELECT fail to
+        # find out. A failed statement aborts the whole transaction on
+        # PostgreSQL, so probing by exception would destroy a caller's open
+        # unit of work — the defect fixed in ``_write_embedding_vec`` — and a
+        # blanket ``except`` would also swallow a transient error and silently
+        # drop every chunk's profile id, dropping them all out of
+        # profile-filtered kNN.
+        has_profile_id = await self.db._column_exists(
+            "document_chunks", "embedding_profile_id",
+        )
+        columns = (
+            "content, embedding, embedding_profile_id"
+            if has_profile_id
+            else "content, embedding"
+        )
+        rows = await self.db.fetchall(
+            f"SELECT {columns} FROM document_chunks "
+            f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+            (file_hash,) + owner_params,
+        )
+
+        chunks: List[IndexedChunk] = []
+        for row in rows:
+            blob = row[1]
+            embedding = _deserialize_embedding(bytes(blob)) if blob else []
+            profile_id = row[2] if len(row) > 2 else None
+            chunks.append(
+                IndexedChunk(
+                    content=row[0],
+                    embedding=embedding,
+                    profile_id=profile_id,
+                )
+            )
+        return chunks
+
+    async def store_precomputed_chunks(
+        self, file_hash: str, chunks: Sequence[IndexedChunk],
+    ) -> int:
+        """Store chunks whose embeddings were computed elsewhere.
+
+        Unlike :meth:`chunk_document` this neither re-chunks the document nor
+        calls the embedding model: the caller already holds both, and
+        re-deriving them would silently produce a *different* index (chunk
+        boundaries depend on a ``chunk_size`` the rows do not record, and a
+        re-embed under a changed model yields vectors in another coordinate
+        space).
+
+        Idempotent: this tenant's existing chunks for ``file_hash`` are
+        replaced, so re-running after a partial or interrupted copy converges
+        on exactly ``len(chunks)`` chunks rather than accumulating duplicates.
+        """
+        if self.agent_id:
+            owned = await self.db.fetchone(
+                "SELECT 1 FROM file_owners "
+                "WHERE content_hash = ? AND agent_id = ?",
+                (file_hash, self.agent_id),
+            )
+            if not owned:
+                raise ValueError("Cannot index a file outside the bound agent")
+
+        await self.delete_chunks_for_file(file_hash)
+
+        written: List[Tuple[int, IndexedChunk]] = []
+        for chunk in chunks:
+            embedding_blob = (
+                _serialize_embedding(chunk.embedding) if chunk.embedding else None
+            )
+            async with self.db.transaction():
+                if self.db.backend_type == "postgres":
+                    row = await self.db.fetchone(
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?) "
+                        "RETURNING chunk_id",
+                        (file_hash, chunk.content, embedding_blob),
+                    )
+                else:
+                    await self.db.execute(
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?)",
+                        (file_hash, chunk.content, embedding_blob),
+                    )
+                    row = await self.db.fetchone("SELECT last_insert_rowid()")
+                if not row:
+                    raise RuntimeError("Could not resolve inserted RAG chunk id")
+                chunk_id = int(row[0])
+                if self.agent_id:
+                    await self.db.execute(
+                        "INSERT INTO document_chunk_owners "
+                        "(chunk_id, agent_id) VALUES (?, ?)",
+                        (chunk_id, self.agent_id),
+                    )
+            written.append((chunk_id, chunk))
+
+        # Same dual-write as chunk_document, and outside the insert loop for
+        # the same reason: the parallel column may not exist yet.
+        for chunk_id, chunk in written:
+            if chunk.embedding:
+                await self._write_embedding_vec(
+                    chunk_id, chunk.embedding, chunk.profile_id,
+                )
+
+        await self.db.commit()
+        self._bm25_built = False  # Invalidate BM25 index
+        return len(written)
+
     async def _write_embedding_vec(
         self,
         chunk_id: int,
@@ -293,22 +426,38 @@ class AsyncRAGStore:
         migration hasn't created the column yet on this DB, in which
         case the legacy ``embedding`` column is already written and
         search degrades to the in-Python fallback.
+
+        Each attempt runs in its own ``transaction()`` so "non-fatal"
+        stays true when a CALLER holds a transaction open. PostgreSQL
+        aborts the whole transaction on any failed statement, so an
+        unwrapped failure here would poison the caller's transaction:
+        every later statement raises, both fallbacks below are
+        swallowed at debug level, and the caller commits nothing while
+        being told it succeeded. Reproduced on a live PostgreSQL where
+        ``embedding_vec`` was deferred (``migrations.py`` skips the
+        column until the table has an embedded row, which is exactly a
+        fresh runtime database): 47 chunks reported written, 0
+        committed. A nested ``transaction()`` is a savepoint on
+        PostgreSQL (#1726) and a no-op yield on SQLite, so this
+        contains the damage without changing either backend's
+        semantics.
         """
         backend_type = getattr(self.db, "backend_type", None)
         try:
-            if backend_type == "postgres":
-                vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?::vector, "
-                    "embedding_profile_id = ? WHERE chunk_id = ?",
-                    (vec_text, profile_id, chunk_id),
-                )
-            else:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?, "
-                    "embedding_profile_id = ? WHERE chunk_id = ?",
-                    (_serialize_embedding(embedding), profile_id, chunk_id),
-                )
+            async with self.db.transaction():
+                if backend_type == "postgres":
+                    vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?::vector, "
+                        "embedding_profile_id = ? WHERE chunk_id = ?",
+                        (vec_text, profile_id, chunk_id),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?, "
+                        "embedding_profile_id = ? WHERE chunk_id = ?",
+                        (_serialize_embedding(embedding), profile_id, chunk_id),
+                    )
             return
         except Exception as e:
             # Partial-migration shape (only one of the two new columns
@@ -321,23 +470,24 @@ class AsyncRAGStore:
                 "trying each column independently.", chunk_id, e,
             )
 
-        # Best-effort vec-only write.
+        # Best-effort vec-only write. Own savepoint, same reason as above.
         try:
-            if backend_type == "postgres":
-                vec_text = "[" + ",".join(
-                    repr(float(v)) for v in embedding
-                ) + "]"
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ?::vector "
-                    "WHERE chunk_id = ?",
-                    (vec_text, chunk_id),
-                )
-            else:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_vec = ? "
-                    "WHERE chunk_id = ?",
-                    (_serialize_embedding(embedding), chunk_id),
-                )
+            async with self.db.transaction():
+                if backend_type == "postgres":
+                    vec_text = "[" + ",".join(
+                        repr(float(v)) for v in embedding
+                    ) + "]"
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ?::vector "
+                        "WHERE chunk_id = ?",
+                        (vec_text, chunk_id),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_vec = ? "
+                        "WHERE chunk_id = ?",
+                        (_serialize_embedding(embedding), chunk_id),
+                    )
         except Exception as e2:
             logger.debug(
                 "document_chunks.embedding_vec write failed for chunk "
@@ -349,11 +499,12 @@ class AsyncRAGStore:
         # chunk when only the Phase-2 column is missing.
         if profile_id is not None:
             try:
-                await self.db.execute(
-                    "UPDATE document_chunks SET embedding_profile_id = ? "
-                    "WHERE chunk_id = ?",
-                    (profile_id, chunk_id),
-                )
+                async with self.db.transaction():
+                    await self.db.execute(
+                        "UPDATE document_chunks SET embedding_profile_id = ? "
+                        "WHERE chunk_id = ?",
+                        (profile_id, chunk_id),
+                    )
             except Exception as e3:
                 logger.debug(
                     "document_chunks.embedding_profile_id write failed "

@@ -54,6 +54,32 @@ class TestHostConfig:
         assert config.port == 9999
         assert config.bind == "127.0.0.1"
 
+    def test_host_feature_configuration_is_typed_and_preserved(self):
+        """Host extensions receive only explicitly selected config mappings."""
+
+        config = HostConfig(
+            features={
+                "talon": {
+                    "operator_state_path": "/srv/kestrel/talon-state",
+                    "runtime": {"project_parent": "/srv/kestrel/projects"},
+                }
+            }
+        )
+
+        assert config.features["talon"]["operator_state_path"] == (
+            "/srv/kestrel/talon-state"
+        )
+
+    @pytest.mark.parametrize(
+        "reserved",
+        ["agents", "host_bind", "host_port", "observability_tenant_resolver"],
+    )
+    def test_host_feature_configuration_rejects_platform_keys(self, reserved):
+        """Extensions cannot shadow metadata injected by the host runtime."""
+
+        with pytest.raises(ValueError, match="reserved key"):
+            HostConfig(features={reserved: {}})
+
     def test_port_validation_below_range(self):
         """Test port validation rejects ports below 1024."""
         with pytest.raises(ValidationError) as exc_info:
@@ -335,6 +361,38 @@ class TestMultiAgentConfigLoading:
         assert "test_agent" in config.agents
         assert config.agents["test_agent"].port == 8801
 
+    def test_load_host_feature_configuration(
+        self, temp_multi_agent_config, temp_agent_dir
+    ):
+        """Nested host feature mappings survive the TOML parse boundary."""
+
+        config_path = temp_multi_agent_config(
+            {
+                "host": {
+                    "features": {
+                        "talon": {
+                            "operator_state_path": "/srv/kestrel/talon-state",
+                            "runtime": {
+                                "project_parent": "/srv/kestrel/projects"
+                            },
+                        }
+                    }
+                },
+                "agents": {
+                    "test_agent": {
+                        "data_dir": str(temp_agent_dir),
+                        "port": 8801,
+                    }
+                },
+            }
+        )
+
+        config = MultiAgentConfig.from_file(config_path)
+
+        assert config.host.features["talon"]["runtime"] == {
+            "project_parent": "/srv/kestrel/projects"
+        }
+
     def test_load_from_file_with_features(self, temp_multi_agent_config, temp_agent_dir):
         """Test loading config with per-agent feature profiles."""
         config_data = {
@@ -551,6 +609,37 @@ class TestMultiAgentConfigSave:
         assert loaded.agents["test"].port == 8801
         assert loaded.agents["test"].autostart is False
 
+    def test_save_preserves_host_feature_configuration(
+        self, tmp_path, temp_agent_dir
+    ):
+        """A fleet rewrite cannot silently disable host extensions."""
+
+        config = MultiAgentConfig(
+            host=HostConfig(
+                features={
+                    "talon": {
+                        "operator_state_path": "/srv/kestrel/talon-state",
+                        "runtime": {
+                            "project_parent": "/srv/kestrel/projects",
+                            "running_agent_source_root": "/srv/kestrel/source",
+                        },
+                    }
+                }
+            ),
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    port=8801,
+                )
+            },
+        )
+        config_path = tmp_path / "multi_agent.toml"
+
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.host.features == config.host.features
+
     def test_save_preserves_per_agent_identity_export_override(
         self,
         tmp_path,
@@ -571,6 +660,61 @@ class TestMultiAgentConfigSave:
         loaded = MultiAgentConfig.from_file(config_path)
 
         assert loaded.agents["test"].identity_export_dir == Path("continuity")
+
+    def test_save_preserves_per_agent_semantic_inference_profile(
+        self,
+        tmp_path,
+        temp_agent_dir,
+    ):
+        profile = {
+            "enabled": True,
+            "rdfs_version": "1.0.0",
+            "ontology": {
+                "namespace": "kestrel-test",
+                "version": "1",
+                "content_digest": "sha256:test",
+                "compatibility_profile": "semantic-kb-v1",
+            },
+        }
+        config = MultiAgentConfig(
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    port=8801,
+                    semantic_inference=profile,
+                )
+            }
+        )
+
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.agents["test"].semantic_inference == profile
+
+    def test_save_preserves_per_agent_semantic_capability_selection(
+        self,
+        tmp_path,
+        temp_agent_dir,
+    ):
+        selection = {
+            "mode": "stable",
+        }
+        config = MultiAgentConfig(
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    port=8801,
+                    semantic_capabilities=selection,
+                )
+            }
+        )
+
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.agents["test"].semantic_capabilities == selection
 
     def test_save_with_remote_agents(self, tmp_path):
         """Test saving config with remote agents."""

@@ -19,8 +19,22 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
-
 SOURCE_NAME = "channel.message"
+# A selector-visible marker limits the durable cognition consumer to new
+# cursor-owning ingress events.  It prevents registration during upgrade from
+# backfilling every historic channel row into a fresh cognition turn.
+DURABLE_COGNITION_MARKER = "_durable_cognition"
+DURABLE_COGNITION_MARKER_VALUE = "channel-v1"
+# The cursor-owning channel consumer is a Core contract rather than a
+# feature-instance detail: durable redelivery recovery must be able to name
+# this exact consumer without broadening delivery to other subscriptions.
+DURABLE_COGNITION_CONSUMER_ID = "core.channel-cognition-v1"
+# A malformed Telegram record has a canonical bot/update identity but no safe
+# content to route to cognition. Its selected delivery is completed as a
+# durable terminal receipt before the provider cursor can advance.
+DURABLE_TERMINAL_MARKER = "_durable_terminal"
+DURABLE_TERMINAL_MARKER_VALUE = "channel-terminal-v1"
+DURABLE_TERMINAL_CONSUMER_ID = "core.channel-terminal-v1"
 PROMPT_TEMPLATE = (
     Path(__file__).resolve().parents[2]
     / "prompts"
@@ -109,21 +123,33 @@ def build_channel_message_registration() -> SourceRegistration:
 def build_signal_for_channel_message(
     message: ChannelMessage,
     target_agent: str,
+    *,
+    durable_cognition: bool = False,
 ) -> Signal:
+    """Build one normalized channel signal.
+
+    The durable-cognition marker is a negotiated cursor protocol capability,
+    not a property of the generic ``channel.message`` source.  Adding it to
+    Slack/WhatsApp/etc. would materialize a Telegram-owned delivery for an
+    event whose producer cannot retain or acknowledge a cursor.
+    """
     if message.direction != MessageDirection.INBOUND:
         raise ValueError("channel message signals require an inbound message")
+    payload = {
+        "message_id": message.id,
+        "channel_type": message.channel_type,
+        "sender": message.sender,
+        "recipient": message.recipient,
+        "content": message.content,
+        "metadata": message.metadata,
+    }
+    if durable_cognition:
+        payload[DURABLE_COGNITION_MARKER] = DURABLE_COGNITION_MARKER_VALUE
     return Signal(
         source=SOURCE_NAME,
         kind="inbound",
         mode=SignalMode.COGNITION,
-        payload={
-            "message_id": message.id,
-            "channel_type": message.channel_type,
-            "sender": message.sender,
-            "recipient": message.recipient,
-            "content": message.content,
-            "metadata": message.metadata,
-        },
+        payload=payload,
         target_agent=target_agent,
         visibility=Visibility.USER_VISIBLE,
         caller=message.sender,
@@ -133,6 +159,12 @@ def build_signal_for_channel_message(
 
 
 __all__ = [
+    "DURABLE_COGNITION_CONSUMER_ID",
+    "DURABLE_COGNITION_MARKER",
+    "DURABLE_COGNITION_MARKER_VALUE",
+    "DURABLE_TERMINAL_CONSUMER_ID",
+    "DURABLE_TERMINAL_MARKER",
+    "DURABLE_TERMINAL_MARKER_VALUE",
     "PROMPT_TEMPLATE",
     "SOURCE_NAME",
     "build_channel_message_registration",

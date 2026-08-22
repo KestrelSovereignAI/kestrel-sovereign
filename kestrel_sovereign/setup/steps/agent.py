@@ -37,6 +37,8 @@ from kestrel_sovereign.setup.toml_file import read_toml
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_QUICKSTART_AGENT_NAME = "Kestrel"
+
 
 @dataclass(frozen=True)
 class CreateAgentResult:
@@ -234,16 +236,21 @@ def run(ctx: SetupContext) -> None:
 def _prompt_name(ctx: SetupContext, existing: dict) -> str:
     """Pick an agent name. Quickstart picks 'Kestrel' if available, else suffixes."""
     if ctx.flow is Flow.QUICKSTART:
-        candidate = "Kestrel"
+        candidate = DEFAULT_QUICKSTART_AGENT_NAME
         suffix = 1
         while candidate in existing:
             suffix += 1
-            candidate = f"Kestrel{suffix}"
+            candidate = f"{DEFAULT_QUICKSTART_AGENT_NAME}{suffix}"
         return candidate
 
     while True:
         name = ctx.prompter.text(
-            "Agent name", default="Kestrel" if "Kestrel" not in existing else ""
+            "Agent name",
+            default=(
+                DEFAULT_QUICKSTART_AGENT_NAME
+                if DEFAULT_QUICKSTART_AGENT_NAME not in existing
+                else ""
+            ),
         ).strip()
         if not name:
             return ""
@@ -413,11 +420,10 @@ def _build_configured_genesis_auditor(project_dir: Path):
         # free of import-time/current-directory dotenv behavior (#2468).
         import os
 
-        from kestrel_sovereign.cli import _load_target_env
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.paths import reset_cache
+        from kestrel_sovereign.paths import load_project_env, reset_cache
 
-        _load_target_env(project_dir)
+        load_project_env(project_dir)
         # LLMService resolves kestrel.toml during its synchronous constructor.
         # Pin that instant to the explicit create_agent target, then restore the
         # host environment before the first await so concurrent agents cannot

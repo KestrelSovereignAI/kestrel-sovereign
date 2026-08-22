@@ -216,6 +216,9 @@ async def test_public_hybrid_dispatch_posts_envelope_verifying_both_halves():
     feature._host_url = "http://multi-agent"
     feature._api_key = ""
     feature._own_name = "emma"
+    # A volatile rename changes the legacy public display identity, but a
+    # hybrid envelope must retain its signing DID as the authenticated sender.
+    feature.agent._agent_name = "renamed-emma"
     response = MagicMock(status_code=200)
     response.raise_for_status.return_value = None
     response.json.return_value = {
@@ -225,6 +228,19 @@ async def test_public_hybrid_dispatch_posts_envelope_verifying_both_halves():
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     client.post.return_value = response
+    directory_response = MagicMock(status_code=200)
+    directory_response.raise_for_status.return_value = None
+    directory_response.json.return_value = {
+        "agents": [
+            {"id": "emma", "name": "emma", "routing_name": "emma"},
+            {
+                "id": "did:test:meridian",
+                "name": "meridian",
+                "routing_name": "meridian",
+            },
+        ],
+    }
+    client.get.return_value = directory_response
 
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",

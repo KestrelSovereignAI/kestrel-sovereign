@@ -131,6 +131,7 @@ class MemoryManager:
         min_relevance: Optional[float] = None,
         read_only: bool = False,
         return_details: bool = False,
+        session_id: Optional[str] = None,
     ) -> Optional[str | RetrievedMemoryBlock]:
         """
         Retrieve emotionally-weighted memories.
@@ -154,6 +155,12 @@ class MemoryManager:
             return_details: Return the rendered block together with the IDs of
                 rows that fit the token budget. Context assembly uses this to
                 apply rehearsal accounting only after insertion succeeds.
+            session_id: Chat session of the turn this retrieval serves, for
+                span attribution only (#2940) — the retriever's answerability
+                judge makes an LLM call, and without a session that call
+                exported a root span of its own beside every turn. Forwarded
+                only when set, matching ``min_score``, so a retriever double
+                without the parameter is unaffected on the sessionless path.
         """
         if not self.memory_retriever:
             return None
@@ -183,6 +190,8 @@ class MemoryManager:
                 retrieve_kwargs["min_score"] = min_score
             if min_relevance is not None:
                 retrieve_kwargs["min_relevance"] = min_relevance
+            if session_id:
+                retrieve_kwargs["session_id"] = session_id
             # Selection happens below, after formatting and token accounting.
             # Suppress the retriever's eager rehearsal writes so over-budget
             # rows do not gain strength merely for being candidates.
@@ -844,7 +853,8 @@ class MemoryManager:
         counter,
         chunk_size: int = 4000,
         preserve_recent: int = 5,
-        max_depth: int = 3
+        max_depth: int = 3,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Hierarchical compaction using RLM-style recursive summarization.
@@ -864,6 +874,10 @@ class MemoryManager:
             chunk_size: Target characters per chunk
             preserve_recent: Messages to keep verbatim
             max_depth: Maximum recursion depth
+            session_id: Span attribution only (#2940) — the turn this
+                compaction was requested from, so every recursion level's
+                ``llm.generate`` span lands in that turn's Timeline band. It
+                does not scope which messages are compacted.
 
         Returns:
             Result dict with compaction stats
@@ -939,7 +953,8 @@ class MemoryManager:
                 llm_service=llm_service,
                 chunks=chunks,
                 depth=0,
-                max_depth=max_depth
+                max_depth=max_depth,
+                session_id=session_id,
             )
 
             final_summary = (final_summary or "").strip()
@@ -1083,7 +1098,8 @@ class MemoryManager:
         llm_service,
         chunks: List[str],
         depth: int,
-        max_depth: int
+        max_depth: int,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Recursively summarize chunks using tree-structured approach.
@@ -1092,20 +1108,29 @@ class MemoryManager:
         1. Summarize each chunk individually
         2. If multiple summaries remain and depth < max_depth, recurse
         3. Otherwise merge remaining summaries
+
+        ``session_id`` is carried through every level purely so each level's
+        LLM span joins the requesting turn's Timeline band (#2940).
         """
         if depth >= max_depth or len(chunks) <= 1:
             # Base case: final merge
             if len(chunks) == 1:
-                return await self._summarize_chunk(llm_service, chunks[0])
+                return await self._summarize_chunk(
+                    llm_service, chunks[0], session_id=session_id
+                )
             else:
                 combined = "\n---\n".join(chunks)
-                return await self._summarize_chunk(llm_service, combined)
+                return await self._summarize_chunk(
+                    llm_service, combined, session_id=session_id
+                )
 
         # Summarize each chunk
         summaries = []
         for i, chunk in enumerate(chunks):
             logger.debug(f"Summarizing chunk {i+1}/{len(chunks)} at depth {depth}")
-            summary = await self._summarize_chunk(llm_service, chunk)
+            summary = await self._summarize_chunk(
+                llm_service, chunk, session_id=session_id
+            )
             summaries.append(summary)
 
         # If we have many summaries, recurse to merge them
@@ -1119,14 +1144,19 @@ class MemoryManager:
                     paired_chunks.append(summaries[i])
 
             return await self._recursive_summarize(
-                llm_service, paired_chunks, depth + 1, max_depth
+                llm_service, paired_chunks, depth + 1, max_depth,
+                session_id=session_id,
             )
         else:
             # Final merge
             combined = "\n---\n".join(summaries)
-            return await self._summarize_chunk(llm_service, combined)
+            return await self._summarize_chunk(
+                llm_service, combined, session_id=session_id
+            )
 
-    async def _summarize_chunk(self, llm_service, chunk: str) -> str:
+    async def _summarize_chunk(
+        self, llm_service, chunk: str, session_id: Optional[str] = None
+    ) -> str:
         """Generate a summary for a single chunk."""
         prompt = f"""Summarize this conversation segment concisely, preserving:
 - Key facts, decisions, and conclusions
@@ -1147,6 +1177,7 @@ SUMMARY:"""
             system_prompt="You are a conversation summarizer. Create concise summaries.",
             user_prompt=prompt,
             model_override=None,
+            session_id=session_id,
         )
 
         if isinstance(response, str):

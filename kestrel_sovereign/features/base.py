@@ -52,7 +52,8 @@ CONTINUATION_INTENT_RE = re.compile(
     r"one moment|hang on|checking|calling|running|searching|looking up"
     r")\b.{0,80}\b("
     r"check|look|search|call|run|fetch|inspect|open|query|verify|use|try|"
-    r"github|tool|cli|browser|file|repo|issue|database|db|talon"
+    r"github|tool|cli|browser|file|repo|issue|database|db|workflow|job|"
+    r"dispatch|provider"
     r")\b",
     re.IGNORECASE | re.DOTALL,
 )
@@ -143,6 +144,50 @@ def _attach_envelope_parts(
     response.pop("parts", None)
     if clean:
         response["parts"] = clean
+
+
+def _subagent_turn_identity(session_id: Optional[str]):
+    """Name a subagent LLM call's turn session WITHOUT joining its LLM thread.
+
+    ``generate_with_messages(session_id=...)`` carries two different facts on
+    one parameter: *which Timeline band this span belongs to* and *which
+    provider conversation to continue*. For the orchestrator's own turn they
+    are the same session. For a feature subagent they are not — it runs inside
+    the user's turn (so its spans belong in that band, #2940) but it is a
+    separate LLM conversation with its own system prompt and its own tool
+    palette.
+
+    Passing the turn's session on the wire would therefore make continuation-
+    backed providers treat the subagent as the user's conversation. Concretely
+    on ``openai:plan``: ``CodexAdapter._ensure_thread`` keys its thread cache on
+    ``session_id`` and fingerprints ``(model, instructions, tools)``, so the
+    subagent's differing prompt/tools would evict the user conversation's
+    thread ("starting fresh thread" — losing its server-side history), cache
+    the subagent's thread under the user's session id, and get evicted right
+    back by the next user-facing turn. That is the same corruption the
+    ``per-turn-reflection::<session>`` namespacing exists to prevent, and the
+    #2841/#2845 continuation-loss class.
+
+    So the session rides :class:`LLMInvocationContext` instead — the carrier
+    the span and per-session metering already read (``_llm_request_span`` is
+    handed ``invocation_context.session_id``), and which nothing provider-
+    facing consumes. Returns ``None`` for a sessionless call so the resolver
+    keeps using ambient identity untouched; a returned context sets only the
+    session, and ``resolve_invocation_context`` merges the ambient
+    companion/user/correlation fields and OR-s ``redact_content`` over it.
+    """
+    if not session_id:
+        return None
+    # Function-local like every other ``kestrel_sovereign`` import in this
+    # module: features.base is imported very early in the discovery chain, so
+    # its module-level surface is kept to ``kestrel_sdk`` (the #1792 class of
+    # re-entrancy). This particular target is cycle-free on its own —
+    # ``kestrel_sovereign.llm`` is a namespace package and invocation_context
+    # imports only logging_config — so the local import is convention, not a
+    # workaround.
+    from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+
+    return LLMInvocationContext(session_id=session_id)
 
 
 @runtime_checkable
@@ -240,6 +285,7 @@ class Feature(_SdkFeature):
         tools: List[Dict[str, Any]],
         tool_executor: Optional[Any] = None,
         model_override: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Any:
         """Give a feature subagent one more step when it narrates but emits no tool.
 
@@ -247,6 +293,14 @@ class Feature(_SdkFeature):
         so codex-routed repair turns don't hit the same "requires a
         tool_executor callback" error the initial subagent call was
         wired around (codex round 1 P2 on #1461 follow-up).
+
+        ``session_id`` is the session of the turn that dispatched the subagent,
+        resolved once in :meth:`execute_as_subagent` and handed down. A repair
+        turn is part of the same turn as the call it repairs, so it belongs in
+        that turn's Timeline band; without it the repair span exported
+        sessionless and became a band of its own (#2940). It travels as the
+        invocation *identity*, never as the wire ``session_id`` — see
+        :func:`_subagent_turn_identity` for why that distinction is load-bearing.
         """
         content = getattr(response, "content", "") or ""
         if not tools or not self._signals_unfinished_tool_work(content):
@@ -261,6 +315,7 @@ class Feature(_SdkFeature):
             tools=tools if tools else None,
             tool_executor=tool_executor,
             model_override=model_override,
+            invocation_context=_subagent_turn_identity(session_id),
         )
 
     # =========================================================================
@@ -283,8 +338,8 @@ class Feature(_SdkFeature):
         registered any of the following and then hit a later boot-phase failure
         must not leave feature-bound handlers / closures / loops stranded:
 
-        * dispatcher **signal sources** and ``task:`` / ``talon:`` **wait
-          providers** (P2);
+        * dispatcher **signal sources** and ``task:`` / other provider-defined
+          **wait providers** (P2);
         * long-lived **background tasks** it started via
           :meth:`_track_owned_background_task` — e.g. Peers' hourly expiry sweep,
           which the agent's global reap only cancels at FULL shutdown, so
@@ -376,8 +431,9 @@ class Feature(_SdkFeature):
     # ------------------------------------------------------------------
     # Wait-provider ownership (#2522, identity-aware stack in P3)
     #
-    # Features register a ``Waitable`` provider (``task:``, ``talon:``) with the
-    # agent's WaitRegistry in ``post_all_features_loaded``. The registry keeps a
+    # Features register a ``Waitable`` provider (for example ``task:`` or a
+    # workflow-owned kind) with the agent's WaitRegistry in
+    # ``post_all_features_loaded``. The registry keeps a
     # per-kind ownership STACK, so a feature only needs to record the exact
     # provider it pushed; on ``shutdown()`` (runtime disable AND boot rollback)
     # it removes that provider from the stack by IDENTITY, and the registry lets
@@ -689,16 +745,27 @@ class Feature(_SdkFeature):
         """Return the graph node ID used to persist this feature's config."""
         return f"feature_config:{self.name}"
 
-    async def load_persisted_config(self) -> Optional[Dict]:
+    async def load_persisted_config(
+        self, *, raise_on_error: bool = False
+    ) -> Optional[Dict]:
         """Load persisted config from agent storage (graph store).
 
-        Returns the stored config dict, or None if nothing is persisted.
+        Returns the stored config dict, or None if nothing is persisted.  The
+        default remains best-effort for existing feature implementations;
+        callers that must not confuse a failed durable read with an absent
+        config can request the original storage exception.
         """
         storage = getattr(self.agent, "storage", None)
         if storage is None:
             return None
+        # The graph-store contract is asynchronous. A non-async ``get_node``
+        # surface is not a configured graph store, so retain the historical
+        # absent-storage result rather than treating it as a durable read.
+        get_node = getattr(storage, "get_node", None)
+        if not inspect.iscoroutinefunction(get_node):
+            return None
         try:
-            node = await storage.get_node(self._config_node_id())
+            node = await get_node(self._config_node_id())
             if node is not None:
                 config = node.properties.get("config")
                 if isinstance(config, str):
@@ -708,8 +775,10 @@ class Feature(_SdkFeature):
                 if isinstance(disabled, list):
                     self.disabled_skills = set(disabled)
                 return config
-        except Exception as e:
-            logger.warning(f"Failed to load persisted config for {self.name}: {e}")
+        except Exception:
+            if raise_on_error:
+                raise
+            logger.warning("Failed to load persisted config for %s", self.name)
         return None
 
     async def persist_config(self, config: Dict) -> None:
@@ -960,6 +1029,43 @@ class Feature(_SdkFeature):
             }
         }
 
+    def _turn_session_id(self) -> Optional[str]:
+        """The chat session of the turn this feature call is running for.
+
+        Feature work is dispatched from inside a turn but is not handed the
+        turn's session, so anything that must name it — a wake routed back to
+        the originating window, the Timeline band an ``llm.*`` span belongs to
+        (#2940) — has to ask the agent. Goes through the turn lifecycle's
+        :meth:`~kestrel_sovereign.agent.turn_lifecycle.TurnLifecycleMixin.get_turn_bound_session_id`
+        rather than reading ``agent._active_session_id`` directly: that
+        attribute is agent-global, so unattended work (a cron tick, a task
+        detached from a turn that has since exited) would otherwise read
+        whichever *concurrent* chat turn happens to be in flight. The lifecycle
+        pairs it with the task-local turn id and answers None unless the caller
+        owns the live turn.
+
+        None outside a turn, for a session-less turn, and for any agent double
+        that does not implement the accessor — all of which mean "no chat
+        window", which callers treat as system-initiated.
+        """
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return None
+        resolve = getattr(agent, "get_turn_bound_session_id", None)
+        if not callable(resolve):
+            # Compatibility for older agents while the public SDK-facing
+            # lifecycle accessor rolls out.
+            resolve = getattr(agent, "_get_turn_bound_session_id", None)
+        if not callable(resolve):
+            return None
+        try:
+            session_id = resolve()
+        except Exception:  # pragma: no cover - defensive; stub agents
+            return None
+        if isinstance(session_id, str) and session_id.strip():
+            return session_id.strip()
+        return None
+
     async def execute_as_subagent(
         self,
         task: str,
@@ -1052,12 +1158,25 @@ class Feature(_SdkFeature):
                 self._make_feature_inline_tool_executor(parts_sink=subagent_parts)
                 if feature_tools else None
             )
+            # The subagent reasons on behalf of the turn that dispatched it, so
+            # every LLM call it makes — this one AND the continuation/repair
+            # turns the tool loop drives — joins that turn's session band
+            # (#2940). Resolved once here: ``_turn_session_id`` answers from the
+            # turn lifecycle, and a multi-step subagent can outlive the turn
+            # binding, so re-resolving deeper in the loop would let a long run
+            # start stamping None halfway through and split the band anyway.
+            turn_session_id = self._turn_session_id()
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=feature_tools if feature_tools else None,
                 tool_executor=tool_executor,
                 model_override=model_override,
+                # Safe as the plain parameter here, unlike on the continuation
+                # calls below: ``generate`` never forwards ``session_id`` to an
+                # adapter (it feeds only the invocation context and the span),
+                # so it carries no provider-continuation meaning to collide with.
+                session_id=turn_session_id,
             )
 
             # Log what we got back
@@ -1082,6 +1201,7 @@ class Feature(_SdkFeature):
                 tool_executor=tool_executor,
                 model_override=model_override,
                 parts_sink=subagent_parts,
+                session_id=turn_session_id,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -1135,31 +1255,44 @@ class Feature(_SdkFeature):
         — without this, hook-gated policies were bypassed by the
         inline-execution path).
 
-        NESTED cross-task reentry (#2672 review P1 follow-up). This executor is
-        BUILT while ``execute_as_subagent`` runs on the PARENT inline executor's
-        reader task, INSIDE that executor's ``bind_transition_lock_reentry`` scope,
-        so the owning turn's transition-lock reentry token is visible in the
-        ContextVar here. But the codex app-server dispatches THIS subagent's OWN
-        inline tools on a SEPARATE, freshly-spawned reader task that does NOT inherit
-        that binding — so a nested durable-identity write (rename / description /
-        discovery history / user name / SOUL) invoked by the subagent would
+        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This
+        executor is BUILT while ``execute_as_subagent`` runs on the PARENT inline
+        executor's reader task, INSIDE that executor's
+        ``bind_transition_lock_reentry`` scope, so the owning turn's
+        transition-lock reentry token is visible in the ContextVar here. But the
+        codex app-server dispatches THIS subagent's OWN inline tools on a
+        SEPARATE, freshly-spawned reader task that does NOT inherit that binding
+        — so a nested durable-identity write (rename / description / discovery
+        history / user name / SOUL) invoked by the subagent would
         re-acquire the transition lock from a token-less foreign task and DEADLOCK
         against the turn that holds it (the turn is blocked awaiting the app-server
         result; the write is blocked acquiring the lock the turn holds). Capture the
         bound token here and re-present it around the subagent tool call — the exact
         cross-task seam ``OrchestratorEngineMixin._make_inline_tool_executor``
         installs for the parent turn — so that one write re-enters the owning turn's
-        span. ``None`` (anthropic path, or a subagent not nested under a held turn
-        lock) is a no-op, so an unrelated background task grants no token and the
-        privacy trust boundary is unchanged."""
+        span. The parent executor also carries the lifecycle-authorized turn/session
+        binding; capture and re-present that binding here so a nested lifecycle tool
+        (notably ``request_restart``) can name the originating window after this
+        second reader-task boundary. An executor built outside a live turn captures
+        an explicit unbound value, so neither binding grants authority to unrelated
+        background work.
+        """
+        from kestrel_sovereign.agent.turn_lifecycle import (
+            bind_turn_session,
+            capture_turn_session_binding,
+        )
         from kestrel_sovereign.storage.privacy_wrapper import (
             bind_transition_lock_reentry,
             current_bound_reentry_token,
         )
         transition_reentry_token = current_bound_reentry_token()
+        turn_session_binding = capture_turn_session_binding(self.agent)
 
         async def _exec(name: str, args: Dict[str, Any]):
-            with bind_transition_lock_reentry(transition_reentry_token):
+            with (
+                bind_transition_lock_reentry(transition_reentry_token),
+                bind_turn_session(turn_session_binding),
+            ):
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
@@ -1384,6 +1517,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         tool_executor: Optional[Any] = None,
         model_override: Optional[str] = None,
         parts_sink: Optional[List[dict]] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -1404,6 +1538,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         into it, so ``execute_as_subagent`` can return them
                         by contract. The loop itself never drains the ambient
                         collector — that is the parent turn's buffer.
+            session_id: Session of the turn that dispatched the subagent,
+                        resolved once by ``execute_as_subagent``. Every
+                        continuation and repair call this loop makes is part of
+                        that same turn, so each stamps it and lands in one
+                        Timeline band; a multi-step subagent otherwise split its
+                        turn across a band per step (#2940). Applied as the
+                        invocation identity — NOT the wire ``session_id``, which
+                        is a provider continuation key the subagent must not
+                        share (:func:`_subagent_turn_identity`).
 
         Returns:
             Final text response after all tool calls are processed
@@ -1431,6 +1574,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 tools,
                 tool_executor=tool_executor,
                 model_override=model_override,
+                session_id=session_id,
             )
             if isinstance(response, str):
                 return response
@@ -1494,6 +1638,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 tools=tools if tools else None,
                 tool_executor=tool_executor,
                 model_override=model_override,
+                # Turn session as invocation identity, not as the wire session:
+                # the subagent shares the turn's Timeline band but must NOT
+                # share its provider thread (:func:`_subagent_turn_identity`).
+                invocation_context=_subagent_turn_identity(session_id),
             )
 
             # If response is string or has no more tool calls, we're done
@@ -1507,6 +1655,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     tools,
                     tool_executor=tool_executor,
                     model_override=model_override,
+                    session_id=session_id,
                 )
                 if isinstance(response, str):
                     return response

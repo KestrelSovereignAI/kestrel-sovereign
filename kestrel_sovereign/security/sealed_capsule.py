@@ -85,7 +85,6 @@ from kestrel_sovereign.security.kem_suite import (
     get_kem_suite,
 )
 from kestrel_sovereign.security.multikey import (
-    multibase_to_kem_public_key,
     public_key_to_multibase,
 )
 

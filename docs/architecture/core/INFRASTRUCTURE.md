@@ -7,8 +7,8 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: historical
 owner: architecture
 canonical: false
 generated: false

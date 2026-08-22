@@ -19,7 +19,6 @@ layer (kestrel_sovereign.storage.sync) for cloud replication of either.
 """
 
 import logging
-from typing import Any, Optional
 
 import asyncpg
 

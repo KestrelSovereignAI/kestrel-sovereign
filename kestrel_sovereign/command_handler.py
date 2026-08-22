@@ -5,14 +5,22 @@ Extracts command parsing and dispatch logic from the main agent,
 making the agent class cleaner and commands easier to test.
 """
 
-import os
 import logging
 import inspect
-from typing import Optional, Dict, Any, Callable, Awaitable
+from typing import Optional, Dict, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from kestrel_sovereign.command_policy import (
+    RECOVERY_COMMANDS as CANONICAL_RECOVERY_COMMANDS,
+    SOVEREIGN_COMMANDS as CANONICAL_SOVEREIGN_COMMANDS,
+    requires_sovereign_authority,
+)
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PRIVACY_TRANSITION_RETRY_MESSAGE,
+    PrivacyViolationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +137,10 @@ class CommandHandler:
         for spec in BUILTIN_COMMAND_SPECS:
             self._command_handlers[spec["cmd"]] = getattr(self, spec["handler"])
     
-    # Commands that require sovereign (API key) authority to execute.
-    SOVEREIGN_COMMANDS = frozenset([
-        "!reanchor-constitution",
-        "!safe-mode",
-    ])
+    # Compatibility aliases for consumers that enumerate command policy. The
+    # immutable module policy remains authoritative for routing and auth.
+    RECOVERY_COMMANDS = CANONICAL_RECOVERY_COMMANDS
+    SOVEREIGN_COMMANDS = CANONICAL_SOVEREIGN_COMMANDS
 
     async def handle(self, user_input: str, caller=None) -> Optional[str]:
         """
@@ -153,8 +160,7 @@ class CommandHandler:
         command = parts[0].lower()
 
         # Authority gate: sovereign-only commands require API key auth
-        if command in self.SOVEREIGN_COMMANDS:
-            from kestrel_sovereign.auth import CallerContext
+        if requires_sovereign_authority(command):
             if caller is None or not caller.is_sovereign:
                 identity = caller.identity if caller else "unknown"
                 logging.warning(
@@ -315,7 +321,6 @@ class CommandHandler:
         - Other iterables
         """
         import json
-        from kestrel_sovereign.llm.model_metadata import ModelInfo
 
         # Handle list of ModelInfo objects
         if isinstance(result, list) and result and hasattr(result[0], 'provider'):
@@ -527,6 +532,8 @@ class CommandHandler:
             except ValueError:
                 valid_modes = ", ".join([m.value for m in PrivacyMode])
                 return f"Invalid privacy mode. Valid modes are: {valid_modes}"
+            except PrivacyViolationError:
+                return PRIVACY_TRANSITION_RETRY_MESSAGE
         return self.agent.privacy_agent.get_status()
     
     async def _cmd_confirm_privacy(self, user_input: str) -> str:
@@ -547,8 +554,11 @@ class CommandHandler:
                 f"Use !confirm-privacy-mode {pending.value} to confirm, or "
                 f"!privacy {pending.value} is superseded by choosing another mode."
             )
-        result = await self.agent.confirm_privacy_transition()
-        return result.message
+        try:
+            result = await self.agent.confirm_privacy_transition()
+            return result.message
+        except PrivacyViolationError:
+            return PRIVACY_TRANSITION_RETRY_MESSAGE
 
     def _cmd_get_privacy_mode(self, user_input: str) -> str:
         """Handle !get-privacy-mode command. Delegates to PrivacyAgent."""
@@ -614,8 +624,6 @@ class CommandHandler:
             !compact --check     - Check if compaction is recommended
         """
         import re
-
-        parts = user_input.split()
 
         # Parse --keep N
         preserve_recent = 10  # default

@@ -4,6 +4,9 @@ tier), not the lower-level MemoryConsolidator.run_consolidation()."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -34,6 +37,104 @@ async def test_consolidate_routes_through_memory_system():
     agent.memory_system.consolidate.assert_awaited_once()
     agent.memory_consolidator.run_consolidation.assert_not_awaited()
     assert result["episodes_deleted"] == 4  # forgetting count flows through
+
+
+@pytest.mark.asyncio
+async def test_nightly_sleep_inherits_memory_system_consolidation_timeout(monkeypatch):
+    """The production sleep path must use the chokepoint's hard deadline."""
+    from kestrel_sovereign.storage.memory_system import MemorySystem
+
+    entered = asyncio.Event()
+    unwound = asyncio.Event()
+
+    async def run_consolidation():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            unwound.set()
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.memory_system.load_section",
+        lambda _section: {"memory_consolidation_timeout_seconds": 0.02},
+    )
+    memory_system = MemorySystem(storage=SimpleNamespace(), agent_id="did:test:sleep")
+    memory_system.consolidator = SimpleNamespace(
+        run_consolidation=run_consolidation
+    )
+    agent = _Agent()
+    agent.memory_system = memory_system
+    agent.sleep_hooks = []
+
+    report = await agent.sleep(
+        skip_export=True,
+        skip_reflection=True,
+    )
+
+    assert entered.is_set()
+    assert unwound.is_set()
+    assert report.success is False
+    assert report.error == "consolidation_failed"
+
+
+@pytest.mark.asyncio
+async def test_nightly_sleep_timeout_preserves_prior_retention_failure():
+    """A consolidation deadline cannot hide an earlier retention failure."""
+    from kestrel_sovereign.storage.memory_system import (
+        MemoryConsolidationTimeoutError,
+    )
+
+    class _FailingSweepStorage:
+        async def sweep_expired_governed_semantic_artifacts(self):
+            raise RuntimeError("private retention detail")
+
+    agent = _Agent()
+    agent.storage = _FailingSweepStorage()
+    agent.sleep_hooks = []
+    agent._consolidate_memories = AsyncMock(
+        side_effect=MemoryConsolidationTimeoutError(0.02)
+    )
+
+    report = await agent.sleep(skip_export=True, skip_reflection=True)
+
+    assert report.success is False
+    assert report.error == (
+        "semantic_artifact_expiry_sweep_failed; consolidation_failed"
+    )
+    assert "private retention detail" not in report.error
+
+
+@pytest.mark.asyncio
+async def test_nightly_sleep_logs_invalid_timeout_cause(monkeypatch, caplog):
+    """A bad operator value must remain visible after sleep records failure."""
+    from kestrel_sovereign.storage.memory_system import MemorySystem
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.memory_system.load_section",
+        lambda _section: {"memory_consolidation_timeout_seconds": 0},
+    )
+    memory_system = MemorySystem(storage=SimpleNamespace(), agent_id="did:test:sleep")
+    memory_system.consolidator = SimpleNamespace(run_consolidation=AsyncMock())
+    agent = _Agent()
+    agent.memory_system = memory_system
+    agent.sleep_hooks = []
+
+    with caplog.at_level(logging.ERROR):
+        report = await agent.sleep(
+            skip_export=True,
+            skip_reflection=True,
+        )
+
+    record = next(
+        record for record in caplog.records
+        if record.message == "Consolidation failed"
+    )
+    assert report.error == "consolidation_failed"
+    assert record.exc_info is not None
+    assert (
+        "retrieval.memory_consolidation_timeout_seconds must be positive"
+        in str(record.exc_info[1])
+    )
 
 
 class _PreHook:

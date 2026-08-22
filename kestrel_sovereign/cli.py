@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
     LocalAgentConfig,
@@ -80,31 +81,6 @@ def _get_project_dir() -> Path:
     return project_dir()
 
 
-def _load_target_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> None:
-    """Load the resolved project home's ``.env`` into ``os.environ``.
-
-    Target-aware replacement for the import-time ``load_dotenv()`` that
-    ``inception_service`` used to run (which loaded the *current-directory*
-    ``.env`` and could seed the wrong ``KESTREL_DATA_KEY`` — #2468). Uses
-    python-dotenv's own parser (``dotenv_values``) — the same one the runtime
-    uses — and ``setdefault`` semantics so a genuinely-exported value stays
-    authoritative (equivalent to ``load_dotenv(override=False)``).
-
-    ``exclude`` names keys to skip. The data key is excluded when this runs
-    *before* custody resolution so that seeding the persisted value into
-    ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
-    """
-    env_path = project_dir / ".env"
-    if not env_path.exists():
-        return
-    from dotenv import dotenv_values
-
-    for key, value in dotenv_values(str(env_path)).items():
-        if value is None or key in exclude:
-            continue
-        os.environ.setdefault(key, value)
-
-
 def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
     """Resolve the single effective ``KESTREL_DATA_KEY`` for this target home
     and make it authoritative in the process, mirroring the wizard ``keys`` step
@@ -132,7 +108,7 @@ def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
         ensure_effective_data_key,
     )
 
-    _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+    load_project_env(project_dir, exclude=(DATA_KEY_ENV,))
     _, conflict, _, _ = ensure_effective_data_key(
         project_dir / ".env", generate_if_missing=True
     )
@@ -236,24 +212,6 @@ def cmd_create(args) -> int:
     print(f"   Added to {MULTI_AGENT_CONFIG_FILENAME}")
     print(f"\u2705 Agent created. Start with: kestrel start {name}")
     return 0
-
-
-def _get_agent_did(agent_dir: Path) -> Optional[str]:
-    """Read agent DID from the database without starting the full agent."""
-    db_path = agent_dir / "kestrel_prime.db"
-    if not db_path.exists():
-        return None
-    try:
-        import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.execute(
-            "SELECT node_id FROM nodes WHERE node_type = 'agent' LIMIT 1"
-        )
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else None
-    except Exception:
-        return None
 
 
 def _detect_running_agent_server(
@@ -409,6 +367,14 @@ def cmd_shell(args) -> int:
     for this agent; falls back to an in-process agent instance if not.
     """
     project_dir = _get_project_dir()
+    # The in-process fallback builds a whole agent here — its own LLMService,
+    # its own storage — so this command needs the home's environment, and it
+    # used to get it as a side effect of constructing that LLMService. That is
+    # exactly the accident #2896 removed. Without it `KESTREL_DATA_KEY` is
+    # absent (the key hierarchy has no `.env` fallback), the first encrypted
+    # read raises, and the shell reports a decryption problem for what is an
+    # env-loading regression.
+    load_project_env(project_dir)
     multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     local_agents = multi_agent.get_local_agents()
 
@@ -533,7 +499,10 @@ async def _run_shell(agent_dir: Path, args) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.security.encryption import DecryptionError
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.kestrel_agent import (
+        KestrelAgent,
+        await_agent_shutdown_completion,
+    )
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
     import logging
@@ -606,15 +575,23 @@ async def _run_shell(agent_dir: Path, args) -> int:
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
     finally:
+        cancelled = False
         try:
             await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
             print("Agent deactivated.")
         except asyncio.TimeoutError:
-            print(f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s), forcing exit.")
+            print(
+                f"Agent shutdown timed out ({SHUTDOWN_TIMEOUT}s); "
+                "waiting for durable cleanup."
+            )
         except asyncio.CancelledError:
+            cancelled = True
             print("Agent shutdown cancelled.")
         except Exception:
             print("Agent deactivated (with errors).")
+        cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError()
 
     return 0
 
@@ -926,6 +903,85 @@ def cmd_constitution_reanchor(args) -> int:
     )
 
     project_dir = _get_project_dir()
+
+    # Load the *target home's* environment before anything resolves a
+    # database. The agent's backend, its DSN, and its data key all live in
+    # that .env; without this the reanchor target is decided by whatever the
+    # operator happens to have exported, so the same command against the same
+    # agent could write PostgreSQL from one shell and the local anchor from
+    # another — and on a PostgreSQL host the anchor is a database the runtime
+    # never reads (#2890). ``setdefault`` semantics keep a genuinely-exported
+    # value authoritative.
+    #
+    # NOT ``_apply_target_data_key_custody``: that generates a data key when
+    # the home has none, which is an inception concern and wrong for a repair.
+    # The trade-off is real — this seeds a persisted ``KESTREL_DATA_KEY``
+    # without detecting an exported⇄persisted conflict (#2468), so an operator
+    # with a stale exported key can still write a constitution blob the agent
+    # cannot decrypt. That hazard predates this change; what changes is that
+    # the key now gets loaded at all.
+    load_project_env(project_dir)
+
+    # ...but the *database target* is resolved separately, with the launcher's
+    # precedence, where the project ``.env`` outranks a conflicting export.
+    # ``load_project_env``'s ``setdefault`` is the opposite, and the two
+    # disagreeing is not academic: ``kestrel doctor`` reads the database the
+    # agents will actually open (``paths.spawned_agent_env``, the body of
+    # ``ProcessManager._load_env``). With a stale DSN exported in the shell,
+    # doctor would report drift in database A while the repair it prescribes
+    # rewrote database B — leaving the finding standing and modifying a copy
+    # nobody reads. A finding and its remedy have to mean the same database.
+    #
+    # Targeting somewhere else deliberately is still possible; it just has to
+    # be deliberate, which is what these explicit arguments are.
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
+    # The database and the key that opens it must come from the same place.
+    # ``load_project_env`` above leaves an exported ``KESTREL_DATA_KEY``
+    # authoritative while the target above is the file's — so a shell still
+    # holding another home's credentials would encrypt the new constitution and
+    # its artifact into database A under key B, and the agent, opening A with
+    # A's key, would fail decryption at its next integrity audit. That is not a
+    # wrong answer an operator can see; it is a governance record nobody can
+    # read again.
+    #
+    # This refuses rather than picking a side, for the reason #2468 excludes
+    # the data key from the general load: a key conflict is the operator's to
+    # resolve, and a tool that silently chooses one has destroyed the evidence
+    # that there was a choice.
+    from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
+
+    # A plain inequality, deliberately: ``spawned_agent_env`` starts from
+    # ``os.environ`` and lets the file overwrite it, so ``launch_key`` already
+    # *is* the key the agent will get, and the two differ only where the file
+    # has its own say. Requiring both to be truthy missed the case where the
+    # file sets ``KESTREL_DATA_KEY=`` explicitly: the agent then gets an empty
+    # key while this command keeps the exported one and writes blobs the agent
+    # cannot read. Empty is an answer, not an absence — the same lesson the
+    # DSN resolution learned two rounds earlier, in a place it had not been
+    # carried to.
+    # The *effective* key for this named agent, not the fleet-wide one:
+    # ``ProcessManager`` applies ``KESTREL_DATA_KEY_<NAME>`` over it when it
+    # starts the agent, so comparing the fleet key would reject a correct
+    # per-agent setup — and, worse, accept a wrong one.
+    from kestrel_sovereign.paths import spawned_agent_data_key
+
+    exported_key = spawned_agent_data_key(os.environ, args.agent_name)
+    launch_key = spawned_agent_data_key(launch_env, args.agent_name)
+    if exported_key != launch_key:
+        print(
+            f"error: {DATA_KEY_ENV} in the environment does not match the one "
+            f"in {project_dir / '.env'}.\n"
+            f"  The agent opens its database with the file's key; a reanchor "
+            f"run now would write governance the agent cannot decrypt.\n"
+            f"  Unset {DATA_KEY_ENV} to use the project's key, or correct the "
+            f"file, then re-run.",
+            file=sys.stderr,
+        )
+        return 2
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -945,10 +1001,11 @@ def cmd_constitution_reanchor(args) -> int:
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the multi_agent's PID file rather
     # than probing the network — same source-of-truth as `kestrel stop`.
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+    holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder:
         print(
             f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            f"Run `{holder}` first to avoid DB corruption.",
             file=sys.stderr,
         )
         return 2
@@ -967,8 +1024,29 @@ def cmd_constitution_reanchor(args) -> int:
             sovereign_trust_root_path=(
                 Path(args.trust_root) if args.trust_root else None
             ),
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
         )
     )
+
+    # Every outcome names the database it describes. A reanchor that does not
+    # say where it read or wrote is the ambiguity #2890 is about.
+    target = f"  Target:  {result.target_label}"
+    if result.backup_path is not None:
+        backup_line = f"  Backup:  {result.backup_path}"
+    else:
+        backup_line = f"  Backup:  {result.backup_unavailable_reason or '(none)'}"
+    if result.target_backend == "sqlite":
+        planned_backup = (
+            f"The DB will be backed up to "
+            f"{result.db_path.name}.backup-<timestamp> before any write."
+        )
+    else:
+        planned_backup = (
+            f"Governance for this agent lives in {result.target_label}; there "
+            f"is no local file to back up. Snapshot that database first if you "
+            f"want to be able to undo a successful reanchor."
+        )
 
     if result.error:
         print(f"error: {result.error}", file=sys.stderr)
@@ -976,7 +1054,8 @@ def cmd_constitution_reanchor(args) -> int:
     if result.unchanged:
         print(
             f"{result.agent_name}: already anchored to current constitution "
-            f"({result.new_hash[:12]}…) — nothing to do."
+            f"({result.new_hash[:12]}…) — nothing to do.\n"
+            f"{target}"
         )
         return 0
     if result.drift_unforced:
@@ -989,21 +1068,20 @@ def cmd_constitution_reanchor(args) -> int:
                 f"{result.agent_name}: governance-edge drift detected.\n"
                 f"  Anchor: {result.new_hash[:12]}… (current)\n"
                 f"  governed_by edge(s): {stale or '(none)'}\n"
+                f"{target}\n"
                 f"\n"
                 f"The fail-closed integrity audit (proof 2) will safe-mode "
                 f"this agent at next boot. Re-run with --force to repair the "
-                f"governance edge. The DB will be backed up to "
-                f"{result.db_path.name}.backup-<timestamp> before any write."
+                f"governance edge. {planned_backup}"
             )
             return 1
         print(
             f"{result.agent_name}: constitution drift detected.\n"
             f"  Stored: {result.old_hash[:12]}…\n"
             f"  File:   {result.new_hash[:12]}… ({result.canonical_path})\n"
+            f"{target}\n"
             f"\n"
-            f"Re-run with --force to update the agent's anchor. "
-            f"The DB will be backed up to "
-            f"{result.db_path.name}.backup-<timestamp> before any write."
+            f"Re-run with --force to update the agent's anchor. {planned_backup}"
         )
         return 1
     # Reanchored (or same-hash governance repair).
@@ -1013,7 +1091,8 @@ def cmd_constitution_reanchor(args) -> int:
             f"  Anchor:  {result.new_hash[:12]}… (unchanged)\n"
             f"  Removed: {', '.join(f'{t[:12]}…' for t in result.stale_edge_targets) or '(none)'}\n"
             f"  Source:  {result.canonical_path}\n"
-            f"  Backup:  {result.backup_path}"
+            f"{target}\n"
+            f"{backup_line}"
         )
         return 0
     print(
@@ -1021,7 +1100,8 @@ def cmd_constitution_reanchor(args) -> int:
         f"  Old: {result.old_hash[:12]}…\n"
         f"  New: {result.new_hash[:12]}…\n"
         f"  Source:  {result.canonical_path}\n"
-        f"  Backup:  {result.backup_path}"
+        f"{target}\n"
+        f"{backup_line}"
     )
     return 0
 
@@ -1040,6 +1120,21 @@ def cmd_constitution_anchor_overlay(args) -> int:
     from kestrel_sovereign.setup.overlay_anchor import anchor_overlay
 
     project_dir = _get_project_dir()
+    # Same rule as reanchor (#2890): the agent's own .env decides which
+    # database this anchor lands in. The overlay hash is read by the runtime,
+    # so writing the local file on a PostgreSQL host leaves every Amendment IX
+    # grant in the overlay permanently denied while reporting success.
+    load_project_env(project_dir)
+
+    # ...and the database target comes from the launcher's precedence, exactly
+    # as it does for `constitution reanchor`. Without this, `kestrel doctor`
+    # could report an overlay problem in the PostgreSQL the agents open while
+    # this command wrote the local SQLite file and reported success — a
+    # finding and its prescribed remedy naming different databases (#2892).
+    launch_env = spawned_agent_env(project_dir)
+    runtime_backend = launch_env.get("KESTREL_DB_BACKEND")
+    runtime_dsn = launch_env.get("KESTREL_DATABASE_URL")
+
     multi_agent = MultiAgentConfig.load(
         project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
     )
@@ -1053,17 +1148,23 @@ def cmd_constitution_anchor_overlay(args) -> int:
         )
         return 2
 
-    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+    holder = _agent_holder(project_dir, args.agent_name, agents[args.agent_name])
+    if holder:
         print(
             f"error: agent '{args.agent_name}' appears to be running. "
-            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            f"Run `{holder}` first to avoid DB corruption.",
             file=sys.stderr,
         )
         return 2
 
     agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
     result = asyncio.run(
-        anchor_overlay(agent_name=args.agent_name, agent_dir=agent_dir)
+        anchor_overlay(
+            agent_name=args.agent_name,
+            agent_dir=agent_dir,
+            runtime_backend=runtime_backend,
+            runtime_dsn=runtime_dsn,
+        )
     )
 
     if result.error:
@@ -1072,14 +1173,16 @@ def cmd_constitution_anchor_overlay(args) -> int:
     if result.unchanged:
         print(
             f"{result.agent_name}: overlay already anchored "
-            f"({result.new_hash[:12]}…) — nothing to do."
+            f"({result.new_hash[:12]}…) — nothing to do.\n"
+            f"  Target:  {result.target_label}"
         )
         return 0
     print(
         f"{result.agent_name}: constitution overlay anchored.\n"
         f"  Old: {(result.old_hash[:12] + '…') if result.old_hash else '(none)'}\n"
         f"  New: {result.new_hash[:12]}…\n"
-        f"  Overlay: {result.overlay_path}"
+        f"  Overlay: {result.overlay_path}\n"
+        f"  Target:  {result.target_label}"
     )
     return 0
 
@@ -1245,21 +1348,52 @@ def cmd_migrate_encryption(args) -> int:
     return cli_run(args)
 
 
-def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
-    """Best-effort check that the agent process isn't holding the DB."""
+def _agent_holder(project_dir, agent_name, agent_cfg) -> Optional[str]:
+    """Which process is holding this agent's database, if any.
+
+    Returns the remedy that clears it — the command the caller should print —
+    or None when nothing is holding it.
+
+    Two processes can be serving an agent, and only one of them writes an
+    ``agent.pid``. In the default in-process mode ``kestrel start`` writes
+    ONLY ``logs/.host.pid``: every agent runs inside that one host, so a
+    per-agent check finds no file and reports the agent stopped while the
+    host is actively serving its SQLite. That is the #2920 guard failure,
+    measured on a live host — four agents up 22h under one shared PID, all
+    four reported "not running".
+
+    The remedy differs by mode, which is why this returns the command rather
+    than a bool: ``kestrel stop <agent>`` cannot stop an agent that has no
+    process of its own, so prescribing it in in-process mode gives an
+    operator advice that can never work, and every retry refuses again.
+    """
     try:
         from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
         resolved_dir = (project_dir / agent_cfg.data_dir).resolve()
-        pid_file = ProcessManager.agent_pid_file(resolved_dir)
-        pid = ProcessManager.read_pid(pid_file)
-        if pid is None:
-            return False
-        return ProcessManager.is_process_running(pid)
+        # The same verified read ``kestrel stop`` uses, so the guard and the
+        # remedy it prescribes cannot disagree about whether an agent is up.
+        # ``is_running`` counts an undecidable record as running: it names a
+        # process that IS alive, and waving a guard past a live agent is the
+        # failure that costs something (#2995).
+        agent_pid = ProcessManager.agent_pid_file(resolved_dir)
+        if ProcessManager.read_pid_record(agent_pid).is_running:
+            return f"kestrel stop {agent_name}"
+
+        host_pid = project_dir / "logs" / ".host.pid"
+        if ProcessManager.read_pid_record(host_pid).is_running:
+            return "kestrel stop"
+
+        return None
     except Exception:
         # If we can't tell, err on the side of letting the user proceed
         # — they get a clear error from the storage layer if it's locked.
-        return False
+        return None
+
+
+def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
+    """Whether anything is holding this agent's database."""
+    return _agent_holder(project_dir, agent_name, agent_cfg) is not None
 
 
 def cmd_setup(args) -> int:
@@ -1310,9 +1444,13 @@ def cmd_setup(args) -> int:
     if not args.reset and flow is not Flow.CHECK:
         from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
 
-        _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+        load_project_env(project_dir, exclude=(DATA_KEY_ENV,))
 
-    return run_wizard(ctx, only_step=args.step)
+    return run_wizard(
+        ctx,
+        only_step=args.step,
+        core_only=getattr(args, "core_only", False),
+    )
 
 
 def _maybe_first_run_setup(project_dir: Path) -> Optional[int]:
@@ -1571,13 +1709,23 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     # (_extension_install_run, _query_agent_feature_catalog) are called back
     # through the ``cli`` module inside cli_features so the patch takes effect.
     _extension_install_run,
+    _install_backend_argv,
+    _install_commands,
+    _render_command,
+    _render_commands,
+    _render_shell,
     _query_agent_feature_catalog,
     _editable_install_path,
+    _direct_url_provenance,
+    _from_index,
+    _file_url_to_path,
+    _core_install_shape,
+    CoreInstallGuard,
     _installed_extension_distributions,
     _registry_info_for,
     _load_host_manifest,
     _host_manifest_path,
-    _parse_pip_installed_version,
+    _installed_version,
     _pip_spec,
     _toml_basic_string,
 )
@@ -1756,9 +1904,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_p.add_argument(
         "step", nargs="?",
-        choices=["keys", "llm", "integrations", "agent", "verify", "talon"],
         help="Run only this step (default: run all in order). "
-             "Optional steps (talon) only run when named explicitly.",
+             "Installed feature steps and optional steps only run when named "
+             "explicitly.",
     )
     setup_p.add_argument(
         "--quickstart", action="store_true",
@@ -1767,6 +1915,10 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument(
         "--check", action="store_true",
         help="Report readiness only, never write or prompt",
+    )
+    setup_p.add_argument(
+        "--core-only", action="store_true",
+        help="Run only built-in setup/recovery steps without loading providers",
     )
     setup_p.add_argument(
         "--reset", action="store_true",
@@ -1966,6 +2118,17 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_extensions import register_cli_extensions
     register_cli_extensions(subparsers)
 
+    # kestrel help [command] — a real command, not just a flag, so users
+    # aren't required to already know `-h`/`--help` syntax to ask for help.
+    help_p = subparsers.add_parser("help", help="Show help for kestrel or a specific command")
+    help_p.add_argument(
+        "topic", nargs="?", help="Command to show help for (e.g. `kestrel help feature`)",
+    )
+
+    # Stashed so `kestrel help <topic>` can look up the topic's own parser
+    # without re-walking the registration above.
+    parser._kestrel_subparsers = subparsers  # type: ignore[attr-defined]
+
     return parser
 
 
@@ -1994,6 +2157,17 @@ def main() -> int:
     if not args.command:
         parser.print_help()
         return 1
+
+    if args.command == "help":
+        topic = getattr(args, "topic", None)
+        subparsers = getattr(parser, "_kestrel_subparsers", None)
+        topic_parser = subparsers.choices.get(topic) if subparsers and topic else None
+        if topic and topic_parser is None:
+            print(f"kestrel help: no such command '{topic}'\n")
+            parser.print_help()
+            return 1
+        (topic_parser or parser).print_help()
+        return 0
 
     from kestrel_sovereign.cli_release import cmd_release
     from kestrel_sovereign.cli_deploy import cmd_deploy

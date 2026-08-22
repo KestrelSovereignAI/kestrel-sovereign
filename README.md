@@ -16,7 +16,21 @@ Kestrel is a pre-1.0 framework for creating autonomous AI agents with cryptograp
 
 `pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, local guarded compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
 
-Voice, MCP, GitHub App, wallet, council, observability, and similar specialized capabilities are **installable feature packages**. RunPod, Vast.ai, GCP Compute, voice cloud backends, and storage backends are **provider packages** that register with provider-specific entry points rather than the feature entry-point group. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md).
+Package ownership has four distinct runtime forms:
+
+| Boundary | Ownership and install behavior |
+|---|---|
+| **Bundled Feature** | A Feature lifecycle class discovered from `kestrel_sovereign/features/`; it ships in `kestrel-sovereign` and needs no separate install. |
+| **Extracted Feature package** | A separate distribution, such as Talon, voice, MCP, GitHub, wallet, council, or observability, that registers Feature classes through `kestrel_sovereign.features`. |
+| **Provider package** | A separate backend distribution, such as RunPod, Vast.ai, GCP Compute, a voice cloud backend, or a storage backend, that implements a provider contract through a provider-specific entry point. It is not a Feature lifecycle package. |
+| **Standalone tool** | An independent control surface. `kestrel-talon` is the standalone coding engine and is modeled separately from its independently installed `kestrel-feature-talon` coordinator. |
+
+The base install also contains runtime components that are not Feature
+lifecycle classes—for example, `PrivacyAgent`. The registry calls these
+`bundled-component` rather than pretending they are Feature packages. The
+canonical ownership contract and live in-tree inventory are in
+[`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the machine-readable catalog is
+[`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
 
 ## 🚀 Quick Start
 
@@ -24,6 +38,11 @@ Voice, MCP, GitHub App, wallet, council, observability, and similar specialized 
 - Python 3.11-3.14
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
+- **Linux: glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+, RHEL 9+). The
+  post-quantum signing dependency publishes `manylinux_2_34` wheels only, so on
+  an older glibc — Ubuntu 20.04, Debian 11, RHEL 8 — installation falls back to
+  building it from source and requires a Rust toolchain. macOS and Windows are
+  unaffected.
 
 ### Install uv
 
@@ -78,6 +97,13 @@ uv run kestrel start            # starts every agent with autostart=true
 uv run kestrel start Kestrel    # if you only ran --quickstart
 uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autostart)
 ```
+
+Installed features may contribute setup steps through the SDK. Their complete
+ordering is validated before any step runs, and contributed default steps may
+not precede the built-in `keys` custody boundary. Use `kestrel setup --core-only`
+to recover built-in configuration without importing provider code. `setup
+--check` is always core-only because Python plugins are not sandboxed and
+therefore cannot be trusted to honor a read-only check contract.
 
 > **Refreshing later — use the `kestrel` CLI, not raw `uv sync`.** The `uv sync` above is only for this first install. To pull in upstream changes afterward, run **`kestrel update`** (pull → install → reconcile → feature sync → restart). Plain `uv sync` makes the venv match `pyproject.toml` exactly and therefore **prunes out-of-tree feature packages** (`kestrel-feature-*`, voice/provider packages); `kestrel update` restores them in the same pass. See [Pulling in upstream changes](#pulling-in-upstream-changes-kestrel-update).
 
@@ -136,7 +162,7 @@ The Quick Start above clones the repo so you have demos, examples, and the `kest
 ```bash
 # 1. Install the CLI (uv tool install is preferred — `kestrel`
 #    lands on PATH in an isolated venv. Plain `pip install
-#    kestrel-sovereign` works too, into whichever venv is active.)
+#    kestrel-sovereign` works too, inside an activated venv.)
 uv tool install kestrel-sovereign
 
 # 2. Pick where Kestrel keeps your data. Either set KESTREL_HOME
@@ -149,6 +175,17 @@ export KESTREL_HOME="$HOME/kestrel-data"
 kestrel setup --quickstart
 kestrel start
 ```
+
+The default uv compute executor requires the Kestrel process itself to run
+inside a Python `venv` or `virtualenv`. This lets it pin an interpreter outside
+Kestrel's runtime while `uv run --isolated --no-project` creates a fresh,
+project-free script environment, so scripts cannot inherit Kestrel's installed
+packages. `uv tool install` and the source checkout's `uv sync` satisfy this
+automatically. For a plain pip installation, create and activate a Python
+virtual environment first. A system or `--user` install can run Kestrel, but
+the uv compute executor deliberately reports unavailable. A Conda environment
+alone is also insufficient because it does not provide the distinct
+`sys.prefix`/`sys.base_prefix` boundary this executor validates.
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 
@@ -242,6 +279,63 @@ kestrel update --allow-dirty         # bypass the old refusal a single time
 
 After the new code lands in your checkout, `kestrel update` alone handles subsequent refreshes.
 
+#### Scheduler protocol-v2 cutover is not an ordinary update
+
+If this database has ever been served by a pre-protocol-v2 scheduler, do **not**
+run a normal rolling `kestrel update` or restart an old image after a failed
+first v2 start. The first v2 process deliberately fences legacy-visible
+schedules and waits for a drain acknowledgement; an old binary against that
+fenced database can leave work dormant or duplicate an occurrence. This applies
+to both local SQLite and shared PostgreSQL deployments.
+
+Stop every legacy poller and schedule writer, take a backend-appropriate backup,
+perform the controlled v2 acknowledgement, and use forward-only recovery unless
+you deliberately restore the complete pre-cutover database while all writers
+remain stopped. The exact local, systemd, PyPI, SQLite, and PostgreSQL commands
+are in the [scheduler protocol-v2 deployment runbook](docs/deployment/README.md#scheduler-protocol-v2-upgrade-sqlite-and-postgresql).
+
+Shared PostgreSQL hosts pre-seed database-global scheduler provenance and every
+resolvable configured DID before parallel agent runners start. That lets a new
+DID join a known fresh-v2 fleet safely, but an absent/unknown provenance marker
+is always treated as a legacy migration; do not seed or unfence scheduler rows
+manually.
+
+#### SDK 0.36 release cascade
+
+Core requires `kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37`; the
+`observability` extra carries the same SDK line with `metrics`. This is a
+runtime contract for durable isolated execution, provider-neutral private
+inference leases (including bounded owner-scoped idle renewal), and private
+host ingress, plus feature-owned operator contribution contracts. It is not a
+preference that a downstream package may relax. The Core-owned release-cascade
+contract is:
+
+| Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
+|---|---|---|
+| Frinz | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.36.0,<0.37` | External prerequisite; Core does not claim observability has changed. |
+
+Verify the published Frinz and observability constraints and tests before the
+Core publish. Do not weaken Core's requirement to make an older sibling
+resolver succeed.
+
+The Core dependency-contract test verifies the base and observability
+declarations and lockfile resolve the same SDK line. It cannot validate another
+repository's working tree, so the downstream release verification remains an
+explicit release gate owned by those repositories.
+
+#### Telegram acknowledged-ingress release order
+
+Core 0.52.1 adds the host-authenticated initialize capability
+`channel-inbound-acknowledgement-v1` for the Telegram polling bridge. Telegram
+0.1.3 requires that capability before it will start polling, preventing an old
+Core from mis-parsing its durable ACK envelope and leaving a child poller
+blocked. Publish Core 0.52.1 first, then publish Telegram 0.1.3; do not relax
+the Telegram requirement to make the reverse order installable.
+
+Windows base installs also include `tzdata`, so default `UTC` and named-IANA
+scheduler time zones work without optional Pandas or Phoenix extras.
+
 ### Feature management (`kestrel feature`)
 
 Kestrel ships a self-contained core with the local storage, identity, governance, and built-in LLM-routing dependencies needed to run an agent. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.
@@ -257,7 +351,14 @@ kestrel feature disable <name>         # Disable without uninstalling
 kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
-The canonical inventory of features lives in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
+The canonical inventory and package-boundary contract live in
+[`KESTREL_FEATURES.md`](KESTREL_FEATURES.md). The runtime registry records the
+same taxonomy in `boundary`: `bundled`, `bundled-component`,
+`feature-package`, `provider-package`, or `standalone-tool`. Its `package` is
+always the owning distribution/install target for that row; `core` remains a
+compatibility flag and is true only for the two bundled categories. Catalog
+status `available` means “known but not detected in this environment,” not that
+an external distribution was verified reachable.
 
 #### Keeping features installed across `uv sync` (`kestrel feature sync`)
 
@@ -480,7 +581,7 @@ into stale release metrics.
 
 ### Optional or actively evolving surfaces
 
-- **Voice, wallets/economics, channels, observability, and specialized provider backends** are feature or provider packages, not guarantees of the base install.
+- **Voice, wallets/economics, observability, channel transports, and specialized provider backends** are feature or provider packages, not guarantees of the base install. The generic `ChannelFeature` coordination surface itself is bundled.
 - **RunPod, Vast.ai, and GCP Compute** are provider integrations whose live behavior depends on credentials and the selected package.
 - **Training/LoRA** supplies core protocol and local-adapter seams; cloud adapters are evolving separately.
 - **GitHub code introspection** supports its shipped retrieval and issue-tool surface. The deeper static-analysis design in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) is not an implementation claim.
@@ -675,6 +776,11 @@ Each backup produces a `backup_artifact` node in the graph linked to the agent w
 
 `KESTREL_DATA_KEY` (a Fernet key or passphrase) is the master key for Kestrel's **application-layer** encryption at rest. It is **not** whole-database encryption. With it set, Kestrel transparently encrypts conversation-history rows, stored file blobs, agent identity private keys (`SecureKeyStorage`, AES-256-GCM), and agent-resource bodies such as the SOUL (`AgentResourceStore`, Fernet). It does **not** cover saved-item (`saved_items.content`) or RAG document-chunk (`document_chunks.content`) bodies — those are plaintext columns today, with application-layer encryption tracked in [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677). Set it before first run:
 
+The accepted, not-yet-implemented design for closing those two gaps is
+[Saved-item and RAG content encryption](docs/architecture/security/MEMORY_CONTENT_ENCRYPTION.md).
+That ADR is a rollout contract, not a claim that the current columns are
+encrypted.
+
 ```bash
 export KESTREL_DATA_KEY=$(python - <<'PY'
 from cryptography.fernet import Fernet
@@ -683,7 +789,7 @@ PY
 )
 ```
 
-Encryption is transparent on read/write. Remote backups (the IPFS/Filecoin export tiers) are encrypted by default, deriving their key from the same `KESTREL_DATA_KEY` master key — there is no separate backup key, and the export fails if `KESTREL_DATA_KEY` is unset. Local exports (`storage_tier="local"`) are written **unencrypted**. For production, set `KESTREL_DATA_KEY` from an env/KMS secret rather than the dev placeholder.
+Encryption is transparent on read/write. Sovereignty exports are encrypted by default on **every** storage tier — local included — deriving their key from the same `KESTREL_DATA_KEY` master key; there is no separate backup key. An export requested with `encrypt=True` is refused outright when `KESTREL_DATA_KEY` is unset, never silently downgraded to plaintext; pass `encrypt=False` to deliberately accept an unencrypted backup. For production, set `KESTREL_DATA_KEY` from an env/KMS secret rather than the dev placeholder.
 
 What is actually encrypted at rest today:
 
@@ -697,7 +803,7 @@ What is actually encrypted at rest today:
 | RAG document-chunk bodies (`document_chunks.content`) | **No** — plaintext column | Same gap — [#2677](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2677) |
 | Embeddings (vectors) | No | Numeric vectors, not reversible ciphertext — their presence is not encryption |
 | Remote backups (IPFS/Filecoin export) | Yes, by default | Encrypted from the `KESTREL_DATA_KEY` master key; export fails if the key is unset |
-| Local export (`storage_tier="local"`) | **No** — written unencrypted | — |
+| Local export (`storage_tier="local"`) | Yes, by default | Same portable per-content key as the remote tiers; `encrypt=False` opts out, and `encrypt=True` with no key is refused rather than downgraded |
 | Identity export packages | N/A — not storage-at-rest encryption | Signed, permissioned continuity packages — see [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md) |
 | Whole database file (SQLCipher) | **No** — not wired in this release | `KESTREL_DB_KEY` is not read by the runtime today; the SQLite backend opens plain (`aiosqlite`) databases |
 

@@ -35,6 +35,23 @@ jobs:
     name: CI gate
     uses: ./.github/workflows/ci.yml
     secrets: inherit
+    # This block must be a SUPERSET of every `permissions:` any job in ci.yml
+    # declares. The workflow-level `contents: read` above caps the called
+    # workflow, and GitHub validates nested-job permissions at run-creation
+    # time — before `if:` is evaluated, so an unreachable job still counts.
+    # Exceeding the cap makes the whole publish run die with
+    # `startup_failure` and zero jobs: no CI gate, no clean-install gate, no
+    # build, no PyPI upload, and no logs to diagnose from. Verified by
+    # reproduction; a nested job requesting `actions: write` behind
+    # `if: false` was enough to trigger it.
+    #
+    # tests/unit/test_ci_workflow_permissions.py asserts this stays a
+    # superset, so adding a `permissions:` block in ci.yml fails a unit test
+    # instead of the next release.
+    permissions:
+      contents: read
+      pull-requests: read  # lint-and-imports: `gh pr list` in the dedupe gate
+      actions: write       # cancel-expensive-tiers-when-unit-fails
     # Pin the gate to the same revision `build` checks out, so a manual
     # workflow_dispatch with `inputs.ref` can't validate one SHA and publish
     # another. On a tag push `inputs.ref` is empty and this is the tag ref.

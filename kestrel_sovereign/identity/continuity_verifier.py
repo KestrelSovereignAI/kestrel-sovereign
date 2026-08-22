@@ -27,10 +27,8 @@ from kestrel_sovereign.storage.async_graph_store import (
 from .identity_package import (
     AgentIdentityPackage,
     MigrationRecord,
-    SubstrateType,
     create_migration_id,
 )
-from .signing import sign_package, verify_package_signature
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase

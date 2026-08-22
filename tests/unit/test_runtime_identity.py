@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import pytest
 
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from kestrel_sovereign.identity.runtime_identity import (
     AgentIdentity,
     IdentityReadinessError,
@@ -249,15 +251,54 @@ def test_succession_present_but_hybrid_keys_missing_raises(
         load_agent_identity(key_id, storage_dir)
 
 
-def test_succession_predecessor_mismatch_raises(post_ceremony_agent_on_disk):
-    """Tamper with the on-disk DID document so the legacy DID no
-    longer matches the succession statement's predecessor — load
-    must raise."""
-    storage_dir, key_id, legacy_did, _, _ = post_ceremony_agent_on_disk
+def test_succession_document_did_binding_mismatch_raises(post_ceremony_agent_on_disk):
+    """A self-certifying legacy DID cannot be relabelled on disk."""
+    storage_dir, key_id, _, _, _ = post_ceremony_agent_on_disk
     did_path = storage_dir / f"{key_id}.json"
     doc = json.loads(did_path.read_text())
     doc["id"] = "did:pkh:eip155:1:0x0000000000000000000000000000000000000000"
     did_path.write_text(json.dumps(doc))
+    with pytest.raises(RuntimeIdentityError, match="address does not match"):
+        load_agent_identity(key_id, storage_dir)
+
+
+def test_legacy_loader_rejects_mismatched_private_key_and_did_document(
+    legacy_agent_on_disk,
+):
+    """A local key must prove control of the document's self-certifying DID."""
+    storage_dir, key_id, _, _ = legacy_agent_on_disk
+    attacker = Secp256k1Suite().generate_keypair()
+    attacker_address = public_key_to_ethereum_address(attacker.public_key)
+    attacker_did = f"did:pkh:eip155:1:{attacker_address}"
+    did_path = storage_dir / f"{key_id}.json"
+    doc = json.loads(did_path.read_text())
+    doc["id"] = attacker_did
+    doc["publicKey"][0].update(
+        {
+            "id": f"{attacker_did}#keys-1",
+            "controller": attacker_did,
+            "publicKeyHex": attacker.public_key.public_bytes(
+                encoding=Encoding.X962,
+                format=PublicFormat.UncompressedPoint,
+            ).hex(),
+        }
+    )
+    did_path.write_text(json.dumps(doc))
+
+    with pytest.raises(RuntimeIdentityError, match="does not match the DID document"):
+        load_agent_identity(key_id, storage_dir)
+
+
+def test_succession_predecessor_mismatch_raises(post_ceremony_agent_on_disk):
+    """A valid legacy document cannot be paired with another succession."""
+    storage_dir, key_id, _, _, _ = post_ceremony_agent_on_disk
+    succession_path = next((storage_dir / "successions").glob("*.json"))
+    statement = json.loads(succession_path.read_text())
+    statement["predecessor_did"] = (
+        "did:pkh:eip155:1:0x0000000000000000000000000000000000000000"
+    )
+    succession_path.write_text(json.dumps(statement))
+
     with pytest.raises(RuntimeIdentityError, match="predecessor.*loaded legacy DID"):
         load_agent_identity(key_id, storage_dir)
 

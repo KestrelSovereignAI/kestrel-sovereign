@@ -9,27 +9,37 @@ environment variable KESTREL_DB_BACKEND.
 """
 import asyncio
 import io
+import json
 import os
 import logging
 import tarfile
 import tempfile
 import shutil
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, UTC
 from typing import Dict, Optional, List, Any, Union
 
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
-from .async_conversation_store import AsyncConversationStore
+from .async_conversation_store import AsyncConversationStore, _rows_affected
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
+from .async_assertion_store import (
+    AsyncAssertionStore,
+    _AssertionTenantCapability,
+    _create_agent_bound_assertion_store,
+)
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
     AgentResourceVersion,
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
-from .db import DatabaseBackend, SQLiteBackend, create_backend
+from .semantic_binding import SemanticAssertionBinding
+from .session_id_column import column_session_id
+from kestrel_sovereign.knowledge import Visibility
+from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +125,10 @@ class AsyncStorage:
         config: Optional[Dict[str, Any]] = None,
         agent_id: str = "",
         llm_service: Optional[Any] = None,
+        _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
+        semantic_capabilities=None,
+        _artifact_clock=None,
+        cold_read: bool = False,
     ):
         """
         Initialize AsyncStorage.
@@ -131,7 +145,36 @@ class AsyncStorage:
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
+        # Semantic-vector provider authority is captured at host construction;
+        # mutating the public chat-service attribute later cannot substitute a
+        # feature-supplied callable or relabel a remote route as local.
+        self.__semantic_vector_llm_service = llm_service
+        if _artifact_clock is not None and not callable(_artifact_clock):
+            raise TypeError("_artifact_clock must be callable")
+        self._artifact_clock = _artifact_clock or (lambda: datetime.now(UTC))
+        # A semantic runtime is agent-owned, not a caller-selected option on
+        # individual maintenance/corpus requests.  Keep its RDF/SPARQL codec
+        # alive with storage so the pins used by live sleep work are the pins
+        # that were accepted during boot.
+        from kestrel_sovereign.knowledge.capabilities import SemanticRuntimeCapabilities
 
+        if semantic_capabilities is not None and not isinstance(
+            semantic_capabilities, SemanticRuntimeCapabilities
+        ):
+            raise TypeError("semantic_capabilities must be SemanticRuntimeCapabilities")
+        self.semantic_capabilities = (
+            semantic_capabilities or SemanticRuntimeCapabilities.stable()
+        )
+        try:
+            self.semantic_capabilities.validate()
+            self._semantic_rdf_codec = self.semantic_capabilities.create_rdf_codec()
+        except ValueError as exc:
+            # This is the line an operator actually reads when agent boot
+            # fails; leaving the cause in the traceback alone is what made a
+            # CRLF-smudged checkout look like an unexplained total failure.
+            raise ValueError(
+                f"semantic runtime capability is unavailable: {exc}"
+            ) from exc
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
             self._backend = backend
@@ -141,49 +184,122 @@ class AsyncStorage:
             # Use config dict
             self._backend = create_backend(config)
             self.db_path = config.get('db_path')
-        elif backend == "postgres" or os.getenv("KESTREL_DB_BACKEND", "").lower() == "postgres":
+        elif backend == "postgres" or (
+            backend is None
+            and os.getenv("KESTREL_DB_BACKEND", "").lower() == "postgres"
+        ):
             # PostgreSQL mode
             pg_dsn = dsn or os.getenv("KESTREL_DATABASE_URL")
             if pg_dsn:
-                self._backend = create_backend({"backend": "postgres", "dsn": pg_dsn})
+                self._backend = create_backend(
+                    {"backend": "postgres", "dsn": pg_dsn, "cold_read": cold_read}
+                )
             else:
                 # Fall back to individual env vars
-                self._backend = create_backend({"backend": "postgres"})
+                self._backend = create_backend(
+                    {"backend": "postgres", "cold_read": cold_read}
+                )
         else:
-            # Default: SQLite mode
+            # Default or explicit SQLite mode.  An explicit backend is an
+            # ownership boundary: multi-agent hosts use local SQLite identity
+            # stores while their runtime data lives in PostgreSQL, so the
+            # environment default must not redirect those reads.
             if db_path is None:
                 agent_data_dir = get_default_agent_data_dir()
                 db_path = os.path.join(agent_data_dir, "kestrel_prime.db")
-                os.makedirs(agent_data_dir, exist_ok=True)
+                # A cold read must be able to answer "there is nothing here"
+                # without bringing the directory into existence to say so. The
+                # backend already refuses to mkdir; the facade was creating it
+                # first and making that refusal moot.
+                if not cold_read:
+                    os.makedirs(agent_data_dir, exist_ok=True)
 
             self.db_path = db_path
-            self._backend = SQLiteBackend(db_path)
+            # SQLite serialises writers at the FILE level, so an inspection
+            # that opens read-write can contend with a running agent even
+            # though it never writes (#2920). A cold read is refused by SQLite
+            # itself, not merely by convention.
+            self._backend = SQLiteBackend(db_path, cold_read=cold_read)
 
+        if _assertion_tenant_capability is not None:
+            if type(_assertion_tenant_capability) is not _AssertionTenantCapability:
+                raise TypeError(
+                    "assertion tenant capability must be issued by the storage tenant resolver"
+                )
+            if _assertion_tenant_capability.tenant_id != agent_id:
+                raise ValueError("assertion tenant capability does not match AsyncStorage.agent_id")
+            self._assertion_tenant_capability = _assertion_tenant_capability
+        else:
+            self._assertion_tenant_capability = None
+
+        # The mode the caller actually asked for, from whichever channel they
+        # used. The ``config=`` path carries ``cold_read`` in the dict while
+        # this keyword keeps its default.
+        requested_cold_read = bool(
+            config.get("cold_read", cold_read) if config is not None else cold_read
+        )
+        # Prefer what the backend reports, so the facade and the connection
+        # cannot disagree — a facade that thinks it is writable runs
+        # migrations against an immutable connection. Backends that do not
+        # carry the flag at all (PostgreSQL, where a second connection is
+        # ordinary and there is no file lock to contend for) fall back to the
+        # request, so an inspection is never silently upgraded to a writer.
+        self.cold_read = bool(
+            getattr(self._backend, "cold_read", requested_cold_read)
+        )
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None
         self.destructive_audit: Optional[DestructiveAuditLog] = None
         self.graph: Optional[AsyncGraphStore] = None
+        # Canonical semantic facts are intentionally separate from the property
+        # graph.  ``graph`` remains an application-resource/projection seam;
+        # ``assertions`` owns assertion lifecycle and provenance.
+        # Assertion scope is capability-bearing.  Keep it private so exposing
+        # this facade's database cannot be combined with a public constructor
+        # to forge another tenant's semantic authority.
+        self._assertions: Optional[AsyncAssertionStore] = None
         self.rag: Optional[AsyncRAGStore] = None
         self.agent_resources: Optional[AgentResourceStore] = None
         self._initialized = False
 
     @classmethod
-    def from_backend(cls, backend: DatabaseBackend) -> "AsyncStorage":
-        """Create AsyncStorage from an existing DatabaseBackend."""
-        return cls(backend=backend)
+    def from_backend(
+        cls,
+        backend: DatabaseBackend,
+        *,
+        agent_id: str = "",
+        _assertion_tenant_capability: Optional[_AssertionTenantCapability] = None,
+    ) -> "AsyncStorage":
+        """Create storage from a shared backend without minting tenant authority.
+
+        ``agent_id`` continues to scope the pre-existing file, graph, RAG, and
+        conversation stores.  Canonical assertions additionally require the
+        opaque capability issued by the host's authenticated tenant resolver;
+        a backend handle plus a caller-selected string is deliberately
+        insufficient.
+        """
+        return cls(
+            backend=backend,
+            agent_id=agent_id,
+            _assertion_tenant_capability=_assertion_tenant_capability,
+        )
 
     @classmethod
-    async def create_sqlite(cls, db_path: str) -> "AsyncStorage":
-        """Factory method to create and initialize SQLite-backed storage."""
-        storage = cls(db_path=db_path)
+    async def create_sqlite(cls, db_path: str, *, agent_id: str = "") -> "AsyncStorage":
+        """Create SQLite storage without granting semantic tenant authority.
+
+        Assertion authority is issued only by the authenticated agent boot
+        resolver and then injected through the private capability seam.
+        """
+        storage = cls(db_path=db_path, agent_id=agent_id)
         await storage.initialize()
         return storage
 
     @classmethod
-    async def create_postgres(cls, dsn: str) -> "AsyncStorage":
-        """Factory method to create and initialize PostgreSQL-backed storage."""
-        storage = cls(backend="postgres", dsn=dsn)
+    async def create_postgres(cls, dsn: str, *, agent_id: str = "") -> "AsyncStorage":
+        """Create PostgreSQL storage without granting semantic tenant authority."""
+        storage = cls(backend="postgres", dsn=dsn, agent_id=agent_id)
         await storage.initialize()
         return storage
 
@@ -191,6 +307,32 @@ class AsyncStorage:
     def backend_type(self) -> str:
         """Get the backend type: 'sqlite' or 'postgres'."""
         return self._backend.backend_type if self._backend else "unknown"
+
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Minimum time an outer guard must reserve for storage close.
+
+        Backends may opt into this narrow shutdown contract when their close
+        lifecycle owns resources that outlive a public close acknowledgement
+        (SQLite's aiosqlite worker is one example).  Backends without that
+        requirement retain the prior zero-extra-budget behavior.
+        """
+        value = getattr(self._backend, "minimum_close_timeout_s", 0.0)
+        return value if isinstance(value, (int, float)) and value > 0 else 0.0
+
+    @property
+    def minimum_sqla_factory_close_timeout_s(self) -> float:
+        """Reservation for the optional cached SQLAlchemy pre-close phase."""
+        if self.db is None:
+            return 0.0
+        return self.db.minimum_sqla_factory_close_timeout_s
+
+    @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Reservation if feature shutdown creates a SQLite factory late."""
+        if self.db is None:
+            return 0.0
+        return self.db.minimum_potential_sqla_factory_close_timeout_s
 
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
@@ -201,11 +343,36 @@ class AsyncStorage:
     async def initialize(self) -> None:
         """Initialize the storage (connect to database)."""
         if not self._initialized:
+            previous_db = self.db
+            if previous_db is not None:
+                if previous_db.connection_retirement_pending is True:
+                    raise ConnectionError(
+                        "Cannot initialize storage while a previous SQLAlchemy "
+                        "engine or database connection is still retiring"
+                    )
+                # A failed close retains its database-level lifecycle owner.
+                # Finalize and detach it before replacing ``self.db`` so the
+                # old factory cannot become an unowned stale worker source.
+                await previous_db.finalize_retired_sqla_factory()
             await self._backend.connect()
             self.db = AsyncDatabase(self._backend)
-            await self.db._init_schema()
+            # A cold read inspects a database it must not alter, so it runs
+            # neither of the two write-oriented steps a normal open performs:
+            # ``_init_schema`` issues migrations and DDL, and the destructive
+            # audit log CREATES a second database file beside the one being
+            # inspected. On a current schema those would fail against an
+            # immutable connection; the point is that they must not be
+            # attempted at all. A cold reader reads what is already there, and
+            # records nothing — it performs no destructive operation to audit.
+            if not self.cold_read:
+                await self.db._init_schema()
             self.db._initialized = True
-            if self.backend_type == "sqlite" and self.db_path and self.db_path != ":memory:":
+            if (
+                not self.cold_read
+                and self.backend_type == "sqlite"
+                and self.db_path
+                and self.db_path != ":memory:"
+            ):
                 self.destructive_audit = DestructiveAuditLog(audit_db_path_for(self.db_path))
                 await self.destructive_audit.initialize()
             self.files = AsyncFileStore(self.db, agent_id=self.agent_id)
@@ -216,6 +383,15 @@ class AsyncStorage:
                 destructive_audit=self.destructive_audit,
             )
             self.graph = AsyncGraphStore(self.db, agent_id=self.agent_id)
+            if self._assertion_tenant_capability is not None:
+                self._assertions = _create_agent_bound_assertion_store(
+                    self.db,
+                    tenant_capability=self._assertion_tenant_capability,
+                    artifact_clock=self._artifact_clock,
+                )
+                self._assertions._bind_semantic_recall_derivative_revoker(  # noqa: SLF001 - storage composition seam
+                    self._withdraw_semantic_recall_derivatives
+                )
             self.rag = AsyncRAGStore(
                 self.db,
                 llm_service=self.llm_service,
@@ -230,9 +406,27 @@ class AsyncStorage:
     
     async def close(self) -> None:
         """Close the storage connection."""
+        try:
+            if self.db:
+                await self.db.close()
+        finally:
+            # ``AsyncDatabase.close`` closes the primary backend before it
+            # reports a cached SQLAlchemy-factory failure.  Mark the facade
+            # closed, but preserve ``self.db`` as the lifecycle owner: a later
+            # initialize is fenced while that database retains any live worker
+            # and may replace it only after retirement completes.
+            self._initialized = False
+
+    async def dispose_cached_sqla_factory(self) -> None:
+        """Dispose the optional SQLAlchemy engine before backend close.
+
+        This is intentionally separate from :meth:`close` for whole-agent
+        shutdown: its bounded pre-close phase cannot consume the reservation
+        that SQLite needs to drain its primary aiosqlite worker.  Ordinary
+        callers still get both phases by calling ``close()`` alone.
+        """
         if self.db:
-            await self.db.close()
-        self._initialized = False
+            await self.db.dispose_cached_sqla_factory()
     
     async def __aenter__(self):
         await self.initialize()
@@ -240,6 +434,29 @@ class AsyncStorage:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+        # Validate the cold read only if the block succeeded. Raising here over
+        # an exception already in flight would replace the real failure with a
+        # complaint about the connection it happened on. Placed in ``__aexit__``
+        # rather than at the end of each caller's block because these blocks
+        # return early in several branches, and a check the caller can skip by
+        # returning is not a check.
+        if exc_type is None:
+            self.assert_cold_read_still_valid()
+        # Reported even when the block failed: the operator needs to know the
+        # store was left with WAL state regardless of why the read ended.
+        checker = getattr(self._backend, "warn_if_wal_state_was_stranded", None)
+        if checker is not None:
+            checker()
+
+    def assert_cold_read_still_valid(self) -> None:
+        """Refuse to act on a cold read that a writer raced. No-op otherwise.
+
+        Delegated to the backend, which is the only layer that knows whether
+        this connection was opened blind to a WAL.
+        """
+        checker = getattr(self._backend, "assert_cold_read_still_valid", None)
+        if checker is not None:
+            checker()
 
     @asynccontextmanager
     async def transaction(self):
@@ -302,11 +519,125 @@ class AsyncStorage:
         """
         if not self._initialized:
             await self.initialize()
-        await self.conversation.add_conversation(
-            role, content, metadata, session_id,
-            rendered_content=rendered_content,
-            model=model,
-            provider=provider,
+        persisted_metadata = dict(metadata) if metadata else {}
+        dependencies = self._semantic_recall_dependencies_for_persistence(
+            persisted_metadata
+        )
+        # Provider embedding and lexical indexing may perform slow I/O.  Do
+        # that work before the assertion lifecycle fence; only the exact
+        # liveness check and final INSERT may hold tenant serialization.
+        prepared = await self.conversation._prepare_conversation_write(  # noqa: SLF001 - coordinated persistence seam
+            role,
+            content,
+            persisted_metadata,
+            session_id,
+            rendered_content,
+            model,
+            provider,
+        )
+        # Token-first lexical work happens before the canonical fence.  Keep
+        # its exact handle even if the prepared object later clears it: an
+        # INSERT exception inside the fence rolls back in-fence cleanup, so
+        # the caller must retry cleanup after the transaction has exited.
+        prepared_lexical_index_id = prepared.lexical_index_id
+
+        async def persist() -> None:
+            await self.conversation._persist_prepared_conversation(  # noqa: SLF001 - coordinated persistence seam
+                prepared
+            )
+
+        async def exclude_and_persist() -> None:
+            self._exclude_stale_semantic_recall_derivative(prepared.metadata)
+            await self.conversation._exclude_prepared_conversation_from_retrieval(  # noqa: SLF001 - coordinated persistence seam
+                prepared
+            )
+            await persist()
+
+        # Only semantic-recall derivatives carry the lineage field.  Normal
+        # conversation writes keep their historical no-lock path.
+        if "semantic_recall_dependencies" not in persisted_metadata:
+            await persist()
+            return
+
+        if dependencies is None:
+            await exclude_and_persist()
+            return
+
+        if not dependencies:
+            # An explicitly empty lineage is not a semantic derivative and is
+            # produced by the normal no-recall path.  Preserve that behavior.
+            await persist()
+            return
+
+        try:
+            assertions = self._assertion_store()
+        except RuntimeError:
+            # A partial/unbound storage bootstrap has no canonical authority
+            # with which to validate a claimed semantic lineage.  Persisting it
+            # visibly would let a caller create an unrevocable derivative.
+            await exclude_and_persist()
+            return
+
+        try:
+            async with assertions._semantic_recall_persistence_fence(
+                dependencies
+            ) as visible:
+                if not visible:
+                    await exclude_and_persist()
+                    return
+                await persist()
+        except Exception:
+            if prepared_lexical_index_id is not None:
+                await self.conversation._discard_lexical_tokens(  # noqa: SLF001 - post-rollback token cleanup
+                    prepared_lexical_index_id
+                )
+            raise
+
+    @staticmethod
+    def _semantic_recall_dependencies_for_persistence(
+        metadata: Dict[str, Any],
+    ) -> tuple[tuple[str, str], ...] | None:
+        """Return exact recalled identities or ``None`` for malformed lineage.
+
+        The marker is supplied only by the trusted context-plan projection.  A
+        malformed non-empty marker is never silently treated as ordinary
+        metadata: it would bypass the canonical liveness fence and make a
+        durable derivative unrevocable.  Empty lineage remains the normal
+        semantic-recall-disabled/no-result representation.
+        """
+        if "semantic_recall_dependencies" not in metadata:
+            return ()
+        raw = metadata.get("semantic_recall_dependencies")
+        if not isinstance(raw, list):
+            return None
+        dependencies: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                return None
+            assertion_id = item.get("assertion_id")
+            revision_id = item.get("revision_id")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or not isinstance(revision_id, str)
+                or not revision_id
+            ):
+                return None
+            dependency = (assertion_id, revision_id)
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+        return tuple(dependencies)
+
+    @staticmethod
+    def _exclude_stale_semantic_recall_derivative(
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Make an unverifiable semantic derivative permanently non-contextual."""
+        metadata["excluded_from_context"] = True
+        metadata.setdefault(
+            "excluded_reason", "semantic_assertion_not_current"
         )
     
     async def get_conversation_history(
@@ -435,6 +766,104 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.delete_message(message_id)
 
+    async def _exclude_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> tuple[int, ...]:
+        """Exclude exact assertion-derived conversation artifacts.
+
+        Private on purpose: only the governed assertion lifecycle may call
+        this companion operation, never an arbitrary user-supplied selector.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.exclude_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+
+    async def _scrub_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+    ) -> int:
+        """Drop physically erased identities from excluded artifacts."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.scrub_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+
+    async def _exclude_memory_episodes_for_key_message_ids(
+        self, message_ids: tuple[int, ...],
+    ) -> tuple[str, ...]:
+        """Exclude episodes whose exact key-message identity intersects IDs.
+
+        Episode summaries are derivatives of conversation artifacts.  They
+        cannot remain prompt-visible once an input artifact is excluded, even
+        if the summary happens not to repeat the fact verbatim.
+        """
+        if not self._initialized:
+            await self.initialize()
+        requested_ids = {str(message_id) for message_id in message_ids}
+        if not requested_ids:
+            return ()
+        rows = await self.db.fetchall(
+            "SELECT id, key_message_ids FROM memory_episodes "
+            "WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0",
+            (self.agent_id,),
+        )
+        excluded: list[str] = []
+        for episode_id, raw_key_ids in rows:
+            try:
+                key_ids = json.loads(raw_key_ids) if isinstance(raw_key_ids, str) else raw_key_ids
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(key_ids, list) or not requested_ids.intersection(
+                str(key_id) for key_id in key_ids
+            ):
+                continue
+            result = await self.db.execute_commit(
+                "UPDATE memory_episodes SET excluded_from_context = 1 "
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0",
+                (episode_id, self.agent_id),
+            )
+            if _rows_affected(result) > 0:
+                excluded.append(str(episode_id))
+        return tuple(excluded)
+
+    async def _withdraw_semantic_recall_derivatives(
+        self,
+        *,
+        assertion_ids=(),
+        revision_ids=(),
+        physically_erased: bool,
+    ) -> None:
+        """Apply one canonical lifecycle withdrawal to exact context artifacts.
+
+        ``AsyncAssertionStore`` calls this private companion while its tenant
+        mutation remains open.  The conversation/episode updates therefore
+        share that transaction on both SQLite and PostgreSQL.  Assertion
+        lifecycle code passes only canonical IDs; this facade deliberately
+        never interprets message content as a deletion selector.
+        """
+        message_ids = await self._exclude_semantic_recall_dependencies(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+        if message_ids:
+            await self._exclude_memory_episodes_for_key_message_ids(message_ids)
+        if physically_erased:
+            await self._scrub_semantic_recall_dependencies(
+                assertion_ids=assertion_ids,
+                revision_ids=revision_ids,
+            )
+
     async def restore_message(self, message_id: int) -> bool:
         """Restore a soft-deleted message — facade delegator (#763)."""
         if not self._initialized:
@@ -498,6 +927,163 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.purge_all_since(since_iso, reason=reason)
+
+    async def purge_session_projection(
+        self, *, reason: str = "ephemeral-leak",
+    ) -> int:
+        """Erase this agent's #2959 projection state (EPHEMERAL).
+
+        The CACHE unconditionally; the LEDGER only when no live history
+        survives. One transaction, and the condition on the ledger is the whole
+        design:
+
+        * It is durable, not a count of what THIS attempt deleted. A retry after
+          a partial failure asks the same question and gets the same answer,
+          where delete counts would read zero and call the residue clean.
+        * When it holds, an EMPTY projection is not merely safe to leave behind
+          — it is the correct value. A projection describes live history, and
+          there is none, so erasing it writes the truth rather than guessing at
+          it. Nothing here has to reason about which rows leaked.
+
+        What accrues without anyone asking is the change ledger, because a
+        database trigger bumps it on every write to ``conversation_history`` and
+        a trigger cannot see privacy mode. A purely EPHEMERAL agent that leaked
+        one turn would otherwise leave a row naming it behind after the sweep
+        that erased the turn.
+
+        **Why the ledger cannot go alone** (round-6 review). ``is_stale()``
+        answers by comparing a stored stamp to the ledger for equality, which is
+        sound only while the ledger is monotonic — the claim
+        ``ConversationSessionProjection.observed_changes()`` makes in its own
+        docstring. Deleting the row breaks that: the trigger's next write is an
+        INSERT of ``1``, so the counter restarts. A projection repaired at stamp
+        N, purged, and then written to N more times reports itself CURRENT while
+        describing history that no longer exists — immediately when N is 1. The
+        stamp is meaningful only against the ledger incarnation it was read
+        from, so the two are erased together or neither is.
+
+        An earlier revision of this sweep did reach all three tables and needed
+        a leak-detection condition, an orphan probe and cross-table atomicity to
+        do it safely. That machinery was for the *scoped* case, where some
+        history survives and the sweep must separate what leaked from what did
+        not. None of it is needed here: this runs only when nothing survives, so
+        the answer for every row is the same one.
+
+        An agent whose legitimate pre-EPHEMERAL history survives keeps its
+        LEDGER row: it names nothing the database does not already say, and
+        deleting it would breach the scoped-purge contract, which forbids
+        touching anything authored before entry. Its projection rows go
+        regardless — they are derived, not authored, and the leaked session is
+        described in them.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from .async_conversation_store import _rows_affected
+        from .conversation_sessions import projection_tables
+
+        ledger = "conversation_history_changes"
+        tables = [
+            table for table, _ddl in projection_tables()
+            if await self.db.table_exists(table)
+        ]
+        if not tables:
+            return 0
+        # Watermark FIRST, ledger LAST, sessions in between. Two orderings have
+        # to hold at once and they do not conflict:
+        #
+        #   * The ledger last is the correctness guarantee (below).
+        #   * The watermark first matches the order a REPAIR takes them in —
+        #     `_claim()` locks the watermark row and only then upserts session
+        #     rows. Taking them the other way round here is the classic ABBA
+        #     deadlock: each holds the row the other is waiting for, and
+        #     PostgreSQL resolves it by aborting one. Aborting this sweep would
+        #     leave projection rows standing after an EPHEMERAL exit that
+        #     reported success, because this store is not a required one.
+        #
+        # The ledger goes last, and that ordering is the guarantee — not the
+        # transaction. The state to avoid is a watermark standing beside a
+        # missing ledger, because that is the one where a restarted counter can
+        # match a stale stamp. Deleting the ledger after everything derived from
+        # it makes that state unreachable at every point in the sequence, on any
+        # backend, at any isolation level: while the ledger is still there the
+        # watermark is either present and consistent or already gone, and once
+        # it is gone there is no stamp left to fool. ``projection_tables()``
+        # happens to order it last too, for an unrelated reason — the triggers
+        # reference it — so it is re-established here rather than inherited from
+        # a coincidence a future reordering could quietly take away.
+        watermark = "conversation_session_watermarks"
+        tables = (
+            [t for t in tables if t == watermark]
+            + [t for t in tables if t not in (watermark, ledger)]
+            + [t for t in tables if t == ledger]
+        )
+
+        purged = 0
+        # The transaction is what makes the sweep all-or-nothing, and on SQLite
+        # (BEGIN IMMEDIATE) it also holds the writer slot across the test. It is
+        # not load-bearing for the invariant above: under PostgreSQL READ
+        # COMMITTED a row committed after this SELECT is still invisible to it,
+        # so a concurrent write can make the survival test stale. What that
+        # costs is bounded — the projection is erased for an agent that now has
+        # history, which the next repair rebuilds, and the ledger is
+        # content-free — and it is the delete ORDER, not the isolation level,
+        # that keeps a stale stamp from ever reading as current.
+        async with self.db.transaction(immediate=True):
+            # The repair exclusion, taken the way a repair takes it. Ordering
+            # the deletes below to match a repair's write order is necessary but
+            # not sufficient: on PostgreSQL a DELETE matching no rows locks
+            # nothing, so a first-time repair can insert the watermark this
+            # sweep has already passed over.
+            from .conversation_sessions import ConversationSessionProjection
+
+            claim_created_watermark = await ConversationSessionProjection(
+                self.db, self.agent_id
+            ).claim_exclusion()
+            survives = await self.db.fetchval(
+                "SELECT 1 FROM conversation_history WHERE agent_id = ? LIMIT 1",
+                (self.agent_id,),
+            )
+            # The CACHE always goes. It is rebuildable from
+            # `conversation_history`, so clearing it destroys no record — while
+            # leaving it keeps the leaked session's id, timestamps, counts and
+            # message pointer standing after a sweep that reported success. An
+            # earlier revision skipped everything whenever any history survived,
+            # reading the scoped-purge contract as covering this too. That
+            # contract is about state authored before entry, and a derived copy
+            # is not authored at all: erasing it costs a rebuild, not data
+            # (round-16 review).
+            #
+            # The LEDGER is the exception, and only while history survives. Such
+            # an agent is already named by that history, so its counter names
+            # nothing new — and erasing it there is exactly what breaks the
+            # monotonicity `is_stale()` rests on, since the trigger's next write
+            # restarts the count.
+            for table in tables:
+                if table == ledger and survives:
+                    continue
+                purged += _rows_affected(
+                    await self.db.execute(
+                        f"DELETE FROM {table} WHERE agent_id = ?",
+                        (self.agent_id,),
+                    )
+                )
+        # Do not count the row the CLAIM just made. On PostgreSQL the exclusion
+        # is acquired by inserting the watermark row when it is absent, and the
+        # very next statement here deletes it — so every clean stint reported
+        # one purged row, and `PurgeOutcome.PURGED` means "a real leak was found
+        # and removed". Measured: a stint that never touched storage returned 1.
+        # SQLite never saw it, because the claim is a no-op there — which is
+        # also why the cases asserting `session_projection == 0` did not catch
+        # it (round-20 review).
+
+        if claim_created_watermark and purged:
+            purged -= 1
+        if purged:
+            logger.info(
+                "purged the session projection for %s (%s): %d row(s) across %s",
+                self.agent_id, reason, purged, ", ".join(tables),
+            )
+        return purged
 
     async def purge_channel_messages_since(
         self, since_iso: str, *, reason: str = "ephemeral-leak",
@@ -859,6 +1445,963 @@ class AsyncStorage:
             await self.initialize()
         return await self.graph.get_edges(node_id, direction="in")
 
+    # --- Canonical Semantic Assertion Operations ---
+
+    def _assertion_store(self) -> AsyncAssertionStore:
+        if not self._initialized or self._assertions is None:
+            raise RuntimeError(
+                "Canonical assertion storage requires initialized, agent-bound AsyncStorage"
+            )
+        return self._assertions
+
+    def semantic_assertion_binding(self) -> SemanticAssertionBinding:
+        """Return non-authorizing storage metadata for internal consumers.
+
+        The tenant and owner come from the private, agent-bound assertion
+        store—not a caller-selected ``agent_id`` or tool payload.  Foreground
+        producers must obtain the wrapper-issued governed binding from
+        ``PrivacyEnforcingStorage``; this raw metadata never authorizes a
+        feature to skip the current privacy policy.
+        """
+        store = self._assertion_store()
+        return SemanticAssertionBinding(
+            tenant_id=store.tenant_id,
+            owning_agent_id=store.owning_agent_id,
+            privacy_classification="normal",
+            release_policy_reference="policy:privacy:normal-v1",
+            visibility=Visibility.PRIVATE,
+        )
+
+    def legacy_graph_fact_migration(
+        self,
+        *,
+        compatibility_read_enabled: bool = False,
+        index_invalidator=None,
+    ):
+        """Return the explicit, agent-bound #2752 legacy fact migrator.
+
+        The caller cannot supply an arbitrary tenant.  The returned service
+        uses this already-authenticated storage's assertion authority and the
+        graph ownership ledger, then routes every accepted proposal through
+        :meth:`put_validated_assertion`.
+        """
+        from .legacy_fact_migration import LegacyGraphFactMigration
+
+        return LegacyGraphFactMigration(
+            self,
+            compatibility_read_enabled=compatibility_read_enabled,
+            index_invalidator=index_invalidator,
+        )
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), operation_id: Optional[str] = None):
+        """Govern canonical ingestion and return its required SHACL report.
+
+        A public agent-bound storage facade is an ingestion boundary, not a
+        migration authority.  It therefore cannot create an active canonical
+        assertion without the accepted report committed beside it.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().put_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def get_assertion(self, assertion_id: str, *, include_inactive: bool = False):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_assertion(assertion_id, include_inactive=include_inactive)
+
+    async def get_assertion_revision(self, revision_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_revision(revision_id)
+
+    async def query_assertions(self, query=None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().query(query)
+
+    async def list_assertion_revisions(self, assertion_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revisions(assertion_id)
+
+    async def list_assertion_sources(self, assertion_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_source_occurrences(assertion_id)
+
+    async def list_assertion_revision_sources(self, revision_id: str):
+        """Read exact revision provenance for a governed corpus example."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revision_source_occurrences(revision_id)
+
+    async def list_assertion_revision_sources_batch(self, revision_ids):
+        """Read exact revision provenance for a bounded corpus page."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().list_revision_source_occurrences_batch(
+            revision_ids
+        )
+
+    async def get_source_occurrence(self, source_occurrence_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().get_source_occurrence(source_occurrence_id)
+
+    async def get_derivation_inputs(self, revision_id: str):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().derivation_inputs(revision_id)
+
+    async def reactivate_inferred_assertion(self, assertion, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().reactivate_inferred(
+            assertion, operation_id=operation_id,
+        )
+
+    async def supersede_assertion(self, expected_predecessor_revision_id: str, replacement, *, source_occurrences=(), operation_id: Optional[str] = None):
+        """Govern canonical supersession and return its required SHACL report."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        operation_id: Optional[str] = None,
+    ):
+        """Append one direct source through the governed revision lifecycle."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        expected_terminal_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        operation_id: Optional[str] = None,
+    ):
+        """Restore a terminal direct shell through governed SHACL validation."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service()._restore_explicit_fact_assertion(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def _replay_governed_assertion_operation(
+        self,
+        operation_id: str,
+        binding,
+    ):
+        """Read one exact accepted governed assertion-write receipt.
+
+        This is a ledger lookup, not a current-state reconstruction.  It is
+        used by the privacy-owned explicit-fact path to make delayed retries
+        stable after subsequent revisions have been committed.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().replay_governed_assertion_operation(
+            operation_id,
+            binding,
+        )
+
+    async def _terminalize_legacy_erased_explicit_fact_operation(
+        self,
+        operation_id: str,
+        binding,
+    ):
+        """Fail closed on an exact semantic identity erased by a v3 store."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().terminalize_legacy_erased_explicit_fact_operation(
+            operation_id,
+            binding,
+        )
+
+    async def retract_assertion(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().retract(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def delete_assertion(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        operation_id: Optional[str] = None,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().delete(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def _delete_explicit_fact_assertion(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        operation_id: str,
+        explicit_fact_selector,
+    ):
+        """Delete one adapter fact while binding its immutable selector."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().delete(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+            explicit_fact_selector=explicit_fact_selector,
+        )
+
+    async def _replay_explicit_fact_forget_operation(
+        self,
+        operation_id: str,
+        subject,
+        predicate,
+    ):
+        """Read an exact explicit-fact delete or absent-result receipt."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().replay_explicit_fact_forget(
+            operation_id,
+            subject,
+            predicate,
+        )
+
+    async def _record_explicit_fact_forget_noop(
+        self,
+        operation_id: str,
+        subject,
+        predicate,
+    ):
+        """Atomically persist a tenant-bound absent-result fact tombstone."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().record_explicit_fact_forget_noop(
+            operation_id,
+            subject,
+            predicate,
+        )
+
+    async def invalidate_assertion_eligibility(self, assertion_id: str, expected_revision_id: str, *, operation_id: Optional[str] = None):
+        """Withdraw a source's validation eligibility and cascade unsupported inference."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().invalidate_assertion_eligibility(
+            assertion_id, expected_revision_id, operation_id=operation_id,
+        )
+
+    async def quarantine_assertion_for_validation(
+        self,
+        assertion_id: str,
+        expected_revision_id: str,
+        *,
+        report_id: str,
+        operation_id: Optional[str] = None,
+    ):
+        """Refuse partial validation repair outside the governed audit path."""
+        raise RuntimeError(
+            "Direct validation quarantine is unavailable; use "
+            "semantic_validation_service().validate_current() or "
+            "full_audit_and_repair() so the report and every repair commit atomically"
+        )
+
+    async def erase_assertion(self, assertion_id: str, *, operation_id: Optional[str] = None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().erase(assertion_id, operation_id=operation_id)
+
+    async def assertion_checkpoint(self):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().checkpoint()
+
+    async def assertion_event_checkpoint(self):
+        """Return the exact event cursor used by governed corpus deltas."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.corpus import CorpusCheckpoint
+
+        checkpoint = await self._assertion_store().event_checkpoint()
+        return CorpusCheckpoint(
+            checkpoint.tenant_id,
+            checkpoint.generation,
+            checkpoint.latest_event_id,
+        )
+
+    async def assertion_changes_since(self, generation: int, *, limit: int = 100):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().changes_since(generation, limit=limit)
+
+    async def assertion_changes_after(self, checkpoint, *, limit: int = 100):
+        """Read the public governed-corpus stream after one exact cursor."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.corpus import CorpusCheckpoint
+        from kestrel_sovereign.storage.async_assertion_store import AssertionCheckpoint
+
+        if not isinstance(checkpoint, CorpusCheckpoint):
+            raise TypeError("checkpoint must be CorpusCheckpoint")
+        return await self._assertion_store().changes_after(
+            AssertionCheckpoint(
+                checkpoint.tenant_id,
+                checkpoint.generation,
+                checkpoint.latest_event_id,
+            ),
+            limit=limit,
+        )
+
+    async def assertion_validation_statuses(self, assertions):
+        """Read privacy-safe validation dispositions for the governed corpus."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().validation_statuses(assertions)
+
+    def semantic_validation_service(self):
+        """Return the tenant-bound SHACL service for this canonical store."""
+        if not self._initialized:
+            raise RuntimeError(
+                "Governed semantic validation requires initialized, agent-bound AsyncStorage"
+            )
+        from .semantic_validation import GovernedSemanticValidationService
+
+        return GovernedSemanticValidationService(self._assertion_store())
+
+    async def put_validated_assertion(self, assertion, *, source_occurrences=(), **validation_options):
+        """Validate a full tentative post-state before a canonical assertion write.
+
+        This named entry point is equivalent to :meth:`put_assertion`; both
+        public ingestion surfaces are governed so callers cannot select an
+        unvalidated shortcut.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().put_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def supersede_validated_assertion(
+        self,
+        expected_predecessor_revision_id: str,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate and atomically commit a canonical assertion replacement.
+
+        This named entry point is equivalent to :meth:`supersede_assertion`;
+        no public replacement surface can make data eligible without its SHACL
+        report.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.semantic_validation_service().supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def assertion_inference_inputs(self, query=None):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().inference_inputs(query)
+
+    async def semantic_recall_candidates(
+        self, *, query, candidate_scan_limit, inference_profile, inference_limits=None, maintenance_limits=None,
+    ):
+        """Read bounded recall candidates through the canonical ledger seam."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().recall_candidates(
+            query=query, candidate_scan_limit=candidate_scan_limit,
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=self.semantic_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+        )
+
+    def semantic_assertion_vector_projection(self, profile):
+        """Create the tenant-bound derived assertion-vector projection.
+
+        This is intentionally an explicit capability, not a generic RAG
+        vector accessor.  Its candidates have to be canonically hydrated
+        before they can enter agent context.
+        """
+        if not self._initialized:
+            raise RuntimeError("semantic vector projection requires initialized AsyncStorage")
+        from .semantic_vector_projection import (
+            SemanticAssertionVectorProjection,
+            _resolve_host_semantic_vector_embedding_provider,
+        )
+
+        provider = _resolve_host_semantic_vector_embedding_provider(
+            profile,
+            self.__semantic_vector_llm_service,
+            host_authority=self._assertion_tenant_capability,
+        )
+        return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
+
+    def _kite_release_vector_projection(self):
+        """Return the deterministic local projection used only by Kite evidence.
+
+        This is not a general embedding-provider selection API.  The endpoint
+        that reaches it is guarded by the isolated test-agent flag, and this
+        method additionally requires the same opt-in environment.  It still
+        uses the production projection owner and its durable outbox/rebuild
+        mechanics; only the local test embedding implementation is fixed.
+        """
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise RuntimeError("Kite release vector projection is unavailable")
+        if not self._initialized:
+            raise RuntimeError("Kite release vector projection requires initialized AsyncStorage")
+        from types import SimpleNamespace
+        from .semantic_vector_projection import SemanticVectorProfile
+
+        class _LocalKiteEmbeddingService:
+            def describe(self):
+                return SimpleNamespace(
+                    provider="kite-local", model="deterministic-v1", dim=4,
+                    profile_id="kite-release-erasure-v1",
+                )
+
+            def semantic_vector_destination(self):
+                return "local"
+
+            async def aembed(self, text: str):
+                digest = hashlib.sha256(text.encode("utf-8")).digest()
+                return [float(int.from_bytes(digest[index:index + 2], "big") + 1) for index in range(0, 8, 2)]
+
+        class _LocalKiteHost:
+            def get_embedding_service(self):
+                return _LocalKiteEmbeddingService()
+
+        profile = SemanticVectorProfile(
+            "kite-release-erasure-v1",
+            hashlib.sha256(b"kite-release-erasure-v1").hexdigest(),
+            provider="kite-local", model="deterministic-v1", dimension=4,
+        )
+        from .semantic_vector_projection import (
+            SemanticAssertionVectorProjection,
+            _resolve_host_semantic_vector_embedding_provider,
+        )
+
+        provider = _resolve_host_semantic_vector_embedding_provider(
+            profile, _LocalKiteHost(), host_authority=self._assertion_tenant_capability,
+        )
+        return SemanticAssertionVectorProjection(self._assertion_store(), profile, provider)
+
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().hydrate_recall_candidates(
+            assertion_ids,
+            semantic_capabilities=self.semantic_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+            **kwargs,
+        )
+
+    async def semantic_inference_state(self, profile):
+        """Read the durable complete/incomplete status for one exact profile."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        return await BoundedInferenceService(self._assertion_store(), profile).closure_state()
+
+    async def explain_semantic_inference(self, assertion_id: str, profile):
+        """Read rule and premise-ID lineage for one tenant-local inferred claim."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        return await BoundedInferenceService(self._assertion_store(), profile).explain(assertion_id)
+
+    async def materialize_semantic_inference(self, profile, *, limits=None, full_rebuild: bool = False):
+        """Advance an incremental semantic closure, or run explicit repair mode."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import BoundedInferenceService
+
+        service = BoundedInferenceService(self._assertion_store(), profile, limits=limits)
+        if full_rebuild:
+            return await service.rebuild()
+        return await service.materialize_incremental()
+
+    async def revoke_semantic_inference(self):
+        """Revoke this tenant's materializations after explicit disablement."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.inference import ENGINE_VERSION
+
+        return await self._assertion_store().revoke_semantic_inference(
+            ENGINE_VERSION
+        )
+
+    async def run_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        full_rebuild: bool = False,
+    ):
+        """Run the tenant's bounded incremental semantic-maintenance unit.
+
+        ``full_rebuild`` is deliberately an explicit repair knob.  Ordinary
+        sleep callers use the incremental path, which consumes the canonical
+        assertion change checkpoint before invoking validation or inference.
+        """
+        if not self._initialized:
+            await self.initialize()
+        # Retention expiry is part of every real semantic-maintenance unit and
+        # uses the storage-owned host clock.  It cannot be advanced by a caller.
+        await self._assertion_store().sweep_expired_governed_artifacts()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+        )
+        if full_rebuild:
+            return await service.rebuild()
+        return await service.run()
+
+    async def semantic_maintenance_training_readiness(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint=None,
+    ):
+        """Return the durable semantic prerequisite for scheduled training.
+
+        Scheduler consumers must ask the same coordinator that owns the
+        maintenance checkpoint.  Reconstructing the capability identity here
+        keeps the gate in lockstep with sleep maintenance when limits, shape
+        pins, or inference profiles change.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+        )
+        from kestrel_sovereign.storage.async_assertion_store import AssertionCheckpoint
+
+        bound_checkpoint = None
+        if expected_checkpoint is not None:
+            bound_checkpoint = AssertionCheckpoint(
+                expected_checkpoint.tenant_id,
+                expected_checkpoint.generation,
+                expected_checkpoint.latest_event_id,
+            )
+        return await service.training_readiness(
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            expected_checkpoint=bound_checkpoint,
+        )
+
+    async def semantic_maintenance_capability_versions(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+    ):
+        """Return the exact semantic capability pins used to verify a corpus."""
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.maintenance import SemanticMaintenanceService
+
+        selected_capabilities = self._resolve_semantic_capabilities(
+            semantic_capabilities
+        )
+        service = SemanticMaintenanceService(
+            self._assertion_store(),
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            limits=maintenance_limits,
+            semantic_capabilities=selected_capabilities,
+            rdf_codec=self._semantic_rdf_codec,
+        )
+        return service.capability_versions()
+
+    async def governed_assertion_corpus_snapshot(
+        self,
+        *,
+        policy,
+        inference_profile,
+        limits=None,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        prior_verified_snapshot=None,
+        allow_prior_verified_snapshot: bool = False,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
+    ):
+        """Produce the public immutable learning-corpus snapshot.
+
+        This host service is intentionally the only feature-facing corpus
+        ingress; it never returns the database handle or property graph.
+        """
+        from kestrel_sovereign.knowledge.corpus import (
+            GovernedAssertionCorpusService,
+            GovernedCorpusLimits,
+        )
+
+        snapshot = await GovernedAssertionCorpusService(self).snapshot(
+            policy=policy,
+            inference_profile=inference_profile,
+            limits=limits if limits is not None else GovernedCorpusLimits(),
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=self._resolve_semantic_capabilities(
+                semantic_capabilities
+            ),
+            prior_verified_snapshot=prior_verified_snapshot,
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+        )
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="corpus_manifest",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=snapshot.checkpoint.generation,
+            policy_pin=snapshot.policy.digest,
+            capability_versions=snapshot.capability_versions,
+            lineage=tuple(
+                (example.assertion.assertion_id, example.assertion.revision_id)
+                for example in snapshot.examples
+            ),
+            retention_seconds=retention_seconds,
+            artifact_digest=snapshot.snapshot_hash,
+        )
+        return snapshot
+
+    async def governed_assertion_corpus_changes_since(
+        self,
+        snapshot,
+        *,
+        policy,
+        inference_profile,
+        limits=None,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
+    ):
+        """Read first-class governed additions/tombstones after a snapshot."""
+        from kestrel_sovereign.knowledge.corpus import (
+            GovernedAssertionCorpusService,
+            GovernedCorpusLimits,
+        )
+
+        delta = await GovernedAssertionCorpusService(self).changes_since(
+            snapshot,
+            policy=policy,
+            inference_profile=inference_profile,
+            limits=limits if limits is not None else GovernedCorpusLimits(),
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=self._resolve_semantic_capabilities(
+                semantic_capabilities
+            ),
+        )
+        lineage_pairs = {
+            (example.assertion.assertion_id, example.assertion.revision_id)
+            for example in delta.additions
+        }
+        lineage_pairs.update(
+            (tombstone.assertion_id, tombstone.revision_id)
+            for tombstone in delta.tombstones
+            if tombstone.assertion_id is not None
+            and tombstone.revision_id is not None
+        )
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="future_corpus_candidate",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=delta.checkpoint.generation,
+            policy_pin=policy.digest,
+            capability_versions=snapshot.capability_versions,
+            lineage=tuple(sorted(lineage_pairs)),
+            retention_seconds=retention_seconds,
+            artifact_digest=delta.snapshot_hash,
+        )
+        return delta
+
+    async def repair_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+    ):
+        """Explicit full revalidation/rebuild using the normal maintenance service."""
+        return await self.run_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            full_rebuild=True,
+        )
+
+    def _resolve_semantic_capabilities(self, supplied):
+        """Reject per-call semantic pin changes after agent boot.
+
+        A durable maintenance profile, training readiness, and corpus snapshot
+        must describe the exact same runtime.  Letting a feature override this
+        selection would make a draft profile appear ready under stable pins.
+        """
+        if supplied is None:
+            return self.semantic_capabilities
+        if supplied != self.semantic_capabilities:
+            raise ValueError(
+                "semantic capabilities must match the agent-bound storage runtime"
+            )
+        return supplied
+
+    def semantic_rdf_capability_report(self):
+        """Return the capabilities active in this storage-owned RDF runtime."""
+        return self._semantic_rdf_codec.capability_report
+
+    def semantic_sparql12_read_adapter(self, backend, decode_row, **kwargs):
+        """Build a draft read adapter from the agent-owned codec only.
+
+        The stable runtime fails closed inside the codec; callers cannot turn
+        on SPARQL 1.2 by attaching a query backend to a stable agent.
+        """
+        return self._semantic_rdf_codec.sparql12_read_adapter(
+            backend, decode_row, **kwargs
+        )
+
+    async def export_assertion_snapshot(
+        self,
+        query=None,
+        *,
+        artifact_id: str,
+        consumer_id: str,
+        consumer_key_id: str,
+        consumer_public_key: str,
+        retention_seconds: float,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        checkpoint, assertions = await self._assertion_store().export_snapshot(query)
+        canonical = json.dumps(
+            [assertion.to_mapping() for assertion in assertions],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        policy_pin = hashlib.sha256(
+            b"kestrel:semantic-export-policy:v1"
+        ).hexdigest()
+        await self._register_produced_semantic_artifact(
+            artifact_id=artifact_id,
+            kind="export_snapshot",
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=checkpoint.generation,
+            policy_pin=policy_pin,
+            capability_versions=self.semantic_capabilities.capability_versions(),
+            lineage=tuple(
+                (assertion.assertion_id, assertion.revision_id)
+                for assertion in assertions
+            ),
+            retention_seconds=retention_seconds,
+            artifact_digest=digest,
+        )
+        return checkpoint, assertions
+
+    async def _register_produced_semantic_artifact(
+        self,
+        *,
+        artifact_id,
+        kind,
+        consumer_id,
+        consumer_key_id,
+        consumer_public_key,
+        checkpoint_generation,
+        policy_pin,
+        capability_versions,
+        lineage,
+        retention_seconds,
+        artifact_digest,
+    ):
+        """Seal producer-derived bytes and trusted runtime pins before return."""
+        if not self._initialized:
+            await self.initialize()
+        if (
+            not isinstance(retention_seconds, (int, float))
+            or isinstance(retention_seconds, bool)
+            or retention_seconds <= 0
+        ):
+            raise ValueError("retention_seconds must be positive")
+        from kestrel_sovereign.knowledge.artifact_lifecycle import (
+            GovernedArtifactKind,
+            GovernedArtifactLineage,
+            GovernedArtifactRegistration,
+        )
+
+        capability_pins = {
+            name: hashlib.sha256(
+                json.dumps(
+                    {"name": name, "version": value},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for name, value in sorted(dict(capability_versions).items())
+        }
+        clock_value = self._artifact_clock()
+        if not isinstance(clock_value, datetime) or clock_value.tzinfo is None:
+            raise ValueError("_artifact_clock must return an aware datetime")
+        registration = GovernedArtifactRegistration(
+            artifact_id=artifact_id,
+            kind=GovernedArtifactKind(kind),
+            tenant_id=self._assertion_store().tenant_id,
+            consumer_id=consumer_id,
+            consumer_key_id=consumer_key_id,
+            consumer_public_key=consumer_public_key,
+            checkpoint_generation=checkpoint_generation,
+            policy_pin=policy_pin,
+            capability_pins=capability_pins,
+            lineage=tuple(
+                GovernedArtifactLineage(assertion_id, revision_id)
+                for assertion_id, revision_id in lineage
+            ),
+            retention_expires_at=(
+                clock_value.astimezone(UTC)
+                + timedelta(seconds=float(retention_seconds))
+            ).isoformat().replace("+00:00", "Z"),
+            artifact_digest=artifact_digest,
+        )
+        return await self._assertion_store().register_governed_artifact(registration)
+
+    async def consume_governed_semantic_artifact(self, artifact_id, *, expected_generation: int):
+        """Generation-fenced guard for a previously sealed semantic artifact."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().consume_governed_artifact(
+            artifact_id, expected_generation=expected_generation
+        )
+
+    async def claim_governed_semantic_artifact_revocation(self, authentication, *, lease_seconds: float = 60.0):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().claim_governed_artifact_revocation(
+            authentication, lease_seconds=lease_seconds
+        )
+
+    async def acknowledge_governed_semantic_artifact_revocation(
+        self, lease, proof,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().acknowledge_governed_artifact_revocation(
+            lease, proof
+        )
+
+    async def process_governed_semantic_artifact_revocation(
+        self, authentication, owner, *, lease_seconds: float = 60.0,
+    ):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().process_governed_artifact_revocation(
+            authentication, owner, lease_seconds=lease_seconds
+        )
+
+    async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
+        # Legacy/test storage instances without authenticated assertion-tenant
+        # authority cannot own a governed artifact registry.  Treat that
+        # capability absence as an unconfigured no-op; once authority exists,
+        # every initialization/database/sweep failure still propagates to the
+        # sleep fail-closed path.
+        if self._assertion_tenant_capability is None:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().sweep_expired_governed_artifacts(
+            limit=limit
+        )
+
+    async def governed_semantic_artifact_erasure_observation(self, *, expected_generation: int):
+        if not self._initialized:
+            await self.initialize()
+        return await self._assertion_store().governed_artifact_erasure_observation(
+            expected_generation=expected_generation
+        )
+
     # --- RAG Operations ---
     
     async def chunk_document(self, content_hash: str) -> int:
@@ -1116,7 +2659,11 @@ class AsyncStorage:
                     # created_at to now() destroyed history ordering, and
                     # dropping deleted_at resurrected trashed (soft-deleted)
                     # messages. session_id rides inside ``metadata`` and is
-                    # carried verbatim.
+                    # carried verbatim; the indexed column is re-derived from
+                    # it below, so a backup taken before that column existed
+                    # restores with it populated wherever the stored id is
+                    # inside the column's contract, and NULL where it is not
+                    # (#2958).
                     cursor = await backup_conn.execute(
                         "SELECT role, content, metadata"
                         + (", model" if has_model else ", NULL AS model")
@@ -1136,18 +2683,50 @@ class AsyncStorage:
                     # created_at/deleted_at come out of the SQLite backup as
                     # TEXT strings. Binding a string to a Postgres TIMESTAMP
                     # column fails: PostgresBackend._strip_tz only handles
-                    # datetime instances, so asyncpg rejects the raw str. Coerce
-                    # to datetime on the Postgres path (SQLite takes the string
-                    # verbatim, preserving the exact stored form). An unparseable
-                    # value is left as-is so the backend raises loudly rather than
-                    # silently nulling a NOT NULL created_at.
+                    # NORMALIZED on both backends, not just PostgreSQL (#3009).
+                    #
+                    # This restores from a backup's SQLite FILE, so `created_at`
+                    # is whatever text the source database happened to hold —
+                    # an older kestrel's spelling, an import, a hand-edited row.
+                    # Passing it through verbatim (which the SQLite path did,
+                    # because asyncpg was the only reason to convert) is the one
+                    # writer in this codebase that can put a value into
+                    # `conversation_history.created_at` that no reader can date.
+                    # Every other writer takes CURRENT_TIMESTAMP or goes through
+                    # `SovereignAdapter._restored_created_at`, which parses and
+                    # re-spells; this now agrees with it.
+                    #
+                    # The column cannot enforce this itself: SQLite has no
+                    # datetime type, so `TIMESTAMP` is NUMERIC affinity and an
+                    # ISO string is stored as TEXT. The rule has to live at the
+                    # writers until #3009 adds the CHECK.
+                    #
+                    # An unparseable value is still written as-is, deliberately.
+                    # Substituting a clock would invent history and dropping it
+                    # would lose the row's only ordering evidence — and this is
+                    # a restore, which is the worst place to do either quietly.
+                    # It is counted instead, because how many exist is the fact
+                    # #3009's migration needs and nobody has.
                     is_pg = self.backend_type == "postgres"
 
                     def _ts(val):
-                        if val is None or not is_pg:
+                        if val is None:
+                            return None
+                        parsed = _parse_utc_datetime(val)
+                        if parsed is None:
+                            stats["messages_with_unreadable_created_at"] = (
+                                stats.get("messages_with_unreadable_created_at", 0)
+                                + 1
+                            )
+                            logger.warning(
+                                "restore: created_at %r cannot be parsed; "
+                                "writing it unchanged (#3009)", val,
+                            )
                             return val
-                        dt = _parse_utc_datetime(val)
-                        return dt if dt is not None else val
+                        naive_utc = parsed.replace(tzinfo=None)
+                        return parsed if is_pg else naive_utc.strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
 
                     for (
                         role, content, metadata_json, model, provider,
@@ -1159,11 +2738,13 @@ class AsyncStorage:
                         await self.db.execute_commit(
                             "INSERT INTO conversation_history "
                             "(agent_id, role, content, model, provider, metadata, "
-                            "created_at, deleted_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            "session_id, created_at, deleted_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, role, content, model, provider,
-                                metadata_json, _ts(created_at), _ts(deleted_at),
+                                metadata_json,
+                                column_session_id(metadata_json),
+                                _ts(created_at), _ts(deleted_at),
                             )
                         )
                         stats["messages_restored"] += 1

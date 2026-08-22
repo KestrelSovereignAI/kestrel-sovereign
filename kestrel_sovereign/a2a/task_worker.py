@@ -16,7 +16,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from kestrel_sovereign.a2a.types import Task, TaskState, Message, TextPart, Artifact
 from kestrel_sovereign.a2a.task_manager import TaskManager

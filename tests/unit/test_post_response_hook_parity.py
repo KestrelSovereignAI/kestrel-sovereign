@@ -256,10 +256,22 @@ def _patch_nonstreaming_module_helpers(monkeypatch):
     monkeypatch.setattr(
         ka, "resolve_turn_invocation_context", lambda *_a, **_k: None
     )
+    # The real envelope, not a MagicMock: the turn now settles the injected
+    # operator notice at the provider boundary (#2530), so the double has to
+    # carry the awaitable settle surface the caller actually uses.
+    from kestrel_sovereign.agent.operator_signals import (
+        OperatorSignalBatch,
+        OperatorTurnInjectionResult,
+    )
+
     monkeypatch.setattr(
         ka,
         "inject_operator_turn",
-        AsyncMock(return_value=MagicMock(keep_trailing_system=False)),
+        AsyncMock(
+            return_value=OperatorTurnInjectionResult(
+                batch=OperatorSignalBatch.empty(), injected_message=None,
+            )
+        ),
     )
     monkeypatch.setattr(
         ps, "build_operational_state_block", AsyncMock(return_value=None)

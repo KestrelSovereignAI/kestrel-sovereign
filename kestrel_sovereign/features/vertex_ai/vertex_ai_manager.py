@@ -29,13 +29,9 @@ Usage:
     lora_bytes = await manager.download_lora(job.job_name)
 """
 
-import asyncio
-import base64
-import json
 import logging
 import os
-import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -47,9 +43,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_DEFAULT,
     HTTP_TIMEOUT_MEDIUM,
     HTTP_TIMEOUT_DOWNLOAD,
-    POLL_INTERVAL_DEFAULT,
 )
-from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
 

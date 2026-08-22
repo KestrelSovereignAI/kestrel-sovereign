@@ -8,8 +8,8 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: experimental
 owner: architecture
 canonical: false
 generated: false
@@ -17,6 +17,14 @@ privacy: public
 ---
 
 # Kestrel Multi-Chain Wallet System
+
+> **Status:** Pre-extraction architecture reference. The current implementation
+> is owned by the
+> [`kestrel-feature-wallet`](https://github.com/KestrelSovereignAI/kestrel-feature-wallet)
+> package. Its source and tests, together with the core
+> [`feature_registry.toml`](../../kestrel_sovereign/data/feature_registry.toml),
+> establish shipped commands and network coverage; the detailed local paths and
+> roadmap below are not current framework contracts.
 
 This document describes the wallet system that enables Kestrel agents to manage cryptocurrency across multiple blockchain networks.
 
@@ -248,20 +256,9 @@ features/wallet/
 
 ## Testing
 
-### Unit Tests
-```bash
-pytest tests/integration/test_evm_transactions_e2e.py -v
-```
-
-### Real Network Tests
-```bash
-RUN_NETWORK_TESTS=true pytest tests/integration/test_evm_transactions_e2e.py -v
-```
-
-### With Funded Wallet
-```bash
-KESTREL_TEST_PRIVATE_KEY=0x... RUN_NETWORK_TESTS=true pytest tests/integration/test_evm_transactions_e2e.py::TestRealTransaction -v
-```
+Run the extracted wallet package's own unit/integration suite and follow its
+network-test instructions. Test paths formerly shown here belonged to the
+removed in-core layout and are not valid paths in `kestrel-sovereign`.
 
 ## Getting Testnet Tokens
 

@@ -1,10 +1,8 @@
 """Tests for ``ContextBuilder.measure_context_breakdown`` and friends.
 
-Track #1308 — the measurement source of truth for the context system.
-These tests assert the read-only contract, the canonical return shape,
-that tool-schema tokens are now measured (previously: never), and that
-episode counting goes through ``len(episodes)`` rather than the legacy
-``"**".count() // 2`` heuristic.
+Track #1308/#2534 — the legacy measurement API is a compatibility adapter over
+the canonical ContextManager plan. These tests assert its read-only contract,
+return shape, tool-schema accounting, and episode counting.
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ import pytest
 from kestrel_sovereign.agent.context_builder import (
     ContextBuilder,
     _count_tool_schema_tokens,
-    _MESSAGE_OVERHEAD,
 )
 from kestrel_sovereign.agent.token_counter import get_token_counter
 
@@ -206,7 +203,7 @@ class TestEpisodeGetFormatSplit:
 
 
 class TestMeasureContextBreakdown:
-    """Single source of truth for per-section measurement."""
+    """Compatibility projection of the canonical per-section plan."""
 
     @pytest.mark.asyncio
     async def test_returns_canonical_shape(self, builder, short_history):
@@ -476,7 +473,7 @@ class TestMeasureContextBreakdown:
         block = "[Memory 1] tiny note"
         retriever = AsyncMock(return_value=block)
         result = await builder.measure_context_breakdown(
-            query="",
+            query="explain the phoenix migration",
             history=short_history,
             constitution="Be kind.",
             include_briefing=False,
@@ -575,6 +572,22 @@ class TestMeasureContextBreakdown:
         assert hist["messages_kept_after_pruning"] <= hist["messages_total"]
         assert hist["raw_tokens"] >= 0
 
+    @pytest.mark.asyncio
+    async def test_empty_history_reports_zero_tokens(self, builder):
+        result = await builder.measure_context_breakdown(
+            query="",
+            history=[],
+            constitution="Be kind.",
+            include_briefing=False,
+            include_rag=False,
+        )
+
+        hist = result["sections"]["history"]
+        assert hist["tokens"] == 0
+        assert hist["raw_tokens"] == 0
+        assert hist["messages_total"] == 0
+        assert hist["messages_kept_after_pruning"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Drift guard: the source-of-truth claim
@@ -621,16 +634,13 @@ class TestDriftGuard:
             "measure_context_breakdown — they must share the assembly path"
         )
 
-        # History tokens must match exactly — both paths run the same
-        # format_conversation_history and the same per-message overhead.
+        # History tokens must match exactly, including the counter's
+        # conversation-priming overhead.
         formatted = builder.format_conversation_history(
             history=short_history,
             max_tokens=measured["sections"]["history"]["budget"],
         )
-        expected_history = sum(
-            builder.counter.count(m.get("content", "") or "") + _MESSAGE_OVERHEAD
-            for m in formatted
-        )
+        expected_history = builder.counter.count_messages(formatted)
         assert measured["sections"]["history"]["tokens"] == expected_history
 
         # ``build_full_context`` exposes ``messages`` from the same

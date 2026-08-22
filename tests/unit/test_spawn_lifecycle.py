@@ -3,12 +3,17 @@
 import asyncio
 import os
 import tempfile
-import pytest
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
+
 from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sovereign.multi_agent.agent_manager import (
+    RuntimeOffboardingRetainedError,
+)
 from kestrel_sovereign.spawn.lifecycle import (
     SpawnedAgentLifecycle,
     SpawnMode,
@@ -175,6 +180,35 @@ class TestTTLExpiration:
 
         result = lifecycle.get_result("quick")
         assert result.status == SpawnStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_ttl_reaper_reconciles_grouped_retained_offboarding(self):
+        manager = _make_mock_manager()
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="ephemeral",
+            agent_id="did:child",
+            runtime_path=Path("operator/runtime/child"),
+            cause=OSError("retained"),
+        )
+        manager.terminate_child.side_effect = BaseExceptionGroup(
+            "cancelled retained cleanup",
+            [asyncio.CancelledError(), retained],
+        )
+        lifecycle = SpawnedAgentLifecycle(manager)
+
+        await lifecycle.register(
+            child_name="ephemeral",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=0.01,
+        )
+        ttl_task = lifecycle._tracked["ephemeral"].ttl_task
+        await asyncio.sleep(0.1)
+
+        assert ttl_task.done()
+        assert ttl_task.exception() is None
+        assert not lifecycle.is_tracked("ephemeral")
+        assert lifecycle.get_result("ephemeral").status == SpawnStatus.TIMED_OUT
 
 
 class TestResultCollection:
@@ -417,6 +451,31 @@ class TestCascadingShutdown:
         result = lifecycle.get_result("child1")
         assert result is not None
         assert result.status == SpawnStatus.TERMINATED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_continues_after_retained_offboarding(self):
+        manager = _make_mock_manager()
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="child1",
+            agent_id="did:c1",
+            runtime_path=Path("operator/runtime/child1"),
+            cause=OSError("retained"),
+        )
+        manager.terminate_child.side_effect = [retained, True]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        for child_name, child_did in (("child1", "did:c1"), ("child2", "did:c2")):
+            await lifecycle.register(
+                child_name=child_name,
+                child_did=child_did,
+                parent_did="did:parent",
+                ttl_seconds=3600,
+            )
+
+        with pytest.raises(RuntimeOffboardingRetainedError):
+            await lifecycle.shutdown()
+
+        assert manager.terminate_child.await_count == 2
+        assert lifecycle.get_tracked_children() == []
 
 
 class TestHookEvents:

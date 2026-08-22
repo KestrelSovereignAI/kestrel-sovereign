@@ -14,12 +14,14 @@ import os
 import subprocess
 import sys
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    PidStatus,
     ProcessManager,
 )
 
@@ -310,15 +312,21 @@ def _start_inprocess_mode(
     print()
 
     host_pid_file = _host_pid_file(project_dir)
-    existing_host = pm.read_pid(host_pid_file)
-    if existing_host and pm.is_process_running(existing_host):
-        print(f"   Server already running (PID: {existing_host})")
+    existing = pm.read_pid_record(host_pid_file)
+    if existing.is_running:
+        print(f"   Server already running (PID: {existing.pid})")
         return 0
 
-    if existing_host:
+    # Keyed on the status, not on whether a PID came back. ``read_pid``
+    # withholds a stale number by design, so testing its result for
+    # truthiness silently stopped clearing exactly the records that most need
+    # clearing — and a leftover legacy file flips from stale to undecidable
+    # the moment its number is reused, after which stop would signal the
+    # replacement (#2995).
+    if existing.needs_cleanup:
         pm.clear_pid(host_pid_file)
 
-    if pm.is_port_in_use(multi_agent.host.port):
+    if pm.is_port_in_use(multi_agent.host.port, multi_agent.host.bind):
         orphans = pm.find_pids_on_port(multi_agent.host.port)
         print(f"   Port {multi_agent.host.port} already in use"
               + (f" by PID(s) {orphans}" if orphans else ""))
@@ -344,7 +352,9 @@ def _start_inprocess_mode(
     # uvicorn host hit a closed pipe (EPIPE) once the launcher
     # exits and are silently swallowed; host.log appears to freeze
     # after startup and runtime tracebacks vanish. See #1461.
-    pm._spawn_detached(cmd, env, log_file, host_pid_file)
+    pm._spawn_detached(
+        cmd, env, log_file, host_pid_file, port=multi_agent.host.port
+    )
 
     if pm.wait_for_health(multi_agent.host.port, timeout=startup_timeout):
         print("          \u2705")
@@ -371,23 +381,75 @@ def _start_inprocess_mode(
     return 0
 
 
-def _reap_orphans_on_port(port: int, label: str, force: bool) -> bool:
-    """Kill untracked listeners on `port`. Returns True if any were killed."""
+class PortReapResult(Enum):
+    """Outcome of reaping untracked listeners on a port.
+
+    Three outcomes rather than a bool, because the caller asks two different
+    questions — "was anything listening?" and "is the port free now?" — and a
+    single flag can only answer one of them. Collapsing them is what let
+    ``stop`` report a clean shutdown over a listener it never dislodged
+    (#2990).
+    """
+
+    NOTHING_FOUND = "nothing_found"
+    RELEASED = "released"
+    STILL_HELD = "still_held"
+
+
+def _await_port_release(port: int, bind: str, attempts: int = 10) -> bool:
+    """Poll until `bind:port` can be bound, returning whether it was released."""
+    for _ in range(attempts):
+        if not ProcessManager.is_port_in_use(port, bind):
+            return True
+        time.sleep(0.3)
+    return not ProcessManager.is_port_in_use(port, bind)
+
+
+def _reap_orphans_on_port(
+    port: int, label: str, force: bool, bind: str = "0.0.0.0"
+) -> PortReapResult:
+    """Kill untracked listeners on `port` and report whether it was freed.
+
+    The result is decided by re-probing the port, never by the fact that a
+    signal was sent: a listener owned by another user cannot be signalled at
+    all (``os.kill`` raises ``PermissionError``), and a delivered signal is not
+    proof the listener honoured it. The operator's next ``kestrel start`` needs
+    the port, so the port is the postcondition worth checking.
+    """
     orphans = ProcessManager.find_pids_on_port(port)
     if not orphans:
-        return False
+        # An empty list is NOT proof the port is free. ``find_pids_on_port``
+        # returns [] on any discovery failure — psutil absent, a parse error,
+        # or a listener owned by another user this process cannot enumerate —
+        # which is precisely the unkillable listener this function exists to
+        # catch. Ask the port before concluding there was nothing here.
+        if ProcessManager.is_port_in_use(port, bind):
+            return PortReapResult.STILL_HELD
+        return PortReapResult.NOTHING_FOUND
     print(f"   {label}: orphan listener(s) on :{port} {orphans} — killing")
     for opid in orphans:
         ProcessManager.kill_process(opid, force=force)
-    for _ in range(10):
-        if not ProcessManager.is_port_in_use(port):
-            return True
-        time.sleep(0.3)
-    if ProcessManager.is_port_in_use(port):
-        for opid in orphans:
-            ProcessManager.kill_process(opid, force=True)
-        time.sleep(0.3)
-    return True
+    if _await_port_release(port, bind):
+        return PortReapResult.RELEASED
+    for opid in orphans:
+        ProcessManager.kill_process(opid, force=True)
+    if _await_port_release(port, bind):
+        return PortReapResult.RELEASED
+    return PortReapResult.STILL_HELD
+
+
+def _report_port_still_held(label: str, port: int) -> None:
+    """Explain a port that survived SIGKILL, and how to find its owner."""
+    print(
+        f"   {label}: port :{port} is still in use — "
+        f"not reporting {label} as stopped"
+    )
+    # A remediation naming a tool the platform does not ship is not a
+    # remediation. Windows is a supported target and has no lsof.
+    if sys.platform == "win32":
+        print(f"   Identify the owner with: netstat -ano | findstr :{port}")
+    else:
+        print(f"   Identify the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN")
 
 
 def cmd_stop(args) -> int:
@@ -409,46 +471,130 @@ def cmd_stop(args) -> int:
         ap = pm._agents.get(args.name)
         if ap and ap.pid:
             print(f"   Stopping {args.name} (PID: {ap.pid})...")
-            pm.stop_agent(args.name)
+            if not pm.stop_agent(args.name):
+                print(
+                    f"   {args.name}: PID {ap.pid} is still running after "
+                    f"SIGKILL — not reporting {args.name} as stopped"
+                )
+                return 1
+            # The tracked PID being gone does not mean the port is free: a
+            # supervisor may already have rebound it under a new PID. Same
+            # two-fact rule the host below uses.
+            if ProcessManager.is_port_in_use(agent_cfg.port, multi_agent.host.bind):
+                _report_port_still_held(args.name, agent_cfg.port)
+                return 1
             print(f"   {args.name} stopped")
-        elif _reap_orphans_on_port(agent_cfg.port, args.name, force):
+            return 0
+
+        reaped = _reap_orphans_on_port(
+            agent_cfg.port, args.name, force, multi_agent.host.bind
+        )
+        if reaped is PortReapResult.RELEASED:
             print(f"   {args.name} stopped (orphan)")
-        else:
+        elif reaped is PortReapResult.NOTHING_FOUND:
             print(f"   {args.name} is not running")
+        else:
+            _report_port_still_held(args.name, agent_cfg.port)
+            return 1
         return 0
 
     # Stop everything: agents first, then host
     print("\U0001F6D1 Stopping Kestrel MultiAgent...")
+
+    # Anything that outlived the stop, named so the summary cannot claim a
+    # clean shutdown over the top of it.
+    unstopped: list[str] = []
 
     for name, cfg in multi_agent.get_local_agents().items():
         pm.register_agent(name, cfg)
         ap = pm._agents.get(name)
         if ap and ap.pid:
             print(f"   Stopping {name} (PID: {ap.pid})...")
-            pm.stop_agent(name)
-            print(f"   {name} stopped")
-        else:
-            _reap_orphans_on_port(cfg.port, name, force)
+            if not pm.stop_agent(name):
+                print(
+                    f"   {name}: PID {ap.pid} is still running after SIGKILL"
+                )
+                unstopped.append(name)
+            elif ProcessManager.is_port_in_use(cfg.port, multi_agent.host.bind):
+                _report_port_still_held(name, cfg.port)
+                unstopped.append(name)
+            else:
+                print(f"   {name} stopped")
+        elif _reap_orphans_on_port(
+            cfg.port, name, force, multi_agent.host.bind
+        ) is PortReapResult.STILL_HELD:
+            _report_port_still_held(name, cfg.port)
+            unstopped.append(name)
 
     # Stop host
     host_pid_file = _host_pid_file(project_dir)
-    host_pid = pm.read_pid(host_pid_file)
-    if host_pid and pm.is_process_running(host_pid):
+    # The verified read, so "nothing is there" and "something else is there
+    # now" are different answers. A number alone could not tell them apart,
+    # and both used to arrive as the same PID (#2995).
+    host_record = pm.read_pid_record(host_pid_file)
+    host_pid = host_record.pid if host_record.is_running else None
+    if host_pid:
         print(f"   Stopping host (PID: {host_pid})...")
-        pm.kill_process(host_pid, force=force)
+        # The instant from the FILE, not a fresh lookup. Looking it up again
+        # would read whatever holds the number now, so a PID reused between
+        # the read and the kill would be validated against itself and
+        # signalled — the exact protection being asked for. None for a legacy
+        # record, which signals as before.
+        started_at = host_record.started_at
+        pm.kill_process(host_pid, force=force, started_at=started_at)
         for _ in range(10):
             if not pm.is_process_running(host_pid):
                 break
             time.sleep(0.5)
         if pm.is_process_running(host_pid):
-            pm.kill_process(host_pid, force=True)
+            pm.kill_process(host_pid, force=True, started_at=started_at)
             time.sleep(0.5)
-        pm.clear_pid(host_pid_file)
-        print("   host stopped")
-    else:
-        if host_pid:
+        # Two independent facts, both required before claiming a stop: the
+        # process is gone, and the port it served is free. Neither implies the
+        # other — a host that failed to bind leaves the port free while still
+        # running, and ``is_process_running`` cannot see a process owned by
+        # another user (#2995), which the port probe can.
+        host_alive = pm.is_process_running(host_pid)
+        port_held = ProcessManager.is_port_in_use(
+            multi_agent.host.port, multi_agent.host.bind
+        )
+        if not host_alive:
+            # The PID file is worth keeping only while it names something
+            # real. Once that process is gone the record is stale, and a
+            # stale record is worse than none: the PID can be reused, and the
+            # next lifecycle command would signal an unrelated process. Clear
+            # it on its own facts, independent of who holds the port.
             pm.clear_pid(host_pid_file)
-        _reap_orphans_on_port(multi_agent.host.port, "host", force)
+        if host_alive or port_held:
+            if host_alive:
+                print(
+                    f"   host: PID {host_pid} is still running after SIGKILL"
+                )
+            if port_held:
+                _report_port_still_held("host", multi_agent.host.port)
+            unstopped.append("host")
+        else:
+            print("   host stopped")
+    else:
+        if host_record.status is PidStatus.STALE:
+            # Known to name a process that is gone, or one that is not the
+            # host. Keeping that record is what lets a later command signal
+            # whatever inherited the number, so it goes now — this is the one
+            # place that can say so with evidence rather than a guess.
+            print(f"   host: clearing stale PID record ({host_record.detail})")
+            pm.clear_pid(host_pid_file)
+        if _reap_orphans_on_port(
+            multi_agent.host.port, "host", force, multi_agent.host.bind
+        ) is PortReapResult.STILL_HELD:
+            _report_port_still_held("host", multi_agent.host.port)
+            unstopped.append("host")
+
+    if unstopped:
+        print(
+            "\u274c MultiAgent stop incomplete — still running: "
+            + ", ".join(unstopped)
+        )
+        return 1
 
     print("\u2705 MultiAgent stopped")
     return 0
@@ -787,6 +933,7 @@ def _run_feature_reconcile(
     (unless ``continue_on_error`` downgrades package failures to warnings).
     """
     from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.cli_features import CORE_UNSAFE, CoreInstallGuard
     from kestrel_sovereign.feature_registry import load_registry
     import importlib.metadata as md
 
@@ -891,9 +1038,27 @@ def _run_feature_reconcile(
         print("• reconcile: host venv already satisfies the agent allowlists.")
         return 0
 
+    # Keyed the way every package identity in the plan is keyed
+    # (``fr.canonical_package``) — an action carrying the canonical name must
+    # not miss a registry row the catalog happened to spell differently.
     git_urls = {
-        info.package: info.git for info in registry.values() if info.package
+        fr.canonical_package(info.package): info.git
+        for info in registry.values() if info.package
     }
+
+    # 4. Guard the core install across the whole batch.
+    #
+    # Every kestrel-feature-* depends on kestrel-sovereign. `uv pip` is
+    # project-blind (see _extension_install_run), so a feature whose core pin the
+    # checkout fails resolves core from the index and replaces the operator's
+    # core with a wheel copy — invisibly, because cwd=checkout keeps shadowing
+    # site-packages for anything started from inside it (issue #2949).
+    #
+    # Same guard object as `feature install` / `upgrade` / `sync`, holding core
+    # to the SAME source-map policy: reconcile never installs core itself (core
+    # classes are bundled, so they are excluded from the plan), so there is no
+    # core entry to apply first here — only a policy to hold everything else to.
+    guard = CoreInstallGuard.snapshot(source_index)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -915,7 +1080,9 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} would {action.op} ({how})")
             continue
 
-        ok, detail = _execute_reconcile_action(action, git_urls, allow_dirty)
+        ok, detail = _execute_reconcile_action(
+            action, git_urls, allow_dirty, guard=guard,
+        )
         if ok:
             print(f"  {label:<34} {current:<10} {action.op}d ({how})")
             if detail:
@@ -926,23 +1093,48 @@ def _run_feature_reconcile(
             print(f"  {label:<34} {current:<10} FAILED")
             for line in (detail or "").splitlines()[-5:]:
                 print(f"      {line}")
+            if guard.constraints:
+                print(
+                    f"      note: core is pinned to {guard.constraints[0]} for "
+                    "this install so a feature cannot silently replace the "
+                    "declared core. If this is a version conflict, update "
+                    "the checkout to satisfy the feature — do not remove the pin."
+                )
             if not continue_on_error:
                 print(
-                    "• reconcile: FAILED — aborting before feature sync. "
+                    "• reconcile: FAILED — aborting before restart. "
                     "Re-run with --continue-on-error to proceed anyway.",
                     file=sys.stderr,
                 )
-                return rc
+                break
+
+    # 5. Assert core survived. Runs even when the loop aborted early: a failing
+    # install can be the very thing that broke the link.
+    #
+    # ``CORE_UNSAFE`` outranks a package failure and is returned verbatim: it
+    # says the venv is running a core the manifest does not declare, which no
+    # caller may continue past. Collapsing it into ``1`` here is what let
+    # ``--continue-on-error`` restart the fleet onto an undeclared core.
+    if not dry_run:
+        core_rc = guard.verify()
+        if core_rc == CORE_UNSAFE:
+            return CORE_UNSAFE
+        if core_rc:
+            rc = 1
 
     return rc
 
 
-def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
+def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool, *, guard):
     """Execute one :class:`ReconcileAction`. Returns ``(ok, detail)``.
 
     Editable -> ``git pull --ff-only`` the checkout (plus ``pip install -e`` when
     not yet installed). PyPI -> ``pip install [--upgrade] spec`` with a git-URL
     fallback (mirrors ``feature sync``/``upgrade``).
+
+    *guard* is required: every install here is a feature install, and a feature
+    install without the core guard is the #2949 defect. Callers with genuinely
+    nothing to protect pass ``CoreInstallGuard.unguarded()`` and say so.
     """
     from kestrel_sovereign.cli_features import _pip_spec
 
@@ -957,9 +1149,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         # it is already editable-linked to this checkout, the pull alone is the
         # update. `relink` is decided by plan_reconcile (codex round 3 P2).
         if action.relink:
-            result = cli._extension_install_run(
-                ["-e", _pip_spec(str(checkout), action.extras)]
-            )
+            result = guard.run(["-e", _pip_spec(str(checkout), action.extras)])
             if result.returncode != 0:
                 return False, (result.stderr or result.stdout or "").strip()
         return True, detail
@@ -972,17 +1162,25 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
     pip_args = []
     if action.op == "update":
         pip_args.append("--upgrade")
-    # Replacing an editable link with the PyPI wheel needs --force-reinstall;
-    # otherwise pip treats an already-satisfying editable version as done and
-    # leaves the checkout linked (codex round 9 P2).
-    if action.force_reinstall:
-        pip_args.append("--force-reinstall")
     pip_args.append(spec)
-    result = cli._extension_install_run(pip_args)
-    # The git-URL fallback installs the repo HEAD with NO version constraint, so
-    # it must NOT be used for a pinned entry — that would silently move the
-    # feature outside the operator's declared pin (codex round 7 P2).
-    if result.returncode != 0 and not action.pinned and git_urls.get(action.package):
+    # Replacing an editable link with the PyPI wheel needs a force reinstall;
+    # otherwise pip treats an already-satisfying editable version as done and
+    # leaves the checkout linked (codex round 9 P2). Scoped to THIS package —
+    # a bare --force-reinstall cascades to every resolved dependency, and core
+    # is one for every feature, so it would pull a same-version core wheel over
+    # the editable link that the version pin cannot exclude (issue #2949).
+    reinstall = action.package if action.force_reinstall else None
+    result = guard.run(pip_args, reinstall=reinstall)
+    # The git-URL fallback installs the repo HEAD from a DIFFERENT source with
+    # NO version constraint, so it is only available to an entry that declared
+    # no source of its own — substituting it for a declared one moves the
+    # feature outside the operator's window, or off the index they named
+    # (codex round 7 P2; ``ReconcileAction.source_declared``).
+    if (
+        result.returncode != 0
+        and not action.source_declared
+        and git_urls.get(action.package)
+    ):
         git_ref = f"git+{git_urls[action.package]}"
         git_spec = (
             f"{_pip_spec(action.package, action.extras)} @ {git_ref}"
@@ -991,7 +1189,7 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         fallback = (
             ["--upgrade", git_spec] if action.op == "update" else [git_spec]
         )
-        result = cli._extension_install_run(fallback)
+        result = guard.run(fallback, reinstall=reinstall)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout or "").strip()
     return True, ""
@@ -1012,8 +1210,13 @@ def cmd_update(args) -> int:
         half-applied update doesn't get restarted into.
       - ``--continue-on-error`` lets ``feature sync`` fail without
         skipping the restart (useful when a single optional feature
-        package is temporarily unreachable).
+        package is temporarily unreachable). It does NOT cover an
+        unrepaired core drift: that returns ``CORE_UNSAFE`` and always
+        aborts before the restart, because continuing would bring the
+        agents up on a core the manifest does not declare (#2949).
     """
+    from kestrel_sovereign.cli_features import CORE_STALE, CORE_UNSAFE
+
     # cli._get_project_dir() returns the RUNTIME data root (honors
     # KESTREL_HOME) which is the wrong place for git pull and
     # uv pip install -e . — use the actual editable source checkout
@@ -1253,8 +1456,36 @@ def cmd_update(args) -> int:
                 manifest=getattr(args, "manifest", None),
                 capture=False,
                 dry_run=False,
+                # Forwarded, or `kestrel update --allow-dirty` still refuses to
+                # pull a dirty declared core checkout during sync — the flag
+                # advertised on THIS command silently not reaching the step that
+                # honours it.
+                allow_dirty=allow_dirty,
             )
             rc = cli.cmd_feature_sync(sync_args)
+            if rc == CORE_STALE:
+                # Core is on its declared path but the pull failed, so the code
+                # about to be restarted is not the code the operator asked for.
+                # Not continuable for the same reason CORE_UNSAFE is not.
+                print(
+                    "• features: FAILED — the declared core checkout could not "
+                    "be updated, so a restart would run stale code. Resolve the "
+                    "checkout (or pass --allow-dirty); --continue-on-error does "
+                    "not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_STALE
+            if rc == CORE_UNSAFE:
+                # Same rule as reconcile below: an unrepaired core drift is a
+                # safety failure, not an optional-package failure, so
+                # --continue-on-error does not reach it.
+                print(
+                    "• features: FAILED — core is not the declared install and "
+                    "could not be repaired. Refusing to continue onto an "
+                    "undeclared core; --continue-on-error does not cover this.",
+                    file=sys.stderr,
+                )
+                return CORE_UNSAFE
             if rc != 0 and not continue_on_error:
                 print(
                     "• features: FAILED — aborting before reconcile/restart. "
@@ -1286,6 +1517,17 @@ def cmd_update(args) -> int:
             continue_on_error=continue_on_error,
             prefer=prefer,
         )
+        if rc == CORE_UNSAFE:
+            # Not continuable, by design: restarting here would bring every
+            # agent up on a core the manifest does not declare, and returning 0
+            # would report that as a successful update.
+            print(
+                "• reconcile: FAILED — core is not the declared install and "
+                "could not be repaired. Refusing to restart agents onto an "
+                "undeclared core; --continue-on-error does not cover this.",
+                file=sys.stderr,
+            )
+            return CORE_UNSAFE
         if rc != 0 and not continue_on_error:
             print(
                 "• reconcile: FAILED — aborting before restart. "
@@ -1327,17 +1569,20 @@ def cmd_status(args) -> int:
     multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
 
     # Host/server status
-    host_pid = ProcessManager.read_pid(_host_pid_file(project_dir))
-    host_running = host_pid is not None and ProcessManager.is_process_running(host_pid)
+    # Same verified read as ``stop`` and the reanchor guard: status must not
+    # report an agent the stop path cannot see, or vice versa (#2995).
+    host_record = ProcessManager.read_pid_record(_host_pid_file(project_dir))
+    host_running = host_record.is_running
+    host_pid = host_record.pid
     host_pid_str = str(host_pid) if host_running else "-"
     host_uptime = _format_uptime(host_pid) if host_running else "-"
 
     # Detect mode: check if any agent has its own PID file (subprocess mode)
     local_agents = multi_agent.get_local_agents()
     any_agent_pid = any(
-        ProcessManager.read_pid(
+        ProcessManager.read_pid_record(
             ProcessManager.agent_pid_file((project_dir / cfg.data_dir).resolve())
-        ) is not None
+        ).is_running
         for cfg in local_agents.values()
     )
 
@@ -1349,8 +1594,11 @@ def cmd_status(args) -> int:
 
         for name, cfg in local_agents.items():
             resolved_dir = (project_dir / cfg.data_dir).resolve()
-            pid = ProcessManager.read_pid(ProcessManager.agent_pid_file(resolved_dir))
-            running = pid is not None and ProcessManager.is_process_running(pid)
+            agent_record = ProcessManager.read_pid_record(
+                ProcessManager.agent_pid_file(resolved_dir)
+            )
+            pid = agent_record.pid
+            running = agent_record.is_running
             status_str = "online" if running else "offline"
             pid_str = str(pid) if running else "-"
             uptime = _format_uptime(pid) if running else "-"

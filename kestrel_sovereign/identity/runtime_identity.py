@@ -32,13 +32,16 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import weakref
 
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -60,6 +63,14 @@ from kestrel_sovereign.security.key_storage import SecureKeyStorage
 
 
 logger = logging.getLogger(__name__)
+
+
+# A runtime ``AgentIdentity`` is only assertion-authoritative after the loader
+# has validated its on-disk key material and DID binding.  Keep that fact
+# separate from the public identity data: callers may construct an
+# ``AgentIdentity`` for signing tests or other local work, but that does not
+# establish authority over a persisted semantic tenant.
+_LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN = object()
 
 
 class RuntimeIdentityError(Exception):
@@ -91,6 +102,14 @@ class IdentityReadinessError(RuntimeError):
         "binding": (
             "identity material does not bind to the configured agent DID; "
             "restore the matching agent home and restart without re-incepting"
+        ),
+        "birth_record": (
+            "on-disk identity material is present but the agent's birth record "
+            "is absent or incomplete in the configured runtime database (it was "
+            "written to a different database, or a fabricated placeholder / "
+            "partial write is missing its constitution). Point the runtime at "
+            "the database inception used, or re-incept against this backend — do "
+            "not boot with a fabricated placeholder identity"
         ),
     }
 
@@ -186,7 +205,6 @@ class AgentIdentity:
     succession_chain: Optional[SuccessionChain] = None
     archival_keypair: Optional[Keypair] = None
     succession_statement: Optional[SuccessionStatement] = None
-
     def __post_init__(self) -> None:
         if self.hybrid_keypair is None and self.legacy_keypair is None:
             raise RuntimeIdentityError(
@@ -212,6 +230,121 @@ class AgentIdentity:
         Legacy-only: the ``did:pkh``.
         """
         return self.new_did if self.is_hybrid else self.legacy_did
+
+
+@dataclass(frozen=True)
+class _LoaderVerifiedIdentityBinding:
+    """Immutable loader evidence held outside a mutable identity instance."""
+
+    dids: frozenset[str]
+    public_material_digest: str
+
+
+_LOADER_VERIFIED_IDENTITIES: dict[
+    int,
+    tuple[weakref.ReferenceType[AgentIdentity], _LoaderVerifiedIdentityBinding],
+] = {}
+
+
+def _identity_dids(identity: AgentIdentity) -> frozenset[str]:
+    return frozenset(
+        candidate
+        for candidate in (identity.legacy_did, identity.new_did)
+        if isinstance(candidate, str) and candidate
+    )
+
+
+def _keypair_public_material(keypair: Keypair | None) -> bytes:
+    if keypair is None:
+        return b""
+    if not isinstance(keypair, Keypair):
+        raise TypeError("runtime identity key material has an invalid keypair type")
+    public_key = keypair.public_key
+    if isinstance(public_key, bytes):
+        return public_key
+    if not hasattr(public_key, "public_bytes"):
+        raise TypeError("runtime identity key material has no serializable public key")
+    try:
+        return public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except (TypeError, ValueError):
+        # The classical keys loaded here support DER. Retain a raw fallback
+        # for providers whose public-key object supports only its native form.
+        return public_key.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+
+
+def _identity_public_material_digest(identity: AgentIdentity) -> str:
+    """Fingerprint loader-verified public key material, not object identities."""
+    hybrid = identity.hybrid_keypair
+    if hybrid is not None and not isinstance(hybrid, HybridKeypair):
+        raise TypeError("runtime identity hybrid key material has an invalid type")
+    parts = [
+        b"legacy\x00" + _keypair_public_material(identity.legacy_keypair),
+        b"hybrid-classical\x00" + _keypair_public_material(
+            hybrid.classical if hybrid is not None else None
+        ),
+        b"hybrid-pq\x00" + _keypair_public_material(
+            hybrid.pq if hybrid is not None else None
+        ),
+        b"archival\x00" + _keypair_public_material(identity.archival_keypair),
+    ]
+    return hashlib.sha256(b"\x1f".join(parts)).hexdigest()
+
+
+def _register_loader_verified_identity(identity: AgentIdentity) -> None:
+    """Record immutable DID/key evidence without trusting identity attributes."""
+    binding = _LoaderVerifiedIdentityBinding(
+        dids=_identity_dids(identity),
+        public_material_digest=_identity_public_material_digest(identity),
+    )
+    if not binding.dids:
+        raise RuntimeIdentityError("loader-verified identity has no DID binding")
+    identity_id = id(identity)
+
+    def _clear(reference: weakref.ReferenceType[AgentIdentity]) -> None:
+        current = _LOADER_VERIFIED_IDENTITIES.get(identity_id)
+        if current is not None and current[0] is reference:
+            del _LOADER_VERIFIED_IDENTITIES[identity_id]
+
+    _LOADER_VERIFIED_IDENTITIES[identity_id] = (weakref.ref(identity, _clear), binding)
+
+
+def _loader_verified_identity_binding(
+    identity: object,
+) -> _LoaderVerifiedIdentityBinding | None:
+    """Return independent loader evidence only while object and contents match."""
+    if type(identity) is not AgentIdentity:
+        return None
+    entry = _LOADER_VERIFIED_IDENTITIES.get(id(identity))
+    if entry is None or entry[0]() is not identity:
+        return None
+    binding = entry[1]
+    try:
+        matches = (
+            _identity_dids(identity) == binding.dids
+            and _identity_public_material_digest(identity)
+            == binding.public_material_digest
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return binding if matches else None
+
+
+def _loader_verified_agent_identity(
+    token: object,
+    **kwargs: object,
+) -> AgentIdentity:
+    """Construct an identity that passed this module's persisted-key checks."""
+    if token is not _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN:
+        raise TypeError("loader verification witness is issued only by load_agent_identity")
+    identity = AgentIdentity(**kwargs)
+    _register_loader_verified_identity(identity)
+    return identity
 
 
 def _validate_hybrid_key_binding(
@@ -386,42 +519,79 @@ def _load_legacy_part(
         )
     did_document = json.loads(did_path.read_text())
     legacy_did = did_document.get("id")
-    if not legacy_did:
+    if not isinstance(legacy_did, str) or not legacy_did:
         raise RuntimeIdentityError(
             f"DID document at {did_path} has no 'id' field"
         )
 
+    # The legacy DID document is not merely display metadata.  The loader
+    # later attests this identity as the tenant authority, so bind all three
+    # persisted pieces here: the local key, the document's public key, and
+    # the self-certifying did:pkh address.  Otherwise a mismatched key/doc
+    # pair could cause an authority capability to be issued for the DID in a
+    # document that the local key never controlled.
+    verification_methods = (
+        did_document.get("publicKey")
+        or did_document.get("verificationMethod")
+    )
+    if not isinstance(verification_methods, list) or len(verification_methods) != 1:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} must contain exactly one legacy public key"
+        )
+    verification_method = verification_methods[0]
+    if not isinstance(verification_method, Mapping):
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has a malformed legacy public key"
+        )
+    public_key_hex = verification_method.get("publicKeyHex")
+    if not isinstance(public_key_hex, str) or not public_key_hex:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has no legacy publicKeyHex"
+        )
+    try:
+        document_public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256K1(), bytes.fromhex(public_key_hex),
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeIdentityError(
+            f"DID document at {did_path} has an invalid legacy publicKeyHex"
+        ) from error
+
     if priv is not None:
         pub = priv.public_key()
     else:
-        # Post-destruction: derive public from the DID document.
-        # The legacy DID document carries publicKeyHex in the
-        # ``publicKey``/``verificationMethod`` array.
-        pub_hex = None
-        for vm in (
-            did_document.get("publicKey") or did_document.get("verificationMethod") or []
-        ):
-            pub_hex = vm.get("publicKeyHex")
-            if pub_hex:
-                break
-        if not pub_hex:
-            raise FileNotFoundError(
-                f"Legacy private key not on disk for {legacy_key_id} "
-                f"AND DID document at {did_path} has no publicKeyHex. "
-                f"Cannot reconstruct legacy public key."
-            )
-        try:
-            pub = ec.EllipticCurvePublicKey.from_encoded_point(
-                ec.SECP256K1(), bytes.fromhex(pub_hex),
-            )
-        except Exception as e:
-            raise RuntimeIdentityError(
-                f"Failed to decode legacy public key from DID document: {e}"
-            )
+        # Post-destruction: the verified document key is all that remains of
+        # the legacy keypair.  Hybrid signing still covers new artifacts.
+        pub = document_public_key
         logger.info(
             f"Legacy private key absent (post-destruction) for {legacy_did}; "
             f"derived legacy public from DID document. Hybrid identity "
             f"continues to provide signing capability."
+        )
+
+    public_bytes = pub.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    document_public_bytes = document_public_key.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    if public_bytes != document_public_bytes:
+        raise RuntimeIdentityError(
+            "legacy private key does not match the DID document public key"
+        )
+    did_prefix = "did:pkh:eip155:1:"
+    if not legacy_did.startswith(did_prefix):
+        raise RuntimeIdentityError(
+            f"legacy DID is not a did:pkh:eip155:1 identifier: {legacy_did!r}"
+        )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    derived_address = public_key_to_ethereum_address(pub)
+    if legacy_did[len(did_prefix):].lower() != derived_address.lower():
+        raise RuntimeIdentityError(
+            "legacy DID address does not match the verified legacy public key"
         )
 
     legacy_kp = Keypair(
@@ -709,7 +879,8 @@ def _load_born_hybrid(
     )
 
     logger.info(f"Loaded born-hybrid agent identity: {new_did}")
-    return AgentIdentity(
+    return _loader_verified_agent_identity(
+        _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
         hybrid_keypair=hybrid,
         new_did=new_did,
         new_verification_methods=signing_vms,
@@ -790,7 +961,8 @@ def load_agent_identity(
     )
 
     if succession_path is None:
-        return AgentIdentity(
+        return _loader_verified_agent_identity(
+            _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
             legacy_did=legacy_did,
             legacy_keypair=legacy_kp,
             legacy_did_document=legacy_did_doc,
@@ -816,7 +988,8 @@ def load_agent_identity(
         f"Loaded hybrid agent identity: legacy={legacy_did} "
         f"-> new={statement.successor_did}"
     )
-    return AgentIdentity(
+    return _loader_verified_agent_identity(
+        _LOADER_VERIFIED_IDENTITY_FACTORY_TOKEN,
         legacy_did=legacy_did,
         legacy_keypair=legacy_kp,
         legacy_did_document=legacy_did_doc,

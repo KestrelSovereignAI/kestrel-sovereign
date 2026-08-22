@@ -10,7 +10,7 @@ from typing import Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 
-from .models import ComputeScript, DenialResponse, ScriptState, calculate_risk_score
+from .models import DenialResponse, ScriptState
 from .script_store import ScriptStore
 from .script_signer import ScriptSigner
 from .script_analyzer import ScriptAnalyzer

@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.49.4"
+version = "0.53.3"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -63,20 +63,47 @@ dependencies = [
     # spans without importing a feature package (stays on the right side of the
     # core-never-imports-features boundary). Tracing is still a runtime no-op
     # unless an OTLP endpoint is configured.
-    # 0.31.1 floor: first-class typed parts on the ToolResult envelope (#2641).
+    # 0.32.0 floor: capability-negotiated isolated tool execution context
+    # required by durable scheduler dispatch (#2715). This also includes the
+    # first-class typed parts on the ToolResult envelope (#2641).
+    # 0.35.1 floor: typed, capability-negotiated private host ingress for
+    # isolated services (#2755), including Core's generic pre-gate
+    # external-ingress quiesce/resume lifecycle. The host must not emulate
+    # this through tools/call because ingress is deliberately unavailable to
+    # agent tools.
     # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
     # agent/parts.py re-exports (emit_part's tool-result fallback), and
     # DynamicTool.execute attaches buffered/explicit parts to the serialized
     # envelope — the SDK owns the buffer so in-tree and external features share
     # it. This floor also covers the obs#32 KESTREL_OTEL_PROJECT reader that
-    # landed in 0.30.2. The floor is 0.31.1 — NOT 0.31.0 — because parts.py
-    # landed in the SDK without a version bump: source/editable builds of
-    # pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed on
-    # source + version) served such a stale build during feature
+    # landed in 0.30.2. The earlier floor was 0.31.1 — not 0.31.0 — because
+    # parts.py landed in the SDK without a version bump: source/editable builds
+    # of pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed
+    # on source + version) served such a stale build during feature
     # reconciliation, repeatedly breaking the CLI with ModuleNotFoundError
-    # (2026-07-20/21 host incidents). >=0.31.1 makes every pre-parts artifact
-    # unsatisfiable regardless of cache state.
-    "kestrel-sovereign-sdk[tracing]>=0.31.1,<0.32",
+    # (2026-07-20/21 host incidents). Requiring 0.35.1 now makes both those
+    # pre-parts artifacts and pre-execution-context services unsatisfiable.
+    # 0.34.0 floor: provider-neutral, owner-scoped private inference request,
+    # quote, route, lifecycle, and entry-point contracts. Core consumes these
+    # contracts without importing any Runpod/Vast/Vertex implementation.
+    # 0.35.0 floor: owner-scoped idle renewal plus the absolute lease-lifetime
+    # ceiling used to reject provider acquisition/touch results that outlive
+    # the request's readiness deadline and expected session.
+    # 0.36.0 floor: public lifecycle-owned operator service, workflow,
+    # execution-target, authorization-context, and contribution contracts.
+    # The ceiling tracks the MINOR, not the major, and 0.35.0 is itself the
+    # evidence for that: it added a required member to a runtime-checkable
+    # protocol and tightened validate_for, so leases that validated under
+    # 0.34.0 are now rejected. An SDK minor can therefore break inference-lease
+    # providers. Under a minor ceiling that lands as an unresolvable install;
+    # under <1 it would resolve silently. InferenceLeaseFeature.initialize
+    # catches discovery errors and keeps the agent up with providers={} - so every
+    # installed provider would become "not installed" on an unchanged Core.
+    # Widen this only with a Core release that has tested the newer minor.
+    # Release cascade: Frinz and the observability fleet must publish/test
+    # constraints that admit this line before Core is released. Do not weaken
+    # Core's safety floor to make an older downstream resolver succeed.
+    "kestrel-sovereign-sdk[tracing]>=0.36.0,<0.37",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -131,6 +158,10 @@ dependencies = [
     "python-dotenv==1.2.2",
     "toml==0.10.2",
     "PyYAML>=6.0",
+    # Maintained parser for the fixed, offline RDF 1.1 N-Triples import edge.
+    # The codec never exposes RDFLib's format, loader, or network configuration
+    # to application callers.
+    "rdflib>=7.1.4,<8",
     # Concrete Bash syntax tree used by compute's fail-closed safe-delete
     # rewriter.  The grammar and Python binding are both MIT licensed.
     "tree-sitter>=0.25,<1",
@@ -183,6 +214,9 @@ dependencies = [
     # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",
+    # Windows does not ship the IANA zoneinfo database. Scheduler cron parsing
+    # must work in the base install, without the optional Pandas/Phoenix trees.
+    "tzdata; sys_platform == 'win32'",
     # CAR file support (sovereignty exports)
     # >=5.9.0 fixes an uncontrolled-recursion DoS on malformed input.
     "cbor2>=5.9.0",
@@ -190,7 +224,17 @@ dependencies = [
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
-    "pqcrypto>=0.4.0",
+    # Floor at 1.0: 0.x used ml_dsa_65.generate_keypair() and a verify()
+    # returning True/False, exposed SPHINCS+ rather than FIPS 205 SLH-DSA, and
+    # used encrypt/decrypt rather than encaps/decaps for ML-KEM. None of those
+    # are interchangeable — see crypto_suite.py, kem_suite.py and #2966 — so
+    # this must not be relaxed back across the 1.0 boundary.
+    #
+    # PLATFORM FLOOR: 1.0 ships Linux wheels as manylinux_2_34 ONLY, so this
+    # pin sets a glibc >= 2.34 requirement (Ubuntu 22.04+, Debian 12+, RHEL 9+).
+    # Below that, install builds from an sdist and needs a Rust toolchain.
+    # Documented in README Prerequisites; accepted deliberately (#2966).
+    "pqcrypto>=1.0,<2.0",
     "kestrel-llms[all]==0.1.8",
 ]
 
@@ -207,6 +251,7 @@ test = [
     # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
     "pytest>=9.0.3",
     "pytest-asyncio>=1.1.0",
+    "pytest-cov>=7.1.0",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
@@ -246,7 +291,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.31.0,<0.32",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.36.0,<0.37",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the
@@ -293,14 +338,15 @@ search = [
     "tavily-python>=0.3.0",
 ]
 # Note on extracted feature packages:
-# Out-of-tree feature packages (kestrel-feature-mcp, kestrel-talon, the
-# kestrel-cloud-* / kestrel-storage-* / kestrel-voice-* family, etc.) are
-# installed independently — `pip install kestrel-feature-mcp` adds MCP
-# support and registers itself via the `kestrel_sovereign.features`
-# entry-point group at startup. The framework deliberately doesn't list
-# those packages here as optional-deps, because doing so inverts the
-# open-core dependency direction (framework → feature instead of
-# feature → framework).
+# Out-of-tree Feature packages (for example kestrel-feature-mcp), provider
+# packages (the kestrel-cloud-* / kestrel-storage-* / kestrel-voice-* family),
+# and standalone tools (kestrel-talon) are installed independently.
+# `pip install kestrel-feature-mcp` registers Feature lifecycle classes via
+# `kestrel_sovereign.features`; providers use their provider-specific groups;
+# kestrel-talon exposes its own command. The framework deliberately doesn't
+# list those packages here as optional-deps, because doing so inverts the
+# open-core dependency direction (framework → extension instead of extension
+# → framework).
 #
 # All feature packages — restores pre-split behavior
 all-features = [
@@ -344,6 +390,7 @@ dev = [
 test = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.1.0",
+    "pytest-cov>=7.1.0",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
@@ -368,7 +415,7 @@ markers = [
     "docker_mcp: Tests that require Docker MCP Toolkit (excluded in CI)",
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
-    "bench: Performance benchmarks (excluded from default CI)",
+    "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",
     "anyio",
 ]
 

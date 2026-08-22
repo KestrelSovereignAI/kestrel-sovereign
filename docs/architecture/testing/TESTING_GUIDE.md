@@ -7,10 +7,10 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: active
 owner: architecture
-canonical: false
+canonical: true
 generated: false
 privacy: public
 ---
@@ -23,6 +23,12 @@ A comprehensive guide to running and writing tests for Kestrel Sovereign.
 > during implementation, independent verification during review, CI
 > before merge) and the structured result states the reviewer reports,
 > see [`TEST_EVIDENCE_GATES.md`](TEST_EVIDENCE_GATES.md).
+>
+> Semantic-KB cutovers additionally use the immutable, content-free
+> conformance, parity, erasure, benchmark, diagnostics, and Kite evidence
+> catalog in [`SEMANTIC_RELEASE_EVIDENCE.md`](SEMANTIC_RELEASE_EVIDENCE.md).
+> A generated template is deliberately non-ready until each catalog-bound
+> observation and artifact digest has been independently recorded.
 
 ## Test Pyramid Strategy
 
@@ -40,7 +46,30 @@ Tests are organized in a pyramid structure - run from the bottom up:
 # Run all tests with the test runner
 ./run_tests.py --unit          # Unit tests only
 ./run_tests.py --integration   # Integration tests
-./run_tests.py --ci            # Full CI suite
+./run_tests.py --ci --skip-check  # Full suite + canonical-package coverage
+```
+
+A fresh `uv sync` installs `pytest-cov` through the default development group.
+The `--ci` command measures the canonical `kestrel_sovereign` package and
+enforces the measured ratchet in `.coveragerc`. The current ratchet is 73%, not
+80%: a 2026-07-25 full-unit-suite measurement produced 73.53% combined
+line/branch coverage (68,079 covered lines and 19,863 covered branches). The
+weekly job includes that unit suite plus the remaining repository tests. An 80%
+floor remains the next target and must not be presented as current coverage.
+
+The scheduled weekly analysis runs the same coverage gate with xdist. CI
+disables fail-fast for this lane so pytest-cov can combine every worker file and
+write terminal, HTML, JSON, and XML diagnostics even when tests fail. The job
+remains failed when tests or coverage fail, while feedback/coverage uploads and
+the issue-analysis job still run. Missing artifacts are tolerated so an early
+test-runner failure does not hide the original failure or prevent analysis.
+
+For a focused coverage report during development, override the repository-wide
+floor so untested modules outside the selected test do not fail the command:
+
+```bash
+uv run pytest tests/unit/test_docs_verify.py --cov=kestrel_sovereign \
+  --cov-report=term --cov-fail-under=0
 ```
 
 ### The `run_tests.py` Script
@@ -52,7 +81,7 @@ The project includes a comprehensive test runner with smart features:
 | `--unit` | Run unit tests only |
 | `--integration` | Run integration tests only |
 | `--llm` | Run LLM-dependent tests |
-| `--ci` | Full CI mode (parallel + coverage) |
+| `--ci` | Full CI mode (parallel + canonical-package branch coverage, 73% measured ratchet) |
 | `-x` | Fail fast (stop on first failure) |
 | `--failed` | Re-run only last failed tests |
 | `--skip-check` | Skip DB/Redis health checks |

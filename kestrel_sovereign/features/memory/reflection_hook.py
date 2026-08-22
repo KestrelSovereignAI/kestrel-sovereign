@@ -11,9 +11,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+from kestrel_sovereign.agent.sleep import (
+    SleepHookContract,
+    SleepHookPhase,
+    SleepHookStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,28 +44,56 @@ class RetrievedMemoryCandidate:
 class ReflectionSleepHook:
     """Sleep hook that marks load-bearing retrieved memories as applied."""
 
+    # Stable declarative identity lets post-consolidation consumers order
+    # themselves against memory's knowledge-extraction boundary without core
+    # knowing this feature's concrete class.
+    sleep_hook_contract = SleepHookContract(
+        hook_id="kestrel_sovereign.memory.reflection",
+        phase=SleepHookPhase.KNOWLEDGE_EXTRACTION,
+    )
+
+    def __init__(self) -> None:
+        # A hook instance is shared by every way an agent can sleep.  Keep its
+        # pre/post handoff task-local so an overlapping scheduled and manual
+        # cycle cannot consume or overwrite one another's attestation result.
+        # Each ``sleep()`` invocation calls the two stages in the same task.
+        self._pre_sleep_status: ContextVar[Optional[SleepHookStatus]] = ContextVar(
+            "reflection_pre_sleep_status",
+            default=None,
+        )
+
+    def _finish_pre_sleep(
+        self,
+        status: SleepHookStatus,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Record the current cycle's terminal pre-stage status and return it."""
+        self._pre_sleep_status.set(status)
+        return result
+
     async def on_pre_sleep(self, agent) -> Dict[str, Any]:
+        self._pre_sleep_status.set(None)
         memory = getattr(agent, "memory", None) or getattr(agent, "memory_system", None)
         if memory is None or not hasattr(memory, "mark_applied"):
-            return {
+            return self._finish_pre_sleep(SleepHookStatus.SKIPPED, {
                 "success": True,
                 "skipped": True,
                 "reason": "memory_system_unavailable",
                 "insights_generated": 0,
                 "candidates": 0,
                 "applied_count": 0,
-            }
+            })
 
         db = self._resolve_db(agent)
         if db is None:
-            return {
+            return self._finish_pre_sleep(SleepHookStatus.SKIPPED, {
                 "success": True,
                 "skipped": True,
                 "reason": "database_unavailable",
                 "insights_generated": 0,
                 "candidates": 0,
                 "applied_count": 0,
-            }
+            })
 
         cutoff = self._session_cutoff(agent)
         candidates = await self._recently_retrieved_memories(
@@ -68,13 +103,13 @@ class ReflectionSleepHook:
             cutoff=cutoff,
         )
         if not candidates:
-            return {
+            return self._finish_pre_sleep(SleepHookStatus.SUCCESS, {
                 "success": True,
                 "skipped": False,
                 "insights_generated": 0,
                 "candidates": 0,
                 "applied_count": 0,
-            }
+            })
 
         session_context = await self._session_context(agent, cutoff=cutoff)
         applied = 0
@@ -86,13 +121,18 @@ class ReflectionSleepHook:
                     candidate=candidate,
                     session_context=session_context,
                 )
-            except Exception as exc:  # noqa: BLE001 - hook must not block sleep
-                logger.warning(
-                    "memory reflection attestation failed for message %s: %s",
-                    candidate.message_id,
-                    exc,
-                )
-                continue
+            except Exception:  # noqa: BLE001 - hook must not block sleep
+                # Provider exceptions can include prompt or response content.
+                # Keep sleep-hook diagnostics content-free.
+                logger.warning("Memory reflection attestation failed")
+                return self._finish_pre_sleep(SleepHookStatus.FAILED, {
+                    "success": False,
+                    "skipped": False,
+                    "reason": "attestation_failed",
+                    "insights_generated": 0,
+                    "candidates": len(candidates),
+                    "applied_count": applied,
+                })
 
             if not attestation.get("applied"):
                 continue
@@ -101,13 +141,52 @@ class ReflectionSleepHook:
             applied += 1
             attested_ids.append(candidate.message_id)
 
-        return {
+        return self._finish_pre_sleep(SleepHookStatus.SUCCESS, {
             "success": True,
             "skipped": False,
             "insights_generated": applied,
             "candidates": len(candidates),
             "applied_count": applied,
             "attested_message_ids": attested_ids,
+        })
+
+    async def on_post_consolidation(
+        self,
+        agent,
+        consolidation_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Complete reflection's declared post-consolidation stage boundary.
+
+        Memory-application attestation deliberately happens before consolidation,
+        while the conversation rows are still the source material.  The hook's
+        declarative identity is nevertheless a post-consolidation prerequisite:
+        downstream semantic maintenance can only consume a corpus after that
+        attestation and the single consolidation chokepoint have both completed.
+        This content-free acknowledgement makes that boundary explicit without
+        duplicating consolidation or performing a second reflection pass.
+        """
+        del agent, consolidation_result
+        pre_sleep_status = self._pre_sleep_status.get()
+        self._pre_sleep_status.set(None)
+        if pre_sleep_status is SleepHookStatus.SUCCESS:
+            return {"success": True, "insights_generated": 0}
+        if pre_sleep_status is SleepHookStatus.SKIPPED:
+            return {
+                "success": False,
+                "skipped": True,
+                "reason": "pre_sleep_reflection_skipped",
+                "insights_generated": 0,
+            }
+        if pre_sleep_status is SleepHookStatus.FAILED:
+            return {
+                "success": False,
+                "reason": "pre_sleep_reflection_failed",
+                "insights_generated": 0,
+            }
+        return {
+            "success": False,
+            "reason": "pre_sleep_reflection_not_completed",
+            "insights_generated": 0,
         }
 
     def _resolve_db(self, agent):
@@ -223,8 +302,8 @@ class ReflectionSleepHook:
                 metadata,
             )
             return decoded
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not decrypt retrieved memory candidate: %s", exc)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not decrypt retrieved memory candidate")
             return content or ""
 
     async def _session_context(self, agent, *, cutoff: datetime) -> str:
@@ -237,8 +316,8 @@ class ReflectionSleepHook:
             history = await conversation.get_conversation_history(
                 limit=_MAX_CONTEXT_MESSAGES
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not load session context for memory attestation: %s", exc)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not load session context for memory attestation")
             return ""
 
         lines: List[str] = []
@@ -277,6 +356,11 @@ class ReflectionSleepHook:
             "Answer as JSON only, with this shape: "
             '{"applied": true|false, "reason": "one sentence"}.'
         )
+        # No ``session_id`` on purpose (#2940). This attestation runs in the
+        # sleep cycle, over every memory retrieved since a time cutoff — which
+        # can span several chat windows and belongs to none of them. Naming any
+        # one of them would file the span in a band it did not happen in, and
+        # #2916's rule is that the attribute stays absent rather than wrong.
         response = await llm_service.generate(
             system_prompt=(
                 "You are auditing memory application. Be conservative. "

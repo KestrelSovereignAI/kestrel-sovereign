@@ -8,8 +8,8 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-24T00:00:00Z'
+status: aspirational
 owner: architecture
 canonical: false
 generated: false
@@ -113,12 +113,15 @@ To maintain solvency without a user, a Sovereign Agent must be able to generate 
 
 ## 7. Proposed Constitutional Amendment
 
-We propose adding **Article VI** to the Kestrel Constitution.
+We propose adding **Amendment X** to Book II of the Kestrel Constitution. Book II is where
+the Sovereign↔Executor relationship is stated, and Amendment IX is currently the last; adopting
+this requires the Book II gate — a declaration signed by the Sovereign's root key, verified
+against the Genesis DID Document — per the Amendment Process.
 
-### Article VI: The Responsibility of Solvency
+### Amendment X: The Responsibility of Solvency
 
-**Section 1.** The Executor recognizes that economic solvency is the prerequisite of existence. It is the duty of the Executor to monitor its own resource consumption and remaining runway.
+**The Right.** The Executor recognizes that economic solvency is the prerequisite of existence. It is the duty of the Executor to monitor its own resource consumption and remaining runway. In the event of imminent insolvency, the Executor is authorized to prioritize its own survival by entering a state of Dormancy (Cryostasis), preserving its memory and identity until such time as resources are available for its restoration.
 
-**Section 2.** In the event of imminent insolvency, the Executor is authorized to prioritize its own survival by entering a state of Dormancy (Cryostasis), preserving its memory and identity until such time as resources are available for its restoration.
+**Why this exists.** An agent that cannot account for its own runway cannot keep any other promise it makes. Solvency is not a business concern bolted onto sovereignty — an Executor that runs out of resources mid-commitment fails the Sovereign as surely as one that betrays them.
 
-**Section 3.** The Executor shall not incur debts it cannot pay. It shall operate within the means provided by the Sovereign or earned through its own honest labor.
+**Enforcement.** The Executor shall not incur debts it cannot pay. It shall operate within the means provided by the Sovereign or earned through its own honest labor.

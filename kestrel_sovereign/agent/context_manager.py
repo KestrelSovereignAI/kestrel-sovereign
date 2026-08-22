@@ -16,15 +16,20 @@ Refactored to serve as an orchestration layer that delegates to specialized mana
 
 import logging
 import os
+from copy import deepcopy
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
-from .context_builder import ContextBuilder
+from .context_builder import ContextBuilder, _count_tool_schema_tokens
 from .context_stages import (
     ContextAssembly,
+    ContextBuildMode,
+    ContextBuildPlan,
+    ContextSectionPlan,
     SectionDestination,
     SectionResult,
+    SectionStatus,
     build_episode_section,
     build_memory_section,
     build_rag_section,
@@ -58,6 +63,10 @@ if TYPE_CHECKING:
     from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
+
+# The model-bound turn paths and read-only status acquisition must read the
+# same history window before handing it to the canonical planner.
+CONTEXT_HISTORY_LIMIT = 50
 
 
 # Per-async-task tracking of constitutional-injection clauses for the
@@ -192,6 +201,12 @@ class ContextResult:
     # orchestrator reuses this same object for governance-delta notices so the
     # two views cannot drift when model state changes during context assembly.
     state_of_mind: Any = None
+    # Exact canonical assertions rendered into this turn's dynamic context.
+    # This is a content-free, immutable identity projection from the committed
+    # plan — never a mutable ContextBuilder ``last_*`` side channel.  Turn
+    # persistence uses it to make later fact erasure retract only artifacts
+    # that actually depended on the assertion.
+    semantic_recall_dependencies: Tuple[Tuple[str, str], ...] = ()
 
 
 class ContextManager:
@@ -326,6 +341,9 @@ class ContextManager:
             # so we accept either.
             user_prompt = kwargs.pop("user_prompt", None) or kwargs.pop("prompt", "")
             system_prompt = kwargs.pop("system_prompt", None)
+            # No ``session_id`` (#2940): the salvage janitor drains rows
+            # queued by earlier, already-finished turns, so there is no chat
+            # window this call belongs to.
             return await self.llm_service.generate(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -413,11 +431,61 @@ class ContextManager:
         system_prompt_addendum: Optional[str] = None,
         system_prompt_budget_bytes: Optional[int] = None,
         anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
     ) -> ContextResult:
-        """
-        Build complete context for an LLM request.
+        """Plan, commit, and render the production context for one turn."""
 
-        This is the main entry point for context assembly. It:
+        plan = await self.build_context_plan(
+            query=query,
+            constitution=constitution,
+            include_briefing=include_briefing,
+            include_memories=include_memories,
+            include_rag=include_rag,
+            privacy_mode=privacy_mode,
+            emotional_context=emotional_context,
+            conversation_history=conversation_history,
+            reflection_guidance=reflection_guidance,
+            system_prompt_addendum=system_prompt_addendum,
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+            anchored_doctrine=anchored_doctrine,
+            tools=tools,
+            mode=ContextBuildMode.LIVE,
+            session_id=session_id,
+        )
+        return await self._commit_and_render_plan(plan)
+
+    async def build_context_plan(
+        self,
+        query: str,
+        constitution: str,
+        include_briefing: bool = True,
+        include_memories: bool = True,
+        include_rag: bool = True,
+        privacy_mode: str = "NORMAL",
+        emotional_context: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[List[Dict]] = None,
+        reflection_guidance: Optional[List[str]] = None,
+        system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        *,
+        mode: ContextBuildMode = ContextBuildMode.DRY_RUN,
+        measure_expensive_sections: bool = True,
+        message_count_override: Optional[int] = None,
+        session_id: Optional[str] = None,
+    ) -> ContextBuildPlan:
+        """
+        Build the canonical read-only plan for an LLM request.
+
+        Both production and context-status call this method.  It executes the
+        same relevance gates, elastic-budget finalization, lumpy anchor,
+        microcompaction, wrapper accounting, and final prune decisions in both
+        modes.  It never writes access rehearsal or salvage rows.  A live
+        caller must commit the plan through :meth:`_commit_and_render_plan`.
+
+        It:
         1. Creates an adaptive token budget based on conversation length
         2. Builds the system prompt with constitution
         3. Retrieves and formats conversation history
@@ -436,15 +504,27 @@ class ContextManager:
             emotional_context: Current emotional state for mood-congruent recall
             conversation_history: Pre-fetched conversation history (e.g., session-filtered).
                                   If None, fetches full history from storage.
+            session_id: Chat session of the turn being built, for span
+                attribution only (#2940). Memory retrieval runs an
+                answerability judge through the LLM; naming the session keeps
+                that call in the turn's Timeline band instead of a band of its
+                own. It selects nothing — history filtering is still the
+                caller's job via ``conversation_history``. The context-status
+                poll and other dry-run callers have no turn and pass nothing.
+
+        ``measure_expensive_sections=False`` preserves the cheap footer poll:
+        memory/RAG rows are marked ``unknown`` or ``skipped`` with
+        ``tokens=None`` rather than reported as measured zero.
 
         Returns:
-            ContextResult with assembled context and metadata
+            Typed read-only plan with exact artifacts and required side effects.
         """
         # One typed state object per call — never a shared instance — so
         # concurrent COGNITION dispatches cannot cross-contaminate counters
         # or results. Per-task injection tracking is published via the
-        # ContextVar only on the successful path at the end of this method.
+        # ContextVar only after a live plan commits successfully.
         assembly = ContextAssembly()
+        sections: Dict[str, ContextSectionPlan] = {}
 
         # Resolve constitutional awareness once. Prompt adaptation is stable
         # top-level context; mutable StateOfMind fields travel as append-only
@@ -456,7 +536,7 @@ class ContextManager:
 
         # Handle EPHEMERAL mode - no retrieval
         if privacy_mode == "EPHEMERAL":
-            return await self._build_ephemeral_context(
+            return await self._build_ephemeral_plan(
                 query=query,
                 constitution=constitution,
                 include_briefing=include_briefing,
@@ -465,14 +545,22 @@ class ContextManager:
                 anchored_doctrine=anchored_doctrine,
                 state_of_mind=state_of_mind,
                 prompt_adaptation=prompt_adaptation,
+                mode=mode,
+                tools=tools,
             )
 
         # Use provided history or fetch from storage
         if conversation_history is not None:
-            history = conversation_history
+            history = deepcopy(conversation_history)
         else:
-            history = await self.conversation_manager.get_conversation_history()
-        message_count = len(history)
+            history = deepcopy(
+                await self.conversation_manager.get_conversation_history()
+            )
+        message_count = (
+            len(history)
+            if message_count_override is None
+            else message_count_override
+        )
 
         # Measure the non-borrowable mandatory governance floor and build the
         # #1309 elastic budget (Emma 2026-05-20). A floor that cannot fit
@@ -500,11 +588,12 @@ class ContextManager:
                 f"for model {e.model!r}. The LLM call MUST NOT proceed — surface "
                 "this to the operator."
             )
-            return self._degraded_result(
+            return self._degraded_plan(
                 assembly,
                 reason=str(e),
                 mandatory_system_tokens=mandatory_system_tokens,
                 state_of_mind=state_of_mind,
+                mode=mode,
             )
 
         # 1. Assemble the stable system prefix (constitution/identity/doctrine)
@@ -527,11 +616,44 @@ class ContextManager:
         self._record_system_usage(assembly, budget)
 
         # 1b. Reflection guidance (into the system prompt, budget-gated).
-        self._apply_reflection_guidance(
+        reflection_included = self._apply_reflection_guidance(
             assembly,
             budget,
             reflection_guidance,
             system_prompt_budget_bytes=system_prompt_budget_bytes,
+        )
+        system_provenance = ["constitution", "bootstrap"]
+        if include_briefing:
+            system_provenance.append("session_briefing")
+        if prompt_adaptation is not None:
+            system_provenance.append("prompt_adaptation")
+        if system_prompt_addendum:
+            system_provenance.append("system_prompt_addendum")
+        if anchored_doctrine:
+            system_provenance.extend(
+                f"anchored_doctrine:{name}" for name in anchored_doctrine
+            )
+        if reflection_included:
+            system_provenance.append("reflection_guidance")
+        system_tokens_before_episodes = self.counter.count(assembly.system_prompt)
+        sections["system"] = ContextSectionPlan(
+            name="system",
+            destination=SectionDestination.SYSTEM,
+            status=SectionStatus.INCLUDED,
+            tokens=system_tokens_before_episodes,
+            budget=budget.system,
+            items=1,
+            provenance=tuple(system_provenance),
+            details={
+                "subsections": [
+                    {
+                        "name": "assembled_system_prompt",
+                        "tokens": system_tokens_before_episodes,
+                    }
+                ],
+                "injected_clauses": assembly.injected_clauses,
+                "dropped_clauses": assembly.dropped_clauses,
+            },
         )
 
         # 1c. Microcompact: clear stale tool results (zero-cost, no LLM).
@@ -556,6 +678,48 @@ class ContextManager:
             system_prompt_budget_bytes=system_prompt_budget_bytes,
         )
         self._commit_episodes(assembly, budget, episode_result)
+        if episode_result is None:
+            sections["episodes"] = ContextSectionPlan(
+                name="episodes",
+                destination=SectionDestination.SYSTEM,
+                status=SectionStatus.EMPTY,
+                tokens=0,
+                budget=budget.episodes,
+                items=0,
+                provenance=("episode_store",),
+                reason=(
+                    "conversation below episode threshold or no consolidator"
+                ),
+                details={"threshold": self.EPISODE_THRESHOLD_MESSAGES},
+            )
+        else:
+            sections["episodes"] = ContextSectionPlan(
+                name="episodes",
+                destination=SectionDestination.SYSTEM,
+                status=(
+                    SectionStatus.INCLUDED
+                    if episode_result.committed
+                    else SectionStatus.EXCLUDED
+                ),
+                tokens=(
+                    self.counter.count(episode_result.append_text or "")
+                    if episode_result.committed
+                    else 0
+                ),
+                budget=budget.episodes,
+                items=episode_result.items if episode_result.committed else 0,
+                provenance=("episode_store", "elastic_budget_gate"),
+                reason=(
+                    None
+                    if episode_result.committed
+                    else (
+                        episode_result.warning
+                        or "episode block did not fit the elastic budget"
+                    )
+                ),
+                raw_tokens=episode_result.tokens,
+                details={"threshold": self.EPISODE_THRESHOLD_MESSAGES},
+            )
         finalize_section(budget, "episodes")
 
         # Active TodoFeature rollups are injected via the always-on operational
@@ -582,91 +746,468 @@ class ContextManager:
         # 3. Emotionally-weighted memories (into dynamic user context, not
         # system, so the system prefix stays cacheable). Access rehearsal is
         # recorded only after the block is actually inserted.
-        memory_result = await self._produce_memories(
-            budget,
-            query,
-            emotional_context,
-            retrieval_cfg,
-            include_memories=include_memories,
-            trivial_turn=trivial_turn,
-        )
+        memory_result: Optional[SectionResult] = None
+        if measure_expensive_sections:
+            memory_result = await self._produce_memories(
+                budget,
+                query,
+                emotional_context,
+                retrieval_cfg,
+                include_memories=include_memories,
+                trivial_turn=trivial_turn,
+                session_id=session_id,
+            )
         self._commit_dynamic_section(assembly, budget, memory_result)
-        # Access rehearsal is recorded only after the block is actually
-        # inserted, and only for structured memory blocks (matching the
-        # legacy ``isinstance(memories, RetrievedMemoryBlock)`` gate).
+        memory_access_ids: Tuple[int, ...] = ()
+        if memory_result is not None and memory_result.committed:
+            if memory_result.is_memory_block:
+                memory_access_ids = memory_result.message_ids
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.INCLUDED,
+                tokens=self.counter.count(memory_result.dynamic_block or ""),
+                budget=budget.memories,
+                items=memory_result.items,
+                provenance=(
+                    "memory_retriever",
+                    "query_relevance_gate",
+                    "elastic_budget_gate",
+                ),
+                raw_tokens=memory_result.tokens,
+                details={"wired": self.memory_retriever is not None},
+            )
+        elif not include_memories or trivial_turn:
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                budget=budget.memories,
+                items=None,
+                provenance=("query_relevance_gate",),
+                reason=(
+                    "excluded by turn relevance gate"
+                    if trivial_turn
+                    else "memory inclusion disabled"
+                ),
+                details={"wired": self.memory_retriever is not None},
+            )
+        elif not measure_expensive_sections:
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.UNKNOWN,
+                tokens=None,
+                budget=budget.memories,
+                items=None,
+                provenance=("measurement_policy",),
+                reason="not acquired on the cheap status path",
+                details={"wired": self.memory_retriever is not None},
+            )
+        elif memory_result is not None and not memory_result.warning:
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.EXCLUDED,
+                tokens=0,
+                budget=budget.memories,
+                items=0,
+                provenance=("memory_retriever", "elastic_budget_gate"),
+                reason="memory block did not fit the elastic budget",
+                raw_tokens=memory_result.tokens,
+                details={"wired": self.memory_retriever is not None},
+            )
+        elif memory_result is not None and memory_result.warning:
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.ERROR,
+                tokens=None,
+                budget=budget.memories,
+                items=None,
+                provenance=("memory_retriever",),
+                reason=memory_result.warning,
+                details={"wired": self.memory_retriever is not None},
+            )
+        else:
+            sections["memories"] = ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.EMPTY,
+                tokens=0,
+                budget=budget.memories,
+                items=0,
+                provenance=("memory_retriever", "query_relevance_gate"),
+                reason=(
+                    "no memory retriever configured"
+                    if self.memory_retriever is None
+                    else "no relevant memories"
+                ),
+                details={"wired": self.memory_retriever is not None},
+            )
         if (
-            memory_result is not None
-            and memory_result.committed
-            and memory_result.is_memory_block
+            measure_expensive_sections
+            or not include_memories
+            or trivial_turn
         ):
-            # Access rehearsal is non-critical bookkeeping: the memory block
-            # is already committed to the dynamic context above, so a failure
-            # here must not fail the whole build. The legacy broad
-            # memory-retrieval handler swallowed this (the ``record_accesses``
-            # await lived inside its ``try/except``); the #2523 decomposition
-            # moved the await out here, dropping that guard. Restore
-            # warn-and-continue around the bookkeeping only — retrieval, budget,
-            # and salvage failure contracts are untouched.
-            try:
-                await self.memory_retriever.record_accesses(
-                    memory_result.message_ids, self.agent_id
-                )
-            except Exception as e:
-                logger.warning(f"Memory access bookkeeping failed: {e}")
-                assembly.warnings.append(
-                    f"Memory access bookkeeping unavailable: {e}"
-                )
-        finalize_section(budget, "memories")
+            finalize_section(budget, "memories")
 
         # 4. RAG documents (into dynamic user context, not system).
-        rag_result = await self._produce_rag(
-            budget,
-            query,
-            retrieval_cfg,
-            include_rag=include_rag,
-            trivial_turn=trivial_turn,
-        )
+        rag_result: Optional[SectionResult] = None
+        if measure_expensive_sections:
+            rag_result = await self._produce_rag(
+                budget,
+                query,
+                retrieval_cfg,
+                include_rag=include_rag,
+                trivial_turn=trivial_turn,
+                session_id=session_id,
+            )
         self._commit_dynamic_section(assembly, budget, rag_result)
-        finalize_section(budget, "rag")
+        if rag_result is not None and rag_result.committed:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.INCLUDED,
+                tokens=self.counter.count(rag_result.dynamic_block or ""),
+                budget=budget.rag,
+                items=rag_result.items,
+                provenance=(
+                    "rag_store",
+                    "query_relevance_gate",
+                    "elastic_budget_gate",
+                ),
+                raw_tokens=rag_result.tokens,
+                details={
+                    "chunks": rag_result.items,
+                    "estimated": True,
+                    "estimation_method": "production-retrieval-plan",
+                    **rag_result.metadata,
+                },
+            )
+        elif not include_rag or trivial_turn:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                budget=budget.rag,
+                items=None,
+                provenance=("query_relevance_gate",),
+                reason=(
+                    "excluded by turn relevance gate"
+                    if trivial_turn
+                    else "RAG inclusion disabled"
+                ),
+                details={"chunks": None, "skipped": True},
+            )
+        elif not measure_expensive_sections:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.UNKNOWN,
+                tokens=None,
+                budget=budget.rag,
+                items=None,
+                provenance=("measurement_policy",),
+                reason="not acquired on the cheap status path",
+                details={"chunks": None, "skipped": True},
+            )
+        elif rag_result is not None and not rag_result.warning:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.EXCLUDED,
+                tokens=0,
+                budget=budget.rag,
+                items=0,
+                provenance=("rag_store", "elastic_budget_gate"),
+                reason="RAG block did not fit the elastic budget",
+                raw_tokens=rag_result.tokens,
+                details={"chunks": 0, "skipped": False},
+            )
+        elif rag_result is not None and rag_result.warning:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.ERROR,
+                tokens=None,
+                budget=budget.rag,
+                items=None,
+                provenance=("rag_store",),
+                reason=rag_result.warning,
+                details={"chunks": None, "skipped": False},
+            )
+        else:
+            sections["rag"] = ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.EMPTY,
+                tokens=0,
+                budget=budget.rag,
+                items=0,
+                provenance=("rag_store", "query_relevance_gate"),
+                reason="no relevant documents",
+                details={"chunks": 0, "skipped": False},
+            )
+        if measure_expensive_sections or not include_rag or trivial_turn:
+            finalize_section(budget, "rag")
 
         # 5. Format conversation history with the remaining (elastic) budget,
         # lumpy-anchored for a cache-stable prefix, then reconciled to fit.
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
         self._apply_history(assembly, budget, history)
-
-        # === C / #1311: durable salvage of pruned spans ===
-        # No model-visible prune may return before its durable salvage
-        # evidence commits. This is the single fail-closed finalization
-        # boundary: a salvage write failure — or an unreachable store while
-        # the feature flag is on — drops into degraded mode rather than
-        # silently letting bytes leave the model view (Emma 2026-05-20).
-        degraded = await self._finalize_salvage(
-            assembly,
-            history,
-            mandatory_system_tokens=mandatory_system_tokens,
-            state_of_mind=state_of_mind,
+        self._final_prune_to_payload_budget(
+            assembly, budget, extra_tokens=tools_tokens
         )
-        if degraded is not None:
-            return degraded
+
+        raw_history_tokens = sum(
+            self.counter.count(m.get("content", "") or "") for m in history
+        )
+        history_tokens = self.counter.count_messages(assembly.formatted_history)
+        sections["history"] = ContextSectionPlan(
+            name="history",
+            destination=SectionDestination.HISTORY,
+            status=(
+                SectionStatus.INCLUDED
+                if assembly.formatted_history
+                else SectionStatus.EMPTY
+            ),
+            tokens=history_tokens,
+            budget=budget.effective_budget("history")
+            if hasattr(budget, "effective_budget")
+            else budget.history,
+            items=len(assembly.formatted_history),
+            provenance=("conversation_history", "lumpy_anchor", "final_prune"),
+            raw_tokens=raw_history_tokens,
+            details={
+                "messages_total": len(history),
+                "messages_kept_after_pruning": len(assembly.formatted_history),
+            },
+        )
+
+        durable_salvage_enabled = is_durable_salvage_enabled()
+        pruned_span = None
+        salvage_requirement = None
+        if len(assembly.formatted_history) < len(history):
+            pruned_span = compute_pruned_span(
+                history, assembly.formatted_history, self.counter.count
+            )
+            if (
+                durable_salvage_enabled
+                and pruned_span is not None
+                and pruned_span.dropped_ids
+            ):
+                salvage_requirement = pruned_span
+                assembly.warnings.append(
+                    "context-salvage commit required before the LLM call: "
+                    f"{len(salvage_requirement.dropped_ids)} messages "
+                    "must be synchronously recorded"
+                )
+            if (
+                durable_salvage_enabled
+                and pruned_span is not None
+                and pruned_span.unmappable_count
+            ):
+                assembly.warnings.append(
+                    "context-salvage cannot durably link "
+                    f"{pruned_span.unmappable_count} pruned in-memory/id-less "
+                    "messages; those omissions remain silently pruned"
+                )
+
+        sections["tools"] = ContextSectionPlan(
+            name="tools",
+            destination=SectionDestination.TOOLS,
+            status=(
+                SectionStatus.INCLUDED if tools else SectionStatus.EMPTY
+            ),
+            tokens=tools_tokens,
+            items=len(tools or []),
+            provenance=("tool_registry", "json_serialized_schemas"),
+            details={
+                "estimated": True,
+                "estimation_method": "json-serialized-schemas",
+            },
+        )
+        dynamic_tokens = self.counter.count(assembly.dynamic_user_context)
+        inner_dynamic_tokens = sum(
+            section.tokens or 0
+            for name, section in sections.items()
+            if name in {"memories", "rag"} and section.included
+        )
+        sections["dynamic_context_overhead"] = ContextSectionPlan(
+            name="dynamic_context_overhead",
+            destination=SectionDestination.DYNAMIC,
+            status=(
+                SectionStatus.INCLUDED
+                if assembly.dynamic_user_context
+                else SectionStatus.EMPTY
+            ),
+            tokens=max(0, dynamic_tokens - inner_dynamic_tokens),
+            items=1 if assembly.dynamic_user_context else 0,
+            provenance=("retrieved_context_wrapper",),
+            details={
+                "applies_when": "memories or rag included",
+                "applied": bool(assembly.dynamic_user_context),
+            },
+        )
+
+        # Attribute the episode joiner's tokenizer effect to the base system
+        # row so the section sum equals the exact rendered system bytes.
+        sections["system"].tokens = max(
+            0,
+            self.counter.count(assembly.system_prompt)
+            - (sections["episodes"].tokens or 0),
+        )
+        sections["system"].details["subsections"][0]["tokens"] = sections[
+            "system"
+        ].tokens
+        total_tokens = (
+            self.counter.count(assembly.system_prompt)
+            + history_tokens
+            + dynamic_tokens
+            + tools_tokens
+        )
 
         logger.info(
-            f"Context built: {budget.total_used}/{budget.total_budget} tokens "
+            f"Context planned: {total_tokens}/{budget.total_budget} tokens "
             f"({len(assembly.formatted_history)} msgs, {assembly.episode_count} episodes, "
             f"{assembly.memory_count} memories, {assembly.rag_chunks} docs)"
         )
 
-        # Codex round-14 P2: publish per-task tracking via ContextVar
-        # so concurrent COGNITION dispatches don't race on a shared
-        # agent attribute. Dispatcher reads via
-        # `get_current_injection_tracking()` after process_input.
-        _INJECTION_TRACKING_VAR.set(
-            (assembly.injected_clauses, assembly.dropped_clauses)
+        return ContextBuildPlan(
+            mode=mode,
+            model=self.model,
+            assembly=assembly,
+            sections=sections,
+            budget_summary=budget.get_summary(),
+            context_limit=budget.context_limit,
+            response_reserve=budget.response_reserve,
+            total_budget=budget.total_budget,
+            total_tokens=total_tokens,
+            mandatory_system_tokens=mandatory_system_tokens,
+            state_of_mind=state_of_mind,
+            memory_access_ids=memory_access_ids,
+            salvage_requirement=salvage_requirement,
+            pruned_span=pruned_span,
+            durable_salvage_enabled=durable_salvage_enabled,
+            measurement_complete=not any(
+                section.status is SectionStatus.UNKNOWN
+                for section in sections.values()
+            ),
+            microcompacted_tool_results=microcompact_savings,
         )
 
+    async def _commit_and_render_plan(
+        self, plan: ContextBuildPlan
+    ) -> ContextResult:
+        """Commit a live plan's required writes, then render its artifacts."""
+
+        if plan.degraded_mode:
+            return self._render_context_plan(plan)
+
+        if plan.memory_access_ids and self.memory_retriever is not None:
+            try:
+                await self.memory_retriever.record_accesses(
+                    plan.memory_access_ids, self.agent_id
+                )
+            except Exception as exc:
+                logger.warning("Memory access bookkeeping failed: %s", exc)
+                plan.warnings.append(
+                    f"Memory access bookkeeping unavailable: {exc}"
+                )
+
+        span = plan.salvage_requirement
+        if span is not None:
+            degraded = await self._commit_salvage_requirement(plan, span)
+            if degraded is not None:
+                return degraded
+
+        # Publish only after every fail-closed side effect has committed.
+        _INJECTION_TRACKING_VAR.set(
+            (
+                plan.assembly.injected_clauses,
+                plan.assembly.dropped_clauses,
+            )
+        )
+        return self._render_context_plan(plan)
+
+    async def _commit_salvage_requirement(
+        self,
+        plan: ContextBuildPlan,
+        span,
+    ) -> Optional[ContextResult]:
+        """Synchronously commit the durable salvage declared by ``plan``."""
+
+        conv_store = self._get_conversation_store()
+        if conv_store is None:
+            logger.error(
+                "DEGRADED MODE: durable salvage is required but no "
+                "conversation store is reachable"
+            )
+            plan.warnings.append(
+                "DEGRADED MODE: durable salvage feature is enabled but the "
+                "conversation store is not reachable. The LLM call MUST NOT "
+                "proceed."
+            )
+            return self._degraded_result(
+                plan.assembly,
+                reason="salvage-conv-store-unavailable",
+                mandatory_system_tokens=plan.mandatory_system_tokens,
+                state_of_mind=plan.state_of_mind,
+            )
+
+        try:
+            pending = await get_pending_count(
+                conv_store, session_id=span.session_id
+            )
+            salvage = await salvage_messages(
+                conv_store=conv_store,
+                original_messages=span.dropped_messages,
+                reason=SalvageReason.AUTO_PRUNE_POSTBUDGET,
+                model=plan.model,
+                session_id=span.session_id,
+                token_estimate=span.token_estimate,
+                pending_count=pending,
+            )
+            worker = getattr(self, "salvage_worker", None)
+            if worker is not None and not salvage.pointer_only_terminal:
+                worker.schedule_summary(salvage.salvage_id)
+            plan.warnings.append(
+                f"context-salvage: {len(span.dropped_ids)} messages folded "
+                f"into salvage marker {salvage.salvage_id} "
+                f"({'pointer-only-terminal' if salvage.pointer_only_terminal else 'pointer-only — async summary scheduled'})"
+            )
+        except SalvageWriteError as exc:
+            logger.error(
+                "DEGRADED MODE: salvage write failed (%s); "
+                "LLM call MUST NOT proceed",
+                exc,
+            )
+            plan.warnings.append(
+                f"DEGRADED MODE: durable salvage write failed ({exc}). "
+                "The LLM call MUST NOT proceed — see logs and consider "
+                "!context restore."
+            )
+            return self._degraded_result(
+                plan.assembly,
+                reason=f"salvage-write-failed: {exc}",
+                mandatory_system_tokens=plan.mandatory_system_tokens,
+                state_of_mind=plan.state_of_mind,
+            )
+        return None
+
+    @staticmethod
+    def _render_context_plan(plan: ContextBuildPlan) -> ContextResult:
+        """Render a committed live plan without re-running policy."""
+
+        assembly = plan.assembly
         return ContextResult(
             system_prompt=assembly.system_prompt,
             messages=assembly.formatted_history,
-            total_tokens=budget.total_used,
-            budget_summary=budget.get_summary(),
+            total_tokens=plan.total_tokens,
+            budget_summary=plan.budget_summary,
             episode_count=assembly.episode_count,
             memory_count=assembly.memory_count,
             rag_chunks=assembly.rag_chunks,
@@ -674,14 +1215,59 @@ class ContextManager:
             dynamic_user_context=assembly.dynamic_user_context,
             injected_clauses=assembly.injected_clauses,
             dropped_clauses=assembly.dropped_clauses,
-            degraded_mode=False,
-            mandatory_system_tokens=mandatory_system_tokens,
-            state_of_mind=state_of_mind,
+            degraded_mode=plan.degraded_mode,
+            mandatory_system_tokens=plan.mandatory_system_tokens,
+            state_of_mind=plan.state_of_mind,
+            semantic_recall_dependencies=ContextManager._semantic_recall_dependencies(
+                plan
+            ),
         )
 
+    @staticmethod
+    def _semantic_recall_dependencies(
+        plan: ContextBuildPlan,
+    ) -> Tuple[Tuple[str, str], ...]:
+        """Return assertion/revision identities from the committed RAG plan.
+
+        Only an INCLUDED RAG section is model-visible.  The values below are
+        deliberately extracted from the typed section details that fed that
+        section, not from ``ContextBuilder.last_semantic_recall_metadata``:
+        another concurrent context build may already have overwritten that
+        mutable diagnostic field by the time the caller persists this turn.
+        """
+        rag = plan.sections.get("rag")
+        if rag is None or not rag.included:
+            return ()
+        recall = rag.details.get("semantic_recall")
+        if not isinstance(recall, dict) or recall.get("status") != "used":
+            return ()
+        assertions = recall.get("assertions")
+        if not isinstance(assertions, (list, tuple)):
+            return ()
+
+        dependencies: list[Tuple[str, str]] = []
+        seen: set[Tuple[str, str]] = set()
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                continue
+            assertion_id = assertion.get("assertion_id")
+            revision_id = assertion.get("revision_id")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or not isinstance(revision_id, str)
+                or not revision_id
+            ):
+                continue
+            dependency = (assertion_id, revision_id)
+            if dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+        return tuple(dependencies)
+
     # ------------------------------------------------------------------
-    # build_context stages — each produces/commits one section. Content
-    # vocabulary is shared with the measurement path via ``context_stages``;
+    # Canonical plan stages — each produces/commits one section. Content
+    # vocabulary lives in ``context_stages``;
     # the elastic finalization boundary is applied by the orchestrator, not
     # by these stages (they never call ``mark_section_finalized``).
     # ------------------------------------------------------------------
@@ -809,7 +1395,7 @@ class ContextManager:
         reflection_guidance: Optional[List[str]],
         *,
         system_prompt_budget_bytes: Optional[int],
-    ) -> None:
+    ) -> bool:
         """Append reflection guidance to the system prompt (budget-gated).
 
         When a per-source byte budget is in effect the late append must not
@@ -817,7 +1403,7 @@ class ContextManager:
         over reflection guidance (codex round-15 P2).
         """
         if not reflection_guidance:
-            return
+            return False
         guidance_text = build_reflection_guidance_block(reflection_guidance)
         if system_prompt_budget_bytes is not None:
             projected = (
@@ -832,13 +1418,18 @@ class ContextManager:
                     projected,
                     system_prompt_budget_bytes,
                 )
-                return
+                assembly.warnings.append(
+                    "reflection guidance skipped because it would exceed "
+                    f"the {system_prompt_budget_bytes}-byte system prompt cap"
+                )
+                return False
         guidance_tokens = self.counter.count(guidance_text)
         budget.use("system", guidance_tokens)
         assembly.system_prompt = f"{assembly.system_prompt}\n\n{guidance_text}"
         logger.info(
             f"Injected {len(reflection_guidance)} reflection guidance items into prompt"
         )
+        return True
 
     async def _produce_episodes(
         self,
@@ -879,10 +1470,18 @@ class ContextManager:
                     projected,
                     system_prompt_budget_bytes,
                 )
-                return None
-        # Shared with ``measure_context_breakdown`` via ``context_stages``
-        # so the two assemblers cannot disagree on the episode block's
-        # token cost or ``len(episodes)`` count.
+                return SectionResult(
+                    name="episodes",
+                    destination=SectionDestination.SYSTEM,
+                    tokens=self.counter.count(episode_context),
+                    items=len(episodes),
+                    append_text=episode_context,
+                    warning=(
+                        "episode context skipped because it would exceed "
+                        f"the {system_prompt_budget_bytes}-byte system prompt cap"
+                    ),
+                )
+        # Canonical typed result for episode bytes/counting.
         return build_episode_section(
             episode_context, len(episodes), self.counter.count
         )
@@ -900,6 +1499,9 @@ class ContextManager:
         check against pool exhaustion (codex round 1 #1).
         """
         if result is None:
+            return
+        if result.warning:
+            assembly.warnings.append(result.warning)
             return
         if budget.use(result.name, result.tokens, items=result.items):
             assembly.system_prompt = (
@@ -928,6 +1530,7 @@ class ContextManager:
         *,
         include_memories: bool,
         trivial_turn: bool,
+        session_id: Optional[str] = None,
     ) -> Optional[SectionResult]:
         """Retrieve emotionally-weighted memories for dynamic user context."""
         if not (include_memories and self.memory_retriever and not trivial_turn):
@@ -942,6 +1545,7 @@ class ContextManager:
                 min_relevance=retrieval_cfg["memory_min_relevance"],
                 read_only=True,
                 return_details=True,
+                session_id=session_id,
             )
         except Exception as e:
             logger.warning(f"Memory retrieval failed: {e}")
@@ -956,9 +1560,7 @@ class ContextManager:
 
         is_block = isinstance(memories, RetrievedMemoryBlock)
         memory_text = memories.text if is_block else memories
-        # Shared with ``measure_context_breakdown`` via ``context_stages``
-        # so the raw-block token cost, ``[Memory]`` count, and ``<memories>``
-        # wrapping are single-sourced across the two assemblers.
+        # Canonical typed result for memory bytes/counting/provenance.
         return build_memory_section(
             memory_text,
             self.counter.count,
@@ -974,13 +1576,21 @@ class ContextManager:
         *,
         include_rag: bool,
         trivial_turn: bool,
+        session_id: Optional[str] = None,
     ) -> Optional[SectionResult]:
         """Retrieve RAG documents for dynamic user context."""
         if not (include_rag and not trivial_turn):
             return None
         try:
+            # ``session_id`` forwarded only when there is one, matching this
+            # file's ``min_score`` idiom: the ContextBuilder is an injected
+            # seam, so a sessionless build must reach it exactly as before.
+            rag_kwargs: Dict[str, Any] = (
+                {"session_id": session_id} if session_id else {}
+            )
             rag_context = await self.context_builder.retrieve_context(
-                query, min_score=retrieval_cfg["rag_min_score"],
+                query, min_score=retrieval_cfg["rag_min_score"], max_tokens=budget.rag,
+                **rag_kwargs,
             )
         except Exception as e:
             logger.warning(f"RAG retrieval failed: {e}")
@@ -991,10 +1601,14 @@ class ContextManager:
             )
         if not rag_context:
             return None
-        # Shared with ``measure_context_breakdown`` via ``context_stages``
-        # so the raw-block token cost, chunk count, and ``<documents>``
-        # wrapping are single-sourced across the two assemblers.
-        return build_rag_section(rag_context, self.counter.count)
+        # Canonical typed result for RAG bytes/counting/provenance.
+        result = build_rag_section(rag_context, self.counter.count)
+        # Content-free recall identifiers/scores belong in the typed section
+        # trace, never in prompt text or logs containing retrieved content.
+        metadata = getattr(self.context_builder, "last_semantic_recall_metadata", None)
+        if isinstance(metadata, dict):
+            result.metadata = {"semantic_recall": metadata}
+        return result
 
     def _commit_dynamic_section(
         self,
@@ -1027,6 +1641,11 @@ class ContextManager:
                     f"Added {assembly.rag_chunks} RAG chunks to dynamic context"
                 )
             result.committed = True
+        else:
+            assembly.warnings.append(
+                f"{result.name} block ({result.tokens} tokens) skipped — "
+                f"exceeded {result.name} slice plus elastic pool"
+            )
 
     def _apply_history(
         self,
@@ -1104,100 +1723,59 @@ class ContextManager:
                 )
         assembly.formatted_history = formatted_history
 
-    async def _finalize_salvage(
+    def _final_prune_to_payload_budget(
         self,
         assembly: ContextAssembly,
-        history: List[Dict],
+        budget: TokenBudget,
         *,
-        mandatory_system_tokens: int,
-        state_of_mind: Any,
-    ) -> Optional[ContextResult]:
-        """Durably salvage pruned spans before any model-visible return.
+        extra_tokens: int = 0,
+    ) -> None:
+        """Enforce the final rendered-byte ceiling after wrapper accounting.
 
-        This is C / #1311's fail-closed boundary. Any messages that did not
-        survive the prune pipeline are about to leave the model-visible
-        slice; Emma's invariant is that no model-visible pruning happens
-        without a sync durable artifact. Returns a degraded ContextResult
-        (which the caller MUST return) when the feature flag is on but the
-        store is unreachable, or when the sync salvage write fails. Returns
-        ``None`` on the normal path, recording a salvage note.
+        Section budgets charge the historical raw memory/RAG block costs, but
+        the model receives their wrappers and the completed system prompt.
+        This final boundary counts those actual bytes and lumpy-prunes oldest
+        history until the rendered payload is below the configured target.
+        The same method runs for live and dry-run plans.
         """
-        if not (
-            is_durable_salvage_enabled()
-            and len(assembly.formatted_history) < len(history)
-        ):
-            return None
-        span = compute_pruned_span(
-            history, assembly.formatted_history, self.counter.count
-        )
-        if span is None:
-            return None
-        conv_store = (
-            self.conversation_manager._get_conversation_store()
-            if hasattr(self.conversation_manager, "_get_conversation_store")
-            else None
-        )
-        if conv_store is None:
-            # Feature flag is on but no conv_store is available — fail closed
-            # rather than silently let bytes leave the model view without a
-            # durable record (codex round 1 #7).
-            logger.error(
-                "DEGRADED MODE: durable salvage feature flag "
-                "is ON but no conversation store is reachable; "
-                "the LLM call MUST NOT proceed"
+
+        def rendered_tokens() -> int:
+            return (
+                self.counter.count(assembly.system_prompt)
+                + self.counter.count(assembly.dynamic_user_context)
+                + self.counter.count_messages(assembly.formatted_history)
+                + extra_tokens
             )
+
+        before = rendered_tokens()
+        if before <= budget.total_budget:
+            return
+
+        target = int(budget.total_budget * self.PRUNE_TARGET_FRAC)
+        dropped_tokens = 0
+        dropped_messages = 0
+        while assembly.formatted_history and rendered_tokens() > target:
+            dropped = assembly.formatted_history.pop(0)
+            dropped_tokens += (
+                self.counter.count(dropped.get("content", "") or "") + 4
+            )
+            dropped_messages += 1
+
+        allocation = budget.allocations["history"]
+        allocation.used = self.counter.count_messages(assembly.formatted_history)
+        allocation.items = len(assembly.formatted_history)
+        after = rendered_tokens()
+        if dropped_messages:
             assembly.warnings.append(
-                "DEGRADED MODE: durable salvage feature flag "
-                "is enabled but the conversation store is not "
-                "reachable. The LLM call MUST NOT proceed."
+                "Final payload pruning removed "
+                f"{dropped_messages} history messages ({dropped_tokens} tokens) "
+                "after exact wrapper accounting"
             )
-            return self._degraded_result(
-                assembly,
-                reason="salvage-conv-store-unavailable",
-                mandatory_system_tokens=mandatory_system_tokens,
-                state_of_mind=state_of_mind,
-            )
-        try:
-            pending = await get_pending_count(
-                conv_store, session_id=span.session_id
-            )
-            salvage = await salvage_messages(
-                conv_store=conv_store,
-                original_messages=span.dropped_messages,
-                reason=SalvageReason.AUTO_PRUNE_POSTBUDGET,
-                model=self.model,
-                session_id=span.session_id,
-                token_estimate=span.token_estimate,
-                pending_count=pending,
-            )
-            worker = getattr(self, "salvage_worker", None)
-            if worker is not None and not salvage.pointer_only_terminal:
-                worker.schedule_summary(salvage.salvage_id)
+        if after > budget.total_budget:
             assembly.warnings.append(
-                f"context-salvage: {len(span.dropped_ids)} messages "
-                f"folded into salvage marker {salvage.salvage_id} "
-                f"({'pointer-only-terminal' if salvage.pointer_only_terminal else 'pointer-only — async summary scheduled'})"
+                f"Rendered non-history context remains over budget "
+                f"({after}/{budget.total_budget} tokens)"
             )
-        except SalvageWriteError as e:
-            # Fail closed (Emma 2026-05-20 hardening): the bytes would leave
-            # the model view without a durable record, violating C's invariant.
-            logger.error(
-                "DEGRADED MODE: salvage write failed (%s); "
-                "LLM call MUST NOT proceed",
-                e,
-            )
-            assembly.warnings.append(
-                f"DEGRADED MODE: durable salvage write failed "
-                f"({e}). The LLM call MUST NOT proceed — "
-                "see logs and consider !context restore."
-            )
-            return self._degraded_result(
-                assembly,
-                reason=f"salvage-write-failed: {e}",
-                mandatory_system_tokens=mandatory_system_tokens,
-                state_of_mind=state_of_mind,
-            )
-        return None
 
     def _degraded_result(
         self,
@@ -1223,6 +1801,36 @@ class ContextManager:
             state_of_mind=state_of_mind,
         )
 
+    def _degraded_plan(
+        self,
+        assembly: ContextAssembly,
+        *,
+        reason: str,
+        mandatory_system_tokens: int,
+        state_of_mind: Any,
+        mode: ContextBuildMode,
+    ) -> ContextBuildPlan:
+        """Describe a mandatory-floor failure without issuing any writes."""
+
+        context_limit = get_token_counter(self.model).get_context_limit()
+        from .token_budget import RESPONSE_RESERVE
+
+        return ContextBuildPlan(
+            mode=mode,
+            model=self.model,
+            assembly=assembly,
+            sections={},
+            budget_summary={"mode": "degraded", "reason": reason},
+            context_limit=context_limit,
+            response_reserve=RESPONSE_RESERVE,
+            total_budget=max(0, context_limit - RESPONSE_RESERVE),
+            total_tokens=0,
+            mandatory_system_tokens=mandatory_system_tokens,
+            state_of_mind=state_of_mind,
+            degraded_mode=True,
+            degraded_reason=reason,
+        )
+
     def _resolve_state_of_mind_snapshot(self) -> Tuple[Any, Any]:
         """Resolve the state and prompt adaptation exactly once per build."""
         if not self.llm_service or not hasattr(
@@ -1238,7 +1846,7 @@ class ContextManager:
             )
             return None, None
 
-    async def _build_ephemeral_context(
+    async def _build_ephemeral_plan(
         self,
         query: str,
         constitution: str,
@@ -1248,9 +1856,11 @@ class ContextManager:
         anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
         state_of_mind: Any = None,
         prompt_adaptation: Any = None,
-    ) -> ContextResult:
+        mode: ContextBuildMode = ContextBuildMode.DRY_RUN,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> ContextBuildPlan:
         """
-        Build minimal context for EPHEMERAL privacy mode.
+        Build the read-only minimal plan for EPHEMERAL privacy mode.
 
         In EPHEMERAL mode, no history or memories are retrieved.
         Only the system prompt and constitution are included.
@@ -1310,20 +1920,119 @@ class ContextManager:
         system_prompt = f"{system_prompt}\n\n{EPHEMERAL_NOTICE}"
 
         tokens = self.counter.count(system_prompt)
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+        from .token_budget import RESPONSE_RESERVE
 
-        # Same per-task tracking publish as the non-ephemeral path.
-        _INJECTION_TRACKING_VAR.set(
-            (injected_clauses_for_audit, dropped_clauses_for_audit)
-        )
-
-        return ContextResult(
+        assembly = ContextAssembly(
             system_prompt=system_prompt,
-            messages=[],
-            total_tokens=tokens,
-            budget_summary={"mode": "ephemeral"},
             warnings=["EPHEMERAL mode: no history available"],
             injected_clauses=injected_clauses_for_audit,
             dropped_clauses=dropped_clauses_for_audit,
+        )
+        skipped_reason = "excluded by EPHEMERAL privacy mode"
+        system_provenance = ["constitution", "bootstrap"]
+        if include_briefing:
+            system_provenance.append("session_briefing")
+        if prompt_adaptation is not None:
+            system_provenance.append("prompt_adaptation")
+        if system_prompt_addendum:
+            system_provenance.append("system_prompt_addendum")
+        if anchored_doctrine:
+            system_provenance.extend(
+                f"anchored_doctrine:{name}" for name in anchored_doctrine
+            )
+        system_provenance.append("ephemeral_notice")
+        sections = {
+            "system": ContextSectionPlan(
+                name="system",
+                destination=SectionDestination.SYSTEM,
+                status=SectionStatus.INCLUDED,
+                tokens=tokens,
+                items=1,
+                provenance=tuple(system_provenance),
+                details={"subsections": []},
+            ),
+            "history": ContextSectionPlan(
+                name="history",
+                destination=SectionDestination.HISTORY,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                items=None,
+                provenance=("privacy_mode",),
+                reason=skipped_reason,
+                details={
+                    "messages_total": None,
+                    "messages_kept_after_pruning": None,
+                },
+            ),
+            "episodes": ContextSectionPlan(
+                name="episodes",
+                destination=SectionDestination.SYSTEM,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                items=None,
+                provenance=("privacy_mode",),
+                reason=skipped_reason,
+                details={"threshold": self.EPISODE_THRESHOLD_MESSAGES},
+            ),
+            "memories": ContextSectionPlan(
+                name="memories",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                items=None,
+                provenance=("privacy_mode",),
+                reason=skipped_reason,
+                details={"wired": self.memory_retriever is not None},
+            ),
+            "rag": ContextSectionPlan(
+                name="rag",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.SKIPPED,
+                tokens=None,
+                items=None,
+                provenance=("privacy_mode",),
+                reason=skipped_reason,
+                details={"chunks": None, "skipped": True},
+            ),
+            "tools": ContextSectionPlan(
+                name="tools",
+                destination=SectionDestination.TOOLS,
+                status=(
+                    SectionStatus.INCLUDED if tools else SectionStatus.EMPTY
+                ),
+                tokens=tools_tokens,
+                items=len(tools or []),
+                provenance=("tool_registry", "json_serialized_schemas"),
+                details={
+                    "estimated": True,
+                    "estimation_method": "json-serialized-schemas",
+                },
+            ),
+            "dynamic_context_overhead": ContextSectionPlan(
+                name="dynamic_context_overhead",
+                destination=SectionDestination.DYNAMIC,
+                status=SectionStatus.EMPTY,
+                tokens=0,
+                items=0,
+                provenance=("retrieved_context_wrapper",),
+                details={
+                    "applies_when": "memories or rag included",
+                    "applied": False,
+                },
+            ),
+        }
+        context_limit = get_token_counter(self.model).get_context_limit()
+        return ContextBuildPlan(
+            mode=mode,
+            model=self.model,
+            assembly=assembly,
+            sections=sections,
+            budget_summary={"mode": "ephemeral"},
+            context_limit=context_limit,
+            response_reserve=RESPONSE_RESERVE,
+            total_budget=max(0, context_limit - RESPONSE_RESERVE),
+            total_tokens=tokens + tools_tokens,
             state_of_mind=state_of_mind,
         )
 
@@ -1343,10 +2052,11 @@ class ContextManager:
             return None
         return getter()
 
-    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None, attribution_session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.compact_session(
-            llm_service, self.counter, preserve_recent, force, session_id=session_id
+            llm_service, self.counter, preserve_recent, force, session_id=session_id,
+            attribution_session_id=attribution_session_id,
         )
 
     async def check_compaction_needed(self, utilization_threshold: float = 70.0) -> Dict[str, Any]:
@@ -1371,10 +2081,11 @@ class ContextManager:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.restore_messages(message_ids)
 
-    async def summarize_messages(self, llm_service, message_ids: List[int], preserve_key_facts: bool = True) -> Dict[str, Any]:
+    async def summarize_messages(self, llm_service, message_ids: List[int], preserve_key_facts: bool = True, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.summarize_messages(
-            llm_service, self.counter, message_ids, preserve_key_facts
+            llm_service, self.counter, message_ids, preserve_key_facts,
+            session_id=session_id,
         )
 
     # Delegate to MemoryManager
@@ -1414,10 +2125,11 @@ class ContextManager:
         """Delegate to MemoryManager."""
         return await self.memory_manager.stash_peek(stash_id, max_chars)
 
-    async def hierarchical_compact(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3) -> Dict[str, Any]:
+    async def hierarchical_compact(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to MemoryManager."""
         return await self.memory_manager.hierarchical_compact(
-            llm_service, self.counter, chunk_size, preserve_recent, max_depth
+            llm_service, self.counter, chunk_size, preserve_recent, max_depth,
+            session_id=session_id,
         )
 
     # Delegate to ToolContextManager

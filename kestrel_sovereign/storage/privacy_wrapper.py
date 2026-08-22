@@ -20,11 +20,12 @@ import json
 import logging
 import re
 import sys
+import threading
 import warnings
 from contextlib import asynccontextmanager, contextmanager
 
 from kestrel_sovereign.storage.session_grouping import summarize_sessions
-from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Any, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -44,6 +45,8 @@ from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
+from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
+from kestrel_sovereign.knowledge import Visibility
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -65,6 +68,7 @@ logger = logging.getLogger(__name__)
 # explicit session_id, so list_conversation_sessions never returns a synthetic
 # index that delete_conversation_session can't resolve (#2019).
 _ISOLATED_UNLABELED_SESSION_ID = "session-local"
+_SEMANTIC_ASSERTION_SQL_RE = re.compile(r"\bsemantic_[a-z_]+\b", re.IGNORECASE)
 
 
 def _conv_session_id(conv: Dict[str, Any]) -> Optional[str]:
@@ -103,11 +107,81 @@ class PrivacyViolationError(Exception):
     pass
 
 
+PRIVACY_TRANSITION_RETRY_MESSAGE = (
+    "Privacy mode change not applied because an explicit fact operation is "
+    "still finishing. Retry shortly."
+)
+
+
 class OperationType(Enum):
     """Types of storage operations for permission checking."""
     READ = "read"
     WRITE = "write"
     DELETE = "delete"
+
+
+class _PrivacyDatabaseView:
+    """Compatibility view for legacy database readers behind privacy storage.
+
+    The wrapper used to return its raw :class:`AsyncDatabase`; that object
+    exposed ``.backend``, allowing a caller to combine a shared backend with a
+    forged ``agent_id`` and obtain another tenant's assertion facade.  This
+    view preserves non-semantic legacy helpers while withholding the backend
+    and refusing direct semantic-table access.  Assertion operations must use
+    the explicit privacy-governed methods on :class:`PrivacyEnforcingStorage`.
+    """
+
+    __slots__ = ("__database",)
+
+    def __init__(self, database) -> None:
+        self.__database = database
+
+    @property
+    def backend(self):
+        raise PrivacyViolationError(
+            "The raw database backend is not exposed through privacy storage; "
+            "use the privacy-governed storage surface."
+        )
+
+    @property
+    def backend_type(self):
+        return self.__database.backend_type
+
+    @staticmethod
+    def _assert_no_semantic_sql(args, kwargs) -> None:
+        def visit(value) -> bool:
+            if isinstance(value, str):
+                return bool(_SEMANTIC_ASSERTION_SQL_RE.search(value))
+            if isinstance(value, dict):
+                return any(visit(item) for item in value.values())
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return any(visit(item) for item in value)
+            return False
+
+        if visit(args) or visit(kwargs):
+            raise PrivacyViolationError(
+                "Direct semantic assertion database access is refused through "
+                "PrivacyEnforcingStorage; use its governed assertion methods."
+            )
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Preserve transactions while keeping each proxied call governed."""
+        async with self.__database.transaction():
+            yield self
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        value = getattr(self.__database, name)
+        if not callable(value):
+            return value
+
+        async def governed(*args, **kwargs):
+            self._assert_no_semantic_sql(args, kwargs)
+            return await value(*args, **kwargs)
+
+        return governed
 
 
 # ── Cross-task reentry token for the privacy-transition lock (#2672 review P1) ──
@@ -1004,6 +1078,17 @@ _STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
             "genesis_audit_history": _is_governance_receipt,
             "emancipation_contract": _is_governance_receipt,
             "constitution_reanchor": _is_governance_receipt,
+            # ``supersede_constitution_reanchor`` archives the receipt each
+            # reanchor replaces here (#2963), exactly as ``supersede_genesis_audit``
+            # archives to ``genesis_audit_history`` above. The reanchor write
+            # itself does not ride this wrapper in a volatile mode — a CHANGED
+            # receipt is refused there and the ceremony uses the raw store (see
+            # ``test_volatile_reanchor_superseded_receipt_refused_by_wrapper``).
+            # It must still be a canonical key: the allowed key set IS this map's
+            # keys, so an agent that accumulated history during a persistent
+            # stint would otherwise fail closed on its next ordinary volatile
+            # agent-node write, carrying the property along unchanged.
+            "constitution_reanchor_history": _is_governance_receipt,
             "doctrine_bundle_hash": _is_hex_hash_or_none,
             "doctrine_bundle_files": _is_path_list_or_none,
             "doctrine_bundle_anchored_at": _is_iso_timestamp_or_none,
@@ -1047,6 +1132,7 @@ _STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
             "genesis_audit_history",
             "emancipation_contract",
             "constitution_reanchor",
+            "constitution_reanchor_history",
             "doctrine_bundle_reanchor",
         }),
         # label = the agent's own name, or ``f"Agent {did}"`` — identity.
@@ -1249,6 +1335,14 @@ class StorePurgeResult:
 
 # Content stores that hold user text. A FAILED sweep of any of these means the
 # "leave no trace" contract cannot be certified, so mode exit must fail closed.
+# The #2959 session projection sweep does not certify CONTENT — it stores a
+# pointer and counts, never text — so it is not in this set. It is required
+# nonetheless, through `REQUIRED_TRACE_STORES` below, because its residue names
+# the agent. Only `REQUIRED_CONTENT_STORES` feeds `leaked_rows`, so a clean
+# stint still cannot report a leak it did not have: the case that paragraph
+# once warned about — an agent that hard-purged its NORMAL history before
+# entering EPHEMERAL, leaving an empty history and a legitimate ledger row —
+# is a CLEAN or PURGED outcome, and only a FAILED one closes the exit.
 # The observability sink (F076) holds content-free metrics and is NOT required —
 # a failure there is recorded but never blocks a transition.
 REQUIRED_CONTENT_STORES = frozenset({
@@ -1256,6 +1350,21 @@ REQUIRED_CONTENT_STORES = frozenset({
     "graph_nodes",
     "channel_messages",
 })
+
+#: Stores that hold no user content but whose residue NAMES the agent, and whose
+#: sweep must therefore also be certified before EPHEMERAL exit.
+#:
+#: Kept separate from :data:`REQUIRED_CONTENT_STORES` because the reason differs
+#: and the name should not lie: the #2959 projection stores a pointer and
+#: counts, never text, which is why it does not certify content. But the
+#: contract is "leave no trace", and the history deletions performed by the
+#: sweep immediately before it fire the change trigger — so a projection sweep
+#: that FAILS leaves a freshly written row carrying this agent's id, after an
+#: exit that reported success (round-17 review).
+REQUIRED_TRACE_STORES = frozenset({
+    "session_projection",
+})
+
 
 
 class EphemeralPurgeReport(dict):
@@ -1296,7 +1405,8 @@ class EphemeralPurgeReport(dict):
     def required_sweep_failed(self) -> bool:
         """True if any REQUIRED content sweep failed (outcome unknown)."""
         return any(
-            r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.FAILED
+            r.store in (REQUIRED_CONTENT_STORES | REQUIRED_TRACE_STORES)
+            and r.outcome is PurgeOutcome.FAILED
             for r in self.store_results.values()
         )
 
@@ -1312,6 +1422,49 @@ class EphemeralPurgeReport(dict):
             r.rows for r in self.store_results.values()
             if r.store in REQUIRED_CONTENT_STORES and r.outcome is PurgeOutcome.PURGED
         )
+
+
+class _PrivacyGuardedSemanticVectorProjection:
+    """Dynamic privacy rail for a projection handle retained across transitions."""
+
+    def __init__(self, owner: "PrivacyEnforcingStorage", projection) -> None:
+        self._owner = owner
+        self._projection = projection
+
+    async def checkpoint(self):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.checkpoint()
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def sync(self, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=True)
+        try:
+            return await self._projection.sync(**kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def recall(self, *args, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.recall(*args, **kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def recall_hydrated(self, *args, **kwargs):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.recall_hydrated(*args, **kwargs)
+        finally:
+            self._owner._release_semantic_vector_lease()
+
+    async def erasure_observation(self):
+        self._owner._acquire_semantic_vector_lease(write=False)
+        try:
+            return await self._projection.erasure_observation()
+        finally:
+            self._owner._release_semantic_vector_lease()
 
 
 class PrivacyEnforcingStorage:
@@ -1336,6 +1489,12 @@ class PrivacyEnforcingStorage:
             privacy_mode: Initial privacy mode (PrivacyMode, PrivacyConfig, or preset name)
         """
         self._storage = underlying_storage
+        # Preserve the agent-bound runtime identity for callers which need to
+        # pass it across an explicit governed boundary.  The raw storage still
+        # rejects a different per-call selection.
+        self.semantic_capabilities = getattr(
+            underlying_storage, "semantic_capabilities", None
+        )
         self._privacy_config = self._to_config(privacy_mode)
         self._policy = PrivacyPolicy.from_config(self._privacy_config)
         self._session_conversations: List[Dict] = []
@@ -1357,6 +1516,540 @@ class PrivacyEnforcingStorage:
         # watermark and returns ``{table: rows_deleted}`` which is merged into
         # the purge breakdown. ``None`` = not wired (no observability sweep).
         self._observability_purge = None
+        # ``set_privacy_mode`` is synchronous, while explicit fact operations
+        # span async storage awaits.  A short synchronous lease supplies the
+        # linearization point those two surfaces otherwise lack: once a fact
+        # operation begins, a concurrent config transition is refused instead
+        # of taking effect between a durable commit/replay and its return.
+        self._explicit_fact_lease_lock = threading.RLock()
+        self._active_explicit_fact_leases = 0
+        self._active_semantic_vector_leases = 0
+        # A governed artifact producer reads canonical assertions and then
+        # creates a durable, externally-consumable representation.  It needs
+        # the same synchronous linearization point as explicit facts: a
+        # privacy transition must not land between the facade's policy check
+        # and the producer returning its registered artifact.
+        self._active_semantic_artifact_producer_leases = 0
+
+        # Explicit semantic teaching is intentionally captured per wrapper.
+        # There is no module-level adapter that accepts caller-supplied storage
+        # or binding objects: a feature can call the public methods below only
+        # on the actual privacy wrapper it was given.  Aliasing those methods
+        # onto raw storage or a forwarding shim does not copy these closures,
+        # and the closures always re-check this wrapper's live privacy policy.
+        from dataclasses import replace as replace_fact_assertion
+        from decimal import Decimal
+
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            FactDeleteReceipt,
+            FactLifecycleError,
+            FactWriteReceipt,
+            _adapter_owned,
+            _assertion,
+            _disposition,
+            _is_adapter_source,
+            _operation_material,
+            _source_for_operation,
+            _write_receipt_from_replay,
+            map_legacy_fact,
+        )
+        from kestrel_sovereign.knowledge import (
+            AssertionQuery,
+            AssertionStatus,
+            DirectLineage,
+        )
+        from kestrel_sovereign.storage.async_assertion_store import (
+            AssertionConflictError,
+            _governed_assertion_replay_binding,
+        )
+        from kestrel_sovereign.storage.semantic_validation import (
+            SemanticValidationStoreError,
+        )
+
+        max_fact_state_retries = 4
+
+        def fact_binding() -> SemanticAssertionBinding:
+            self._assert_semantic_assertion_write_allowed("explicit_fact")
+            raw_binding = self._storage.semantic_assertion_binding()
+            is_public = self._privacy_config.sharing == "public"
+            return SemanticAssertionBinding(
+                tenant_id=raw_binding.tenant_id,
+                owning_agent_id=raw_binding.owning_agent_id,
+                privacy_classification="public" if is_public else "normal",
+                release_policy_reference=(
+                    "policy:privacy:public-v1"
+                    if is_public
+                    else "policy:privacy:normal-v1"
+                ),
+                visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
+            )
+
+        async def has_adapter_provenance(assertion) -> bool:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            return any(_is_adapter_source(source) for source in sources)
+
+        async def current_for_mapping(mapping):
+            assertions = await self.query_assertions(
+                AssertionQuery(
+                    subject=mapping.subject,
+                    predicate=mapping.predicate,
+                )
+            )
+            foreign = [
+                item
+                for item in assertions
+                if not _adapter_owned(item, mapping)
+                or not await has_adapter_provenance(item)
+            ]
+            if foreign:
+                raise FactLifecycleError(
+                    "the mapped subject/predicate already has a canonical assertion "
+                    "outside save_fact; refusing to create a competing preference"
+                )
+            if len(assertions) > 1:
+                raise FactLifecycleError(
+                    "multiple current save_fact assertions exist for the mapped "
+                    "subject/predicate; repair canonical state before changing it"
+                )
+            return assertions
+
+        async def adapter_source_reference(assertion) -> str:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            source = next(
+                (item for item in sources if _is_adapter_source(item)),
+                None,
+            )
+            if source is None:
+                raise FactLifecycleError(
+                    "save_fact assertion lacks adapter provenance for lifecycle receipt"
+                )
+            return source.source_occurrence_id
+
+        async def terminal_for_assertion(candidate, mapping):
+            terminal = await self.get_assertion(
+                candidate.assertion_id,
+                include_inactive=True,
+            )
+            if terminal is None or terminal.status is AssertionStatus.ACTIVE:
+                return None
+            if (
+                not _adapter_owned(terminal, mapping)
+                or not await has_adapter_provenance(terminal)
+            ):
+                raise FactLifecycleError(
+                    "the matching terminal assertion is outside save_fact; "
+                    "refusing to restore it"
+                )
+            if terminal.status is not AssertionStatus.DELETED:
+                raise FactLifecycleError(
+                    "save_fact cannot revive a retracted, quarantined, or "
+                    "superseded assertion"
+                )
+            return terminal
+
+        def is_retryable_state_conflict(error: Exception) -> bool:
+            if isinstance(error, AssertionConflictError):
+                return True
+            if not isinstance(error, SemanticValidationStoreError):
+                return False
+            message = str(error)
+            return message.startswith(
+                (
+                    "validation conflict:",
+                    "governed initial write cannot replace an existing assertion",
+                    "governed supersession requires an active predecessor",
+                    "governed restoration requires a current terminal",
+                )
+            )
+
+        async def save_fact_executor_unleased(
+            *,
+            subject: str,
+            predicate: str,
+            value: str,
+            confidence: float,
+            confidence_requested: float | None = None,
+            invocation_id: object = None,
+        ) -> FactWriteReceipt:
+            from kestrel_sovereign.agent.invocation import ensure_invocation_id
+
+            invocation_id = ensure_invocation_id(invocation_id)
+            binding = fact_binding()
+            mapping = map_legacy_fact(
+                subject,
+                predicate,
+                value,
+                tenant_id=binding.tenant_id,
+            )
+            operation_id, digest = _operation_material(
+                action="save",
+                subject=subject,
+                predicate=predicate,
+                value=value,
+                confidence_requested=(
+                    confidence
+                    if confidence_requested is None
+                    else confidence_requested
+                ),
+                invocation_id=invocation_id,
+            )
+            source = _source_for_operation(
+                operation_id,
+                digest,
+                binding.owning_agent_id,
+            )
+            assertion = _assertion(
+                binding=binding,
+                mapping=mapping,
+                source=source,
+                confidence=confidence,
+            )
+            replay_binding = _governed_assertion_replay_binding(
+                assertion,
+                source,
+                digest,
+            )
+
+            for attempt in range(max_fact_state_retries):
+                replay = await self._storage._replay_governed_assertion_operation(
+                    operation_id,
+                    replay_binding,
+                )
+                if replay is not None:
+                    return _write_receipt_from_replay(
+                        replay,
+                        source=source,
+                        operation_id=operation_id,
+                    )
+                legacy_erased = (
+                    await self._storage._terminalize_legacy_erased_explicit_fact_operation(
+                        operation_id,
+                        replay_binding,
+                    )
+                )
+                if legacy_erased is not None:
+                    return _write_receipt_from_replay(
+                        legacy_erased,
+                        source=source,
+                        operation_id=operation_id,
+                    )
+
+                current = await current_for_mapping(mapping)
+                prior = current[0] if current else None
+                try:
+                    if (
+                        prior is not None
+                        and prior.object == mapping.object
+                        and prior.confidence == Decimal(str(confidence))
+                    ):
+                        if not isinstance(prior.lineage, DirectLineage):
+                            raise FactLifecycleError(
+                                "current save_fact assertion lacks direct provenance"
+                            )
+                        replacement = replace_fact_assertion(
+                            prior,
+                            revision_id=source.source_occurrence_id,
+                            asserted_at=source.received_at,
+                            supersedes_revision_id=None,
+                            lineage=DirectLineage(
+                                (
+                                    *prior.lineage.source_occurrence_ids,
+                                    source.source_occurrence_id,
+                                )
+                            ),
+                        )
+                        result = await self.append_assertion_source(
+                            prior.revision_id,
+                            replacement,
+                            source_occurrences=(source,),
+                            operation_id=operation_id,
+                        )
+                        if not result.accepted:
+                            return FactWriteReceipt(
+                                saved=False,
+                                assertion_id=None,
+                                revision_id=None,
+                                validation_disposition=_disposition(result.report),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=source.source_occurrence_id,
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=False,
+                                superseded_assertion_id=prior.assertion_id,
+                                error=(
+                                    "canonical validation did not accept the "
+                                    "fact provenance"
+                                ),
+                            )
+                        return FactWriteReceipt(
+                            saved=True,
+                            assertion_id=result.replacement.assertion_id,
+                            revision_id=result.replacement.revision_id,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=result.idempotent,
+                            superseded_assertion_id=result.predecessor.assertion_id,
+                        )
+
+                    if prior is None:
+                        terminal = await terminal_for_assertion(
+                            assertion,
+                            mapping,
+                        )
+                        if terminal is not None:
+                            result = await self._restore_explicit_fact_assertion(
+                                terminal.revision_id,
+                                assertion,
+                                source_occurrences=(source,),
+                                operation_id=operation_id,
+                            )
+                            if not result.accepted:
+                                return FactWriteReceipt(
+                                    saved=False,
+                                    assertion_id=None,
+                                    revision_id=None,
+                                    validation_disposition=_disposition(
+                                        result.report
+                                    ),
+                                    validation_report_id=(
+                                        result.report.report_id
+                                    ),
+                                    provenance_reference=(
+                                        source.source_occurrence_id
+                                    ),
+                                    provenance_digest=source.content_digest,
+                                    operation_id=operation_id,
+                                    idempotent=False,
+                                    superseded_assertion_id=(
+                                        terminal.assertion_id
+                                    ),
+                                    error=(
+                                        "canonical validation did not accept "
+                                        "the restored fact"
+                                    ),
+                                )
+                            return FactWriteReceipt(
+                                saved=True,
+                                assertion_id=(
+                                    result.replacement.assertion_id
+                                ),
+                                revision_id=result.replacement.revision_id,
+                                validation_disposition=_disposition(
+                                    result.report
+                                ),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=(
+                                    source.source_occurrence_id
+                                ),
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=result.idempotent,
+                                superseded_assertion_id=(
+                                    result.predecessor.assertion_id
+                                ),
+                            )
+                        result = await self.put_assertion(
+                            assertion,
+                            source_occurrences=(source,),
+                            operation_id=operation_id,
+                        )
+                        if not result.accepted:
+                            return FactWriteReceipt(
+                                saved=False,
+                                assertion_id=None,
+                                revision_id=None,
+                                validation_disposition=_disposition(result.report),
+                                validation_report_id=result.report.report_id,
+                                provenance_reference=source.source_occurrence_id,
+                                provenance_digest=source.content_digest,
+                                operation_id=operation_id,
+                                idempotent=False,
+                                error="canonical validation did not accept the fact",
+                            )
+                        return FactWriteReceipt(
+                            saved=True,
+                            assertion_id=result.assertion.assertion_id,
+                            revision_id=result.assertion.revision_id,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=result.idempotent,
+                        )
+
+                    result = await self.supersede_assertion(
+                        prior.revision_id,
+                        assertion,
+                        source_occurrences=(source,),
+                        operation_id=operation_id,
+                    )
+                    if not result.accepted:
+                        return FactWriteReceipt(
+                            saved=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            validation_disposition=_disposition(result.report),
+                            validation_report_id=result.report.report_id,
+                            provenance_reference=source.source_occurrence_id,
+                            provenance_digest=source.content_digest,
+                            operation_id=operation_id,
+                            idempotent=False,
+                            superseded_assertion_id=prior.assertion_id,
+                            error=(
+                                "canonical validation did not accept the replacement fact"
+                            ),
+                        )
+                    return FactWriteReceipt(
+                        saved=True,
+                        assertion_id=result.replacement.assertion_id,
+                        revision_id=result.replacement.revision_id,
+                        validation_disposition=_disposition(result.report),
+                        validation_report_id=result.report.report_id,
+                        provenance_reference=source.source_occurrence_id,
+                        provenance_digest=source.content_digest,
+                        operation_id=operation_id,
+                        idempotent=result.idempotent,
+                        superseded_assertion_id=result.predecessor.assertion_id,
+                    )
+                except (AssertionConflictError, SemanticValidationStoreError) as error:
+                    if (
+                        not is_retryable_state_conflict(error)
+                        or attempt + 1 == max_fact_state_retries
+                    ):
+                        if not is_retryable_state_conflict(error):
+                            raise
+                        raise FactLifecycleError(
+                            "canonical fact state changed during bounded write retries"
+                        ) from error
+            raise AssertionError("bounded fact write loop exhausted")
+
+        async def forget_fact_executor_unleased(
+            *,
+            subject: str,
+            predicate: str,
+            invocation_id: object = None,
+        ) -> FactDeleteReceipt:
+            from kestrel_sovereign.agent.invocation import ensure_invocation_id
+
+            invocation_id = ensure_invocation_id(invocation_id)
+            binding = fact_binding()
+            mapping = map_legacy_fact(
+                subject,
+                predicate,
+                "forgetting-target",
+                tenant_id=binding.tenant_id,
+            )
+            operation_id, _ = _operation_material(
+                action="forget",
+                subject=subject,
+                predicate=predicate,
+                value=None,
+                confidence_requested=None,
+                invocation_id=invocation_id,
+            )
+
+            for attempt in range(max_fact_state_retries):
+                replay = (
+                    await self._storage._replay_explicit_fact_forget_operation(
+                        operation_id,
+                        mapping.subject,
+                        mapping.predicate,
+                    )
+                )
+                if replay is not None:
+                    if not replay.deleted:
+                        return FactDeleteReceipt(
+                            deleted=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            provenance_reference=None,
+                            operation_id=operation_id,
+                            idempotent=replay.idempotent,
+                            error=(
+                                "no current save_fact assertion exists for the "
+                                "mapped subject/predicate"
+                            ),
+                        )
+                    deletion = replay.deletion
+                    if deletion is None:  # pragma: no cover - property contract
+                        raise AssertionError("deleted replay lacks deletion receipt")
+                    return FactDeleteReceipt(
+                        deleted=True,
+                        assertion_id=deletion.deleted.assertion_id,
+                        revision_id=deletion.deleted.revision_id,
+                        provenance_reference=await adapter_source_reference(
+                            deletion.deleted
+                        ),
+                        operation_id=operation_id,
+                        idempotent=True,
+                    )
+
+                current = await current_for_mapping(mapping)
+                try:
+                    if not current:
+                        no_op = await self._storage._record_explicit_fact_forget_noop(
+                            operation_id,
+                            mapping.subject,
+                            mapping.predicate,
+                        )
+                        return FactDeleteReceipt(
+                            deleted=False,
+                            assertion_id=None,
+                            revision_id=None,
+                            provenance_reference=None,
+                            operation_id=operation_id,
+                            idempotent=no_op.idempotent,
+                            error=(
+                                "no current save_fact assertion exists for the "
+                                "mapped subject/predicate"
+                            ),
+                        )
+                    target = current[0]
+                    provenance_reference = await adapter_source_reference(target)
+                    result = await self._delete_explicit_fact_assertion(
+                        target.assertion_id,
+                        target.revision_id,
+                        operation_id=operation_id,
+                        explicit_fact_selector=(
+                            mapping.subject,
+                            mapping.predicate,
+                        )
+                    )
+                    return FactDeleteReceipt(
+                        deleted=True,
+                        assertion_id=result.deleted.assertion_id,
+                        revision_id=result.deleted.revision_id,
+                        provenance_reference=provenance_reference,
+                        operation_id=operation_id,
+                        idempotent=result.idempotent,
+                    )
+                except AssertionConflictError as error:
+                    if attempt + 1 == max_fact_state_retries:
+                        raise FactLifecycleError(
+                            "canonical fact state changed during bounded forget retries"
+                        ) from error
+            raise AssertionError("bounded fact forget loop exhausted")
+
+        async def save_fact_executor(**kwargs) -> FactWriteReceipt:
+            self._acquire_explicit_fact_lease()
+            try:
+                return await save_fact_executor_unleased(**kwargs)
+            finally:
+                self._release_explicit_fact_lease()
+
+        async def forget_fact_executor(**kwargs) -> FactDeleteReceipt:
+            self._acquire_explicit_fact_lease()
+            try:
+                return await forget_fact_executor_unleased(**kwargs)
+            finally:
+                self._release_explicit_fact_lease()
+
+        self.__save_explicit_fact = save_fact_executor
+        self.__forget_explicit_fact = forget_fact_executor
         logger.info(f"PrivacyEnforcingStorage initialized with config: storage={self._privacy_config.storage}, llm={self._privacy_config.llm_location}")
 
     def set_observability_purge(self, purge_callable) -> None:
@@ -1415,6 +2108,51 @@ class PrivacyEnforcingStorage:
     @property
     def _privacy_mode(self) -> PrivacyMode:
         return self.privacy_mode
+
+    def _acquire_explicit_fact_lease(self) -> None:
+        """Linearize one fact operation before any async storage await."""
+        with self._explicit_fact_lease_lock:
+            self._assert_semantic_assertion_write_allowed("explicit_fact")
+            self._active_explicit_fact_leases += 1
+
+    def _release_explicit_fact_lease(self) -> None:
+        """Release exactly one fact lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_explicit_fact_leases <= 0:
+                raise RuntimeError("explicit fact privacy lease underflow")
+            self._active_explicit_fact_leases -= 1
+
+    def _acquire_semantic_vector_lease(self, *, write: bool) -> None:
+        """Atomically check current privacy and lease an awaited vector operation."""
+        with self._explicit_fact_lease_lock:
+            self._assert_semantic_assertion_read_allowed("semantic vector projection")
+            if write:
+                self._assert_semantic_assertion_write_allowed("semantic vector projection")
+            self._active_semantic_vector_leases += 1
+
+    def _release_semantic_vector_lease(self) -> None:
+        with self._explicit_fact_lease_lock:
+            if self._active_semantic_vector_leases <= 0:
+                raise RuntimeError("semantic vector privacy lease underflow")
+            self._active_semantic_vector_leases -= 1
+
+    def _acquire_semantic_artifact_producer_lease(self) -> None:
+        """Fence a governed artifact producer before its policy checks.
+
+        The lease deliberately precedes both the read and durable-write
+        policy checks at the public facade.  Once acquired, a concurrent mode
+        transition is refused until the producer has either returned or
+        unwound through cancellation.
+        """
+        with self._explicit_fact_lease_lock:
+            self._active_semantic_artifact_producer_leases += 1
+
+    def _release_semantic_artifact_producer_lease(self) -> None:
+        """Release one governed producer lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_semantic_artifact_producer_leases <= 0:
+                raise RuntimeError("semantic artifact producer privacy lease underflow")
+            self._active_semantic_artifact_producer_leases -= 1
     
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
@@ -1430,14 +2168,29 @@ class PrivacyEnforcingStorage:
         is preserved across the EPHEMERAL→exit transition because the
         purge needs to read it before clearing.
         """
-        old_config = self._privacy_config
         new_config = self._to_config(mode)
-        was_ephemeral = old_config.is_ephemeral()
-        is_ephemeral = new_config.is_ephemeral()
-        if is_ephemeral and not was_ephemeral:
-            self._entered_ephemeral_at = self._now_iso()
-        self._privacy_config = new_config
-        self._policy = PrivacyPolicy.from_config(self._privacy_config)
+        with self._explicit_fact_lease_lock:
+            old_config = self._privacy_config
+            if (
+                new_config != old_config
+                and (
+                    self._active_explicit_fact_leases > 0
+                    or self._active_semantic_vector_leases > 0
+                    or self._active_semantic_artifact_producer_leases > 0
+                )
+            ):
+                raise PrivacyViolationError(
+                    "privacy configuration transition refused while an "
+                    "explicit semantic fact, vector operation, or governed artifact "
+                    "producer is in flight; retry "
+                    "the transition after that operation completes"
+                )
+            was_ephemeral = old_config.is_ephemeral()
+            is_ephemeral = new_config.is_ephemeral()
+            if is_ephemeral and not was_ephemeral:
+                self._entered_ephemeral_at = self._now_iso()
+            self._privacy_config = new_config
+            self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
 
     async def _sweep_store(self, store: str, coro_factory) -> "StorePurgeResult":
@@ -1559,6 +2312,29 @@ class PrivacyEnforcingStorage:
         report.record(await self._sweep_store(
             "channel_messages",
             lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+        ))
+
+        # Last, because the sweeps above fire the projection's change trigger
+        # themselves; clearing first would leave a fresh row naming the very
+        # agent being erased.
+        #
+        # All of it, not just the ledger. At this phase the ledger is the only
+        # projection table that ordinarily holds anything — nothing in
+        # production maintains the projection yet (Phase C, #2960, is where that
+        # starts, and where this question has to be asked again against rows
+        # that exist). But the ledger cannot be erased on its own: a stored
+        # watermark stamp is only meaningful against the ledger incarnation it
+        # was read from, and deleting the row restarts the counter, so a
+        # surviving watermark can match it again and report a projection of
+        # purged history as CURRENT (round-6 review; see the method).
+        #
+        # This costs none of the machinery an earlier revision needed — the
+        # leak-detection condition, the orphan probe — because that was for the
+        # scoped case. Here nothing survives, so the correct projection is the
+        # empty one and every row gets the same answer.
+        report.record(await self._sweep_store(
+            "session_projection",
+            lambda: self._storage.purge_session_projection(reason=reason),
         ))
 
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
@@ -2248,13 +3024,15 @@ class PrivacyEnforcingStorage:
         if result == NodeSwapResult.TYPE_NOT_ALLOWED:
             node_type = getattr(new_node, "node_type", None)
             raise PrivacyViolationError(
-                f"Graph write '{operation}' blocked: the existing node at "
-                f"{node_id!r} is not a {node_type!r} structural node, so a "
-                f"durable properties swap onto it is a user-derived write and is "
-                f"default-denied in the current privacy config "
-                f"(storage={self._privacy_config.storage}). CAS cannot relabel a "
-                f"user-derived node as structural to smuggle content through "
-                f"(#2672)."
+                f"Graph write '{operation}' blocked: the storage layer refuses a "
+                f"durable properties swap onto the existing node at {node_id!r} "
+                f"as a {node_type!r} write. Either that row is not a "
+                f"{node_type!r} structural node — so the swap is a user-derived "
+                f"write, default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage}), and CAS cannot "
+                f"relabel a user-derived node as structural to smuggle content "
+                f"through (#2672) — or it is a fleet-shared content-addressed "
+                f"row, which only add_node may update (#2893)."
             )
         return result
 
@@ -2343,6 +3121,890 @@ class PrivacyEnforcingStorage:
     async def get_edges_to(self, node_id: str) -> List:
         """Get incoming edges to a node."""
         return await self._storage.get_edges_to(node_id)
+
+    # === Canonical semantic assertions (explicit privacy-governed surface) ===
+    #
+    # Assertions are not graph nodes.  In particular, do not add an assertion
+    # method to ``_PrivacyGoverningGraphStore``: that proxy intentionally
+    # default-denies every unreviewed future graph writer.  These named facade
+    # methods are the only route from a privacy wrapper to the normalized
+    # assertion authority.
+
+    def _assert_semantic_assertion_write_allowed(self, operation: str) -> None:
+        if self._policy.use_session_storage:
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: ISOLATED "
+                "mode has no durable semantic assertion authority. Promotion is "
+                "a fresh governed write with fresh provenance."
+            )
+        if not self._policy.allow_persistent_write:
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: durable "
+                "semantic writes are default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage})."
+            )
+        if self._privacy_config.requires_anonymization():
+            # There is no generic, semantically safe way to redact an IRI or a
+            # typed literal while preserving a canonical claim identity.  A
+            # future approved redaction pipeline may submit an already-governed
+            # replacement; this boundary must not pretend string substitution is
+            # equivalent to semantic anonymization.
+            raise PrivacyViolationError(
+                f"Canonical assertion operation '{operation}' blocked: anonymous "
+                "semantic persistence requires an approved redacted assertion "
+                "pipeline; this wrapper will not silently rewrite canonical terms."
+            )
+
+    async def save_explicit_fact(
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        value: str,
+        confidence: float,
+        confidence_requested: float | None = None,
+        invocation_id: object = None,
+    ):
+        """Run explicit teaching through this wrapper's captured authority."""
+        return await self.__save_explicit_fact(
+            subject=subject,
+            predicate=predicate,
+            value=value,
+            confidence=confidence,
+            confidence_requested=confidence_requested,
+            invocation_id=invocation_id,
+        )
+
+    async def forget_explicit_fact(
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        invocation_id: object = None,
+    ):
+        """Run explicit-fact deletion through the same privacy boundary."""
+        return await self.__forget_explicit_fact(
+            subject=subject,
+            predicate=predicate,
+            invocation_id=invocation_id,
+        )
+
+    @staticmethod
+    def _require_kite_release_operation(operation_id: str, *, prefix: str) -> None:
+        """Accept only one server-derived, nonce-bound Kite operation name."""
+        import os
+        import re
+
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            raise PrivacyViolationError("Kite release evidence is unavailable")
+        if not isinstance(operation_id, str) or not re.fullmatch(
+            rf"{re.escape(prefix)}[0-9a-f]{{64}}", operation_id
+        ):
+            raise PrivacyViolationError("Kite release evidence operation is invalid")
+
+    async def semantic_release_kite_diagnostics(self, *, operation_id: str) -> dict[str, object]:
+        """Return fixed, content-free diagnostics from real semantic owners.
+
+        The endpoint owns the operation identity and exposes only the returned
+        aggregate.  This is deliberately not a general diagnostic query: it
+        cannot select a tenant, source, assertion, migration, or capability.
+        """
+        self._require_kite_release_operation(
+            operation_id, prefix="kite-diagnostics-"
+        )
+        self._assert_semantic_assertion_read_allowed("Kite release diagnostics")
+        from kestrel_sovereign.features.memory_agency.semantic_facts import (
+            _is_adapter_source,
+            map_legacy_fact,
+        )
+        from kestrel_sovereign.knowledge import AssertionQuery
+
+        binding = self._storage.semantic_assertion_binding()
+        mapping = map_legacy_fact(
+            "user",
+            "preferred_deploy_region",
+            "kite-release-diagnostic",
+            tenant_id=binding.tenant_id,
+        )
+        assertions = await self.query_assertions(
+            AssertionQuery(subject=mapping.subject, predicate=mapping.predicate, limit=10)
+        )
+        provenance_count = 0
+        for assertion in assertions:
+            sources = await self.list_assertion_sources(assertion.assertion_id)
+            provenance_count += sum(1 for source in sources if _is_adapter_source(source))
+        migration = await self._storage.legacy_graph_fact_migration().compatibility_metrics()
+        migration_count = migration.get("canonical_recorded")
+        if type(migration_count) is not int or migration_count < 0:
+            raise RuntimeError("Kite migration diagnostics did not return a bounded count")
+        capabilities = self._storage.semantic_capabilities
+        return {
+            "capability_mode": capabilities.mode,
+            "active_capability_pins": [
+                f"{key}={value}"
+                for key, value in sorted(capabilities.capability_versions().items())
+            ],
+            "canonical_migration_count": migration_count,
+            "explicit_fact_provenance_present_count": provenance_count,
+        }
+
+    async def semantic_release_kite_invalid_import_quarantine(
+        self, *, operation_id: str
+    ) -> dict[str, int]:
+        """Drive one fixed invalid imported candidate through the real validator.
+
+        A server-owned one-triple budget makes the complete candidate graph
+        nonconformant/incomplete before canonical admission.  The production
+        imported-source policy persists a tenant-private quarantine report and
+        deliberately retains neither canonical assertion nor its identity.
+        """
+        self._require_kite_release_operation(
+            operation_id, prefix="kite-import-quarantine-"
+        )
+        self._assert_semantic_assertion_write_allowed("Kite invalid import quarantine")
+        import hashlib
+
+        from kestrel_sovereign.features.memory_agency.semantic_facts import map_legacy_fact
+        from kestrel_sovereign.knowledge import (
+            Assertion,
+            DirectLineage,
+            EpistemicState,
+            SourceOccurrence,
+            XSD_STRING,
+        )
+        from kestrel_sovereign.knowledge.assertion import Literal
+        from kestrel_sovereign.knowledge.shacl_validation import (
+            ShaclValidationLimits,
+            ValidationSource,
+            ValidationWriteAction,
+        )
+
+        binding = self._storage.semantic_assertion_binding()
+        mapping = map_legacy_fact(
+            "user",
+            "preferred_deploy_region",
+            "kite-release-invalid-import",
+            tenant_id=binding.tenant_id,
+        )
+        digest = hashlib.sha256(operation_id.encode("ascii")).hexdigest()
+        source_id = f"source:kite-release-invalid-import:{digest}"
+        candidate = Assertion(
+            tenant_id=binding.tenant_id,
+            owning_agent_id=binding.owning_agent_id,
+            subject=mapping.subject,
+            predicate=mapping.predicate,
+            object=Literal("kite-release-invalid-import", XSD_STRING),
+            revision_id=f"kite-import-{digest[:24]}",
+            confidence="1.0",
+            confidence_method="kite-release-import-probe",
+            confidence_basis="server-owned-fixed-candidate",
+            epistemic_state=EpistemicState.REPORTED,
+            asserted_at="2026-07-31T00:00:00Z",
+            ontology_version=mapping.ontology,
+            lineage=DirectLineage((source_id,)),
+            privacy_classification=binding.privacy_classification,
+            release_policy_reference=binding.release_policy_reference,
+            visibility=binding.visibility,
+        )
+        source = SourceOccurrence(
+            source_occurrence_id=source_id,
+            source_kind="kite_release_import_probe",
+            locator="internal:kite-release-invalid-import",
+            received_at="2026-07-31T00:00:00Z",
+            content_digest=f"sha256:{digest}",
+            actor=binding.owning_agent_id,
+            selector="fixed-server-probe",
+        )
+        result = await self.semantic_validation_service().put_assertion(
+            candidate,
+            source_occurrences=(source,),
+            source=ValidationSource.IMPORTED,
+            limits=ShaclValidationLimits(max_graph_triples=1),
+            operation_id=operation_id,
+            run_id=f"kite-import-{digest[:24]}",
+        )
+        if (
+            result.accepted
+            or result.report.source is not ValidationSource.IMPORTED
+            or result.report.action is not ValidationWriteAction.QUARANTINE
+            or result.report.assertion_ids
+            or await self.get_assertion(candidate.assertion_id) is not None
+        ):
+            raise RuntimeError("Kite invalid import did not stay in the quarantine boundary")
+        return {"invalid_import_quarantine_count": 1}
+
+    async def semantic_release_erasure_drill(
+        self, *, capability: object,
+    ) -> dict[str, dict[str, int]]:
+        """Run the fixed, isolated Kite physical-erasure drill.
+
+        This is intentionally not a public storage primitive: its only caller
+        is the loopback Kite evidence endpoint after bootstrap authentication,
+        test-instance checks, durable exact-nonce consumption, and Ed25519
+        response signing. The endpoint exchanges that nonce receipt for an
+        opaque capability bound to this operation and correlation; this method
+        consumes it before touching storage. The server owns the
+        assertion/revision lineage, local vector profile, consumer key, policy,
+        capability pins, checkpoints, deletion callback, and content-free
+        final aggregate.
+        """
+        import os
+        from dataclasses import replace
+        from datetime import UTC, datetime, timedelta
+        from uuid import uuid4
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from kestrel_sovereign.knowledge import (
+            Assertion,
+            DerivedLineage,
+            EpistemicState,
+            GovernedArtifactConsumerAuthentication,
+            GovernedArtifactDeletionOwner,
+            GovernedArtifactDeletionProof,
+            GovernedCorpusPolicy,
+            IRI,
+            Literal,
+            XSD_STRING,
+        )
+        from kestrel_sovereign.knowledge.kite_erasure_authority import (
+            ERASURE_CORE_SNAPSHOT_OPERATION,
+            KiteErasureDrillAuthorityError,
+            _consume_kite_erasure_drill_capability,
+        )
+        from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProjectionError
+
+        if os.environ.get("KESTREL_KITE_RELEASE_EVIDENCE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            raise PrivacyViolationError("Kite semantic release drill is unavailable")
+        try:
+            authority = _consume_kite_erasure_drill_capability(
+                capability, expected_operation=ERASURE_CORE_SNAPSHOT_OPERATION,
+            )
+        except KiteErasureDrillAuthorityError as error:
+            raise PrivacyViolationError(
+                "Kite semantic release drill requires its endpoint-issued one-shot authority"
+            ) from error
+        self._assert_semantic_assertion_write_allowed("kite_release_erasure_drill")
+        raw = self._storage
+        operation_id = authority.operation_id
+        correlation = authority.correlation
+        fact = await self.save_explicit_fact(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value=f"kite-evidence-{correlation[:24]}",
+            confidence=1.0,
+            invocation_id=f"{operation_id}:assertion",
+        )
+        if not fact.saved or not isinstance(fact.assertion_id, str) or not isinstance(fact.revision_id, str):
+            raise RuntimeError("Kite erasure drill did not create a governed assertion")
+        assertion = await raw.get_assertion(fact.assertion_id)
+        if assertion is None or assertion.revision_id != fact.revision_id:
+            raise RuntimeError("Kite erasure drill lost its exact canonical revision")
+        sources = await raw.list_assertion_revision_sources(fact.revision_id)
+        if not sources:
+            raise RuntimeError("Kite erasure drill requires exact source lineage")
+        derived = Assertion(
+            tenant_id=assertion.tenant_id,
+            owning_agent_id=assertion.owning_agent_id,
+            subject=assertion.subject,
+            predicate=IRI("https://kestrel.ai/vocab/kiteReleaseDerived"),
+            object=Literal("true", XSD_STRING),
+            revision_id=str(uuid4()),
+            confidence="1",
+            confidence_method="kite-release-erasure-rule",
+            confidence_basis=assertion.confidence_basis,
+            epistemic_state=EpistemicState.INFERRED,
+            asserted_at=assertion.asserted_at,
+            ontology_version=assertion.ontology_version,
+            lineage=DerivedLineage(
+                rule_id="kite-release-erasure-v1",
+                engine_version="1",
+                profile_version="1",
+                input_revision_ids=(fact.revision_id,),
+                input_digest=f"sha256:{correlation}",
+                run_id=correlation,
+                generated_at=assertion.asserted_at,
+            ),
+            privacy_classification=assertion.privacy_classification,
+            release_policy_reference=assertion.release_policy_reference,
+        )
+        await raw.put_assertion(derived)
+        capabilities = await raw.semantic_maintenance_capability_versions(None)
+        policy = GovernedCorpusPolicy(
+            policy_id="kite-release-erasure-v1",
+            policy_version="1",
+            accepted_epistemic_states=(assertion.epistemic_state,),
+            accepted_visibility=(assertion.visibility,),
+            accepted_privacy_classifications=(assertion.privacy_classification,),
+            accepted_consent_references=(assertion.release_policy_reference,),
+            accepted_grounding_classes=(assertion.confidence_basis,),
+            accepted_source_kinds=tuple(sorted({source.source_kind for source in sources})),
+            accepted_ontology_pins=(assertion.ontology_version,),
+            accepted_semantic_capability_versions=tuple(sorted(capabilities.items())),
+        )
+        private_key = Ed25519PrivateKey.generate()
+        consumer_id = "kite-release-verifier"
+        consumer_key_id = "kite-release-verifier-v1"
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+        ).hex()
+        consumer = {
+            "consumer_id": consumer_id,
+            "consumer_key_id": consumer_key_id,
+            "consumer_public_key": public_key,
+            "retention_seconds": 300.0,
+        }
+        export_id, corpus_id, future_id = (str(uuid4()) for _ in range(3))
+        projection = raw._kite_release_vector_projection()
+        checkpoint = await projection.sync()
+        vector_before = await projection.erasure_observation()
+        if vector_before.candidate_count < 1 or vector_before.generation != checkpoint.generation:
+            raise RuntimeError("Kite erasure drill did not project its exact current revision")
+        export_checkpoint, exported = await raw.export_assertion_snapshot(artifact_id=export_id, **consumer)
+        if export_checkpoint.generation != checkpoint.generation or fact.revision_id not in {
+            item.revision_id for item in exported
+        }:
+            raise RuntimeError("Kite export artifact lacks the drill revision lineage")
+        maintenance = await raw.run_semantic_maintenance(None)
+        if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+            raise RuntimeError("Kite corpus drill did not reach a durable maintenance checkpoint")
+        corpus = await raw.governed_assertion_corpus_snapshot(
+            policy=policy, inference_profile=None, artifact_id=corpus_id, **consumer,
+        )
+        if tuple(example.assertion.revision_id for example in corpus.examples) != (fact.revision_id,):
+            raise RuntimeError("Kite corpus artifact lacks the drill revision lineage")
+        erased = await raw.erase_assertion(fact.assertion_id, operation_id=f"{operation_id}:physical-erase")
+        if (
+            fact.assertion_id not in erased.erased_assertion_ids
+            or fact.revision_id not in erased.erased_revision_ids
+            or derived.revision_id not in erased.erased_revision_ids
+        ):
+            raise RuntimeError("Kite erasure drill did not physically erase its exact lineage")
+        if await raw.get_assertion(fact.assertion_id) is not None:
+            raise RuntimeError("Kite physical erasure left its canonical assertion active")
+        try:
+            await projection.recall((1.0, 1.0, 1.0, 1.0))
+        except SemanticVectorProjectionError as error:
+            if "checkpoint_stale" not in str(error):
+                raise
+        else:
+            raise RuntimeError("Kite vector projection remained eligible after physical erase")
+        await projection.sync()
+        vector_after = await projection.erasure_observation()
+        if vector_after.candidate_count != 0:
+            raise RuntimeError("Kite vector rebuild retained the erased target")
+        maintenance = await raw.run_semantic_maintenance(None)
+        if getattr(getattr(maintenance, "status", None), "value", None) not in {"complete", "no_op"}:
+            raise RuntimeError("Kite future corpus drill did not reach a durable maintenance checkpoint")
+        delta = await raw.governed_assertion_corpus_changes_since(
+            corpus, policy=policy, inference_profile=None, artifact_id=future_id, **consumer,
+        )
+        # Physical erasure deliberately emits an opaque tombstone: exposing
+        # the just-erased assertion/revision in a later corpus artifact would
+        # recreate the very data the drill removed.  Exact lineage was bound
+        # before deletion in the registered export/current corpus artifacts;
+        # this future corpus surface proves its non-resurrection counterpart.
+        if not delta.tombstones or any(
+            tombstone.assertion_id is not None or tombstone.revision_id is not None
+            for tombstone in delta.tombstones
+        ):
+            raise RuntimeError("Kite future corpus artifact did not preserve opaque physical-erasure tombstones")
+        raw._artifact_clock = lambda: datetime.now(UTC) + timedelta(minutes=10)
+        raw._assertion_store()._artifact_clock = raw._artifact_clock
+        await raw.sweep_expired_governed_semantic_artifacts(limit=10)
+
+        async def delete_artifact(lease):
+            proof = GovernedArtifactDeletionProof(datetime.now(UTC).isoformat(), "0" * 128)
+            return replace(proof, signature=private_key.sign(proof.signable_bytes(lease)).hex())
+
+        owner = GovernedArtifactDeletionOwner(consumer_id, consumer_key_id, delete_artifact)
+        for _ in range(3):
+            authentication = GovernedArtifactConsumerAuthentication(
+                consumer_id, consumer_key_id, str(uuid4()),
+                datetime.now(UTC).isoformat(), "0" * 128,
+            )
+            authentication = replace(
+                authentication,
+                signature=private_key.sign(
+                    authentication.signable_bytes(raw._assertion_store().tenant_id)
+                ).hex(),
+            )
+            if await raw.process_governed_semantic_artifact_revocation(authentication, owner) is None:
+                raise RuntimeError("Kite artifact revocation did not issue a signed deletion ACK")
+        artifacts = await raw.governed_semantic_artifact_erasure_observation(
+            expected_generation=erased.generation,
+        )
+        if (
+            artifacts.export_snapshots != 0 or artifacts.governed_corpus != 0
+            or artifacts.future_corpus != 0 or artifacts.pending_revocations != 0
+            or artifacts.completed_revocations < 3
+        ):
+            raise RuntimeError("Kite artifact erasure did not reach the signed terminal state")
+        return {
+            "active_assertions": {"erased_count": 2, "remaining_count": 0},
+            "derivations": {"erased_count": 1, "remaining_count": 0},
+            "vector_index": {"erased_count": 1, "remaining_count": 0},
+            "recall_candidates": {"erased_count": 1, "remaining_count": 0},
+            "export_snapshots": {"erased_count": 1, "remaining_count": 0},
+            "governed_corpus": {"erased_count": 1, "remaining_count": 0},
+            "future_corpus": {"erased_count": 1, "remaining_count": 0},
+            "projection_candidates": {"erased_count": 1, "remaining_count": 0},
+        }
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), operation_id=None):
+        """Govern normal assertion ingestion through the SHACL write boundary.
+
+        ``AsyncStorage.put_assertion`` is governed too.  Private raw mutation
+        capabilities exist only for tightly controlled migrations, so an
+        agent-facing privacy storage cannot forward ordinary ingestion around
+        its required validation report.
+        """
+        return await self.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            operation_id=operation_id,
+        )
+
+    async def put_validated_assertion(
+        self,
+        assertion,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate and persist an assertion through the privacy-governed path."""
+        self._assert_semantic_assertion_write_allowed("put_validated_assertion")
+        return await self._storage.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    def semantic_validation_service(self):
+        """Return a privacy-governed facade for SHACL validation and reports."""
+        return _PrivacyGoverningSemanticValidationService(self)
+
+    async def supersede_assertion(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Govern replacements through full tentative-state SHACL validation."""
+        self._assert_semantic_assertion_write_allowed("supersede_assertion")
+        return await self._storage.supersede_validated_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Append direct provenance through the privacy-governed writer."""
+        self._assert_semantic_assertion_write_allowed("append_assertion_source")
+        return await self._storage.append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def _restore_explicit_fact_assertion(
+        self,
+        expected_terminal_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Restore a direct terminal shell through the governed writer."""
+        self._assert_semantic_assertion_write_allowed(
+            "restore_explicit_fact_assertion"
+        )
+        return await self._storage._restore_explicit_fact_assertion(
+            expected_terminal_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def retract_assertion(self, assertion_id, expected_revision_id, *, operation_id=None):
+        # The result contains the retracted assertion and every dependent.
+        # Volatile sessions have no local semantic store, so returning that
+        # durable content would pierce their read boundary.
+        self._assert_semantic_assertion_read_allowed("retractions")
+        return await self._storage.retract_assertion(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def delete_assertion(
+        self,
+        assertion_id,
+        expected_revision_id,
+        *,
+        operation_id=None,
+    ):
+        # A deletion result likewise includes durable dependent content.
+        self._assert_semantic_assertion_read_allowed("deletions")
+        return await self._storage.delete_assertion(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def _delete_explicit_fact_assertion(
+        self,
+        assertion_id,
+        expected_revision_id,
+        *,
+        operation_id,
+        explicit_fact_selector,
+    ):
+        """Delete one adapter fact through its selector-bound lifecycle."""
+        self._assert_semantic_assertion_read_allowed("explicit fact deletion")
+        return await self._storage._delete_explicit_fact_assertion(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+            explicit_fact_selector=explicit_fact_selector,
+        )
+
+    async def invalidate_assertion_eligibility(self, assertion_id, expected_revision_id, *, operation_id=None):
+        # The result names inferred dependents, so volatile modes must not use
+        # this durable lifecycle surface to observe semantic history.
+        self._assert_semantic_assertion_read_allowed("validation invalidation")
+        return await self._storage.invalidate_assertion_eligibility(
+            assertion_id,
+            expected_revision_id,
+            operation_id=operation_id,
+        )
+
+    async def erase_assertion(self, assertion_id, *, operation_id=None):
+        # Physical erasure is never blocked by a privacy mode, a pin, or a
+        # derived reference.  The canonical store computes the full transitive
+        # closure under its tenant lock and invokes its bound derivative
+        # companion before canonical identities can be erased.
+        return await self._storage.erase_assertion(
+            assertion_id,
+            operation_id=operation_id,
+        )
+
+    async def consume_governed_semantic_artifact(
+        self, artifact_id, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact consumption")
+        return await self._storage.consume_governed_semantic_artifact(
+            artifact_id, expected_generation=expected_generation
+        )
+
+    async def claim_governed_semantic_artifact_revocation(
+        self, authentication, *, lease_seconds: float = 60.0,
+    ):
+        # Privacy modes never block cleanup of bytes written in an earlier
+        # durable mode. Consumer authentication remains mandatory in storage.
+        return await self._storage.claim_governed_semantic_artifact_revocation(
+            authentication, lease_seconds=lease_seconds
+        )
+
+    async def acknowledge_governed_semantic_artifact_revocation(
+        self, lease, proof,
+    ):
+        return await self._storage.acknowledge_governed_semantic_artifact_revocation(
+            lease, proof
+        )
+
+    async def process_governed_semantic_artifact_revocation(
+        self, authentication, owner, *, lease_seconds: float = 60.0,
+    ):
+        return await self._storage.process_governed_semantic_artifact_revocation(
+            authentication, owner, lease_seconds=lease_seconds
+        )
+
+    async def sweep_expired_governed_semantic_artifacts(self, *, limit: int = 100):
+        # Retention cleanup is always permitted; it can only remove active
+        # controlled artifacts and create authenticated deletion work.
+        return await self._storage.sweep_expired_governed_semantic_artifacts(
+            limit=limit
+        )
+
+    async def governed_semantic_artifact_erasure_observation(
+        self, *, expected_generation: int,
+    ):
+        self._assert_semantic_assertion_read_allowed("governed artifact observations")
+        return await self._storage.governed_semantic_artifact_erasure_observation(
+            expected_generation=expected_generation
+        )
+
+    def _assert_semantic_assertion_read_allowed(self, operation: str) -> None:
+        """Keep volatile sessions from observing durable semantic knowledge.
+
+        Canonical assertions have no session-local implementation.  Returning
+        durable rows in EPHEMERAL or ISOLATED mode would silently cross the
+        privacy boundary, so each explicit read surface fails closed until an
+        approved session-local assertion store exists.
+        """
+        if (
+            not self._policy.allow_persistent_read
+            or self._privacy_config.is_ephemeral()
+            or self._policy.use_session_storage
+        ):
+            raise PrivacyViolationError(
+                f"Canonical assertion {operation} is disabled in volatile privacy modes"
+            )
+
+    async def get_assertion(self, assertion_id, *, include_inactive=False):
+        self._assert_semantic_assertion_read_allowed("reads")
+        return await self._storage.get_assertion(assertion_id, include_inactive=include_inactive)
+
+    async def get_assertion_revision(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("revision reads")
+        return await self._storage.get_assertion_revision(revision_id)
+
+    async def query_assertions(self, query=None):
+        self._assert_semantic_assertion_read_allowed("queries")
+        return await self._storage.query_assertions(query)
+
+    async def list_assertion_revisions(self, assertion_id):
+        self._assert_semantic_assertion_read_allowed("revision listing")
+        return await self._storage.list_assertion_revisions(assertion_id)
+
+    async def list_assertion_sources(self, assertion_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_sources(assertion_id)
+
+    async def list_assertion_revision_sources(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_revision_sources(revision_id)
+
+    async def list_assertion_revision_sources_batch(self, revision_ids):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.list_assertion_revision_sources_batch(revision_ids)
+
+    async def get_source_occurrence(self, source_occurrence_id):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.get_source_occurrence(source_occurrence_id)
+
+    async def get_derivation_inputs(self, revision_id):
+        self._assert_semantic_assertion_read_allowed("derivation traversal")
+        return await self._storage.get_derivation_inputs(revision_id)
+
+    async def reactivate_inferred_assertion(self, assertion, *, operation_id=None):
+        self._assert_semantic_assertion_write_allowed("reactivate_inferred_assertion")
+        return await self._storage.reactivate_inferred_assertion(
+            assertion, operation_id=operation_id,
+        )
+
+    def _assert_semantic_assertion_incremental_read_allowed(self, operation: str) -> None:
+        """Prevent volatile modes from observing durable semantic progress."""
+        self._assert_semantic_assertion_read_allowed(operation)
+
+    async def assertion_checkpoint(self):
+        self._assert_semantic_assertion_incremental_read_allowed("checkpoint")
+        return await self._storage.assertion_checkpoint()
+
+    async def assertion_event_checkpoint(self):
+        self._assert_semantic_assertion_incremental_read_allowed("event checkpoint")
+        return await self._storage.assertion_event_checkpoint()
+
+    async def assertion_changes_since(self, generation, *, limit=100):
+        self._assert_semantic_assertion_incremental_read_allowed("change reads")
+        return await self._storage.assertion_changes_since(generation, limit=limit)
+
+    async def assertion_changes_after(self, checkpoint, *, limit=100):
+        self._assert_semantic_assertion_incremental_read_allowed("change reads")
+        return await self._storage.assertion_changes_after(checkpoint, limit=limit)
+
+    async def assertion_validation_statuses(self, assertions):
+        self._assert_semantic_assertion_read_allowed("validation status")
+        return await self._storage.assertion_validation_statuses(assertions)
+
+    async def assertion_inference_inputs(self, query=None):
+        self._assert_semantic_assertion_read_allowed("inference inputs")
+        return await self._storage.assertion_inference_inputs(query)
+
+    async def semantic_recall_candidates(
+        self, *, query, candidate_scan_limit, inference_profile, inference_limits=None, maintenance_limits=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic recall")
+        return await self._storage.semantic_recall_candidates(
+            query=query, candidate_scan_limit=candidate_scan_limit,
+            inference_profile=inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+        )
+
+    def semantic_assertion_vector_projection(self, profile):
+        """Return a retained handle whose every operation rechecks privacy."""
+        self._assert_semantic_assertion_read_allowed("semantic vector projection")
+        self._assert_semantic_assertion_write_allowed("semantic vector projection")
+        projection = self._storage.semantic_assertion_vector_projection(profile)
+        return _PrivacyGuardedSemanticVectorProjection(self, projection)
+
+    async def hydrate_semantic_recall_candidates(self, assertion_ids, **kwargs):
+        self._assert_semantic_assertion_read_allowed("semantic recall provenance")
+        return await self._storage.hydrate_semantic_recall_candidates(assertion_ids, **kwargs)
+
+    async def semantic_inference_state(self, profile):
+        self._assert_semantic_assertion_read_allowed("inference status")
+        return await self._storage.semantic_inference_state(profile)
+
+    async def explain_semantic_inference(self, assertion_id, profile):
+        self._assert_semantic_assertion_read_allowed("inference lineage")
+        return await self._storage.explain_semantic_inference(assertion_id, profile)
+
+    async def materialize_semantic_inference(self, profile, *, limits=None, full_rebuild: bool = False):
+        self._assert_semantic_assertion_write_allowed("semantic inference")
+        return await self._storage.materialize_semantic_inference(
+            profile, limits=limits, full_rebuild=full_rebuild,
+        )
+
+    async def revoke_semantic_inference(self):
+        """Honor an explicit disablement through the governed storage facade.
+
+        Revocation reports only aggregate counts and removes durable derived
+        knowledge.  It is therefore always allowed: refusing it in a privacy
+        transition would leave a previously approved materialization live.
+        """
+        return await self._storage.revoke_semantic_inference()
+
+    async def run_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        full_rebuild: bool = False,
+    ):
+        """Keep sleep maintenance behind the same durable privacy boundary."""
+        self._assert_semantic_assertion_read_allowed("semantic maintenance")
+        self._assert_semantic_assertion_write_allowed("semantic maintenance")
+        return await self._storage.run_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            full_rebuild=full_rebuild,
+        )
+
+    async def semantic_maintenance_training_readiness(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+        allow_prior_verified_snapshot: bool = False,
+        expected_checkpoint=None,
+    ):
+        """Read the training prerequisite without bypassing privacy policy."""
+        self._assert_semantic_assertion_read_allowed("semantic maintenance status")
+        return await self._storage.semantic_maintenance_training_readiness(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+            allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            expected_checkpoint=expected_checkpoint,
+        )
+
+    async def semantic_maintenance_capability_versions(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic maintenance status")
+        return await self._storage.semantic_maintenance_capability_versions(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+        )
+
+    def semantic_rdf_capability_report(self):
+        """Expose only the runtime's pinned RDF capability report."""
+        self._assert_semantic_assertion_read_allowed("semantic RDF runtime status")
+        return self._storage.semantic_rdf_capability_report()
+
+    def semantic_sparql12_read_adapter(self, backend, decode_row, **kwargs):
+        """Create a governed SPARQL 1.2 adapter from the bound runtime."""
+        self._assert_semantic_assertion_read_allowed("semantic SPARQL 1.2 read")
+        return self._storage.semantic_sparql12_read_adapter(
+            backend, decode_row, **kwargs
+        )
+
+    async def governed_assertion_corpus_snapshot(self, **kwargs):
+        """Expose the host corpus service through the normal privacy gate."""
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_read_allowed("governed learning corpus")
+            self._assert_semantic_assertion_write_allowed(
+                "governed learning corpus artifact registration"
+            )
+            return await self._storage.governed_assertion_corpus_snapshot(**kwargs)
+        finally:
+            self._release_semantic_artifact_producer_lease()
+
+    async def governed_assertion_corpus_changes_since(self, snapshot, **kwargs):
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_incremental_read_allowed(
+                "governed learning corpus"
+            )
+            self._assert_semantic_assertion_write_allowed(
+                "future corpus artifact registration"
+            )
+            return await self._storage.governed_assertion_corpus_changes_since(
+                snapshot, **kwargs
+            )
+        finally:
+            self._release_semantic_artifact_producer_lease()
+
+    async def repair_semantic_maintenance(
+        self,
+        inference_profile,
+        *,
+        inference_limits=None,
+        maintenance_limits=None,
+        semantic_capabilities=None,
+    ):
+        self._assert_semantic_assertion_read_allowed("semantic maintenance repair")
+        self._assert_semantic_assertion_write_allowed("semantic maintenance repair")
+        return await self._storage.repair_semantic_maintenance(
+            inference_profile,
+            inference_limits=inference_limits,
+            maintenance_limits=maintenance_limits,
+            semantic_capabilities=semantic_capabilities,
+        )
+
+    async def export_assertion_snapshot(self, query=None, **artifact_governance):
+        self._acquire_semantic_artifact_producer_lease()
+        try:
+            self._assert_semantic_assertion_read_allowed("export")
+            self._assert_semantic_assertion_write_allowed(
+                "export artifact registration"
+            )
+            return await self._storage.export_assertion_snapshot(
+                query, **artifact_governance
+            )
+        finally:
+            self._release_semantic_artifact_producer_lease()
 
     # === Private Agent Identity Resources (privacy-governed durable writes) ===
     #
@@ -2524,11 +4186,20 @@ class PrivacyEnforcingStorage:
         else:
             archive_clause = "archived_at IS NULL"
 
+        # Newest-first here; `/api/conversations` reverses before grouping, so
+        # the grouper sees `canonical_order()`. Shared with the #2959 projection
+        # rather than restated: the projection is meant to be a faithful cache
+        # of this list, and it cannot be if the two derive from different
+        # orders. `id` is the tie-break — without it equal timestamps came back
+        # in whatever order the backend chose, so the same history could group
+        # two ways on two calls.
+        from .conversation_sessions import canonical_order
+
         return await self._storage.db.fetchall(f"""
             SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
-            ORDER BY created_at DESC
+            {canonical_order(self._storage.db.backend_type, descending=True)}
             LIMIT ?
         """, (agent_id, bounded_limit))
 
@@ -3380,30 +5051,30 @@ class PrivacyEnforcingStorage:
 
     # === Pass-through properties (with deprecation warnings) ===
     #
-    # These properties expose the underlying storage objects directly,
-    # which bypasses privacy mode enforcement. They are deprecated and
-    # callers should migrate to the privacy-aware methods above.
-    # They remain for backward compatibility with internal agent code.
+    # These properties retain selected compatibility surfaces for internal
+    # callers.  The database property is a governed view, not the underlying
+    # raw handle; callers should still prefer the explicit privacy-aware
+    # methods above.
 
     def _warn_direct_access(self, property_name: str) -> None:
         """Log a deprecation warning when a raw storage property is accessed."""
         warnings.warn(
-            f"Direct access to PrivacyEnforcingStorage.{property_name} bypasses "
-            f"privacy enforcement. Use privacy-aware methods instead "
+            f"Direct access to PrivacyEnforcingStorage.{property_name} is deprecated. "
+            f"Use privacy-aware methods instead "
             f"(e.g., query_conversations, get_conversation_history).",
             DeprecationWarning,
             stacklevel=3,
         )
         logger.warning(
-            f"Privacy bypass: direct access to .{property_name} property "
+            f"Deprecated direct access to .{property_name} property "
             f"(current mode: {self._privacy_mode.value})"
         )
 
     @property
     def db(self):
-        """Access to underlying database. DEPRECATED: bypasses privacy enforcement."""
+        """Return a guarded legacy database view, never its raw backend."""
         self._warn_direct_access("db")
-        return self._storage.db
+        return _PrivacyDatabaseView(self._storage.db)
 
     @property
     def db_path(self) -> str:
@@ -3414,6 +5085,25 @@ class PrivacyEnforcingStorage:
     def llm_service(self):
         """Get the agent-scoped LLM service from underlying storage."""
         return getattr(self._storage, "llm_service", None)
+
+    @property
+    def minimum_close_timeout_s(self) -> float:
+        """Preserve the underlying storage's optional close-budget contract."""
+        return getattr(self._storage, "minimum_close_timeout_s", 0.0)
+
+    @property
+    def minimum_sqla_factory_close_timeout_s(self) -> float:
+        """Preserve the cached SQLAlchemy pre-close reservation."""
+        return getattr(self._storage, "minimum_sqla_factory_close_timeout_s", 0.0)
+
+    @property
+    def minimum_potential_sqla_factory_close_timeout_s(self) -> float:
+        """Preserve a late-created SQLAlchemy factory's reservation."""
+        return getattr(
+            self._storage,
+            "minimum_potential_sqla_factory_close_timeout_s",
+            0.0,
+        )
 
     @property
     def graph_store(self):
@@ -3455,12 +5145,123 @@ class PrivacyEnforcingStorage:
     async def close(self):
         """Close the underlying storage."""
         await self._storage.close()
+
+    async def dispose_cached_sqla_factory(self):
+        """Bound SQLAlchemy pre-close without hiding the storage contract."""
+        dispose = getattr(self._storage, "dispose_cached_sqla_factory", None)
+        if callable(dispose):
+            await dispose()
     
     async def __aenter__(self):
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+
+class _PrivacyGoverningSemanticValidationReports:
+    """Read-only, privacy-governed view of tenant validation reports."""
+
+    __slots__ = ("_wrapper",)
+
+    def __init__(self, wrapper: PrivacyEnforcingStorage) -> None:
+        self._wrapper = wrapper
+
+    def _reports(self):
+        return self._wrapper._storage.semantic_validation_service().reports
+
+    async def get(self, report_id: str):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation report reads")
+        return await self._reports().get(report_id)
+
+    async def list(self, *, assertion_id: str | None = None, limit: int = 100):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation report listing")
+        return await self._reports().list(assertion_id=assertion_id, limit=limit)
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise PrivacyViolationError(
+            f"Validation-report facade refuses to forward {name!r}: reports are "
+            "read only through get/list so callers cannot persist private validation "
+            "data outside the governed assertion path."
+        )
+
+
+class _PrivacyGoverningSemanticValidationService:
+    """Privacy facade that cannot bypass governed SHACL assertion ingestion."""
+
+    __slots__ = ("_wrapper",)
+
+    def __init__(self, wrapper: PrivacyEnforcingStorage) -> None:
+        self._wrapper = wrapper
+
+    @property
+    def reports(self) -> _PrivacyGoverningSemanticValidationReports:
+        return _PrivacyGoverningSemanticValidationReports(self._wrapper)
+
+    async def put_assertion(self, assertion, *, source_occurrences=(), **validation_options):
+        return await self._wrapper.put_validated_assertion(
+            assertion,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def supersede_assertion(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate a replacement through the same privacy-governed boundary."""
+        return await self._wrapper.supersede_assertion(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def append_assertion_source(
+        self,
+        expected_predecessor_revision_id,
+        replacement,
+        *,
+        source_occurrences=(),
+        **validation_options,
+    ):
+        """Validate a provenance append through the privacy-governed path."""
+        return await self._wrapper.append_assertion_source(
+            expected_predecessor_revision_id,
+            replacement,
+            source_occurrences=source_occurrences,
+            **validation_options,
+        )
+
+    async def validate_current(self, **validation_options):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation")
+        self._wrapper._assert_semantic_assertion_write_allowed("validate_current")
+        return await self._wrapper._storage.semantic_validation_service().validate_current(
+            **validation_options,
+        )
+
+    async def full_audit_and_repair(self, **validation_options):
+        self._wrapper._assert_semantic_assertion_read_allowed("validation")
+        self._wrapper._assert_semantic_assertion_write_allowed("full_audit_and_repair")
+        return await self._wrapper._storage.semantic_validation_service().full_audit_and_repair(
+            **validation_options,
+        )
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise PrivacyViolationError(
+            f"Semantic-validation facade refuses to forward {name!r}: use the "
+            "governed put_assertion, supersede_assertion, "
+            "append_assertion_source, validate_current, "
+            "full_audit_and_repair, or reports surfaces."
+        )
 
 
 

@@ -17,7 +17,6 @@ from typing import Optional
 import httpx
 
 from ..protocol import (
-    TrainingProvider,
     TrainingProviderError,
     ProviderNotAvailableError,
     TrainingSubmissionError,

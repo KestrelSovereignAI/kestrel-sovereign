@@ -85,7 +85,12 @@ def resolve_governing_constitution_bytes(
         ValueError: If the resolved source is empty / whitespace-only — an
             authoritative governing source can never be blank, so an empty
             read is treated as an unreadable/ambiguous source rather than a
-            valid (hashable) constitution.
+            valid (hashable) constitution. Also
+            :class:`~.emancipation.AmbiguousAmendmentVIII`, a ``ValueError``,
+            when an active contract must be substituted into a text carrying
+            more than one Amendment VIII heading: which section is the
+            amendment has no answer, which is ambiguity in exactly the sense
+            this contract already fails closed on.
 
     Callers rely on these raising so they FAIL CLOSED: a governing source that
     is missing, unreadable, or ambiguous must never be silently substituted or

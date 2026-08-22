@@ -16,17 +16,28 @@ import os
 import re
 import struct
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    UNDATABLE_ROW_FALLBACK,
+    canonical_timestamp_sql,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    sort_sessions,
     summarize_sessions,
+    timestamp_predicate,
+    timestamp_query_param,
+)
+from .session_id_column import (
+    SESSION_ID_KEY,
+    column_session_id,
+    merged_column_assignment,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
@@ -68,6 +79,30 @@ class ConversationLexicalSchemaError(RuntimeError):
 
 class ConversationSessionTimestampError(RuntimeError):
     """Exact session membership cannot be proven from stored chronology."""
+
+
+@dataclass(slots=True)
+class _PreparedConversationWrite:
+    """Precomputed, not-yet-visible conversation row material.
+
+    Semantic recall persistence must acquire the assertion lifecycle fence only
+    for its final liveness check and INSERT.  Provider embedding and lexical
+    token indexing are intentionally prepared before that narrow critical
+    section; the lexical token handle remains available for cleanup if the
+    final fenced write cannot be admitted.
+    """
+
+    role: str
+    content: str
+    rendered_content: Optional[str]
+    metadata: Dict[str, Any]
+    embedding: Optional[List[float]]
+    embedding_profile_id: Optional[str]
+    embedding_service: Optional[Any]
+    model: Optional[str]
+    provider: Optional[str]
+    lexical_index_id: Optional[str]
+    lexical_index_version: Optional[str]
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -363,9 +398,10 @@ def search_session_summaries(
     list view (and the delete/archive lifecycle) agrees exists.
 
     Returns session dicts shaped like ``group_messages_into_sessions`` output
-    (``preview_content``/``preview_metadata`` retained for the endpoint's
-    decorator) plus ``name`` (when titled), ``match_count``, ``match_role``,
-    and ``match_snippet`` — decrypted plaintext excerpts around the first hit.
+    (``preview_content``/``preview_metadata``/``preview_wake_source`` retained
+    for the endpoint's decorator) plus ``name`` (when titled), ``match_count``,
+    ``match_role``, and ``match_snippet`` — decrypted plaintext excerpts around
+    the first hit.
     """
     names = names or {}
     query_lower = query.strip().lower()
@@ -435,7 +471,11 @@ def search_session_summaries(
             session["match_snippet"] = None
         results.append(session)
 
-    results.sort(key=lambda s: s["last_message_at"], reverse=True)
+    # The same order the list and the #2959 projection page by, not a third
+    # spelling of "newest first". Ties are ordinary and `limit` truncates, so
+    # sorting on `last_message_at` alone let search and the list disagree about
+    # WHICH session made the page (round-8/9 review).
+    sort_sessions(results)
     return results[:limit]
 
 
@@ -834,37 +874,16 @@ class AsyncConversationStore:
         return "datetime('now')"
 
     def _timestamp_query_param(self, value: Any) -> Any:
-        """Adapt the public ISO-string timestamp contract for PostgreSQL.
-
-        SQLite's query expressions normalize its mixed timestamp text with
-        ``julianday`` and accept the public ``*_iso`` argument directly.
-        asyncpg instead binds a ``TIMESTAMP`` predicate as a Python
-        :class:`datetime`, so pass the equivalent naive UTC value on
-        PostgreSQL. Invalid values remain unchanged: PostgreSQL rejects them,
-        while SQLite's ``julianday`` produces NULL and the destructive
-        predicate safely matches no rows.
-        """
-        if self.db.backend_type != "postgres":
-            return value
-        parsed = coerce_session_timestamp(value)
-        return value if parsed is None else parsed
+        """Adapt public timestamps through the shared backend boundary."""
+        return timestamp_query_param(self.db.backend_type, value)
 
     def _canonical_timestamp_sql(self, expression: str) -> str:
         """Normalize one timestamp SQL expression for the active backend."""
-        if self.db.backend_type == "sqlite":
-            # SQLite history contains both ``YYYY-MM-DD HH:MM:SS`` and public
-            # ISO-8601 ``T``/``Z`` representations.  Comparing or ordering the
-            # raw TEXT puts a space before ``T`` and misorders same-day values.
-            return f"julianday({expression})"
-        return expression
+        return canonical_timestamp_sql(self.db.backend_type, expression)
 
     def _timestamp_predicate(self, column: str, operator: str) -> str:
         """Compare timestamps canonically across supported storage formats."""
-        if operator not in {"<", ">="}:
-            raise ValueError(f"Unsupported timestamp comparison: {operator}")
-        left = self._canonical_timestamp_sql(column)
-        right = self._canonical_timestamp_sql("?")
-        return f"{left} {operator} {right}"
+        return timestamp_predicate(self.db.backend_type, column, operator)
 
     @property
     def encryption_enabled(self) -> bool:
@@ -1218,26 +1237,34 @@ class AsyncConversationStore:
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
                                provider: Optional[str] = None) -> None:
-        """Add a conversation message with per-agent encryption.
+        """Prepare and persist a conversation message with per-agent encryption."""
+        prepared = await self._prepare_conversation_write(
+            role,
+            content,
+            metadata,
+            session_id,
+            rendered_content,
+            model,
+            provider,
+        )
+        await self._persist_prepared_conversation(prepared)
 
-        Args:
-            role: Message role (user, assistant, system)
-            content: Canonical message content. For user turns this is the
-                raw user speech (typically ``wrap_user_input(raw)``) — never
-                the rendered-with-retrieval transport form.
-            metadata: Optional metadata dict
-            session_id: If provided, link this message to a specific session.
-                       This allows resuming old conversations beyond the 30-min gap.
-                       If not provided, an implicit session_id is derived from
-                       the time-gap heuristic (30 min inactivity = new session).
-            rendered_content: Write-once transport bytes for byte-stable cache
-                replay (#1402). Carries memories + RAG baked into the user
-                template. The history-load path emits this verbatim so the
-                prefix bytes match what the LLM saw at send time. Encrypted
-                with the same per-agent key as ``content``.
-            model: Concrete model that produced this message. Intended for
-                assistant rows; nullable for user/system and legacy rows.
-            provider: Resolved provider route that produced this message.
+    async def _prepare_conversation_write(
+        self,
+        role: str,
+        content: str,
+        metadata: Optional[Dict],
+        session_id: Optional[str],
+        rendered_content: Optional[str],
+        model: Optional[str],
+        provider: Optional[str],
+    ) -> _PreparedConversationWrite:
+        """Do provider/lexical prework before any semantic lifecycle fence.
+
+        The returned object is not visible to readers.  Its final insertion is
+        intentionally separate so semantic recall can fence only the brief
+        canonical-liveness check plus INSERT, rather than a network embedding
+        request or token-index write.
         """
         meta = dict(metadata) if metadata else {}
 
@@ -1261,10 +1288,9 @@ class AsyncConversationStore:
         if session_id:
             meta['session_id'] = session_id
 
-        # Use per-agent key for new messages
+        # Use per-agent key for new messages.
         fernet_to_use = self._agent_fernet or self._global_fernet
         to_store, was_encrypted = encrypt_string(content, fernet_to_use)
-
         if was_encrypted:
             meta['enc'] = True
             meta['key_version'] = CURRENT_KEY_VERSION
@@ -1281,19 +1307,9 @@ class AsyncConversationStore:
                 meta['enc'] = True
                 meta['key_version'] = CURRENT_KEY_VERSION
 
-        # Compute the embedding from plaintext content BEFORE the
-        # INSERT so we can co-write ``embedding_vec`` in a single
-        # statement (no follow-up UPDATE → no autoincrement-id
-        # round-trip needed). The embedding service is optional;
-        # absence + per-call failure both fall back to the legacy
-        # column set with no behavioural change.
-        embedding_vec_val: Optional[List[float]] = await self._maybe_embed(content)
-
-        # #1477 — derive the active embedding profile id so the row
-        # can be filtered out of kNN reads that don't share the
-        # same semantic coordinate space. Never blocks the write —
-        # if the service can't describe itself the row's profile id
-        # stays NULL (= invisible to profile-filtered kNN, harmless).
+        # Compute the embedding from plaintext before the final INSERT so it
+        # can still be co-written without an autoincrement-id round trip.
+        embedding_vec_val = await self._maybe_embed(content)
         profile_id: Optional[str] = None
         embedding_service: Optional[Any] = None
         if embedding_vec_val is not None:
@@ -1310,14 +1326,14 @@ class AsyncConversationStore:
                     )
 
         lexical_index_id: Optional[str] = uuid.uuid4().hex
-        lexical_tokens = _tokenize_for_search(_strip_search_wrappers(content))
         lexical_index_version: Optional[str] = self._lexical_index.version
         try:
             # Completion protocol: token rows commit first, then the message
             # row and its coverage marker commit together.  A crash can leave
             # harmless orphan tokens, but never a falsely-covered message.
             await self._lexical_index.index_message(
-                lexical_index_id, lexical_tokens
+                lexical_index_id,
+                _tokenize_for_search(_strip_search_wrappers(content)),
             )
         except Exception as exc:  # noqa: BLE001 - recall falls back safely
             logger.error(
@@ -1328,35 +1344,81 @@ class AsyncConversationStore:
             lexical_index_id = None
             lexical_index_version = None
 
+        return _PreparedConversationWrite(
+            role=role,
+            content=to_store,
+            rendered_content=rendered_to_store,
+            metadata=meta,
+            embedding=embedding_vec_val,
+            embedding_profile_id=profile_id,
+            embedding_service=embedding_service,
+            model=model,
+            provider=provider,
+            lexical_index_id=lexical_index_id,
+            lexical_index_version=lexical_index_version,
+        )
+
+    async def _exclude_prepared_conversation_from_retrieval(
+        self,
+        prepared: _PreparedConversationWrite,
+    ) -> None:
+        """Drop precomputed retrieval residue before an excluded write lands."""
+        if prepared.lexical_index_id is not None:
+            await self._discard_lexical_tokens(prepared.lexical_index_id)
+            prepared.lexical_index_id = None
+            prepared.lexical_index_version = None
+        # An excluded derivative remains an auditable transcript row but must
+        # not retain a vector path while it has no retrievable lexical path.
+        prepared.embedding = None
+        prepared.embedding_profile_id = None
+        prepared.embedding_service = None
+
+    async def _persist_prepared_conversation(
+        self,
+        prepared: _PreparedConversationWrite,
+    ) -> None:
+        """Insert precomputed bytes and clean token-first work on failure."""
         try:
             lexical_columns_written = await self._insert_message(
-                role=role,
-                content=to_store,
-                rendered_content=rendered_to_store,
-                metadata=json.dumps(meta) if meta else None,
-                embedding=embedding_vec_val,
-                embedding_profile_id=profile_id,
-                model=model,
-                provider=provider,
-                lexical_index_id=lexical_index_id,
-                lexical_index_version=lexical_index_version,
+                role=prepared.role,
+                content=prepared.content,
+                rendered_content=prepared.rendered_content,
+                metadata=json.dumps(prepared.metadata) if prepared.metadata else None,
+                # Derived from the metadata this same INSERT is about to
+                # store, rather than from a variable that may have moved on
+                # (#2958). The rule is deliberately narrower than session
+                # grouping's, so the column stays NULL for ids grouping still
+                # honours: it may be silent, never wrong.
+                session_id=column_session_id(prepared.metadata),
+                embedding=prepared.embedding,
+                embedding_profile_id=prepared.embedding_profile_id,
+                model=prepared.model,
+                provider=prepared.provider,
+                lexical_index_id=prepared.lexical_index_id,
+                lexical_index_version=prepared.lexical_index_version,
             )
         except Exception:
-            if lexical_index_id:
-                await self._discard_lexical_tokens(lexical_index_id)
+            if prepared.lexical_index_id:
+                await self._discard_lexical_tokens(prepared.lexical_index_id)
+                prepared.lexical_index_id = None
             raise
-        if not lexical_columns_written and lexical_index_id:
-            await self._discard_lexical_tokens(lexical_index_id)
+        if not lexical_columns_written and prepared.lexical_index_id:
+            await self._discard_lexical_tokens(prepared.lexical_index_id)
+            prepared.lexical_index_id = None
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
-        # human-readable fields. Best-effort: registry write must
-        # NEVER block message persistence. Cached in-process to
-        # avoid an UPSERT per turn.
-        if profile_id is not None and embedding_service is not None:
+        # human-readable fields. Best-effort: registry write must never block
+        # the already-persisted message.
+        if (
+            prepared.embedding_profile_id is not None
+            and prepared.embedding_service is not None
+        ):
             try:
                 await _upsert_embedding_profile(
-                    self.db, embedding_service, profile_id,
+                    self.db,
+                    prepared.embedding_service,
+                    prepared.embedding_profile_id,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug(
@@ -1458,6 +1520,7 @@ class AsyncConversationStore:
         embedding_profile_id: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        session_id: Optional[str] = None,
         lexical_index_id: Optional[str] = None,
         lexical_index_version: Optional[str] = None,
     ) -> bool:
@@ -1481,26 +1544,39 @@ class AsyncConversationStore:
         when embeddings are unavailable. ``embedding_profile_id`` is
         always written alongside ``embedding_vec`` — they share the
         same row state (#1477).
+
+        ``session_id`` duplicates the id already inside ``metadata`` into its
+        own indexed column, or is ``None`` where that id is outside the
+        column's contract (#2958). It rides in the base AND legacy column
+        lists because its migration raises unless the column exists, so no
+        schema this method can reach is without it — unlike the
+        lexical/embedding columns, whose migrations are non-fatal and whose
+        absence the fallbacks below exist to survive.
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, lexical_index_id, lexical_index_version, created_at"
+            "metadata, session_id, lexical_index_id, lexical_index_version, "
+            "created_at"
         )
         base_vals_suffix = f", {self._now_sql()}"
         base_params = (
             self.agent_id, role, content, rendered_content, model, provider,
-            metadata, lexical_index_id, lexical_index_version,
+            metadata, session_id, lexical_index_id, lexical_index_version,
         )
         legacy_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, created_at"
+            "metadata, session_id, created_at"
         )
-        legacy_params = base_params[:7]
+        legacy_params = base_params[:8]
+        # Generated, not hand-counted: these lists are spelled into six
+        # statements below and a miscount would only surface at runtime.
+        base_binds = ", ".join(["?"] * len(base_params))
+        legacy_binds = ", ".join(["?"] * len(legacy_params))
 
         if embedding is None:
             sql = (
                 f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
+                f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
                 await self.db.execute_commit(sql, base_params)
@@ -1514,7 +1590,7 @@ class AsyncConversationStore:
                 )
                 await self.db.execute_commit(
                     f"INSERT INTO conversation_history ({legacy_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                    f"VALUES ({legacy_binds}{base_vals_suffix})",
                     legacy_params,
                 )
                 return False
@@ -1535,7 +1611,7 @@ class AsyncConversationStore:
             sql = (
                 f"INSERT INTO conversation_history "
                 f"({base_cols}, embedding_vec, embedding_profile_id) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
             await self.db.execute_commit(
@@ -1551,7 +1627,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder}, ?)",
                         legacy_params + (emb_bind, embedding_profile_id),
                     )
@@ -1577,7 +1653,7 @@ class AsyncConversationStore:
                 sql = (
                     f"INSERT INTO conversation_history "
                     f"({base_cols}, embedding_vec) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                    f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
                 await self.db.execute_commit(sql, base_params + (emb_bind,))
@@ -1591,7 +1667,7 @@ class AsyncConversationStore:
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder})",
                         legacy_params + (emb_bind,),
                     )
@@ -1603,11 +1679,29 @@ class AsyncConversationStore:
                     )
                     await self.db.execute_commit(
                         f"INSERT INTO conversation_history ({legacy_cols}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                        f"VALUES ({legacy_binds}{base_vals_suffix})",
                         legacy_params,
                     )
                     return False
         return True
+
+    def decrypt_stored_content(self, content: str, meta: Optional[Dict]) -> str:
+        """Public: decrypt one stored row's content to plaintext.
+
+        The conversation store owns message decryption. Consumers that read
+        ``conversation_history`` with their own SQL (the memory consolidator
+        does, for clustering and episode synthesis) previously had no
+        supported way to reach it, so they treated the at-rest envelope as
+        text — which is how ciphertext ended up tokenized into episode topics
+        (#2850). This is that supported way; it deliberately does NOT
+        opportunistically migrate, because a read-only consumer must not
+        rewrite rows.
+
+        Raises ``DecryptionError`` when the row is marked encrypted and no
+        key can open it — callers decide whether to skip or fail.
+        """
+        plaintext, _needs_migration = self._decrypt_with_fallback(content, meta)
+        return plaintext
 
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
         """Decrypt content, trying per-agent key first then global.
@@ -1921,7 +2015,19 @@ class AsyncConversationStore:
 
         seen_ids: set[int] = set()
         candidates: list[tuple[datetime, int, tuple, dict[str, Any]]] = []
-        fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        # NOT a clock. An unreadable timestamp dated with `now()` sorts to the
+        # end of the candidates and is gap-filtered out of the session the
+        # conversation list says it belongs to — and it does so differently
+        # depending on when the read happens, so the same session opens with
+        # different contents on two consecutive requests. `group_messages_into_
+        # sessions` stopped consulting a clock for #2959 (a grouping that reads
+        # one cannot be cached); this is the same constant it falls back to.
+        #
+        # This does not make the two agree about which session an unreadable row
+        # joins: the grouper inherits the row's predecessor, and the candidates
+        # here are a subset that need not contain it. That is one rule with two
+        # implementations, which is #2961's subject.
+        fallback_timestamp = UNDATABLE_ROW_FALLBACK
         session_id_str = str(session_id)
         for row in rows:
             row_id = int(row[0])
@@ -3318,6 +3424,26 @@ class AsyncConversationStore:
         rehearsal, reflection, tagging, and routing writes cannot be erased by
         a stale Python read-modify-write cycle.
 
+        The key set is the caller's, so this is the one door through which
+        ``metadata.session_id`` can be rewritten after insertion. When it is,
+        the derived column moves in the SAME statement (#2958) — a merge that
+        left the column behind would put the row in the single state the column
+        is not allowed to occupy: naming a session its metadata no longer does.
+        Every other key leaves the column untouched, including the merge that
+        deletes nothing and the empty update.
+
+        The column follows the metadata down to NULL where the merge cannot
+        speak for the whole document, and "cannot" is wider than it looks. On
+        BOTH backends a metadata root that is not an object — ``42``, ``[]``,
+        ``"text"``, JSON ``null``, all shapes free-text legacy metadata holds —
+        declines the merge while reporting success: SQLite's ``json_set``
+        returns the document unchanged and PostgreSQL's ``||`` concatenates
+        into an array instead of merging. On SQLite a legacy row carrying the
+        key twice additionally stays ambiguous after ``json_set``. None of
+        those rows has an id the column may claim. See
+        :func:`~kestrel_sovereign.storage.session_id_column.merged_column_assignment`
+        for the measurements and why the metadata is left as it is.
+
         Args:
             message_id: The message ID to update
             metadata_updates: Dict of metadata fields to update (merged with existing)
@@ -3325,15 +3451,32 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
+        # The value is derived from the update rather than re-read from the
+        # row, because the merge is last-writer-wins on this key and re-reading
+        # would reintroduce the read-modify-write race this method exists to
+        # avoid. Whether that value may be stamped at all is a question about
+        # the DOCUMENT, though, and the two dialects merge documents
+        # differently, so the clause comes from the shared contract rather than
+        # being spelled here (#2958).
+        if SESSION_ID_KEY in metadata_updates:
+            column_assignment = ", " + merged_column_assignment(
+                self.db.backend_type
+            )
+            column_params: tuple = (column_session_id(metadata_updates),)
+        else:
+            column_assignment = ""
+            column_params = ()
+
         if self.db.backend_type == "postgres":
             updates_json = json.dumps(metadata_updates)
             # PostgreSQL: atomic JSON merge via || operator
             # COALESCE handles NULL metadata columns gracefully
             result = await self.db.execute_commit(
                 "UPDATE conversation_history "
-                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb "
+                "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || ?::jsonb"
+                f"{column_assignment} "
                 "WHERE id = ? AND agent_id = ?",
-                (updates_json, message_id, self.agent_id)
+                (updates_json, *column_params, message_id, self.agent_id)
             )
             updated = result.rowcount > 0 if hasattr(result, 'rowcount') else True
             if not updated:
@@ -3352,11 +3495,15 @@ class AsyncConversationStore:
                     merge_params.extend((f'$."{escaped_key}"', json.dumps(value)))
                 sql = (
                     "UPDATE conversation_history SET metadata = "
-                    f"json_set(COALESCE(metadata, '{{}}'), {assignments}) "
+                    f"json_set(COALESCE(metadata, '{{}}'), {assignments})"
+                    f"{column_assignment} "
                     "WHERE id = ? AND agent_id = ?"
                 )
-                params = (*merge_params, message_id, self.agent_id)
+                params = (*merge_params, *column_params,
+                          message_id, self.agent_id)
             else:
+                # No keys, so no session_id among them — the column cannot be
+                # stale after a merge that changes nothing.
                 sql = (
                     "UPDATE conversation_history SET metadata = "
                     "COALESCE(metadata, '{}') WHERE id = ? AND agent_id = ?"
@@ -3367,6 +3514,197 @@ class AsyncConversationStore:
             if not updated:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
             return updated
+
+    async def _semantic_recall_dependency_rows(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """Return this agent's rows linked to exact canonical identities.
+
+        The lookup is an exact JSON identity match, never a scan over message
+        content.  It includes archived and trashed artifacts deliberately: a
+        later restore must not make a forgotten fact reappear in context.
+
+        Physical erasure can remove a historical revision while preserving its
+        assertion identity with a fresh direct current revision.  Both identity
+        dimensions therefore participate in the match: assertion IDs cover a
+        fully erased assertion; revision IDs cover erased historical lineage.
+        """
+        normalized_assertion_ids = tuple(
+            sorted({value for value in assertion_ids if isinstance(value, str) and value})
+        )
+        normalized_revision_ids = tuple(
+            sorted({value for value in revision_ids if isinstance(value, str) and value})
+        )
+        if not normalized_assertion_ids and not normalized_revision_ids:
+            return []
+
+        predicates: list[str] = []
+        params: list[Any] = [self.agent_id]
+        if normalized_assertion_ids:
+            predicates.append(
+                "dependency ->> 'assertion_id' IN ("
+                + ", ".join("?" for _ in normalized_assertion_ids)
+                + ")"
+            )
+            params.extend(normalized_assertion_ids)
+        if normalized_revision_ids:
+            predicates.append(
+                "dependency ->> 'revision_id' IN ("
+                + ", ".join("?" for _ in normalized_revision_ids)
+                + ")"
+            )
+            params.extend(normalized_revision_ids)
+        postgres_predicate = " OR ".join(predicates)
+
+        if self.db.backend_type == "postgres":
+            postgres_sql = (
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM jsonb_array_elements("
+                "CASE jsonb_typeof(metadata::jsonb -> "
+                "'semantic_recall_dependencies') "
+                "WHEN 'array' THEN metadata::jsonb -> "
+                "'semantic_recall_dependencies' ELSE '[]'::jsonb END"
+                ") AS dependency WHERE "
+                + postgres_predicate
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                postgres_sql,
+                tuple(params),
+            )
+        else:
+            sqlite_predicates: list[str] = []
+            sqlite_params: list[Any] = [self.agent_id]
+            if normalized_assertion_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.assertion_id') IN ("
+                    + ", ".join("?" for _ in normalized_assertion_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_assertion_ids)
+            if normalized_revision_ids:
+                sqlite_predicates.append(
+                    "json_extract(CASE WHEN json_valid(dependency.value) "
+                    "THEN dependency.value ELSE '{}' END, '$.revision_id') IN ("
+                    + ", ".join("?" for _ in normalized_revision_ids)
+                    + ")"
+                )
+                sqlite_params.extend(normalized_revision_ids)
+            sqlite_sql = (
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? AND EXISTS ("
+                "SELECT 1 FROM json_each(CASE "
+                "WHEN json_type(CASE WHEN json_valid(COALESCE(metadata, '{}')) "
+                "THEN metadata ELSE '{}' END, "
+                "'$.semantic_recall_dependencies') = 'array' THEN json_extract("
+                "CASE WHEN json_valid(COALESCE(metadata, '{}')) THEN metadata "
+                "ELSE '{}' END, '$.semantic_recall_dependencies') "
+                "ELSE '[]' END) AS dependency WHERE "
+                + " OR ".join(sqlite_predicates)
+                + ") ORDER BY id ASC"
+            )
+            rows = await self.db.fetchall(
+                sqlite_sql,
+                tuple(sqlite_params),
+            )
+
+        matched: List[Tuple[int, Dict[str, Any]]] = []
+        for row_id, raw_metadata in rows:
+            try:
+                metadata = (
+                    dict(raw_metadata)
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(raw_metadata) if raw_metadata else {}
+                )
+            except (TypeError, json.JSONDecodeError):
+                # The SQL predicate only admits valid JSON in SQLite; keep the
+                # defensive guard for old/manual PostgreSQL rows.
+                continue
+            if isinstance(metadata, dict):
+                matched.append((int(row_id), metadata))
+        return matched
+
+    async def exclude_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> Tuple[int, ...]:
+        """Exclude every conversation artifact linked to an exact identity.
+
+        This is intentionally a reversible context exclusion rather than a
+        string-based deletion.  The privacy wrapper invokes it in the same
+        transaction as canonical fact deletion; callers receive exact message
+        IDs only so dependent episode summaries can be excluded too.
+        """
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=assertion_ids,
+            revision_ids=revision_ids,
+        )
+        message_ids: list[int] = []
+        for message_id, metadata in rows:
+            updates: Dict[str, Any] = {"excluded_from_context": True}
+            if not metadata.get("excluded_reason"):
+                updates["excluded_reason"] = "semantic_assertion_deleted"
+            if await self.update_message_metadata(message_id, updates):
+                message_ids.append(message_id)
+        return tuple(message_ids)
+
+    async def scrub_semantic_recall_dependencies(
+        self,
+        *,
+        assertion_ids: Iterable[str] = (),
+        revision_ids: Iterable[str] = (),
+    ) -> int:
+        """Remove erased assertion/revision IDs from excluded artifacts.
+
+        Physical canonical erasure must not leave a durable reference to the
+        erased identifier.  ``excluded_from_context`` is deliberately sticky:
+        scrubbing lineage never re-admits the derivative content.
+        """
+        normalized_assertion_ids = {
+            value for value in assertion_ids if isinstance(value, str) and value
+        }
+        normalized_revision_ids = {
+            value for value in revision_ids if isinstance(value, str) and value
+        }
+        rows = await self._semantic_recall_dependency_rows(
+            assertion_ids=normalized_assertion_ids,
+            revision_ids=normalized_revision_ids,
+        )
+        scrubbed = 0
+        for message_id, metadata in rows:
+            dependencies = metadata.get("semantic_recall_dependencies")
+            if not isinstance(dependencies, list):
+                continue
+            retained = [
+                dependency
+                for dependency in dependencies
+                if not (
+                    isinstance(dependency, dict)
+                    and (
+                        dependency.get("assertion_id") in normalized_assertion_ids
+                        or dependency.get("revision_id") in normalized_revision_ids
+                    )
+                )
+            ]
+            if len(retained) == len(dependencies):
+                continue
+            updated = await self.update_message_metadata(
+                message_id,
+                {
+                    "semantic_recall_dependencies": retained,
+                    "excluded_from_context": True,
+                },
+            )
+            if updated:
+                scrubbed += 1
+        return scrubbed
 
     async def atomic_increment_metadata_counter(
         self,
@@ -3399,7 +3737,24 @@ class AsyncConversationStore:
         Backend-aware: both SQLite (3.38+) and PostgreSQL (jsonb)
         support ``json_set`` + ``json_extract`` natively, so the
         statement is a single atomic UPDATE on either.
+
+        Both field names come from the caller, which makes this the second door
+        onto ``metadata.session_id`` — and unlike
+        :meth:`update_message_metadata` it declines rather than keeping the
+        derived column in step (#2958). Not squeamishness: this writes a
+        counter or a timestamp, and neither is ever a session identity. A
+        caller asking for one has a bug that a silently-synchronized column
+        would hide.
         """
+        if SESSION_ID_KEY in (counter_field, timestamp_field):
+            raise ValueError(
+                f"atomic_increment_metadata_counter cannot write metadata."
+                f"{SESSION_ID_KEY}: it writes counters and timestamps, and "
+                f"neither is a session identity. Session identity is moved "
+                f"through update_message_metadata, which keeps the indexed "
+                f"conversation_history.{SESSION_ID_KEY} column in step (#2958)."
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat() if timestamp_field else None
 
         if self.db.backend_type == "postgres":
@@ -3493,6 +3848,10 @@ class AsyncConversationStore:
         metadata_updates: Dict[str, Any]
     ) -> int:
         """Update metadata for multiple messages.
+
+        One :meth:`update_message_metadata` per id, so the derived
+        ``session_id`` column moves with the metadata here too (#2958) — the
+        per-row statement stays atomic; only the batch is not.
 
         Args:
             message_ids: List of message IDs to update

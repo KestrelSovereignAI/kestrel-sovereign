@@ -11,7 +11,9 @@ import importlib.metadata
 import inspect
 import logging
 import os
+import re
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Type
 
@@ -39,6 +41,29 @@ class DuplicateFeatureEntryPointError(RuntimeError):
     """Raised when multiple distributions claim one external feature class."""
 
 
+class FeatureDiscoveryAmbiguityError(RuntimeError):
+    """A bundled and external class collide without an authorized migration."""
+
+
+@dataclass(frozen=True)
+class FeatureDiscoverySelection:
+    """Selected in-process implementation and its inspectable provenance."""
+
+    class_name: str
+    feature_class: Type[_SdkFeature]
+    source: str
+    implementation_module: str
+    discovery_location: str
+    distribution: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _EntrypointFeatureCandidate:
+    feature_class: Type[_SdkFeature]
+    distribution: str
+    entry_point: str
+
+
 class MandatoryFeatureReadinessError(RuntimeError):
     """A sovereignty feature could not satisfy the readiness contract.
 
@@ -52,6 +77,7 @@ class MandatoryFeatureReadinessError(RuntimeError):
         "agent readiness",
         "configuration",
         "construction",
+        "contribution registration",
         "discovery",
         "enablement",
         "import",
@@ -67,6 +93,7 @@ class MandatoryFeatureReadinessError(RuntimeError):
         "could not be enabled",
         "could not be imported",
         "could not be inspected",
+        "could not register its SDK contributions",
         "could not finish cross-feature wiring",
         "could not initialize",
         "could not register its hooks",
@@ -316,19 +343,11 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     return None
 
 
-def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
-    """
-    Discover Feature classes from installed pip packages via entry_points.
+def _discover_entrypoint_feature_candidates(
+) -> Dict[str, _EntrypointFeatureCandidate]:
+    """Load valid in-process entry points while retaining owner metadata."""
 
-    External feature packages register entry points in their pyproject.toml:
-
-        [project.entry-points."kestrel_sovereign.features"]
-        GreeterFeature = "kestrel_feature_greeter.feature:GreeterFeature"
-
-    Returns:
-        Dict mapping class name to Feature class.
-    """
-    classes: Dict[str, Type[Feature]] = {}
+    candidates: Dict[str, _EntrypointFeatureCandidate] = {}
     try:
         from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
 
@@ -343,9 +362,8 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
         eps = importlib.metadata.entry_points()
     except Exception as e:
         logger.warning(f"Failed to read entry_points: {e}")
-        return classes
+        return candidates
 
-    # Python 3.12+ returns a SelectableGroups; 3.9-3.11 returns a dict
     if hasattr(eps, "select"):
         feature_eps = list(eps.select(group=FEATURE_ENTRY_POINT_GROUP))
     else:
@@ -377,12 +395,223 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
                     f"Entry point '{ep.name}' does not point to a Feature subclass, skipping"
                 )
                 continue
-            classes[cls.__name__] = cls
-            logger.info(f"Discovered entry_point feature: {cls.__name__} from {ep.value}")
+            dist = getattr(ep, "dist", None)
+            distribution = str(
+                getattr(dist, "name", None) or "unknown distribution"
+            )
+            candidates[cls.__name__] = _EntrypointFeatureCandidate(
+                feature_class=cls,
+                distribution=distribution,
+                entry_point=str(getattr(ep, "value", "") or ep.name),
+            )
+            logger.info(
+                "Discovered entry_point feature: %s from %s",
+                cls.__name__,
+                getattr(ep, "value", ep.name),
+            )
         except Exception as e:
             logger.warning(f"Failed to load entry_point feature '{ep.name}': {e}")
 
-    return classes
+    return candidates
+
+
+def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
+    """
+    Discover Feature classes from installed pip packages via entry_points.
+
+    External feature packages register entry points in their pyproject.toml:
+
+        [project.entry-points."kestrel_sovereign.features"]
+        GreeterFeature = "kestrel_feature_greeter.feature:GreeterFeature"
+
+    Returns:
+        Dict mapping class name to Feature class.
+    """
+    return {
+        name: candidate.feature_class
+        for name, candidate in _discover_entrypoint_feature_candidates().items()
+    }
+
+
+def _normalized_distribution_name(name: str) -> str:
+    """Apply Python distribution-name normalization for owner comparisons."""
+
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _module_matches_prefix(module: str, prefix: str) -> bool:
+    """Return whether ``module`` is exactly inside an authorized package."""
+
+    return module == prefix or module.startswith(f"{prefix}.")
+
+
+def _raise_feature_ambiguity(
+    class_name: str,
+    local_module: str,
+    external_module: str,
+    distribution: str,
+    *,
+    reason: str,
+) -> None:
+    raise FeatureDiscoveryAmbiguityError(
+        f"Feature class '{class_name}' is provided by bundled module "
+        f"'{local_module}' and external distribution '{distribution}' "
+        f"(module '{external_module}'), but {reason}. Uninstall the conflicting "
+        "external package or add a reviewed extracted-replacement migration "
+        "to kestrel_sovereign/data/feature_registry.toml."
+    )
+
+
+def discover_feature_selections() -> Dict[str, FeatureDiscoverySelection]:
+    """Resolve all importable Feature classes with explicit collision policy.
+
+    Bundled/external collisions fail closed unless the bundled registry row
+    explicitly names the external distribution and implementation-module
+    prefix. The returned diagnostic records expose the selected module to
+    operators and tests without requiring Feature instantiation.
+    """
+
+    selections: Dict[str, FeatureDiscoverySelection] = {}
+    for module_path in discover_feature_modules():
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            logger.warning(f"Failed to import feature module {module_path}: {e}")
+            continue
+        feature_class = find_feature_class(module)
+        if feature_class is None:
+            continue
+        class_name = feature_class.__name__
+        selections[class_name] = FeatureDiscoverySelection(
+            class_name=class_name,
+            feature_class=feature_class,
+            source="bundled",
+            implementation_module=feature_class.__module__,
+            discovery_location=module_path,
+            distribution="kestrel-sovereign",
+        )
+
+    external_candidates = _discover_entrypoint_feature_candidates()
+    from kestrel_sovereign.feature_registry import (
+        discover_installed_feature_runtimes,
+        get_extracted_feature_replacements,
+    )
+
+    replacement_rules = get_extracted_feature_replacements()
+    try:
+        external_runtimes = discover_installed_feature_runtimes()
+    except Exception:  # noqa: BLE001
+        external_runtimes = {}
+
+    # Metadata still constitutes an ownership claim when the implementation is
+    # isolated, broken, or invalid. An authorized isolated migration suppresses
+    # the bundled class here and is instantiated as ProxyFeature in phase 2;
+    # every other non-importable collision fails rather than falling back.
+    for class_name in set(selections) & set(external_runtimes):
+        if class_name in external_candidates:
+            continue
+        runtime = external_runtimes[class_name]
+        external_module = runtime.entry_point.split(":", 1)[0]
+        rule = replacement_rules.get(class_name)
+        if getattr(runtime, "runtime", None) == "isolated-venv" and rule is not None:
+            if (
+                _normalized_distribution_name(runtime.distribution)
+                != _normalized_distribution_name(rule.extracted_distribution)
+            ):
+                _raise_feature_ambiguity(
+                    class_name,
+                    selections[class_name].implementation_module,
+                    external_module,
+                    runtime.distribution,
+                    reason=(
+                        "the registry authorizes only distribution "
+                        f"'{rule.extracted_distribution}'"
+                    ),
+                )
+            if not _module_matches_prefix(external_module, rule.module_prefix):
+                _raise_feature_ambiguity(
+                    class_name,
+                    selections[class_name].implementation_module,
+                    external_module,
+                    runtime.distribution,
+                    reason=(
+                        "the implementation module is outside the registered "
+                        f"prefix '{rule.module_prefix}'"
+                    ),
+                )
+            del selections[class_name]
+            continue
+        _raise_feature_ambiguity(
+            class_name,
+            selections[class_name].implementation_module,
+            external_module,
+            runtime.distribution,
+            reason=(
+                "the external claim did not provide a valid importable "
+                "in-process replacement"
+            ),
+        )
+
+    for class_name, candidate in external_candidates.items():
+        local = selections.get(class_name)
+        if local is None:
+            selections[class_name] = FeatureDiscoverySelection(
+                class_name=class_name,
+                feature_class=candidate.feature_class,
+                source="entry-point",
+                implementation_module=candidate.feature_class.__module__,
+                discovery_location=candidate.entry_point,
+                distribution=candidate.distribution,
+            )
+            continue
+
+        rule = replacement_rules.get(class_name)
+        if rule is None:
+            _raise_feature_ambiguity(
+                class_name,
+                local.implementation_module,
+                candidate.feature_class.__module__,
+                candidate.distribution,
+                reason="no extracted-over-bundled migration is registered",
+            )
+        if (
+            _normalized_distribution_name(candidate.distribution)
+            != _normalized_distribution_name(rule.extracted_distribution)
+        ):
+            _raise_feature_ambiguity(
+                class_name,
+                local.implementation_module,
+                candidate.feature_class.__module__,
+                candidate.distribution,
+                reason=(
+                    "the registry authorizes only distribution "
+                    f"'{rule.extracted_distribution}'"
+                ),
+            )
+        if not _module_matches_prefix(
+            candidate.feature_class.__module__, rule.module_prefix
+        ):
+            _raise_feature_ambiguity(
+                class_name,
+                local.implementation_module,
+                candidate.feature_class.__module__,
+                candidate.distribution,
+                reason=(
+                    "the implementation module is outside the registered "
+                    f"prefix '{rule.module_prefix}'"
+                ),
+            )
+
+        selections[class_name] = FeatureDiscoverySelection(
+            class_name=class_name,
+            feature_class=candidate.feature_class,
+            source="entry-point",
+            implementation_module=candidate.feature_class.__module__,
+            discovery_location=candidate.entry_point,
+            distribution=candidate.distribution,
+        )
+
+    return selections
 
 
 def discover_local_feature_class_names() -> Set[str]:
@@ -459,29 +688,30 @@ def discover_entrypoint_feature_dists() -> Dict[str, str]:
 def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
     """Resolve a discoverable feature class by class name, module name, or shorthand.
 
-    Local core features take priority over entry-point features, matching
-    ``discover_features`` duplicate handling.
+    Uses the same explicit bundled/external collision resolution as
+    :func:`discover_features`.
     """
 
     target = _normalize_feature_lookup(name)
     if not target:
         return None
 
-    for module_path in discover_feature_modules():
-        try:
-            module = importlib.import_module(module_path)
-        except ImportError as e:
-            logger.warning(f"Failed to import feature module {module_path}: {e}")
-            continue
-        feature_class = find_feature_class(module)
-        if feature_class is None:
-            continue
-        aliases = _feature_lookup_aliases(feature_class, module_path)
-        if target in aliases:
-            return feature_class
-
-    for feature_class in discover_entrypoint_feature_classes().values():
-        aliases = _feature_lookup_aliases(feature_class, feature_class.__module__)
+    for selection in discover_feature_selections().values():
+        feature_class = selection.feature_class
+        # Bundled discovery may intentionally happen through a public
+        # re-export module whose class is implemented by a nested module. That
+        # public module owns the historic shorthand. External entry points cannot
+        # trust their entry-point name/value as an alias, so they continue to
+        # derive aliases from the loaded implementation module.
+        alias_module = (
+            selection.discovery_location
+            if selection.source == "bundled"
+            else selection.implementation_module
+        )
+        aliases = _feature_lookup_aliases(
+            feature_class,
+            alias_module,
+        )
         if target in aliases:
             return feature_class
 
@@ -534,11 +764,9 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
     """
     Discover and instantiate Feature classes from local directory and entry_points.
 
-    Discovery order:
-    1. Local features/ directory (core features) — these take priority
-    2. Installed pip packages via entry_points (external feature packages)
-
-    On duplicate class names, local wins and the entry_point is skipped.
+    Bundled and entry-point classes share one explicit resolution pass. A
+    collision fails unless the static registry authorizes that exact external
+    distribution and implementation-module prefix as a migration replacement.
 
     Args:
         agent: The KestrelAgent instance to pass to feature constructors
@@ -563,6 +791,7 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
             "configuration",
             "is explicitly disabled",
         )
+    selected_implementations = discover_feature_selections()
     features = []
     discovered_names = set()
 
@@ -613,25 +842,6 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         discovered_names.add(class_name)
         logger.info(f"Discovered feature: {class_name} from {source}")
 
-    from kestrel_sovereign.features.isolated_runtime import (
-        IsolatedRuntimeNamespaceError,
-        ProxyFeature,
-    )
-
-    def _try_add_isolated(runtime, source: str) -> None:
-        class_name = runtime.class_name
-        if not _feature_allowed(class_name):
-            return
-
-        # Resolve the scope while discovering, before this optional feature can
-        # be downgraded to a logged discovery error. A hosted agent that selected
-        # an isolated feature without an explicit namespace must fail its boot
-        # instead of falling back to a shared CWD directory.
-        feature = ProxyFeature(agent, runtime)
-        features.append(feature)
-        discovered_names.add(class_name)
-        logger.info(f"Discovered isolated feature: {class_name} from {source}")
-
     # Phase 0: import the sovereignty foundation explicitly and fail closed.
     # Generic directory discovery is intentionally best-effort for optional
     # features and therefore cannot own this invariant: it logs import errors
@@ -662,45 +872,77 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
             )
         _try_add(feature_class, f"mandatory:{module_path}", mandatory=True)
 
-    # Phase 1: Local optional features. Mandatory modules appear in this list
-    # too, but ``discovered_names`` guarantees their strict Phase 0 instances
-    # win and appear exactly once.
-    for module_path in discover_feature_modules():
+    # Phase 1: Resolved in-process features. Mandatory classes appear in this
+    # mapping too, but ``discovered_names`` guarantees their strict Phase 0
+    # instances appear exactly once. An authorized extracted replacement for a
+    # mandatory class is intentionally not supported by the current registry.
+    for selection in selected_implementations.values():
         try:
-            module = importlib.import_module(module_path)
-            feature_class = find_feature_class(module)
-            if feature_class is None:
-                logger.debug(f"No Feature class found in {module_path}")
-                continue
-            _try_add(feature_class, f"local:{module_path}")
+            _try_add(
+                selection.feature_class,
+                f"{selection.source}:{selection.implementation_module}",
+            )
         except ImportError as e:
-            logger.warning(f"Failed to import feature module {module_path}: {e}")
+            logger.warning(
+                "Failed to import selected feature %s: %s",
+                selection.class_name,
+                e,
+            )
         except Exception as e:
-            logger.error(f"Error loading feature from {module_path}: {e}")
+            logger.error(
+                "Error loading selected feature %s: %s",
+                selection.class_name,
+                e,
+            )
 
-    # Phase 2: Entry-point features (external packages)
+    # Phase 2: Entry-point features (external packages). Keep the isolated
+    # runtime itself optional: a core-only profile, or a profile that filters
+    # out every isolated feature, must never import its SDK-coupled module.
     try:
         from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
 
-        for class_name, runtime in discover_installed_feature_runtimes().items():
-            if runtime.runtime != "isolated-venv":
-                continue
-            try:
-                _try_add_isolated(runtime, f"entry_point:{runtime.entry_point}")
-            except IsolatedRuntimeNamespaceError:
-                raise
-            except Exception as e:
-                logger.error(f"Error loading isolated entry_point feature {class_name}: {e}")
-    except IsolatedRuntimeNamespaceError:
-        raise
+        installed_runtimes = discover_installed_feature_runtimes()
     except Exception as e:
         logger.warning("Failed to inspect entry_point feature runtime metadata: %s", e)
+        installed_runtimes = {}
 
-    for class_name, feature_class in discover_entrypoint_feature_classes().items():
+    for class_name, runtime in installed_runtimes.items():
+        if runtime.runtime != "isolated-venv" or not _feature_allowed(class_name):
+            continue
         try:
-            _try_add(feature_class, f"entry_point:{feature_class.__module__}")
+            isolated_runtime = importlib.import_module(
+                "kestrel_sovereign.features.isolated_runtime"
+            )
         except Exception as e:
-            logger.error(f"Error loading entry_point feature {class_name}: {e}")
+            logger.error(
+                "Error loading isolated entry_point feature %s: %s",
+                class_name,
+                e,
+            )
+            continue
+
+        try:
+            # Resolve scope during discovery. A selected hosted feature with an
+            # unsafe/missing namespace is a tenant-boundary violation and must
+            # still escape this optional-feature containment path.
+            feature = isolated_runtime.ProxyFeature(agent, runtime)
+        except isolated_runtime.IsolatedRuntimeNamespaceError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Error loading isolated entry_point feature %s: %s",
+                class_name,
+                e,
+            )
+            continue
+
+        features.append(feature)
+        discovered_names.add(class_name)
+        logger.info(
+            "Discovered isolated feature: %s from entry_point:%s",
+            class_name,
+            runtime.entry_point,
+        )
 
     verify_mandatory_feature_set(features, stage="discovery")
     return features

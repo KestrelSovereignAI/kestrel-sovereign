@@ -18,12 +18,10 @@ narrating an escalation failure to the user. The narrative helper
 ``format_escalation_outcome`` guarantees the wording never blames
 the user without audit evidence.
 
-Hooked taxonomy mirrors ``features/talon/verification.py``'s
-``VerificationState``: same five states, same provenance contract.
-Sharing the contract (but not importing across feature boundaries)
-keeps both call-sites — Talon's reviewer-side test-evidence path
-and the LLM's general tool-result path — in lockstep about what
-counts as a real user denial.
+This taxonomy is also suitable for feature-owned verification surfaces: the
+same provenance rule keeps external reviewer-side test evidence and the LLM's
+general tool-result path aligned about what counts as a real user denial,
+without importing across feature boundaries.
 """
 
 from __future__ import annotations
@@ -216,9 +214,8 @@ _COMMAND_EXECUTION_CONTEXTS: frozenset[str] = frozenset({
 })
 
 
-# Audit decision values that constitute a real user denial. Mirrors
-# the contract in ``features/talon/verification.classify_denial`` — keep
-# both lists in sync if the security feature ever extends them.
+# Audit decision values that constitute a real user denial. External
+# verification features consume the same security decision contract.
 _USER_DENIAL_DECISIONS: frozenset[str] = frozenset({
     "user_denied",
 })

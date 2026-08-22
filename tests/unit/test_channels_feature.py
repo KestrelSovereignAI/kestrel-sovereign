@@ -13,12 +13,22 @@ Covers:
 """
 
 import json
-import pytest
-import pytest_asyncio
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+import pytest_asyncio
+from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
+
+from kestrel_sovereign.features.channels.adapter import ChannelAdapter
+from kestrel_sovereign.features.channels.feature import (
+    ChannelFeature,
+    InboundAdmissionDisposition,
+)
 from kestrel_sovereign.features.channels.models import (
     ChannelConfig,
     ChannelMessage,
@@ -26,11 +36,18 @@ from kestrel_sovereign.features.channels.models import (
     DeliveryStatus,
     MessageDirection,
 )
-from kestrel_sovereign.features.channels.adapter import ChannelAdapter
 from kestrel_sovereign.features.channels.registry import ChannelRegistry
-from kestrel_sovereign.features.channels.feature import ChannelFeature
-from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
-
+from kestrel_sovereign.signals.dispatcher import (
+    DurableAdmissionDisposition,
+    DurableAdmissionResult,
+)
+from kestrel_sovereign.signals import OrderedLockManager, SignalDispatcher, SignalLogStore
+from kestrel_sovereign.signals.registry import (
+    RegistrationOutcome,
+    RegistrationState,
+    SourceRegistry,
+)
+from kestrel_sovereign.storage.db import SQLiteBackend, TransactionError
 
 # ============================================================================
 # Helpers
@@ -110,6 +127,11 @@ def _make_agent(db=None, agent_id="test-agent", privacy_preset=None):
     storage.agent_id = agent_id
     agent.storage = storage
     agent._raw_storage = None
+    # Channel ingress now requires a verifiable source contract. Give ordinary
+    # feature tests the production registry rather than a permissive MagicMock
+    # so their legacy-routing assertions retain their intended meaning.
+    agent.signal_registry = SourceRegistry()
+    agent.dispatcher = None
 
     if privacy_preset is not None:
         from kestrel_sovereign.privacy import get_privacy_preset
@@ -125,6 +147,13 @@ def _insert_calls(db):
         for call in db.execute.call_args_list
         if "INSERT INTO channel_messages" in str(call)
     ]
+
+
+def _cursor_owned_telegram(message):
+    """Stamp a direct unit-test message as proxy-validated polling ingress."""
+
+    message._kestrel_cursor_owned_protocol = True
+    return message
 
 
 # ============================================================================
@@ -586,10 +615,10 @@ class TestChannelFeature:
     async def test_handle_inbound_logs_and_routes(self, feature):
         router = AsyncMock()
         feature.registry.set_inbound_router(router)
-        feature.registry.register(StubAdapter(channel="telegram"))
+        feature.registry.register(StubAdapter(channel="slack"))
 
         msg = ChannelMessage(
-            channel_type="telegram",
+            channel_type="slack",
             direction=MessageDirection.INBOUND,
             sender="alice",
             recipient="bot",
@@ -609,12 +638,20 @@ class TestChannelFeature:
         router.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_handle_inbound_enqueues_signal_when_dispatcher_available(self):
+    async def test_handle_inbound_enqueues_durable_cognition_when_dispatcher_available(self):
         db = _make_db()
         agent = _make_agent(db=db)
         agent.did = "did:test:channels"
         agent.dispatcher = MagicMock()
-        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
 
         feat = ChannelFeature(agent)
         await feat.initialize()
@@ -625,17 +662,680 @@ class TestChannelFeature:
         msg = ChannelMessage(
             channel_type="telegram",
             direction=MessageDirection.INBOUND,
-            sender="alice",
+            sender="555",
             recipient="bot",
             content="hi there",
         )
-        await feat.handle_inbound(msg)
+        admission = await feat.handle_inbound(_cursor_owned_telegram(msg))
 
-        agent.dispatcher.enqueue_signal.assert_awaited_once()
-        signal = agent.dispatcher.enqueue_signal.await_args.args[0]
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+        signal = agent.dispatcher.enqueue_durable_cognition.await_args.args[0]
         assert signal.source == "channel.message"
         assert signal.payload["content"] == "hi there"
+        assert (
+            agent.dispatcher.enqueue_durable_cognition.await_args.kwargs["source_event_id"]
+            == msg.id
+        )
         router.assert_not_awaited()
+        assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+    @pytest.mark.asyncio
+    async def test_volatile_telegram_cursor_waits_for_terminal_durable_outcome(self):
+        """A marker-only privacy row cannot advance Telegram before cognition ends."""
+
+        db = _make_db()
+        agent = _make_agent(db=db, privacy_preset="ephemeral")
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        handle.wait = AsyncMock(return_value=MagicMock())
+        handle.signal_id = "durable-signal-1"
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        agent.dispatcher.get_durable_delivery_for_event = AsyncMock(
+            return_value=SimpleNamespace(status="acknowledged")
+        )
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(_cursor_owned_telegram(ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="555",
+            recipient="bot",
+            content="do not acknowledge a marker-only handoff",
+        )))
+
+        handle.wait.assert_awaited_once()
+        handle.wait_for_durable_admission.assert_not_awaited()
+        agent.dispatcher.get_durable_delivery_for_event.assert_awaited_once()
+        assert agent.dispatcher.get_durable_delivery_for_event.await_args.kwargs == {
+            "consumer_id": "core.channel-cognition-v1",
+            "event_id": "durable-signal-1",
+        }
+        assert admission.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_fails_closed_when_durable_consumer_registration_fails(self):
+        """Registration failure cannot fall back to ordinary queued routing."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock(
+            side_effect=RuntimeError("durable store unavailable")
+        )
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="do not lose this",
+            )),
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state",
+        (RegistrationState.MISMATCH, RegistrationState.INVALID),
+    )
+    async def test_handle_inbound_fails_closed_when_channel_source_is_not_registered(
+        self, state
+    ):
+        """A non-OK optional source outcome keeps ACK-bearing ingress retryable."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.signal_registry = MagicMock()
+        agent.signal_registry.register_with_policy.return_value = RegistrationOutcome(
+            "channel.message", state, "test source contract failure"
+        )
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="retain my provider cursor",
+            )),
+        )
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.register_durable_consumer.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "registry",
+        (
+            None,
+            object(),
+            type(
+                "UnverifiableRegistry",
+                (),
+                {
+                    "register_with_policy": lambda self, registration, policy: RegistrationOutcome(
+                        registration.name, RegistrationState.REGISTERED
+                    ),
+                    "get": lambda self, name: None,
+                },
+            )(),
+        ),
+    )
+    async def test_handle_inbound_fails_closed_when_channel_source_cannot_be_verified(
+        self, registry
+    ):
+        """Older/embedder registries may not turn an unknown source into an ACK."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.signal_registry = registry
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        agent.dispatcher.enqueue_signal = AsyncMock()
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock()
+        feat = ChannelFeature(agent)
+
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="retain my provider cursor",
+            )),
+        )
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.register_durable_consumer.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_not_awaited()
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_source_keeps_only_cursor_ingress_retryable(self):
+        """An optional-source failure does not globally disable legacy channels."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.signal_registry = None
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="slack"))
+
+        message = ChannelMessage(
+            channel_type="slack",
+            direction=MessageDirection.INBOUND,
+            sender="legacy-sender",
+            recipient="bot",
+            content="ordinary ingress remains available",
+        )
+        admission = await feat.handle_inbound(message)
+
+        assert feat._durable_cognition_registration_failed is True
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once_with(message)
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_keeps_ordinary_legacy_ingress_available(self):
+        """Non-cursor channels retain compatibility routing without durable ingress."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.dispatcher = MagicMock()
+        # This models the released SDK SignalHandle: it has eventual completion,
+        # but no durable-admission receipt.
+        agent.dispatcher.enqueue_signal = AsyncMock(return_value=MagicMock())
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="slack"))
+
+        message = ChannelMessage(
+            channel_type="slack",
+            direction=MessageDirection.INBOUND,
+            sender="alice",
+            recipient="bot",
+            content="durability first",
+        )
+
+        admission = await feat.handle_inbound(message)
+
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once_with(message)
+
+    @pytest.mark.asyncio
+    async def test_ready_dispatcher_keeps_slack_on_legacy_signal_path(self, tmp_path):
+        """A ready production dispatcher must not create Telegram work for Slack."""
+
+        backend = SQLiteBackend(str(tmp_path / "slack-ready-dispatcher.db"))
+        await backend.connect()
+        tasks = []
+
+        class ReadyAgent:
+            did = "did:test:slack-ready"
+
+            def __init__(self):
+                self.storage = SimpleNamespace(db=backend, agent_id=self.did)
+                self.signal_registry = SourceRegistry()
+                self._privacy_transition_lock = asyncio.Lock()
+                self.cognition_started = asyncio.Event()
+                self.dispatcher = None
+
+            def _get_privacy_transition_lock(self):
+                return self._privacy_transition_lock
+
+            def _track_background_task(self, coro, *, name):
+                task = asyncio.create_task(coro, name=name)
+                tasks.append(task)
+                return task
+
+            async def process_input(self, _prompt):
+                self.cognition_started.set()
+                return "processed"
+
+        agent = ReadyAgent()
+        log_store = SignalLogStore(backend)
+        await log_store.initialize()
+        dispatcher = SignalDispatcher(
+            agent=agent,
+            registry=agent.signal_registry,
+            lock_manager=OrderedLockManager(),
+            store=log_store,
+        )
+        agent.dispatcher = dispatcher
+        await dispatcher.initialize_durable_delivery()
+        feature = ChannelFeature(agent)
+        try:
+            await feature.initialize()
+            router = AsyncMock()
+            feature.registry.set_inbound_router(router)
+            feature.registry.register(StubAdapter(channel="slack"))
+            message = ChannelMessage(
+                id="shared-slack-message",
+                channel_type="slack",
+                direction=MessageDirection.INBOUND,
+                sender="legacy-sender",
+                recipient="bot",
+                content="ordinary channel ingress",
+            )
+
+            admission = await feature.handle_inbound(message)
+
+            assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+            router.assert_awaited_once_with(message)
+            await asyncio.wait_for(agent.cognition_started.wait(), timeout=1)
+            assert await dispatcher.list_durable_deliveries() == []
+            row = await backend.fetch_one(
+                "SELECT payload FROM durable_signal_events WHERE source_event_id = ?",
+                (message.id,),
+            )
+            assert row is not None
+            payload = json.loads(row[0])
+            assert "_durable_cognition" not in payload
+            assert payload["channel_type"] == "slack"
+        finally:
+            await dispatcher.shutdown_durable_delivery()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_channel_history_identity_is_agent_scoped_and_migrates_sqlite_safely(
+        self, tmp_path
+    ):
+        """Legacy history survives migration and two agents may share an id."""
+
+        backend = SQLiteBackend(str(tmp_path / "shared-channel-history.db"))
+        await backend.connect()
+        await backend.execute(
+            """CREATE TABLE channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL, direction TEXT NOT NULL,
+                   sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                   content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        await backend.execute(
+            """INSERT INTO channel_messages
+                   (id, agent_id, channel_type, direction, sender, recipient,
+                    content, status, metadata, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "historic-id",
+                "did:test:historic",
+                "slack",
+                "inbound",
+                "old-sender",
+                "bot",
+                "historic content",
+                "received",
+                None,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        def agent(agent_id):
+            return SimpleNamespace(
+                did=agent_id,
+                storage=SimpleNamespace(db=backend, agent_id=agent_id),
+                signal_registry=SourceRegistry(),
+                dispatcher=None,
+            )
+
+        first = ChannelFeature(agent("did:test:first"))
+        second = ChannelFeature(agent("did:test:second"))
+        try:
+            await first.initialize()
+            await second.initialize()
+            historic = await backend.fetch_one(
+                "SELECT agent_id, content FROM channel_messages WHERE id = ?",
+                ("historic-id",),
+            )
+            assert historic == ("did:test:historic", "historic content")
+
+            for feature, agent_id in (
+                (first, "did:test:first"),
+                (second, "did:test:second"),
+            ):
+                await feature.handle_inbound(
+                    ChannelMessage(
+                        id="same-provider-message",
+                        channel_type="slack",
+                        direction=MessageDirection.INBOUND,
+                        sender="sender",
+                        recipient="bot",
+                        content=agent_id,
+                        agent_id=agent_id,
+                    )
+                )
+            rows = await backend.fetch_all(
+                "SELECT agent_id, content FROM channel_messages "
+                "WHERE id = ? ORDER BY agent_id",
+                ("same-provider-message",),
+            )
+            assert [row[0] for row in rows] == [
+                "did:test:first",
+                "did:test:second",
+            ]
+            assert all(row[1] for row in rows)
+            columns = await backend.fetch_all("PRAGMA table_info(channel_messages)")
+            assert [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]] == [
+                "agent_id",
+                "id",
+            ]
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_channel_history_identity_sqlite_copy_failure_rolls_back_rename(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed copy leaves the original PK/table intact for recovery."""
+        backend = SQLiteBackend(str(tmp_path / "rollback-channel-history.db"))
+        await backend.connect()
+        await backend.execute(
+            """CREATE TABLE channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL, direction TEXT NOT NULL,
+                   sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                   content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        await backend.execute(
+            """INSERT INTO channel_messages
+                   (id, agent_id, channel_type, direction, sender, recipient, content)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy", "did:test:legacy", "telegram", "inbound", "1", "bot", "hello"),
+        )
+        original_execute = backend.execute
+
+        async def fail_copy(query, params=()):
+            if "INSERT OR IGNORE INTO channel_messages" in query:
+                raise RuntimeError("simulated copy failure")
+            return await original_execute(query, params)
+
+        feature = ChannelFeature(_make_agent(db=backend))
+        feature._db = backend
+        try:
+            monkeypatch.setattr(backend, "execute", fail_copy)
+            with pytest.raises(TransactionError, match="simulated copy failure"):
+                await feature._migrate_channel_message_identity()
+            monkeypatch.setattr(backend, "execute", original_execute)
+
+            tables = await backend.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN (?, ?)",
+                ("channel_messages", "channel_messages_legacy_global_id"),
+            )
+            assert tables == [("channel_messages",)]
+            primary_key = await backend.fetch_all("PRAGMA table_info(channel_messages)")
+            assert [row[1] for row in primary_key if row[5]] == ["id"]
+            assert await backend.fetch_one(
+                "SELECT agent_id, content FROM channel_messages WHERE id = ?", ("legacy",)
+            ) == ("did:test:legacy", "hello")
+        finally:
+            monkeypatch.setattr(backend, "execute", original_execute)
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_channel_history_identity_sqlite_concurrent_initializers_converge(
+        self, tmp_path
+    ):
+        """Two independent SQLite connections never expose a half migration."""
+        db_path = str(tmp_path / "concurrent-channel-history.db")
+        first_backend = SQLiteBackend(db_path)
+        second_backend = SQLiteBackend(db_path)
+        await first_backend.connect()
+        await second_backend.connect()
+        await first_backend.execute(
+            """CREATE TABLE channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL, direction TEXT NOT NULL,
+                   sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                   content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        await first_backend.execute(
+            """INSERT INTO channel_messages
+                   (id, agent_id, channel_type, direction, sender, recipient, content)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy", "did:test:legacy", "telegram", "inbound", "1", "bot", "hello"),
+        )
+
+        def feature(backend, agent_id):
+            instance = ChannelFeature(_make_agent(db=backend, agent_id=agent_id))
+            instance._db = backend
+            return instance
+
+        try:
+            await asyncio.gather(
+                feature(first_backend, "did:test:first")._migrate_channel_message_identity(),
+                feature(second_backend, "did:test:second")._migrate_channel_message_identity(),
+            )
+            columns = await first_backend.fetch_all("PRAGMA table_info(channel_messages)")
+            assert [
+                row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]
+            ] == ["agent_id", "id"]
+            assert await first_backend.fetch_one(
+                "SELECT agent_id, content FROM channel_messages WHERE id = ?", ("legacy",)
+            ) == ("did:test:legacy", "hello")
+            assert await first_backend.fetch_one(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("channel_messages_legacy_global_id",),
+            ) is None
+        finally:
+            await second_backend.close()
+            await first_backend.close()
+
+    @pytest.mark.asyncio
+    async def test_channel_history_identity_migrates_postgres_without_row_rewrite(self):
+        """PostgreSQL broadens the old key in place; it never copies/deletes data."""
+
+        db = AsyncMock()
+        db.backend_type = "postgres"
+        db.fetchone = AsyncMock(
+            side_effect=[("channel_messages",), ('legacy"pkey',)]
+        )
+        db.fetchall = AsyncMock(return_value=[("id",)])
+        db.execute = AsyncMock(return_value=0)
+        transaction_events = []
+
+        @asynccontextmanager
+        async def transaction():
+            transaction_events.append("begin")
+            try:
+                yield
+            finally:
+                transaction_events.append("end")
+
+        db.backend = SimpleNamespace(backend_type="postgres", transaction=transaction)
+        feature = ChannelFeature(_make_agent(db=db))
+        feature._db = db
+
+        await feature._migrate_channel_message_identity()
+
+        assert [call.args[0] for call in db.execute.await_args_list] == [
+            "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))",
+            "LOCK TABLE channel_messages IN ACCESS EXCLUSIVE MODE",
+            'ALTER TABLE channel_messages DROP CONSTRAINT "legacy""pkey"',
+            "ALTER TABLE channel_messages ADD PRIMARY KEY (agent_id, id)",
+        ]
+        assert transaction_events == ["begin", "end"]
+
+    @pytest.mark.asyncio
+    async def test_postgres_absent_channel_table_is_created_and_locked_in_migration_transaction(self):
+        """A cold creator establishes canonical identity before bootstrap returns."""
+
+        db = AsyncMock()
+        db.backend_type = "postgres"
+        # absent -> visible after CREATE -> composite primary key after LOCK
+        db.fetchone = AsyncMock(
+            side_effect=[None, ("channel_messages",), ("channel_messages_pkey",)]
+        )
+        db.fetchall = AsyncMock(return_value=[("agent_id",), ("id",)])
+        db.execute = AsyncMock(return_value=0)
+        transaction_events = []
+
+        @asynccontextmanager
+        async def transaction():
+            transaction_events.append("begin")
+            try:
+                yield
+            finally:
+                transaction_events.append("end")
+
+        db.backend = SimpleNamespace(backend_type="postgres", transaction=transaction)
+        feature = ChannelFeature(_make_agent(db=db))
+        feature._db = db
+
+        await feature._migrate_channel_message_identity()
+
+        executed = [call.args[0] for call in db.execute.await_args_list]
+        assert executed[0] == (
+            "SELECT pg_advisory_xact_lock(hashtext('kestrel.channel_messages.identity'))"
+        )
+        assert executed[1].strip().startswith("CREATE TABLE IF NOT EXISTS channel_messages")
+        assert executed[2] == "LOCK TABLE channel_messages IN ACCESS EXCLUSIVE MODE"
+        assert transaction_events == ["begin", "end"]
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_keeps_cursor_retryable_when_durable_cognition_fails(self):
+        """The legacy router must not consume a rate-limited durable callback."""
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.NOT_ADMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        admission = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="retry me",
+            )),
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.RETRYABLE
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_telegram_host_rejects_forged_username_sender_before_durable_admission(self):
+        """A child cannot re-authorize a migration username as a sender identity."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.register_durable_consumer = AsyncMock()
+        handle = MagicMock()
+        handle.wait_for_durable_admission = AsyncMock(
+            return_value=DurableAdmissionResult(
+                disposition=DurableAdmissionDisposition.COMMITTED,
+                signal_id="signal-1",
+            )
+        )
+        agent.dispatcher.enqueue_durable_cognition = AsyncMock(return_value=handle)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        feat.registry.register(
+            StubAdapter(
+                channel="telegram",
+                config=ChannelConfig(channel_type="telegram", allowed_senders=["555"]),
+            )
+        )
+
+        for forged_sender in ("@jason", "00555"):
+            admission = await feat.handle_inbound(
+                ChannelMessage(
+                    channel_type="telegram",
+                    direction=MessageDirection.INBOUND,
+                    sender=forged_sender,
+                    recipient="bot",
+                    content="forged child notification",
+                )
+            )
+            assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        agent.dispatcher.enqueue_durable_cognition.assert_not_awaited()
+
+        admitted = await feat.handle_inbound(
+            _cursor_owned_telegram(ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="555",
+                recipient="bot",
+                content="canonical sender",
+            ))
+        )
+        assert admitted.disposition is InboundAdmissionDisposition.DURABLY_ADMITTED
+        agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_handle_inbound_blocked_sender(self, feature):
@@ -663,20 +1363,88 @@ class TestChannelFeature:
         router.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_handle_inbound_rejects_disabled_adapter(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(
+                channel="slack",
+                config=ChannelConfig(
+                    channel_type="slack", enabled=False, allowed_senders=["alice"]
+                ),
+            )
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="slack",
+                direction=MessageDirection.INBOUND,
+                sender="alice",
+                recipient="bot",
+                content="disabled host adapter",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_defaults_telegram_to_deny_without_allowlist(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(channel="telegram", config=ChannelConfig(channel_type="telegram"))
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="telegram",
+                direction=MessageDirection.INBOUND,
+                sender="untrusted",
+                recipient="bot",
+                content="faulty child notification",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.REJECTED
+        router.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_preserves_generic_empty_allowlist_behavior(self, feature):
+        router = AsyncMock()
+        feature.registry.set_inbound_router(router)
+        feature.registry.register(
+            StubAdapter(channel="slack", config=ChannelConfig(channel_type="slack"))
+        )
+
+        admission = await feature.handle_inbound(
+            ChannelMessage(
+                channel_type="slack",
+                direction=MessageDirection.INBOUND,
+                sender="generic-sender",
+                recipient="bot",
+                content="normal generic channel behavior",
+            )
+        )
+
+        assert admission.disposition is InboundAdmissionDisposition.LEGACY_ROUTED
+        router.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_handle_inbound_allowed_sender(self, feature):
         router = AsyncMock()
         feature.registry.set_inbound_router(router)
 
         cfg = ChannelConfig(
-            channel_type="telegram",
+            channel_type="slack",
             allowed_senders=["alice"],
         )
         feature.registry.register(
-            StubAdapter(channel="telegram", config=cfg)
+            StubAdapter(channel="slack", config=cfg)
         )
 
         msg = ChannelMessage(
-            channel_type="telegram",
+            channel_type="slack",
             direction=MessageDirection.INBOUND,
             sender="alice",
             recipient="bot",
@@ -692,13 +1460,39 @@ class TestChannelFeature:
         msg = ChannelMessage(
             channel_type="telegram",
             direction=MessageDirection.INBOUND,
-            sender="alice",
+            sender="555",
             recipient="bot",
             content="hi",
             agent_id="",
         )
         await feature.handle_inbound(msg)
         assert msg.agent_id == "test-agent"
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_overwrites_child_supplied_foreign_agent_scope(self):
+        """An isolated child cannot write or dispatch an inbound message as another tenant."""
+
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:authoritative-agent"
+        feature = ChannelFeature(agent)
+        await feature.initialize()
+        feature.registry.register(StubAdapter(channel="telegram"))
+        message = ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="555",
+            recipient="bot",
+            content="cross-tenant attempt",
+            agent_id="did:other-agent",
+        )
+
+        await feature.handle_inbound(message)
+
+        assert message.agent_id == "did:authoritative-agent"
+        inserts = _insert_calls(db)
+        assert len(inserts) == 1
+        assert inserts[0].args[1][1] == "did:authoritative-agent"
 
     # ----------------------------------------------------------------
     # Tool discovery
@@ -746,7 +1540,7 @@ class TestChannelFeature:
 # ============================================================================
 
 
-def _inbound(content="secret text", channel="telegram", sender="alice"):
+def _inbound(content="secret text", channel="slack", sender="alice"):
     return ChannelMessage(
         channel_type=channel,
         direction=MessageDirection.INBOUND,

@@ -27,6 +27,7 @@ from .async_conversation_store import (
     _token_match_score,
     _tokenize_for_search,
 )
+from .session_grouping import timestamp_predicate, timestamp_query_param
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 # ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
@@ -38,6 +39,13 @@ _SALVAGE_STATE_PENDING_SUMMARY = "pending-summary"
 _SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
 
 logger = logging.getLogger(__name__)
+
+# The single tokenizer used to turn message text into episode topic terms.
+# Episode repair (#2856) decides whether a persisted term came from a source
+# row's plaintext or from its at-rest envelope, which is only a sound
+# comparison while detection and generation split text identically — so both
+# read this one pattern rather than each carrying a copy.
+_TOPIC_TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9'-]{2,}")
 
 
 class MemoryConsolidator:
@@ -70,7 +78,8 @@ class MemoryConsolidator:
         return _GAP
 
     def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None,
-                 llm_service=None, persist_policy=None):
+                 llm_service=None, persist_policy=None, conversation_store=None,
+                 transition_lock=None):
         """
         Initialize consolidator.
 
@@ -86,6 +95,14 @@ class MemoryConsolidator:
                 recall (#1674 P2). When absent (or no embedding provider is
                 configured), episode recall degrades to keyword search and no
                 embeddings are written — both paths stay functional.
+            conversation_store: The AsyncConversationStore that owns message
+                decryption. This class reads ``conversation_history`` with its
+                own SQL for clustering, so without it every encrypted row's
+                at-rest envelope was treated as text and tokenized straight
+                into episode titles, summaries and affect (#2850). ``None``
+                (raw storage, tests) means rows are assumed plaintext, and any
+                row still carrying an envelope is skipped rather than
+                summarized.
             persist_policy: Optional privacy authority exposing
                 ``allows_persistent_writes() -> bool``. Consulted before the
                 direct ``memory_episodes`` write so manual / scheduled
@@ -93,12 +110,21 @@ class MemoryConsolidator:
                 while the agent is in a volatile privacy mode (#2672). ``None``
                 (raw storage, tests) imposes no gate — durable persistence
                 proceeds, preserving prior behaviour.
+            transition_lock: The agent's privacy-transition mutex
+                (``KestrelAgent._get_privacy_transition_lock()``). Episode
+                repair checks the privacy mode and THEN awaits decryption and
+                several writes, so without this a transition to EPHEMERAL /
+                ISOLATED can land in the await gap and the write persists
+                anyway (#2672 review P1, applied to repair in #2856). ``None``
+                (raw storage, offline CLI, tests) runs unguarded.
         """
         self._db = db
         self.agent_id = agent_id
         self._graph_store = graph_store
         self._llm_service = llm_service
         self._persist_policy = persist_policy
+        self._conversation_store = conversation_store
+        self._transition_lock = transition_lock
         # Lazily-built SQLAlchemy session factory for the shared vector
         # backend (mirrors SavedItemsStore). None when unavailable.
         self._sqla_factory = None
@@ -245,15 +271,18 @@ class MemoryConsolidator:
         report_skipped: List[Tuple[str, int, str]] = []
 
         # Get messages from last 30 days
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        created_at_predicate = timestamp_predicate(
+            self._db.backend_type, "created_at", ">"
+        )
 
         rows = await self._db.fetchall(
-            """SELECT id, content, metadata, created_at, role
+            f"""SELECT id, content, metadata, created_at, role
                FROM conversation_history
-               WHERE agent_id = ? AND created_at > ?
+               WHERE agent_id = ? AND {created_at_predicate}
                  AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
-            (self.agent_id, cutoff)
+            (self.agent_id, timestamp_query_param(self._db.backend_type, cutoff))
         )
 
         if not rows:
@@ -275,6 +304,19 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+
+            # Excluded conversation artifacts are provenance-tainted
+            # derivatives.  They must never seed a fresh visible episode after
+            # a fact lifecycle action, even if the original episode had been
+            # excluded before this nightly pass.
+            if metadata.get("excluded_from_context"):
+                continue
+
+            # #2850: rows come from raw SQL, so `content` is still the at-rest
+            # envelope. Decode before anything reads it as text.
+            content = self._row_plaintext(content, metadata)
+            if content is None:
+                continue
 
             # Parse date from created_at
             try:
@@ -413,7 +455,7 @@ class MemoryConsolidator:
         """
         rows = await self._db.fetchall(
             """SELECT key_message_ids FROM memory_episodes
-               WHERE agent_id = ?""",
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id,),
         )
         covered: set = set()
@@ -670,7 +712,7 @@ class MemoryConsolidator:
             content = str(message.get("content") or "")
             if message.get("role") == "user":
                 content = extract_raw_user_content(content)
-            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", content.lower()):
+            for token in _TOPIC_TOKEN_RE.findall(content.lower()):
                 if token in stop_words:
                     continue
                 counts[token] += 1
@@ -678,6 +720,811 @@ class MemoryConsolidator:
                 position += 1
         ranked = sorted(counts, key=lambda term: (-counts[term], first_seen[term], term))
         return ranked[:limit]
+
+    # ------------------------------------------------------------------
+    # Row content decoding (#2850)
+    # ------------------------------------------------------------------
+
+    # Legacy Fernet tokens are urlsafe-base64 of a v0x80 envelope, so they
+    # always begin "gAAAAA". Those rows predate KSAv2 and, when their metadata
+    # is lost, decrypt_stored_content is a no-op — a KSAv2-only backstop would
+    # let them through and recreate the bug for legacy data (codex review r5).
+    _LEGACY_FERNET_PREFIX = "gAAAAA"
+
+    @staticmethod
+    def _looks_like_ciphertext(content: str) -> bool:
+        """Whether ``content`` still carries an at-rest ciphertext envelope."""
+        try:
+            from kestrel_sdk.security.aead import KSA_V2_PREFIX
+
+            prefix = KSA_V2_PREFIX.decode()
+        except Exception:  # noqa: BLE001 - never let a probe break consolidation
+            prefix = "KSAv2:"
+        return content.startswith(prefix) or content.startswith(
+            MemoryConsolidator._LEGACY_FERNET_PREFIX
+        )
+
+    def _row_plaintext(self, content: Any, metadata: Optional[Dict]) -> Optional[str]:
+        """Decrypt one raw ``conversation_history`` row to plaintext.
+
+        Returns ``None`` when the row cannot be trusted as text, and the
+        caller must then SKIP it. Failing closed is the point: an episode
+        title, summary, emotional arc or embedding derived from ciphertext is
+        silently wrong forever, and it corrupts every downstream consumer with
+        no error anywhere (#2850). A dropped message is visible in the message
+        counts; a ciphertext topic is not.
+        """
+        text = "" if content is None else str(content)
+        store = self._conversation_store
+        decryptor = (
+            store
+            if store is not None and hasattr(store, "decrypt_stored_content")
+            else None
+        )
+        is_encrypted = bool((metadata or {}).get("enc"))
+
+        if decryptor is None:
+            # No decryptor wired. The METADATA FLAG is authoritative here, not
+            # the envelope prefix: legacy Fernet rows are marked ``enc`` but
+            # start with ``gAAAA...``, so a prefix-only check would wave them
+            # through and tokenize Fernet ciphertext into episode titles
+            # exactly as KSAv2 did (codex review, #2850). Anything marked
+            # encrypted is unreadable without a key — skip it.
+            if is_encrypted:
+                logger.warning(
+                    "episode consolidation skipped an encrypted message: no "
+                    "conversation store wired into MemoryConsolidator "
+                    "(agent=%s)", self.agent_id,
+                )
+                return None
+        else:
+            try:
+                text = decryptor.decrypt_stored_content(text, metadata)
+            except Exception as e:  # noqa: BLE001 - DecryptionError and friends
+                logger.warning(
+                    "episode consolidation skipped a message it could not "
+                    "decrypt: %s", e,
+                )
+                return None
+        # Backstop only where nothing decrypted this row. After a SUCCESSFUL
+        # decrypt the result is authenticated plaintext, and plaintext may
+        # legitimately begin with the marker — someone discussing the envelope
+        # format, or pasting a token. Vetoing that would silently drop a real
+        # message from episode synthesis (codex review r2, #2850).
+        # Exempt marker-prefixed plaintext only where an authenticated decrypt
+        # actually happened. A wired store is NOT enough: a row with NULL or
+        # malformed metadata makes decrypt_stored_content a no-op, and gating
+        # on "a decryptor exists" would then wave the untouched envelope
+        # straight through to topic extraction (codex review r3).
+        decrypted = decryptor is not None and is_encrypted
+        if not decrypted and text and self._looks_like_ciphertext(text):
+            # Unreachable once the store is wired; loud rather than silent
+            # because this is precisely the bug that produced episode titles
+            # reading "Discussion of ksav2, <base64>".
+            logger.error(
+                "episode consolidation refused a message that is still "
+                "encrypted after decode (agent=%s) — check that the "
+                "conversation store is wired into MemoryConsolidator",
+                self.agent_id,
+            )
+            return None
+        return text
+
+    # ------------------------------------------------------------------
+    # Repair of episodes already synthesized from ciphertext (#2856)
+    # ------------------------------------------------------------------
+
+    #: How many persisted topic terms must be traceable to a source row's
+    #: at-rest envelope — and absent from that row's plaintext — before an
+    #: episode is treated as ciphertext-derived. The envelope magic on its own
+    #: is exactly one term, and a conversation *about* the envelope format
+    #: yields that term from plaintext, so one is never enough.
+    _REPAIR_MIN_ENVELOPE_TERMS = 2
+
+    #: Bound on the ``IN`` list used to rehydrate one episode's source rows,
+    #: kept well under SQLite's variable limit.
+    _REPAIR_ID_CHUNK = 400
+
+    @classmethod
+    def _envelope_magic_terms(cls) -> Tuple[str, ...]:
+        """The topic terms the at-rest envelope prefixes reduce to.
+
+        Used only to PRE-FILTER repair candidates cheaply in SQL. It never
+        authorizes a write on its own — :meth:`_envelope_derived_terms` does
+        that, against the episode's own source rows.
+        """
+        try:
+            from kestrel_sdk.security.aead import KSA_V2_PREFIX
+
+            ksa_prefix = KSA_V2_PREFIX.decode()
+        except Exception:  # noqa: BLE001 - never let a probe break maintenance
+            ksa_prefix = "KSAv2:"
+        terms: List[str] = []
+        for prefix in (ksa_prefix, cls._LEGACY_FERNET_PREFIX):
+            terms.extend(_TOPIC_TOKEN_RE.findall(prefix.lower()))
+        return tuple(dict.fromkeys(terms))
+
+    @staticmethod
+    def _topic_terms(text: Optional[str]) -> set:
+        """Tokenize text the way episode topics are extracted."""
+        return set(_TOPIC_TOKEN_RE.findall(str(text or "").lower()))
+
+    #: A term already proven alien is treated as envelope material rather than
+    #: a word when it is at least this long and carries a digit. Base64 bodies
+    #: are; topic words are not. Only ever consulted for alien terms, so it
+    #: cannot by itself put a healthy episode at risk.
+    _ENVELOPE_TOKEN_MIN_LEN = 16
+
+    @classmethod
+    def _looks_like_envelope_token(cls, term: str) -> bool:
+        return (
+            len(term) >= cls._ENVELOPE_TOKEN_MIN_LEN
+            and any(character.isdigit() for character in term)
+        )
+
+    @classmethod
+    def _alien_terms(
+        cls,
+        title: Optional[str],
+        summary: Optional[str],
+        sources: List[Dict[str, Any]],
+        expected_title: str,
+        expected_summary: str,
+    ) -> set:
+        """Persisted terms the episode's own sources cannot account for.
+
+        Episode topics are extracted FROM message text, so every term in a
+        healthy narrative appears either in the decrypted sources or in the
+        fixed scaffolding the generators emit — and re-synthesizing from those
+        same sources reproduces that scaffolding exactly, which is why the
+        expected text is the template allowlist rather than a hand-maintained
+        stop list. Anything left over was never in this episode's content.
+        """
+        persisted = cls._topic_terms(title) | cls._topic_terms(summary)
+        if not persisted:
+            return set()
+        accounted = (
+            cls._topic_terms(expected_title) | cls._topic_terms(expected_summary)
+        )
+        for source in sources:
+            accounted |= cls._topic_terms(source.get("content"))
+        return persisted - accounted
+
+    @classmethod
+    def _envelope_terms(cls, sources: List[Dict[str, Any]]) -> set:
+        """Terms present in the sources' CURRENT at-rest bytes.
+
+        Only rows that genuinely needed decrypting contribute: for a plaintext
+        row raw == content and there is no envelope to blame.
+        """
+        envelope: set = set()
+        for source in sources:
+            raw = source.get("raw")
+            if raw is not None and raw != source.get("content"):
+                envelope |= cls._topic_terms(raw)
+        return envelope
+
+    @classmethod
+    def _corruption_evidence(
+        cls,
+        title: Optional[str],
+        summary: Optional[str],
+        sources: List[Dict[str, Any]],
+        expected_title: str,
+        expected_summary: str,
+    ) -> set:
+        """The evidence that authorizes a rewrite, or an empty set.
+
+        Two independent routes, because matching the CURRENT ciphertext cannot
+        be required: ``KeyRotationService`` re-encrypts
+        ``conversation_history.content``, and migrate-on-read rewrites legacy
+        global-key rows. After either, the envelope no longer contains the body
+        tokens baked into the corrupted title — only the shared magic prefix
+        intersects, and a genuinely corrupt episode would be cleared forever
+        (codex review r4 P1).
+
+        Both routes are gated on the term being ALIEN first, which is what
+        keeps a conversation genuinely about the envelope format safe: its
+        terms come from its own plaintext, so nothing is ever alien.
+        """
+        alien = cls._alien_terms(
+            title, summary, sources, expected_title, expected_summary
+        )
+        if not alien:
+            return set()
+        envelope = cls._envelope_terms(sources)
+
+        # Route 0 — conclusive on a single term: it is BOTH still present in
+        # the sources' at-rest bytes AND shaped like a base64 body. A legacy
+        # Fernet token is one long chunk (the alphabet's '_' is the only
+        # separator the tokenizer honours, and plenty of tokens contain none),
+        # so a single-source episode yields exactly one alien term — and the
+        # two-term floor would clear it and then mark the agent done, leaving
+        # real corruption unrepaired forever (codex review r7 P2). The floor
+        # exists to stop the bare magic prefix authorizing a write; `ksav2`
+        # and `gaaaaa` are far too short to be shaped, so this cannot fire on
+        # a healthy episode that merely mentions the format.
+        exact = {
+            term for term in alien
+            if term in envelope and cls._looks_like_envelope_token(term)
+        }
+        if exact:
+            return exact
+
+        if len(alien) < cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return set()
+
+        # Route 1 — the strongest proof: the terms are still sitting in the
+        # sources' own at-rest bytes.
+        corroborated = alien & envelope
+        if len(corroborated) >= cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return corroborated
+
+        # Route 2 — the ciphertext has since been rotated, so fall back to the
+        # shape of the alien terms themselves.
+        shaped = {term for term in alien if cls._looks_like_envelope_token(term)}
+        if len(shaped) >= cls._REPAIR_MIN_ENVELOPE_TERMS:
+            return shaped
+        return set()
+
+    async def _repair_candidates(
+        self, scan_limit: int
+    ) -> List[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
+        """Cheap SQL pre-filter for episodes that may be ciphertext-derived.
+
+        Withdrawn episodes are excluded. ``excluded_from_context = 1`` is set
+        by the assertion lifecycle precisely because an episode summary is a
+        derivative of conversation artifacts that may no longer be shown; a
+        repair would decrypt those withdrawn sources and rewrite the mirrored
+        graph node with fresh plaintext-derived topics, resurfacing the very
+        content the exclusion took away. The ciphertext title is the safer
+        state for a row nobody is allowed to read (codex review r1 P1).
+
+        The scan is RANDOMISED rather than ordered. Repaired episodes leave
+        this predicate for good, but cleared and permanently-unrepairable ones
+        match forever — so any fixed ordering hands the same prefix to every
+        nightly pass, and a corrupt episode sitting past ``scan_limit`` behind
+        enough of them would never be examined at all. Sampling instead gives
+        every candidate an independent chance each night, so coverage is
+        eventual without a persisted cursor. Below the limit the order is
+        irrelevant: every candidate is examined regardless (codex review r5).
+        """
+        conditions: List[str] = []
+        params: List[Any] = [self.agent_id]
+        for term in self._envelope_magic_terms():
+            pattern = f"%{term}%"
+            conditions.append("lower(title) LIKE ?")
+            params.append(pattern)
+            conditions.append("lower(summary) LIKE ?")
+            params.append(pattern)
+        if not conditions:
+            return []
+        params.append(int(scan_limit))
+        rows = await self._db.fetchall(
+            f"""SELECT id, title, summary, key_message_ids
+                FROM memory_episodes
+                WHERE agent_id = ?
+                  AND COALESCE(excluded_from_context, 0) = 0
+                  AND ({' OR '.join(conditions)})
+                ORDER BY random()
+                LIMIT ?""",
+            tuple(params),
+        )
+        return list(rows or [])
+
+    async def _rehydrate_episode_sources(
+        self, message_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load an episode's source rows BY ID, with both raw and plain text.
+
+        Deliberately NOT bounded by ``_create_episodes``' 30-day clustering
+        window and NOT filtered on ``archived_at``: an episode is a durable
+        record of a span that may long predate the window, and a repair that
+        leaned on re-clustering would simply never rebuild the older ones
+        (#2856). ``deleted_at`` IS honoured — a soft-deleted message must not
+        be resurrected into a rebuilt narrative.
+
+        ``key_message_ids`` is persisted as JSON strings while
+        ``conversation_history.id`` is an integer column, so the IDs are bound
+        as integers: on PostgreSQL asyncpg rejects a text parameter against an
+        integer column, which would turn every candidate into a lookup failure
+        and silently disable repair on that backend. A non-numeric recorded ID
+        cannot match an integer primary key at all, so it is simply left
+        unresolved and surfaces through the ``sources_missing`` path.
+        """
+        numeric_ids: List[int] = []
+        for message_id in message_ids:
+            try:
+                numeric_ids.append(int(message_id))
+            except (TypeError, ValueError):
+                continue
+
+        found: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(numeric_ids), self._REPAIR_ID_CHUNK):
+            chunk = numeric_ids[start:start + self._REPAIR_ID_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._db.fetchall(
+                f"""SELECT id, content, metadata, created_at, role
+                    FROM conversation_history
+                    WHERE agent_id = ? AND id IN ({placeholders})
+                      AND deleted_at IS NULL""",
+                (self.agent_id, *chunk),
+            )
+            for msg_id, content, metadata, created_at, role in rows or []:
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                if (metadata or {}).get("excluded_from_context"):
+                    # Compaction, stashing and the fact lifecycle all mark a
+                    # row hidden without deleting it, and `_create_episodes`
+                    # skips those rows outright. Repair must match, or it would
+                    # synthesize a fresh title from content deliberately taken
+                    # out of context. Leaving it out here makes the episode fail
+                    # the all-sources-present gate, so nothing is rewritten
+                    # (codex review r9 P1).
+                    continue
+                raw = "" if content is None else str(content)
+                found[str(msg_id)] = {
+                    "id": msg_id,
+                    "raw": raw,
+                    "content": self._row_plaintext(content, metadata),
+                    "metadata": metadata or {},
+                    "created_at": created_at,
+                    "role": role,
+                }
+        return found
+
+    async def _episode_graph_node_exists(self, episode_id: str) -> bool:
+        """Whether a KG node mirrors this episode.
+
+        A missing ``graph_nodes`` table means no projection exists. Any other
+        failure propagates: the caller must refuse the repair rather than
+        assume the visible surface is clean.
+        """
+        if not await self._db.table_exists("graph_nodes"):
+            return False
+        return bool(
+            await self._db.fetchval(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?", (episode_id,)
+            )
+        )
+
+    def _resynthesize_narrative(
+        self, sources: List[Dict[str, Any]]
+    ) -> Tuple[str, str]:
+        """Rebuild an episode's title and summary from decrypted sources.
+
+        Runs the same generators as first synthesis, so a repaired episode is
+        byte-identical to what #2850's fix would have produced originally.
+        Note the emotional arc is reproduced, not corrected: it derives from
+        ``emotional_valence`` metadata written by the inline tagger from
+        request-path plaintext, so it was never ciphertext-damaged.
+        """
+        intensities = [
+            s["metadata"].get("emotional_intensity", 0.0) for s in sources
+        ]
+        avg_intensity = sum(intensities) / len(intensities) if intensities else 0.0
+        valences = [s["metadata"].get("emotional_valence", 0.0) for s in sources]
+        arc = self._describe_emotional_arc(valences)
+        title = self._generate_episode_title(sources, avg_intensity)
+        summary = self._generate_episode_summary(sources, arc)
+        return title, summary
+
+    async def _apply_episode_repair(
+        self, episode_id: str, title: str, summary: str, has_node: bool,
+        source_ids: Optional[List[int]] = None,
+    ) -> bool:
+        """Persist a rebuilt narrative: graph node first, then row, then vector.
+
+        Ordering is the requirement, not an implementation detail. The KG node
+        is what ``/api/memories`` renders, so it must never be the thing left
+        holding the ciphertext label. Because the node id IS the episode id
+        this is an in-place upsert — no fresh UUID is minted, so the stale node
+        cannot survive as a duplicate. If the node write fails the row write
+        never runs, and the episode stays wholly corrupt and wholly repairable
+        on the next pass; the reverse order could leave a clean row behind a
+        poisoned panel with nothing left to re-detect from.
+
+        Both the lifecycle re-check and the durable writes happen under the
+        agent's privacy-transition lock. Candidate selection and decryption are
+        long awaits; without the lock a transition to EPHEMERAL / ISOLATED can
+        land in that gap and this raw ``memory_episodes`` update — which no
+        graph proxy governs — persists anyway (codex review r2 P1).
+
+        Returns True when the repair was applied, False when it was abandoned
+        because the episode was withdrawn or persistence became forbidden.
+        """
+        from .privacy_wrapper import optional_transition_lock
+
+        async with optional_transition_lock(self._transition_lock):
+            # Re-check under the lock, not once per pass. Between candidate
+            # selection and here the mode may have flipped.
+            if not self._durable_writes_allowed():
+                return False
+
+            # And the assertion lifecycle may have withdrawn the episode. Its
+            # sources are then content nobody may read, so a plaintext-derived
+            # narrative must not reach the panel (codex review r2 P1).
+            if await self._episode_is_withdrawn(episode_id):
+                return False
+
+            restore: Optional[Tuple[str, Dict[str, Any]]] = None
+            if has_node:
+                from .async_graph_store import GraphNode
+
+                existing = await self._graph_store.get_node(episode_id)
+                if existing is None:
+                    # Deleted through /api/memories between the probe and here.
+                    # `has_node` is stale, and upserting it back would resurrect
+                    # a memory the user explicitly removed — a maintenance pass
+                    # must never undo a deliberate deletion (codex review r7).
+                    has_node = False
+                else:
+                    properties = dict(getattr(existing, "properties", None) or {})
+                    restore = (
+                        getattr(existing, "label", None) or "",
+                        dict(properties),
+                    )
+                    properties["summary"] = summary
+                    properties["repaired_from_ciphertext"] = True
+                    await self._graph_store.add_node(
+                        GraphNode(
+                            node_id=episode_id,
+                            node_type="episode",
+                            label=title,
+                            properties=properties,
+                        )
+                    )
+
+            # The stored vector was computed from the base64 title+summary, so
+            # it poisons the shared embedding space until it is re-derived.
+            # Clearing it in the SAME write that fixes the narrative is what
+            # makes the repair safe to leave half-done: `_embed_episode` is
+            # best-effort and returns silently when no provider is configured,
+            # and by then the title no longer matches the pre-filter, so the
+            # episode would never be selected again — stranding a base64
+            # vector in the shared space forever. NULL degrades to keyword
+            # recall, which is the documented fallback (codex review r1 P2).
+            #
+            # The exclusion predicate makes this write lose cleanly to a
+            # concurrent withdrawal rather than overwriting it.
+            #
+            # Source liveness is re-tested in the SAME statement. A user can
+            # move a key source message to Trash between rehydration and here;
+            # soft deletion only stamps conversation_history.deleted_at and
+            # never touches the episode's exclusion flag, so no predicate on
+            # memory_episodes alone would notice, and the rewrite would publish
+            # topics drawn from a deleted message (codex review r4 P1).
+            predicates = (
+                "WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 0"
+            )
+            params: List[Any] = [title, summary, episode_id, self.agent_id]
+            if source_ids:
+                # Require every declared source to still EXIST and be live.
+                # Testing only for `deleted_at IS NOT NULL` would be satisfied
+                # by a hard purge, because a row that is gone cannot match it —
+                # so a purged source would have waved the write straight
+                # through (codex review r5 P1).
+                placeholders = ",".join("?" for _ in source_ids)
+                predicates += (
+                    " AND (SELECT COUNT(*) FROM conversation_history "
+                    f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                    "AND deleted_at IS NULL) = ?"
+                )
+                params.append(self.agent_id)
+                params.extend(source_ids)
+                params.append(len(source_ids))
+
+            try:
+                changed = await self._db.execute(
+                    "UPDATE memory_episodes SET title = ?, summary = ?, "
+                    "embedding_vec = NULL, embedding_profile_id = NULL "
+                    + predicates,
+                    tuple(params),
+                )
+            except Exception:
+                # The node already carries the rebuilt narrative. If this write
+                # never lands — a lock timeout, a transient query error — the
+                # outer handler would report `write_failed` while the panel
+                # kept showing reconstructed topics, and a withdrawal racing or
+                # committing afterwards would make that permanent, because the
+                # row is then excluded from every future scan (codex review r5
+                # P1). Undo the node before letting the failure propagate.
+                if restore is not None:
+                    await self._restore_graph_node(episode_id, *restore)
+                raise
+
+            if not changed:
+                # Lost the race after the node was rewritten. Put the node
+                # back: a withdrawn episode showing reconstructed topics is
+                # the leak this whole branch exists to prevent.
+                if restore is not None:
+                    await self._restore_graph_node(episode_id, *restore)
+                return False
+
+            await self._embed_episode(episode_id, title, summary)
+            return True
+
+    async def _episode_is_withdrawn(self, episode_id: str) -> bool:
+        """Whether the assertion lifecycle has excluded this episode."""
+        return bool(
+            await self._db.fetchval(
+                "SELECT 1 FROM memory_episodes WHERE id = ? AND agent_id = ? "
+                "AND COALESCE(excluded_from_context, 0) = 1",
+                (episode_id, self.agent_id),
+            )
+        )
+
+    async def _restore_graph_node(
+        self, episode_id: str, label: str, properties: Dict[str, Any]
+    ) -> None:
+        """Undo a node rewrite whose row update did not land.
+
+        This runs only when an episode was withdrawn mid-repair, so the node
+        currently carries topics reconstructed from content nobody may read.
+        Restoring the prior label is the good outcome; if that write fails the
+        node is DELETED instead. A missing panel entry is a visible loss, an
+        exposed one is a privacy failure, and a swallowed rollback error would
+        leave the exposure in place while the caller reported the repair
+        abandoned (codex review r3 P1). Deletion is permitted in every privacy
+        mode — it takes content away rather than persisting it.
+        """
+        from .async_graph_store import GraphNode
+
+        try:
+            await self._graph_store.add_node(
+                GraphNode(
+                    node_id=episode_id,
+                    node_type="episode",
+                    label=label,
+                    properties=properties,
+                )
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "episode repair could not restore the graph node for %s; "
+                "deleting it so withdrawn content is not left exposed: %s",
+                episode_id, e,
+            )
+
+        try:
+            await self._graph_store.delete_node(episode_id)
+        except Exception as e:  # noqa: BLE001
+            # Nothing further can be done here, and the caller must not treat
+            # this as a clean abandon.
+            logger.critical(
+                "episode repair could NOT restore or delete graph node %s — "
+                "it may still expose topics reconstructed from withdrawn "
+                "sources: %s", episode_id, e,
+            )
+            raise
+
+    async def repair_ciphertext_episodes(
+        self, *, dry_run: bool = False, limit: int = 100,
+        max_examined: int = 1000,
+    ) -> Dict[str, Any]:
+        """Re-synthesize episodes whose narrative was built from ciphertext.
+
+        #2850 stopped NEW episodes being derived from at-rest envelopes; rows
+        written before it keep serving titles like ``Discussion of ksav2,
+        ax1iv9waarjjkc8...`` until repaired. This is that repair.
+
+        It is proof-driven, not heuristic. An episode is rewritten only when
+        its own source rows show that its persisted terms came from their
+        envelope and not their plaintext, and only when every declared source
+        is still present and decryptable. Anything unprovable is reported and
+        left alone — serving a bad title is recoverable, deleting a real
+        memory is not.
+
+        Args:
+            dry_run: Report what would be repaired without writing anything.
+            limit: Maximum episodes to REPAIR in one pass. Bounding writes
+                rather than the scan is what guarantees the pass makes
+                progress — see the comment at the candidate query.
+            max_examined: Safety valve on the candidate scan itself.
+        """
+        report: Dict[str, Any] = {
+            "scanned": 0,
+            "repaired": 0,
+            "cleared": 0,
+            "unrepairable": [],
+            "planned": [],
+            "dry_run": bool(dry_run),
+        }
+
+        # A rebuilt title and summary are user-derived content, so a live
+        # repair is a durable write like any other and answers to the same
+        # privacy boundary (#2672). A dry run only reads.
+        if not dry_run and not self._durable_writes_allowed():
+            report["skipped"] = True
+            report["skipped_reason"] = "privacy_mode_forbids_persistence"
+            return report
+
+        # The budget bounds REPAIRS, not the scan. A repaired episode leaves
+        # the pre-filter for good, but a cleared one (healthy, and genuinely
+        # about the envelope format) matches forever — so capping the SQL
+        # SELECT would let a handful of permanent false positives sit at the
+        # head of created_at order and starve every corrupt episode behind
+        # them, indefinitely and silently. Bounding writes instead guarantees
+        # progress: each pass repairs up to `limit`, and what it repairs never
+        # comes back (codex review r2/r3 P2).
+        candidates = await self._repair_candidates(max_examined)
+        report["scanned"] = len(candidates)
+
+        if len(candidates) >= max_examined:
+            # The safety valve, not the budget. Only reachable with a very
+            # large corpus of envelope-mentioning episodes.
+            report["scan_truncated"] = True
+            logger.warning(
+                "episode repair stopped scanning at %d candidates for %s; "
+                "later rows were not examined this pass",
+                max_examined, self.agent_id,
+            )
+
+        for episode_id, title, summary, key_ids_json in candidates:
+            if report["repaired"] >= limit:
+                # Checked BEFORE the write path, not only after it: a limit of
+                # 0 would otherwise still repair the first candidate, making a
+                # nominal zero-write bound destructive (codex review r9 P2).
+                report["limit_reached"] = True
+                break
+            episode_id = str(episode_id)
+            try:
+                declared = json.loads(key_ids_json or "[]")
+                if not isinstance(declared, list):
+                    raise ValueError("key_message_ids is not a list")
+                declared = [str(m) for m in declared]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "unreadable_key_message_ids"}
+                )
+                continue
+
+            if not declared:
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "no_recorded_sources"}
+                )
+                continue
+
+            try:
+                found = await self._rehydrate_episode_sources(declared)
+            except Exception as e:  # noqa: BLE001 - one bad episode must not halt the pass
+                logger.warning(
+                    "episode repair could not rehydrate sources for %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "source_lookup_failed"}
+                )
+                continue
+
+            # Fail closed on incomplete provenance. ``key_message_ids`` is the
+            # episode's provenance trail; silently rebuilding from a subset
+            # would rewrite what the episode claims to be a record OF, and the
+            # new message counts would look authoritative while being wrong.
+            missing = [m for m in declared if m not in found]
+            if missing:
+                report["unrepairable"].append({
+                    "episode_id": episode_id,
+                    "reason": "sources_missing",
+                    "missing": len(missing),
+                })
+                continue
+
+            # Preserve the recorded order — it is the order the episode was
+            # originally synthesized in, and the emotional arc reads the first
+            # and last entries.
+            sources = [found[m] for m in declared]
+
+            if any(s["content"] is None for s in sources):
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "undecryptable_sources"}
+                )
+                continue
+
+            # Re-synthesis comes FIRST: what these sources would produce today
+            # is also the allowlist the detector measures the persisted
+            # narrative against.
+            try:
+                new_title, new_summary = self._resynthesize_narrative(sources)
+            except Exception as e:  # noqa: BLE001
+                # Malformed metadata (a null emotional_intensity, say) must
+                # cost one episode, not the pass. Outside this guard the same
+                # oldest row would abort every nightly run and starve every
+                # candidate behind it (codex review r3 P2).
+                logger.warning(
+                    "episode repair could not re-synthesize %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "resynthesis_failed"}
+                )
+                continue
+
+            evidence = self._corruption_evidence(
+                title, summary, sources, new_title, new_summary
+            )
+            if not evidence:
+                # Pre-filter hit, proof did not follow — a healthy episode that
+                # genuinely discusses the envelope format lands here.
+                report["cleared"] += 1
+                continue
+
+            try:
+                has_node = await self._episode_graph_node_exists(episode_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "episode repair could not probe the graph node for %s: %s",
+                    episode_id, e,
+                )
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "graph_probe_failed"}
+                )
+                continue
+
+            if has_node and self._graph_store is None:
+                # A stale node exists but nothing can rewrite it. Repairing the
+                # row alone would leave the ciphertext label rendering in the
+                # Memories panel forever.
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "graph_store_unavailable"}
+                )
+                continue
+
+            if dry_run:
+                report["planned"].append({
+                    "episode_id": episode_id,
+                    "old_title": title,
+                    "new_title": new_title,
+                    "evidence_terms": sorted(evidence)[:8],
+                    "sources": len(sources),
+                    "graph_node": has_node,
+                })
+                continue
+
+            try:
+                applied = await self._apply_episode_repair(
+                    episode_id, new_title, new_summary, has_node,
+                    source_ids=[s["id"] for s in sources],
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("episode repair failed for %s: %s", episode_id, e)
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "write_failed"}
+                )
+                continue
+
+            if not applied:
+                # Withdrawn, or persistence became forbidden, while this
+                # episode was being decrypted. Nothing was persisted.
+                report["unrepairable"].append(
+                    {"episode_id": episode_id, "reason": "abandoned_mid_repair"}
+                )
+                continue
+
+            report["repaired"] += 1
+            # ID and outcome only. Both the old and new titles are
+            # user-derived conversation topics, and the log surface is not
+            # governed the way memory storage is (codex review r1 P1).
+            logger.info(
+                "repaired ciphertext-derived episode %s (%d source messages)",
+                episode_id, len(sources),
+            )
+
+            if report["repaired"] >= limit:
+                report["limit_reached"] = True
+                logger.warning(
+                    "episode repair reached its per-pass budget of %d for %s; "
+                    "the remainder will be repaired on subsequent passes",
+                    limit, self.agent_id,
+                )
+                break
+
+        return report
 
     def _durable_writes_allowed(self) -> bool:
         """Whether the current privacy mode permits persisting an episode.
@@ -841,6 +1688,7 @@ class MemoryConsolidator:
             rows = await self._db.fetchall(
                 """SELECT id, title, summary FROM memory_episodes
                    WHERE agent_id = ? AND embedding_vec IS NULL
+                     AND COALESCE(excluded_from_context, 0) = 0
                    ORDER BY created_at DESC
                    LIMIT ?""",
                 (self.agent_id, limit),
@@ -979,7 +1827,10 @@ class MemoryConsolidator:
             from kestrel_sovereign.storage.vector import get_vector_backend
 
             spec = build_episode_spec(dimension=len(query_embedding))
-            filter_kwargs: Dict[str, Any] = {"agent_id": self.agent_id}
+            filter_kwargs: Dict[str, Any] = {
+                "agent_id": self.agent_id,
+                "excluded_from_context": 0,
+            }
             if hasattr(service, "current_profile_id"):
                 try:
                     pid = service.current_profile_id()
@@ -1045,6 +1896,7 @@ class MemoryConsolidator:
                            ({score_clause}) AS token_match_count
                     FROM memory_episodes
                     WHERE agent_id = ?
+                      AND COALESCE(excluded_from_context, 0) = 0
                       AND ({token_clause})
                     {exclude_clause}
                     ORDER BY token_match_count DESC, created_at DESC
@@ -1075,7 +1927,8 @@ class MemoryConsolidator:
                        key_message_ids, emotional_arc, created_at, importance,
                        access_count
                 FROM memory_episodes
-                WHERE agent_id = ? AND id IN ({placeholders})""",
+                WHERE agent_id = ? AND id IN ({placeholders})
+                  AND COALESCE(excluded_from_context, 0) = 0""",
             (self.agent_id, *ids),
         )
         by_id = {r[0]: MemoryEpisode.from_row(r) for r in rows or []}
@@ -1091,15 +1944,18 @@ class MemoryConsolidator:
         from .temporal_analyzer import TemporalAnalyzer
 
         # Get messages from last 90 days for pattern detection
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+        created_at_predicate = timestamp_predicate(
+            self._db.backend_type, "created_at", ">"
+        )
 
         rows = await self._db.fetchall(
-            """SELECT content, metadata, created_at
+            f"""SELECT content, metadata, created_at
                FROM conversation_history
-               WHERE agent_id = ? AND created_at > ?
+               WHERE agent_id = ? AND {created_at_predicate}
                  AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
-            (self.agent_id, cutoff)
+            (self.agent_id, timestamp_query_param(self._db.backend_type, cutoff))
         )
 
         messages = []
@@ -1110,6 +1966,14 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+            content = self._row_plaintext(content, metadata)  # #2850
+            if content is None:
+                continue
+            # Temporal patterns are durable derived memory too.  Do not allow
+            # a hidden semantic-recall artifact to re-enter context through a
+            # newly detected pattern on the next sleep cycle.
+            if metadata.get("excluded_from_context"):
+                continue
             messages.append({
                 "content": content,
                 "metadata": metadata,
@@ -1157,6 +2021,12 @@ class MemoryConsolidator:
                     metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
+
+            # Keep the exclusion barrier sticky.  Decay processing is not a
+            # context producer, but must not normalize an excluded row into a
+            # legacy archive representation that other paths could restore.
+            if metadata.get("excluded_from_context"):
+                continue
 
             # Migrate the legacy dual-state representation. Older releases
             # wrote metadata.archived without the dedicated column, making
@@ -1291,33 +2161,41 @@ class MemoryConsolidator:
 
         # Build query for recent messages
         if cutoff:
+            created_at_predicate = timestamp_predicate(
+                self._db.backend_type, "created_at", ">"
+            )
             rows = await self._db.fetchall(
-                """SELECT id, content, metadata, created_at, role
+                f"""SELECT id, content, metadata, created_at, role
                    FROM conversation_history
-                   WHERE agent_id = ? AND created_at > ?
+                   WHERE agent_id = ? AND {created_at_predicate}
                      AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
-                (self.agent_id, cutoff)
+                (
+                    self.agent_id,
+                    timestamp_query_param(self._db.backend_type, cutoff),
+                )
             )
         else:
             # Get messages from last 24 hours if no previous episode
-            cutoff_time = (
-                datetime.now(timezone.utc) - timedelta(hours=self.MAX_EPISODE_HOURS)
-            ).isoformat()
+            cutoff_time = datetime.now(timezone.utc) - timedelta(
+                hours=self.MAX_EPISODE_HOURS
+            )
+            created_at_predicate = timestamp_predicate(
+                self._db.backend_type, "created_at", ">"
+            )
             rows = await self._db.fetchall(
-                """SELECT id, content, metadata, created_at, role
+                f"""SELECT id, content, metadata, created_at, role
                    FROM conversation_history
-                   WHERE agent_id = ? AND created_at > ?
+                   WHERE agent_id = ? AND {created_at_predicate}
                      AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
-                (self.agent_id, cutoff_time)
+                (
+                    self.agent_id,
+                    timestamp_query_param(self._db.backend_type, cutoff_time),
+                )
             )
 
         if not rows:
-            return None
-
-        # Check minimum message count
-        if len(rows) < self.MIN_EPISODE_MESSAGES and not force:
             return None
 
         # Convert rows to message dicts
@@ -1331,6 +2209,18 @@ class MemoryConsolidator:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
 
+            # Session episodes use a separate source query from nightly
+            # consolidation.  Apply the same barrier here or sleep/restart can
+            # recreate visible episode text from an excluded derivative.
+            if metadata.get("excluded_from_context"):
+                continue
+
+            # #2850: same raw-SQL source, same envelope — decode before this
+            # content reaches title/summary/affect synthesis.
+            content = self._row_plaintext(content, metadata)
+            if content is None:
+                continue
+
             messages.append({
                 "id": msg_id,
                 "content": content,
@@ -1338,6 +2228,14 @@ class MemoryConsolidator:
                 "created_at": created_at,
                 "role": role,
             })
+
+        # The threshold is intentionally evaluated after exclusion.  Hidden
+        # artifacts must neither produce an episode nor count toward forcing
+        # a visible episode from the remaining unrelated messages.
+        if len(messages) < self.MIN_EPISODE_MESSAGES and not force:
+            return None
+        if not messages:
+            return None
 
         # Calculate emotional intensity for episode worthiness
         intensities = [
@@ -1435,7 +2333,7 @@ class MemoryConsolidator:
                       key_message_ids, emotional_arc, created_at, importance,
                       access_count
                FROM memory_episodes
-               WHERE agent_id = ?
+               WHERE agent_id = ? AND COALESCE(excluded_from_context, 0) = 0
                ORDER BY created_at DESC
                LIMIT ? OFFSET ?""",
             (self.agent_id, limit, offset)

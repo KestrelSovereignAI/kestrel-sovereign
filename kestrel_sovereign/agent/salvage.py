@@ -71,6 +71,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+from kestrel_sovereign.storage.session_id_column import column_session_id
+
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_conversation_store import (
         AsyncConversationStore,
@@ -262,8 +264,9 @@ async def salvage_messages(
             # after the insert.
             await db.execute_commit(
                 f"INSERT INTO conversation_history "
-                f"(agent_id, role, content, model, provider, metadata, created_at) "
-                f"VALUES (?, ?, ?, ?, ?, ?, {conv_store._now_sql()})",
+                f"(agent_id, role, content, model, provider, metadata, "
+                f"session_id, created_at) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, {conv_store._now_sql()})",
                 (
                     conv_store.agent_id,
                     "system",
@@ -271,6 +274,10 @@ async def salvage_messages(
                     None,
                     None,
                     json.dumps(marker_metadata),
+                    # The marker is a live history row filed in the session it
+                    # salvaged, so it stamps the indexed column like any other
+                    # write — or leaves it NULL, by the same rule (#2958).
+                    column_session_id(marker_metadata),
                 ),
             )
             # Find the marker we just inserted by its uuid. This is
@@ -868,22 +875,19 @@ async def get_pending_count(
 
 
 def is_durable_salvage_enabled() -> bool:
-    """Feature flag for the C release gate.
+    """Return whether the conditional durable-salvage path is enabled.
 
-    When True, the full sync-salvage + async-worker + popup-wiring
-    path is live end-to-end, AND the endpoint flips
-    ``silently_pruned_path_active`` to False.
+    When true, the production coordinator attempts synchronous salvage for
+    pruned spans that can be mapped to id-bearing persistent conversation
+    rows, and the process-local worker can summarize those markers. The status
+    endpoint derives ``silently_pruned_path_active`` from the projected plan:
+    it is false only when the enabled path leaves no projected id-less rows.
+    The flag alone is not proof that a particular turn created salvage
+    evidence.
 
     When False, ``ContextManager.build_context`` falls back to the
-    legacy silent-prune behaviour (no salvage records) — exactly
-    pre-C semantics. The popup keeps surfacing
-    ``silently-pruned path still active``.
-
-    The flag exists so the implementation can ship behind a switch:
-    a partially-shipped C never silently claims correctness it
-    doesn't have. The release gate from epic #1307 keys off this
-    flag flipping to True in production, not off ticket closure
-    (Emma 2026-05-21).
+    legacy silent-prune behaviour (no salvage records). The popup keeps
+    surfacing the plan's silent-prune warning.
     """
     import os
 

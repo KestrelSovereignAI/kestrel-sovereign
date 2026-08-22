@@ -219,6 +219,7 @@ try:
     OI_INPUT_VALUE = _OISpanAttributes.INPUT_VALUE
     OI_OUTPUT_VALUE = _OISpanAttributes.OUTPUT_VALUE
     OI_LLM_MODEL_NAME = _OISpanAttributes.LLM_MODEL_NAME
+    OI_SESSION_ID = _OISpanAttributes.SESSION_ID
     OI_SPAN_KIND = _OISpanAttributes.OPENINFERENCE_SPAN_KIND
     OI_SPAN_KIND_CHAIN = _OISpanKindValues.CHAIN.value
     OI_SPAN_KIND_TOOL = _OISpanKindValues.TOOL.value
@@ -226,6 +227,7 @@ except Exception:  # pragma: no cover - openinference optional
     OI_INPUT_VALUE = "input.value"
     OI_OUTPUT_VALUE = "output.value"
     OI_LLM_MODEL_NAME = "llm.model_name"
+    OI_SESSION_ID = "session.id"
     OI_SPAN_KIND = "openinference.span.kind"
     OI_SPAN_KIND_CHAIN = "CHAIN"
     OI_SPAN_KIND_TOOL = "TOOL"
@@ -234,6 +236,53 @@ except Exception:  # pragma: no cover - openinference optional
 # LLM spans, so telemetry-layer lifecycle/dispatch spans group under the right
 # agent lane in Phoenix instead of "(none)" (issue #2699).
 KESTREL_AGENT_NAME = "kestrel.agent_name"
+
+# Attribute key naming the conversation session a span belongs to. The fleet
+# Timeline's ``sessionKeyOf`` reads only ``kestrel.session_id`` / ``session.id``
+# / ``kestrel.run_id`` — the agent runtime's long-standing ``agent.session_id``
+# is in none of them, so its turns grouped by trace id instead (one band per
+# turn, a staircase lane). Stamp this ALONGSIDE ``agent.session_id`` (issue
+# #2916); never stamp it empty, since an absent attribute and an empty one read
+# the same to the consumer but only one of them is noise.
+KESTREL_SESSION_ID = "kestrel.session_id"
+
+# A ``session_id`` in flight doubles as a source tag: callers with no
+# conversation session pass a sentinel ("orchestrator" is the dispatch
+# parameter's own default, "original" comes from the re-entrant chat path)
+# rather than a session UUID. Everything that RECORDS a session — the a2a
+# dispatch row, ``agent.feature_dispatch`` (#2916), the ``llm.*`` and
+# ``signal.dispatch.cognition`` spans (#2940) — must agree on which of those is
+# a real session, so the test lives here once instead of at each consumer.
+_SESSION_ID_SENTINELS = ("", "original", "orchestrator")
+
+
+def real_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return ``session_id`` when it names an actual session, else ``None``."""
+    if session_id in _SESSION_ID_SENTINELS:
+        return None
+    return session_id
+
+
+def session_span_attributes(session_id: Optional[str]) -> Dict[str, str]:
+    """Both session keys for one span, or ``{}`` when there is no session.
+
+    One session id, two attribute names, because two consumers read different
+    ones: the fleet Timeline groups a lane on ``kestrel.session_id`` first, and
+    Phoenix's own session view reads OpenInference's ``session.id``. Every span
+    type that knows its session stamps BOTH (#2940) so a single band holds the
+    turn, its feature dispatches, its LLM calls, and the cognition wake —
+    instead of one session splitting into a band per span type.
+
+    Returns an empty mapping for ``None``, blank, and sentinel values: an absent
+    attribute and an empty one read the same to both consumers, and stamping a
+    sentinel would invent a fleet-wide session shared by every sessionless call
+    on every agent.
+    """
+    resolved = real_session_id(session_id)
+    if not isinstance(resolved, str) or not resolved.strip():
+        return {}
+    resolved = resolved.strip()
+    return {KESTREL_SESSION_ID: resolved, OI_SESSION_ID: resolved}
 
 
 def _resolved_otlp_endpoint() -> Optional[str]:

@@ -47,7 +47,10 @@ def test_pqcrypto_installed_and_importable():
     assert ml_dsa_65.PUBLIC_KEY_SIZE == 1952
     assert ml_dsa_65.SECRET_KEY_SIZE == 4032
     assert ml_dsa_65.SIGNATURE_SIZE == 3309
-    assert ml_dsa_65.ALGORITHM == "ml_dsa_65"
+    # pqcrypto 1.0 reports the Rust crate's type name here, not the module
+    # name it is imported under. Pinned because it is the cheapest signal that
+    # the dependency moved under us again (#2966).
+    assert ml_dsa_65.ALGORITHM == "Mldsa65"
 
 
 # ---------------------------------------------------------------------------

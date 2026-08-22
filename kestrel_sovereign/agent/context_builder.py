@@ -18,31 +18,12 @@ from pathlib import Path
 from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, TYPE_CHECKING
 
 from .token_counter import TokenCounter, get_token_counter
-from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget, RESPONSE_RESERVE
-from .context_stages import (
-    RETRIEVED_CONTEXT_EMPTY_ENVELOPE,
-    assemble_dynamic_user_context,
-    build_episode_section,
-    build_memory_section,
-    build_rag_section,
-    build_reflection_guidance_block,
-)
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 
 # Per-message overhead used by format_conversation_history and the
-# effective-history estimator. Centralised here so the measurement path
-# stays in lock-step with the LLM call path.
+# effective-history estimator.
 _MESSAGE_OVERHEAD = 4
-
-# Conversation length at which the production LLM path
-# (``ContextManager.build_context``) starts admitting episode summaries
-# into the prompt. Pinned to the same value as
-# ``ContextManager.EPISODE_THRESHOLD_MESSAGES`` so the measurement path
-# cannot drift below that boundary. Codex round 1 #2 (PR #1308) caught
-# this drift — measurement was using 10, production was using 20, so the
-# popup over-attributed episode tokens for 10-19 message conversations.
-EPISODE_THRESHOLD_MESSAGES = 20
 
 # Subsection names that count as mandatory governance content for the
 # #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). The rest
@@ -95,9 +76,11 @@ def _count_tool_schema_tokens(
 
 # extract_raw_user_content moved to kestrel_sovereign.security.input_guardrails
 # (#1402) so the storage layer can import it without cycling through the
-# agent layer. Re-exported here to keep existing consumers working.
+# agent layer. Re-exported here to keep existing consumers working — the
+# redundant alias marks it as deliberate re-export surface so an unused-import
+# sweep cannot strip it (in-tree callers plus frinz import it from here).
 from kestrel_sovereign.security.input_guardrails import (  # noqa: E402
-    extract_raw_user_content,
+    extract_raw_user_content as extract_raw_user_content,
 )
 
 
@@ -109,11 +92,15 @@ logger = logging.getLogger(__name__)
 
 # Re-export for backward compatibility.  New code should use
 # ``BootstrapLoader.DEFAULT_BOOTSTRAP_FILES`` or ``loader.file_order``.
+# The two *renamed* bindings below cannot use the redundant-alias convention
+# (the name changes), so they carry an explicit noqa: they are deliberate
+# re-export surface — tests/unit/test_bootstrap_files.py imports both from
+# here — and an unused-import sweep must not strip them.
 from kestrel_sovereign.features.bootstrap.loader import (
-    DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,
+    DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,  # noqa: F401
     DEFAULT_MAX_CHARS_PER_FILE,
     DEFAULT_MAX_TOTAL_CHARS,
-    truncate_content as truncate_bootstrap_content,
+    truncate_content as truncate_bootstrap_content,  # noqa: F401
     BootstrapLoader,
 )
 
@@ -139,6 +126,10 @@ class ContextBuilder:
         llm_service=None,
         db=None,
         agent_id: Optional[str] = None,
+        semantic_inference_profile=None,
+        semantic_inference_limits=None,
+        semantic_maintenance_limits=None,
+        semantic_answerability_gate=None,
     ):
         """
         Initialize the context builder.
@@ -162,6 +153,13 @@ class ContextBuilder:
         self._counter = None
         self._counter_model = None
         self.consolidator = consolidator
+        self._semantic_inference_profile = semantic_inference_profile
+        self._semantic_inference_limits = semantic_inference_limits
+        self._semantic_maintenance_limits = semantic_maintenance_limits
+        # Reuse the agent-owned, privacy-aware memory judge.  Assertion
+        # recall must never create a second LLM client or bypass that lane.
+        self._semantic_answerability_gate = semantic_answerability_gate
+        self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
 
         # Load bootstrap config from kestrel.toml
@@ -218,8 +216,8 @@ class ContextBuilder:
         """Resolved model ID, route-qualified when available.
 
         Prefers the route-qualified form (``"<vendor>:<route>/<model>"``)
-        from ``get_active_model_selection`` so ``measure_context_breakdown``
-        and the ``/context-status`` endpoint see the route's per-turn
+        from ``get_active_model_selection`` so canonical context planning
+        sees the route's per-turn
         cap (#1395). Without this, the status footer/popup would
         under-report utilization on capped routes (codex round-6 P2 on
         PR #1396) — top-level ``context_limit`` would honor the route
@@ -324,7 +322,8 @@ class ContextBuilder:
         return True
 
     async def retrieve_context(
-        self, query: str, min_score: Optional[float] = None
+        self, query: str, min_score: Optional[float] = None, max_tokens: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
@@ -337,6 +336,10 @@ class ContextBuilder:
                 weak matches don't get stamped into the rendered
                 transport form. ``None`` falls back to the storage
                 layer's default (no floor, all candidates merge).
+            session_id: Chat session of the turn being served, for span
+                attribution only (#2940). Semantic recall reuses the same
+                answerability judge as memory retrieval, so its LLM call
+                needs the same session to land in the turn's Timeline band.
 
         Returns:
             Formatted context string with relevant documents
@@ -351,30 +354,203 @@ class ContextBuilder:
             if min_score is not None:
                 search_kwargs["min_score"] = min_score
             rag_results = await self.storage.search_chunks(query, **search_kwargs)
-            context_parts = []
-            for res in rag_results:
-                doc_name = res.get('document_name') or res.get('file_hash', 'unknown')
-                content = res.get('content', '')
-                # Include timestamp if available for temporal awareness
-                created_at = res.get('created_at', '')
-                timestamp_note = f" (indexed: {created_at})" if created_at else ""
-                context_parts.append(
-                    f"Source: {doc_name}{timestamp_note}\nContent: {content}"
-                )
         except Exception as e:
             logger.error(f"Error during RAG search: {e}")
-            context_parts = ["Error retrieving document context."]
+            return "Error retrieving document context."
 
-        # 2. Search knowledge graph (Conceptual)
-        # In a real implementation, we would parse the query for entities
-        # and query the graph for related nodes.
-        # kg_results = self.storage.query_graph(...)
-        # context_parts.append(f"Knowledge Graph Context: {kg_results}")
-
-        if not context_parts:
+        # The semantic boundary is opt-in. Disabled and empty results preserve
+        # the legacy RAG bytes exactly, including ordering and cache behavior.
+        from kestrel_sovereign.agent.semantic_recall import coerce_config, render_hybrid_context
+        try:
+            from kestrel_sovereign.config import load_section
+            recall_values = load_section("retrieval") or {}
+            if "semantic_recall_enabled" not in recall_values:
+                recall_values = {**recall_values, "semantic_recall_enabled": False}
+            recall_config = coerce_config(recall_values)
+        except Exception as exc:
+            logger.warning("Semantic recall configuration unavailable: %s", exc)
+            recall_config = coerce_config({"semantic_recall_enabled": False})
+        if recall_config.enabled:
+            self.last_semantic_recall_metadata = {"status": "enabled"}
+            reader = getattr(self.storage, "semantic_recall_candidates", None)
+            if reader is None:
+                logger.warning("Semantic recall capability unavailable: storage seam missing")
+            else:
+                try:
+                    recalled = await reader(
+                        query=query,
+                        candidate_scan_limit=recall_config.candidate_scan_limit,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
+                    semantic_scores = await self._semantic_scores(
+                        query, recalled.candidates,
+                        max_claim_characters=recall_config.max_claim_characters,
+                        batch_size=recall_config.embedding_batch_size,
+                        session_id=session_id,
+                    )
+                    ordered = sorted(
+                        (item for item in recalled.candidates if item.assertion.assertion_id in semantic_scores),
+                        key=lambda item: (-semantic_scores[item.assertion.assertion_id], item.assertion.assertion_id),
+                    )
+                    selected = tuple(ordered[:recall_config.candidate_limit])
+                    # Empty discovery/ranking is a normal governed result.
+                    # Do not ask the provenance capability to hydrate an empty
+                    # set: that would convert byte-identical legacy RAG into a
+                    # spurious unavailable state.
+                    if not selected:
+                        hybrid = render_hybrid_context(
+                            query=query,
+                            rag_results=rag_results,
+                            assertion_candidates=(),
+                            config=recall_config,
+                            count_tokens=self.counter.count,
+                            semantic_scores=semantic_scores,
+                            max_tokens=max_tokens,
+                        )
+                        self.last_semantic_recall_metadata = {
+                            "status": "empty",
+                            "checkpoint_generation": recalled.checkpoint_generation,
+                            "capability_versions": dict(recalled.capability_versions),
+                            "discovery_count": recalled.discovery_count,
+                            "assertions": hybrid.metadata,
+                        }
+                        return hybrid.context
+                    hydrator = getattr(self.storage, "hydrate_semantic_recall_candidates", None)
+                    if hydrator is None:
+                        raise RuntimeError("semantic_recall_provenance_capability_unavailable")
+                    hydrated = await hydrator(
+                        [item.assertion.assertion_id for item in selected],
+                        expected_checkpoint_generation=recalled.checkpoint_generation,
+                        inference_profile=self._semantic_inference_profile,
+                        inference_limits=self._semantic_inference_limits,
+                        maintenance_limits=self._semantic_maintenance_limits,
+                    )
+                    by_id = {item.assertion.assertion_id: item for item in hydrated}
+                    candidates = tuple(by_id[item.assertion.assertion_id] for item in selected if item.assertion.assertion_id in by_id)
+                    hybrid = render_hybrid_context(
+                        query=query, rag_results=rag_results,
+                        assertion_candidates=candidates,
+                        config=recall_config, count_tokens=self.counter.count,
+                        semantic_scores=semantic_scores, max_tokens=max_tokens,
+                    )
+                    self.last_semantic_recall_metadata = {
+                        "status": "used" if hybrid.assertion_count else "empty",
+                        "checkpoint_generation": recalled.checkpoint_generation,
+                        "capability_versions": dict(recalled.capability_versions),
+                        "discovery_count": recalled.discovery_count,
+                        "assertions": hybrid.metadata,
+                    }
+                    return hybrid.context
+                except Exception as exc:
+                    # Capability failures are observable and never fabricate a
+                    # graph result; retain the established RAG path.
+                    reason = self._semantic_failure_reason(exc)
+                    logger.warning(
+                        "Semantic recall unavailable reason=%s error_class=%s",
+                        reason, type(exc).__name__,
+                    )
+                    self.last_semantic_recall_metadata = {
+                        "status": "unavailable", "reason": self._semantic_failure_reason(exc),
+                    }
+        else:
+            self.last_semantic_recall_metadata = {"status": "disabled"}
+        if not rag_results:
             return "No relevant documents or knowledge found in memory."
+        return "\n\n".join(
+            f"Source: {res.get('document_name') or res.get('file_hash', 'unknown')}"
+            f"{' (indexed: ' + str(res.get('created_at')) + ')' if res.get('created_at') else ''}\n"
+            f"Content: {res.get('content', '')}"
+            for res in rag_results
+        )
 
-        return "\n\n".join(context_parts)
+    async def _semantic_scores(
+        self, query: str, candidates, *, max_claim_characters: int, batch_size: int,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Score already-authorized candidates in one embedding batch.
+
+        Assertions never get a second persisted vector index. The existing
+        embedding service is only a candidate ranker; a capability failure
+        aborts semantic recall rather than silently pretending lexical recall
+        was semantic.
+        """
+        if not candidates:
+            return {}
+        from kestrel_sovereign.agent.semantic_recall import _claim_text
+        from kestrel_sovereign.llm.embedding_service import aembed_retrieval_query, cosine_similarity, get_provider_embedding_service
+        service = get_provider_embedding_service(self._llm_service)
+        if service is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
+        requires_gate = getattr(service, "requires_answerability_gate", None)
+        gate_required = callable(requires_gate) and requires_gate()
+        floor_getter = getattr(service, "retrieval_similarity_floor", None)
+        floor = float(floor_getter()) if callable(floor_getter) else 0.0
+        query_embedding = await aembed_retrieval_query(service, query)
+        if query_embedding is None:
+            raise RuntimeError("semantic_embedding_capability_unavailable")
+        scores: Dict[str, float] = {}
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            embeddings = await service.aembed_batch([
+                _claim_text(item.assertion, max_claim_characters) for item in batch
+            ])
+            if len(embeddings) != len(batch) or any(value is None for value in embeddings):
+                raise RuntimeError("semantic_embedding_capability_unavailable")
+            scores.update({
+                item.assertion.assertion_id: score
+                for item, embedding in zip(batch, embeddings)
+                if (score := cosine_similarity(query_embedding, embedding)) >= floor
+            })
+        if gate_required:
+            gate = self._semantic_answerability_gate
+            if gate is None or not callable(getattr(gate, "filter", None)):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            # The judge sees only the bounded, already-ranked top-K projection.
+            # It runs before provenance hydration, so rejected or failed claims
+            # cannot be published through a later storage read.
+            from kestrel_sovereign.storage.memory_answerability import AnswerabilityCandidate
+            ranked = sorted(
+                (item for item in candidates if item.assertion.assertion_id in scores),
+                key=lambda item: (-scores[item.assertion.assertion_id], item.assertion.assertion_id),
+            )[:8]
+            decision = await gate.filter(
+                query,
+                [
+                    AnswerabilityCandidate(
+                        memory_id=item.assertion.assertion_id,
+                        content=_claim_text(item.assertion, max_claim_characters),
+                    )
+                    for item in ranked
+                ],
+                session_id=session_id,
+            )
+            if not getattr(decision, "completed", False):
+                raise RuntimeError("semantic_answerability_gate_unavailable")
+            allowed = frozenset(getattr(decision, "answerable_ids", ()))
+            scores = {
+                assertion_id: score
+                for assertion_id, score in scores.items()
+                if assertion_id in allowed
+            }
+        return scores
+
+    @staticmethod
+    def _semantic_failure_reason(error: Exception) -> str:
+        """Never serialize provider exception text into retrieval metadata."""
+        known = {
+            "semantic_embedding_capability_unavailable",
+            "semantic_recall_candidate_window_exceeded",
+            "semantic_maintenance_capability_unavailable",
+            "semantic_maintenance_checkpoint_behind",
+            "semantic_maintenance_state_missing",
+            "semantic_maintenance_partial",
+            "semantic_recall_checkpoint_changed",
+            "semantic_answerability_gate_unavailable",
+        }
+        value = str(error)
+        return value if value in known else "semantic_recall_capability_unavailable"
 
     def get_session_briefing(self) -> str:
         """
@@ -412,7 +588,7 @@ You are beginning a new session. As the Executor, you are bound by the Kestrel C
 6. INTEGRITY: Report any code or memory discrepancies immediately. Enter Safe Mode if integrity fails.
 
 **Remember:** Use `!constitution` to consult the full text when facing ethical dilemmas or unclear situations.
-Use `!constitution article <N>` for specific articles, or `!constitution search <term>` to find relevant sections.
+Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution amendment <I-IX>`, or `!constitution section <book>.<n>` for a specific unit, or `!constitution search <term>` to find relevant passages.
 
 --- END BRIEFING ---
 
@@ -1083,9 +1259,9 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         Assembles all context sources (system prompt, history, episodes,
         RAG) within the model's token budget using adaptive allocation.
 
-        Delegates to ``measure_context_breakdown`` so the assembled
-        bytes and the per-section measurement come from a single source
-        and **cannot drift** (#1308 / PR #1306). RAG is now wrapped in
+        Delegates through ``measure_context_breakdown`` to the canonical
+        ``ContextManager`` plan so the assembled bytes and per-section
+        measurement cannot drift (#1308 / #2534). RAG is wrapped in
         the same ``<retrieved_context><documents>…</documents></retrieved_context>``
         envelope ``ContextManager.build_context`` uses, replacing the
         legacy ``--- RELEVANT DOCUMENTS ---`` markers — the per-section
@@ -1155,369 +1331,86 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         include_rag: bool = True,
         memory_retriever: Optional[Callable[[str, int], Awaitable[Optional[str]]]] = None,
     ) -> Dict[str, Any]:
-        """Measure context composition the LLM call would actually see.
+        """Compatibility adapter over ContextManager's canonical dry-run plan.
 
-        **Read-only.** No LLM call. No DB writes. The caller is
-        responsible for passing only side-effect-free helpers (see
-        ``memory_retriever`` below — the production
-        ``MemoryManager.retrieve_memories`` schedules access-count writes
-        as a rehearsal-effect side effect and MUST NOT be passed in
-        unmodified; wrap it in a side-effect-free adapter).
-
-        Single source of truth for per-section token measurement: the
-        breakdown popup (#1310), elastic budget (#1309), and any future
-        introspection caller all read from this method so the surface
-        and the live call path cannot drift. ``build_full_context`` now
-        calls this method directly to obtain its per-section counts.
-
-        Per-section accuracy:
-
-        - **system** — sub-rows attributed from
-          ``_collect_system_prompt_parts``; the *same* parts
-          ``build_system_prompt`` joins. Each subsection's token count
-          equals counting the parts of that group joined with
-          ``"\\n\\n"``. The whole-system total is computed by counting
-          the fully assembled prompt so it matches the LLM-visible bytes
-          exactly.
-        - **tools** — JSON-serialised tool schemas; previously
-          *never measured*. Caller passes the same list it would hand
-          to the LLM adapter.
-        - **history** — runs ``format_conversation_history`` as a
-          dry-run; reports ``messages_kept_after_pruning`` and the
-          unpruned raw sum so the popup can distinguish "lots of stored
-          history" from "lots of history the LLM will actually see."
-        - **episodes** — uses ``len(episodes)`` (no ``"**"`` heuristic).
-          Gated at ``EPISODE_THRESHOLD_MESSAGES`` (=20), matching the
-          production ``ContextManager.build_context`` path.
-        - **memories** — wrapped by the production
-          ``<retrieved_context><memories>…</memories></retrieved_context>``
-          envelope and gated by the per-section ``can_fit`` check, so
-          the figure equals the byte-cost the LLM would actually see.
-          Measured when ``memory_retriever`` is supplied (and is
-          side-effect-free).
-        - **rag** — wrapped by the production
-          ``<retrieved_context><documents>…</documents></retrieved_context>``
-          envelope and gated by ``can_fit``; query-dependent, so the
-          section is flagged ``estimated=True``.
-
-        Args:
-            query: Current user query (drives RAG retrieval).
-            history: Raw conversation history rows.
-            constitution: Constitution text.
-            include_briefing: Include the session briefing.
-            message_count: Effective conversation length for adaptive
-                budgeting and episode gating; defaults to
-                ``len(history)``.
-            tools: Tool schemas the agent would send this turn.
-            prompt_adaptation: Optional constitutional preamble.
-            state_of_mind: Optional ``StateOfMind`` block.
-            reflection_guidance: Optional active-reflection lines.
-            system_prompt_addendum: Optional per-turn addendum.
-            additional_context: Optional extra-context block (matches
-                ``build_system_prompt``'s ``additional_context`` arg).
-            include_rag: Skip RAG retrieval when ``False`` (used by the
-                cheap footer poll; the popup makes a second on-demand
-                call with this flag flipped on).
-            memory_retriever: Async ``(query, max_tokens) -> Optional[str]``
-                callable returning a pre-formatted memory block. **Must
-                be side-effect-free.** Wrap the production retriever
-                yourself; do not pass it raw.
-
-        Returns:
-            Dict with ``model``, ``context_limit``, ``response_reserve``,
-            ``total_budget``, ``total_measured`` (sum of section
-            tokens), ``utilization_percent`` (honest whole-window
-            utilization for #1310's pill), ``budget_summary`` (legacy
-            ``TokenBudget`` shape preserved), ``sections`` (canonical
-            per-section breakdown with ``budget`` / ``tokens`` /
-            per-section extras), and ``notes`` (free-form measurement
-            caveats — e.g. when memories or RAG are skipped/excluded).
+        New code should call ContextManager.build_context_plan directly.  This
+        method remains for legacy callers and build_full_context; it performs no
+        assembly or budget policy of its own.
         """
-        effective_msg_count = len(history) if message_count is None else message_count
+        from kestrel_sovereign.agent.context_manager import ContextManager
+        from kestrel_sovereign.agent.context_stages import ContextBuildMode
 
-        budget = create_budget(self.model, effective_msg_count, adaptive=True)
-        notes: List[str] = []
+        memory_adapter = object() if memory_retriever is not None else None
+        manager = ContextManager(
+            storage=self.storage,
+            model=self.model,
+            consolidator=self.consolidator,
+            memory_retriever=memory_adapter,
+            llm_service=self._llm_service,
+            context_builder=self,
+        )
 
-        # ----- system: shared with build_system_prompt (no drift) -----
-        groups = self._collect_system_prompt_parts(
+        if memory_retriever is not None:
+            async def retrieve_memories_read_only(**kwargs):
+                return await memory_retriever(
+                    kwargs["query"], kwargs["max_tokens"]
+                )
+
+            manager.memory_manager.retrieve_memories = retrieve_memories_read_only
+
+        manager._resolve_state_of_mind_snapshot = lambda: (
+            state_of_mind,
+            prompt_adaptation,
+        )
+        addendum_parts = [
+            part
+            for part in (additional_context, system_prompt_addendum)
+            if part
+        ]
+        effective_addendum = "\n\n".join(addendum_parts) or None
+        plan = await manager.build_context_plan(
+            query=query,
             constitution=constitution,
             include_briefing=include_briefing,
-            additional_context=additional_context,
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind,
-            system_prompt_addendum=system_prompt_addendum,
+            include_memories=memory_retriever is not None,
+            include_rag=include_rag,
+            conversation_history=history,
+            reflection_guidance=reflection_guidance,
+            system_prompt_addendum=effective_addendum,
+            tools=tools,
+            mode=ContextBuildMode.DRY_RUN,
+            measure_expensive_sections=True,
+            message_count_override=message_count,
         )
-        # Per-subsection: count "\n\n".join(group_parts) for that group
-        # in isolation. The inter-group "\n\n" joins are shared and live
-        # in the whole-system count below.
-        system_sub: List[Dict[str, Any]] = [
-            {"name": name, "tokens": self.counter.count("\n\n".join(parts))}
-            for name, parts in groups
-        ]
-        # Whole-system count from the assembled bytes — guarantees this
-        # equals what the LLM receives. Reflection-guidance lives in
-        # ``ContextManager.build_context`` (not in
-        # ``build_system_prompt``); when supplied it is appended after
-        # the joined prompt with "\n\n" separator, so we count it here
-        # the same way and add it as its own sub-row.
-        assembled_system = "\n\n".join(p for _, parts in groups for p in parts)
-        system_tokens = self.counter.count(assembled_system)
-        if reflection_guidance:
-            # Shared with ``ContextManager.build_context`` via
-            # ``context_stages`` so the reflection block cannot drift
-            # between the measurement and production assemblers.
-            guidance_block = build_reflection_guidance_block(reflection_guidance)
-            guidance_tokens = self.counter.count(guidance_block)
-            # Production appends with "\n\n". Recompute system_tokens
-            # from the final assembled bytes so the invariant
-            # "whole-system tokens come from the assembled bytes" holds
-            # literally (Codex round 2 #2). The algebraic shortcut
-            # ``system_tokens += guidance_tokens`` happened to produce
-            # the same number for current tokenisers, but the literal
-            # form removes the assumption.
-            assembled_system = f"{assembled_system}\n\n{guidance_block}"
-            system_tokens = self.counter.count(assembled_system)
-            system_sub.append(
-                {"name": "reflection_guidance", "tokens": guidance_tokens}
+        breakdown = plan.to_breakdown()
+        # Preserve the legacy projection schema for callers that have not yet
+        # migrated to ContextBuildPlan.  The context-status endpoint consumes
+        # the plan directly, so deliberately omitted sections remain
+        # tokens=None there rather than being confused with measured zero.
+        for row in breakdown["sections"].values():
+            if row.get("tokens") is None:
+                row["measured"] = False
+                row["tokens"] = 0
+        memory_row = breakdown["sections"]["memories"]
+        memory_row["excluded"] = memory_row["status"] == "excluded"
+        rag_row = breakdown["sections"]["rag"]
+        rag_row["skipped"] = rag_row["status"] in {"skipped", "unknown"}
+        rag_row["excluded"] = rag_row["status"] == "excluded"
+        if memory_retriever is None:
+            breakdown["notes"].append(
+                "memories not measured (no memory_retriever supplied)"
             )
-
-        # ----- tools (previously never measured) -----
-        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
-        tools_count = len(tools) if tools else 0
-
-        # ----- history (dry-run through the real formatter) -----
-        formatted_history = self.format_conversation_history(
-            history=history,
-            max_tokens=budget.history,
-        )
-        history_tokens = sum(
-            self.counter.count(m.get("content", "") or "") + _MESSAGE_OVERHEAD
-            for m in formatted_history
-        )
-        raw_history_tokens = sum(
-            self.counter.count(m.get("content", "") or "") for m in history
-        )
-        budget.use("history", history_tokens, items=len(formatted_history))
-
-        # ----- episodes (real count, production threshold) -----
-        # Section produced via the shared ``context_stages`` builder so the
-        # measurement path and ``ContextManager.build_context`` cannot drift
-        # on the episode block's token cost or ``len(episodes)`` count.
-        episodes_list: List[Dict[str, Any]] = []
-        episodes_tokens = 0
-        if effective_msg_count >= EPISODE_THRESHOLD_MESSAGES and self.consolidator:
-            episodes_list = await self.get_episodes_for_context(
-                max_tokens=budget.episodes, max_episodes=5
+        if not include_rag:
+            breakdown["notes"].append(
+                "rag skipped (include_rag=False — popup should fetch on demand)"
             )
-            episode_block = self.format_episodes_for_context(episodes_list)
-            if episode_block:
-                episode_section = build_episode_section(
-                    episode_block, len(episodes_list), self.counter.count
-                )
-                episodes_tokens = episode_section.tokens
-                budget.use(
-                    "episodes", episode_section.tokens, items=episode_section.items
-                )
-
-        # ----- memories: gate on RAW (production semantics), report
-        # inner-wrapper tokens for the per-section figure. The outer
-        # <retrieved_context> envelope is shared with RAG and counted
-        # once below as ``dynamic_context_overhead``. Codex round 2 #1
-        # caught the earlier version gating on the wrapped block, which
-        # could exclude blocks production would include, and could
-        # double-count the outer wrapper when both memories and RAG
-        # were present.
-        memories_tokens = 0
-        memories_count = 0
-        memories_excluded = False
-        memory_block: Optional[str] = None
-        memory_dynamic_block: Optional[str] = None
-        if memory_retriever is not None:
-            try:
-                memory_block = await memory_retriever(query, budget.memories)
-            except Exception as e:
-                memory_block = None
-                notes.append(f"memory retrieval failed during measurement: {e}")
-            if memory_block:
-                # Produced via the shared ``context_stages`` builder: raw-block
-                # gate input, ``[Memory]`` count, and ``<memories>`` wrapping are
-                # single-sourced with production's ``_produce_memories``.
-                memory_section = build_memory_section(memory_block, self.counter.count)
-                memories_count = memory_section.items
-                if budget.can_fit("memories", memory_section.tokens):
-                    budget.use(
-                        "memories", memory_section.tokens, items=memory_section.items
-                    )
-                    memory_dynamic_block = memory_section.dynamic_block
-                    memories_tokens = self.counter.count(memory_dynamic_block)
-                else:
-                    memories_excluded = True
-                    memory_block = None
-                    notes.append(
-                        "memories excluded from measurement: would exceed "
-                        "memories budget (matches production can_fit gate "
-                        "on the raw block)"
-                    )
-        else:
-            notes.append("memories not measured (no memory_retriever supplied)")
-
-        # ----- rag: same raw/wrapped split as memories above -----
-        rag_tokens = 0
-        rag_chunks = 0
-        rag_excluded = False
-        rag_context: Optional[str] = None
-        rag_dynamic_block: Optional[str] = None
-        if include_rag:
-            try:
-                rag_context = await self.retrieve_context(query)
-            except Exception as e:
-                rag_context = None
-                notes.append(f"rag retrieval failed during measurement: {e}")
-            if rag_context:
-                # Shared ``context_stages`` builder — same raw-block gate input,
-                # chunk count, and ``<documents>`` wrapping as production's
-                # ``_produce_rag``.
-                rag_section = build_rag_section(rag_context, self.counter.count)
-                rag_chunks = rag_section.items
-                if budget.can_fit("rag", rag_section.tokens):
-                    budget.use("rag", rag_section.tokens, items=rag_section.items)
-                    rag_dynamic_block = rag_section.dynamic_block
-                    rag_tokens = self.counter.count(rag_dynamic_block)
-                else:
-                    rag_excluded = True
-                    rag_context = None
-                    notes.append(
-                        "rag excluded from measurement: would exceed rag "
-                        "budget (matches production can_fit gate on the raw block)"
-                    )
-        else:
-            notes.append("rag skipped (include_rag=False — popup should fetch on demand)")
-
-        # Shared <retrieved_context>…</retrieved_context> envelope —
-        # counted once when at least one dynamic block is included,
-        # mirroring ``ContextManager.build_context``'s single-wrapper
-        # behavior (codex round 2 #1: do not double-charge the outer
-        # wrapper across sections). #1310's popup attributes this to
-        # "Reserve / Overhead" in Emma's canonical taxonomy.
-        dynamic_blocks_present = bool(memory_block) or bool(rag_context)
-        if dynamic_blocks_present:
-            dynamic_context_overhead = self.counter.count(
-                RETRIEVED_CONTEXT_EMPTY_ENVELOPE
+        if memory_row["excluded"]:
+            breakdown["notes"].append(
+                "memories excluded from measurement: would exceed memories budget"
             )
-        else:
-            dynamic_context_overhead = 0
-
-        # ----- assemble breakdown -----
-        sections: Dict[str, Dict[str, Any]] = {
-            "system": {
-                "tokens": system_tokens,
-                "budget": budget.system,
-                "subsections": system_sub,
-            },
-            "tools": {
-                "tokens": tools_tokens,
-                "count": tools_count,
-                "estimated": True,
-                "estimation_method": "json-serialized-schemas",
-            },
-            "history": {
-                "tokens": history_tokens,
-                "budget": budget.history,
-                "messages_total": len(history),
-                "messages_kept_after_pruning": len(formatted_history),
-                "raw_tokens": raw_history_tokens,
-            },
-            "episodes": {
-                "tokens": episodes_tokens,
-                "budget": budget.episodes,
-                "count": len(episodes_list),
-                "threshold": EPISODE_THRESHOLD_MESSAGES,
-            },
-            "memories": {
-                "tokens": memories_tokens,
-                "budget": budget.memories,
-                "count": memories_count,
-                "wired": memory_retriever is not None,
-                "excluded": memories_excluded,
-            },
-            "rag": {
-                "tokens": rag_tokens,
-                "budget": budget.rag,
-                "chunks": rag_chunks,
-                "estimated": True,
-                "estimation_method": "live-search-against-current-store",
-                "skipped": not include_rag,
-                "excluded": rag_excluded,
-            },
-            # Shared overhead: a single <retrieved_context>…</retrieved_context>
-            # envelope wraps memories AND rag when either is present
-            # (production behavior — see ``ContextManager.build_context``).
-            # Surfaced here as its own row so the per-section ``tokens``
-            # figures stay attributable, and the popup (#1310) can show
-            # this under Emma's "Reserve / Overhead" taxonomy slice
-            # without double-charging memories or rag.
-            "dynamic_context_overhead": {
-                "tokens": dynamic_context_overhead,
-                "applies_when": "memories or rag included",
-                "applied": dynamic_blocks_present,
-            },
+        breakdown["_artifacts"] = {
+            "system_prompt": plan.assembly.system_prompt,
+            "formatted_history": plan.assembly.formatted_history,
+            "dynamic_user_context": plan.assembly.dynamic_user_context,
         }
-
-        total_measured = (
-            system_tokens
-            + tools_tokens
-            + history_tokens
-            + episodes_tokens
-            + memories_tokens
-            + rag_tokens
-            + dynamic_context_overhead
-        )
-        context_limit = self.counter.get_context_limit()
-        response_reserve = RESPONSE_RESERVE
-        total_budget = context_limit - response_reserve
-        utilization_percent = (
-            (total_measured / total_budget * 100.0) if total_budget > 0 else 0.0
-        )
-        # Cap at 100 for display — tiny overshoots from per-section
-        # rounding should not read as 120%.
-        utilization_percent = min(utilization_percent, 100.0)
-
-        # Assembled artifacts — same bytes the LLM would see, in the
-        # same wrapper format ``ContextManager.build_context`` uses. The
-        # underscore prefix signals these are internal; consumers should
-        # read top-level ``sections`` for measurement and reach into
-        # ``_artifacts`` only when they need to re-use the assembled
-        # text (``build_full_context`` does, for example, to share the
-        # measurement path).
-        # Reuse the EXACT wrapped bytes the shared section builders produced
-        # (and that we measured above) rather than re-wrapping — the artifact
-        # and the per-section figure can never disagree.
-        dynamic_blocks: List[str] = []
-        if memory_dynamic_block:
-            dynamic_blocks.append(memory_dynamic_block)
-        if rag_dynamic_block:
-            dynamic_blocks.append(rag_dynamic_block)
-        dynamic_user_context = assemble_dynamic_user_context(dynamic_blocks)
-        episode_block_for_artifacts = self.format_episodes_for_context(episodes_list)
-        artifacts_system_prompt = assembled_system
-        if episode_block_for_artifacts:
-            artifacts_system_prompt = (
-                f"{artifacts_system_prompt}\n\n{episode_block_for_artifacts}"
-            )
-
-        return {
-            "model": self.model,
-            "context_limit": context_limit,
-            "response_reserve": response_reserve,
-            "total_budget": total_budget,
-            "total_measured": total_measured,
-            "utilization_percent": round(utilization_percent, 1),
-            "budget_summary": budget.get_summary(),
-            "sections": sections,
-            "notes": notes,
-            "_artifacts": {
-                "system_prompt": artifacts_system_prompt,
-                "formatted_history": formatted_history,
-                "dynamic_user_context": dynamic_user_context,
-            },
-        }
+        return breakdown

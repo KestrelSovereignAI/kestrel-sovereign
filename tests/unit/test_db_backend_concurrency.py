@@ -11,6 +11,450 @@ the full suite, so it was deferred rather than shipped on the hot read path.)
 from __future__ import annotations
 
 import asyncio
+from collections import UserList
+from unittest.mock import AsyncMock, Mock, call, patch
+
+import pytest
+
+
+def test_postgres_from_pool_keeps_advisory_dsn_outside_operational_pool_state():
+    """A wrapped pool needs an explicit, scheduler-only connection source."""
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def get_max_size(self):
+            return 2
+
+    backend = PostgresBackend.from_pool(
+        _Pool(),
+        advisory_dsn="postgresql://scheduler-test/kestrel",
+    )
+
+    # ``_dsn`` remains absent for existing wrapped-pool consumers (including
+    # SQLAlchemy factories); only advisory gates use the explicit DSN.
+    assert backend._dsn is None
+    assert backend._advisory_dsn == "postgresql://scheduler-test/kestrel"
+    assert backend._advisory_max_pool_size == 2
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_a_dedicated_advisory_pool_recipe():
+    """Pool-only embeddings never borrow the operational pool for gates."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect_args = ("postgresql://pool-only/kestrel",)
+        _connect_kwargs = {"server_settings": {"application_name": "host"}}
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    backend = PostgresBackend.from_pool(shared_pool)
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        "postgresql://pool-only/kestrel",
+        min_size=0,
+        max_size=2,
+        server_settings={"application_name": "host"},
+        connect=shared_pool._connect,
+        connection_class=object,
+        record_class=object,
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_preserves_list_connect_args_from_asyncpg_mutator():
+    """``Pool.set_connect_args()`` still supplies an advisory-pool recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect = staticmethod(lambda *_args, **_kwargs: None)
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    # asyncpg's public mutator deliberately stores the positional DSN in a
+    # list, unlike create_pool()'s initial tuple-shaped state.
+    postgres_module.asyncpg.Pool.set_connect_args(
+        shared_pool,
+        "postgresql://pool-reset/kestrel",
+        server_settings={"application_name": "host"},
+    )
+
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_connect_args == ("postgresql://pool-reset/kestrel",)
+    assert backend._advisory_connect_args is not shared_pool._connect_args
+    assert backend._advisory_recipe_available is True
+
+    # The backend keeps an immutable copy, not the mutable list that asyncpg
+    # changes when its public mutator is used again.
+    shared_pool._connect_args[0] = "postgresql://changed/kestrel"
+
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        "postgresql://pool-reset/kestrel",
+        min_size=0,
+        max_size=2,
+        server_settings={"application_name": "host"},
+        connect=shared_pool._connect,
+        connection_class=object,
+        record_class=object,
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_uses_custom_asyncpg_connect_factory_without_dsn():
+    """A custom asyncpg connector is a complete advisory-pool recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    async def custom_connect(*_args, **_kwargs):
+        raise AssertionError("the wrapped operational pool must not be acquired")
+
+    # A real asyncpg pool records its absent DSN as ``(None,)`` and stores a
+    # custom connection factory in ``_connect``.  With min_size=0, asyncpg
+    # initializes this pool without opening a database connection.
+    shared_pool = await postgres_module.asyncpg.create_pool(
+        min_size=0,
+        max_size=2,
+        connect=custom_connect,
+    )
+    try:
+        backend = PostgresBackend.from_pool(shared_pool)
+        assert backend._advisory_recipe_available is True
+
+        advisory_pool = object()
+        with patch.object(
+            postgres_module.asyncpg,
+            "create_pool",
+            AsyncMock(return_value=advisory_pool),
+        ) as create_pool:
+            assert await backend._ensure_advisory_pool() is advisory_pool
+
+        create_pool.assert_awaited_once_with(
+            None,
+            min_size=0,
+            max_size=2,
+            connect=custom_connect,
+            connection_class=postgres_module.asyncpg.Connection,
+            record_class=postgres_module.asyncpg.Record,
+        )
+    finally:
+        await shared_pool.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_keyword_only_advisory_pool_recipe():
+    """asyncpg keyword-only pool settings are a valid dedicated recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        # Real ``asyncpg.create_pool(host=..., database=..., user=...)``
+        # stores the absent positional DSN as ``(None,)``.
+        _connect_args = (None,)
+        _connect_kwargs = {
+            "host": "postgres.internal",
+            "database": "kestrel",
+            "user": "scheduler",
+            "password": "pool-only-secret",
+        }
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_recipe_available is True
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        None,
+        min_size=0,
+        max_size=2,
+        host="postgres.internal",
+        database="kestrel",
+        user="scheduler",
+        password="pool-only-secret",
+    )
+    shared_pool.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_derives_multi_host_advisory_pool_recipe():
+    """A real asyncpg multi-host pool remains an explicit advisory recipe."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    hosts = ["primary", "standby"]
+    # min_size=0 lets us exercise asyncpg's real recorded connection settings
+    # without attempting a network connection to either failover host.
+    shared_pool = await postgres_module.asyncpg.create_pool(
+        host=hosts,
+        database="kestrel",
+        min_size=0,
+        max_size=2,
+    )
+    try:
+        backend = PostgresBackend.from_pool(shared_pool)
+        assert backend._advisory_connect_kwargs["host"] == hosts
+        assert backend._advisory_recipe_available is True
+
+        advisory_pool = object()
+        with patch.object(
+            postgres_module.asyncpg,
+            "create_pool",
+            AsyncMock(return_value=advisory_pool),
+        ) as create_pool:
+            assert await backend._ensure_advisory_pool() is advisory_pool
+
+        create_pool.assert_awaited_once_with(
+            None,
+            min_size=0,
+            max_size=2,
+            host=hosts,
+            database="kestrel",
+            connect=postgres_module.asyncpg.connection.connect,
+            connection_class=postgres_module.asyncpg.Connection,
+            record_class=postgres_module.asyncpg.Record,
+        )
+    finally:
+        await shared_pool.close()
+
+
+@pytest.mark.parametrize(
+    ("host", "database", "expected"),
+    [
+        ("primary", "kestrel", True),
+        (["primary", "standby"], "kestrel", True),
+        (("primary", "standby"), "kestrel", True),
+        ([], "kestrel", False),
+        ((), "kestrel", False),
+        (["primary", ""], "kestrel", False),
+        (("primary", None), "kestrel", False),
+        (UserList(["primary"]), "kestrel", False),
+        ("primary", "", False),
+        ("primary", None, False),
+    ],
+    ids=[
+        "string-host",
+        "list-hosts",
+        "tuple-hosts",
+        "empty-list",
+        "empty-tuple",
+        "empty-list-member",
+        "non-string-tuple-member",
+        "arbitrary-sequence",
+        "empty-database",
+        "missing-database",
+    ],
+)
+def test_postgres_advisory_recipe_requires_explicit_valid_host_and_database(
+    host, database, expected
+):
+    """Default asyncpg connection settings must stay explicit and complete."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    assert (
+        PostgresBackend._has_advisory_connection_recipe(
+            (),
+            {"host": host, "database": database},
+        )
+        is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_advisory_pool_allows_asyncpg_default_user_from_parameters():
+    """Host and database are a complete explicit recipe without a user."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(host="postgres.internal", database="kestrel")
+    backend._pool = object()
+    advisory_pool = object()
+    with patch.object(
+        postgres_module.asyncpg,
+        "create_pool",
+        AsyncMock(return_value=advisory_pool),
+    ) as create_pool:
+        assert await backend._ensure_advisory_pool() is advisory_pool
+
+    create_pool.assert_awaited_once_with(
+        host="postgres.internal",
+        port=5432,
+        database="kestrel",
+        user=None,
+        password=None,
+        min_size=0,
+        max_size=4,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host", "database"),
+    [(None, "kestrel"), ("postgres.internal", None)],
+    ids=["missing-host", "missing-database"],
+)
+async def test_postgres_advisory_pool_rejects_incomplete_explicit_recipe(host, database):
+    """The default asyncpg user does not authorize a missing endpoint or DB."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.interface import ConnectionError
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(host=host, database=database)
+    backend._pool = object()
+    with patch.object(postgres_module.asyncpg, "create_pool", AsyncMock()) as create_pool:
+        with pytest.raises(ConnectionError, match="require connection parameters"):
+            await backend._ensure_advisory_pool()
+
+    create_pool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_postgres_from_pool_rejects_incomplete_advisory_pool_recipe():
+    """asyncpg's default connector needs explicit connection settings."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from kestrel_sovereign.storage.db.interface import ConnectionError
+
+    class _Pool:
+        _connect_args = ()
+        _connect_kwargs = {}
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+        acquire = Mock(side_effect=AssertionError("shared pool must not be acquired"))
+
+    shared_pool = _Pool()
+    shared_pool._connect = postgres_module.asyncpg.connection.connect
+    backend = PostgresBackend.from_pool(shared_pool)
+    assert backend._advisory_recipe_available is False
+    with patch.object(postgres_module.asyncpg, "create_pool", AsyncMock()) as create_pool:
+        with pytest.raises(ConnectionError, match="valid wrapped-pool recipe"):
+            await backend._ensure_advisory_pool()
+
+    create_pool.assert_not_awaited()
+    shared_pool.acquire.assert_not_called()
+
+
+def test_postgres_from_pool_explicit_advisory_dsn_ignores_pool_connect_kwargs():
+    """An explicit scheduler DSN does not inherit operational credentials."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        _connect_args = ("postgresql://operational/kestrel",)
+        _connect_kwargs = {"ssl": "operational-only", "password": "secret"}
+        _connection_class = object
+        _record_class = object
+
+        def get_max_size(self):
+            return 2
+
+    backend = PostgresBackend.from_pool(
+        _Pool(),
+        advisory_dsn="postgresql://scheduler/kestrel",
+        advisory_connect_kwargs={"server_settings": {"search_path": "scheduler"}},
+    )
+
+    assert backend._advisory_connect_args == ("postgresql://scheduler/kestrel",)
+    assert backend._advisory_connect_kwargs == {
+        "connection_class": object,
+        "record_class": object,
+        "server_settings": {"search_path": "scheduler"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_polled_advisory_lock_finishes_each_failed_try_before_sleep():
+    """Concurrent-DDL waiters poll without retaining a blocked SQL snapshot."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Connection:
+        def __init__(self):
+            self.fetchval = AsyncMock(side_effect=[False, False, True, True])
+            self.terminate = Mock()
+
+    class _Acquire:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    connection = _Connection()
+    advisory_pool = Mock()
+    advisory_pool.acquire.return_value = _Acquire(connection)
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._ensure_advisory_pool = AsyncMock(return_value=advisory_pool)
+
+    with patch("kestrel_sovereign.storage.db.postgres.asyncio.sleep", AsyncMock()) as sleep:
+        async with backend.polled_advisory_lock((11, 22)):
+            pass
+
+    assert connection.fetchval.await_args_list == [
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_try_advisory_lock($1, $2)", 11, 22),
+        call("SELECT pg_advisory_unlock($1, $2)", 11, 22),
+    ]
+    assert sleep.await_count == 2
+    connection.terminate.assert_not_called()
 
 
 def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():
@@ -132,3 +576,115 @@ def test_autocommit_write_gives_up_after_max_retries():
     with pytest.raises(QueryError):
         asyncio.run(main())
     assert pool.calls == 5  # initial + 4 retries
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_cleans_primary_after_advisory_failure_and_retries():
+    """A failed advisory close cannot strand its handle or skip primary cleanup."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Pool:
+        def __init__(self, *, fail_once: bool = False) -> None:
+            self.fail_once = fail_once
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("advisory close failed")
+
+    advisory = _Pool(fail_once=True)
+    primary = _Pool(fail_once=True)
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = True
+
+    with pytest.raises(RuntimeError, match="advisory close failed"):
+        await backend.close()
+
+    assert advisory.close_calls == 1
+    assert primary.close_calls == 1
+    assert backend._advisory_pool is advisory
+    assert backend._pool is primary
+
+    await backend.close()
+    assert advisory.close_calls == 2
+    assert primary.close_calls == 2
+    assert backend._advisory_pool is None
+    assert backend._pool is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_releases_external_primary_after_advisory_failure():
+    """from_pool never closes its primary pool, even when advisory close fails."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _AdvisoryPool:
+        async def close(self) -> None:
+            raise RuntimeError("advisory close failed")
+
+    class _ExternalPool:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    advisory = _AdvisoryPool()
+    primary = _ExternalPool()
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = False
+
+    with pytest.raises(RuntimeError, match="advisory close failed"):
+        await backend.close()
+
+    assert backend._advisory_pool is advisory
+    assert backend._pool is None
+    assert primary.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_close_drains_both_pools_through_repeated_cancellation():
+    """Caller cancellation is delayed until owned advisory and primary closes finish."""
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _BlockingPool:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.entered.set()
+            await self.release.wait()
+
+    advisory = _BlockingPool()
+    primary = _BlockingPool()
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._advisory_pool = advisory
+    backend._pool = primary
+    backend._owns_pool = True
+
+    closing = asyncio.create_task(backend.close())
+    await asyncio.wait_for(advisory.entered.wait(), timeout=1.0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    advisory.release.set()
+    await asyncio.wait_for(primary.entered.wait(), timeout=1.0)
+    primary.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1.0)
+
+    assert advisory.close_calls == 1
+    assert primary.close_calls == 1
+    assert backend._advisory_pool is None
+    assert backend._pool is None

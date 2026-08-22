@@ -3,11 +3,13 @@
 Serves stored files (avatars, documents, etc.) via content-addressable hashes.
 """
 
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import Response, FileResponse
+import asyncio
 import logging
 import re
 from pathlib import Path
+
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import Response
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,8 @@ def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
     """
     from kestrel_sovereign.features.isolated_runtime import (
         IsolatedRuntimeNamespaceError,
-        agent_runtime_dir,
+        IsolatedRuntimePreparationError,
+        resolve_agent_runtime_dir,
     )
 
     # The proxy's legacy no-storage fallback exists solely to preserve its
@@ -60,8 +63,8 @@ def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
         return None
 
     try:
-        base = agent_runtime_dir(agent)
-    except IsolatedRuntimeNamespaceError:
+        base = resolve_agent_runtime_dir(agent)
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError, OSError):
         return None
     return base / "channel_link_artifacts" / f"{channel_type}_{name}"
 
@@ -80,10 +83,30 @@ async def serve_channel_link_qr(channel_type: str, request: Request):
         raise HTTPException(status_code=400, detail="Invalid channel type")
     agent = get_agent(request)
     path = channel_artifact_path(agent, channel_type, "link_qr.png")
-    if path is None or not path.exists():
+    if path is None:
         raise HTTPException(status_code=404, detail="No pairing QR available")
-    return FileResponse(
-        str(path),
+    from kestrel_sovereign.features.isolated_runtime import (
+        IsolatedRuntimeNamespaceError,
+        IsolatedRuntimePreparationError,
+        read_private_artifact,
+    )
+
+    try:
+        # Keep both the no-follow open and bounded descriptor read off the
+        # event loop. Returning bytes is deliberate: FileResponse would reopen
+        # the tenant-controlled pathname after validation and restore the race.
+        content = await asyncio.to_thread(read_private_artifact, path)
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError, OSError):
+        logger.warning(
+            "Refusing unsafe or unavailable %s channel QR artifact",
+            channel_type,
+            exc_info=True,
+        )
+        content = None
+    if content is None:
+        raise HTTPException(status_code=404, detail="No pairing QR available")
+    return Response(
+        content=content,
         media_type="image/png",
         headers={"Cache-Control": "no-store, max-age=0"},
     )

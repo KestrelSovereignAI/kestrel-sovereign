@@ -146,7 +146,7 @@ ad hoc.
 | Multi-currency agent wallets | [`kestrel_feature_wallet/wallet_feature.py`][wf] | FIL, USDC, USDT on FEVM/Ethereum/Polygon |
 | Stripe **on-ramp** (fiat → crypto, into agent wallet) | [`kestrel_feature_wallet/onramp/stripe_onramp.py`][onramp] | Built; card never enters Kestrel |
 | Lighthouse provider with unused key resolver hook | [`storage/providers/lighthouse_provider.py:72-82`][lhp] | Constructor accepts `key_resolver`; `_get_api_key()` delegates to it; never wired |
-| Setup wizard with step modules | [`kestrel_sovereign/setup/`][setup] | Steps: agent, emancipation, integrations, keys, llm, talon, verify |
+| Setup wizard with step modules | [`kestrel_sovereign/setup/`][setup] | Core steps: agent, emancipation, integrations, keys, llm, payments, verify; external feature packages contribute optional named steps |
 | Emma-named scripts (audited individually) | `scripts/provision_emma_openrouter.py`, `scripts/rotate_emma_key.py`, `scripts/emma_scheduler.py` | First two have real functionality with bad Emma-defaulted names (provision-and-persist-key, AEAD passphrase rotation) — generalize. Third is one-off Emma scaffolding (born in initial commit, never modified, never invoked anywhere) — delete. Phase 0 handles all three. |
 | `kestrel-sovereign-sdk` companion repo | `/Volumes/data2/projects/kestrel-sovereign-sdk` | Clean package layout; active SDK work on `feat/1094-sdk-database` |
 

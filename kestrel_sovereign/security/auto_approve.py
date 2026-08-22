@@ -29,7 +29,7 @@ sink live on :class:`PermissionStore` (which already owns the agent DB).
 Intentional scope (epic #1290): auto-approve governs the **internal
 computer_use gate** signature (``feature_name="computer_use"`` with an
 ``argv`` payload). That is the path the loop-closing primitive
-``talon_file_and_claim`` uses — a direct ``cu.shell()`` method call, with
+feature-owned coding workflows may use — a direct ``cu.shell()`` method call, with
 no PRE_TOOL_USE hook in front of it — so the acceptance criterion is met
 and every run is audited *and* exit-code-finalized in
 ``computer_use._audit_run``. A direct LLM ``computer_use.shell`` *tool*

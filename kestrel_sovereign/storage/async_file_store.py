@@ -15,7 +15,7 @@ from .async_graph_store import (
     GraphNode,
     record_graph_node_owner,
 )
-from .encryption import get_fernet, encrypt_bytes, decrypt_bytes, DecryptionError
+from .encryption import get_fernet, encrypt_bytes, decrypt_bytes
 from kestrel_sovereign.kestrel_config.constants import MAX_FILE_SIZE
 
 

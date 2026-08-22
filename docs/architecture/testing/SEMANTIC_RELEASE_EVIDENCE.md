@@ -1,0 +1,538 @@
+---
+type: Architecture Spec
+title: Semantic Knowledge Release Evidence
+description: Immutable, content-free evidence contracts for semantic knowledge conformance, parity, erasure, performance, diagnostics, and live-agent verification.
+resource: /docs/architecture/testing/SEMANTIC_RELEASE_EVIDENCE.md
+tags:
+- docs
+- architecture
+- testing
+- semantic-knowledge
+timestamp: '2026-07-31T00:00:00Z'
+status: active
+owner: architecture
+canonical: true
+generated: false
+privacy: public
+---
+
+# Semantic Knowledge Release Evidence
+
+The semantic-KB release artifact is an immutable evidence contract, not a
+feature switch or a release claim. Its catalog lives in
+[`kestrel_sovereign.knowledge.release_evidence`](../../../kestrel_sovereign/knowledge/release_evidence.py)
+and supplies every gate's exact runner, command-pattern digest, execution
+environment, fixture ID/digest, observation schema, and (where needed) drill
+correlation. A record is accepted only when it binds to that current `GateSpec`.
+
+**Current status:** the catalog and assembly tooling exist, but no release
+evidence has been executed for this rollout. A newly generated artifact is
+always `ready: false`; [#2753](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2753)
+remains open. Do not infer readiness, a completed migration, or a shipped
+semantic capability from this document or from a passing unit test.
+
+The artifact stores only content-free structure: declared IDs, digests,
+aggregate counts, booleans, and safe opaque references. It never stores test
+stdout, assertions, prompts, tenant IDs, source locators, DSNs, credentials, or
+arbitrary command lines.
+
+## Catalog-bound execution and unverified structural assembly
+
+The public CLI has no `record -- <argv>` escape hatch and does **not** accept
+an observation JSON object or benchmark samples to create a passed result.
+`record` and `budget` are retained only as fail-closed migration errors.
+`run` resolves a pre-registered, immutable `(runner_id, command_id)` workload
+from the current catalog; it has no caller argv, artifact reference, or
+observation fields. After the workload returns a schema-valid content-free
+measurement, the execution authority creates an opaque artifact reference and
+signs the exact run digest with Ed25519.
+
+The public `assemble` command is deliberately **not** a signature-verification
+or release-verdict surface. It reads no trust policy from CLI inputs or process
+environment. It validates catalog, schema, digest, artifact, budget, drill,
+and correlation bindings, then emits the separate structural contract
+`semantic-kb-v1-release-evidence-structural-v1` with fixed
+`"ready": false` and `"trust_status": "unverified"`. A
+`"structurally_complete": true` result means only that every submitted field
+fits the catalog; it is never proof that the signers are trusted or that a
+release is ready.
+
+Signature verification remains an explicit in-process verifier API:
+`apply_evidence_records` and `apply_performance_budgets` require a
+`TrustedExecutionPolicy`. That policy and any signed verification receipt must
+be supplied by an independent Talon/CI verifier, not by a report author or the
+public CLI. Until such a verifier issues a receipt, #2753 remains open and no
+assembled artifact is a release claim. Within that verifier policy,
+`external_ci` keys may attest only the catalog's `external_ci` runner;
+`catalog_runner` keys cannot attest that runner, and neither source can
+substitute for the other.
+
+The built-in executable workloads are the stable-only registry contract plus
+the catalog-bound core pytest contracts for advertised RDF/RDFS/OWL/SHACL/
+SPARQL fixtures, both declared backend-parity cases, maintenance diagnostics,
+and legacy-fact migration equivalence. Their selectors are source-declared in
+`release_evidence_workloads.py`; the runner accepts no selector, test argument,
+observation, or artifact input and discards raw pytest output after reducing a
+temporary JUnit report to the catalog's aggregate schema. A skipped required
+PostgreSQL case is a failed record, never evidence from SQLite.
+
+The immutable benchmark runner resolves every declared semantic-benchmark
+command. For `startup`, assertion write/validation, bounded inference, hybrid
+recall, storage growth, and representative migration it creates three fresh,
+agent-scoped `AsyncStorage` samples for the declared backend and emits a
+signed `ms` budget. Storage growth instead reads the actual backend footprint:
+the SQLite database plus active journal/WAL sidecars, or PostgreSQL database
+size; elapsed time is never relabeled as bytes. PostgreSQL runs require both
+`KESTREL_SEMANTIC_RELEASE_ISOLATED=1` and an operator-provided
+`KESTREL_SEMANTIC_RELEASE_ISOLATED_POSTGRES_ADMIN_DSN`. The runner creates a
+random database named `kestrel_semantic_release_<32 hex>` beneath that admin
+connection, passes only the generated DSN to parity/benchmark work, terminates
+its sessions, drops it, and verifies removal. It never inherits
+`TEST_POSTGRES_URL`, `DATABASE_URL`, or an app database. The admin and generated
+DSNs are never emitted. If either authorization/configuration step is absent or
+the disposable database cannot be created or verified removed, the workload
+writes a content-free nonzero block.
+
+Changed-work and unchanged-work sleep retain their catalog `kite_http` mode.
+They block with `kite_http_benchmark_runner_required` until the dedicated Kite
+HTTP runner measures them; an in-process maintenance call is not an allowed
+substitute. The stable, experimental, persisted-data, and correlated HTTP
+erasure drills likewise remain owned by their dedicated HTTP runners.
+`run` writes that content-free block but exits nonzero so automation cannot
+mistake an unavailable workload for successful execution; use the explicit
+`block` command to record an independently observed block. They cannot become
+passes through artifact JSON.
+
+Start with a fresh conservative template:
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence template \
+  --output /tmp/semantic-release-template.json
+```
+
+For example, a protected CI signing key can run the currently registered
+stable-only registry workload. The key file contains raw 32-byte
+lowercase-hex Ed25519 private-key material and must stay in the CI/host secret
+store rather than source control or a command-line value. It must be a regular
+file owned by the effective CI user, with no group or other permission bits;
+symlinks are rejected.
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence run \
+  --gate stable_only_capability_selection \
+  --signing-key-file /secure/semantic-release.ed25519 \
+  --issuer-id kestrel_ci \
+  --key-id release_runner \
+  --output /tmp/stable-only-registry.json
+
+uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
+  --record /tmp/stable-only-registry.json \
+  --output /tmp/semantic-release-evidence.json
+```
+
+An independent verifier's trust policy stores public information only. Each
+key fixes an issuer/key ID, `catalog_runner` or `external_ci` source, raw
+Ed25519 public key, and allowed runner IDs. It is verifier-owned configuration,
+not an attachment supplied by a record or an input to `assemble`:
+
+```json
+{
+  "keys": [{
+    "issuer_id": "kestrel_ci",
+    "key_id": "release_runner",
+    "source": "catalog_runner",
+    "public_key": "<64-lowercase-hex-ed25519-public-key>",
+    "runner_ids": ["registry", "pytest", "semantic_benchmark", "kite_http"]
+  }]
+}
+```
+
+Safe references are deliberately narrow: exactly
+`ci://sha256/<64-lowercase-hex>`, `artifact://sha256/<64-lowercase-hex>`, or
+`evidence://sha256/<64-lowercase-hex>`, alongside the artifact's SHA-256
+digest; the SHA-256 component embedded in the locator must exactly equal
+`artifact_digest`. The locator is opaque—not a path, label, subject, user, or
+secret—and both the exact locator and digest are bound into the run digest.
+URLs with query strings, identity-bearing parts, secret-like labels, traversal
+segments, or connection strings are rejected. A blocked gate has no fake
+artifact payload:
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence block \
+  --gate postgres_assertion \
+  --reason-code postgres_service_unavailable \
+  --output /tmp/postgres-assertion-blocked.json
+```
+
+`assemble` starts from the current catalog, rejects unknown or duplicate gate
+records, preserves missing work as `not_run` or `blocked`, and reports
+structural completeness for inspection. It always emits `ready: false` and
+includes `trust_verification_required` as a blocker. JSON fields named
+`ready`, supplied keys, and environment variables cannot make the structural
+artifact ready.
+
+## Standards matrix and stable capability boundary
+
+The template records exact offline registry pins and exact runtime library
+versions. The matrix carries the official fixture ID/digest and predeclared
+runner contract for the advertised RDF 1.1, RDFS 1.1, OWL 2 RL, SHACL 2017,
+and read-only SPARQL 1.1 checks. A required library resolving as `unavailable`
+blocks artifact construction rather than becoming a pass.
+
+RDF 1.2, SHACL 1.2, and SPARQL 1.2 remain explicitly unadvertised draft gates;
+only those gates may be `skipped` with `outside_advertised_capability`. The
+stable registry capability-rejection gate is separate from live behavior:
+
+- `stable_only_capability_selection` proves the registry rejects an
+  experimental capability without opt-in.
+- `kite_http_stable_only_release_drill` proves the isolated Kite HTTP path
+  works under the stable-only profile.
+- `kite_http_experimental_enabled_release_drill` independently proves the
+  explicit experimental-enabled HTTP path.
+- `stable_persisted_data_no_canonical_migration_drill` proves persisted stable
+  data stays usable without a canonical-data migration.
+
+All four are required gates. A registry unit check is not a substitute for the
+two HTTP invoke drills, and an experimental-enabled result is not evidence for
+stable-only operation.
+
+### Per-agent capability selection
+
+An agent without a `[semantic_capabilities]` table is stable-only. An explicit
+stable selection may contain only `mode = "stable"`. Draft mode is all or
+nothing: it must select exact registry capability/version pairs for RDF 1.2,
+SPARQL 1.2, and SHACL 1.2, plus an exact SHACL 1.2-compatible shape-set pin.
+For example, the current snapshot-pinned experiment is:
+
+```toml
+[semantic_capabilities]
+mode = "experimental"
+
+[semantic_capabilities.rdf12]
+capability = "rdf-profile:rdf12-cr-20260407-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.sparql12]
+capability = "query-profile:sparql12-20260605-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.shacl12]
+capability = "validation-profile:shacl12-core-20260602-experimental"
+version = "0.1.0"
+
+[semantic_capabilities.shape_set]
+identifier = "kestrel-assertion-shapes-shacl12-experimental"
+version = "0.1.0"
+```
+
+The host parses and verifies every selected local resource before publishing
+the agent. Missing, partial, unknown, mismatched, or incompatible selections
+fail closed. The selected capability map is then passed to the bounded sleep
+maintenance coordinator and appears only as content-free `!sleep` diagnostics.
+It changes no canonical assertion identity, storage schema, or migration path;
+disabling the experiment returns to the stable profile without a migration.
+
+## Backend parity and measured budgets
+
+SQLite and PostgreSQL each require distinct results for assertion,
+ownership/privacy, validation, inference/retraction, migration, corpus export,
+and retrieval. A skipped PostgreSQL service stays blocked; a SQLite result
+cannot satisfy its PostgreSQL counterpart. The artifact never stores a DSN.
+
+Every performance workload is also separate by backend and execution mode:
+startup; assertion write/validation; bounded inference; hybrid recall;
+changed-work and unchanged-work sleep; storage growth; and representative
+migration. Duration metrics use `ms`; storage growth uses the measured
+post-operation minus pre-operation backend footprint in `bytes` (a SQLite file
+size or Postgres relation-size reader), never elapsed time relabeled as bytes.
+No timeout is a performance budget.
+
+An allowlisted production benchmark workload must measure at least three
+samples, emit the matching catalog observation, and write the signed record
+and signed budget together. The public CLI intentionally has no
+`--observation-json` or `--samples` route for this. Until a named benchmark
+workload is registered, `run` records a block and the target remains a release
+blocker. A registered workload is invoked in this shape:
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence run \
+  --gate performance_hybrid_recall_sqlite_integration \
+  --signing-key-file /secure/semantic-release.ed25519 \
+  --issuer-id kestrel_ci \
+  --key-id benchmark_runner \
+  --output /tmp/hybrid-recall-sqlite-record.json \
+  --budget-output /tmp/hybrid-recall-sqlite-budget.json
+
+uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
+  --record /tmp/hybrid-recall-sqlite-record.json \
+  --budget /tmp/hybrid-recall-sqlite-budget.json \
+  --output /tmp/semantic-release-evidence.json
+```
+
+The record and budget must bind to the same immutable performance gate,
+backend, mode, environment, fixture, and successful evidence digest.
+
+## Correlated erasure and external adapter evidence
+
+One release erasure drill has the catalog-defined content-free ID/digest
+`semantic_erasure_release_drill_v1`. Every required core stage and every
+external adapter stage must carry that same binding; a mismatched or omitted
+drill is rejected. Core records cover active assertions, derivations, vector
+index, recall candidates, exports, governed/future corpus output, and
+projection candidates. The parametric-self external-CI contract owns served
+adapter eligibility because only that adapter can observe its real serving
+state.
+
+The `export_snapshots`, `governed_corpus`, and `future_corpus` stage records
+must be backed by the tenant-scoped governed artifact lifecycle: an exact
+checkpoint-fenced registration, a content-free aggregate observation, and—on
+erasure—a verifier-accepted, consumer-signed physical-deletion proof produced
+by the registered owner's deletion callback. The retained receipt carries only
+the content-free proof digest.
+A fresh empty export, Story Archive timeline export, or unrelated corpus is not
+evidence that a previously registered consumer artifact was deleted.
+
+The core-erasure storage drill accepts no caller-selected operation ID or
+prefix-shaped correlation.  Only the authenticated typed loopback endpoint can
+exchange its durably committed, exact request nonce for an opaque one-shot
+authority.  That authority is bound to the endpoint's exact asyncio task, not
+merely task-local context (which child tasks inherit), and is bound to
+`erasure_core_snapshot` and its server-derived correlation, and consumed before
+the storage owner touches durable state.  Direct construction, a same-process
+call outside that endpoint scope, a malformed receipt, reuse, a cross-operation
+attempt, or a capability retained after the route returns is rejected; a
+cross-operation attempt burns the authority.  Non-erasure typed probes retain
+no capability receipt.  Consequently no lower-level storage call can be
+relabeled as core release evidence.
+
+Every catalog-created Kite home is an owner-managed temporary directory. Its
+`finally` cleanup runs after both successful and failed prepare/start/invoke
+attempts and removes the ephemeral SQLite database, signing key, nonce ledger,
+and child log. Only sanitized lifecycle diagnostics (catalog gate and backend)
+are retained by the parent process; no forensic home is kept with release
+evidence secrets or test data.
+
+`kestrel-feature-parametric-self` is an external optional consumer, not a
+dependency imported by this repository. Its report is absent from a new
+template and therefore remains a readiness blocker until its envelope contains
+exactly four signed records in catalog order:
+
+- `erasure_served_adapter_eligibility` first, followed by
+  `external_corpus_consumed`, `external_candidate_invalidated`, and
+  `external_served_eligibility_rejected`;
+- the same verifier-issued nonce, external-CI runner revision, core contract
+  digest, and erasure drill binding on every record; and
+- each record's exact gate-spec digest, evidence-result digest, and artifact
+  reference/digest.
+
+The capability report inside that envelope remains intentionally narrower: it
+attests exactly the three `external_*` capability records, never the served
+adapter record. It must contain all of:
+
+- the exact repository, immutable capability source revision, and evidence
+  runner revision;
+- an attestation for `external_corpus_consumed`,
+  `external_candidate_invalidated`, and
+  `external_served_eligibility_rejected` only;
+- those three stages' exact gate-spec digest, evidence-result digest, artifact
+  reference/digest, and common drill binding; and
+- the exact core release-evidence contract digest and a new 64-hex run nonce;
+  and
+- a report digest over all of those fields.
+
+For this contract the immutable capability source is
+`KestrelSovereignAI/kestrel-feature-parametric-self` at
+`7aad9bb924f61434485e5eae22e61c95d3f97187`. It describes the governed adapter
+runtime under test. Run its standalone two-phase release CLI: prepare the
+candidate/served eligibility before core physical erasure, then observe the
+same drill after erasure. The current verifier policy pins the external CI
+runner to merged parametric-self PR #27 squash commit
+`761728de2617cf43033aa5bebcc1d66c923897c4`. That full 40-hex
+`evidence_runner_revision` must resolve a clean, verifiable VCS `HEAD` at
+runtime, is bound into every external record's signed run digest, and must
+equal both the envelope/report field and the verifier's expected runner
+revision. The capability-source baseline above remains distinct: it identifies
+the governed adapter contract under test, not the evidence emitter. Another
+capability revision, omitted runner revision, or runner/report/policy mismatch
+remains non-evidence even if its result fields look similar.
+
+The core contract pin is not a self-referential runtime Git SHA. It is a
+SHA-256 over canonical JSON containing the release-evidence schema version,
+the semantic release contract identifier, and the declared-order external
+`gate_id`/gate-spec-digest pairs. It changes only when that immutable contract
+changes, so a feature can use a new report field without falsely claiming to
+have executed a future core checkout. The external JSON carries that
+`core_release_evidence_contract_digest` and `run_nonce`, but never a caller
+chosen freshness receipt. Core derives the receipt as SHA-256 over canonical
+JSON containing exactly `core_release_evidence_contract_digest`, `repository`,
+`capability_source_revision`, `evidence_runner_revision`, `run_nonce`, and the
+declared-order `record_digests` list. The report digest binds both revisions,
+the contract digest, and nonce. This is deliberately content-free: it carries
+no test output, database name, tenant, or source location.
+
+The nonce is verifier-issued, not producer-chosen. Before an external run, the
+independent verifier calls `ExternalFreshnessLedger.issue_challenge()` and
+persists its one-time nonce as `pending`; it sends that challenge to external
+CI over its authenticated control plane. External CI must bind the exact nonce
+into every external `EvidenceRecord` run digest before signing it, then bind it
+in the report. Trusted ingestion verifies all four record nonces against the
+report and atomically marks the challenge `consumed` while recording the
+core-derived receipt. Unknown, reused, and merely rewrapped nonces are
+rejected, so old signed records cannot become a fresh report.
+
+Only an independent Talon/CI verifier may ingest that report through
+`attach_external_capability_report`, which requires an explicit absolute path
+for an `ExternalFreshnessLedger` and an explicit `trusted_root`. The root must
+be a resolved owner-only verifier directory; every component from it through
+the ledger parent must likewise be a real owner-only directory, and the ledger
+is an owner-only regular file. This permits a private verifier root beneath a
+system-managed ancestor while refusing `/tmp` itself as a trust root. The
+ledger is securely created and inode-checked before and after SQLite opens it.
+The verifier atomically consumes each valid receipt once and rejects a replay
+even if a later verifier process creates a new ledger object for the same path.
+A report author cannot choose, reset, or supply the ledger. The public `assemble`
+CLI uses `attach_structural_external_capability_report` instead: it may
+preserve the structural JSON for inspection, but never consumes a receipt and remains
+`trust_status: "unverified"`, `ready: false`.
+
+Trusted ingestion additionally requires the independent verifier to pass its
+expected full `evidence_runner_revision` into
+`attach_external_capability_report`; omission or mismatch fails. That policy
+input is never accepted by the public structural assembler or report author.
+
+Trusted finalization uses the separate verifier-only module
+`kestrel_sovereign.knowledge.release_evidence_verifier_cli`, never the public
+`release_evidence` CLI. Its one protected owner-only configuration is rooted
+under a verifier-owned private directory and fixes the ledger path, public-key
+policy, expected external runner revision, `semantic_release_verifier` role,
+and distinct receipt signer. The executable reads only its host-provisioned
+fixed configuration locator: it has no `--config` argument or environment
+override, so a producer cannot select its own policy, ledger, or key. Every
+directory component below the verifier root is owner-only, non-symlinked, and
+rechecked around sensitive reads and writes; the receipt signer may not also
+be an execution-policy identity, including under different issuer/key labels
+that alias the same Ed25519 public key.
+
+After every signed core record/budget and the external report validate, the
+verifier stages content-addressed evidence and receipt files beneath that
+private root. Only then does one SQLite transaction consume the pending nonce
+and bind the external report's attestation digest to the evidence, policy, and
+receipt digests. The staged files are promoted with replacement-safe writes.
+If an output failure occurs before the transaction, the nonce remains pending;
+if a process dies after it, retrying the exact digest-bound finalization
+recovers the staged files and rejects a different receipt. The Ed25519 receipt
+signs the core release-evidence contract digest as well as both revisions and
+all receipt bindings. Finalization independently verifies that signature and
+recomputes the canonical evidence digest, then compares the policy digest,
+freshness receipt, nonce, capability revision, and runner revision against the
+exact evidence/report before staging or consuming. Its final ledger binding
+also covers both serialized payload digests and their verifier-rooted target
+paths. The public `assemble` command remains structural and
+cannot issue challenges, consume a ledger, emit a receipt, or set `ready: true`.
+
+External CI writes one signed envelope. The verifier-only CLI parses that
+exact envelope schema, rejects split external records or reports beside it,
+and structurally checks every enclosed record against the local catalog before
+freshness consumption:
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence_verifier_cli assemble \
+  --record /tmp/core-release-record.json \
+  --budget /tmp/core-performance-budget.json \
+  --external-envelope /tmp/parametric-self-erasure-envelope.json \
+  --output /secure/verifier/semantic-release-evidence.json \
+  --receipt-output /secure/verifier/semantic-release-receipt.json
+```
+
+The verifier still requires every required core record and budget; the command
+above abbreviates those repeated core inputs. Missing, duplicated, or
+substituted served evidence; another repository/revision; a different result,
+artifact, or drill remains rejected rather than being narrated as evidence.
+
+## Content-free diagnostics and Kite HTTP proof
+
+`semantic_maintenance_diagnostics_contract` is a required gate. The live
+`!sleep --consolidate-only` HTTP invoke surface must yield a positive
+content-free diagnostic count and zero redaction violations. Its structured
+diagnostic exposes bounded checkpoint/backlog state, fixed repair guidance,
+and only exact registry-verified capability labels.
+
+The diagnostic renderer does not accept a version merely because it resembles
+one: `v999` and `999.999.999` are omitted. An inference-profile hash is shown
+only when it reconstructs from exact local ontology/rule pins; an ontology is
+shown as its registry resource ID rather than its raw namespace. Missing or
+unverifiable producer profile/ontology fields are explicitly `omitted` or
+`unavailable`. No assertion terms, IDs, tenant data, source provenance, raw
+errors, or arbitrary capability-map values reach the HTTP response.
+
+Drive Kite through the isolated HTTP path described in
+[Live-Agent Dogfooding](LIVE_AGENT_DOGFOODING.md), not by calling a storage or
+service method directly. The required live gates cover paraphrased recall with
+provenance, contradiction/supersession, invalid-import quarantine, sleep,
+restart persistence, and post-delete non-recall. The release artifact records
+only the catalog-bound aggregate observation and approved artifact reference;
+the transcript remains in the isolated evidence environment.
+
+Kite has no public semantic-evidence command. Its fixed diagnostics and
+invalid-import probes are server-owned typed operations, available only to
+the loopback isolated test instance after bootstrap authentication, nonce
+consumption, and signed-response verification. They derive tenant scope,
+capability pins, active explicit-fact provenance, migration receipts, and the
+fixed validation budget in production storage code; callers supply none of
+those inputs and receive only aggregate counts.
+
+## Compatibility retirement is an observed decision
+
+`legacy_fact_migration_equivalence` is a dedicated non-readiness gate used only
+for compatibility retirement. A removal decision is bound to that exact gate
+ID, its current spec digest, and its passing run digest; a result from any
+other gate or an unrelated result digest is rejected.
+
+Telemetry is a separate content-free attestation with UTC start/end timestamps,
+an inventory digest, inventory-complete flag, unmigrated-eligible-row count,
+required-consumer count, artifact reference/digest, and a digest over the
+whole envelope. Create it with the safe CLI input, then attach it only during
+assembly:
+
+```bash
+uv run python -m kestrel_sovereign.knowledge.release_evidence telemetry \
+  --window-started-at 2026-07-30T00:00:00Z \
+  --window-ended-at 2026-07-31T00:00:00Z \
+  --inventory-digest SHA256_OF_TELEMETRY_INVENTORY \
+  --inventory-complete \
+  --unmigrated-eligible-rows 0 \
+  --required-consumer-count 0 \
+  --artifact-ref ci://sha256/SHA256_OF_TELEMETRY_ARTIFACT \
+  --artifact-digest SHA256_OF_TELEMETRY_ARTIFACT \
+  --output /tmp/legacy-fact-retirement-telemetry.json
+
+uv run python -m kestrel_sovereign.knowledge.release_evidence assemble \
+  --record /tmp/legacy-fact-migration-equivalence.json \
+  --retirement-telemetry /tmp/legacy-fact-retirement-telemetry.json \
+  --output /tmp/semantic-release-evidence.json
+```
+
+Only a complete inventory with zero eligible rows, zero required consumers,
+and the exact passing equivalence result can make the **structural** decision
+read `eligible_for_review`. That is not a trusted removal verdict: an
+independent verifier must validate the signed evidence before operator review
+and the migration/rollback policy may proceed. Any absent, mismatched, or
+incomplete component leaves the path at `retain`.
+
+## Verification order
+
+The structural artifact is implementation-side evidence, not a substitute for
+independent review or CI. Run the focused contract tests first, then actual
+backend and live-agent evidence when those environments are available:
+
+```bash
+uv run pytest tests/unit/test_semantic_release_evidence.py \
+  tests/unit/test_sleep_observability.py -q
+```
+
+Then follow the test pyramid in [Testing Guide](TESTING_GUIDE.md): targeted
+backend integration, isolated Kite HTTP dogfooding, independent
+`talon_verify`, and CI. The independent verifier—not `assemble`—must emit any
+signed verification receipt and own its trust policy. If a review changes live
+wiring, rerun the affected catalog records and re-dogfood before describing the
+release as observed.

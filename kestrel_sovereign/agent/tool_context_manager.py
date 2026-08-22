@@ -6,8 +6,7 @@ Extracted from ContextManager to improve modularity and maintainability.
 """
 
 import logging
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
-from datetime import datetime, timezone
+from typing import Dict, Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage import AsyncStorage
@@ -78,8 +77,9 @@ class ToolContextManager:
         """
         Get detailed context window status for agent introspection.
 
-        Uses the same data path as the LLM to ensure the status report
-        reflects what the model actually receives.
+        This legacy helper estimates utilization from session history. It does
+        not reproduce production retrieval, elastic borrowing, lumpy pruning,
+        or provider framing.
 
         Args:
             counter: TokenCounter for token counting
@@ -92,7 +92,7 @@ class ToolContextManager:
         """
         from .token_budget import create_budget
 
-        # Use provided history (same as LLM sees) or fetch with same constraints
+        # Use provided history or approximate the production 50-row preload.
         if history is None:
             conv_store = self._get_conversation_store()
             if conv_store:

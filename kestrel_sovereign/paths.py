@@ -1,6 +1,6 @@
 """Project-root and package-root resolution.
 
-Three questions, three answers:
+Four questions, four answers:
 
   1. **Where does the user's data live?** — agent DBs, ``multi_agent.toml``,
      ``kestrel.toml``, ``.env``, ``logs/``. Answered by :func:`project_dir`.
@@ -9,6 +9,8 @@ Three questions, three answers:
   3. **Where does implicit host-runtime state live?** — supervised services,
      fleet/host feature state, and other data that must not appear merely
      because Kestrel launched from a clone. Answered by :func:`host_data_dir`.
+  4. **How does that home's ``.env`` reach the process?** — deliberately, at an
+     entry point, naming the home. Answered by :func:`load_project_env`.
 
 The historical answer for the first two was the same:
 ``Path(__file__).parent.parent``.
@@ -89,6 +91,95 @@ def project_dir() -> Path:
     cwd = Path.cwd()
     explicit_home = os.environ.get("KESTREL_HOME")
     return _resolve_cached(explicit_home, str(cwd))
+
+
+def load_project_env(home: Path, *, exclude: tuple[str, ...] = ()) -> None:
+    """Load a resolved project home's ``.env`` into ``os.environ``.
+
+    The one place a process may pull ``.env`` into its environment, and it
+    belongs to a *named* home rather than to whatever directory the process
+    happened to start in. Import-time and constructor-time loads have twice
+    been custody defects: ``inception_service`` seeded the wrong
+    ``KESTREL_DATA_KEY`` from the current directory (#2468), and
+    ``LLMService.__init__`` re-ran a bare ``load_dotenv()`` on every
+    construction, silently resurrecting variables a caller had deliberately
+    unset (#2896).
+
+    Uses python-dotenv's own parser (``dotenv_values``) — the same one the
+    runtime uses, so a plain value is the identical byte string boot will see —
+    and ``setdefault`` semantics so a genuinely exported value stays
+    authoritative.
+
+    Equivalent to ``load_dotenv(override=False)`` for every value that does not
+    interpolate another variable. It is **not** equivalent for ``${VAR}``:
+    ``dotenv_values`` fixes ``override=True`` internally, so a reference
+    resolves against the file's own bindings where ``load_dotenv(override=
+    False)`` would prefer an exported one. No shipped ``.env`` template uses
+    interpolation, and ``server.py`` still boots through the other call, so the
+    two can disagree there until they are aligned.
+
+    ``exclude`` names keys to skip. The data key is excluded when this runs
+    *before* custody resolution so that seeding the persisted value into
+    ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
+    """
+    env_path = home / ".env"
+    if not env_path.exists():
+        return
+    from dotenv import dotenv_values
+
+    for key, value in dotenv_values(str(env_path)).items():
+        if value is None or key in exclude:
+            continue
+        os.environ.setdefault(key, value)
+
+
+def spawned_agent_env(project_dir: Path) -> dict:
+    """The environment ``kestrel start`` hands a spawned agent process.
+
+    The launch authority for every agent in ``multi_agent.toml``, factored out
+    of ``multi_agent.process_manager.ProcessManager._load_env`` so that a tool
+    reasoning about a running agent can ask the launcher instead of guessing.
+
+    Note the precedence, which is the **opposite** of :func:`load_project_env`
+    above: the launcher copies ``os.environ`` and then lets the project ``.env``
+    overwrite it, so the file wins. That disagreement is real and predates this
+    function — a spawned agent is configured by the file, while a process that
+    boots through ``load_project_env`` keeps its exported values. Reconciling
+    the two is a boot-semantics change, not something to settle inside a
+    caller; what matters here is that a caller asking "which database do the
+    agents read" gets the launcher's answer, not the other one's.
+
+    Returns a copy. Nothing is exported: the point is to describe a child
+    process, not to become one.
+    """
+    from dotenv import dotenv_values
+
+    env = os.environ.copy()
+    env_file = project_dir / ".env"
+    if env_file.exists():
+        env.update({
+            key: value
+            for key, value in dotenv_values(env_file).items()
+            if value is not None
+        })
+    return env
+
+
+def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
+    """The ``KESTREL_DATA_KEY`` a *named* agent is actually started with.
+
+    ``ProcessManager.start_agent`` applies ``KESTREL_DATA_KEY_<NAME>`` over the
+    fleet-wide key *after* building the environment, so the value in
+    :func:`spawned_agent_env` is the pre-override one. A caller comparing
+    custody against that would reject a correct per-agent key and accept a
+    wrong one — which is worse, because it writes blobs the agent cannot read.
+
+    Kept beside ``spawned_agent_env`` so the pair stays a faithful description
+    of one launch, rather than two half-descriptions that drift apart.
+    """
+    return env.get(f"KESTREL_DATA_KEY_{agent_name.upper()}") or env.get(
+        "KESTREL_DATA_KEY"
+    )
 
 
 def host_data_dir() -> Path:

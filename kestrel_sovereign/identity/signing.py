@@ -14,15 +14,10 @@ Verification:
 1. Recompute content hash
 2. Verify signature using the public key from DID document
 """
-import hashlib
 import logging
 from pathlib import Path
 from typing import Optional, Tuple
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.exceptions import InvalidSignature
 
 from .identity_package import AgentIdentityPackage
 from .protected_export import (
@@ -366,7 +361,6 @@ def _verify_v2_signatures(
     )
     from kestrel_sovereign.security.multikey import (
         multibase_to_public_key,
-        public_key_to_multibase,
     )
 
     # Trust anchor: load the agent's hybrid identity from the
