@@ -35,6 +35,7 @@ additions"):
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import inspect
@@ -86,6 +87,17 @@ class RegistrationError(ValueError):
     Caught only at startup / source-add time. At dispatch time, an unknown
     source name produces `Status.DROPPED_VALIDATION` instead.
     """
+
+
+#: A feature holds sources in two independent roles: ones it registered itself,
+#: and ones its declared contributions activated. They tear down by different
+#: paths and either can fail alone, so they are separate claims (issue #3053).
+CLAIM_IMPERATIVE = "imperative"
+CLAIM_CONTRIBUTION = "contribution"
+
+#: Marks the host as a holder of a source (issue #3053). The host outlives every
+#: feature, so this claim is never released — only `unregister` clears it.
+_HOST_CLAIM = "host"
 
 
 class RegistrationPolicy(enum.Enum):
@@ -155,12 +167,30 @@ class SourceRegistry:
 
     def __init__(self) -> None:
         self._sources: dict[str, SourceRegistration] = {}
+        # Who holds each source, in registration order — THE ownership record
+        # (issue #3053).
+        #
+        # Ownership used to be kept by the callers instead, in two places that
+        # could not see each other: `Feature._owned_signal_source_names` for
+        # sources a feature registers itself, and
+        # `ActiveFeatureContributions.registered_sources` for ones it declares.
+        # Both applied the same rule — only a newly-created source is yours —
+        # and neither knew the other existed, so a feature that did both could
+        # tear down a source another feature was still dispatching against.
+        #
+        # It belongs here: "who registered this source" is a fact about the
+        # source, and this is what holds the sources. A claim is released by its
+        # holder; the source itself goes when the last claim does.
+        self._claims: dict[str, list] = {}
+        self._claim_owners: dict[int, object] = {}
+        #: Active `claims_acquired` scopes, innermost last.
+        self._acquisition_logs: list = []
 
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
 
-    def register(self, registration: SourceRegistration) -> None:
+    def register(self, registration: SourceRegistration, *, owner=None) -> None:
         self._validate(registration)
         if registration.name in self._sources:
             raise RegistrationError(
@@ -168,6 +198,159 @@ class SourceRegistry:
                 "Re-registration is not supported; restart the process to change."
             )
         self._sources[registration.name] = registration
+        self._claim(registration.name, owner)
+
+    # ------------------------------------------------------------------
+    # Ownership (issue #3053)
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def claims_acquired(self, owner):
+        """Record exactly the claims ACQUIRED inside the block.
+
+        Callers with a rollback path kept deriving "what did I just take?" by
+        hand, and three separate sites got it wrong three different ways: a host
+        claim retained so a feature could never release its source; a claim that
+        PREDATED the operation released, deleting a live source; and owners
+        compared by equality, so a distinct-but-equal instance's claim went
+        untracked.
+
+        Only the registry knows whether a claim was actually added, so it
+        reports it. Yields the list of names acquired; unwind with
+        :meth:`release_acquired` (issue #3053).
+        """
+        acquired: list = []
+        self._acquisition_logs.append(acquired)
+        try:
+            yield acquired
+        finally:
+            self._acquisition_logs.pop()
+
+    def release_acquired(
+        self, acquired, owner, role: str = CLAIM_CONTRIBUTION
+    ) -> None:
+        """Release exactly the claims recorded by :meth:`claims_acquired`."""
+        key = _HOST_CLAIM if owner is None else (id(owner), role)
+        for name in acquired:
+            holders = self._claims.get(name)
+            if not holders or key not in holders:
+                continue
+            holders.remove(key)
+            self._forget_owner_if_unreferenced(key)
+            if not holders:
+                self._claims.pop(name, None)
+                self._sources.pop(name, None)
+
+    def _record_acquisition(self, name: str) -> None:
+        # EVERY active scope, not just the innermost: `register_batch` opens
+        # its own scope inside a caller's, and an acquisition made there
+        # happened inside both. Recording only the innermost left the outer
+        # rollback believing it had taken nothing.
+        for log in self._acquisition_logs:
+            log.append(name)
+
+    def _claim(self, name: str, owner, role: str = CLAIM_CONTRIBUTION) -> None:
+        """Record *owner* as a holder of *name*. ``None`` means the host.
+
+        The host IS a holder — it just never lets go. Recording nothing for it
+        made a feature that claimed an equivalent host source the sole holder,
+        so that feature's teardown deleted the host's own source. Explicit
+        sentinel: `release` can never drop it, and `unregister` (the boot
+        rollback's unconditional removal) clears it outright.
+        """
+        holders = self._claims.setdefault(name, [])
+        if owner is None:
+            if _HOST_CLAIM not in holders:
+                holders.append(_HOST_CLAIM)
+                self._record_acquisition(name)
+            return
+        key = (id(owner), role)
+        if key not in holders:
+            holders.append(key)
+            self._claim_owners[key] = owner
+            self._record_acquisition(name)
+
+    def _forget_owner_if_unreferenced(self, key) -> None:
+        """Drop the owner object once no claim list mentions it.
+
+        `_claim_owners` holds STRONG references so `owners_of` can hand back the
+        objects; leaving one behind after its last claim went would retain a
+        feature instance (and everything it holds) for the registry's lifetime.
+        """
+        if key is _HOST_CLAIM:
+            return
+        if not any(key in holders for holders in self._claims.values()):
+            self._claim_owners.pop(key, None)
+
+    def owners_of(self, name: str) -> tuple:
+        """The objects currently holding *name*, in the order they claimed it."""
+        seen: list = []
+        for key in self._claims.get(name, ()):
+            if key is _HOST_CLAIM or key not in self._claim_owners:
+                continue
+            owner = self._claim_owners[key]
+            if not any(owner is existing for existing in seen):
+                seen.append(owner)
+        return tuple(seen)
+
+    def release(self, name: str, owner, role: str = CLAIM_CONTRIBUTION) -> bool:
+        """Drop *owner*'s claim on *name*; remove the source with the last one.
+
+        Returns True when the source itself was removed. This is what replaces
+        both private ledgers: a holder releases what it holds, and a source
+        another holder still needs simply does not go away — no transfer, no
+        reference count kept somewhere else, no second list to agree with.
+        """
+        holders = self._claims.get(name)
+        key = (id(owner), role)
+        if not holders or key not in holders:
+            return False
+        holders.remove(key)
+        self._forget_owner_if_unreferenced(key)
+        if holders:
+            return False
+        self._claims.pop(name, None)
+        return self._sources.pop(name, None) is not None
+
+    def adopt(
+        self, name: str, owner, *, created: bool, role: str = CLAIM_IMPERATIVE
+    ) -> None:
+        """Record *owner* as a holder AFTER the fact.
+
+        For call sites that cannot pass ``owner=`` at registration — the
+        channels feature duck-types an embedder-supplied registry and cannot
+        assume the keyword exists. Same ledger, claimed a moment later.
+
+        *created* says whether this owner is the source's creator (a
+        ``REGISTERED`` outcome). A creator takes the host's place, so its
+        teardown removes the source; a caller that merely rode an equivalent
+        incumbent claims alongside the host, which keeps the source alive.
+        """
+        if name not in self._sources:
+            return
+        if created:
+            holders = self._claims.setdefault(name, [])
+            if _HOST_CLAIM in holders:
+                holders.remove(_HOST_CLAIM)
+        self._claim(name, owner, role)
+
+    def release_all(self, owner, role: str = CLAIM_CONTRIBUTION) -> tuple:
+        """Release every claim *owner* holds IN THIS ROLE.
+
+        A feature is two independent dependents: what it registered itself
+        (``CLAIM_IMPERATIVE``) and what its declared contributions activated
+        (``CLAIM_CONTRIBUTION``). They are torn down by different code paths and
+        either can fail on its own — `_unregister_feature_runtime` deliberately
+        continues to `shutdown()` after a rejected `deactivate()` — so releasing
+        both together dropped a still-active contribution's claim and could take
+        its source with it (issue #3053).
+        """
+        removed = []
+        key = (id(owner), role)
+        for name in [n for n, h in self._claims.items() if key in h]:
+            if self.release(name, owner, role):
+                removed.append(name)
+        return tuple(removed)
 
     def unregister(self, name: str) -> bool:
         """Remove a source by name. Returns True if one was present.
@@ -178,12 +361,16 @@ class SourceRegistry:
         the deliberate inverse for the teardown path, not a mutate-behind-a-
         running-dispatcher tool.
         """
+        for key in self._claims.pop(name, ()):
+            self._forget_owner_if_unreferenced(key)
         return self._sources.pop(name, None) is not None
 
     def register_with_policy(
         self,
         registration: SourceRegistration,
         policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+        *,
+        owner=None,
     ) -> RegistrationOutcome:
         """Register a source under an explicit name-clash :class:`RegistrationPolicy`.
 
@@ -211,9 +398,32 @@ class SourceRegistry:
         existing = self._sources.get(registration.name)
         if existing is None:
             self._sources[registration.name] = registration
+            self._claim(registration.name, owner)
             return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
 
         if self.contract_equivalent(existing, registration):
+            # An equivalent re-registration is a no-op for the SOURCE and a real
+            # claim for the CALLER: it now depends on this source and must keep
+            # it alive until it lets go. Recording that is what stops the first
+            # holder's teardown pulling the source out from under the second.
+            #
+            # An ownerless re-registration is ambiguous on its face: it is
+            # either core saying "I need this source" or the imperative feature
+            # path, which registers ownerless and claims a moment later. The
+            # POLICY already says which.
+            #
+            # MANDATORY / IDEMPOTENT — the caller requires the source, so it is
+            # a holder. Without this, core registering an equivalent source a
+            # feature happened to create first (heartbeat: feature in phase 4,
+            # core in phase 6) recorded no claim, and disabling that feature
+            # deleted a source core was still running on.
+            #
+            # OPTIONAL — "nice to have", and the path every imperative feature
+            # site uses. Claiming here would staple a permanent host claim onto
+            # a feature's own source on a repeated `initialize()` and strand its
+            # handlers forever.
+            if owner is not None or policy is not RegistrationPolicy.OPTIONAL:
+                self._claim(registration.name, owner)
             return RegistrationOutcome(
                 registration.name, RegistrationState.ALREADY_EQUIVALENT
             )
@@ -240,6 +450,8 @@ class SourceRegistry:
         self,
         registrations: Iterable[SourceRegistration],
         policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+        *,
+        owner=None,
     ) -> list[RegistrationOutcome]:
         """Register several sources under one policy.
 
@@ -251,16 +463,23 @@ class SourceRegistry:
         """
         outcomes: list[RegistrationOutcome] = []
         newly_added: list[str] = []
-        try:
-            for registration in registrations:
-                outcome = self.register_with_policy(registration, policy)
-                outcomes.append(outcome)
-                if outcome.state is RegistrationState.REGISTERED:
-                    newly_added.append(outcome.name)
-        except RegistrationError:
-            for name in newly_added:
-                self._sources.pop(name, None)
-            raise
+        # Atomic means the CLAIMS unwind too: exactly the ones this batch took,
+        # host claims included, and nothing that predated it.
+        with self.claims_acquired(owner) as acquired:
+            try:
+                for registration in registrations:
+                    outcome = self.register_with_policy(
+                        registration, policy, owner=owner
+                    )
+                    outcomes.append(outcome)
+                    if outcome.state is RegistrationState.REGISTERED:
+                        newly_added.append(outcome.name)
+            except RegistrationError:
+                self.release_acquired(acquired, owner)
+                for name in newly_added:
+                    self._sources.pop(name, None)
+                    self._claims.pop(name, None)
+                raise
         return outcomes
 
     @staticmethod

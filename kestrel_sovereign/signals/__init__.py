@@ -76,6 +76,8 @@ from kestrel_sovereign.signals.prompt_overrides import (
     SourceRegistrationWithPromptOverride,
 )
 from kestrel_sovereign.signals.registry import (
+    CLAIM_CONTRIBUTION,
+    CLAIM_IMPERATIVE,
     RegistrationError,
     RegistrationOutcome,
     RegistrationPolicy,
@@ -127,6 +129,8 @@ __all__ = [
     "RegistrationError",
     "RegistrationOutcome",
     "RegistrationPolicy",
+    "CLAIM_CONTRIBUTION",
+    "CLAIM_IMPERATIVE",
     "RegistrationState",
     "SignalDispatcher",
     "SignalDispatchHandle",

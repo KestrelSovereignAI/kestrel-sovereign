@@ -374,6 +374,14 @@ class Feature(_SdkFeature):
         name-list helpers already exclude sources a host owned. Recording just
         the newly-owned names means :meth:`_unregister_owned_signal_sources`
         tears down exactly this feature's sources and never a host's.
+
+        The record itself lives in the REGISTRY, not on the feature. It used to
+        be a private list here, and the contribution runtime kept its own — two
+        ledgers applying the same rule with no knowledge of each other, so a
+        feature doing both could tear down a source another feature still
+        needed (issue #3053). Prefer passing ``owner=`` straight to the
+        register call; this exists for call sites that duck-type an
+        embedder-supplied registry and cannot assume the keyword.
         """
         if not result:
             return
@@ -386,14 +394,29 @@ class Feature(_SdkFeature):
             RegistrationOutcome = None  # type: ignore[assignment]
             RegistrationState = None  # type: ignore[assignment]
 
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        if registry is None:
+            return
+        # A registry that cannot hold claims still has to be cleaned up, and
+        # nothing else can know what this feature created — so for that case
+        # ONLY, the names are tracked here. This is not the second ledger #3053
+        # removed: there is still exactly one record per registry, and which one
+        # is decided by what the registry can actually do.
+        fallback = not hasattr(registry, "adopt")
+        owned = None
+        if fallback:
+            owned = getattr(self, "_owned_signal_source_names", None)
+            if owned is None:
+                owned = []
+                self._owned_signal_source_names = owned
+
         items = result if isinstance(result, (list, tuple, set)) else [result]
-        owned = getattr(self, "_owned_signal_source_names", None)
-        if owned is None:
-            owned = []
-            self._owned_signal_source_names = owned
         for item in items:
             name = None
+            created = True
             if isinstance(item, str):
+                # A name-list helper already excluded sources a host owned, so
+                # anything reaching here by name was created by this feature.
                 name = item
             elif (
                 RegistrationOutcome is not None
@@ -401,8 +424,21 @@ class Feature(_SdkFeature):
             ):
                 if item.state is RegistrationState.REGISTERED:
                     name = item.name
-            if name and name not in owned:
-                owned.append(name)
+                elif item.state is RegistrationState.ALREADY_EQUIVALENT:
+                    # Rode an incumbent: a real dependency, but not this
+                    # feature's to remove — it claims ALONGSIDE the holder.
+                    name = item.name
+                    created = False
+            if not name:
+                continue
+            if fallback:
+                # Only what this feature CREATED: an equivalent incumbent is a
+                # host's or a peer's, and this path has no claims to express
+                # shared use, so it must not remove it.
+                if created and name not in owned:
+                    owned.append(name)
+            else:
+                registry.adopt(name, self, created=created)
 
     async def _unregister_owned_signal_sources(self) -> None:
         """Unregister the signal sources this feature registered (#2522 P2).
@@ -410,12 +446,13 @@ class Feature(_SdkFeature):
         Best-effort and idempotent: unregistering an already-absent source is a
         benign no-op, so repeated shutdowns are safe.
         """
-        names = getattr(self, "_owned_signal_source_names", None)
-        if not names:
-            return
         registry = getattr(getattr(self, "agent", None), "signal_registry", None)
-        if registry is not None and hasattr(registry, "unregister"):
-            for name in names:
+        if registry is None:
+            return
+        if not hasattr(registry, "release_all"):
+            # Registry without the ownership API: fall back to removing exactly
+            # the names recorded for it. Best-effort and idempotent.
+            for name in getattr(self, "_owned_signal_source_names", None) or ():
                 try:
                     registry.unregister(name)
                 except Exception as exc:  # noqa: BLE001 - best-effort teardown
@@ -426,7 +463,24 @@ class Feature(_SdkFeature):
                         name,
                         exc,
                     )
-        self._owned_signal_source_names = []
+            self._owned_signal_source_names = []
+            return
+        try:
+            # ONLY the sources this feature registered itself. Its declared
+            # contributions are released by the contribution runtime, which is a
+            # different teardown that can fail on its own — and
+            # `_unregister_feature_runtime` deliberately continues to here after
+            # a rejected `deactivate()`. Releasing both roles together dropped a
+            # still-active contribution's claim (#3053).
+            from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+            registry.release_all(self, CLAIM_IMPERATIVE)
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logger.warning(
+                "feature '%s': could not release its signal sources: %s",
+                getattr(self, "name", type(self).__name__),
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Wait-provider ownership (#2522, identity-aware stack in P3)

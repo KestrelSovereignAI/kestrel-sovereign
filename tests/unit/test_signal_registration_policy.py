@@ -413,3 +413,244 @@ def test_workflow_rescue_helper_is_idempotent_when_equivalent():
     reg = SourceRegistry()
     assert set(register_workflow_rescue_sources(reg)) == set(RESCUE_SOURCE_NAMES)
     assert register_workflow_rescue_sources(reg) == []
+
+
+# ---------------------------------------------------------------------------
+# Ownership claims (issue #3053)
+# ---------------------------------------------------------------------------
+
+
+def _owner_test_source(name="own.test"):
+    from kestrel_sdk.signals import RedactionPolicy, SignalMode, SourceRegistration, Trust
+
+    async def handle(payload):
+        return payload
+
+    return SourceRegistration(
+        name=name, schema=dict, default_mode=SignalMode.ACTION,
+        allowed_modes=frozenset({SignalMode.ACTION}), handler=handle,
+        trust=Trust.TRUSTED, log_redaction=RedactionPolicy(summarize=lambda p: ""),
+    )
+
+
+def test_an_ownerless_re_registration_does_not_pin_a_feature_owned_source():
+    """"No owner supplied" is not "the host owns this".
+
+    The imperative path registers ownerless and claims a moment later, so a
+    repeated `initialize()` would staple a permanent host claim onto a
+    feature's own source — releasing every real owner would then never remove
+    it and the disabled feature's handler stayed registered forever.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source()
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    # A second, ownerless idempotent registration — the repeated initialize().
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL)
+
+    assert registry.owners_of(source.name) == (feature,)
+    assert registry.release(source.name, feature) is True
+    assert registry.get(source.name) is None
+
+
+def test_a_failed_owner_scoped_batch_unwinds_its_claims():
+    """Atomic means the CLAIMS unwind too, not just the newly-added sources.
+
+    The case that matters is a claim on an INCUMBENT: an equivalent
+    registration claims a source the batch did not create, so the
+    newly-added rollback cannot reach it. A failed owner left holding it
+    would keep that source alive forever.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    owner = object()
+
+    # An incumbent the batch will ride (equivalent), and a clash that raises.
+    shared = _owner_test_source("batch.shared")
+    registry.register(shared)
+    clash_incumbent = _owner_test_source("batch.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY, owner=owner
+        )
+
+    # The incumbent survives and the failed owner does NOT hold it.
+    assert registry.get("batch.shared") is shared
+    assert owner not in registry.owners_of("batch.shared")
+    assert registry.get("batch.clash") is clash_incumbent
+
+
+def test_a_failed_batch_keeps_a_claim_the_owner_already_held():
+    """Rollback unwinds what the BATCH acquired, not what predated it.
+
+    A feature that registered a source imperatively and also declares it holds
+    a claim before the batch runs. Releasing that on a later failure would
+    delete a source the feature is still running on.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    owner = object()
+
+    shared = _owner_test_source("prior.shared")
+    registry.register_with_policy(shared, RegistrationPolicy.OPTIONAL, owner=owner)
+    assert registry.owners_of("prior.shared") == (owner,)   # premise: held BEFORE
+
+    clash_incumbent = _owner_test_source("prior.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY, owner=owner
+        )
+
+    # The pre-existing claim survives, and so does the source it protects.
+    assert registry.owners_of("prior.shared") == (owner,)
+    assert registry.get("prior.shared") is shared
+
+
+def test_unregister_does_not_retain_the_owner_object():
+    """The registry must not pin a feature instance after its source is gone."""
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    owner = object()
+    source = _owner_test_source("leak.test")
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=owner)
+    assert registry.owners_of("leak.test") == (owner,)
+
+    registry.unregister("leak.test")
+
+    assert registry.owners_of("leak.test") == ()
+    assert id(owner) not in registry._claim_owners
+
+
+def test_core_requiring_a_source_a_feature_created_first_is_a_holder():
+    """Phase ordering: a feature can create a source core registers later.
+
+    Heartbeat is the live case — a feature contributes the equivalent
+    registration in phase 4, core registers it MANDATORY in phase 6. Recording
+    no claim for core meant disabling that feature deleted a source
+    `HeartbeatRunner` was still dispatching on.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("phase.ordered")
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    # Core, later, ownerless and MANDATORY: it REQUIRES this source.
+    registry.register_with_policy(source, RegistrationPolicy.MANDATORY)
+
+    registry.release_all(feature)
+
+    # Core still holds it, so it survives the feature going away.
+    assert registry.get("phase.ordered") is source
+
+
+def test_an_optional_ownerless_re_registration_still_does_not_pin():
+    """The other half of the same rule — OPTIONAL is "nice to have".
+
+    Every imperative feature site registers OPTIONAL and ownerless, then claims
+    a moment later. Treating that as a host claim strands the feature's
+    handlers forever.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("optional.retry")
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL)
+
+    assert registry.owners_of("optional.retry") == (feature,)
+    registry.release_all(feature)
+    assert registry.get("optional.retry") is None
+
+
+def test_a_failed_ownerless_batch_unwinds_its_host_claim():
+    """Host claims unwind with a failed batch too.
+
+    An ownerless MANDATORY batch meeting an equivalent feature-owned source
+    takes a host claim. Leaving it behind after a failure meant the feature
+    could never release its own source again.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    feature = object()
+    shared = _owner_test_source("hostclaim.shared")
+    registry.register_with_policy(shared, RegistrationPolicy.OPTIONAL, owner=feature)
+
+    clash_incumbent = _owner_test_source("hostclaim.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY,
+        )
+
+    # The host claim the failed batch took is gone, so the feature is once
+    # again the last holder and can release its own source.
+    registry.release_all(feature)
+    assert registry.get("hostclaim.shared") is None
+
+
+def test_activation_rollback_keeps_a_claim_the_feature_already_held():
+    """A pre-existing imperative claim survives a failed activation."""
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("preexisting.claim")
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+
+    # An activation that acquires nothing new, then rolls back.
+    with registry.claims_acquired(feature) as acquired:
+        registry.register_batch(
+            [source], RegistrationPolicy.MANDATORY, owner=feature
+        )
+    assert acquired == []          # nothing NEW was taken
+    registry.release_acquired(acquired, feature)
+
+    # The claim that predated the activation is intact.
+    assert registry.owners_of("preexisting.claim") == (feature,)
+    assert registry.get("preexisting.claim") is source
