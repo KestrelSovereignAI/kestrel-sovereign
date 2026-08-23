@@ -317,6 +317,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from dataclasses import dataclass
@@ -1239,6 +1240,39 @@ _CHANGES_DDL = _CHANGES_DDL_TEMPLATE.format(table=CHANGES_TABLE)
 #: The column whose absence identifies a pre-#3005 ledger.
 CHANGES_SLOT_COLUMN = "slot"
 
+#: Operator confirmation that no pre-#3005 revision is still serving.
+#:
+#: Only PostgreSQL asks. SQLite's ``migration_lock`` is ``BEGIN IMMEDIATE`` --
+#: one writer by construction -- so no second revision can be mid-write there
+#: and the migration is unconditional.
+LEDGER_KEY_SWAP_OPT_IN = "KESTREL_ALLOW_LEDGER_KEY_SWAP"
+
+
+class LedgerKeySwapRequiresQuiesce(RuntimeError):
+    """Raised rather than swapping a key a live older revision still needs.
+
+    Sharding the ledger means an agent may hold more than one counter row,
+    which is exactly what the pre-#3005 ``PRIMARY KEY (agent_id)`` forbids.
+    The two shapes are not merely different, they are mutually exclusive: a
+    pre-#3005 revision's triggers upsert ``ON CONFLICT (agent_id)`` and begin
+    failing history writes the moment that constraint is gone, and its next
+    schema initialization reinstalls them over this one's -- so the two
+    revisions flap each other's trigger family for as long as they overlap.
+
+    There is no revision fence in this codebase able to detect such a process
+    (#3078), so the migration asks instead of assuming. Refusing is the safe
+    direction and costs nothing that is not already lost: without the
+    migration this binary cannot open the database at all.
+    """
+
+
+
+def _opted_in_to_the_key_swap() -> bool:
+    """Whether an operator has confirmed no older revision is serving."""
+    return str(os.environ.get(LEDGER_KEY_SWAP_OPT_IN, "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 
 def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
     """Statements that give a pre-#3005 counter ledger its ``slot`` column.
@@ -1277,6 +1311,20 @@ def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
     Either way it runs inside one transaction, so an interrupted migration
     leaves the original table under its own name, not a half-copied one.
     """
+    if backend_type == "postgres" and not _opted_in_to_the_key_swap():
+        raise LedgerKeySwapRequiresQuiesce(
+            "This PostgreSQL database still carries the pre-#3005 counter "
+            "ledger, and bringing it forward swaps "
+            "conversation_history_changes' primary key from (agent_id) to "
+            "(agent_id, slot). A revision older than #3005 that is still "
+            "serving cannot share that schema: its triggers upsert "
+            "ON CONFLICT (agent_id), which stops matching any constraint, and "
+            "its next initialization reinstalls them over this one's. Nothing "
+            "here can detect such a process (see issue #3078), so it is "
+            "asking rather than assuming. Stop every older revision, then "
+            f"restart with {LEDGER_KEY_SWAP_OPT_IN}=1 set. SQLite hosts never "
+            "see this: their migration lock admits one writer by construction."
+        )
     if backend_type == "postgres":
         return (
             # In place, because PostgreSQL can be. A rebuild here would be
@@ -1305,14 +1353,9 @@ def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
             "LOCK TABLE conversation_history IN ACCESS EXCLUSIVE MODE",
             "ALTER TABLE conversation_history_changes "
             "ADD COLUMN IF NOT EXISTS slot BIGINT NOT NULL DEFAULT 0",
-            # NOTE (#3078): swapping this key makes the schema incompatible
-            # with a pre-#3005 revision still holding a connection -- its
-            # trigger functions upsert ON CONFLICT (agent_id), which no longer
-            # has a matching unique constraint. There is no schema that
-            # satisfies both, because sharding exists precisely to allow the
-            # second row UNIQUE (agent_id) forbids. This codebase has no
-            # revision fence to refuse the migration while such a process is
-            # live, so on PostgreSQL this upgrade must not overlap revisions.
+            # Reaching here means an operator confirmed no pre-#3005 revision
+            # is serving -- see LedgerKeySwapRequiresQuiesce above and #3078
+            # for the fence that would make the confirmation unnecessary.
             #
             # The constraint is found rather than named. It was minted by an
             # inline PRIMARY KEY so it is almost certainly

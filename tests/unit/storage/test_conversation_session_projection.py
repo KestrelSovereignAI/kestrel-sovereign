@@ -3639,7 +3639,54 @@ async def test_a_pre_slot_ledger_is_migrated_even_when_nothing_else_moved(
         await reopened.close()
 
 
-def test_the_postgres_migration_never_copies_the_ledger():
+def test_postgres_refuses_the_key_swap_until_an_operator_confirms(monkeypatch):
+    """A comment enforces nothing, so this refuses instead.
+
+    Sharding means an agent may hold more than one counter row, which is
+    exactly what the pre-#3005 PRIMARY KEY (agent_id) forbids — the two shapes
+    are mutually exclusive, so an older revision still serving begins failing
+    history writes the moment the constraint goes, and reinstalls its own
+    triggers over ours besides. Nothing here can detect such a process (#3078).
+
+    Refusing costs nothing that is not already lost: without the migration
+    this binary cannot open the database at all.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
+        LedgerKeySwapRequiresQuiesce,
+    )
+
+    monkeypatch.delenv(LEDGER_KEY_SWAP_OPT_IN, raising=False)
+    with pytest.raises(LedgerKeySwapRequiresQuiesce) as refusal:
+        changes_slot_migration("postgres")
+
+    message = str(refusal.value)
+    assert LEDGER_KEY_SWAP_OPT_IN in message, "the message names the way out"
+    assert "#3078" in message
+
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
+    assert changes_slot_migration("postgres"), "and the way out works"
+
+
+def test_sqlite_never_asks_because_it_cannot_overlap(monkeypatch):
+    """SQLite's migration_lock is BEGIN IMMEDIATE: one writer, by construction.
+
+    So there is no second revision to quiesce, and asking an operator to
+    confirm something that cannot happen would be ceremony that teaches people
+    to click through it.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
+    )
+
+    monkeypatch.delenv(LEDGER_KEY_SWAP_OPT_IN, raising=False)
+
+    assert changes_slot_migration("sqlite")
+
+
+def test_the_postgres_migration_never_copies_the_ledger(monkeypatch):
     """A copy on PostgreSQL would discard concurrent increments.
 
     ``migration_lock`` is a transaction-scoped ADVISORY lock there: it excludes
@@ -3656,8 +3703,10 @@ def test_the_postgres_migration_never_copies_the_ledger():
     from kestrel_sovereign.storage.conversation_sessions import (
         changes_slot_migration,
         CHANGES_TABLE,
+        LEDGER_KEY_SWAP_OPT_IN,
     )
 
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
     statements = changes_slot_migration("postgres")
 
     assert not any(
@@ -3670,7 +3719,7 @@ def test_the_postgres_migration_never_copies_the_ledger():
     assert any("ADD PRIMARY KEY (agent_id, slot)" in s for s in statements)
 
 
-def test_the_postgres_migration_locks_history_before_the_ledger():
+def test_the_postgres_migration_locks_history_before_the_ledger(monkeypatch):
     """Writers reach the ledger THROUGH a trigger on conversation_history.
 
     So they hold history and then want the ledger. This transaction goes on to
@@ -3682,8 +3731,10 @@ def test_the_postgres_migration_locks_history_before_the_ledger():
     """
     from kestrel_sovereign.storage.conversation_sessions import (
         changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
     )
 
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
     statements = changes_slot_migration("postgres")
     lock_at = next(
         i for i, s in enumerate(statements)

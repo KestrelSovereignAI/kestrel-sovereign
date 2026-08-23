@@ -3863,7 +3863,7 @@ async def test_a_clean_stint_reports_no_purged_projection_rows(postgres_db):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_the_slot_migration_runs_on_both_engines(db_backend):
+async def test_the_slot_migration_runs_on_both_engines(db_backend, monkeypatch):
     """``slot`` is half a primary key, so this is a rebuild, not an ALTER.
 
     Written as a dual-backend case because the two engines disagree about what
@@ -3882,7 +3882,13 @@ async def test_the_slot_migration_runs_on_both_engines(db_backend):
     """
     from kestrel_sovereign.storage.conversation_sessions import (
         CHANGES_PRE_SLOT_TABLE,
+        LEDGER_KEY_SWAP_OPT_IN,
     )
+
+    # PostgreSQL refuses the key swap without an operator's confirmation that
+    # no pre-#3005 revision is still serving (#3078). This test IS that
+    # confirmation: nothing else holds the isolated schema it just created.
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
 
     async with _isolated_schema(db_backend) as db:
         # The four-column shape #3005 replaced, spelled out rather than derived
