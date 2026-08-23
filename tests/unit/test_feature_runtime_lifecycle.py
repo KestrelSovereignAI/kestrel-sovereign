@@ -1179,3 +1179,51 @@ async def test_a_claims_registry_without_the_role_keyword_falls_back_by_name():
     await feature._unregister_owned_signal_sources()
 
     assert registry.unregistered == ["seam.roleless"]
+
+
+async def test_declining_on_the_fallback_path_unregisters_what_it_created():
+    """Declining and teardown must do the SAME thing to a source.
+
+    Dropping only the bookkeeping left the refused source registered and no
+    longer tracked: still dispatchable, and beyond the reach of the shutdown
+    that would otherwise have removed it. Strictly worse than either branch.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    outcomes = feature._register_signal_sources(
+        _fake_source_registration("seam.declined"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.declined" in registry.sources
+
+    feature._disown_signal_sources(outcomes)
+
+    assert registry.unregistered == ["seam.declined"]
+    assert "seam.declined" not in registry.sources
+    assert feature._owned_signal_source_names == []
+
+
+async def test_declining_on_the_fallback_path_keeps_a_peers_source():
+    """A ridden incumbent is not this feature's to remove, declining included.
+
+    The name path has no claims to express shared use, so the rule is the same
+    one its teardown follows: remove only what this feature created.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    incumbent = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.declined.peer"), RegistrationPolicy.OPTIONAL,
+    )
+    rider = _seam_feature(registry)
+    outcomes = rider._register_signal_sources(
+        _fake_source_registration("seam.declined.peer"), RegistrationPolicy.OPTIONAL,
+    )
+
+    rider._disown_signal_sources(outcomes)
+
+    assert registry.unregistered == []
+    assert "seam.declined.peer" in registry.sources

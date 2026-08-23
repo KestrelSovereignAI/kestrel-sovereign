@@ -514,6 +514,31 @@ class Feature(_SdkFeature):
             if name not in owned:
                 owned.append(name)
 
+    def _drop_tracked_signal_sources(self, registry, names) -> None:
+        """Unregister *names* this feature created, and stop tracking them.
+
+        The whole of the name-tracking path's removal, in one place: teardown
+        and declining a source do the same thing to it, and having them differ
+        is how declining left a source registered AND untracked — dispatchable
+        forever, and no longer removable by shutdown.
+
+        Best-effort and idempotent: unregistering an already-absent source is a
+        benign no-op, so repeated shutdowns are safe.
+        """
+        owned = getattr(self, "_owned_signal_source_names", None) or []
+        removing = [name for name in owned if name in names]
+        self._owned_signal_source_names = [n for n in owned if n not in removing]
+        for name in removing:
+            try:
+                registry.unregister(name)
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                logger.warning(
+                    "feature '%s': could not unregister signal source '%s': %s",
+                    getattr(self, "name", type(self).__name__),
+                    name,
+                    exc,
+                )
+
     def _disown_signal_sources(self, outcomes) -> None:
         """Hand back claims :meth:`_register_signal_sources` took.
 
@@ -532,8 +557,11 @@ class Feature(_SdkFeature):
             return
         names = self._signal_source_names(outcomes, created_only=False)
         if not self._registry_holds_claims(registry):
-            owned = getattr(self, "_owned_signal_source_names", None) or []
-            self._owned_signal_source_names = [n for n in owned if n not in names]
+            # Only what this feature CREATED is removed — a ridden incumbent is
+            # a peer's, and this path has no claims to express shared use. But
+            # what it created IS removed: dropping only the bookkeeping left a
+            # refused source dispatchable and beyond the reach of shutdown.
+            self._drop_tracked_signal_sources(registry, names)
             return
         from kestrel_sovereign.signals import CLAIM_IMPERATIVE
 
@@ -559,19 +587,10 @@ class Feature(_SdkFeature):
             return
         if not self._registry_holds_claims(registry):
             # Registry without the ownership API: fall back to removing exactly
-            # the names recorded for it. Best-effort and idempotent.
-            for name in getattr(self, "_owned_signal_source_names", None) or ():
-                try:
-                    registry.unregister(name)
-                except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "feature '%s': could not unregister signal source "
-                        "'%s': %s",
-                        getattr(self, "name", type(self).__name__),
-                        name,
-                        exc,
-                    )
-            self._owned_signal_source_names = []
+            # the names recorded for it.
+            self._drop_tracked_signal_sources(
+                registry, list(getattr(self, "_owned_signal_source_names", None) or ()),
+            )
             return
         try:
             # ONLY the sources this feature registered itself. Its declared
