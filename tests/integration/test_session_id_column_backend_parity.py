@@ -3854,3 +3854,75 @@ async def test_a_clean_stint_reports_no_purged_projection_rows(postgres_db):
             "watermark the claim inserted to have something to lock, counted "
             "as a leak"
         )
+
+
+# ---------------------------------------------------------------------------
+# #3058 — the pre-#3005 counter ledger migrates on both engines
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_the_slot_migration_runs_on_both_engines(db_backend):
+    """``slot`` is half a primary key, so this is a rebuild, not an ALTER.
+
+    Written as a dual-backend case because the two engines disagree about what
+    a rebuild may do. SQLite reparses every trigger naming a table when that
+    table is renamed — and against the schema BEFORE the rename lands, which
+    makes both orderings of a rename-based migration impossible once the
+    triggers already reference ``slot``. PostgreSQL resolves a trigger body at
+    fire time and does not care. The migration therefore uses no ALTER at all,
+    and this asserts the *result* on whichever dialect ran rather than the
+    statements it got there by.
+
+    The counters are preserved, not reset: this table is the reference a
+    watermark is compared against, so a zeroed ledger beside an untouched
+    watermark leaves the projection reporting itself ahead of a history it
+    never walked.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        CHANGES_PRE_SLOT_TABLE,
+    )
+
+    async with _isolated_schema(db_backend) as db:
+        # The four-column shape #3005 replaced, spelled out rather than derived
+        # from the DDL under test.
+        await db.execute(
+            "CREATE TABLE conversation_history_changes ("
+            "agent_id TEXT PRIMARY KEY, "
+            "changes BIGINT NOT NULL DEFAULT 0, "
+            "appends BIGINT NOT NULL DEFAULT 0, "
+            "generation TEXT NOT NULL DEFAULT '')"
+        )
+        await db.execute(
+            "INSERT INTO conversation_history_changes "
+            "(agent_id, changes, appends, generation) VALUES (?, ?, ?, ?)",
+            ("did:a", 17, 5, "gen-a"),
+        )
+        # The triggers and indexes this migration installs are ON
+        # conversation_history, so it has to be there and it has to carry the
+        # columns the projection reads.
+        id_column = (
+            "BIGSERIAL PRIMARY KEY"
+            if db.backend_type == "postgres"
+            else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        )
+        await db.execute(
+            f"CREATE TABLE conversation_history ("
+            f"id {id_column}, agent_id TEXT NOT NULL DEFAULT '', "
+            "session_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL, "
+            "metadata TEXT, created_at TIMESTAMP, "
+            "deleted_at TIMESTAMP DEFAULT NULL, "
+            "archived_at TIMESTAMP DEFAULT NULL)"
+        )
+
+        await db.ensure_session_projection_schema()
+
+        rows = await db.fetchall(
+            "SELECT agent_id, slot, changes, appends "
+            "FROM conversation_history_changes"
+        )
+        assert [tuple(row) for row in rows] == [("did:a", 0, 17, 5)]
+        assert not await db.table_exists(CHANGES_PRE_SLOT_TABLE), (
+            "the scratch copy must not survive a successful migration"
+        )

@@ -281,3 +281,143 @@ async def test_a_later_start_does_not_erase_an_earlier_rejection():
 
     # ...and the earlier, still-unresolved rejection is still reported, intact.
     assert tuple(ctx.rejected_host_feature_contributions) == after_first
+
+
+# ---------------------------------------------------------------------------
+# #3058 — a dropped host feature must not read as a healthy one
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_hook_is_recorded_where_health_reads_it():
+    """A start-hook failure drops the feature WHOLE — router, panel, service.
+
+    Every consumer downstream then sees an empty list rather than an error.
+    #3058: WorkflowsHostFeature refused a host with no database, the feature
+    vanished, Talon's router refused without it, and /health reported ok over
+    an entire missing operator run plane — the only trace a single WARNING.
+
+    "Did not start" and "was refused activation" are the same fact for a
+    reader: the feature is not loaded. So it goes through the same door.
+    """
+    class FailingHostFeature(SDKFixtureHostFeature):
+        contribution_prefix = "unstarted-host-fixture"
+        name = "unstarted-host-fixture"
+
+        async def on_host_start(self, ctx):
+            raise RuntimeError("operator runs require the host database")
+
+    ctx = SovereignHostContext()
+
+    started = await start_host_features([FailingHostFeature()], ctx)
+
+    assert started == []
+    rejections = tuple(ctx.rejected_host_feature_contributions)
+    assert [r.feature_name for r in rejections] == ["unstarted-host-fixture"]
+    assert "operator runs require the host database" in rejections[0].reason
+
+
+@pytest.mark.asyncio
+async def test_a_feature_that_starts_on_retry_stops_being_reported():
+    """The verdict is superseded by NAME, like every other rejection.
+
+    A fixed feature is retried as a freshly constructed instance, so an
+    id-keyed match would never fire and health would go on reporting a
+    now-live feature as not loaded.
+    """
+    class Flaky(SDKFixtureHostFeature):
+        contribution_prefix = "flaky-host-fixture"
+        name = "flaky-host-fixture"
+        fail = True
+
+        async def on_host_start(self, ctx):
+            if type(self).fail:
+                raise RuntimeError("not yet")
+            await super().on_host_start(ctx)
+
+    ctx = SovereignHostContext()
+    await start_host_features([Flaky()], ctx)
+    assert [r.feature_name for r in ctx.rejected_host_feature_contributions] == [
+        "flaky-host-fixture"
+    ]
+
+    Flaky.fail = False
+    try:
+        started = await start_host_features([Flaky()], ctx)
+    finally:
+        Flaky.fail = True
+
+    assert len(started) == 1
+    assert tuple(ctx.rejected_host_feature_contributions) == ()
+
+
+def test_a_host_with_no_backend_names_why_in_detailed_health():
+    """The symptom without the cause is a diagnosis one scroll away.
+
+    build_host_context is built to survive a store it cannot open — the host
+    must start without one — but a capability gap has to be named. Without
+    this the reason lives only in a boot log, while the features it took down
+    each report an empty result.
+    """
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = SovereignHostContext(
+            backend_error="TransactionError: no such column: slot"
+        )
+
+    payload = _with_host_feature_rejections(_State(), {"status": "healthy"})
+
+    assert payload["host_backend_unavailable"] == (
+        "TransactionError: no such column: slot"
+    )
+    assert payload["status"] == "degraded", (
+        "a host running without its store is not healthy"
+    )
+
+
+def test_a_healthy_host_gains_no_diagnostic_noise():
+    """The fold must stay invisible when there is nothing to report."""
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = SovereignHostContext()
+
+    payload = _with_host_feature_rejections(_State(), {"status": "healthy"})
+
+    assert payload == {"status": "healthy"}
+
+
+@pytest.mark.asyncio
+async def test_build_host_context_carries_why_the_backend_is_missing(tmp_path):
+    """`db=None` is the symptom; the exception that caused it is the fact.
+
+    The host is built to start without a store, so this path must not raise —
+    but reducing the cause to a log line is what made #3058 a six-link chain
+    nobody could see the start of.
+    """
+    from kestrel_sovereign.host_features.context import build_host_context
+
+    # A directory where the database file must be: the open fails, and it
+    # fails for a reason that is not this test's invention.
+    occupied = tmp_path / "host.db"
+    occupied.mkdir()
+
+    ctx = await build_host_context(config={}, db_path=str(occupied))
+
+    assert ctx.db is None
+    assert ctx.backend_error, "the reason must travel with the degradation"
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_opened_its_backend_reports_no_error(tmp_path):
+    """And the field stays empty when there is nothing wrong."""
+    from kestrel_sovereign.host_features.context import build_host_context
+
+    ctx = await build_host_context(config={}, db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.db is not None
+        assert ctx.backend_error == ""
+    finally:
+        if ctx.db is not None:
+            await ctx.db.close()

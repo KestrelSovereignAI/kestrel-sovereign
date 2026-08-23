@@ -3387,13 +3387,21 @@ def _with_host_feature_rejections(app_state, payload: dict) -> dict:
     rejections = tuple(
         getattr(ctx, "rejected_host_feature_contributions", ()) or ()
     )
-    if not rejections:
+    # Why the host store is missing, when it is. Reported beside the features
+    # it took down rather than only in the boot log: every one of them reports
+    # an empty result instead of an error, so the symptom never names the
+    # cause and the cause is a scroll away (#3058).
+    backend_error = str(getattr(ctx, "backend_error", "") or "")
+    if not rejections and not backend_error:
         return payload
     merged = dict(payload)
-    merged["host_features_not_loaded"] = [
-        {"feature": rejection.feature_name, "reason": rejection.reason}
-        for rejection in rejections
-    ]
+    if rejections:
+        merged["host_features_not_loaded"] = [
+            {"feature": rejection.feature_name, "reason": rejection.reason}
+            for rejection in rejections
+        ]
+    if backend_error:
+        merged["host_backend_unavailable"] = backend_error
     if merged.get("status") == "healthy":
         merged["status"] = "degraded"
     return merged

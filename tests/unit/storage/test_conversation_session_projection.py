@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -63,6 +64,7 @@ from kestrel_sovereign.storage.async_conversation_store import AsyncConversation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.conversation_sessions import (
+    CHANGES_PRE_SLOT_TABLE,
     CURRENT,
     active_history_predicate,
     canonical_order_index_columns,
@@ -3424,3 +3426,214 @@ async def test_the_publish_fence_will_not_subtract_across_a_ledger_reset(tmp_pat
             "a snapshot derived before the ledger was erased was published as "
             "current, because its counters were subtracted from a fresh one's"
         )
+
+
+# ---------------------------------------------------------------------------
+# #3058 — the pre-#3005 counter ledger has no `slot`
+# ---------------------------------------------------------------------------
+
+
+def _pre_slot_ledger(path, rows=()):
+    """Build the four-column counter ledger #3005 replaced.
+
+    Written out rather than derived from the current DDL: the point is a shape
+    this codebase no longer produces, and deriving it from the shape it DOES
+    produce would make the fixture agree with the code under test by
+    construction.
+    """
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE conversation_history_changes (
+            agent_id   TEXT PRIMARY KEY,
+            changes    BIGINT NOT NULL DEFAULT 0,
+            appends    BIGINT NOT NULL DEFAULT 0,
+            generation TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    connection.commit()
+    connection.close()
+
+
+def _ledger_columns(path):
+    connection = sqlite3.connect(path)
+    try:
+        return [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(conversation_history_changes)"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def _ledger_rows(path):
+    connection = sqlite3.connect(path)
+    try:
+        return sorted(
+            connection.execute(
+                "SELECT agent_id, slot, changes, appends "
+                "FROM conversation_history_changes"
+            )
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pre_slot_ledger_does_not_stop_the_database_opening(tmp_path):
+    """The boot failure #3058 was filed on, from the shape that causes it.
+
+    _CHANGES_DDL is a CREATE TABLE IF NOT EXISTS, so on a database predating
+    #3005 it is a no-op and the four-column table survives -- and the next
+    statement in the same migration is
+    ``UPDATE conversation_history_changes SET generation = ... WHERE slot = 0``.
+    """
+    path = tmp_path / "pre-slot.db"
+    _pre_slot_ledger(path)
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_preserves_the_counters_at_slot_zero(tmp_path):
+    """Preserved, not dropped -- unlike the conversation_sessions cache.
+
+    This table is the reference a watermark is compared against, so resetting
+    it to zero beside an untouched watermark would leave the projection
+    reporting itself AHEAD of a history it had never walked. Slot 0 is the
+    right home: it is where the generation lives, and SQLite has one writer by
+    construction so it is the only slot it ever uses.
+    """
+    path = tmp_path / "counters.db"
+    _pre_slot_ledger(path, rows=[("did:a", 17, 5, "gen-a"), ("did:b", 3, 3, "gen-b")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert _ledger_rows(path) == [("did:a", 0, 17, 5), ("did:b", 0, 3, 3)]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_leaves_no_scratch_table_behind(tmp_path):
+    """The rename target must not survive a successful migration."""
+    path = tmp_path / "scratch.db"
+    _pre_slot_ledger(path, rows=[("did:a", 1, 1, "g")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        connection = sqlite3.connect(path)
+        try:
+            leftovers = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE ?",
+                    (f"%{CHANGES_PRE_SLOT_TABLE}%",),
+                )
+            ]
+        finally:
+            connection.close()
+        assert leftovers == []
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_scratch_table_does_not_wedge_the_boot(tmp_path):
+    """An interrupted migration must not become a boot that never succeeds.
+
+    The rename/copy/drop is one transaction, so this should be unreachable --
+    but if it ever happened, the RENAME would fail on the name already
+    existing and every subsequent boot would fail the same way. A recoverable
+    state must not turn into a permanent one.
+    """
+    path = tmp_path / "leftover.db"
+    _pre_slot_ledger(path, rows=[("did:a", 9, 2, "g")])
+    connection = sqlite3.connect(path)
+    connection.execute(
+        f"CREATE TABLE {CHANGES_PRE_SLOT_TABLE} "
+        "(agent_id TEXT, changes BIGINT, appends BIGINT, generation TEXT)"
+    )
+    connection.commit()
+    connection.close()
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path)
+        assert _ledger_rows(path) == [("did:a", 0, 9, 2)]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_ledger_is_not_migrated_again(tmp_path):
+    """The probe is on the COLUMN, so a healthy database never enters it."""
+    path = tmp_path / "twice.db"
+    _pre_slot_ledger(path, rows=[("did:a", 4, 4, "g")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        before = _ledger_rows(path)
+        await database.ensure_session_projection_schema()
+        assert _ledger_rows(path) == before
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pre_slot_ledger_is_migrated_even_when_nothing_else_moved(
+    tmp_path,
+):
+    """The probe has to be its own reason to take the lock.
+
+    The fast path takes no lock when every object is present, and a pre-#3005
+    database usually also carries pre-#3005 TRIGGERS, whose fingerprinted names
+    do not match — so the lock is entered for that reason and the migration
+    rides along. A partial upgrade breaks that coincidence: triggers and
+    functions current, ledger not. Then nothing else notices, the fast path
+    returns, and the first row event fires a trigger that writes a column the
+    table does not have.
+    """
+    path = tmp_path / "partial-upgrade.db"
+    database = await AsyncDatabase.sqlite(str(path))
+    await database.close()
+
+    # Everything current, then the ledger alone rolled back to the old shape.
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        DROP TABLE conversation_history_changes;
+        CREATE TABLE conversation_history_changes (
+            agent_id   TEXT PRIMARY KEY,
+            changes    BIGINT NOT NULL DEFAULT 0,
+            appends    BIGINT NOT NULL DEFAULT 0,
+            generation TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO conversation_history_changes VALUES ('did:a', 11, 4, 'g');
+        """
+    )
+    connection.commit()
+    connection.close()
+    assert "slot" not in _ledger_columns(path)
+
+    reopened = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path), (
+            "no trigger or table went missing, so only the column probe could "
+            "have brought this database into the lock"
+        )
+        assert _ledger_rows(path) == [("did:a", 0, 11, 4)]
+    finally:
+        await reopened.close()
