@@ -403,6 +403,14 @@ WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_target",
 )
 
+#: How large a whole-transcript derivation has to get before it is worth saying.
+#:
+#: Below this the pass is a few milliseconds and happens on databases that have
+#: barely any history; above it the cost is user-visible on a read path, and
+#: the operator should hear about it from a log rather than from a slow pane.
+#: Measured at roughly 8.5 microseconds a live row, so this is the ~100 ms mark.
+TRANSCRIPT_PASS_NOISY_ROWS = 10_000
+
 #: How many of an agent's live rows one chunk folds.
 #:
 #: It bounds the rows a step *reads*, not merely the rows it selects, and the
@@ -2847,12 +2855,32 @@ class ConversationSessionProjection:
         # result current. The read is the unbounded work, but "unbounded" is
         # about how MANY rows, never about which: a snapshot must describe one
         # frontier and say which one.
-        projections = project_transcript(
-            await self.db.fetchall(
-                _live_rows_through(self.db.backend_type),
-                (self.agent_id, target),
-            )
+        transcript = await self.db.fetchall(
+            _live_rows_through(self.db.backend_type),
+            (self.agent_id, target),
         )
+        # Said out loud, because #2960 put this pass on the conversation list's
+        # read path and its cost is the agent's whole live history. One live row
+        # with a NULL `session_id` is enough to choose it, and legacy history is
+        # full of them (Emma: 473 of 1,522), so for such an agent EVERY repair
+        # after a turn re-derives everything. Measured, SQLite, one session in
+        # three legacy: 143 ms at 15,000 live rows, 524 ms at 60,000, 1,020 ms
+        # at 120,000 — linear, about 8.5 microseconds a row.
+        #
+        # A silent cost that grows with history is the shape this epic exists to
+        # remove, so it is logged rather than left to be discovered from a slow
+        # pane. #3061 is the fix: stamp the legacy rows once and this pass
+        # stops being chosen at all.
+        if len(transcript) >= TRANSCRIPT_PASS_NOISY_ROWS:
+            logger.warning(
+                "conversation_sessions: %s has live rows carrying no session id, "
+                "so this repair re-derived all %d of its live rows rather than "
+                "folding a chunk (#3061). List latency for this agent grows "
+                "with its history.",
+                self.agent_id,
+                len(transcript),
+            )
+        projections = project_transcript(transcript)
 
         written = 0
         async with self.db.transaction(immediate=True):
