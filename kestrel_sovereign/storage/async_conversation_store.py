@@ -27,6 +27,8 @@ from .conversation_created_at import UNDATED_TABLE
 from .session_grouping import (
     UNDATABLE_ROW_FALLBACK,
     canonical_timestamp_sql,
+    iso_session_timestamp,
+    parse_message_metadata,
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
@@ -53,6 +55,33 @@ from .encryption import (
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
+
+
+class ProjectionNotReady(RuntimeError):
+    """The session index is not complete enough to answer the list (#2960).
+
+    Its own type because the caller has to tell it from a storage failure: this
+    one is temporary and self-correcting — the next request continues the walk
+    — so it is a 503 rather than a 500.
+    """
+
+
+#: How many budgeted repairs one list request will run before refusing.
+#:
+#: Each is ``STEP_BUDGET * CHUNK_ROWS`` live rows, so this is tens of millions
+#: of rows for one agent — far past anything measured, and past the point where
+#: a synchronous rebuild belongs on a request at all. It is a backstop on the
+#: refusal, not a work budget: the loop exits the moment the walk lands, which
+#: for every agent this has been measured on is the first pass.
+REPAIR_PASSES = 8
+
+#: How many times a list request will re-read a page that was rebuilt under it.
+#:
+#: Each attempt is three primary-key reads and one bounded page query, so this
+#: is cheap; it is a bound on a race rather than on work. Losing it three times
+#: running means a projection being rebuilt continuously, which is a state to
+#: report rather than to keep retrying inside a request.
+_PAGE_ATTEMPTS = 3
 
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
@@ -3217,6 +3246,268 @@ class AsyncConversationStore:
             # <retrieved_context>.../<user_input>... replay wrappers.
             preview_transform=extract_raw_user_content,
         )
+
+    async def list_session_page(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One page of the active conversation list, from the sessions table.
+
+        Phase C of #2948, and the read the epic exists for. What this replaces
+        fetched a fixed window of ``conversation_history`` — ``limit * 20``
+        rows, capped at 1000 — and grouped whatever fell inside it. Measured on
+        Emma's live database, 34% of her conversations were outside that window
+        and no ``limit`` could reach them, because the cap was a constant rather
+        than a function of the request. Here the bound is the page and the
+        continuation is a key, so every session is reachable by asking again.
+
+        Returns ``{"sessions": [...], "next_cursor": str | None}``. The session
+        dicts carry exactly the fields the shared grouper emits — including the
+        undecorated ``preview_content`` / ``preview_metadata`` /
+        ``preview_wake_source`` triple — so the endpoint decorates one shape
+        whichever path produced it.
+
+        **The preview is a pointer, resolved here, never a stored copy.**
+        ``content`` is ciphertext, so a preview column would be a plaintext copy
+        of encrypted text and a record outliving what it describes (#2948).
+        The projection stores which row the picker chose; this reads that row's
+        body at request time, and a pointer at a row that has since gone
+        resolves to nothing rather than to a stale excerpt.
+
+        **Repair runs on the first page only.** The list must be current, and
+        the projection is a cache that knows how far behind it is — three
+        primary-key reads answer that, at any size of history. Repeating it per
+        page would be work for no answer, and worse: a repair between two pages
+        can move ``last_message_at`` under the cursor, so a page sequence is
+        consistent to the extent that it is read from one repair's output.
+        Keyset pagination over a table the agent is still writing to can still
+        show a session twice or not at all if that session's activity moves
+        across the cursor mid-walk — that is inherent to paging live data, and
+        it is a far smaller window than the one this replaces, in which 34% of
+        sessions could not be shown at all.
+        """
+        from .conversation_sessions import (
+            ConversationSessionProjection,
+            decode_session_cursor,
+            encode_session_cursor,
+            live_history_predicate,
+        )
+
+
+        # Named by the caller, defaulting to the one this store was built for.
+        # Every other method here is bound to ``self.agent_id``, and this one
+        # would be too if its caller were not the privacy wrapper, whose read
+        # methods take the agent as an argument. Ignoring that argument and
+        # answering for a different agent is the one behaviour that must not
+        # happen — the read this replaces scoped its SQL to the value it was
+        # given, so silently substituting another agent's would report an empty
+        # list rather than refusing.
+        agent = agent_id or self.agent_id
+        bounded = max(1, int(limit))
+        after = decode_session_cursor(cursor, "active") if cursor else None
+        projection = ConversationSessionProjection(self.db, agent)
+        # One more than asked for, which is how "is there another page" is
+        # answered without a second query and without a COUNT over the whole
+        # table — the cost this table exists to remove.
+        rows = await self._page_a_whole_projection(
+            projection, limit=bounded + 1, after=after, refresh=after is None
+        )
+        has_more = len(rows) > bounded
+        rows = rows[:bounded]
+
+        previews = await self._preview_rows(
+            [
+                row["first_user_message_id"]
+                for row in rows
+                if row["first_user_message_id"] is not None
+            ],
+            live_history_predicate(),
+            agent_id=agent,
+        )
+        sessions = [self._as_listed_session(row, previews) for row in rows]
+        next_cursor = (
+            encode_session_cursor(sessions[-1], "active")
+            if has_more and sessions
+            else None
+        )
+        return {"sessions": sessions, "next_cursor": next_cursor}
+
+    async def _whole_watermark(self, projection):
+        """This projection's watermark if it describes the WHOLE history, else None.
+
+        Three questions, and all three have to hold before a page read means
+        anything:
+
+        * **valid** — something has been accounted for at all. All-zero is both
+          "never built" and "built over an empty history", and only the flag
+          separates them.
+        * **complete** — the walk reached its target. A part-walked projection
+          holds the OLDEST sessions (the walk goes forward by row id) while the
+          list is ordered by most recent activity, so it is missing the FRONT of
+          the list, not its tail.
+        * **the same generation** — the counters this watermark was compared
+          against are the ones standing now. A recreated cache rotates the
+          generation and leaves the watermark, which is then ``valid`` and
+          ``complete`` about a table that no longer exists; without this the
+          continuation would page an empty cache and call it the end.
+        """
+        accounted = await projection.accounted()
+        if not accounted.valid or not accounted.complete:
+            return None
+        if accounted.generation != await projection.observed_generation():
+            return None
+        return accounted
+
+    async def _page_a_whole_projection(
+        self, projection, *, limit: int, after, refresh: bool
+    ) -> List[Dict[str, Any]]:
+        """Read one page, having established the projection was whole THROUGHOUT.
+
+        The check and the read are one observation, not two. A repair started by
+        another request between them clears the table and commits chunks as it
+        goes, so a page read in that window is a partial one — and its last row
+        comes back with ``next_cursor: null``, which is a truncated list wearing
+        the shape of a complete one. So the watermark is read before and after
+        and required to be identical: it moves only when a repair writes it, and
+        that is exactly the concurrency this cannot tolerate. Ordinary appends
+        do not move it, so a page read beside a live conversation is unaffected.
+
+        ``refresh`` is page one, which repairs first so the list reflects
+        messages written since the last request. A continuation does not, on
+        purpose: repairing moves ``last_message_at``, and a keyset cursor
+        resumed against moved keys skips rows. It DOES repair when the
+        projection is not whole — the cursor is meaningless over a partial table
+        anyway, and refusing without repairing would make the 503 unclearable,
+        since only page-one requests would ever advance the walk.
+        """
+        for _ in range(_PAGE_ATTEMPTS):
+            before = await self._whole_watermark(projection)
+            if refresh or before is None:
+                await self._repair_until_whole(projection)
+                before = await self._whole_watermark(projection)
+                if before is None:
+                    # Whole a moment ago and not whole now: another repair got
+                    # in between. Try again rather than raise — the loop below
+                    # is where giving up lives, and a repair that has just
+                    # started will have finished by the next attempt.
+                    continue
+            rows = await projection.page(limit=limit, after=after)
+            # The SAME question afterwards, and it turns on the REVISION rather
+            # than on the watermark's fields. Two reasons, and the second is why
+            # the column exists:
+            #
+            # * a generation rotation leaves the watermark row untouched, so a
+            #   cache recreated under the read would pass a field comparison;
+            # * `rebuild()` over an unchanged history invalidates, discards
+            #   every row, walks, and lands on a watermark identical to the one
+            #   it replaced — field for field. A page read during that walk is
+            #   partial, and a field comparison certifies it. ABA.
+            #
+            # The revision only ever increases, so neither can hide.
+            after_read = await self._whole_watermark(projection)
+            if after_read is not None and after_read.fence == before.fence:
+                return rows
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index was rebuilt underneath "
+            f"{_PAGE_ATTEMPTS} attempts to read a page of it"
+        )
+
+    async def _repair_until_whole(
+        self, projection, *, passes: int = REPAIR_PASSES
+    ) -> None:
+        """Repair until the walk has reached its target, or refuse to serve.
+
+        A repair is budgeted — ``STEP_BUDGET`` chunks of ``CHUNK_ROWS`` — and
+        may legitimately stop part-way on a history bigger than that product.
+        The projection is then *partial*, and partial is not "a bit behind":
+        the walk goes forward by row id, so what it has written is the OLDEST
+        sessions, and the list is ordered by most recent activity. A partial
+        projection is therefore missing the FRONT of the list — the
+        conversations the user is most likely looking for — and it says so
+        nowhere: the last page comes back with ``next_cursor: null``, which
+        reads as the end of a list that is missing its beginning.
+
+        So this loops rather than serving what happens to be there, and if the
+        walk still has not landed it refuses. That is a worse answer for the
+        request and the only honest one: an error says the list is not ready,
+        while a truncated list says these are your conversations.
+
+        ``accounted().complete`` is the question, not ``RepairOutcome.current``.
+        They differ in the case that matters: a row arriving DURING a repair
+        makes ``current`` false while the walk has reached its target perfectly
+        well, and that is the ordinary state of an agent being written to. Only
+        an unfinished WALK leaves a hole.
+        """
+        for _ in range(max(1, int(passes))):
+            await projection.repair()
+            if await self._whole_watermark(projection) is not None:
+                return
+        raise ProjectionNotReady(
+            f"{projection.agent_id}'s conversation index is still being built; "
+            "serving it now would list the oldest conversations and omit the "
+            "newest, with nothing to say so"
+        )
+
+    async def _preview_rows(
+        self,
+        message_ids: List[Any],
+        membership: str,
+        *,
+        agent_id: Optional[str] = None,
+    ) -> Dict[Any, Tuple[Any, Dict[str, Any]]]:
+        """``{id: (content, metadata)}`` for the rows a page previews.
+
+        One statement for the whole page rather than one per row: a list of 50
+        is 50 round trips otherwise, which on the read path is the cost the
+        projection just removed reappearing one layer up.
+
+        Scoped to this agent AND to the membership the projection describes, so
+        a pointer at a row that has since been deleted or archived resolves to
+        nothing. That is the designed direction — the pointer is a *detectable*
+        stale state, and the change stamp has already moved, so the next repair
+        replaces it.
+        """
+        if not message_ids:
+            return {}
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = await self.db.fetchall(
+            "SELECT id, content, metadata FROM conversation_history "
+            f"WHERE agent_id = ? AND id IN ({placeholders}) AND {membership}",
+            (agent_id or self.agent_id, *message_ids),
+        )
+        return {
+            row[0]: (row[1], parse_message_metadata(row[2])) for row in rows
+        }
+
+    @staticmethod
+    def _as_listed_session(
+        row: Dict[str, Any], previews: Dict[Any, Tuple[Any, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """One projection row shaped exactly as the grouper shapes a session.
+
+        The timestamps are re-spelled with ``isoformat()`` because that is what
+        the grouper emits and therefore what every consumer of this endpoint
+        has always received — the browser parses it, and the projection holds
+        the column's own spelling instead (canonical text on SQLite, a
+        ``datetime`` on PostgreSQL, which would serialize as neither). A value
+        that cannot be read is passed through as text rather than dropped: it is
+        wrong to show, but it is what the row says, and a ``None`` here would
+        move the session to the end of the list on the strength of a spelling.
+        """
+        content, metadata = previews.get(row["first_user_message_id"], (None, {}))
+        return {
+            "session_id": row["session_id"],
+            "started_at": iso_session_timestamp(row["started_at"]),
+            "last_message_at": iso_session_timestamp(row["last_message_at"]),
+            "message_count": row["message_count"],
+            "user_message_count": row["user_message_count"],
+            "preview_content": content,
+            "preview_metadata": metadata,
+            "preview_wake_source": row["wake_source"],
+        }
 
     async def count_session_messages(
         self, session_id: str, deleted_filter: str = "all"

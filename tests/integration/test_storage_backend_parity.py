@@ -3539,12 +3539,14 @@ async def test_conversation_session_queries_are_backend_neutral(db_backend):
     )
     session_id = str(inserted[0][0])
 
-    listed = await privacy_storage.query_conversations(agent_id, limit=10)
-    assert _project_rows(listed) == [
-        ("assistant", "hi there"),
-        ("user", "hello"),
-        ("system", "[New conversation started]"),
-    ]
+    # The conversation list, which since #2960 pages the sessions table rather
+    # than a window of raw rows. Scoped to this agent on both backends: the
+    # other agent's row must not appear in it.
+    page = await privacy_storage.list_session_page(agent_id, limit=10)
+    assert [s["session_id"] for s in page["sessions"]] == [session_id]
+    assert page["sessions"][0]["message_count"] == 2
+    assert page["sessions"][0]["preview_content"] == "hello"
+    assert page["next_cursor"] is None
 
     start_row = await privacy_storage.query_conversation_start(session_id, agent_id)
     assert start_row is not None

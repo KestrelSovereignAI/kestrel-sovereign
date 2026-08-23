@@ -35,6 +35,7 @@ const EMITTED_CLASSES = [
     'conversation-preview',
     'conversation-rename-input',
     'conversations-error',
+    'conversations-load-more',
     'empty-state',
     // kebab_menu.js
     'kebab-btn',

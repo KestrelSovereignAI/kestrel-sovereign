@@ -15,9 +15,10 @@ plain dicts, and hands them here.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
@@ -238,6 +239,33 @@ _GROUPING_EPOCH = datetime(1970, 1, 1)
 #: implementations, which is #2961's subject and not something a shared constant
 #: can fix.
 UNDATABLE_ROW_FALLBACK = _GROUPING_EPOCH
+
+
+def parse_message_metadata(raw: Any) -> Dict[str, Any]:
+    """A row's ``metadata`` as every reader of it wants: a dict, or an empty one.
+
+    ``metadata`` is free text and legacy rows hold documents no parser can read,
+    so an unreadable one becomes an empty dict rather than dropping the row: a
+    message with a broken blob is still a message in the conversation, and the
+    flags read off it (``enc``, ``sent_form``, ``new_session``) are absent
+    rather than wrong.
+
+    Authored once because three call sites had grown their own copy — the
+    projection's derivation, the list endpoint's normalization and the preview
+    resolution — and they disagreed about a JSON document that parses to
+    something other than an object. ``"[]"`` is valid JSON and is not metadata;
+    two of the three would have handed a list to code that calls ``.get``.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 
 def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
@@ -505,20 +533,49 @@ SESSION_ORDER: Tuple[Tuple[str, bool], ...] = (
     ("session_id", False),
 )
 
+#: Which of :data:`SESSION_ORDER`'s keys are text rather than timestamps.
+#:
+#: Named once because three places need the distinction and were spelling it as
+#: ``column == "session_id"`` each time: the comparable rendering of a key, the
+#: binding of a cursor for its engine, and the validation of a cursor arriving
+#: from a client. A key added to the ordering and forgotten in one of the three
+#: is a cursor that compares a timestamp as text or hands a client's string to
+#: asyncpg as a ``TIMESTAMP``.
+SESSION_ORDER_TEXT_COLUMNS = frozenset({"session_id"})
 
-def session_order_sql(backend_type: str) -> str:
-    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause.
+
+def _session_order_key(backend_type: str, column: str) -> str:
+    """One ordering key of :data:`SESSION_ORDER`, spelled for this backend.
 
     ``session_id`` is compared through :func:`bytewise_sql` so the SQL page and
     :func:`sort_sessions` break ties the same way. Without it the two agree only
     on a cluster whose default collation happens to be bytewise, which is not
     the common case.
     """
-    return "ORDER BY " + ", ".join(
-        f"{bytewise_sql(backend_type, column) if column == 'session_id' else column} "
+    return bytewise_sql(backend_type, column) if column == "session_id" else column
+
+
+def _session_order_terms(backend_type: str) -> List[str]:
+    """Every key of :data:`SESSION_ORDER`, with its direction.
+
+    No NULL placement, because there are no NULLs to place: both keys are
+    ``NOT NULL`` in the projection's schema (see
+    ``NON_NULL_PROJECTION_COLUMNS``), and stating a placement here would be a
+    rule about a state the table cannot hold — one SQLite rejects outright
+    inside ``CREATE INDEX`` ("unsupported use of NULLS LAST", 3.50.4), so the
+    ordering and the index that serves it could not even be spelled the same
+    way.
+    """
+    return [
+        f"{_session_order_key(backend_type, column)} "
         f"{'DESC' if descending else 'ASC'}"
         for column, descending in SESSION_ORDER
-    )
+    ]
+
+
+def session_order_sql(backend_type: str) -> str:
+    """:data:`SESSION_ORDER` as an ``ORDER BY`` clause."""
+    return "ORDER BY " + ", ".join(_session_order_terms(backend_type))
 
 
 def session_order_index_columns(backend_type: str) -> str:
@@ -528,12 +585,114 @@ def session_order_index_columns(backend_type: str) -> str:
     ``last_message_at`` are ordinary at second resolution, and the engine must
     then sort the whole tie group before applying ``LIMIT``. The tie-break is
     compared bytewise for the same reason the ``ORDER BY`` compares it that way,
-    so the index and the ordering are the same comparison.
+    so the index and the ordering are the same comparison — and the NULL
+    placement travels with it, because an index whose NULLs sit at the other end
+    from the query's does not serve that query's ``ORDER BY``.
     """
-    return ", ".join(
-        f"{bytewise_sql(backend_type, column) if column == 'session_id' else column} "
-        f"{'DESC' if descending else 'ASC'}"
-        for column, descending in SESSION_ORDER
+    return ", ".join(_session_order_terms(backend_type))
+
+
+def session_cursor_clause(
+    backend_type: str, after: Sequence[Any]
+) -> Tuple[str, Tuple[Any, ...]]:
+    """``(predicate, params)`` selecting the rows strictly after ``after``.
+
+    ``after`` is one row's :data:`SESSION_ORDER` values, in that order. The
+    result is the standard lexicographic keyset expansion — equal on every
+    earlier key, past the cursor on this one — generated from the same
+    declaration :func:`session_order_sql` is, so a page and its continuation
+    cannot come to order by different things. A predicate rather than an
+    ``OFFSET`` because an offset counts rows that may have moved between two
+    requests, which is how a paging list silently drops or repeats a session
+    while the agent is still writing.
+
+    **The leading conjunct is redundant and load-bearing.** ``last_message_at
+    <= ?`` is implied by every branch of the disjunction that follows, and
+    without it the engine cannot use the index to SEEK: measured on 200,000
+    sessions, SQLite plans ``(agent_id=?)`` and walks every entry above the
+    cursor at 17.7 ms per page, and ``(agent_id=? AND last_message_at<?)`` at
+    0.11 ms. A disjunction is not a range, so the range has to be stated
+    separately — otherwise the continuation costs ``O(rows already paged)``,
+    which is the shape this epic exists to remove, reappearing one page in.
+    """
+    if len(after) != len(SESSION_ORDER):
+        raise ValueError(
+            f"session cursor needs {len(SESSION_ORDER)} values, got {len(after)}"
+        )
+    lead_column, lead_descending = SESSION_ORDER[0]
+    lead_key = _session_order_key(backend_type, lead_column)
+    conjuncts = [f"{lead_key} {'<=' if lead_descending else '>='} ?"]
+    params: List[Any] = [after[0]]
+
+    terms: List[str] = []
+    for index, (column, descending) in enumerate(SESSION_ORDER):
+        clauses = [
+            f"{_session_order_key(backend_type, SESSION_ORDER[earlier][0])} = ?"
+            for earlier in range(index)
+        ]
+        params.extend(after[earlier] for earlier in range(index))
+        key = _session_order_key(backend_type, column)
+        clauses.append(f"{key} {'<' if descending else '>'} ?")
+        params.append(after[index])
+        terms.append("(" + " AND ".join(clauses) + ")")
+    conjuncts.append("(" + " OR ".join(terms) + ")")
+    return "(" + " AND ".join(conjuncts) + ")", tuple(params)
+
+
+def iso_session_timestamp(value: Any) -> Any:
+    """A stored session timestamp spelled the way the grouper spells one.
+
+    ``started_at`` / ``last_message_at`` reach a client as
+    ``datetime.isoformat()`` text and always have, because the grouper is what
+    produced them. The #2959 projection holds the column's own spelling instead
+    — canonical space-separated text on SQLite, a ``datetime`` on PostgreSQL —
+    and serializing either of those would change what every existing consumer
+    parses. One conversion, named, so the two producers of a listed session
+    cannot present the same instant two ways.
+
+    A value that cannot be read is returned as text rather than as ``None``:
+    it is wrong to show, but it is what the row says, and ``None`` is a
+    different claim that this ordering places at a specific end of the list.
+    """
+    if value is None:
+        return None
+    parsed = coerce_session_timestamp(value)
+    return parsed.isoformat() if parsed is not None else str(value)
+
+
+def session_order_value(column: str, value: Any) -> Any:
+    """One :data:`SESSION_ORDER` key, spelled so any two of them compare.
+
+    The paths that page in Python hold the grouper's ISO output
+    (``2026-03-01T09:00:00``) while a cursor carries the comparable spelling
+    (``2026-03-01 09:00:00``), and ``"T"`` is 0x54 against a space's 0x20 — so
+    comparing the two as they arrive makes an hour-earlier row sort *after* a
+    later one. Both sides pass through here first, which is also what makes the
+    Python comparison the same comparison the SQL one performs: canonical text
+    is fixed-width, so its lexicographic order IS chronological order, on both
+    engines.
+
+    An unreadable timestamp is returned unchanged rather than becoming ``None``.
+    ``None`` means "no value", which this ordering places at a specific end; a
+    value that merely cannot be parsed is not that, and turning one into the
+    other would move a session to the end of the list on the strength of a
+    spelling.
+    """
+    if value is None:
+        return None
+    if column in SESSION_ORDER_TEXT_COLUMNS:
+        return str(value)
+    from .conversation_created_at import comparable_created_at
+
+    comparable = comparable_created_at(value)
+    return comparable if comparable is not None else str(value)
+
+
+def session_cursor_values(session: Dict[str, Any]) -> Tuple[Any, ...]:
+    """One session's :data:`SESSION_ORDER` keys, comparably spelled."""
+    return tuple(
+        session_order_value(column, session.get(column))
+        for column, _ in SESSION_ORDER
     )
 
 
@@ -547,6 +706,40 @@ def sort_sessions(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for column, descending in reversed(SESSION_ORDER):
         sessions.sort(key=lambda session: session[column], reverse=descending)
     return sessions
+
+
+def page_grouped_sessions(
+    messages: Iterable[Dict[str, Any]],
+    *,
+    limit: int,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Group an OLDEST-FIRST transcript into one page of sessions.
+
+    ``(sessions, has_more)``. The Python counterpart of
+    :meth:`~kestrel_sovereign.storage.conversation_sessions.ConversationSessionProjection.page`,
+    for the two read paths that have no table to page — ISOLATED privacy mode's
+    in-memory buffer, and the archived view, whose membership the #2959
+    projection does not describe.
+
+    Everything after the grouping is the same sequence the SQL page performs in
+    the engine: coalesce same-id clusters into unique delete targets (#2019),
+    order by :data:`SESSION_ORDER`, resume past the cursor, take the page. Doing
+    it in the same order matters — coalescing after ordering would merge two
+    rows whose merged activity belongs elsewhere in the list.
+
+    ``keep_empty_markers=True`` so a just-started conversation (a session marker
+    with no messages yet) is list-visible immediately (#2222): the UI
+    optimistically prepends a tile for it, and this reconciling list must
+    include it or the tile vanishes on the next refresh.
+    """
+    grouped = coalesce_sessions_by_session_id(
+        group_messages_into_sessions(messages, keep_empty_markers=True)
+    )
+    sort_sessions(grouped)
+    remaining = grouped[max(0, int(offset)):]
+    bounded = max(1, int(limit))
+    return remaining[:bounded], len(remaining) > bounded
 
 
 def summarize_sessions(

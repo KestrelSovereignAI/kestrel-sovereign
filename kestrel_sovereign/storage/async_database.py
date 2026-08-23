@@ -2046,6 +2046,10 @@ class AsyncDatabase:
             live_history_predicate,
             mutation_trigger_functions,
             mutation_triggers,
+            NON_NULL_PROJECTION_COLUMNS,
+            emptied_cache_invalidation,
+            WATERMARK_EPOCH_COLUMN,
+            WATERMARK_REVISION_COLUMN,
             projection_tables,
             shape_change_invalidation,
         )
@@ -2061,6 +2065,25 @@ class AsyncDatabase:
             for table, ddl in tables
             if not await self.table_exists(table)
         ]
+        # A projection table carrying an EARLIER shape is as good as missing.
+        # #2960 made ``started_at`` / ``last_message_at`` NOT NULL — the page's
+        # keyset predicate cannot seek while it must also admit NULL — and a
+        # database created before that still permits one. There is no ALTER for
+        # it on SQLite and no reason to reach for one on either engine: this
+        # table is a rebuildable cache, so the migration is to drop it and let a
+        # repair derive it again, which is cheaper than rewriting it in place.
+        async def _predates_the_not_null_stamps(table: str) -> bool:
+            for column in NON_NULL_PROJECTION_COLUMNS:
+                if await self._column_accepts_null(table, column):
+                    return True
+            return False
+
+        outdated_tables = [
+            table
+            for table in ("conversation_sessions",)
+            if not any(table == name for name, _ in missing_tables)
+            and await _predates_the_not_null_stamps(table)
+        ]
         # Set equality, not "are the ones I want present". The names carry the
         # mechanism's fingerprint, so a database running a SUPERSEDED shape has
         # names this run has never heard of — and that database is exactly the
@@ -2073,10 +2096,32 @@ class AsyncDatabase:
         )
         if (
             missing_tables
+            or outdated_tables
             or installed_triggers != set(wanted_triggers)
             or installed_functions != set(wanted_functions)
         ):
             async with self.migration_lock("conversation_sessions_2959"):
+                # Re-probed under the lock: a concurrent initializer may have
+                # replaced this while this one waited.
+                # Whether this block leaves `conversation_sessions` EMPTY —
+                # by replacing it, or by creating one that was not there.
+                emptied_the_cache = False
+                for table in outdated_tables:
+                    if not await _predates_the_not_null_stamps(table):
+                        continue
+                    await self._backend.execute(
+                        f"DROP TABLE IF EXISTS {self._quoted(table)}"
+                    )
+                    logger.info(
+                        "dropped %s: it predates the NOT NULL stamps and will "
+                        "be derived again (#2960)", table,
+                    )
+                    # No flag set here on purpose: a dropped table is recreated
+                    # by the loop below, which is where "the cache is empty" is
+                    # recorded. Setting it in both places reads as belt and
+                    # braces and is really one statement that cannot change the
+                    # outcome — a mutation removing it survived, which is what
+                    # that always means.
                 # Re-probed under the lock: a concurrent initializer may have
                 # created every one of these while this one waited.
                 for table, ddl in tables:
@@ -2085,6 +2130,39 @@ class AsyncDatabase:
                             normalize_schema(ddl, self.backend_type)
                         )
                         logger.info("created %s (#2959)", table)
+                        # Creating this one is the same event as replacing it,
+                        # and both reach here by ordinary routes: a restore that
+                        # carried the watermarks but not the cache, or a hand
+                        # recovery that dropped it. The watermarks then describe
+                        # rows that are gone, `is_stale()` compares numbers that
+                        # still match, and the projection reports itself current
+                        # over an EMPTY table — so the conversation list serves
+                        # nothing, for ever, beside intact history. Measured
+                        # before this was here.
+                        if table == "conversation_sessions":
+                            emptied_the_cache = True
+                if emptied_the_cache:
+                    # Two statements, because one of them can match no rows.
+                    #
+                    # Rotating the generation is the mechanism already written
+                    # for "the shape moved": both `is_stale` and `_plan` read a
+                    # changed generation as counters belonging to a different
+                    # incarnation, and answer REBUILD — including for a repair
+                    # already in flight, whose publish fence re-reads it. But it
+                    # updates the LEDGER, and an agent can have a watermark with
+                    # no ledger row at all (a projection built before the
+                    # triggers existed, a restore that carried one table and not
+                    # the other). Its generation is '' and its stamp is 0, which
+                    # is precisely what a missing ledger reads back as, so the
+                    # rotation touches nothing and the numbers go on agreeing.
+                    await self._backend.execute(
+                        shape_change_invalidation(self.backend_type)
+                    )
+                    await self._backend.execute(emptied_cache_invalidation())
+                    logger.info(
+                        "conversation_sessions is empty; every agent's "
+                        "projection will be derived again (#2960)"
+                    )
                 installed_triggers = await self._trigger_family(
                     TRIGGER_NAME_PREFIX, "conversation_history"
                 )
@@ -2179,6 +2257,18 @@ class AsyncDatabase:
                 "row changed, and would report itself current forever."
             )
 
+        # Additive, for a watermark table created before #2960 gave it a write
+        # counter. Through the shared helper rather than by hand: it does the
+        # ALTER and its verification inside one migration lock, and a column
+        # that silently failed to land here would make the page fence compare
+        # a value that never moves.
+        await self.migrate_columns_once(
+            "conversation_session_watermarks",
+            (
+                (WATERMARK_REVISION_COLUMN, "BIGINT NOT NULL DEFAULT 0"),
+                (WATERMARK_EPOCH_COLUMN, "TEXT NOT NULL DEFAULT ''"),
+            ),
+        )
         await self.ensure_index(
             *_SESSION_PROJECTION_INDEX,
             f"agent_id, {session_order_index_columns(self.backend_type)}",
@@ -2906,7 +2996,34 @@ class AsyncDatabase:
                 f"WHERE name='{column}'"
             )
         return bool(row and row[0] > 0)
-    
+
+    async def _column_accepts_null(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` still permits NULL.
+
+        Asked of the same relation ``ALTER TABLE`` and every unqualified read
+        resolve — ``to_regclass`` on PostgreSQL, ``pragma_table_info`` on SQLite
+        — for the reason :meth:`_column_exists` spells out: a name-based
+        ``information_schema`` probe answers about whichever same-named table
+        the search path happens to union in.
+
+        A column that does not exist reads as ``False``: "this column accepts
+        NULL" is a claim about a column, and the absent one is not a nullable
+        one. The callers that care create the table when it is missing.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT attnotnull FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
+                (table, column),
+            )
+        else:
+            row = await self._backend.fetch_one(
+                f"SELECT \"notnull\" FROM pragma_table_info('{table}') "
+                f"WHERE name='{column}'"
+            )
+        return bool(row) and not bool(row[0])
+
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
     # ─────────────────────────────────────────────────────────────────

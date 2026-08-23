@@ -176,6 +176,44 @@ _DIGIT_CLASS = _assert_class_denotes(
 )
 
 
+def is_storable_session_id(value: Any) -> bool:
+    """Whether ``conversation_sessions`` can hold this key on BOTH engines.
+
+    A **weaker** question than :func:`is_stampable_session_id`, and a different
+    one. That function asks what the indexed DUPLICATE may hold, and is narrow
+    on purpose so one rule can be written in three languages; this asks only
+    what a primary key can physically store, because #2960 keys the session
+    projection on whatever the grouper produced — including the ``sms:{sender}``
+    ids ``rasa_shim`` writes, which the column contract excludes and every
+    reader opens without difficulty.
+
+    Three limits, and each is PostgreSQL telling us so at insert time — which
+    is inside the repair that runs on the first page of every conversation
+    list, so a key past one of them does not lose a session, it fails the whole
+    list:
+
+    * **No NUL.** PostgreSQL cannot hold one in ``TEXT`` at all.
+    * **Encodable.** A lone surrogate has no UTF-8 encoding, so the driver
+      cannot send it.
+    * **Bounded.** A composite B-tree entry over ~2704 bytes is refused.
+      :data:`SESSION_ID_MAX_LENGTH` is the bound used rather than that number,
+      because it is the length a session id already has everywhere else in this
+      system and one number that two tables share cannot drift into two.
+
+    Measured in BYTES, not characters: this admits non-ASCII, where the two
+    differ by up to 4×, and it is bytes the index counts.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if "\x00" in value:
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return len(encoded) <= SESSION_ID_MAX_LENGTH
+
+
 def is_stampable_session_id(value: Any) -> bool:
     """Whether ``value`` may be copied into the indexed column.
 

@@ -61,6 +61,7 @@ from kestrel_sovereign.storage.conversation_created_at import (
 )
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.conversation_sessions import (
     CURRENT,
     active_history_predicate,
@@ -237,10 +238,18 @@ async def _assert_agrees_with_the_grouper(
 
     * Every session the projection claims, the grouper also finds, with the
       same boundaries, counts, pointer and wake source.
-    * Every session the grouper finds whose id the column may hold, the
-      projection claims. Absence is only ever an id outside that contract —
-      the legacy row-id keys and the ``did:x:1`` shapes — which is Phase A's
-      invariant carried forward: silent where it must be, never wrong.
+    * Every session the grouper finds whose id a READER CAN OPEN, the projection
+      claims. Absence is only ever an id no reader could round-trip — the
+      ``did:x:1`` shapes — which is Phase A's invariant carried forward: silent
+      where it must be, never wrong.
+
+    That second direction was narrower when this table had no reader: it also
+    excused the legacy row-id keys of #2012, on the grounds that absence is the
+    permitted direction. #2960 makes this table THE conversation list, so an
+    absent session is a conversation that has vanished from the UI. A row-id key
+    is not in the column and never can be, but it is exactly what the row-id
+    resolver opens — so it is claimed, and the test for "can a reader open this"
+    is asked of the resolver rather than of the column.
     """
     history = await _live_history(db, agent_id)
     reference = _reference_sessions(history)
@@ -253,10 +262,27 @@ async def _assert_agrees_with_the_grouper(
         )
         assert projected == reference[session_id], session_id
 
-    expected = {
-        session_id for session_id in reference if is_stampable_session_id(session_id)
-    }
-    assert set(stored) == expected
+    # Asked of the RESOLVER, not modelled from the key's shape. "Can a reader
+    # open this session" is the whole of the second direction, and every
+    # spelling of it that reasons about the key instead has been wrong: Phase B
+    # asked `is_stampable_session_id`, which is a question about Phase A's
+    # INDEXED COLUMN — and the resolver does not use that column. It matches a
+    # row id, or `metadata LIKE '%"session_id": "<value>"%'`. So an `sms:`
+    # session (rasa_shim files every SMS turn under `sms:{sender}`) opens
+    # perfectly and was being dropped from the list.
+    #
+    # `_get_session_messages` is the resolver both halves of that live in, and
+    # `include_markers=True` is what makes a marker-only session (#2222) — real,
+    # openable, and carrying no messages — answer yes.
+    store = AsyncConversationStore(db, agent_id=agent_id)
+    openable = set()
+    for session_id in reference:
+        rows = await store._get_session_messages(
+            session_id, limit=1, deleted_filter="live", include_markers=True
+        )
+        if rows:
+            openable.add(session_id)
+    assert set(stored) == openable
     return stored
 
 
@@ -292,11 +318,15 @@ async def _assert_repaired_projection_is_true(
                 "which is not a live row"
             )
             assert live[0] == "user"
-        counted = await db.fetchval(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? "
-            "AND session_id = ? AND deleted_at IS NULL AND archived_at IS NULL",
-            (agent_id, row["session_id"]),
-        )
+        # Counted through the store's own resolver, not by the indexed column.
+        # The column is one of the two ways a session is keyed and it cannot
+        # find the other: a legacy row-id session (#2012) carries NULL in every
+        # row's column by construction. A membership test that only knows the
+        # column would report those as empty and would be asserting the
+        # checker's blind spot rather than the projection's claim.
+        counted = await AsyncConversationStore(
+            db, agent_id=agent_id
+        ).count_session_messages(row["session_id"], deleted_filter="live")
         assert counted > 0, (
             f"session {row['session_id']!r} has a projection row but no live rows"
         )
@@ -567,8 +597,10 @@ async def test_the_projection_says_what_the_grouper_says(seeded):
     assert stored[UUID_C]["message_count"] == 2
     assert stored[UUID_C]["first_user_message_id"] == ids["C live turn"]
 
-    # The legacy and outside-the-contract clusters are absent, never invented.
-    assert OUTSIDE_THE_CONTRACT not in stored
+    # A session the indexed COLUMN may not hold is still listed, because the
+    # column is not what opens it (#2960). `did:x:1` resolves through
+    # `metadata LIKE`, exactly as `rasa_shim`'s `sms:{sender}` sessions do.
+    assert OUTSIDE_THE_CONTRACT in stored
 
 
 @pytest.mark.asyncio
@@ -1290,8 +1322,9 @@ async def test_a_database_that_gains_the_ledger_after_its_history_is_rebuilt(
         projection = ConversationSessionProjection(db, AGENT)
         await db.execute(
             "INSERT INTO conversation_sessions "
-            "(agent_id, session_id, message_count) VALUES (?, ?, ?)",
-            (AGENT, "a-session-that-is-gone", 7),
+            "(agent_id, session_id, started_at, last_message_at, message_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (AGENT, "a-session-that-is-gone", _at(0), _at(1), 7),
         )
         await db.execute("DELETE FROM conversation_history_changes", ())
         await db.execute("DELETE FROM conversation_session_watermarks", ())
@@ -2207,12 +2240,19 @@ async def test_two_repairs_racing_leave_a_projection_that_is_true(modern):
 
 
 @pytest.mark.asyncio
-async def test_an_id_outside_the_column_contract_is_never_projected(seeded):
-    """Phase A's invariant, carried forward: absent is allowed, wrong is not.
+async def test_an_id_outside_the_column_contract_is_still_listed(seeded):
+    """An id Phase A's column may not hold is one a READER opens perfectly.
 
-    ``did:x:1`` is a session the grouper honours and the indexed column may not
-    hold, so no projection row may claim it — and adding more of its rows must
-    not change that.
+    Phase B refused these on the grounds that absence is the permitted
+    direction, which it was while nothing read this table. #2960 makes it the
+    conversation list, and the refusal was resting on a proxy: the session
+    resolver does not consult the indexed column at all — it matches a row id,
+    or `metadata LIKE '%"session_id": "<value>"%'`. `did:x:1` is found by the
+    second, and so is every SMS turn `rasa_shim` files under `sms:{sender}`,
+    which is core code and not a hypothetical.
+
+    So the claim is inverted, deliberately: the session is listed, its counts
+    track its rows, and adding more of them keeps both true.
     """
     db, _store, projection = seeded
     await _seed(
@@ -2222,28 +2262,35 @@ async def test_an_id_outside_the_column_contract_is_never_projected(seeded):
     )
 
     await projection.repair()
-    assert await projection.get(OUTSIDE_THE_CONTRACT) is None
-    assert not any(
-        row["session_id"] == OUTSIDE_THE_CONTRACT for row in await projection.list()
+    stored = await projection.get(OUTSIDE_THE_CONTRACT)
+    assert stored is not None, (
+        "a session the resolver opens was dropped from the list — the defect "
+        "#2960 exists to remove, arriving through the column contract"
     )
+    assert stored["session_id"] == OUTSIDE_THE_CONTRACT
     await _assert_repaired_projection_is_true(db, projection)
 
 
 @pytest.mark.asyncio
-async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
+async def test_a_row_whose_column_contradicts_its_metadata_is_refused(modern):
     """The guard that only a Phase A violation can reach — defended, not assumed.
 
-``project_transcript`` drops any session whose id
-    :func:`is_stampable_session_id` rejects, and the column contract means no
-    shipped write path can produce one. That makes the filter a clause no
-    ordinary test can exercise, which Phase A's Finding named as the worst kind:
-    it reads as protection while a mutation removing it goes unnoticed.
+    Phase A's column is a derived duplicate of ``metadata.session_id``, written
+    by the same INSERT. The two disagreeing is a violation with no correct
+    answer: filing the row under either candidate puts it somewhere the
+    transcript does not show it. ``project_transcript`` refuses the whole
+    session, and no shipped write path can produce the state, which makes the
+    clause one no ordinary test exercises — the worst kind, reading as
+    protection while a mutation removing it goes unnoticed.
 
-    So the violation is written directly into the column, bypassing
-    ``column_session_id`` the way only a future bug could. The projection's
-    primary key is ``(agent_id, session_id)`` and Phase C will read it, so a row
-    keyed by a value the contract forbids is a key no reader can round-trip.
-    Absent is the permitted direction.
+    So the contradiction is written straight into the column, bypassing
+    ``column_session_id`` the way only a future bug could.
+
+    This case used to smuggle a value the column's CHARSET forbids and assert
+    the session vanished. That claim went with #2960: the resolver does not
+    consult the column, so such a session is openable and dropping it from the
+    list is the bug. What survives is the disagreement, which is a different
+    thing and still refused.
 
     On the all-stamped corpus deliberately: that is the derivation a chunk
     feeds, so this is the path where the filter is load-bearing.
@@ -2255,17 +2302,21 @@ async def test_a_column_value_the_contract_forbids_is_still_not_keyed(modern):
         "VALUES (?, ?, ?, ?, ?, ?)",
         (
             AGENT, "user", "smuggled row",
-            json.dumps({"session_id": OUTSIDE_THE_CONTRACT}),
-            OUTSIDE_THE_CONTRACT,
+            json.dumps({"session_id": UUID_A}),
+            "a-column-value-nothing-wrote",
             _at(700),
         ),
     )
 
     await projection.repair()
-    assert await projection.get(OUTSIDE_THE_CONTRACT) is None
+    assert await projection.get("a-column-value-nothing-wrote") is None
     assert not any(
-        row["session_id"] == OUTSIDE_THE_CONTRACT for row in await projection.list()
+        row["session_id"] == "a-column-value-nothing-wrote"
+        for row in await projection.list()
     )
+    # ...and the session its metadata names is refused too, rather than stored
+    # describing a set of rows that does not include the contradicting one.
+    assert await projection.get(UUID_A) is None
 
 
 @pytest.mark.asyncio
@@ -2515,12 +2566,19 @@ async def test_the_list_orders_ties_deterministically(tmp_path):
     Asserted through a real database rather than a double: the ordering is
     decided by SQL, so a mock storage would only prove that the test knows what
     it wrote.
+
+    Asked of the LIST, which since #2960 means the sessions page rather than a
+    window of raw rows. The consequence is what is observable and what a user
+    would see move: a legacy cluster is keyed and previewed by its FIRST row in
+    canonical order, so a tie resolved differently gives the same three messages
+    a different session id and a different card.
     """
     from kestrel_sovereign.privacy import PrivacyMode
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
     async with AsyncStorage(str(tmp_path / "ties.db"), agent_id=AGENT) as storage:
+        ids = []
         for content in ("first", "second", "third"):
             await storage.db.execute(
                 "INSERT INTO conversation_history "
@@ -2528,17 +2586,26 @@ async def test_the_list_orders_ties_deterministically(tmp_path):
                 "VALUES (?, 'user', ?, NULL, ?)",
                 (AGENT, content, _at(0)),
             )
+        ids = [
+            row[0] for row in await storage.db.fetchall(
+                "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id",
+                (AGENT,),
+            )
+        ]
+        assert len(ids) == 3, "the corpus did not land, so the order proves nothing"
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations(AGENT, limit=10)
-        ids = [row[0] for row in rows]
+        page = await wrapper.list_session_page(AGENT, limit=10)
+        sessions = page["sessions"]
 
-        assert len(ids) == 3, "the corpus did not land, so the order proves nothing"
-        assert ids == sorted(ids, reverse=True), (
-            "rows sharing a timestamp came back in an order the backend chose; "
-            f"got {ids}. The list must break ties on id so the same history "
-            "always groups the same way."
+        assert len(sessions) == 1, f"three tied rows are one cluster; got {sessions}"
+        assert sessions[0]["session_id"] == str(min(ids)), (
+            "rows sharing a timestamp were ordered by whatever the backend "
+            f"chose; the cluster keyed on {sessions[0]['session_id']!r} rather "
+            f"than on the lowest id {min(ids)}. The list must break ties on id "
+            "so the same history always groups the same way."
         )
+        assert sessions[0]["preview_content"] == "first"
 
 
 @pytest.mark.asyncio
@@ -2651,11 +2718,13 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
     two rows come back reversed under a raw ``ORDER BY created_at``, and
     ``julianday()`` restores chronology.
 
-    Asked of ``query_conversations``, because that is where the order is
-    actually consumed: the conversation list pages by it and reverses it before
-    grouping, so getting it wrong reorders the transcript the grouper sees. The
-    projection's ordinary chunk path walks ids and never reaches this clause,
-    which is why an earlier version of this test passed with the fix removed.
+    Asked of the LIST, because that is where the order is actually consumed.
+    Since #2960 the list reads the sessions table, and the derivation that fills
+    it for a history holding unstamped rows — which this one is — walks the
+    whole transcript in exactly this order, so getting it wrong reorders the
+    sequence the grouper sees and moves the session boundaries. The chunked
+    path walks ids and never reaches this clause, which is why an earlier
+    version of this test passed with the fix removed.
 
     The mixture now arrives only in a database that predates #3009's CHECK, and
     the migration removes it on the way in. Both readings of the order have to
@@ -2679,8 +2748,8 @@ async def test_mixed_timestamp_spellings_are_ordered_chronologically(tmp_path):
     async with AsyncStorage(str(tmp_path / "spellings.db"), agent_id=AGENT) as storage:
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-        rows = await wrapper.query_conversations(AGENT, limit=10)
-        newest_first = [row[2] for row in rows]
+        page = await wrapper.list_session_page(AGENT, limit=10)
+        newest_first = [s["preview_content"] for s in page["sessions"]]
 
         assert newest_first == ["later, SQL spelling", "earlier, ISO spelling"], (
             "the list paged these newest-first by TEXT, not by time: the "
