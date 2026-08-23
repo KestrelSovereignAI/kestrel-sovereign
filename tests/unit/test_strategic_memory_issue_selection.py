@@ -63,3 +63,56 @@ async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypat
 
     assert picked["issue_number"] == 17
     broad_fetch.assert_not_awaited()
+
+
+class TestReferencePrefixMustLookLikeARepository:
+    """A prose prefix is not a repository.
+
+    ``parse_issue_ref`` treated any non-empty prefix as one, so a handwritten
+    ``Issue #123`` produced the repository ``Issue``. ``pick_top_issue``
+    returns on its first candidate, so such a row did not merely dispatch
+    against an invalid target — it masked every valid blocker behind it. The
+    fix for one wrong-repository path had opened another.
+    """
+
+    def test_prose_prefixes_do_not_become_repositories(self):
+        from kestrel_sovereign.features.strategic_memory.issue_selection import (
+            parse_issue_ref,
+        )
+
+        for text in ("Issue #123", "not-a-repo#123", "see FIXME #7"):
+            repo, number = parse_issue_ref(text)
+            assert repo is None, f"{text!r} must not yield a repository"
+            assert number is not None, f"{text!r} still names an issue number"
+
+    def test_owner_repo_shapes_are_still_recognised(self):
+        from kestrel_sovereign.features.strategic_memory.issue_selection import (
+            parse_issue_ref,
+        )
+
+        assert parse_issue_ref("owner/repo#123") == ("owner/repo", 123)
+        assert parse_issue_ref("Kestrel.AI/kestrel-x#9") == ("Kestrel.AI/kestrel-x", 9)
+        assert parse_issue_ref("#42") == (None, 42)
+
+    @pytest.mark.asyncio
+    async def test_a_prose_blocker_does_not_mask_the_valid_one_behind_it(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GITHUB_TOKEN", "dummy")
+        from kestrel_sovereign.features.strategic_memory.issue_selection import (
+            pick_top_issue,
+        )
+
+        data = {
+            "morning_signal_config": {"scan_repos": []},
+            "blockers": [
+                {"severity": "critical", "issue": "Issue #123", "title": "prose"},
+                {"severity": "high", "issue": "owner/repo#7", "title": "valid"},
+            ],
+        }
+
+        picked = await pick_top_issue(data)
+
+        assert picked is not None, "the valid blocker must still be reachable"
+        assert picked["repo"] == "owner/repo"
+        assert picked["issue_number"] == 7
