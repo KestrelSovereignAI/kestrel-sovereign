@@ -249,18 +249,26 @@ def _termination_partial_result(
             and type(item.metadata.get("cause_type")) is str
         }
     )
-    cleanup_states = {
-        item.metadata.get("runtime_cleanup_state", "retained")
+    cleanup_pending = any(
+        item.metadata.get("runtime_cleanup_state") == "pending"
         for item in retained
         if isinstance(getattr(item, "metadata", None), dict)
+    )
+    named_child_retained_states = {
+        str(item.metadata.get("runtime_cleanup_state", "retained"))
+        for item in retained
+        if isinstance(getattr(item, "metadata", None), dict)
+        and isinstance(getattr(item, "agent_name", None), str)
+        and item.agent_name.casefold() == child_name.casefold()
     }
-    cleanup_pending = "pending" in cleanup_states
-    if cleanup_pending and cleanup_states != {"pending"}:
-        cleanup_state = "mixed"
-    elif cleanup_pending:
-        cleanup_state = "pending"
+    if len(named_child_retained_states) == 1:
+        named_child_retained_state = next(iter(named_child_retained_states))
+    elif named_child_retained_states:
+        named_child_retained_state = "mixed"
+    elif named_child_retained:
+        named_child_retained_state = "retained"
     else:
-        cleanup_state = "retained"
+        named_child_retained_state = None
 
     retention_witness = False
     named_retention_witness = False
@@ -289,8 +297,8 @@ def _termination_partial_result(
             if termination_not_performed
             else "not_performed"
             if not named_child_removed
-            else cleanup_state
-            if retained
+            else named_child_retained_state
+            if named_child_retained
             else scoped_no_op_state or "removed"
         )
     else:
