@@ -494,3 +494,58 @@ def test_a_failed_owner_scoped_batch_unwinds_its_claims():
     assert registry.get("batch.shared") is shared
     assert owner not in registry.owners_of("batch.shared")
     assert registry.get("batch.clash") is clash_incumbent
+
+
+def test_a_failed_batch_keeps_a_claim_the_owner_already_held():
+    """Rollback unwinds what the BATCH acquired, not what predated it.
+
+    A feature that registered a source imperatively and also declares it holds
+    a claim before the batch runs. Releasing that on a later failure would
+    delete a source the feature is still running on.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    owner = object()
+
+    shared = _owner_test_source("prior.shared")
+    registry.register_with_policy(shared, RegistrationPolicy.OPTIONAL, owner=owner)
+    assert registry.owners_of("prior.shared") == (owner,)   # premise: held BEFORE
+
+    clash_incumbent = _owner_test_source("prior.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY, owner=owner
+        )
+
+    # The pre-existing claim survives, and so does the source it protects.
+    assert registry.owners_of("prior.shared") == (owner,)
+    assert registry.get("prior.shared") is shared
+
+
+def test_unregister_does_not_retain_the_owner_object():
+    """The registry must not pin a feature instance after its source is gone."""
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    owner = object()
+    source = _owner_test_source("leak.test")
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=owner)
+    assert registry.owners_of("leak.test") == (owner,)
+
+    registry.unregister("leak.test")
+
+    assert registry.owners_of("leak.test") == ()
+    assert id(owner) not in registry._claim_owners

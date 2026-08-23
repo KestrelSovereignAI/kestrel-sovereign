@@ -214,6 +214,18 @@ class SourceRegistry:
             holders.append(key)
             self._claim_owners[key] = owner
 
+    def _forget_owner_if_unreferenced(self, key) -> None:
+        """Drop the owner object once no claim list mentions it.
+
+        `_claim_owners` holds STRONG references so `owners_of` can hand back the
+        objects; leaving one behind after its last claim went would retain a
+        feature instance (and everything it holds) for the registry's lifetime.
+        """
+        if key is _HOST_CLAIM:
+            return
+        if not any(key in holders for holders in self._claims.values()):
+            self._claim_owners.pop(key, None)
+
     def owners_of(self, name: str) -> tuple:
         """The objects currently holding *name*, in the order they claimed it."""
         return tuple(
@@ -235,8 +247,7 @@ class SourceRegistry:
         if not holders or key not in holders:
             return False
         holders.remove(key)
-        if not any(key in other for other in self._claims.values()):
-            self._claim_owners.pop(key, None)
+        self._forget_owner_if_unreferenced(key)
         if holders:
             return False
         self._claims.pop(name, None)
@@ -279,7 +290,8 @@ class SourceRegistry:
         the deliberate inverse for the teardown path, not a mutate-behind-a-
         running-dispatcher tool.
         """
-        self._claims.pop(name, None)
+        for key in self._claims.pop(name, ()):
+            self._forget_owner_if_unreferenced(key)
         return self._sources.pop(name, None) is not None
 
     def register_with_policy(
@@ -373,13 +385,20 @@ class SourceRegistry:
         claimed: list[str] = []
         try:
             for registration in registrations:
+                # Only a claim this batch ACQUIRES is this batch's to unwind.
+                # An owner that already held the source — a feature that
+                # registered it imperatively and also declares it — keeps that
+                # claim, or the rollback would delete a source it is running on.
+                held_before = owner is not None and owner in self.owners_of(
+                    registration.name
+                )
                 outcome = self.register_with_policy(
                     registration, policy, owner=owner
                 )
                 outcomes.append(outcome)
                 if outcome.state is RegistrationState.REGISTERED:
                     newly_added.append(outcome.name)
-                if owner is not None and outcome.ok:
+                if owner is not None and outcome.ok and not held_before:
                     claimed.append(outcome.name)
         except RegistrationError:
             for name in claimed:
