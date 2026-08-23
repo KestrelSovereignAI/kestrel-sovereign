@@ -1997,6 +1997,19 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
         await _shutdown_single_agent(agent)
 
 
+def _split_lifecycle_cancellation(
+    failure: BaseException | None,
+) -> tuple[bool, BaseException | None]:
+    """Separate cancellation leaves while preserving every ordinary failure."""
+
+    if isinstance(failure, asyncio.CancelledError):
+        return True, None
+    if isinstance(failure, BaseExceptionGroup):
+        cancellation, remaining = failure.split(asyncio.CancelledError)
+        return cancellation is not None, remaining
+    return False, failure
+
+
 async def _rollback_startup_agent_manager(manager) -> bool:
     """Drain a partially-started multi-agent manager before dropping it.
 
@@ -2009,13 +2022,15 @@ async def _rollback_startup_agent_manager(manager) -> bool:
         manager.shutdown_all(), name="server_startup:rollback_agents"
     )
     cancelled, failure = await await_lifecycle_task_completion(rollback)
-    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+    failure_cancelled, failure = _split_lifecycle_cancellation(failure)
+    cancelled = cancelled or failure_cancelled
+    if failure is not None:
         logger.warning(
             "Multi-agent startup rollback did not fully shut down loaded agents: %s",
             failure,
             exc_info=(type(failure), failure, failure.__traceback__),
         )
-    elif isinstance(failure, asyncio.CancelledError):
+    elif failure_cancelled:
         logger.warning(
             "Multi-agent startup rollback was cancelled after its cleanup task "
             "reached a cancelled terminal state"
@@ -2035,17 +2050,18 @@ async def _run_lifespan_shutdown_phase(
     """
     phase_task = asyncio.create_task(operation(), name=f"server_shutdown:{name}")
     cancelled, failure = await await_lifecycle_task_completion(phase_task)
-    if failure is not None and not isinstance(failure, asyncio.CancelledError):
+    task_had_failure = failure is not None
+    failure_cancelled, failure = _split_lifecycle_cancellation(failure)
+    cancelled = cancelled or failure_cancelled
+    if failure is not None:
         logger.warning(
             "Server shutdown phase %r failed: %s",
             name,
             failure,
             exc_info=(type(failure), failure, failure.__traceback__),
         )
-    if isinstance(failure, asyncio.CancelledError):
-        cancelled = True
     result = None
-    if failure is None:
+    if not task_had_failure:
         result = phase_task.result()
     return cancelled, failure, result
 

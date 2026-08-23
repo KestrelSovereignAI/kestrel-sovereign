@@ -134,6 +134,30 @@ class SpawnMode(str, Enum):
     PERSISTENT = "persistent"
 
 
+@dataclass(frozen=True)
+class TerminationRefusalState:
+    """Operator-visible state for a live child whose TTL removal was refused."""
+
+    automatic_termination_attempts: int
+    requested_status: SpawnStatus
+    recorded_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    def as_metadata(self) -> Dict[str, Any]:
+        """Return a detached, stable operator-facing representation."""
+
+        return {
+            "termination_not_performed": True,
+            "automatic_termination_attempts": self.automatic_termination_attempts,
+            "automatic_retries_exhausted": True,
+            "operator_action_required": True,
+            "retry_termination": True,
+            "requested_status": self.requested_status.value,
+            "recorded_at": self.recorded_at,
+        }
+
+
 @dataclass
 class SpawnResult:
     """Result collected from a spawned child agent after termination.
@@ -183,6 +207,7 @@ class _TrackedChild:
     ttl_task: Optional[asyncio.Task] = None
     result: Optional[SpawnResult] = None
     automatic_termination_attempts: int = 0
+    termination_refusal: Optional[TerminationRefusalState] = None
 
 
 class SpawnedAgentLifecycle:
@@ -308,6 +333,10 @@ class SpawnedAgentLifecycle:
                 return None
             if tracked.result is not None:
                 return tracked.result  # already finalized (e.g. by TTL)
+            # A bounded automatic-refusal record describes a still-live child,
+            # not its work result. A real report supersedes that operator state
+            # and must retain its artifacts and budget through finalization.
+            tracked.termination_refusal = None
 
             result = SpawnResult(
                 child_name=child_name,
@@ -357,6 +386,16 @@ class SpawnedAgentLifecycle:
     def get_tracked_children(self) -> list[str]:
         """Return names of all currently tracked children."""
         return list(self._tracked.keys())
+
+    def get_termination_refusal(
+        self, child_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return detached operator state without marking the child finalized."""
+
+        tracked = self._tracked.get(child_name)
+        if tracked is None or tracked.termination_refusal is None:
+            return None
+        return tracked.termination_refusal.as_metadata()
 
     async def terminate(
         self,
@@ -465,11 +504,16 @@ class SpawnedAgentLifecycle:
                     result=result,
                 )
                 if not terminated:
-                    logger.warning(
-                        "TTL termination was refused for child '%s'; tracking "
-                        "and periodic retry remain active",
-                        child_name,
-                    )
+                    still_tracked = self._tracked.get(child_name)
+                    if (
+                        still_tracked is not None
+                        and still_tracked.termination_refusal is None
+                    ):
+                        logger.warning(
+                            "TTL termination was refused for child '%s'; "
+                            "tracking and periodic retry remain active",
+                            child_name,
+                        )
             except BaseException as exc:
                 if not _is_expected_termination_outcome(exc):
                     raise
@@ -540,12 +584,22 @@ class SpawnedAgentLifecycle:
                 parent_did=tracked.parent_did,
                 child_name=child_name,
             ):
-                # A concurrent ordinary DELETE may already have shut down and
-                # unpublished the child and pruned its parent edge.  The
-                # manager's False then means this caller performed no second
-                # removal, not that the child survived.  Finalize local
-                # lifecycle custody exactly once.
+                # A concurrent removal may already have shut down and
+                # unpublished the child and pruned its parent edge. Finalize
+                # local lifecycle custody exactly once. Routing absence alone
+                # does not prove that destructive runtime offboarding ran.
                 terminated = True
+                if offboard_runtime:
+                    from kestrel_sovereign.multi_agent.agent_manager import (
+                        RuntimeOffboardingNotPerformedError,
+                    )
+
+                    termination_failure = RuntimeOffboardingNotPerformedError(
+                        agent_name=child_name,
+                        agent_id=tracked.child_did,
+                        cleanup_state="already_absent",
+                        custody_unknown=True,
+                    )
             else:
                 # A TTL attempt is itself the timer task and is about to
                 # finish. Bound automatic retries so a genuine refusal cannot
@@ -559,22 +613,10 @@ class SpawnedAgentLifecycle:
                             self._ttl_monitor(child_name, tracked.ttl_seconds)
                         )
                     else:
-                        refused_result = SpawnResult(
-                            child_name=child_name,
-                            child_did=tracked.child_did,
-                            status=SpawnStatus.FAILED,
-                            output_artifacts={
-                                "termination_not_performed": True,
-                                "automatic_termination_attempts": attempts,
-                                "operator_action_required": True,
-                                "retry_termination": True,
-                                "requested_status": status.value,
-                            },
-                            started_at=tracked.started_at,
-                            parent_did=tracked.parent_did,
+                        tracked.termination_refusal = TerminationRefusalState(
+                            automatic_termination_attempts=attempts,
+                            requested_status=status,
                         )
-                        tracked.result = refused_result
-                        self._results[child_name] = refused_result
                         logger.error(
                             "Automatic termination was refused %d times for "
                             "child %r; automatic retries stopped and explicit "
@@ -595,6 +637,7 @@ class SpawnedAgentLifecycle:
                 started_at=tracked.started_at,
                 parent_did=tracked.parent_did,
             )
+        tracked.termination_refusal = None
         tracked.result = result
         self._results[child_name] = result
         if (

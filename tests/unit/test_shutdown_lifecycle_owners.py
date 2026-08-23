@@ -366,6 +366,84 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
 
 
 @pytest.mark.asyncio
+async def test_lifespan_consumer_preserves_grouped_cancellation_and_failure(
+    monkeypatch,
+) -> None:
+    """Grouped fleet cancellation remains cancellation through teardown."""
+
+    class _GroupedManager:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        async def shutdown_all(self) -> None:
+            self.shutdown_calls += 1
+            raise BaseExceptionGroup(
+                "cancelled fleet failure",
+                [
+                    asyncio.CancelledError(),
+                    RuntimeError("agent cleanup failed"),
+                ],
+            )
+
+    async def noop(_app) -> None:
+        return None
+
+    manager = _GroupedManager()
+    app = FastAPI()
+    app.state.agent_manager = manager
+    app.state.startup_cleanup_agent_manager = None
+    app.state.agent = None
+    monkeypatch.setattr(server, "_shutdown_host_scheduler", noop)
+    monkeypatch.setattr(server, "_shutdown_host_features", noop)
+    monkeypatch.setattr(server, "_shutdown_phoenix", noop)
+
+    cancelled, failure = await server._shutdown_server_resources(app)
+
+    assert cancelled is True
+    assert isinstance(failure, ExceptionGroup)
+    assert len(failure.exceptions) == 1
+    assert isinstance(failure.exceptions[0], RuntimeError)
+    assert str(failure.exceptions[0]) == "agent cleanup failed"
+
+    with pytest.raises(asyncio.CancelledError):
+        async with server._lifespan_teardown_owner(app):
+            pass
+    assert manager.shutdown_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_startup_rollback_consumer_preserves_grouped_cancellation_and_failure(
+    caplog,
+) -> None:
+    """Startup rollback reports cancellation without dropping its failure leaf."""
+
+    class _GroupedManager:
+        async def shutdown_all(self) -> None:
+            raise BaseExceptionGroup(
+                "cancelled startup rollback",
+                [
+                    asyncio.CancelledError(),
+                    OSError("rollback cleanup failed"),
+                ],
+            )
+
+    cancelled = await server._rollback_startup_agent_manager(_GroupedManager())
+
+    assert cancelled is True
+    warning = next(
+        record
+        for record in caplog.records
+        if "startup rollback did not fully shut down" in record.getMessage()
+    )
+    assert warning.exc_info is not None
+    logged_failure = warning.exc_info[1]
+    assert isinstance(logged_failure, ExceptionGroup)
+    assert len(logged_failure.exceptions) == 1
+    assert isinstance(logged_failure.exceptions[0], OSError)
+    assert str(logged_failure.exceptions[0]) == "rollback cleanup failed"
+
+
+@pytest.mark.asyncio
 async def test_host_scheduler_drains_cold_onboarding_before_feature_unmount(
     monkeypatch,
 ):
@@ -1616,7 +1694,11 @@ async def test_terminal_quarantine_drain_reports_precompleted_reaper_failure() -
     with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers") as exc_info:
         await manager.drain_quarantined_shutdowns()
 
-    assert reaper_id in str(exc_info.value.exceptions[0])
+    rendered = str(exc_info.value.exceptions[0])
+    assert reaper_id in rendered
+    assert "unacknowledged cleanup failure" in rendered
+    assert "(RuntimeError)" not in rendered
+    assert "late durable release failed" not in rendered
     assert reaper_id in manager._unsafe_quarantined_shutdown_failures
 
 
@@ -2314,7 +2396,8 @@ async def test_terminal_drain_retains_prelinearization_ordinary_release_failure(
         await asyncio.wait_for(drain, timeout=1.0)
     rendered_failure = str(first.value.exceptions[0])
     assert "ordinary-budget-release:1" in rendered_failure
-    assert "RuntimeError" in rendered_failure
+    assert "unacknowledged cleanup failure" in rendered_failure
+    assert "(RuntimeError)" not in rendered_failure
     assert "ordinary refund failed before drain linearization" not in (
         rendered_failure
     )

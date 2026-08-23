@@ -300,7 +300,7 @@ class TestTTLExpiration:
 
     @pytest.mark.asyncio
     async def test_ttl_refusal_retries_are_bounded_and_explicitly_retryable(
-        self, tmp_path
+        self, tmp_path, caplog
     ):
         """A live refused child stops auto-looping but remains operator-retryable."""
 
@@ -322,27 +322,39 @@ class TestTTLExpiration:
         )
         lifecycle._fire_hook = AsyncMock()
         for _ in range(100):
-            result = lifecycle.get_result("bounded-refusal")
-            if result is not None:
+            refusal = lifecycle.get_termination_refusal("bounded-refusal")
+            if refusal is not None:
                 break
             await asyncio.sleep(0.01)
 
-        result = lifecycle.get_result("bounded-refusal")
-        assert result is not None
-        assert result.status is SpawnStatus.FAILED
-        assert result.output_artifacts == {
+        refusal = lifecycle.get_termination_refusal("bounded-refusal")
+        assert refusal is not None
+        recorded_at = refusal.pop("recorded_at")
+        assert recorded_at
+        assert refusal == {
             "termination_not_performed": True,
             "automatic_termination_attempts": 3,
+            "automatic_retries_exhausted": True,
             "operator_action_required": True,
             "retry_termination": True,
             "requested_status": "timed_out",
         }
+        assert lifecycle.get_result("bounded-refusal") is None
+        assert lifecycle._tracked["bounded-refusal"].result is None
         assert manager.terminate_child.await_count == 3
         await asyncio.sleep(0.05)
         assert manager.terminate_child.await_count == 3
         assert lifecycle.is_tracked("bounded-refusal")
         assert ephemeral_dir.exists()
         lifecycle._fire_hook.assert_not_awaited()
+        assert sum(
+            "periodic retry remain active" in record.getMessage()
+            for record in caplog.records
+        ) == 2
+        assert sum(
+            "automatic retries stopped" in record.getMessage()
+            for record in caplog.records
+        ) == 1
 
         manager.terminate_child.return_value = True
         retried = await lifecycle.terminate("bounded-refusal")
@@ -351,6 +363,52 @@ class TestTTLExpiration:
         assert retried.status is SpawnStatus.TERMINATED
         assert manager.terminate_child.await_count == 4
         assert not lifecycle.is_tracked("bounded-refusal")
+        assert lifecycle.get_termination_refusal("bounded-refusal") is None
+        assert not ephemeral_dir.exists()
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_real_result_supersedes_bounded_ttl_refusal(self, tmp_path):
+        """Operator refusal state cannot consume child artifacts or budget."""
+
+        manager = _make_mock_manager()
+        manager.get_agent.return_value = object()
+        manager.get_children.return_value = ["completed-after-refusal"]
+        manager.terminate_child.return_value = False
+        lifecycle = SpawnedAgentLifecycle(manager)
+        ephemeral_dir = tmp_path / "completed-after-refusal"
+        ephemeral_dir.mkdir()
+        await lifecycle.register(
+            child_name="completed-after-refusal",
+            child_did="did:child:completed-after-refusal",
+            parent_did="did:parent",
+            ttl_seconds=0.01,
+            mode=SpawnMode.EPHEMERAL,
+            temp_dir=str(ephemeral_dir),
+        )
+        lifecycle._fire_hook = AsyncMock()
+        for _ in range(100):
+            if lifecycle.get_termination_refusal("completed-after-refusal"):
+                break
+            await asyncio.sleep(0.01)
+
+        assert lifecycle.get_termination_refusal("completed-after-refusal")
+        assert lifecycle.get_result("completed-after-refusal") is None
+        manager.terminate_child.return_value = True
+
+        result = await lifecycle.report_result(
+            "completed-after-refusal",
+            output_artifacts={"answer": "42"},
+            budget_consumed=Decimal("1.75"),
+        )
+
+        assert result is not None
+        assert result.status is SpawnStatus.COMPLETED
+        assert result.output_artifacts == {"answer": "42"}
+        assert result.budget_consumed == Decimal("1.75")
+        assert lifecycle.get_result("completed-after-refusal") is result
+        assert lifecycle.get_termination_refusal("completed-after-refusal") is None
+        assert not lifecycle.is_tracked("completed-after-refusal")
         assert not ephemeral_dir.exists()
         lifecycle._fire_hook.assert_awaited_once()
 

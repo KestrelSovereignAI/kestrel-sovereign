@@ -21,7 +21,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingRetainedError,
     _uncommitted_spawn_not_hosted_cancellation,
 )
-from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnMode
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -233,6 +233,43 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["count"] == 1
         assert envelope.data["children"][0]["name"] == "helper"
         assert envelope.data["children"][0]["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_list_children_surfaces_exhausted_ttl_refusal(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.get_agent = MagicMock(return_value=child)
+        manager.terminate_child = AsyncMock(return_value=False)
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="helper",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=0.01,
+        )
+        for _ in range(100):
+            if lifecycle.get_termination_refusal("helper") is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        envelope = await feature.list_children()
+
+        child_record = envelope.data["children"][0]
+        assert child_record["status"] == "running"
+        assert child_record["has_result"] is False
+        assert child_record["operator_action_required"] is True
+        refusal = child_record["termination_refusal"]
+        assert refusal["automatic_termination_attempts"] == 3
+        assert refusal["automatic_retries_exhausted"] is True
+        assert refusal["retry_termination"] is True
+        assert lifecycle.get_result("helper") is None
+
+        manager.terminate_child.return_value = True
+        await lifecycle.terminate("helper")
 
     @pytest.mark.asyncio
     async def test_delegate_task_success(self):
@@ -1129,6 +1166,75 @@ class TestSpawnFeatureWithManager:
         assert manager.terminate_child.await_count == 2
         assert not lifecycle.is_tracked("helper")
         assert lifecycle.get_result("helper").status.value == "terminated"
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_destructive_terminate_racing_ordinary_delete_is_partial(
+        self, tmp_path
+    ):
+        """Routing absence cannot be promoted to destructive offboarding proof."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child:ordinary-delete-race")
+        manager = AgentManager(base_data_dir=tmp_path)
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("retain-on-ordinary-delete")
+        child.isolated_runtime_scope = scope
+        manager._agents["worker"] = child
+        manager._agent_names[child.agent_id] = "worker"
+        manager._parent_children[parent.agent_id] = ["worker"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="worker",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+            mode=SpawnMode.EPHEMERAL,
+        )
+        lifecycle._fire_hook = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        await lifecycle._lock.acquire()
+        tool_task = asyncio.create_task(
+            feature.terminate_child("worker", offboard_runtime=True)
+        )
+        try:
+            for _ in range(100):
+                if getattr(lifecycle._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(lifecycle._lock, "_waiters", None)
+            assert await manager.remove_agent("worker") is True
+            assert manager.get_agent("worker") is None
+            assert manager.get_children(parent.agent_id) == []
+        finally:
+            lifecycle._lock.release()
+
+        envelope = await tool_task
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["runtime_retention_unknown"] is True
+        assert envelope.data["operator_action_required"] is True
+        assert "operator reconciliation" in envelope.error
+        assert credential.read_text() == "retain-on-ordinary-delete"
+        assert not lifecycle.is_tracked("worker")
+        assert lifecycle.get_result("worker").status.value == "terminated"
         lifecycle._fire_hook.assert_awaited_once()
 
     @pytest.mark.asyncio

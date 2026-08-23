@@ -143,11 +143,12 @@ class RuntimeOffboardingRetainedError(RuntimeError):
 class RuntimeOffboardingNotPerformedError(RuntimeError):
     """A destructive request stopped the agent but deleted no runtime tree.
 
-    This is intentionally distinct from retained custody: an already-absent
-    namespace has no tree to retain, while a storage-backed agent has no hosted
-    namespace that Core is authorized to delete.  Administrative callers must
-    not translate either outcome into ``runtime_offboarded=true`` merely because
-    the cleanup worker returned without raising.
+    This is intentionally distinct from a failed deletion: an already-absent
+    namespace normally has no tree to retain, while a storage-backed agent has
+    no hosted namespace that Core is authorized to delete. A lifecycle race
+    may know only that routing is already absent; ``custody_unknown`` keeps that
+    narrower evidence from becoming a false deletion claim. Administrative
+    callers must never translate these outcomes into ``runtime_offboarded=true``.
     """
 
     def __init__(
@@ -156,13 +157,15 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
         agent_name: str,
         agent_id: str,
         cleanup_state: str,
+        custody_unknown: bool = False,
     ) -> None:
         if cleanup_state not in {"already_absent", "not_hosted"}:
             raise ValueError("invalid runtime offboarding no-op state")
         self.agent_name = agent_name
         self.agent_id = agent_id
         self.cleanup_state = cleanup_state
-        runtime_retained = cleanup_state == "not_hosted"
+        self.custody_unknown = custody_unknown
+        runtime_retained = cleanup_state == "not_hosted" or custody_unknown
         self.metadata = {
             "code": "runtime_offboarding_not_performed",
             "agent": agent_name,
@@ -176,7 +179,20 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
             "runtime_already_absent": cleanup_state == "already_absent",
             "hosted_runtime_configured": cleanup_state != "not_hosted",
         }
-        if cleanup_state == "already_absent":
+        if custody_unknown:
+            self.metadata.update(
+                {
+                    "runtime_already_absent": False,
+                    "runtime_custody_known": False,
+                    "runtime_retention_unknown": True,
+                }
+            )
+            message = (
+                f"Agent {agent_name!r} was already shut down and unpublished; "
+                "this request performed no secure runtime offboarding, so "
+                "runtime custody requires operator reconciliation."
+            )
+        elif cleanup_state == "already_absent":
             message = (
                 f"Agent {agent_name!r} was shut down and unpublished; its hosted "
                 "runtime namespace was already absent, so no tree was deleted."
@@ -3670,6 +3686,16 @@ class AgentManager:
                 )
             )
 
+        def record_retained_failure(*, owner: str, owner_id: str) -> None:
+            """Report bounded retained evidence without inventing its type."""
+
+            failures.append(
+                RuntimeError(
+                    f"{owner} {owner_id!r} retained an unacknowledged cleanup "
+                    "failure; inspect server-side lifecycle diagnostics"
+                )
+            )
+
         sealed = False
         try:
             cancelled = (
@@ -3796,9 +3822,9 @@ class AgentManager:
             # unacknowledged failure exactly once alongside failures observed live.
             for reaper_id, record in self._unsafe_quarantined_shutdown_failures.items():
                 if reaper_id not in observed_reapers:
-                    record_reaper_failure(
-                        reaper_id,
-                        RuntimeError("retained cleanup failure"),
+                    record_retained_failure(
+                        owner="Quarantined shutdown reaper",
+                        owner_id=reaper_id,
                     )
 
             # An ordinary release may fail before this drain acquires the
@@ -3813,9 +3839,9 @@ class AgentManager:
                     release_id not in observed_budget_releases
                     and release_id not in reported_budget_release_failures
                 ):
-                    record_budget_release_failure(
-                        release_id,
-                        RuntimeError("retained budget release failure"),
+                    record_retained_failure(
+                        owner="Ordinary child budget release",
+                        owner_id=release_id,
                     )
 
             # A direct ``terminate_child`` retains its parent edge while a

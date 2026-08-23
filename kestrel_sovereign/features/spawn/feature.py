@@ -182,6 +182,11 @@ def _termination_partial_result(
         no_op_cleanup_state = next(iter(no_op_states))
     else:
         no_op_cleanup_state = None
+    custody_unknown = any(
+        item.metadata.get("runtime_custody_known") is False
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+    )
 
     additional = [
         item
@@ -222,9 +227,11 @@ def _termination_partial_result(
             or bool(retained)
             or bool(termination_not_performed)
             or "not_hosted" in no_op_states
+            or custody_unknown
         )
         named_runtime_retained = not named_child_removed or named_child_retained or (
-            named_child_not_performed and "not_hosted" in no_op_states
+            named_child_not_performed
+            and ("not_hosted" in no_op_states or custody_unknown)
         )
         named_runtime_removed = named_child_removed and (
             not named_child_retained and not named_child_not_performed
@@ -300,8 +307,13 @@ def _termination_partial_result(
         data["not_performed_outcome_count"] = len(not_performed)
         data["not_performed_agents"] = not_performed_agents
         data["runtime_custody_code"] = "runtime_offboarding_not_performed"
-        data["runtime_already_absent"] = "already_absent" in no_op_states
+        data["runtime_already_absent"] = (
+            "already_absent" in no_op_states and not custody_unknown
+        )
         data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
+        if custody_unknown:
+            data["runtime_custody_known"] = False
+            data["runtime_retention_unknown"] = True
 
     if termination_not_performed:
         survivors = ", ".join(surviving_subtree_agents)
@@ -340,6 +352,13 @@ def _termination_partial_result(
             "The child was stopped and its runtime state was retained for "
             "restart, but lifecycle bookkeeping requires operator "
             "reconciliation. Do not retry termination."
+        )
+    elif custody_unknown:
+        custody_message = (
+            "The child was already stopped and unpublished, but this request "
+            "performed no secure runtime offboarding. Treat its runtime as "
+            "retained until operator reconciliation confirms custody. Do not "
+            "retry termination."
         )
     elif not_performed and "already_absent" in no_op_states:
         custody_message = (
@@ -705,6 +724,7 @@ class SpawnFeature(Feature):
 
         parent_did = self.agent.agent_id
         child_names = manager.get_children(parent_did)
+        lifecycle = self._get_lifecycle(manager)
 
         children = []
         for child_name in child_names:
@@ -717,12 +737,18 @@ class SpawnFeature(Feature):
                 and not self._child_tasks[child_name].done()
             )
 
-            children.append({
+            child_record = {
                 "name": child_name,
                 "status": status,
                 "has_result": has_result,
                 "has_pending_task": has_pending_task,
-            })
+            }
+            if lifecycle is not None:
+                refusal = lifecycle.get_termination_refusal(child_name)
+                if refusal is not None:
+                    child_record["termination_refusal"] = refusal
+                    child_record["operator_action_required"] = True
+            children.append(child_record)
 
         if not children:
             return ToolResult.ok(
