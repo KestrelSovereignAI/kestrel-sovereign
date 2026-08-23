@@ -47,8 +47,9 @@ from .ledger import (
     strip_ledger_sections,
 )
 from .ledger_index import (
-    BLOCKER_NODE_TYPE,
-    PATTERN_NODE_TYPE,
+    BLOCKER_SECTION,
+    PATTERN_SECTION,
+    LedgerSection,
     project_ledger,
     recall_nodes,
     search_rows,
@@ -1018,12 +1019,9 @@ class StrategicMemoryFeature(Feature):
 
     async def _recall_ledger(
         self,
-        node_type: str,
-        noun: str,
+        section: LedgerSection,
         limit: Any,
         include_retired: bool,
-        include_flag_name: str,
-        canonical_rows: List[Dict[str, Any]],
     ) -> ToolResult:
         """Shared body for :meth:`recall_patterns` / :meth:`recall_blockers`.
 
@@ -1034,9 +1032,10 @@ class StrategicMemoryFeature(Feature):
         went to YAML. Routing these two tools through the index means a
         projection that stops working fails a query instead of going quiet.
         """
+        noun = section.noun
         if not isinstance(include_retired, bool):
             return ToolResult.failed(
-                f"{include_flag_name} must be a boolean, got "
+                f"{section.include_flag_name} must be a boolean, got "
                 f"{type(include_retired).__name__}={include_retired!r}"
             )
         try:
@@ -1061,52 +1060,92 @@ class StrategicMemoryFeature(Feature):
             rows = await recall_nodes(
                 graph_store,
                 agent_id,
-                node_type,
+                section.node_type,
                 include_retired=include_retired,
                 limit=limit_val,
             )
         except Exception as e:  # noqa: BLE001
             # A query failure is not an empty result. Reporting zero here is
             # the precise lie this ticket was filed on.
-            logger.error("strategy index recall failed for %s: %s", node_type, e)
+            logger.error(
+                "strategy index recall failed for %s: %s", section.node_type, e
+            )
             return ToolResult.failed(
                 f"Could not read the strategy index: {e}",
-                data={"node_type": node_type, "count": 0},
+                data={"node_type": section.node_type, "count": 0},
             )
 
-        data = {
+        data: Dict[str, Any] = {
             "count": len(rows),
             "limit_requested": limit_val,
-            include_flag_name: include_retired,
+            section.include_flag_name: include_retired,
             noun: rows,
         }
         confirmation = (
             f"Retrieved {len(rows)} {noun[:-1] if len(rows) == 1 else noun} "
             f"from the strategy index (limit requested: {limit_val})"
         )
-        if rows or not self._ledger.readable:
-            # An unreadable ledger gives no trustworthy count to compare
-            # against, so the divergence check below has nothing to say.
+
+        # The divergence check runs on EVERY result, not only the empty one.
+        # #3064: a non-empty answer was taken as proof the index was complete,
+        # so one projected row standing in for two canonical ones returned a
+        # clean, short list. Non-emptiness answers a narrower question than
+        # the caller asked.
+        if not self._ledger.readable:
+            # An unreadable ledger gives no trustworthy membership to compare
+            # against, so the check has nothing to say -- and says so rather
+            # than letting silence read as agreement.
+            data["completeness_checked"] = False
+            data["completeness_unchecked_reason"] = "ledger_unreadable"
             return ToolResult.ok(confirmation=confirmation, data=data)
 
-        # Zero rows from the index while the canonical file holds some is not
-        # an answer, it is the index being absent. Saying "0" here would
-        # reproduce exactly what #2851 was filed on: recall_decisions returning
-        # a truthful zero while STRATEGY.yaml held the real ones.
-        canonical = len(canonical_rows)
-        if canonical:
-            return ToolResult.partial(
-                confirmation=confirmation,
-                error=(
-                    f"The strategy index holds no {noun}, but "
-                    f"{LEDGER_FILENAME} holds {canonical} active row(s). The "
-                    "index is stale or was never built -- restart the agent to "
-                    "reproject, and use strategy_search to read the canonical "
-                    "file meanwhile."
+        # Membership, not a count: an index holding one row the ledger dropped
+        # and missing one it still holds has the right total and the wrong
+        # contents. The baseline follows the query's own mode, so asking for
+        # superseded rows is measured against superseded rows (#3064).
+        expected_ids = section.expected_row_ids(
+            self._ledger.data, include_retired=include_retired
+        )
+        returned_ids = {str(row.get("row_id") or "") for row in rows}
+        missing = expected_ids - returned_ids
+        data["canonical_expected"] = len(expected_ids)
+
+        if not missing:
+            data["completeness_checked"] = True
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        if len(rows) >= limit_val:
+            # A full page. Rows the ledger holds may be past the limit rather
+            # than absent from the index, and this check cannot tell those
+            # apart -- so it reports that it did not run instead of passing.
+            data["completeness_checked"] = False
+            data["completeness_unchecked_reason"] = "result_truncated_at_limit"
+            return ToolResult.ok(
+                confirmation=(
+                    f"{confirmation}; the limit was reached, so whether the "
+                    "index holds every canonical row was not checked"
                 ),
-                data={**data, "canonical_active": canonical, "index_stale": True},
+                data=data,
             )
-        return ToolResult.ok(confirmation=confirmation, data=data)
+
+        # Fewer rows than the canonical file holds, on a page that was not
+        # full. That is the index being incomplete, and reporting the short
+        # list as an answer is what #2851 was filed on: recall_decisions
+        # returning a truthful zero while STRATEGY.yaml held the real ones.
+        data["completeness_checked"] = True
+        data["index_stale"] = True
+        data["missing_count"] = len(missing)
+        return ToolResult.partial(
+            confirmation=confirmation,
+            error=(
+                f"The strategy index is missing {len(missing)} of the "
+                f"{len(expected_ids)} {noun} {LEDGER_FILENAME} holds. The "
+                "index is stale or was never built -- restart the agent to "
+                "reproject, and use strategy_search to read the canonical "
+                "file meanwhile."
+            ),
+            data=data,
+        )
 
     @tool(
         name="recall_patterns",
@@ -1129,12 +1168,9 @@ class StrategicMemoryFeature(Feature):
             include_superseded: Include patterns that have been retired
         """
         return await self._recall_ledger(
-            node_type=PATTERN_NODE_TYPE,
-            noun="patterns",
+            section=PATTERN_SECTION,
             limit=limit,
             include_retired=include_superseded,
-            include_flag_name="include_superseded",
-            canonical_rows=active_patterns(self._ledger.patterns),
         )
 
     @tool(
@@ -1158,12 +1194,9 @@ class StrategicMemoryFeature(Feature):
             include_resolved: Include blockers that have been resolved
         """
         return await self._recall_ledger(
-            node_type=BLOCKER_NODE_TYPE,
-            noun="blockers",
+            section=BLOCKER_SECTION,
             limit=limit,
             include_retired=include_resolved,
-            include_flag_name="include_resolved",
-            canonical_rows=active_blockers(self._ledger.blockers),
         )
 
     @tool(

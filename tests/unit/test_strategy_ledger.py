@@ -1017,6 +1017,31 @@ class TestTheIndexHasAConsumer:
         assert row["node_id"].startswith(f"{BLOCKER_NODE_TYPE}:{AGENT}:")
 
     @pytest.mark.asyncio
+    async def test_a_recalled_blocker_carries_its_repository(self, tmp_path):
+        """#3064: the projection dropped ``repo``.
+
+        ``#42`` names an issue only relative to a repository, and the ledger
+        records the field for exactly that reason. Losing it in the index
+        hands every consumer an ambiguous reference -- in the same change
+        that added repository-identity guards elsewhere.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="#42",
+            title="CI runner is wedged",
+            severity="high",
+            repo="owner/repo",
+        )
+
+        result = await feature.recall_blockers()
+
+        row = result.data["blockers"][0]
+        assert row["issue"] == "#42"
+        assert row["repo"] == "owner/repo", (
+            "a bare issue number without its repo is not a reference"
+        )
+
+    @pytest.mark.asyncio
     async def test_superseded_patterns_are_excluded_by_default(self, tmp_path):
         feature = await _feature(tmp_path)
         added = await feature.strategy_add_pattern(pattern="held once, not now")
@@ -1077,9 +1102,166 @@ class TestTheIndexHasAConsumer:
 
         assert result.status.value == "partial"
         assert result.data["count"] == 0
-        assert result.data["canonical_active"] == 1
+        assert result.data["canonical_expected"] == 1
+        assert result.data["missing_count"] == 1
         assert result.data["index_stale"] is True
         assert "stale or was never built" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_partial_index_is_not_a_clean_answer(self, tmp_path):
+        """#3064: non-emptiness was taken as proof the index was complete.
+
+        One projected row standing in for two canonical ones returned a short
+        list with an ok status -- a check answering "is there anything?" while
+        the caller asked "is this all of it?".
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first observation")
+        await feature.strategy_add_pattern(pattern="the second observation")
+        graph = feature.agent.storage.graph
+        # Drop exactly one projected node. The ledger still holds both.
+        victim = next(
+            node_id
+            for node_id, node in graph.nodes.items()
+            if node.node_type == PATTERN_NODE_TYPE
+        )
+        del graph.nodes[victim]
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "partial", (
+            "a list missing a canonical row is not a clean answer"
+        )
+        assert result.data["index_stale"] is True
+        assert result.data["missing_count"] == 1
+        assert result.data["canonical_expected"] == 2
+
+    @pytest.mark.asyncio
+    async def test_membership_not_count_decides_staleness(self, tmp_path):
+        """An index of the right size and the wrong contents is still stale.
+
+        Comparing counts would pass here: one node in, one node out.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the canonical observation")
+        graph = feature.agent.storage.graph
+        victim, node = next(
+            (nid, n)
+            for nid, n in graph.nodes.items()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        del graph.nodes[victim]
+        # A node of the same type and agent, but not a row the ledger holds.
+        node.node_id = f"{PATTERN_NODE_TYPE}:{AGENT}:pat_stranger"
+        node.properties = {**node.properties, "row_id": "pat_stranger"}
+        graph.nodes[node.node_id] = node
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "partial"
+        assert result.data["missing_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_superseded_recall_is_measured_against_superseded_rows(
+        self, tmp_path
+    ):
+        """#3064: include_superseded=True still compared against ACTIVE rows.
+
+        A ledger holding only retired rows against an empty index therefore
+        returned a clean zero -- the baseline answered a different question
+        than the query did.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a since-retired observation")
+        for row in feature._ledger.patterns:
+            row["superseded_at"] = "2026-01-01"
+            row["superseded_reason"] = "no longer holds"
+        feature._ledger.save()
+        feature.agent.storage.graph.nodes.clear()
+
+        active = await feature.recall_patterns()
+        assert active.status.value == "ok", (
+            "no active rows are expected, so an empty index is the right answer"
+        )
+        assert active.data["canonical_expected"] == 0
+
+        everything = await feature.recall_patterns(include_superseded=True)
+
+        assert everything.data["count"] == 0
+        assert everything.status.value == "partial", (
+            "the ledger holds a superseded row the index does not"
+        )
+        assert everything.data["canonical_expected"] == 1
+        assert everything.data["index_stale"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_full_page_reports_that_completeness_was_not_checked(
+        self, tmp_path
+    ):
+        """The limit truncates, so absence from the page is not absence.
+
+        Claiming completeness here would be a claim the check did not make;
+        claiming staleness would be a false alarm on a healthy index.
+        """
+        feature = await _feature(tmp_path)
+        for n in range(4):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+
+        result = await feature.recall_patterns(limit=2)
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 2
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "result_truncated_at_limit"
+        )
+        assert "not checked" in result.confirmation
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ledger_names_the_unrun_check(self, tmp_path):
+        """No trustworthy baseline means the check cannot run -- and says so."""
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        # The real path: the index is already projected, then the canonical
+        # file is corrupted underneath it and reloaded. Setting the flag by
+        # hand would test the flag.
+        (tmp_path / LEDGER_FILENAME).write_text(
+            "patterns_learned: [unclosed\n", encoding="utf-8"
+        )
+        feature._ledger.load()
+        assert not feature._ledger.readable
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == "ledger_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_a_text_less_row_is_not_reported_missing_forever(self, tmp_path):
+        """The projection skips rows with no text; the check must skip them too.
+
+        Otherwise every recall reports a permanent staleness no reprojection
+        can clear.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a real observation")
+        # ``patterns`` is a property that builds a fresh list, so appending to
+        # it changes nothing. Write through ``data``, which is the ledger.
+        feature._ledger.data[PATTERNS_KEY].append(
+            {"id": "pat_blank", "pattern": "   "}
+        )
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is True
 
     @pytest.mark.asyncio
     async def test_a_genuinely_empty_ledger_recalls_cleanly(self, tmp_path):

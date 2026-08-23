@@ -23,6 +23,7 @@ pattern in YAML could never take effect in the index.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Mapping
 
 from .ledger import (
@@ -103,6 +104,11 @@ def _blocker_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
         "row_id": str(row.get("id") or ""),
         "text": str(row.get("title") or "").strip(),
         "issue": str(row.get("issue") or ""),
+        # ``#42`` names an issue only relative to a repository. The ledger
+        # records ``repo`` for exactly that reason, so dropping it here hands
+        # every consumer of the index an ambiguous reference and leaves
+        # disambiguation to whichever repo happens to contain a number 42.
+        "repo": str(row.get("repo") or ""),
         "severity": str(row.get("severity") or ""),
         "owner": str(row.get("owner") or ""),
         "notes": str(row.get("notes") or ""),
@@ -117,6 +123,93 @@ def _blocker_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str:
     return str(row.get("id") or "").strip() or minter(row)
+
+
+
+@dataclass(frozen=True)
+class LedgerSection:
+    """One kind of ledger row, and everything both halves of the index need.
+
+    The projection and the recall each have to answer "which rows belong in
+    the index?", and #3064 was filed because they answered it separately: the
+    writer skipped text-less rows and the reader compared against a list of
+    *active* rows the caller had computed, so ``include_superseded=True``
+    measured itself against the wrong baseline. Two call sites deriving one
+    fact is the bug; naming the fact once is the fix.
+    """
+
+    node_type: str
+    ledger_key: str
+    noun: str
+    include_flag_name: str
+    text_key: str
+    minter: Callable[[Dict[str, Any]], str]
+    is_active: Callable[[Dict[str, Any]], bool]
+    properties: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+
+    def rows(self, ledger_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return _dict_rows(ledger_data, self.ledger_key)
+
+    def is_projectable(self, row: Dict[str, Any]) -> bool:
+        """A row with no text has nothing to reason over, so it is not indexed.
+
+        The recall's completeness check has to apply the same rule or a
+        text-less row reads as permanently missing from the index.
+        """
+        return bool(str(row.get(self.text_key) or "").strip())
+
+    def row_id(self, row: Dict[str, Any]) -> str:
+        return _row_id(row, self.minter)
+
+    def node_id(self, agent_id: str, row: Dict[str, Any]) -> str:
+        return ledger_node_id(self.node_type, agent_id, self.row_id(row))
+
+    def expected_rows(
+        self, ledger_data: Optional[Dict[str, Any]], *, include_retired: bool
+    ) -> List[Dict[str, Any]]:
+        """The canonical rows a recall in this mode should find in the index.
+
+        ``include_retired`` is the query's own flag, so the baseline follows
+        the question that was asked. Computing it at the call site is what let
+        a ledger of only superseded rows report a clean zero.
+        """
+        rows = [row for row in self.rows(ledger_data) if self.is_projectable(row)]
+        if include_retired:
+            return rows
+        return [row for row in rows if self.is_active(row)]
+
+    def expected_row_ids(
+        self, ledger_data: Optional[Dict[str, Any]], *, include_retired: bool
+    ) -> Set[str]:
+        return {
+            self.row_id(row)
+            for row in self.expected_rows(
+                ledger_data, include_retired=include_retired
+            )
+        }
+
+
+PATTERN_SECTION = LedgerSection(
+    node_type=PATTERN_NODE_TYPE,
+    ledger_key=PATTERNS_KEY,
+    noun="patterns",
+    include_flag_name="include_superseded",
+    text_key="pattern",
+    minter=pattern_row_id,
+    is_active=is_active_pattern,
+    properties=_pattern_properties,
+)
+
+BLOCKER_SECTION = LedgerSection(
+    node_type=BLOCKER_NODE_TYPE,
+    ledger_key=BLOCKERS_KEY,
+    noun="blockers",
+    include_flag_name="include_resolved",
+    text_key="title",
+    minter=blocker_row_id,
+    is_active=is_active_blocker,
+    properties=_blocker_properties,
+)
 
 
 async def project_ledger(
@@ -152,9 +245,8 @@ async def project_ledger(
             report["skipped_reason"] = "ledger_unavailable"
             return report
         ledger_data = getattr(ledger, "data", {}) or {}
-    patterns = _dict_rows(ledger_data, PATTERNS_KEY)
-    blockers = _dict_rows(ledger_data, BLOCKERS_KEY)
-    total = len(patterns) + len(blockers)
+    sections = (PATTERN_SECTION, BLOCKER_SECTION)
+    total = sum(len(section.rows(ledger_data)) for section in sections)
 
     if graph_store is None:
         report["skipped_reason"] = "no_graph_store"
@@ -172,20 +264,14 @@ async def project_ledger(
         report["skipped_reason"] = "graph_node_unavailable"
         return report
 
-    for node_type, rows, minter, properties_fn, text_key in (
-        (PATTERN_NODE_TYPE, patterns, pattern_row_id, _pattern_properties, "pattern"),
-        (BLOCKER_NODE_TYPE, blockers, blocker_row_id, _blocker_properties, "title"),
-    ):
+    for section in sections:
         await _project_section(
             graph_store,
             GraphNode,
             NodeSwapResult,
             agent_id,
-            node_type,
-            rows,
-            minter,
-            properties_fn,
-            text_key,
+            section,
+            section.rows(ledger_data),
             report,
         )
     return report
@@ -205,11 +291,8 @@ async def _project_section(
     GraphNode,
     NodeSwapResult,
     agent_id: str,
-    node_type: str,
+    section: LedgerSection,
     rows: List[Dict[str, Any]],
-    minter: Callable[[Dict[str, Any]], str],
-    properties_fn: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    text_key: str,
     report: Dict[str, Any],
 ) -> None:
     # Membership in the ledger, not success of the write. Deriving the keep-set
@@ -218,19 +301,19 @@ async def _project_section(
     # delete a node the ledger still contains — turning a recoverable blip into
     # data loss.
     expected_ids: Set[str] = {
-        ledger_node_id(node_type, agent_id, _row_id(row, minter))
+        section.node_id(agent_id, row)
         for row in rows
-        if str(row.get(text_key) or "").strip()
+        if section.is_projectable(row)
     }
 
     for row in rows:
-        if not str(row.get(text_key) or "").strip():
+        if not section.is_projectable(row):
             # A row with no text has nothing to reason over.
             report["skipped"] += 1
             continue
 
-        node_id = ledger_node_id(node_type, agent_id, _row_id(row, minter))
-        properties = properties_fn(agent_id, row)
+        node_id = section.node_id(agent_id, row)
+        properties = section.properties(agent_id, row)
 
         try:
             existing = await graph_store.get_node(node_id)
@@ -257,8 +340,8 @@ async def _project_section(
 
         node = GraphNode(
             node_id=node_id,
-            node_type=node_type,
-            label=_label(row.get(text_key)),
+            node_type=section.node_type,
+            label=_label(row.get(section.text_key)),
             properties=properties,
         )
         try:
@@ -286,7 +369,7 @@ async def _project_section(
     # Reconcile: the ledger is canonical, so a row removed there must stop
     # being reachable. Upserting current rows alone leaves the old node behind.
     report["removed"] += await _remove_orphans(
-        graph_store, agent_id, node_type, expected_ids
+        graph_store, agent_id, section.node_type, expected_ids
     )
 
 
