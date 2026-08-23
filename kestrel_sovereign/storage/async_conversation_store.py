@@ -2837,6 +2837,27 @@ class AsyncConversationStore:
         touch it — so this is rare, and starting again is honest where resuming
         would be a guess about where the cursor now points.
 
+        **What the fence covers, and what it does not.** It covers what the
+        projection describes — which rows exist, in which session, live or not.
+        It does not cover a row's BODY: ``content`` and ``rendered_content`` are
+        deliberately outside the change stamp (see ``conversation_sessions``'
+        ``_DERIVED_FROM``), because watching them would make every
+        re-encryption rebuild the projection, which is the cost that table
+        exists to remove.
+
+        That is sound rather than convenient, and it rests on a fact about the
+        writers rather than on the fence. Three paths rewrite a body in place,
+        and none can move a query term BETWEEN sessions: ``_migrate_message``
+        re-encrypts the same plaintext; ``_migrate_split_sent_form`` moves the
+        transport bytes into their own column and leaves the canonical text this
+        matches against unchanged; ``salvage._mark_durable_folded`` writes a
+        summary into one marker row, in place, in its own session. A body edit
+        can therefore make a session start or stop matching mid-walk, which is
+        an ordinary later truth about a live corpus and the same thing an append
+        does — it cannot make a session that matched throughout come back
+        unmatched. **A writer that edits bodies across sessions in one statement
+        would break that, and there is no fence here that would notice.**
+
         The map is read AFTER the first page, which repairs, and re-read on
         every restart for the same reason. The projection is then no newer than
         the map, so every session the walk can return has its rows in it. The
