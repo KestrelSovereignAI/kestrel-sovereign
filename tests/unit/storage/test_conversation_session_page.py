@@ -525,9 +525,10 @@ async def test_a_page_rebuilt_underneath_the_read_is_not_returned(tmp_path):
 
         async def page_after_a_rebuild(*args, **kwargs):
             rebuilt["count"] += 1
+            # What any real repair does to this table: the write counter moves.
             await db.execute(
                 "UPDATE conversation_session_watermarks "
-                "SET accounted_stamp = accounted_stamp + 1 WHERE agent_id = ?",
+                "SET accounted_revision = accounted_revision + 1 WHERE agent_id = ?",
                 (AGENT,),
             )
             return await real_page(*args, **kwargs)
@@ -538,6 +539,65 @@ async def test_a_page_rebuilt_underneath_the_read_is_not_returned(tmp_path):
                 projection, limit=10, after=None, refresh=False
             )
         assert rebuilt["count"] > 1, "the read must be retried, not abandoned"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_lands_where_it_started_still_invalidates_the_page(
+    tmp_path,
+):
+    """The ABA the write counter exists for, driven through the real rebuild.
+
+    ``rebuild()`` invalidates the watermark, discards every projection row and
+    walks again. Over a history that did not change in the meantime it arrives
+    at a watermark IDENTICAL to the one it replaced — same generation, stamp,
+    appends, through and target. A page read during the walk is partial, and a
+    before/after comparison of those fields certifies it and returns the
+    truncated page with ``next_cursor: null``.
+
+    Nothing here is simulated: the concurrent pass is
+    ``ConversationSessionProjection.rebuild`` itself.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "aba.db"))
+    try:
+        for index in range(4):
+            await db.execute(
+                "INSERT INTO conversation_history "
+                "(agent_id, role, content, metadata, created_at) "
+                "VALUES (?, 'user', ?, '{}', ?)",
+                (AGENT, f"m{index}", f"2026-05-0{index + 1} 09:00:00"),
+            )
+        store = await _store_with(db)
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        before = await projection.accounted()
+
+        # A rebuild lands entirely between the fence's two reads.
+        real_page = projection.page
+        rebuilds = {"count": 0}
+
+        async def page_then_rebuild(*args, **kwargs):
+            rows = await real_page(*args, **kwargs)
+            rebuilds["count"] += 1
+            await ConversationSessionProjection(db, AGENT).rebuild()
+            return rows
+
+        projection.page = page_then_rebuild
+        with pytest.raises(ProjectionNotReady):
+            await store._page_a_whole_projection(
+                projection, limit=10, after=None, refresh=False
+            )
+
+        after = await ConversationSessionProjection(db, AGENT).accounted()
+        assert (after.generation, after.valid, after.stamp, after.appends,
+                after.through, after.target) == (
+            before.generation, before.valid, before.stamp, before.appends,
+            before.through, before.target
+        ), "the case only means something while every FIELD comes back identical"
+        assert after.revision > before.revision, "the write counter must have moved"
     finally:
         await db.close()
 

@@ -360,6 +360,25 @@ PROJECTION_COLUMNS: Tuple[str, ...] = (
 #: What a watermark claims, in :class:`SessionWatermark` field order. All four
 #: are written by one statement, in the same transaction as the rows they
 #: describe — which is this module's entire concurrency mechanism.
+#: How many times this agent's watermark has been written, ever.
+#:
+#: Not one of :data:`WATERMARK_COLUMNS`, because those are what a WALK decided
+#: and this is how many decisions there have been. It is the one column
+#: ``_record`` does not take from the value it is given.
+#:
+#: It exists because the watermark's own fields can return to a previous value.
+#: ``rebuild()`` invalidates, discards every row, and walks again — and over an
+#: unchanged history it arrives at a watermark identical to the one it replaced,
+#: field for field. A page read during that walk sees a partial table, and a
+#: before/after comparison of the watermark alone then certifies it: same
+#: generation, same stamp, same target, so the truncated page is returned with
+#: ``next_cursor: null``. ABA, in a cache whose whole contract is "may be silent,
+#: may never disagree".
+#:
+#: Monotonic per agent and bumped by the same statement that writes the
+#: watermark, so no pass can move one without the other.
+WATERMARK_REVISION_COLUMN = "accounted_revision"
+
 WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_generation",
     "accounted_valid",
@@ -998,6 +1017,7 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
 _WATERMARKS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
     agent_id             TEXT PRIMARY KEY,
+    accounted_revision   BIGINT NOT NULL DEFAULT 0,
     accounted_generation TEXT NOT NULL DEFAULT '',
     accounted_valid   INTEGER NOT NULL DEFAULT 0,
     accounted_stamp   BIGINT NOT NULL DEFAULT 0,
@@ -1746,6 +1766,10 @@ class SessionWatermark:
     appends: int = 0
     through: int = 0
     target: int = 0
+    #: See :data:`WATERMARK_REVISION_COLUMN`. Read back, never supplied: the
+    #: writer increments it, so a value constructed in Python carries 0 and
+    #: only what came from the database carries the real count.
+    revision: int = 0
 
     @property
     def complete(self) -> bool:
@@ -2191,7 +2215,7 @@ class ConversationSessionProjection:
         *invalid* is the honest name for that — it must derive, not compare.
         """
         row = await self.db.fetchone(
-            f"SELECT {', '.join(WATERMARK_COLUMNS)} "
+            f"SELECT {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_REVISION_COLUMN} "
             "FROM conversation_session_watermarks WHERE agent_id = ?",
             (self.agent_id,),
         )
@@ -2199,7 +2223,7 @@ class ConversationSessionProjection:
             return INVALID
         return SessionWatermark(
             str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
-            int(row[5]),
+            int(row[5]), int(row[6]),
         )
 
     async def is_stale(self) -> bool:
@@ -3184,7 +3208,13 @@ class ConversationSessionProjection:
             "ON CONFLICT (agent_id) DO UPDATE SET "
             + ", ".join(
                 f"{column} = excluded.{column}" for column in WATERMARK_COLUMNS
-            ),
+            )
+            # ...and the revision, which is the one column not taken from the
+            # value being written. Its own clause because it counts WRITES
+            # rather than recording a decision, and it is incremented by this
+            # statement so nothing can move the watermark without moving it.
+            + f", {WATERMARK_REVISION_COLUMN} = "
+            f"conversation_session_watermarks.{WATERMARK_REVISION_COLUMN} + 1",
             (self.agent_id, *watermark.as_params()),
         )
 

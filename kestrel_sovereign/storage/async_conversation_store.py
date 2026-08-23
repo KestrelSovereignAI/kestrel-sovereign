@@ -3395,12 +3395,20 @@ class AsyncConversationStore:
                     # started will have finished by the next attempt.
                     continue
             rows = await projection.page(limit=limit, after=after)
-            # The SAME question afterwards, generation included. Comparing the
-            # watermark row alone would miss a generation rotation — that
-            # leaves the row untouched — so a cache recreated under the read
-            # would pass the fence and return an obsolete page as the end of
-            # the list. A boundary has two ends and they have to ask one thing.
-            if await self._whole_watermark(projection) == before:
+            # The SAME question afterwards, and it turns on the REVISION rather
+            # than on the watermark's fields. Two reasons, and the second is why
+            # the column exists:
+            #
+            # * a generation rotation leaves the watermark row untouched, so a
+            #   cache recreated under the read would pass a field comparison;
+            # * `rebuild()` over an unchanged history invalidates, discards
+            #   every row, walks, and lands on a watermark identical to the one
+            #   it replaced — field for field. A page read during that walk is
+            #   partial, and a field comparison certifies it. ABA.
+            #
+            # The revision only ever increases, so neither can hide.
+            after_read = await self._whole_watermark(projection)
+            if after_read is not None and after_read.revision == before.revision:
                 return rows
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index was rebuilt underneath "

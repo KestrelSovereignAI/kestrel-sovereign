@@ -2047,6 +2047,7 @@ class AsyncDatabase:
             mutation_trigger_functions,
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
+            WATERMARK_REVISION_COLUMN,
             projection_tables,
             shape_change_invalidation,
         )
@@ -2245,6 +2246,15 @@ class AsyncDatabase:
                 "row changed, and would report itself current forever."
             )
 
+        # Additive, for a watermark table created before #2960 gave it a write
+        # counter. Through the shared helper rather than by hand: it does the
+        # ALTER and its verification inside one migration lock, and a column
+        # that silently failed to land here would make the page fence compare
+        # a value that never moves.
+        await self.migrate_columns_once(
+            "conversation_session_watermarks",
+            ((WATERMARK_REVISION_COLUMN, "BIGINT NOT NULL DEFAULT 0"),),
+        )
         await self.ensure_index(
             *_SESSION_PROJECTION_INDEX,
             f"agent_id, {session_order_index_columns(self.backend_type)}",
