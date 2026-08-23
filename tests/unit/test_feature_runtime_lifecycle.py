@@ -21,6 +21,7 @@ or test-only shims — and pin the three P1 contracts the GPT-5.6 Terra review f
 from __future__ import annotations
 
 import asyncio
+import types
 
 import pytest
 from fastapi import FastAPI
@@ -118,11 +119,9 @@ class _FullFeature(Feature):
         registry = getattr(self.agent, "signal_registry", None)
         if registry is not None:
             # OPTIONAL policy is idempotent on a second initialize().
-            self._own_signal_sources(
-                registry.register_with_policy(
-                    _fake_source_registration(self.SOURCE),
-                    RegistrationPolicy.OPTIONAL,
-                )
+            self._register_signal_sources(
+                _fake_source_registration(self.SOURCE),
+                RegistrationPolicy.OPTIONAL,
             )
 
     def get_hooks(self):
@@ -966,3 +965,434 @@ async def test_register_feature_a2a_failure_strands_nothing(tmp_path):
         "exercise the post-registration strand"
     )
     _no_registration_survives(agent, feature)
+
+
+# --- the ONE door a feature registers signal sources through (#3074) --------
+#
+# Ownership is stated at registration now, so `owner=None` means the host and
+# nothing infers a holder from the policy. These pin the two halves the
+# registry cannot see: what a feature does with a registry that predates the
+# claims ledger, and what it does when it registers a source and then refuses
+# it.
+
+
+class _NoClaimsRegistry:
+    """An embedder-supplied registry from before the claims ledger.
+
+    No ``release_all``, so :meth:`Feature._registry_holds_claims` is False and
+    the base class must track names itself — otherwise this feature's sources
+    are never torn down at all, which is worse than the ledger it replaced.
+    Deliberately REJECTS ``owner=``: a registry that cannot hold claims has no
+    parameter for one, and passing it anyway is the failure this branch exists
+    to avoid.
+    """
+
+    def __init__(self):
+        self.sources = {}
+        self.unregistered = []
+
+    def register_with_policy(self, registration, policy):
+        from kestrel_sovereign.signals import RegistrationOutcome, RegistrationState
+
+        if registration.name in self.sources:
+            return RegistrationOutcome(
+                registration.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+        self.sources[registration.name] = registration
+        return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
+
+    def unregister(self, name):
+        self.unregistered.append(name)
+        return self.sources.pop(name, None) is not None
+
+
+class _MinimalFeature(Feature):
+    tool_name = "minimal_owner"
+    tool_description = "feature used to exercise the registration seam"
+
+    async def initialize(self):
+        # The seam is driven directly by these tests, so boot does nothing.
+        return None
+
+
+def _seam_feature(registry):
+    return _MinimalFeature(types.SimpleNamespace(signal_registry=registry))
+
+
+async def test_a_registry_without_the_claims_api_is_torn_down_by_name():
+    """A registry that cannot hold a claim still has to be cleaned up.
+
+    The names are tracked on the feature for THIS case only. It is not the
+    second ledger #3053 removed: there is one record per registry, and which
+    one is decided by what the registry can actually do.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    feature._register_signal_sources(
+        _fake_source_registration("seam.byname"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.byname" in registry.sources
+
+    await feature._unregister_owned_signal_sources()
+
+    assert registry.unregistered == ["seam.byname"]
+    assert "seam.byname" not in registry.sources
+
+
+async def test_a_registry_without_the_claims_api_keeps_what_it_did_not_create():
+    """Riding an incumbent is not owning it.
+
+    This path has no claims to express shared use, so a source it merely found
+    already registered must not be removed by its teardown — the peer that
+    created it is still dispatching on it.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    incumbent = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.shared"), RegistrationPolicy.OPTIONAL,
+    )
+    rider = _seam_feature(registry)
+    rider._register_signal_sources(
+        _fake_source_registration("seam.shared"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await rider._unregister_owned_signal_sources()
+
+    assert registry.unregistered == []
+    assert "seam.shared" in registry.sources
+
+
+async def test_a_feature_that_registers_a_source_and_refuses_it_hands_the_claim_back():
+    """Registering and declining are two halves of one door.
+
+    The claim is taken AT registration now, so a feature that verifies the
+    installed contract afterwards and rejects it has to give the claim back —
+    and giving back the last claim removes the source, which is the right
+    answer: nothing needs a source its only holder refused.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = _seam_feature(registry)
+
+    outcomes = feature._register_signal_sources(
+        _fake_source_registration("seam.refused"), RegistrationPolicy.OPTIONAL,
+    )
+    assert registry.get("seam.refused") is not None
+
+    feature._disown_signal_sources(outcomes)
+
+    assert registry.get("seam.refused") is None
+    assert registry.owners_of("seam.refused") == ()
+
+
+async def test_disowning_a_source_a_peer_still_holds_leaves_it_registered():
+    """The invariant is per-holder, not per-name.
+
+    A feature that rode an equivalent incumbent and then refused it drops its
+    own claim only; the peer that created it keeps the source alive.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    incumbent = _seam_feature(registry)
+    rider = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.peer"), RegistrationPolicy.OPTIONAL,
+    )
+    outcomes = rider._register_signal_sources(
+        _fake_source_registration("seam.peer"), RegistrationPolicy.OPTIONAL,
+    )
+
+    rider._disown_signal_sources(outcomes)
+
+    assert registry.get("seam.peer") is not None
+    assert registry.owners_of("seam.peer") == (incumbent,)
+
+
+class _RolelessClaimsRegistry:
+    """A registry from the generation BETWEEN the two: claims, but no role.
+
+    `release_all` and `owner=` shipped together; `role=` came a commit later.
+    An embedder written against that first shape passes the "can it hold
+    claims" question and then raises `TypeError` on the keyword, mid
+    `initialize()` — which is why the capability question has to ask about the
+    whole contract, not the half that happens to be older.
+    """
+
+    def __init__(self):
+        self.sources = {}
+        self.claims = {}
+        self.unregistered = []
+
+    def register_with_policy(self, registration, policy, *, owner=None):
+        from kestrel_sovereign.signals import RegistrationOutcome, RegistrationState
+
+        if registration.name in self.sources:
+            return RegistrationOutcome(
+                registration.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+        self.sources[registration.name] = registration
+        self.claims.setdefault(registration.name, []).append(owner)
+        return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
+
+    def release_all(self, owner, role=None):
+        raise AssertionError(
+            "teardown must not reach a registry the register call could not "
+            "claim through"
+        )
+
+    def unregister(self, name):
+        self.unregistered.append(name)
+        return self.sources.pop(name, None) is not None
+
+
+async def test_a_claims_registry_without_the_role_keyword_falls_back_by_name():
+    """Having `release_all` is not having the contract a claim needs.
+
+    Passing `role=` to a registry that predates it is a TypeError inside
+    `initialize()` — Channels would degrade ingress permanently and Scheduler
+    and Restart Coordinator would fail to start. Such a registry gets the
+    name-tracking path: no claims, but correct teardown, which is the half that
+    cannot be skipped.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _RolelessClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    assert feature._registry_holds_claims(registry) is False
+
+    feature._register_signal_sources(
+        _fake_source_registration("seam.roleless"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.roleless" in registry.sources
+    # Registered WITHOUT an owner, because this registry has no role to put it
+    # in — the fallback is a name list, not a half-stated claim.
+    assert registry.claims["seam.roleless"] == [None]
+
+    await feature._unregister_owned_signal_sources()
+
+    assert registry.unregistered == ["seam.roleless"]
+
+
+async def test_declining_on_the_fallback_path_unregisters_what_it_created():
+    """Declining and teardown must do the SAME thing to a source.
+
+    Dropping only the bookkeeping left the refused source registered and no
+    longer tracked: still dispatchable, and beyond the reach of the shutdown
+    that would otherwise have removed it. Strictly worse than either branch.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    outcomes = feature._register_signal_sources(
+        _fake_source_registration("seam.declined"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.declined" in registry.sources
+
+    feature._disown_signal_sources(outcomes)
+
+    assert registry.unregistered == ["seam.declined"]
+    assert "seam.declined" not in registry.sources
+    assert feature._owned_signal_source_names == []
+
+
+async def test_declining_on_the_fallback_path_keeps_a_peers_source():
+    """A ridden incumbent is not this feature's to remove, declining included.
+
+    The name path has no claims to express shared use, so the rule is the same
+    one its teardown follows: remove only what this feature created.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    incumbent = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.declined.peer"), RegistrationPolicy.OPTIONAL,
+    )
+    rider = _seam_feature(registry)
+    outcomes = rider._register_signal_sources(
+        _fake_source_registration("seam.declined.peer"), RegistrationPolicy.OPTIONAL,
+    )
+
+    rider._disown_signal_sources(outcomes)
+
+    assert registry.unregistered == []
+    assert "seam.declined.peer" in registry.sources
+
+
+class _HalfRoleAwareRegistry(_RolelessClaimsRegistry):
+    """Role-aware for one source, pre-role for a batch.
+
+    The shape a subclass takes when it inherits the new single-source method
+    and keeps its own `register_batch` override. Scheduler registers its cron
+    sources as a BATCH, so passing `role=` to it raises TypeError inside
+    `initialize()` — and refusing the whole registry over that pushes it onto
+    the name path it does not need. It keeps its claims and registers one at a
+    time instead.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.claimed = []
+
+    def register_with_policy(self, registration, policy, *, owner=None, role=None):
+        outcome = super().register_with_policy(registration, policy)
+        self.claimed.append((registration.name, owner, role))
+        return outcome
+
+    def register_batch(self, registrations, policy, *, owner=None):
+        raise AssertionError(
+            "a batch that cannot take the role must not be used for a claim"
+        )
+
+
+class _ForwardingProxyRegistry:
+    """An embedder proxy that forwards everything to a real registry.
+
+    `(*args, **kwargs)` cannot be inspected for a `role` parameter, and
+    refusing it would push a proxy onto the name path — whose teardown removes
+    by name and cannot see a peer's claim in the registry behind it. A leak is
+    the better failure than deleting a source something else dispatches on.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def register_with_policy(self, *args, **kwargs):
+        return self._inner.register_with_policy(*args, **kwargs)
+
+    def register_batch(self, *args, **kwargs):
+        return self._inner.register_batch(*args, **kwargs)
+
+    def release_all(self, *args, **kwargs):
+        return self._inner.release_all(*args, **kwargs)
+
+    def release(self, *args, **kwargs):
+        return self._inner.release(*args, **kwargs)
+
+
+async def test_a_batch_that_cannot_take_the_role_is_not_used_for_a_claim():
+    """The batch is an optimisation, not a capability.
+
+    A registry whose batch predates the role can still hold claims one source
+    at a time. Passing `role=` to that batch raises inside `initialize()`;
+    refusing the registry over it pushes a claims-capable registry onto the
+    name path, whose teardown removes by name and cannot see a peer's claim.
+    Neither is necessary — register one at a time and keep the claims.
+
+    Atomicity is what that costs, and it costs nothing here: every imperative
+    site registers OPTIONAL, where each source is independent by definition.
+    """
+    from kestrel_sovereign.signals import CLAIM_IMPERATIVE, RegistrationPolicy
+
+    registry = _HalfRoleAwareRegistry()
+    feature = _seam_feature(registry)
+
+    assert feature._registry_holds_claims(registry) is True
+
+    feature._register_signal_sources(
+        [
+            _fake_source_registration("seam.half.one"),
+            _fake_source_registration("seam.half.two"),
+        ],
+        RegistrationPolicy.OPTIONAL,
+    )
+
+    assert set(registry.sources) == {"seam.half.one", "seam.half.two"}
+    # Claimed as this feature, in the imperative role, one call each.
+    assert registry.claimed == [
+        ("seam.half.one", feature, CLAIM_IMPERATIVE),
+        ("seam.half.two", feature, CLAIM_IMPERATIVE),
+    ]
+
+
+async def test_a_forwarding_proxy_keeps_the_claims_path():
+    """`**kwargs` counts: a proxy must not lose shared-claim safety.
+
+    On the name path a rider's teardown removes by name, so it would delete a
+    source the peer behind the proxy still holds. The claims path keeps that
+    peer's claim visible.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    inner = SourceRegistry()
+    proxy = _ForwardingProxyRegistry(inner)
+    incumbent = _seam_feature(proxy)
+    rider = _seam_feature(proxy)
+
+    assert rider._registry_holds_claims(proxy) is True
+
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.proxy"), RegistrationPolicy.OPTIONAL,
+    )
+    rider._register_signal_sources(
+        _fake_source_registration("seam.proxy"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await rider._unregister_owned_signal_sources()
+
+    # The peer still holds it, so it survives the rider going away.
+    assert inner.get("seam.proxy") is not None
+    assert inner.owners_of("seam.proxy") == (incumbent,)
+
+
+class _NoBatchClaimsRegistry(_RolelessClaimsRegistry):
+    """Role-aware, with release APIs, and no `register_batch` at all.
+
+    A valid embedder shape for a feature that registers one source at a time.
+    Requiring a batch method refused it over a call it never makes.
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self._inner = inner
+
+    def register_with_policy(self, registration, policy, *, owner=None, role=None):
+        return self._inner.register_with_policy(
+            registration, policy, owner=owner, role=role,
+        )
+
+    def release_all(self, owner, role=None):
+        return self._inner.release_all(owner, role)
+
+    def release(self, name, owner, role=None):
+        return self._inner.release(name, owner, role)
+
+
+async def test_a_registry_without_a_batch_method_still_holds_claims():
+    """No batch is not "no claims".
+
+    Refusing such a registry pushed it onto the name path, where the creator's
+    shutdown removes by name — deleting a source a peer that rode it is still
+    dispatching on.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    inner = SourceRegistry()
+    registry = _NoBatchClaimsRegistry(inner)
+    incumbent = _seam_feature(registry)
+    rider = _seam_feature(registry)
+
+    assert rider._registry_holds_claims(registry) is True
+
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.nobatch"), RegistrationPolicy.OPTIONAL,
+    )
+    rider._register_signal_sources(
+        _fake_source_registration("seam.nobatch"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await incumbent._unregister_owned_signal_sources()
+
+    # The rider still holds it, so the creator's teardown does not take it.
+    assert inner.get("seam.nobatch") is not None
+    assert inner.owners_of("seam.nobatch") == (rider,)

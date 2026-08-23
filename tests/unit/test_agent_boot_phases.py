@@ -651,12 +651,11 @@ async def test_feature_owned_signal_sources_absent_after_rollback(tmp_path):
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            # Registered AS THIS FEATURE, so base shutdown releases it.
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            # Record the newly-owned source so base shutdown unregisters it.
-            self._own_signal_sources(outcome)
 
         async def shutdown(self):
             self.shutdown_calls += 1
@@ -744,11 +743,10 @@ async def test_feature_hooks_and_wait_providers_absent_after_rollback(tmp_path):
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            self._own_signal_sources(outcome)
 
         def get_hooks(self):
             return [self._hook]
@@ -824,11 +822,10 @@ async def test_feature_source_unregistered_when_its_own_init_fails_after_registe
         async def initialize(self):
             from kestrel_sovereign.signals import RegistrationPolicy
 
-            outcome = self.agent.signal_registry.register_with_policy(
+            self._register_signal_sources(
                 _fake_source_registration(self.FAKE_SOURCE),
                 RegistrationPolicy.OPTIONAL,
             )
-            self._own_signal_sources(outcome)
             raise RuntimeError("feature init boom after registering source")
 
     agent = _make_agent(tmp_path)
