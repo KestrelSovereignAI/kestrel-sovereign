@@ -533,3 +533,204 @@ class TestSearchIsLeasedLikeTheList:
         with pytest.raises(RuntimeError):
             await wrapper.search_conversations("a", "penguin")
         assert wrapper._active_session_projection_leases == 0
+
+
+class TestTheCostIsSaidOutLoud:
+    @pytest.mark.asyncio
+    async def test_a_large_membership_map_is_logged(self, store, caplog, monkeypatch):
+        """A cost that grows with history is the shape this epic exists to remove.
+
+        The map is the whole live history on every search — measured at about
+        5.4 microseconds a row — and the walk's early exit does not shorten it.
+        An operator should hear that from a log rather than from a slow pane,
+        and the message has to name the reason that is actually true of every
+        search: attribution needs the transcript, whether or not any row is
+        unstamped. The corpus below is fully stamped for exactly that reason.
+        """
+        import logging
+
+        from kestrel_sovereign.storage import conversation_sessions
+
+        monkeypatch.setattr(conversation_sessions, "TRANSCRIPT_PASS_NOISY_ROWS", 8)
+        await _seed(store.db, store.agent_id, _wide_corpus(5, 4, needle_in=0))
+
+        with caplog.at_level(logging.WARNING):
+            await store.search_sessions("penguin folder")
+
+        said = [r.getMessage() for r in caplog.records if "search_sessions" in r.getMessage()]
+        assert said, "the whole-history read happened silently"
+        assert "all 20 of its live rows" in said[0]
+        assert "#3075" in said[0]
+
+    @pytest.mark.asyncio
+    async def test_a_small_history_says_nothing(self, store, caplog):
+        import logging
+
+        await _seed(store.db, store.agent_id, _wide_corpus(2, 2, needle_in=0))
+        with caplog.at_level(logging.WARNING):
+            await store.search_sessions("penguin folder")
+        assert not [
+            r for r in caplog.records if "search_sessions" in r.getMessage()
+        ]
+
+
+# ---------------------------------------------------------------------------
+# One walk, one projection
+# ---------------------------------------------------------------------------
+
+class TestTheWalkIsOneProjection:
+    @pytest.mark.asyncio
+    async def test_a_repair_between_pages_does_not_lose_a_match(
+        self, store, monkeypatch
+    ):
+        """The list tolerates this; search cannot (codex R1 P2).
+
+        A session holding the only match receives a new, NON-matching message,
+        and another request repairs the projection between two pages of this
+        walk. Its ``last_message_at`` moves ahead of the cursor, so no later page
+        can reach it — and search answers "no matches" for a conversation that
+        matches. Reproduced against the unfenced walk before the fence existed:
+        ``found: []``.
+
+        The list's version of this event is a session shown twice or skipped in
+        a list the user is scrolling. Search's version is silence, which is also
+        what search says when there is genuinely nothing — so there is no shape
+        left in the response for "and a page went missing".
+        """
+        from kestrel_sovereign.storage.conversation_sessions import (
+            ConversationSessionProjection,
+        )
+
+        await _seed(
+            store.db,
+            store.agent_id,
+            [
+                ("old", "user", "the launch codes are in the penguin folder", 0),
+                ("mid", "user", "nothing of interest here", 100),
+                ("new", "user", "nothing of interest here either", 200),
+            ],
+        )
+        monkeypatch.setattr(AsyncConversationStore, "SEARCH_SESSION_STEP", 1)
+
+        original = AsyncConversationStore._search_rows
+        fired: List[bool] = []
+
+        async def repairing(self, message_ids):
+            rows = await original(self, message_ids)
+            if not fired:
+                fired.append(True)
+                await _seed(
+                    store.db,
+                    store.agent_id,
+                    [("old", "user", "an unrelated later remark", 500)],
+                )
+                await ConversationSessionProjection(
+                    store.db, store.agent_id
+                ).repair()
+            return rows
+
+        monkeypatch.setattr(AsyncConversationStore, "_search_rows", repairing)
+
+        found = await store.search_sessions("penguin folder")
+
+        assert fired, "the fixture never got between two pages"
+        assert [s["session_id"] for s in found] == ["old"]
+
+    @pytest.mark.asyncio
+    async def test_a_projection_that_never_settles_refuses(self, store, monkeypatch):
+        """...and giving up says so, rather than returning the short answer.
+
+        A walk restarted forever would hang; a walk that returned what it had
+        would report a partial search as a complete one. The list refuses on the
+        same condition, and the endpoint turns both into the same 503.
+        """
+        from kestrel_sovereign.storage.async_conversation_store import (
+            ProjectionNotReady,
+        )
+        from kestrel_sovereign.storage.conversation_sessions import (
+            ConversationSessionProjection,
+        )
+
+        await _seed(
+            store.db,
+            store.agent_id,
+            [
+                ("old", "user", "the launch codes are in the penguin folder", 0),
+                ("mid", "user", "nothing of interest here", 100),
+                ("new", "user", "nothing of interest here either", 200),
+            ],
+        )
+        monkeypatch.setattr(AsyncConversationStore, "SEARCH_SESSION_STEP", 1)
+
+        original = AsyncConversationStore._search_rows
+        moved: List[int] = []
+
+        async def always_repairing(self, message_ids):
+            rows = await original(self, message_ids)
+            moved.append(len(moved))
+            await _seed(
+                store.db,
+                store.agent_id,
+                [("old", "user", f"remark {len(moved)}", 500 + len(moved))],
+            )
+            await ConversationSessionProjection(store.db, store.agent_id).repair()
+            return rows
+
+        monkeypatch.setattr(AsyncConversationStore, "_search_rows", always_repairing)
+
+        with pytest.raises(ProjectionNotReady):
+            await store.search_sessions("penguin folder", limit=2)
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_walk_re_reads_the_membership_map(
+        self, store, monkeypatch
+    ):
+        """A restart is a new walk, so it needs a new map.
+
+        The invariant is that the projection is no newer than the map, so every
+        session the walk can return has its rows in it. A restart repairs again,
+        which can project a conversation that arrived after the first map was
+        read — and carrying that map forward would list it and find nothing in
+        it, which for search means reporting no match against a message that
+        matches.
+        """
+        from kestrel_sovereign.storage.conversation_sessions import (
+            ConversationSessionProjection,
+        )
+
+        await _seed(
+            store.db,
+            store.agent_id,
+            [
+                ("a", "user", "nothing of interest here", 0),
+                ("b", "user", "nothing of interest here", 100),
+                ("c", "user", "nothing of interest here", 200),
+            ],
+        )
+        monkeypatch.setattr(AsyncConversationStore, "SEARCH_SESSION_STEP", 1)
+
+        original = AsyncConversationStore._search_rows
+        fired: List[bool] = []
+
+        async def landing_a_new_match(self, message_ids):
+            rows = await original(self, message_ids)
+            if not fired:
+                fired.append(True)
+                await _seed(
+                    store.db,
+                    store.agent_id,
+                    [("late", "user", "the launch codes are in the penguin folder", 500)],
+                )
+                await ConversationSessionProjection(
+                    store.db, store.agent_id
+                ).repair()
+            return rows
+
+        monkeypatch.setattr(
+            AsyncConversationStore, "_search_rows", landing_a_new_match
+        )
+
+        found = await store.search_sessions("penguin folder")
+
+        assert fired, "the fixture never got between two pages"
+        assert [s["session_id"] for s in found] == ["late"]

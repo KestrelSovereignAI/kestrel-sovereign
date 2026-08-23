@@ -359,7 +359,7 @@ _NEGATION_TOKENS = frozenset({
 })
 
 
-def _token_match_score(query_tokens: List[str], content_lower: str) -> float:
+def _token_match_score(query_tokens: Sequence[str], content_lower: str) -> float:
     """Return the fraction of *query_tokens* found in *content_lower*.
 
     Plain substring matching for all tokens, with one semantic-safety
@@ -483,7 +483,7 @@ def session_match_decoration(
             if first_hit is None:
                 first_hit = msg
         elif terms.use_token_fallback and match_count == 0:
-            score = _token_match_score(list(terms.tokens), content_lower)
+            score = _token_match_score(terms.tokens, content_lower)
             if score >= _TOKEN_MATCH_THRESHOLD and (
                 best_token is None or score > best_token[0]
             ):
@@ -2722,16 +2722,16 @@ class AsyncConversationStore:
         sessions by grouping — over *every* archived row, with no cap, exactly
         as the archived list does.
         """
+        bounded = max(1, int(limit))
+        if view == "archived":
+            return await self._search_archived_sessions(query, bounded)
         terms = SearchTerms.compile(query)
         if terms is None:
             return []
-        bounded = max(1, int(limit))
-        if view == "archived":
-            return await self._search_archived_sessions(terms, query, bounded)
         return await self._search_active_sessions(terms, bounded)
 
     async def _search_archived_sessions(
-        self, terms: SearchTerms, query: str, limit: int
+        self, query: str, limit: int
     ) -> List[Dict[str, Any]]:
         """Search the archived view, by grouping — the membership with no table.
 
@@ -2770,43 +2770,97 @@ class AsyncConversationStore:
         * the **rows themselves**, decrypted, but only for the sessions the walk
           actually reaches.
 
-        That last point is what makes this cheaper than the scan it replaces as
-        well as complete: the walk stops at ``limit`` matches, so an ordinary
-        query decrypts a step's worth of rows rather than 5,000. A query that
-        matches nothing does read everything, and that is the honest cost of
-        proving a negative over content no index can see.
+        **What it costs, measured rather than hoped.** The decryption is
+        proportional to the answer — the walk stops at ``limit`` matches, so an
+        ordinary query reads a step's worth of rows rather than 5,000 — but the
+        map is not: it is the whole live history, every time, at about 5.4
+        microseconds a row on SQLite (measured: 81 ms at 15,000 live rows,
+        323 ms at 60,000, 671 ms at 120,000 — linear).
 
-        The map is read AFTER the first page, which repairs. The projection is
-        then no newer than the map, so every session the walk can return has its
-        rows in it. The reverse order would leave a conversation written between
-        the two reads listed but unsearchable. A session the map has no entry
-        for — one appended under the walk, or one that exists only as its
-        ``new_session`` marker — can still match on its title, and matches on
-        nothing else; that is the ordinary consequence of reading live data, and
-        it is the same window the list documents.
+        So this is NOT cheaper than the 5,000-row scan it replaces on a large
+        history, and saying otherwise would be the kind of claim this epic keeps
+        finding underneath its bugs. That scan was cheap because it was bounded,
+        and bounded is what made 34% of a real agent's conversations unfindable.
+        The cheapest complete alternative — scan every row WITH its content and
+        group once — costs strictly more than this, because it adds the content
+        and the decryption to the same pass. #3075 is what would make the map
+        proportional to the page instead of to history.
+
+        The walk is retried, not resumed, when the projection moves under it.
+        See :meth:`_walk_for_matches` for why a search cannot inherit the list's
+        tolerance for that.
         """
-        from .conversation_sessions import (
-            ConversationSessionProjection,
-            live_history_predicate,
-        )
+        from .conversation_sessions import ConversationSessionProjection
 
         projection = ConversationSessionProjection(self.db, self.agent_id)
         names = await self._search_names()
+        for _ in range(_PAGE_ATTEMPTS):
+            walked = await self._walk_for_matches(projection, terms, names, limit)
+            if walked is not None:
+                return walked
+        raise ProjectionNotReady(
+            f"{self.agent_id}'s conversation index was rebuilt underneath "
+            f"{_PAGE_ATTEMPTS} attempts to search it"
+        )
+
+    async def _walk_for_matches(
+        self,
+        projection,
+        terms: SearchTerms,
+        names: Dict[str, str],
+        limit: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One walk of the table, or ``None`` if the projection moved under it.
+
+        **A walk of several pages has to be a walk of ONE projection.** The list
+        tolerates a repair between its pages and says so: a session whose
+        activity moves across the cursor mid-walk can be shown twice or not at
+        all, which is a visible oddity in a list the user is scrolling. Search
+        cannot inherit that tolerance, because the same event produces a
+        different kind of wrong answer. Measured, not reasoned about: an old
+        session holding the only match receives a new, non-matching message and
+        another request repairs the projection between two pages. Its
+        ``last_message_at`` moves AHEAD of this walk's cursor, so no later page
+        can reach it — and the search returns *no matches* for a conversation
+        that plainly matches, with nothing in the response to say a page was
+        skipped. Silence is the answer search gives when it finds nothing, so
+        there is no shape left for "and also I lost your cursor".
+
+        So every page is required to come from the revision the first page
+        established, and the walk starts again from the top when it is not. The
+        revision moves only when a repair WRITES it — ordinary appends do not
+        touch it — so this is rare, and starting again is honest where resuming
+        would be a guess about where the cursor now points.
+
+        The map is read AFTER the first page, which repairs, and re-read on
+        every restart for the same reason. The projection is then no newer than
+        the map, so every session the walk can return has its rows in it. The
+        reverse order would leave a conversation written between the two reads
+        listed but unsearchable. A session the map has no entry for — one
+        appended under the walk, or one that exists only as its ``new_session``
+        marker — can still match on its title, and matches on nothing else.
+        """
+        from .conversation_sessions import live_history_predicate
+
+        fence: Optional[Tuple[str, int]] = None
         membership: Optional[Dict[str, List[Any]]] = None
         results: List[Dict[str, Any]] = []
         after: Optional[Tuple[Any, ...]] = None
 
         while len(results) < limit:
-            page = await self._page_a_whole_projection(
+            page, standing = await self._page_a_whole_projection(
                 projection,
                 limit=self.SEARCH_SESSION_STEP,
                 after=after,
-                refresh=membership is None,
+                refresh=fence is None,
             )
+            if fence is None:
+                fence = standing
+                membership = await self._live_membership()
+            elif standing != fence:
+                return None
             if not page:
                 break
-            if membership is None:
-                membership = await self._live_membership()
 
             matched: List[Tuple[Dict[str, Any], Optional[str], Dict[str, Any]]] = []
             for batch in _within_row_budget(
@@ -2890,16 +2944,22 @@ class AsyncConversationStore:
             live_transcript_sql(self.db.backend_type), (self.agent_id,)
         )
         # Said out loud for the same reason the projection's transcript pass
-        # says it: a cost that grows with history is the shape this epic exists
-        # to remove, and an operator should hear about it from a log rather than
-        # from a slow pane. #3061 is the fix — stamp the legacy rows and this
-        # map can be read a session at a time from an index.
+        # says it, and against the same threshold — it is the same read over the
+        # same rows, so "how large is worth mentioning" is one question, not two.
+        #
+        # The message says only what is true of EVERY search: the map covers the
+        # whole history. It deliberately does not blame unstamped rows the way
+        # the projection's pass does, because this read is taken whether or not
+        # any exist — the attribution has to be the grouper's, and the grouper
+        # needs the transcript. #3075 is the ticket for making it proportional
+        # to the page.
         if len(rows) >= TRANSCRIPT_PASS_NOISY_ROWS:
             logger.warning(
-                "search_sessions: attributing %s's rows to sessions read all "
-                "%d of its live rows, because rows carrying no session id can "
-                "only be placed by reading the transcript in order (#3061). "
-                "Search latency for this agent grows with its history.",
+                "search_sessions: %s's search attributed all %d of its live "
+                "rows to sessions, because which session a row belongs to is "
+                "decided by the rows before it and the map is built for the "
+                "whole history rather than for the page (#3075). Search "
+                "latency for this agent grows with its history.",
                 self.agent_id,
                 len(rows),
             )
@@ -3658,7 +3718,7 @@ class AsyncConversationStore:
         # One more than asked for, which is how "is there another page" is
         # answered without a second query and without a COUNT over the whole
         # table — the cost this table exists to remove.
-        rows = await self._page_a_whole_projection(
+        rows, _ = await self._page_a_whole_projection(
             projection, limit=bounded + 1, after=after, refresh=after is None
         )
         has_more = len(rows) > bounded
@@ -3709,8 +3769,15 @@ class AsyncConversationStore:
 
     async def _page_a_whole_projection(
         self, projection, *, limit: int, after, refresh: bool
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], Tuple[str, int]]:
         """Read one page, having established the projection was whole THROUGHOUT.
+
+        Returns ``(rows, fence)`` — the page, and the projection revision it was
+        read under. The fence is returned rather than left inside because one
+        page being self-consistent does not make a SEQUENCE of pages one read:
+        a caller walking further than one page has to be able to require that
+        every page came from the same projection, and it cannot ask afterwards
+        without a gap in which the answer changes.
 
         The check and the read are one observation, not two. A repair started by
         another request between them clears the table and commits chunks as it
@@ -3755,7 +3822,7 @@ class AsyncConversationStore:
             # The revision only ever increases, so neither can hide.
             after_read = await self._whole_watermark(projection)
             if after_read is not None and after_read.fence == before.fence:
-                return rows
+                return rows, before.fence
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index was rebuilt underneath "
             f"{_PAGE_ATTEMPTS} attempts to read a page of it"
