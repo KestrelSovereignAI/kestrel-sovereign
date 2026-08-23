@@ -19,6 +19,15 @@ _READINESS_STATE_BASELINE = {
     "scheduler_cold_agent_failures": [],
     "scheduler_readiness_failures": [],
     "host_scheduler_runner": None,
+    # HOST state, and these tests control only the agent. `server.app`'s real
+    # lifespan starts whatever host features are installed, and one that fails
+    # to start is recorded on the host context and correctly downgrades
+    # /health/detailed to `degraded` (#3058) — so an environment with a
+    # feature package installed made unrelated tests here see a degraded host.
+    # That is the endpoint doing its job; the downgrade is asserted in
+    # tests/unit/test_host_feature_contribution_runtime.py, not by leaking
+    # into every test in this file.
+    "host_context": None,
 }
 
 
@@ -652,7 +661,6 @@ def test_health_detailed_requires_auth_and_uses_feature_dict_with_api_key():
     original_mandatory_failures = getattr(
         app.state, "mandatory_feature_failures", None
     )
-
     app.router.lifespan_context = noop_lifespan
 
     health_feature = MagicMock()

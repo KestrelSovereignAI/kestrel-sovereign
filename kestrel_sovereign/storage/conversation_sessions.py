@@ -317,6 +317,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from dataclasses import dataclass
@@ -335,6 +336,7 @@ from .session_grouping import (
     session_order_sql,
     timestamp_query_param,
 )
+from .db.placeholder import normalize_schema
 from .conversation_ids import coerce_persistent_message_id
 from .session_id_column import (
     SESSION_ID_KEY,
@@ -1084,8 +1086,8 @@ CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
 )
 """
 
-_CHANGES_DDL = """
-CREATE TABLE IF NOT EXISTS conversation_history_changes (
+_CHANGES_DDL_TEMPLATE = """
+CREATE TABLE IF NOT EXISTS {table} (
     agent_id   TEXT NOT NULL,
     slot       BIGINT NOT NULL DEFAULT 0,
     changes    BIGINT NOT NULL DEFAULT 0,
@@ -1221,6 +1223,195 @@ def _anchor(generation: str, *, row: str = "", agents: str = "", where: str = ""
         + " "
         + values
         + " ON CONFLICT (agent_id, slot) DO NOTHING"
+    )
+
+
+#: The name the SHARDED replacement is built under before it takes over.
+#:
+#: Named rather than inlined so the cleanup below and the sweep that removes a
+#: leftover from an interrupted migration cannot disagree about it.
+CHANGES_PRE_SLOT_TABLE = "conversation_history_changes_pre_slot"
+
+#: The live counter ledger.
+CHANGES_TABLE = "conversation_history_changes"
+
+_CHANGES_DDL = _CHANGES_DDL_TEMPLATE.format(table=CHANGES_TABLE)
+
+#: The column whose absence identifies a pre-#3005 ledger.
+CHANGES_SLOT_COLUMN = "slot"
+
+#: Operator confirmation that no pre-#3005 revision is still serving.
+#:
+#: Only PostgreSQL asks. SQLite's ``migration_lock`` is ``BEGIN IMMEDIATE`` --
+#: one writer by construction -- so no second revision can be mid-write there
+#: and the migration is unconditional.
+LEDGER_KEY_SWAP_OPT_IN = "KESTREL_ALLOW_LEDGER_KEY_SWAP"
+
+
+class LedgerKeySwapRequiresQuiesce(RuntimeError):
+    """Raised rather than swapping a key a live older revision still needs.
+
+    Sharding the ledger means an agent may hold more than one counter row,
+    which is exactly what the pre-#3005 ``PRIMARY KEY (agent_id)`` forbids.
+    The two shapes are not merely different, they are mutually exclusive: a
+    pre-#3005 revision's triggers upsert ``ON CONFLICT (agent_id)`` and begin
+    failing history writes the moment that constraint is gone, and its next
+    schema initialization reinstalls them over this one's -- so the two
+    revisions flap each other's trigger family for as long as they overlap.
+
+    There is no revision fence in this codebase able to detect such a process
+    (#3078), so the migration asks instead of assuming. Refusing is the safe
+    direction and costs nothing that is not already lost: without the
+    migration this binary cannot open the database at all.
+    """
+
+
+
+def _opted_in_to_the_key_swap() -> bool:
+    """Whether an operator has confirmed no older revision is serving."""
+    return str(os.environ.get(LEDGER_KEY_SWAP_OPT_IN, "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
+    """Statements that give a pre-#3005 counter ledger its ``slot`` column.
+
+    #3005 sharded this table on ``pg_backend_pid()`` and made ``slot`` half of
+    its primary key. The DDL is a ``CREATE TABLE IF NOT EXISTS``, so on a
+    database that predates the change it is a no-op — the four-column table
+    survives — and the very next statement inside the same migration is
+    ``UPDATE conversation_history_changes SET generation = ... WHERE slot = 0``.
+    That raises, and because :func:`build_host_context` reduces any failure to
+    open the backend to a warning, the host then starts with ``db=None``: the
+    Workflows host feature's start hook refuses, the feature is dropped whole,
+    Talon's router refuses without it, and ``/health`` still says ok (#3058).
+
+    ``slot`` is part of ``PRIMARY KEY (agent_id, slot)``, so
+    :meth:`migrate_columns_once` cannot add it and there is no ALTER on SQLite
+    that would. The table is rebuilt instead.
+
+    The counters are PRESERVED rather than dropped, which is the difference
+    between this and the ``conversation_sessions`` path above. That table is a
+    rebuildable cache; this one is the reference the watermark is compared
+    against, so resetting it to zero beside an untouched watermark would leave
+    the projection reporting itself AHEAD of a history it had never walked.
+    Every existing row belongs at slot 0: it is where the generation lives, and
+    SQLite has one writer by construction so it is the only slot it ever uses.
+
+    The two engines get different statements, because ``migration_lock`` means
+    different things on them. On SQLite it is ``BEGIN IMMEDIATE`` -- one writer
+    by construction, so no increment can land mid-migration and a rebuild is
+    safe. On PostgreSQL it is a transaction-scoped ADVISORY lock, which
+    excludes other initializers and no ordinary writer at all; there the table
+    is altered in place, because a copy would discard the increments those
+    writers commit between the SELECT and the DROP. Each branch carries its
+    own argument.
+
+    Either way it runs inside one transaction, so an interrupted migration
+    leaves the original table under its own name, not a half-copied one.
+    """
+    if backend_type == "postgres" and not _opted_in_to_the_key_swap():
+        raise LedgerKeySwapRequiresQuiesce(
+            "This PostgreSQL database still carries the pre-#3005 counter "
+            "ledger, and bringing it forward swaps "
+            "conversation_history_changes' primary key from (agent_id) to "
+            "(agent_id, slot). A revision older than #3005 that is still "
+            "serving cannot share that schema: its triggers upsert "
+            "ON CONFLICT (agent_id), which stops matching any constraint, and "
+            "its next initialization reinstalls them over this one's. Nothing "
+            "here can detect such a process (see issue #3078), so it is "
+            "asking rather than assuming. Stop every older revision, then "
+            f"restart with {LEDGER_KEY_SWAP_OPT_IN}=1 set. SQLite hosts never "
+            "see this: their migration lock admits one writer by construction."
+        )
+    if backend_type == "postgres":
+        return (
+            # In place, because PostgreSQL can be. A rebuild here would be
+            # unsafe: `migration_lock` takes a transaction-scoped ADVISORY
+            # lock, which excludes other initializers and nothing else, so an
+            # ordinary history writer goes on incrementing the old ledger
+            # through its triggers. The copy would read ACCESS SHARE --
+            # compatible with the writers' ROW EXCLUSIVE -- and the DROP would
+            # then wait for those writers and discard the increments they had
+            # just committed. The watermark would still equal the copied
+            # counter, so the projection would report itself current while the
+            # history it never walked stayed permanently unlisted.
+            #
+            # ALTER TABLE takes ACCESS EXCLUSIVE itself, so each statement is
+            # already serialized against those writers and no row is copied at
+            # all.
+            #
+            # conversation_history is locked FIRST, in the writers' own order.
+            # They reach the ledger THROUGH a trigger on history, so they hold
+            # history and then want the ledger. This transaction goes on to
+            # create and drop triggers on history after these statements, which
+            # takes ACCESS EXCLUSIVE on it -- so taking the ledger first would
+            # be the opposite order and PostgreSQL would abort one side of the
+            # cycle. The window is no wider than the trigger DDL already opens
+            # a moment later; it just opens sooner.
+            "LOCK TABLE conversation_history IN ACCESS EXCLUSIVE MODE",
+            "ALTER TABLE conversation_history_changes "
+            "ADD COLUMN IF NOT EXISTS slot BIGINT NOT NULL DEFAULT 0",
+            # Reaching here means an operator confirmed no pre-#3005 revision
+            # is serving -- see LedgerKeySwapRequiresQuiesce above and #3078
+            # for the fence that would make the confirmation unnecessary.
+            #
+            # The constraint is found rather than named. It was minted by an
+            # inline PRIMARY KEY so it is almost certainly
+            # `conversation_history_changes_pkey`, and "almost certainly" is
+            # not a thing to hinge a boot on.
+            """
+            DO $$
+            DECLARE existing_pkey text;
+            BEGIN
+                SELECT conname INTO existing_pkey
+                  FROM pg_constraint
+                 WHERE conrelid = 'conversation_history_changes'::regclass
+                   AND contype = 'p';
+                IF existing_pkey IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE conversation_history_changes '
+                        'DROP CONSTRAINT %I', existing_pkey
+                    );
+                END IF;
+                ALTER TABLE conversation_history_changes
+                    ADD PRIMARY KEY (agent_id, slot);
+            END $$;
+            """.strip(),
+        )
+
+    new_shape = normalize_schema(        _CHANGES_DDL_TEMPLATE.format(table=CHANGES_PRE_SLOT_TABLE).strip(),
+        backend_type,
+    )
+    return (
+        # No ALTER TABLE anywhere, and that is the whole design.
+        #
+        # SQLite reparses every trigger that names a table whenever that table
+        # is renamed, and it does so against the schema BEFORE the rename
+        # lands. The triggers this database already carries reference `slot`,
+        # so renaming the old table aside fails on the missing column, and
+        # renaming a replacement in fails on the name it is about to create not
+        # existing yet. Either order is a boot that cannot succeed -- and only
+        # on a database whose triggers are ALREADY current, which is the
+        # partial upgrade a plain pre-#3005 host never exercises. Found by the
+        # test for exactly that case, not by the obvious one.
+        #
+        # CREATE and DROP trigger no such reparse: a trigger body resolves at
+        # fire time on both engines. So the table is rebuilt in place through a
+        # scratch copy, and the live name never stops meaning what it means.
+        new_shape,
+        f"INSERT INTO {CHANGES_PRE_SLOT_TABLE} "
+        "(agent_id, slot, changes, appends, generation) "
+        "SELECT agent_id, 0, changes, appends, generation "
+        f"FROM {CHANGES_TABLE}",
+        f"DROP TABLE {CHANGES_TABLE}",
+        normalize_schema(_CHANGES_DDL.strip(), backend_type),
+        f"INSERT INTO {CHANGES_TABLE} "
+        "(agent_id, slot, changes, appends, generation) "
+        "SELECT agent_id, slot, changes, appends, generation "
+        f"FROM {CHANGES_PRE_SLOT_TABLE}",
+        f"DROP TABLE {CHANGES_PRE_SLOT_TABLE}",
     )
 
 

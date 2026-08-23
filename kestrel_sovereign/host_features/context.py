@@ -127,11 +127,13 @@ class SovereignHostContext:
         backplane: Any = None,
         config: Any = None,
         session_factory: Optional[FleetSessionFactory] = None,
+        backend_error: str = "",
     ) -> None:
         self._db = db
         self._backplane = backplane
         self._config = config if config is not None else {}
         self._session_factory = session_factory
+        self._backend_error = str(backend_error or "")
 
     @property
     def db(self) -> Any:
@@ -149,6 +151,22 @@ class SovereignHostContext:
     def session_factory(self) -> Optional[FleetSessionFactory]:
         """Fleet tenant-scoped session factory on the host backend."""
         return self._session_factory
+
+    @property
+    def backend_error(self) -> str:
+        """Why :attr:`db` is None, when it is, and empty otherwise.
+
+        The host is built to start without a store, so a backend that cannot
+        open is a capability gap rather than an identity one and must not abort
+        boot. But a capability gap has to be NAMED. #3058: the open failed on a
+        schema migration, this constructor was handed ``db=None``, the
+        Workflows host feature's start hook refused for want of a database, the
+        feature was dropped whole, Talon's router refused without it, and every
+        surface downstream reported an empty list on a host answering ok.
+        Carrying the reason turns the diagnosis from "read the boot log" into
+        one field beside the symptom.
+        """
+        return self._backend_error
 
     @property
     def fleet_tenant_id(self) -> str:
@@ -171,6 +189,7 @@ async def build_host_context(
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
+    backend_error = ""
     try:
         from kestrel_sovereign.host_features.storage import (
             prepare_host_database,
@@ -202,13 +221,18 @@ async def build_host_context(
                 logger.warning("Could not close partial host backend: %s", close_exc)
         session_factory = None
         db = None
-        logger.warning("Could not open host backend/session factory: %s", exc)
+        backend_error = f"{type(exc).__name__}: {exc}"
+        # ERROR, not warning: everything that depends on the host store is
+        # about to be dropped, and each of those drops reports an empty
+        # result rather than a failure (#3058).
+        logger.error("Could not open host backend/session factory: %s", exc)
 
     return SovereignHostContext(
         db=db,
         backplane=None,
         config=config,
         session_factory=session_factory,
+        backend_error=backend_error,
     )
 
 

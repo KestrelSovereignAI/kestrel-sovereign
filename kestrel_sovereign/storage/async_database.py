@@ -2049,6 +2049,9 @@ class AsyncDatabase:
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
             emptied_cache_invalidation,
+            CHANGES_PRE_SLOT_TABLE,
+            CHANGES_SLOT_COLUMN,
+            changes_slot_migration,
             WATERMARK_EPOCH_COLUMN,
             WATERMARK_REVISION_COLUMN,
             projection_tables,
@@ -2085,6 +2088,23 @@ class AsyncDatabase:
             if not any(table == name for name, _ in missing_tables)
             and await _predates_the_not_null_stamps(table)
         ]
+        # A counter ledger from before #3005 has no `slot`, and `slot` is half
+        # of its primary key -- so the CREATE TABLE IF NOT EXISTS below is a
+        # no-op on it and `shape_change_invalidation`, which addresses slot 0,
+        # raises. That failure is swallowed by `build_host_context` into
+        # `db=None`, and a host then boots with its whole operator run plane
+        # missing while /health reports ok (#3058).
+        # Existence comes from the probe above rather than a second query of
+        # its own: this method runs on every from_pool(), so a duplicate
+        # `SELECT to_regclass` here is a round trip on every request. Only the
+        # column probe is new work, and the re-probe under the lock still
+        # settles any race.
+        changes_present = not any(
+            name == "conversation_history_changes" for name, _ in missing_tables
+        )
+        changes_predates_slot = changes_present and not await self._column_exists(
+            "conversation_history_changes", CHANGES_SLOT_COLUMN
+        )
         # Set equality, not "are the ones I want present". The names carry the
         # mechanism's fingerprint, so a database running a SUPERSEDED shape has
         # names this run has never heard of — and that database is exactly the
@@ -2098,6 +2118,7 @@ class AsyncDatabase:
         if (
             missing_tables
             or outdated_tables
+            or changes_predates_slot
             or installed_triggers != set(wanted_triggers)
             or installed_functions != set(wanted_functions)
         ):
@@ -2107,6 +2128,28 @@ class AsyncDatabase:
                 # Whether this block leaves `conversation_sessions` EMPTY —
                 # by replacing it, or by creating one that was not there.
                 emptied_the_cache = False
+                # FIRST, and re-probed under the lock: everything below this
+                # point may address slot 0, and on a pre-#3005 ledger there is
+                # no such column to address.
+                if await self.table_exists(
+                    "conversation_history_changes"
+                ) and not await self._column_exists(
+                    "conversation_history_changes", CHANGES_SLOT_COLUMN
+                ):
+                    # A leftover from a migration interrupted before the drop.
+                    # The rename/copy/drop is one transaction, so this should
+                    # be unreachable -- but a leftover would make the RENAME
+                    # below fail on the name already existing, turning a
+                    # recoverable state into a boot that never succeeds again.
+                    await self._backend.execute(
+                        f"DROP TABLE IF EXISTS {self._quoted(CHANGES_PRE_SLOT_TABLE)}"
+                    )
+                    for statement in changes_slot_migration(self.backend_type):
+                        await self._backend.execute(statement)
+                    logger.info(
+                        "migrated conversation_history_changes to the sharded "
+                        "shape, counters preserved at slot 0 (#3058)"
+                    )
                 for table in outdated_tables:
                     if not await _predates_the_not_null_stamps(table):
                         continue

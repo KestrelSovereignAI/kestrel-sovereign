@@ -3387,15 +3387,38 @@ def _with_host_feature_rejections(app_state, payload: dict) -> dict:
     rejections = tuple(
         getattr(ctx, "rejected_host_feature_contributions", ()) or ()
     )
-    if not rejections:
+    # Why the host store is missing, when it is. Reported beside the features
+    # it took down rather than only in the boot log: every one of them reports
+    # an empty result instead of an error, so the symptom never names the
+    # cause and the cause is a scroll away (#3058).
+    #
+    # A STRING, checked, not coerced. `str()` of any object is truthy, so
+    # coercing would turn a context whose attribute is absent-but-not-missing
+    # -- a stand-in, a partially built object -- into a fabricated outage
+    # report naming its repr. This surface exists to stop health lying; it
+    # must not invent a failure to do it.
+    raw_backend_error = getattr(ctx, "backend_error", "")
+    backend_error = (
+        raw_backend_error.strip() if isinstance(raw_backend_error, str) else ""
+    )
+    if not rejections and not backend_error:
         return payload
     merged = dict(payload)
-    merged["host_features_not_loaded"] = [
-        {"feature": rejection.feature_name, "reason": rejection.reason}
-        for rejection in rejections
-    ]
+    if rejections:
+        merged["host_features_not_loaded"] = [
+            {"feature": rejection.feature_name, "reason": rejection.reason}
+            for rejection in rejections
+        ]
+    if backend_error:
+        merged["host_backend_unavailable"] = backend_error
     if merged.get("status") == "healthy":
         merged["status"] = "degraded"
+    if "overall_healthy" in merged:
+        # Two fields, one fact. A monitor reading the boolean and a human
+        # reading the string must not get different answers -- leaving
+        # overall_healthy true beside a degraded status reproduces exactly the
+        # silent-healthy report this fold exists to end (#3058).
+        merged["overall_healthy"] = merged.get("status") == "healthy"
     return merged
 
 

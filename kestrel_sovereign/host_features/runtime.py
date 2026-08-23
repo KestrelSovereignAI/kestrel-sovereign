@@ -221,7 +221,23 @@ async def start_host_features(
         try:
             await feature.on_host_start(ctx)
         except Exception as exc:  # noqa: BLE001 - isolate a reversible failure
-            logger.warning("Host feature %s on_host_start failed: %s", feature, exc)
+            # ERROR, and recorded where health reads it. A feature dropped here
+            # is dropped WHOLE -- no router, no panel, no service -- and every
+            # downstream consumer then sees an empty list rather than an error.
+            # #3058: WorkflowsHostFeature's start hook refused a host with no
+            # database, the feature vanished, Talon's router refused without
+            # it, and /health went on reporting ok over an entire missing
+            # operator run plane. A start-hook failure is the same fact as a
+            # contribution rejection -- the feature is not loaded -- so it goes
+            # through the same door rather than getting a second one.
+            logger.error(
+                "Host feature %s did not start — %s",
+                _host_feature_name(feature),
+                exc,
+            )
+            _record_host_feature_rejection(
+                ctx, feature, f"on_host_start failed: {exc}"
+            )
             try:
                 runtime.deactivate(feature)
             except Exception:  # noqa: BLE001 - unsafe rollback cannot be hidden
@@ -248,6 +264,38 @@ async def start_host_features(
         raise
     ctx.started_host_features = (*previously_started, *started)
     return started
+
+
+def _host_feature_name(feature: Any) -> str:
+    """The stable name health reports a feature under.
+
+    Matches what ``prepare_transition`` records, so a start-hook rejection and
+    a contribution rejection for the same feature supersede each other by name
+    rather than accumulating two entries that disagree.
+    """
+    name = getattr(feature, "name", None) or type(feature).__name__
+    return str(name)
+
+
+def _record_host_feature_rejection(ctx: Any, feature: Any, reason: str) -> None:
+    """File a not-loaded verdict where ``/health/detailed`` reads it."""
+    from kestrel_sovereign.features.contribution_runtime import (
+        ContributionRejection,
+    )
+
+    # Appended, not deduplicated. A prior verdict for this feature was already
+    # dropped by the `carried` filter at the top of this call -- the name is in
+    # the transition either way -- so a second pass here could not change an
+    # outcome, and a guard that cannot is one nothing can test.
+    ctx.rejected_host_feature_contributions = tuple(
+        getattr(ctx, "rejected_host_feature_contributions", ()) or ()
+    ) + (
+        ContributionRejection(
+            feature=feature,
+            feature_name=_host_feature_name(feature),
+            reason=reason,
+        ),
+    )
 
 
 async def _rollback_started_host_features(

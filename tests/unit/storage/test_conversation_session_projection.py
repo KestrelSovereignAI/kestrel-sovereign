@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -63,6 +64,7 @@ from kestrel_sovereign.storage.async_conversation_store import AsyncConversation
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
 from kestrel_sovereign.storage.conversation_sessions import (
+    CHANGES_PRE_SLOT_TABLE,
     CURRENT,
     active_history_predicate,
     canonical_order_index_columns,
@@ -3424,3 +3426,346 @@ async def test_the_publish_fence_will_not_subtract_across_a_ledger_reset(tmp_pat
             "a snapshot derived before the ledger was erased was published as "
             "current, because its counters were subtracted from a fresh one's"
         )
+
+
+# ---------------------------------------------------------------------------
+# #3058 — the pre-#3005 counter ledger has no `slot`
+# ---------------------------------------------------------------------------
+
+
+def _pre_slot_ledger(path, rows=()):
+    """Build the four-column counter ledger #3005 replaced.
+
+    Written out rather than derived from the current DDL: the point is a shape
+    this codebase no longer produces, and deriving it from the shape it DOES
+    produce would make the fixture agree with the code under test by
+    construction.
+    """
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE conversation_history_changes (
+            agent_id   TEXT PRIMARY KEY,
+            changes    BIGINT NOT NULL DEFAULT 0,
+            appends    BIGINT NOT NULL DEFAULT 0,
+            generation TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO conversation_history_changes "
+        "(agent_id, changes, appends, generation) VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    connection.commit()
+    connection.close()
+
+
+def _ledger_columns(path):
+    connection = sqlite3.connect(path)
+    try:
+        return [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(conversation_history_changes)"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def _ledger_rows(path):
+    connection = sqlite3.connect(path)
+    try:
+        return sorted(
+            connection.execute(
+                "SELECT agent_id, slot, changes, appends "
+                "FROM conversation_history_changes"
+            )
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pre_slot_ledger_does_not_stop_the_database_opening(tmp_path):
+    """The boot failure #3058 was filed on, from the shape that causes it.
+
+    _CHANGES_DDL is a CREATE TABLE IF NOT EXISTS, so on a database predating
+    #3005 it is a no-op and the four-column table survives -- and the next
+    statement in the same migration is
+    ``UPDATE conversation_history_changes SET generation = ... WHERE slot = 0``.
+    """
+    path = tmp_path / "pre-slot.db"
+    _pre_slot_ledger(path)
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_preserves_the_counters_at_slot_zero(tmp_path):
+    """Preserved, not dropped -- unlike the conversation_sessions cache.
+
+    This table is the reference a watermark is compared against, so resetting
+    it to zero beside an untouched watermark would leave the projection
+    reporting itself AHEAD of a history it had never walked. Slot 0 is the
+    right home: it is where the generation lives, and SQLite has one writer by
+    construction so it is the only slot it ever uses.
+    """
+    path = tmp_path / "counters.db"
+    _pre_slot_ledger(path, rows=[("did:a", 17, 5, "gen-a"), ("did:b", 3, 3, "gen-b")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert _ledger_rows(path) == [("did:a", 0, 17, 5), ("did:b", 0, 3, 3)]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_leaves_no_scratch_table_behind(tmp_path):
+    """The rename target must not survive a successful migration."""
+    path = tmp_path / "scratch.db"
+    _pre_slot_ledger(path, rows=[("did:a", 1, 1, "g")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        connection = sqlite3.connect(path)
+        try:
+            leftovers = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE ?",
+                    (f"%{CHANGES_PRE_SLOT_TABLE}%",),
+                )
+            ]
+        finally:
+            connection.close()
+        assert leftovers == []
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_scratch_table_does_not_wedge_the_boot(tmp_path):
+    """An interrupted migration must not become a boot that never succeeds.
+
+    The rename/copy/drop is one transaction, so this should be unreachable --
+    but if it ever happened, the RENAME would fail on the name already
+    existing and every subsequent boot would fail the same way. A recoverable
+    state must not turn into a permanent one.
+    """
+    path = tmp_path / "leftover.db"
+    _pre_slot_ledger(path, rows=[("did:a", 9, 2, "g")])
+    connection = sqlite3.connect(path)
+    connection.execute(
+        f"CREATE TABLE {CHANGES_PRE_SLOT_TABLE} "
+        "(agent_id TEXT, changes BIGINT, appends BIGINT, generation TEXT)"
+    )
+    connection.commit()
+    connection.close()
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path)
+        assert _ledger_rows(path) == [("did:a", 0, 9, 2)]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_ledger_is_not_migrated_again(tmp_path):
+    """The probe is on the COLUMN, so a healthy database never enters it."""
+    path = tmp_path / "twice.db"
+    _pre_slot_ledger(path, rows=[("did:a", 4, 4, "g")])
+
+    database = await AsyncDatabase.sqlite(str(path))
+    try:
+        before = _ledger_rows(path)
+        await database.ensure_session_projection_schema()
+        assert _ledger_rows(path) == before
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pre_slot_ledger_is_migrated_even_when_nothing_else_moved(
+    tmp_path,
+):
+    """The probe has to be its own reason to take the lock.
+
+    The fast path takes no lock when every object is present, and a pre-#3005
+    database usually also carries pre-#3005 TRIGGERS, whose fingerprinted names
+    do not match — so the lock is entered for that reason and the migration
+    rides along. A partial upgrade breaks that coincidence: triggers and
+    functions current, ledger not. Then nothing else notices, the fast path
+    returns, and the first row event fires a trigger that writes a column the
+    table does not have.
+    """
+    path = tmp_path / "partial-upgrade.db"
+    database = await AsyncDatabase.sqlite(str(path))
+    await database.close()
+
+    # Everything current, then the ledger alone rolled back to the old shape.
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        DROP TABLE conversation_history_changes;
+        CREATE TABLE conversation_history_changes (
+            agent_id   TEXT PRIMARY KEY,
+            changes    BIGINT NOT NULL DEFAULT 0,
+            appends    BIGINT NOT NULL DEFAULT 0,
+            generation TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO conversation_history_changes VALUES ('did:a', 11, 4, 'g');
+        """
+    )
+    connection.commit()
+    connection.close()
+    assert "slot" not in _ledger_columns(path)
+
+    reopened = await AsyncDatabase.sqlite(str(path))
+    try:
+        assert "slot" in _ledger_columns(path), (
+            "no trigger or table went missing, so only the column probe could "
+            "have brought this database into the lock"
+        )
+        assert _ledger_rows(path) == [("did:a", 0, 11, 4)]
+    finally:
+        await reopened.close()
+
+
+def test_postgres_refuses_the_key_swap_until_an_operator_confirms(monkeypatch):
+    """A comment enforces nothing, so this refuses instead.
+
+    Sharding means an agent may hold more than one counter row, which is
+    exactly what the pre-#3005 PRIMARY KEY (agent_id) forbids — the two shapes
+    are mutually exclusive, so an older revision still serving begins failing
+    history writes the moment the constraint goes, and reinstalls its own
+    triggers over ours besides. Nothing here can detect such a process (#3078).
+
+    Refusing costs nothing that is not already lost: without the migration
+    this binary cannot open the database at all.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
+        LedgerKeySwapRequiresQuiesce,
+    )
+
+    monkeypatch.delenv(LEDGER_KEY_SWAP_OPT_IN, raising=False)
+    with pytest.raises(LedgerKeySwapRequiresQuiesce) as refusal:
+        changes_slot_migration("postgres")
+
+    message = str(refusal.value)
+    assert LEDGER_KEY_SWAP_OPT_IN in message, "the message names the way out"
+    assert "#3078" in message
+
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
+    assert changes_slot_migration("postgres"), "and the way out works"
+
+
+def test_sqlite_never_asks_because_it_cannot_overlap(monkeypatch):
+    """SQLite's migration_lock is BEGIN IMMEDIATE: one writer, by construction.
+
+    So there is no second revision to quiesce, and asking an operator to
+    confirm something that cannot happen would be ceremony that teaches people
+    to click through it.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
+    )
+
+    monkeypatch.delenv(LEDGER_KEY_SWAP_OPT_IN, raising=False)
+
+    assert changes_slot_migration("sqlite")
+
+
+def test_the_postgres_migration_never_copies_the_ledger(monkeypatch):
+    """A copy on PostgreSQL would discard concurrent increments.
+
+    ``migration_lock`` is a transaction-scoped ADVISORY lock there: it excludes
+    other initializers and no ordinary writer at all. A history write commits
+    through its trigger against the old table, the copy's ACCESS SHARE does not
+    exclude it, and the DROP then waits for that writer and throws away what it
+    just wrote — leaving the watermark equal to the copied counter while the
+    newer history stays permanently unlisted.
+
+    Asserted on the statements because this repository has no PostgreSQL to run
+    against; the behaviour itself is exercised by the dual-backend case in
+    tests/integration, which runs in CI.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        CHANGES_TABLE,
+        LEDGER_KEY_SWAP_OPT_IN,
+    )
+
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
+    statements = changes_slot_migration("postgres")
+
+    assert not any(
+        f"DROP TABLE {CHANGES_TABLE}" in statement for statement in statements
+    ), "the live ledger is never dropped on PostgreSQL"
+    assert not any("INSERT INTO" in statement for statement in statements), (
+        "and no row is copied, so none can be lost"
+    )
+    assert any("ADD COLUMN IF NOT EXISTS slot" in s for s in statements)
+    assert any("ADD PRIMARY KEY (agent_id, slot)" in s for s in statements)
+
+
+def test_the_postgres_migration_locks_history_before_the_ledger(monkeypatch):
+    """Writers reach the ledger THROUGH a trigger on conversation_history.
+
+    So they hold history and then want the ledger. This transaction goes on to
+    create and drop triggers on history after the ALTERs, which takes ACCESS
+    EXCLUSIVE on it — taking the ledger first would be the opposite order and
+    PostgreSQL would abort one side of the cycle. Asserted on the statements
+    and on their ORDER, because a deadlock needs a server to observe and this
+    repository has none.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        LEDGER_KEY_SWAP_OPT_IN,
+    )
+
+    monkeypatch.setenv(LEDGER_KEY_SWAP_OPT_IN, "1")
+    statements = changes_slot_migration("postgres")
+    lock_at = next(
+        i for i, s in enumerate(statements)
+        if "LOCK TABLE conversation_history IN ACCESS EXCLUSIVE MODE" in s
+    )
+    ledger_at = next(
+        i for i, s in enumerate(statements)
+        if "ALTER TABLE conversation_history_changes" in s
+    )
+    assert lock_at < ledger_at, (
+        "history first, in the writers' own order"
+    )
+
+
+def test_the_sqlite_migration_rebuilds_because_it_safely_can():
+    """SQLite's migration_lock is BEGIN IMMEDIATE: one writer, by construction.
+
+    So no increment can land mid-migration and the rebuild is safe — which is
+    the only reason the two engines are allowed to differ here.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        CHANGES_PRE_SLOT_TABLE,
+        CHANGES_TABLE,
+    )
+
+    statements = changes_slot_migration("sqlite")
+
+    assert any(f"DROP TABLE {CHANGES_TABLE}" in s for s in statements)
+    assert any(f"DROP TABLE {CHANGES_PRE_SLOT_TABLE}" in s for s in statements)
+    assert not any("ALTER TABLE" in s for s in statements), (
+        "SQLite reparses triggers on rename, against the schema before it "
+        "lands, so no ordering of an ALTER-based migration can work here"
+    )
