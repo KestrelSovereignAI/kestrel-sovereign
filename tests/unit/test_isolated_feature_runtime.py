@@ -2374,6 +2374,135 @@ def test_hosted_process_venv_accepts_secure_operator_symlink_chains(
     )
 
 
+def _assert_mutated_hosted_venv_selection_fails_before_probe(
+    feature: ProxyFeature,
+    *,
+    expected_setting: str,
+) -> None:
+    feature._verify_launch_artifact = Mock(
+        side_effect=AssertionError("stale launch artifact was inspected")
+    )
+    feature._verify_prebuilt_feature_distribution = Mock(
+        side_effect=AssertionError("stale distribution was probed")
+    )
+    feature._warn_on_sdk_mismatch = Mock(
+        side_effect=AssertionError("stale SDK was probed")
+    )
+    feature._run = Mock(side_effect=AssertionError("stale venv was provisioned"))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature.ensure_venv()
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert expected_setting in diagnostic
+    assert str(feature._venv_path) not in diagnostic
+    feature._verify_launch_artifact.assert_not_called()
+    feature._verify_prebuilt_feature_distribution.assert_not_called()
+    feature._warn_on_sdk_mismatch.assert_not_called()
+    feature._run.assert_not_called()
+    assert feature._validated_hosted_console_path is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX release symlink contract")
+def test_hosted_venv_release_symlink_flip_fails_before_stale_tree_probe(
+    monkeypatch,
+    tmp_path,
+):
+    releases = tmp_path / "releases"
+    release_1 = releases / "v1"
+    release_2 = releases / "v2"
+    for release in (release_1, release_2):
+        _write_prebuilt_venv_shape(
+            release,
+            console_service=_isolated_runtime().service,
+        )
+    selected = tmp_path / "current-venv"
+    selected.symlink_to(release_1, target_is_directory=True)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(selected))
+    client_factory = Mock(side_effect=AssertionError("stale child was launched"))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "release-link-flip"),
+        _isolated_runtime(),
+        client_factory=client_factory,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._venv_path == release_1.resolve()
+
+    selected.unlink()
+    selected.symlink_to(release_2, target_is_directory=True)
+
+    _assert_mutated_hosted_venv_selection_fails_before_probe(
+        feature,
+        expected_setting=key,
+    )
+    client_factory.assert_not_called()
+
+
+def test_hosted_runtime_venv_to_process_override_flip_fails_before_stale_probe(
+    monkeypatch,
+    tmp_path,
+):
+    declared = tmp_path / "declared-venv"
+    process_override = tmp_path / "process-venv"
+    for prebuilt in (declared, process_override):
+        _write_prebuilt_venv_shape(
+            prebuilt,
+            console_service=_isolated_runtime().service,
+        )
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    client_factory = Mock(side_effect=AssertionError("stale child was launched"))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "selection-flip"),
+        _runtime_with_declared_venv(str(declared)),
+        client_factory=client_factory,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._venv_path == declared.resolve()
+
+    monkeypatch.setenv(key, str(process_override))
+
+    _assert_mutated_hosted_venv_selection_fails_before_probe(
+        feature,
+        expected_setting=key,
+    )
+    client_factory.assert_not_called()
+
+
+def test_hosted_process_override_removal_selects_runtime_venv_and_fails_closed(
+    monkeypatch,
+    tmp_path,
+):
+    declared = tmp_path / "declared-venv"
+    process_override = tmp_path / "process-venv"
+    for prebuilt in (declared, process_override):
+        _write_prebuilt_venv_shape(
+            prebuilt,
+            console_service=_isolated_runtime().service,
+        )
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(process_override))
+    client_factory = Mock(side_effect=AssertionError("stale child was launched"))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "selection-removal"),
+        _runtime_with_declared_venv(str(declared)),
+        client_factory=client_factory,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._venv_path == process_override.resolve()
+
+    monkeypatch.delenv(key)
+
+    _assert_mutated_hosted_venv_selection_fails_before_probe(
+        feature,
+        expected_setting="runtime.venv",
+    )
+    client_factory.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_hosted_agents_share_only_immutable_prebuilt_venv_without_writes(
     monkeypatch,
@@ -3239,6 +3368,137 @@ def test_hosted_prebuilt_missing_console_names_selecting_venv_setting(
     assert str(prebuilt) not in diagnostic
     assert "filesystem health" not in diagnostic
     feature._run.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX console custody contract")
+@pytest.mark.parametrize(
+    ("mode", "case"),
+    ((0o720, "group-writable"), (0o600, "non-executable")),
+)
+def test_hosted_prebuilt_console_rejects_unsafe_target_mode(
+    monkeypatch,
+    tmp_path,
+    mode,
+    case,
+):
+    prebuilt = tmp_path / f"operator-console-{case}"
+    _write_prebuilt_venv_shape(
+        prebuilt,
+        console_service=_isolated_runtime().service,
+    )
+    wrapper = isolated_runtime._console_script_path(
+        prebuilt,
+        _isolated_runtime().service,
+    )
+    wrapper.chmod(mode)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", f"console-{case}"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._verify_prebuilt_feature_distribution = Mock(
+        side_effect=AssertionError("unsafe console reached distribution probe")
+    )
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature.ensure_venv()
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert key in diagnostic
+    assert str(prebuilt) not in diagnostic
+    feature._verify_prebuilt_feature_distribution.assert_not_called()
+    assert feature._validated_hosted_console_path is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX console custody contract")
+def test_hosted_prebuilt_console_rejects_foreign_owned_target(
+    monkeypatch,
+    tmp_path,
+):
+    prebuilt = tmp_path / "operator-console-foreign"
+    _write_prebuilt_venv_shape(
+        prebuilt,
+        console_service=_isolated_runtime().service,
+    )
+    wrapper = isolated_runtime._console_script_path(
+        prebuilt,
+        _isolated_runtime().service,
+    ).resolve()
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "console-foreign"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    real_stat = Path.stat
+    foreign_uid = next(uid for uid in range(1, 4) if uid != os.geteuid())
+
+    def foreign_console_stat(path, *, follow_symlinks=True):
+        metadata = real_stat(path, follow_symlinks=follow_symlinks)
+        if path == wrapper:
+            return _stat_result_with_uid(metadata, foreign_uid)
+        return metadata
+
+    monkeypatch.setattr(Path, "stat", foreign_console_stat)
+    feature._verify_prebuilt_feature_distribution = Mock(
+        side_effect=AssertionError("foreign console reached distribution probe")
+    )
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature.ensure_venv()
+
+    assert key in raised.value.safe_diagnostic()
+    assert str(prebuilt) not in raised.value.safe_diagnostic()
+    feature._verify_prebuilt_feature_distribution.assert_not_called()
+    assert feature._validated_hosted_console_path is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX console symlink contract")
+def test_hosted_prebuilt_console_symlink_launches_validated_pinned_target(
+    monkeypatch,
+    tmp_path,
+):
+    prebuilt = tmp_path / "operator-console-symlink"
+    _write_prebuilt_venv_shape(
+        prebuilt,
+        console_service=_isolated_runtime().service,
+    )
+    public_wrapper = isolated_runtime._console_script_path(
+        prebuilt,
+        _isolated_runtime().service,
+    )
+    first_target = public_wrapper.with_name(f"{public_wrapper.name}-v1")
+    second_target = public_wrapper.with_name(f"{public_wrapper.name}-v2")
+    public_wrapper.rename(first_target)
+    second_target.write_bytes(first_target.read_bytes())
+    second_target.chmod(0o700)
+    public_wrapper.symlink_to(first_target.name)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "console-symlink"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._verify_prebuilt_feature_distribution = Mock()
+    feature._warn_on_sdk_mismatch = Mock()
+
+    feature.ensure_venv()
+
+    assert feature._validated_hosted_console_path == first_target.resolve()
+    public_wrapper.unlink()
+    public_wrapper.symlink_to(second_target.name)
+    assert feature._service_command() == [str(first_target.resolve())]
+    feature._verify_prebuilt_feature_distribution.assert_called_once()
 
 
 def _callable_verification_feature(tmp_path: Path) -> ProxyFeature:

@@ -315,10 +315,13 @@ artifact-selection inputs and are never exposed to the child. In hosted mode
 these process-wide overrides are accepted only when the executable or complete
 venv already exists; a venv carrying Core's provisioning manifest is refused.
 On POSIX, Core also requires the resolved venv root, `pyvenv.cfg`, bin
-directory, and resolved interpreter target to be owned by root or the service
-account and not group/world writable; the interpreter must be a regular
-executable. Secure operator-facing venv, configuration, and interpreter
-symlinks remain supported and resolve to the canonical artifact before use.
+directory, resolved interpreter target, and exact console wrapper target to be
+owned by root or the service account and not group/world writable. Interpreter
+and console targets must be regular executables. Secure operator-facing venv,
+configuration, interpreter, and console-wrapper symlinks remain supported and
+resolve to canonical artifacts before use. Core launches the pinned console
+target it validated, so replacing the public wrapper symlink cannot redirect a
+prepared feature.
 Core never creates, upgrades, or stamps a process-wide override. The validated
 operator-selected artifact may be shared, but every child process and mutable
 workspace/cache/state path remains namespace-distinct.
@@ -327,8 +330,12 @@ Installed `[tool.kestrel.feature] venv = ...` metadata follows the same hosted
 immutable-prebuilt contract as `..._VENV`: the value must be absolute, the venv
 and executable interpreter must already exist, and the directory must not carry
 a Core provisioning manifest. Core revalidates it immediately before the
-mutation boundary and never creates, upgrades, or stamps it. Standalone agents
-retain their historical mutable and relative metadata behavior.
+mutation boundary and refuses a release-link or override-selection change when
+the revalidated canonical root differs from the path resolved for that enable
+attempt. No stale-tree launch-artifact, distribution, or SDK probe runs after
+that mismatch. Core never creates, upgrades, or stamps the immutable venv.
+Standalone agents retain their historical mutable and relative metadata
+behavior.
 
 The per-feature directory identity is a digest of the normalized distribution
 name and declared feature class. Entry-point module paths and service runner

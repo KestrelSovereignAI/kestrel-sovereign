@@ -5039,6 +5039,20 @@ def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
     return resolved
 
 
+def _validate_hosted_prebuilt_console(
+    venv_path: Path,
+    service: str,
+    *,
+    setting: str,
+) -> Path:
+    """Pin the exact immutable console target selected inside a hosted venv."""
+
+    return _validate_hosted_prebuilt_bin(
+        str(_console_script_path(venv_path, service)),
+        setting=setting,
+    )
+
+
 @dataclass(frozen=True)
 class _ValidatedHostedPrebuiltOverrides:
     """Canonical immutable artifacts selected by hosted operator settings."""
@@ -5646,6 +5660,11 @@ class ProxyFeature(Feature):
         self._fenced_recovery_failed = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        # Hosted immutable console wrappers may themselves be operator-facing
+        # symlinks. Preparation resolves and validates one exact regular target;
+        # child construction must execute that target rather than re-following
+        # the public link after the custody check.
+        self._validated_hosted_console_path: Optional[Path] = None
         # Set only when Core observes a custody-preserving directory rename in
         # the current enable attempt. A missing manifest stamp is not evidence
         # of relocation; older, unmoved venvs use this distinction to start
@@ -9729,6 +9748,8 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
+        # A new resolution invalidates any prior enable cycle's console pin.
+        self._validated_hosted_console_path = None
         validated_hosted_overrides: Optional[
             _ValidatedHostedPrebuiltOverrides
         ] = None
@@ -10183,13 +10204,19 @@ class ProxyFeature(Feature):
             except FileNotFoundError:
                 pass
 
-    def _console_script_location_state(self) -> str:
+    def _console_script_location_state(
+        self,
+        *,
+        validated_script_path: Optional[Path] = None,
+    ) -> str:
         """Return ``current``, ``relocated``, ``missing``, or ``not-applicable``.
 
         A configured console entry point normally embeds the venv's absolute
         path. Python callables launch through the current venv interpreter and
         have no wrapper to verify. Only a positively observed foreign absolute
-        shebang proves console relocation when no Core path stamp exists.
+        shebang proves console relocation when no Core path stamp exists. A
+        hosted immutable wrapper symlink is inspected through the already
+        resolved and custody-validated target that will be launched.
         """
 
         if self._bin_path is not None:
@@ -10199,14 +10226,17 @@ class ProxyFeature(Feature):
             return "not-applicable"
         service = service_target.console_executable
         assert self._venv_path is not None
-        script = _console_script_path(self._venv_path, service)
+        script = validated_script_path or _console_script_path(
+            self._venv_path,
+            service,
+        )
         executable_name = script.name
         if _secure_dirfd_supported():
             bin_fd: Optional[int] = None
             script_fd: Optional[int] = None
             try:
                 bin_fd = os.open(
-                    _venv_bin_dir(self._venv_path),
+                    script.parent,
                     _directory_open_flags(),
                 )
                 metadata = os.stat(
@@ -10383,7 +10413,11 @@ class ProxyFeature(Feature):
         )
         return True
 
-    def _verify_launch_artifact(self) -> None:
+    def _verify_launch_artifact(
+        self,
+        *,
+        validated_console_path: Optional[Path] = None,
+    ) -> None:
         """Require the configured launch target to resolve inside this venv."""
 
         target = self._required_service_target()
@@ -10391,7 +10425,9 @@ class ProxyFeature(Feature):
             self._verify_python_callable_target(target)
             return
 
-        state = self._console_script_location_state()
+        state = self._console_script_location_state(
+            validated_script_path=validated_console_path,
+        )
         if state in {"relocated", "missing"}:
             raise IsolatedRuntimePreparationError(
                 "Isolated feature launch artifact could not be verified after "
@@ -10603,6 +10639,7 @@ class ProxyFeature(Feature):
             else None
         )
         if hosted_immutable_setting is not None:
+            self._validated_hosted_console_path = None
             # Revalidate at the mutation boundary, not only at discovery/path
             # resolution. A concurrent host/metadata change or late Core
             # manifest must never make this shared path fall through to uv
@@ -10614,6 +10651,7 @@ class ProxyFeature(Feature):
             if validated_overrides.venv_path != self._venv_path:
                 raise _hosted_prebuilt_override_error(hosted_immutable_setting)
             target = self._required_service_target()
+            validated_console_path: Optional[Path] = None
             if target.is_callable:
                 # Callable target and infrastructure classifications must stay
                 # distinct from selecting-setting custody diagnostics. Verify
@@ -10624,9 +10662,18 @@ class ProxyFeature(Feature):
             try:
                 if not target.is_callable:
                     # A console wrapper is part of the selected immutable venv.
-                    # Missing or relocated artifacts must therefore name the
-                    # VENV setting that the operator needs to repair.
-                    self._verify_launch_artifact()
+                    # Resolve and custody-check the exact launch target first;
+                    # missing, mutable, foreign, or relocated artifacts must
+                    # name the VENV setting that the operator needs to repair.
+                    assert target.console_executable is not None
+                    validated_console_path = _validate_hosted_prebuilt_console(
+                        self._venv_path,
+                        target.console_executable,
+                        setting=hosted_immutable_setting,
+                    )
+                    self._verify_launch_artifact(
+                        validated_console_path=validated_console_path,
+                    )
                 self._verify_prebuilt_feature_distribution(
                     python_path,
                     install_target,
@@ -10638,6 +10685,7 @@ class ProxyFeature(Feature):
                 raise _hosted_prebuilt_override_error(
                     hosted_immutable_setting
                 ) from exc
+            self._validated_hosted_console_path = validated_console_path
             return
 
         exists = python_path.exists()
@@ -10943,6 +10991,8 @@ class ProxyFeature(Feature):
             )
 
         assert service.console_executable is not None
+        if self._validated_hosted_console_path is not None:
+            return [str(self._validated_hosted_console_path)]
         if self._venv_path is not None:
             return [
                 str(
