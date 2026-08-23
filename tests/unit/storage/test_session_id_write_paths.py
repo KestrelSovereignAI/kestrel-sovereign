@@ -159,6 +159,11 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
             (AGENT, "user", "one", None, None, "2026-01-02T03:04:05"),
             (AGENT, "user", "two", None, None, "2026-01-02T05:04:05Z"),
             (AGENT, "user", "three", None, None, "2026-01-02 07:04:05+01:00"),
+            # A spelling PYTHON reads and SQLite's `julianday` does not. It is
+            # here because ordering the restore in SQL filed it as undatable and
+            # renumbered it first, while the Python pass a moment later dated it
+            # perfectly well — two parsers, one column (#3049).
+            (AGENT, "user", "basic", None, None, "20260102T040405"),
             (AGENT, "user", "four", None, None, "an older kestrel's idea"),
         ],
     )
@@ -172,7 +177,7 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
     await target.initialize()
     try:
         stats = await target.restore_from_backup_blob(blob)
-        assert stats["messages_restored"] == 4
+        assert stats["messages_restored"] == 5
         assert stats.get("messages_with_unreadable_created_at", 0) == 1, (
             "the row nothing could date was not reported to the caller"
         )
@@ -205,10 +210,33 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
         assert restored == sorted(restored), (
             f"the restored transcript is not in chronological order: {restored}"
         )
-        # The undatable row sorts FIRST and takes its neighbour's stamp, which
-        # is the same answer `canonical_order` gives — undatable means
-        # earliest, always — rather than whatever its raw text happened to do.
-        assert restored[0] == "2026-01-02 03:04:05", restored
+        # The undatable row sorts FIRST, which is the answer `canonical_order`
+        # gives — undatable means earliest, always.
+        #
+        # Asserted by WHICH ROW is first, not by the stamp at index 0: sorting
+        # it last is also chronological (it would take its PREDECESSOR's stamp
+        # instead, 06:04:05, and the list would still be ordered), so a stamp
+        # assertion passes either way and proves nothing. Placement is the
+        # claim, and the consequence is which neighbour it inherits from.
+        placed = [
+            row[0] for row in await target.db.fetchall(
+                "SELECT content FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
+            )
+        ]
+        assert placed[0] == "four", (
+            f"the undatable row should sort first, got order {placed}"
+        )
+        assert restored[0] == "2026-01-02 03:04:05", (
+            "...having taken its SUCCESSOR's stamp, since a row ordered first "
+            "has no predecessor and never can acquire one"
+        )
+        # ...and the basic-ISO row is dated, not filed as undatable: it sits in
+        # its own place in the sequence rather than at the front.
+        assert "2026-01-02 04:04:05" in restored, restored
+        assert restored.index("2026-01-02 04:04:05") > restored.index(
+            "2026-01-02 03:04:05"
+        ), restored
     finally:
         await target.close()
 
