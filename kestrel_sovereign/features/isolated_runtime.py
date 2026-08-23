@@ -1981,6 +1981,7 @@ _CHILD_SDK_PROBE = (
 _ISOLATED_PYTHON_SAFE_PATH_FLAG = "-P"
 _NO_BYTECODE_FLAG = "-B"
 _CALLABLE_TARGET_VERIFICATION_TIMEOUT_S = 10.0
+_FRESHNESS_PROBE_TIMEOUT_S = 10.0
 _CALLABLE_TARGET_MISSING_MODULE_EXIT = 40
 _CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT = 41
 _CALLABLE_TARGET_NOT_CALLABLE_EXIT = 42
@@ -2089,6 +2090,7 @@ def _venv_feature_distribution_probe(
                 if hosted
                 else _isolated_child_env(venv_path)
             ),
+            timeout=_FRESHNESS_PROBE_TIMEOUT_S,
         )
         decoded = json.loads(result.stdout)
         if type(decoded) is not dict:
@@ -2102,6 +2104,8 @@ def _venv_feature_distribution_probe(
             return _FeatureDistributionProbe.missing()
         if state == "probe-failed":
             return _FeatureDistributionProbe.failed()
+        return _FeatureDistributionProbe.failed()
+    except subprocess.TimeoutExpired:
         return _FeatureDistributionProbe.failed()
     except Exception:  # noqa: BLE001 - the caller applies the safe stale policy
         return _FeatureDistributionProbe.failed()
@@ -2130,8 +2134,11 @@ def _venv_sdk_version(python_path: Path, *, hosted: bool = False) -> str:
                 if hosted
                 else _isolated_child_env(venv_path)
             ),
+            timeout=_FRESHNESS_PROBE_TIMEOUT_S,
         )
         return res.stdout.strip() or "unknown"
+    except subprocess.TimeoutExpired:
+        return "unknown"
     except Exception:  # noqa: BLE001
         return "unknown"
 
@@ -4943,27 +4950,38 @@ def _hosted_prebuilt_override_error(key: str) -> IsolatedRuntimeConfigurationErr
     )
 
 
+def _hosted_immutable_metadata_is_unsafe(metadata: os.stat_result) -> bool:
+    """Return whether an immutable artifact has unsafe POSIX custody/mode."""
+
+    return os.name == "posix" and (
+        metadata.st_uid not in {0, os.geteuid()}
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
+    )
+
+
 def _validate_hosted_prebuilt_venv(
     value: str,
     *,
     setting: str,
     require_absolute: bool,
 ) -> Path:
-    """Validate one immutable hosted venv selection without following its leaf.
+    """Resolve and validate one immutable hosted venv selection.
 
     ``runtime.venv`` comes from installed package metadata.  Unlike a
     standalone declaration, a relative value would resolve against Core's
     process CWD and become one shared mutable location for every tenant, so it
     is never a valid hosted selection.  Environment overrides retain their
     established absolute-normalization behavior but are subject to the same
-    immutable artifact checks.
+    immutable artifact checks. Operator-facing venv and interpreter symlinks
+    remain supported: every chain is resolved once and the canonical venv root,
+    configuration target, bin directory, and interpreter target are validated.
     """
 
     try:
         candidate = Path(value).expanduser()
         if require_absolute and not candidate.is_absolute():
             raise ValueError("hosted runtime venv must be absolute")
-        venv_path = Path(os.path.abspath(candidate))
+        venv_path = Path(os.path.abspath(candidate)).resolve(strict=True)
         venv_metadata = venv_path.stat(follow_symlinks=False)
         manifest = venv_path / ".kestrel_provision.json"
         try:
@@ -4972,16 +4990,24 @@ def _validate_hosted_prebuilt_venv(
             manifest_present = False
         else:
             manifest_present = True
-        config_metadata = (venv_path / "pyvenv.cfg").stat(follow_symlinks=False)
-        python_path = _venv_python(venv_path)
-        python_metadata = python_path.stat()
+        config_path = (venv_path / "pyvenv.cfg").resolve(strict=True)
+        config_metadata = config_path.stat(follow_symlinks=False)
+        bin_path = _venv_bin_dir(venv_path).resolve(strict=True)
+        bin_metadata = bin_path.stat(follow_symlinks=False)
+        python_path = _venv_python(venv_path).resolve(strict=True)
+        python_metadata = python_path.stat(follow_symlinks=False)
     except (OSError, RuntimeError, TypeError, ValueError):
         raise _hosted_prebuilt_override_error(setting) from None
     if (
         not stat.S_ISDIR(venv_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(venv_metadata)
         or manifest_present
         or not stat.S_ISREG(config_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(config_metadata)
+        or not stat.S_ISDIR(bin_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(bin_metadata)
         or not stat.S_ISREG(python_metadata.st_mode)
+        or _hosted_immutable_metadata_is_unsafe(python_metadata)
         or (os.name == "posix" and not os.access(python_path, os.X_OK))
     ):
         raise _hosted_prebuilt_override_error(setting)
@@ -5005,21 +5031,27 @@ def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
         metadata = resolved.stat(follow_symlinks=False)
     except (OSError, RuntimeError, TypeError, ValueError):
         raise _hosted_prebuilt_override_error(setting) from None
-    unsafe_posix_custody = os.name == "posix" and (
-        metadata.st_uid not in {0, os.geteuid()}
-        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
-        or not os.access(resolved, os.X_OK)
+    unsafe_posix_custody = _hosted_immutable_metadata_is_unsafe(metadata) or (
+        os.name == "posix" and not os.access(resolved, os.X_OK)
     )
     if not stat.S_ISREG(metadata.st_mode) or unsafe_posix_custody:
         raise _hosted_prebuilt_override_error(setting)
     return resolved
 
 
+@dataclass(frozen=True)
+class _ValidatedHostedPrebuiltOverrides:
+    """Canonical immutable artifacts selected by hosted operator settings."""
+
+    venv_path: Optional[Path]
+    bin_path: Optional[Path]
+
+
 def _validate_hosted_process_prebuilt_overrides(
     feature_name: str,
     *,
     runtime_venv: Optional[str] = None,
-) -> Optional[Path]:
+) -> _ValidatedHostedPrebuiltOverrides:
     """Accept only existing immutable-shape hosted launch overrides.
 
     Process variables and installed ``runtime.venv`` metadata are host
@@ -5031,27 +5063,36 @@ def _validate_hosted_process_prebuilt_overrides(
 
     venv_key = _env_key(feature_name, "VENV")
     venv_value = os.environ.get(venv_key)
+    validated_process_venv: Optional[Path] = None
     if venv_value:
-        _validate_hosted_prebuilt_venv(
+        validated_process_venv = _validate_hosted_prebuilt_venv(
             venv_value,
             setting=venv_key,
             require_absolute=False,
         )
 
+    validated_runtime_venv: Optional[Path] = None
     if runtime_venv is not None:
         if type(runtime_venv) is not str or not runtime_venv:
             raise _hosted_prebuilt_override_error(_HOSTED_RUNTIME_VENV_SETTING)
-        _validate_hosted_prebuilt_venv(
+        validated_runtime_venv = _validate_hosted_prebuilt_venv(
             runtime_venv,
             setting=_HOSTED_RUNTIME_VENV_SETTING,
             require_absolute=True,
         )
+    selected_venv = validated_process_venv or validated_runtime_venv
 
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
     if bin_value:
-        return _validate_hosted_prebuilt_bin(bin_value, setting=bin_key)
-    return None
+        return _ValidatedHostedPrebuiltOverrides(
+            venv_path=selected_venv,
+            bin_path=_validate_hosted_prebuilt_bin(bin_value, setting=bin_key),
+        )
+    return _ValidatedHostedPrebuiltOverrides(
+        venv_path=selected_venv,
+        bin_path=None,
+    )
 
 
 def _isolated_child_env(
@@ -9688,13 +9729,15 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
-        validated_hosted_bin: Optional[Path] = None
+        validated_hosted_overrides: Optional[
+            _ValidatedHostedPrebuiltOverrides
+        ] = None
         if self._runtime_is_hosted():
             # Revalidate here as well as at construction: tests, embedders, and
             # long-lived hosts can mutate ``os.environ`` between discovery and
             # enable.  A late process-wide path must never acquire provisioning
             # authority merely because the ProxyFeature already exists.
-            validated_hosted_bin = _validate_hosted_process_prebuilt_overrides(
+            validated_hosted_overrides = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
@@ -9703,8 +9746,14 @@ class ProxyFeature(Feature):
             # BIN is authoritative for this launch attempt. Do not reflect or
             # forward unused service metadata to the child factory.
             self._service_target = None
-            if validated_hosted_bin is not None:
-                return self._default_venv_path(), validated_hosted_bin
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.bin_path is not None
+            ):
+                return (
+                    self._default_venv_path(),
+                    validated_hosted_overrides.bin_path,
+                )
             return (
                 self._default_venv_path(),
                 Path(bin_override).expanduser().resolve(),
@@ -9719,9 +9768,19 @@ class ProxyFeature(Feature):
 
         venv_override = os.environ.get(_env_key(self.name, "VENV"))
         if venv_override:
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.venv_path is not None
+            ):
+                return validated_hosted_overrides.venv_path, None
             return Path(venv_override).expanduser().resolve(), None
 
         if self.runtime.venv:
+            if (
+                validated_hosted_overrides is not None
+                and validated_hosted_overrides.venv_path is not None
+            ):
+                return validated_hosted_overrides.venv_path, None
             return Path(self.runtime.venv).expanduser().resolve(), None
 
         return self._default_venv_path(), None
@@ -10548,15 +10607,26 @@ class ProxyFeature(Feature):
             # resolution. A concurrent host/metadata change or late Core
             # manifest must never make this shared path fall through to uv
             # creation, upgrade, or manifest stamping.
-            _validate_hosted_process_prebuilt_overrides(
+            validated_overrides = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
-            # For callable services, establish the interpreter capability and
-            # target outcome before distribution probing can collapse an
-            # unsupported ``-P`` interpreter into an opaque missing package.
-            self._verify_launch_artifact()
+            if validated_overrides.venv_path != self._venv_path:
+                raise _hosted_prebuilt_override_error(hosted_immutable_setting)
+            target = self._required_service_target()
+            if target.is_callable:
+                # Callable target and infrastructure classifications must stay
+                # distinct from selecting-setting custody diagnostics. Verify
+                # before the override wrapper and before distribution probing
+                # can collapse an unsupported interpreter into a missing
+                # package outcome.
+                self._verify_launch_artifact()
             try:
+                if not target.is_callable:
+                    # A console wrapper is part of the selected immutable venv.
+                    # Missing or relocated artifacts must therefore name the
+                    # VENV setting that the operator needs to repair.
+                    self._verify_launch_artifact()
                 self._verify_prebuilt_feature_distribution(
                     python_path,
                     install_target,

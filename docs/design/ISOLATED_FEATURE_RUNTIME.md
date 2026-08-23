@@ -314,6 +314,11 @@ persisted feature configuration. `..._BIN` and `..._VENV` remain host-side
 artifact-selection inputs and are never exposed to the child. In hosted mode
 these process-wide overrides are accepted only when the executable or complete
 venv already exists; a venv carrying Core's provisioning manifest is refused.
+On POSIX, Core also requires the resolved venv root, `pyvenv.cfg`, bin
+directory, and resolved interpreter target to be owned by root or the service
+account and not group/world writable; the interpreter must be a regular
+executable. Secure operator-facing venv, configuration, and interpreter
+symlinks remain supported and resolve to the canonical artifact before use.
 Core never creates, upgrades, or stamps a process-wide override. The validated
 operator-selected artifact may be shared, but every child process and mutable
 workspace/cache/state path remains namespace-distinct.
@@ -336,19 +341,22 @@ both and marks that optional feature unavailable pending operator custody
 reconciliation.
 
 Hosted venv SDK/distribution probes use the same narrow execution/locale/CA/
-proxy allowlist and receive no package credentials. `uv` provisioning and
-feature build backends additionally receive only explicit `PIP_INDEX_*`,
-`UV_*INDEX*`, and named `UV_INDEX_<NAME>_{USERNAME,PASSWORD}` package-index
-settings. They do not inherit API/channel/tenant secrets, config-file or
-keyring paths, SSH-agent authority, or the host process environment. Private
-VCS dependencies that require those broader capabilities must be materialized
-as an operator-owned prebuilt venv rather than widening the hosted subprocess
-boundary. Core resolves `uv` to a trusted absolute host executable after
-excluding the mutable feature venv from the search path, and provisioning uses
-an explicit private per-agent/per-feature `UV_CACHE_DIR` in a dedicated
-`provisioning_cache` directory. That cache is distinct from the child's
-`XDG_CACHE_HOME`, is not exported to the child, and never relies on `HOME`,
-passwd-database discovery, or an operator uv cache.
+proxy allowlist and receive no package credentials. Each probe has a finite
+ten-second subprocess timeout; a timeout remains fail-closed as an
+unverifiable distribution or unknown SDK rather than wedging agent startup.
+`uv` provisioning and feature build backends additionally receive only
+explicit `PIP_INDEX_*`, `UV_*INDEX*`, and named
+`UV_INDEX_<NAME>_{USERNAME,PASSWORD}` package-index settings. They do not
+inherit API/channel/tenant secrets, config-file or keyring paths, SSH-agent
+authority, or the host process environment. Private VCS dependencies that
+require those broader capabilities must be materialized as an operator-owned
+prebuilt venv rather than widening the hosted subprocess boundary. Core
+resolves `uv` to a trusted absolute host executable after excluding the mutable
+feature venv from the search path, and provisioning uses an explicit private
+per-agent/per-feature `UV_CACHE_DIR` in a dedicated `provisioning_cache`
+directory. That cache is distinct from the child's `XDG_CACHE_HOME`, is not
+exported to the child, and never relies on `HOME`, passwd-database discovery,
+or an operator uv cache.
 
 Namespace creation and ownership binding happen only during isolated-feature
 startup. QR GETs resolve the cached path read-only and perform their filesystem

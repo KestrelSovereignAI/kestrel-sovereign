@@ -2069,6 +2069,14 @@ def _write_prebuilt_venv_shape(
     return python
 
 
+def _stat_result_with_uid(metadata: os.stat_result, uid: int) -> os.stat_result:
+    """Clone metadata with a deterministic foreign owner for custody tests."""
+
+    fields = list(metadata)
+    fields[stat.ST_UID] = uid
+    return os.stat_result(fields)
+
+
 def _write_real_venv_module(
     venv: Path,
     module: str,
@@ -2218,6 +2226,152 @@ def test_hosted_process_venv_override_rejects_core_managed_manifest(
 
     assert key in raised.value.safe_diagnostic()
     assert manifest.read_text() == '{"install_target": "old-core-state"}'
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX immutable custody contract")
+@pytest.mark.parametrize("component", ("root", "config", "bin", "python"))
+def test_hosted_process_venv_override_rejects_mutable_components(
+    monkeypatch,
+    tmp_path,
+    component,
+):
+    prebuilt = tmp_path / "mutable-prebuilt"
+    python = _write_prebuilt_venv_shape(prebuilt)
+    components = {
+        "root": prebuilt,
+        "config": prebuilt / "pyvenv.cfg",
+        "bin": isolated_runtime._venv_bin_dir(prebuilt),
+        "python": python,
+    }
+    selected = components[component]
+    selected.chmod(stat.S_IMODE(selected.stat().st_mode) | 0o020)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(
+            _hosted_postgres_agent(tmp_path / "runtime", f"mutable-{component}"),
+            _isolated_runtime(),
+            client_factory=FakeIsolatedClient,
+        )
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert key in diagnostic
+    assert str(prebuilt) not in diagnostic
+
+
+@pytest.mark.parametrize("component", ("root", "config", "bin", "python"))
+def test_hosted_process_venv_override_rejects_wrong_component_types(
+    monkeypatch,
+    tmp_path,
+    component,
+):
+    prebuilt = tmp_path / "wrong-type-prebuilt"
+    if component == "root":
+        prebuilt.write_text("not a venv directory")
+    else:
+        python = _write_prebuilt_venv_shape(prebuilt)
+        selected = {
+            "config": prebuilt / "pyvenv.cfg",
+            "bin": isolated_runtime._venv_bin_dir(prebuilt),
+            "python": python,
+        }[component]
+        if selected.is_dir():
+            python.unlink()
+            selected.rmdir()
+            selected.write_text("not a directory")
+        else:
+            selected.unlink()
+            selected.mkdir()
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(
+            _hosted_postgres_agent(tmp_path / "runtime", f"wrong-{component}"),
+            _isolated_runtime(),
+            client_factory=FakeIsolatedClient,
+        )
+
+    assert key in raised.value.safe_diagnostic()
+    assert str(prebuilt) not in raised.value.safe_diagnostic()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX immutable custody contract")
+@pytest.mark.parametrize("component", ("root", "config", "bin", "python"))
+def test_hosted_process_venv_override_rejects_foreign_owned_components(
+    monkeypatch,
+    tmp_path,
+    component,
+):
+    prebuilt = tmp_path / "foreign-prebuilt"
+    python = _write_prebuilt_venv_shape(prebuilt)
+    components = {
+        "root": prebuilt.resolve(),
+        "config": (prebuilt / "pyvenv.cfg").resolve(),
+        "bin": isolated_runtime._venv_bin_dir(prebuilt).resolve(),
+        "python": python.resolve(),
+    }
+    selected = components[component]
+    real_stat = Path.stat
+    foreign_uid = next(uid for uid in range(1, 4) if uid != os.geteuid())
+
+    def foreign_component_stat(path, *, follow_symlinks=True):
+        metadata = real_stat(path, follow_symlinks=follow_symlinks)
+        if path == selected:
+            return _stat_result_with_uid(metadata, foreign_uid)
+        return metadata
+
+    monkeypatch.setattr(Path, "stat", foreign_component_stat)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(
+            _hosted_postgres_agent(tmp_path / "runtime", f"foreign-{component}"),
+            _isolated_runtime(),
+            client_factory=FakeIsolatedClient,
+        )
+
+    assert key in raised.value.safe_diagnostic()
+    assert str(prebuilt) not in raised.value.safe_diagnostic()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX operator symlink contract")
+def test_hosted_process_venv_accepts_secure_operator_symlink_chains(
+    monkeypatch,
+    tmp_path,
+):
+    actual_venv = tmp_path / "operator-venv-v1"
+    original_python = _write_prebuilt_venv_shape(actual_venv)
+    original_python.unlink()
+    interpreter_target = tmp_path / "operator-python"
+    interpreter_target.write_text("#!/bin/sh\nexit 0\n")
+    interpreter_target.chmod(0o500)
+    original_python.symlink_to(interpreter_target)
+    original_config = actual_venv / "pyvenv.cfg"
+    original_config.unlink()
+    config_target = tmp_path / "operator-pyvenv.cfg"
+    config_target.write_text("home = /operator/python\n")
+    config_target.chmod(0o400)
+    original_config.symlink_to(config_target)
+    public_venv = tmp_path / "current-operator-venv"
+    public_venv.symlink_to(actual_venv, target_is_directory=True)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(public_venv))
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "secure-symlink-venv"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    venv_path, bin_path = feature.resolve_runtime_paths()
+
+    assert venv_path == actual_venv.resolve()
+    assert bin_path is None
+    assert isolated_runtime._venv_python(venv_path).resolve() == (
+        interpreter_target.resolve()
+    )
 
 
 @pytest.mark.asyncio
@@ -3058,6 +3212,33 @@ def test_hosted_prebuilt_callable_target_failure_is_actionable_and_read_only(
         if path.is_file()
     }
     assert after == before
+
+
+def test_hosted_prebuilt_missing_console_names_selecting_venv_setting(
+    monkeypatch,
+    tmp_path,
+):
+    prebuilt = tmp_path / "operator-console-venv"
+    _write_prebuilt_venv_shape(prebuilt)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_VENV"
+    monkeypatch.setenv(key, str(prebuilt))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "missing-console"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._run = Mock(side_effect=AssertionError("prebuilt venv was mutated"))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature.ensure_venv()
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert key in diagnostic
+    assert str(prebuilt) not in diagnostic
+    assert "filesystem health" not in diagnostic
+    feature._run.assert_not_called()
 
 
 def _callable_verification_feature(tmp_path: Path) -> ProxyFeature:
@@ -6249,6 +6430,33 @@ def test_venv_feature_distribution_probe_marks_execution_failure_unverifiable(
         )
         == isolated_runtime._FeatureDistributionProbe.failed()
     )
+
+
+@pytest.mark.parametrize("probe_name", ("distribution", "sdk"))
+def test_venv_freshness_probes_timeout_to_fail_closed_outcomes(
+    monkeypatch,
+    tmp_path,
+    probe_name,
+):
+    captured = {}
+
+    def time_out(command, **kwargs):
+        captured.update(kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", time_out)
+    python = tmp_path / "venv" / "bin" / "python"
+    if probe_name == "distribution":
+        outcome = isolated_runtime._venv_feature_distribution_probe(
+            python,
+            "example-pkg",
+        )
+        assert outcome == isolated_runtime._FeatureDistributionProbe.failed()
+    else:
+        assert isolated_runtime._venv_sdk_version(python) == "unknown"
+
+    assert captured["timeout"] == isolated_runtime._FRESHNESS_PROBE_TIMEOUT_S
+    assert 0 < captured["timeout"] <= 30
 
 
 def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
