@@ -2842,9 +2842,8 @@ class AsyncConversationStore:
         """
         from .conversation_sessions import live_history_predicate
 
-        fence: Optional[Tuple[str, int]] = None
+        snapshot = None
         membership: Optional[Dict[str, List[Any]]] = None
-
         results: List[Dict[str, Any]] = []
         after: Optional[Tuple[Any, ...]] = None
 
@@ -2853,11 +2852,11 @@ class AsyncConversationStore:
                 projection,
                 limit=self.SEARCH_SESSION_STEP,
                 after=after,
-                refresh=fence is None,
+                refresh=snapshot is None,
             )
-            if fence is None:
-                fence = standing.fence
-            elif standing.fence != fence:
+            if snapshot is None:
+                snapshot = standing
+            elif standing.fence != snapshot.fence:
                 return None
             if not page:
                 break
@@ -2865,7 +2864,7 @@ class AsyncConversationStore:
             # has nothing to search, and reading its whole history to discover
             # that would be the one cost this walk can avoid paying.
             if membership is None:
-                membership = await self._live_membership(standing.target)
+                membership = await self._live_membership(snapshot.target)
 
             matched: List[Tuple[Dict[str, Any], Optional[str], Dict[str, Any]]] = []
             for batch in _within_row_budget(
@@ -2923,6 +2922,16 @@ class AsyncConversationStore:
             # is what let search and the list disagree about which session made
             # the page before (round-8/9 review of #2960).
             after = session_cursor_values(self._as_listed_session(page[-1], {}))
+
+        # The other end of the same boundary. The frontier above keeps rows that
+        # ARRIVED after the snapshot out of the answer; this asks whether any row
+        # already inside it MOVED — archived, trashed, restored, re-grouped — in
+        # which case the summaries and the rows no longer describe one history
+        # and the walk starts again. It is one question asked once at the end
+        # rather than per read, because holding for the whole walk is what has to
+        # be true, and three primary-key reads is what asking costs.
+        if membership is not None and not await projection.unchanged_below(snapshot):
+            return None
         return results
 
     async def _live_membership(self, through: int) -> Dict[str, List[Any]]:

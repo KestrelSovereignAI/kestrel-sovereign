@@ -1946,6 +1946,25 @@ def _caused_by(exc: BaseException, wanted: type) -> bool:
     return False
 
 
+def only_appends_above(delta: int, appended: int, rows_above: int) -> bool:
+    """Is a stamp movement explained entirely by rows appended above the target?
+
+    Authored once because two callers need it and they must not drift:
+    :meth:`ConversationSessionProjection._plan` decides whether the walk may
+    CONTINUE, and :meth:`ConversationSessionProjection.unchanged_below` answers
+    a reader asking whether the rows a projection describes are still the rows
+    standing now (#2961). Those are the same question — "did anything at or
+    below the frontier move" — reached from two directions.
+
+    Three numbers rather than two, because two cannot tell a row ARRIVING above
+    the target from an existing row RENUMBERED above it: both are one change and
+    one row up there, and treating the second as an append counts a row the
+    projection has already counted (#3001). Only the first is also an append,
+    which is what the third number sees.
+    """
+    return delta > 0 and delta == appended and delta == rows_above
+
+
 @dataclass(frozen=True, slots=True)
 class _Plan:
     """What one step decided to do, computed inside that step's transaction.
@@ -2376,6 +2395,39 @@ class ConversationSessionProjection:
         return SessionWatermark(
             str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
             int(row[5]), int(row[6]), str(row[7] or ""),
+        )
+
+    async def unchanged_below(self, accounted: SessionWatermark) -> bool:
+        """Has nothing at or below ``accounted.target`` moved since it was written?
+
+        For a reader that takes SUMMARIES from this projection and then reads
+        the ROWS those summaries describe — search does, because matching needs
+        content this table deliberately does not hold. Its two reads have to
+        describe one history, and ``is_stale`` is the wrong question: it is
+        false for an append above the frontier, which changes nothing the
+        summaries claim and happens on every turn of every conversation.
+
+        Measured what the gap costs when it is not asked: a row below the
+        frontier restored from Trash between the two reads came back as
+        ``message_count: 1`` beside ``match_count: 2`` — a pairing the data
+        cannot produce, which is worse than a stale number because nothing
+        about it looks stale (codex R3 P2).
+
+        ``False`` for an invalid or foreign-generation watermark: those describe
+        a projection that is not the one standing, so "unchanged" is not a claim
+        that can be made about them.
+        """
+        if not accounted.valid:
+            return False
+        if accounted.generation != await self.observed_generation():
+            return False
+        observed = await self.observed_changes()
+        if observed == accounted.stamp:
+            return True
+        return only_appends_above(
+            observed - accounted.stamp,
+            await self.observed_appends() - accounted.appends,
+            await self._rows_above(accounted.target),
         )
 
     async def is_stale(self) -> bool:
@@ -2810,10 +2862,8 @@ class ConversationSessionProjection:
         # existing row RENUMBERED above it: both are one change and one row up
         # there, and folding the second one counts a row this projection has
         # already counted (#3001). Only the first is also an append.
-        if (
-            delta > 0
-            and delta == appended
-            and delta == await self._rows_above(accounted.target)
+        if only_appends_above(
+            delta, appended, await self._rows_above(accounted.target)
         ):
             return _Plan(
                 INCREMENTAL,

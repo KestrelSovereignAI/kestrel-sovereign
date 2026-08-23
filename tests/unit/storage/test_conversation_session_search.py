@@ -805,3 +805,97 @@ class TestTheWalkIsOneProjection:
             "the message the previous query could not see is now both counted "
             "and matched — one snapshot, one answer"
         )
+
+    @pytest.mark.asyncio
+    async def test_a_row_moving_below_the_frontier_restarts_the_walk(
+        self, store, monkeypatch
+    ):
+        """The other end of the same boundary (codex R3 P2).
+
+        The frontier keeps rows that ARRIVED after the snapshot out of the
+        answer. It says nothing about a row already inside it that MOVED —
+        archived, trashed, restored, re-grouped — and those change what the
+        summaries describe without changing where the frontier is. Reproduced
+        before the check existed: a row restored from Trash between the two
+        reads came back as ``message_count: 1`` beside ``match_count: 2``, a
+        pairing the data cannot produce.
+        """
+        await _seed(
+            store.db,
+            store.agent_id,
+            [
+                ("s1", "user", "the launch codes are in the penguin folder", 0),
+                ("s1", "user", "more about the penguin folder", 1),
+            ],
+        )
+        # The second row is in Trash when the projection is built, so the
+        # projection counts one.
+        await store.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE agent_id = ? AND content LIKE 'more about%'",
+            (store.agent_id,),
+        )
+
+        original = AsyncConversationStore._live_membership
+        fired: List[bool] = []
+
+        async def restoring(self, through):
+            if not fired:
+                fired.append(True)
+                await store.db.execute_commit(
+                    "UPDATE conversation_history SET deleted_at = NULL "
+                    "WHERE agent_id = ? AND content LIKE 'more about%'",
+                    (store.agent_id,),
+                )
+            return await original(self, through)
+
+        monkeypatch.setattr(AsyncConversationStore, "_live_membership", restoring)
+
+        found = await store.search_sessions("penguin folder")
+
+        assert fired, "the fixture never raced the membership read"
+        assert len(found) == 1
+        assert found[0]["match_count"] <= found[0]["message_count"], (
+            f"match_count {found[0]['match_count']} exceeds message_count "
+            f"{found[0]['message_count']}: the summary and the rows came from "
+            "two different histories"
+        )
+        assert (found[0]["message_count"], found[0]["match_count"]) == (2, 2)
+
+    @pytest.mark.asyncio
+    async def test_an_append_during_a_search_does_not_restart_it(
+        self, store, monkeypatch
+    ):
+        """...and the check is not the stricter one, which would be useless.
+
+        ``is_stale`` is false for a row appended above the frontier, and rows
+        are appended above the frontier on every turn of every conversation.
+        Restarting on that would make a search of a live agent restart until it
+        gave up. The question asked is narrower: did anything at or below the
+        frontier move.
+        """
+        await _seed(
+            store.db,
+            store.agent_id,
+            [("s1", "user", "the launch codes are in the penguin folder", 0)],
+        )
+
+        original = AsyncConversationStore._live_membership
+        attempts: List[int] = []
+
+        async def appending(self, through):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                await _seed(
+                    store.db,
+                    store.agent_id,
+                    [("s2", "user", "a brand new conversation", 900)],
+                )
+            return await original(self, through)
+
+        monkeypatch.setattr(AsyncConversationStore, "_live_membership", appending)
+
+        found = await store.search_sessions("penguin folder")
+
+        assert attempts == [0], f"the walk restarted {len(attempts)} times"
+        assert [s["session_id"] for s in found] == ["s1"]
