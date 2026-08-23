@@ -47,8 +47,11 @@ from .ledger import (
     strip_ledger_sections,
 )
 from .ledger_index import (
-    BLOCKER_NODE_TYPE,
-    PATTERN_NODE_TYPE,
+    MEMBERSHIP_READ_CAP,
+    BLOCKER_SECTION,
+    PATTERN_SECTION,
+    LedgerSection,
+    index_membership,
     project_ledger,
     recall_nodes,
     search_rows,
@@ -942,7 +945,11 @@ class StrategicMemoryFeature(Feature):
         command_prefix="!strategy-search",
     )
     async def strategy_search(
-        self, query: str, kind: str = "all", limit: int = 10
+        self,
+        query: str,
+        kind: str = "all",
+        limit: int = 10,
+        include_retired: bool = False,
     ) -> ToolResult:
         """
         Search learned patterns and blockers.
@@ -951,7 +958,17 @@ class StrategicMemoryFeature(Feature):
             query: Words to match against the ledger rows
             kind: Which rows to search -- all, patterns, blockers (default all)
             limit: Maximum matches to return (default 10)
+            include_retired: Include superseded patterns and resolved blockers
         """
+        # search_rows has always taken this; not exposing it made this tool
+        # unable to answer for retired rows, while recall_patterns/
+        # recall_blockers named it as the canonical fallback when their
+        # retired-mode index came back stale (#3064).
+        if not isinstance(include_retired, bool):
+            return ToolResult.failed(
+                "include_retired must be a boolean, got "
+                f"{type(include_retired).__name__}={include_retired!r}"
+            )
         kind = (kind or "all").strip().lower()
         if kind not in ("all", "patterns", "pattern", "blockers", "blocker"):
             return ToolResult.failed(
@@ -976,7 +993,13 @@ class StrategicMemoryFeature(Feature):
                 {"query": query, "kind": kind, "matches": [], "count": 0}
             )
 
-        matches = search_rows(self._ledger.data, query, kind=kind, limit=limit)
+        matches = search_rows(
+            self._ledger.data,
+            query,
+            kind=kind,
+            limit=limit,
+            include_retired=include_retired,
+        )
         if not matches:
             return ToolResult.ok(
                 confirmation=f"No ledger matches for {query!r}.",
@@ -1016,14 +1039,29 @@ class StrategicMemoryFeature(Feature):
     # Tools: reading the projected index back out of the graph
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _unchecked_recall(
+        confirmation: str, data: Dict[str, Any], reason: str, explanation: str
+    ) -> ToolResult:
+        """A recall whose completeness check could not run.
+
+        PARTIAL, not ok. The rows really were retrieved, so this is not a
+        failure -- but ToolResult carries its honesty in ``status`` and
+        ``error``, and a caveat parked in ``data`` is narrated to the caller
+        as the clean confirmation "Retrieved 0 patterns." That is the same
+        shape of quiet degradation this whole ticket is about (#3064).
+        """
+        data["completeness_checked"] = False
+        data["completeness_unchecked_reason"] = reason
+        return ToolResult.partial(
+            confirmation=confirmation, error=explanation, data=data
+        )
+
     async def _recall_ledger(
         self,
-        node_type: str,
-        noun: str,
+        section: LedgerSection,
         limit: Any,
         include_retired: bool,
-        include_flag_name: str,
-        canonical_rows: List[Dict[str, Any]],
     ) -> ToolResult:
         """Shared body for :meth:`recall_patterns` / :meth:`recall_blockers`.
 
@@ -1034,9 +1072,10 @@ class StrategicMemoryFeature(Feature):
         went to YAML. Routing these two tools through the index means a
         projection that stops working fails a query instead of going quiet.
         """
+        noun = section.noun
         if not isinstance(include_retired, bool):
             return ToolResult.failed(
-                f"{include_flag_name} must be a boolean, got "
+                f"{section.include_flag_name} must be a boolean, got "
                 f"{type(include_retired).__name__}={include_retired!r}"
             )
         try:
@@ -1057,56 +1096,248 @@ class StrategicMemoryFeature(Feature):
             )
         storage = getattr(self.agent, "storage", None)
         graph_store = getattr(storage, "graph", None) if storage else None
+        # The page and the membership are two queries, so a reprojection
+        # landing between them can leave the page describing the old index and
+        # the membership the new one -- and in that interleaving every
+        # divergence set comes out empty, so a just-resolved blocker is
+        # returned and certified current. Reading membership on BOTH sides of
+        # the page and requiring the two to be identical makes the check one
+        # observation rather than two, the same fence #2960 puts around its
+        # projection reads. A reprojection during the read is not a
+        # divergence, so it is reported as a check that did not run.
+        fence_before: Optional[Dict[str, Any]] = None
+        try:
+            # Only the membership matters here; whether THIS read saturated is
+            # not carried forward, because a saturated pair that compares equal
+            # is caught by the second read's own completeness flag below, and a
+            # pair that stopped saturating cannot compare equal.
+            fence_before, _ = await index_membership(
+                graph_store, agent_id, section.node_type
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "strategy index membership unavailable for %s: %s",
+                section.node_type,
+                e,
+            )
         try:
             rows = await recall_nodes(
                 graph_store,
                 agent_id,
-                node_type,
+                section.node_type,
                 include_retired=include_retired,
                 limit=limit_val,
             )
         except Exception as e:  # noqa: BLE001
             # A query failure is not an empty result. Reporting zero here is
             # the precise lie this ticket was filed on.
-            logger.error("strategy index recall failed for %s: %s", node_type, e)
+            logger.error(
+                "strategy index recall failed for %s: %s", section.node_type, e
+            )
             return ToolResult.failed(
                 f"Could not read the strategy index: {e}",
-                data={"node_type": node_type, "count": 0},
+                data={"node_type": section.node_type, "count": 0},
             )
 
-        data = {
+        data: Dict[str, Any] = {
             "count": len(rows),
             "limit_requested": limit_val,
-            include_flag_name: include_retired,
+            section.include_flag_name: include_retired,
             noun: rows,
         }
         confirmation = (
             f"Retrieved {len(rows)} {noun[:-1] if len(rows) == 1 else noun} "
             f"from the strategy index (limit requested: {limit_val})"
         )
-        if rows or not self._ledger.readable:
-            # An unreadable ledger gives no trustworthy count to compare
-            # against, so the divergence check below has nothing to say.
+
+        # The divergence check runs on EVERY result, not only the empty one.
+        # #3064: a non-empty answer was taken as proof the index was complete,
+        # so one projected row standing in for two canonical ones returned a
+        # clean, short list. Non-emptiness answers a narrower question than
+        # the caller asked.
+        if not self._ledger.readable:
+            # An unreadable ledger gives no trustworthy membership to compare
+            # against, so the check has nothing to say -- and says so rather
+            # than letting silence read as agreement.
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "ledger_unreadable",
+                f"{LEDGER_FILENAME} could not be read, so whether this list "
+                "is the whole of it was not checked.",
+            )
+
+        # Membership, not a count: an index holding one row the ledger dropped
+        # and missing one it still holds has the right total and the wrong
+        # contents. Read from the WHOLE scoped projection rather than from the
+        # page, because a divergence that sorts behind every canonical row is
+        # invisible to a LIMIT and present in the database -- the page would
+        # certify a clean index and a larger limit would then return deleted
+        # guidance (#3064).
+        try:
+            membership, membership_complete = await index_membership(
+                graph_store, agent_id, section.node_type
+            )
+            if fence_before is None:
+                # The FIRST read failed, which is not the same as the index
+                # moving -- reporting a reprojection that was never observed
+                # sends an operator looking for the wrong thing.
+                return self._unchecked_recall(
+                    confirmation,
+                    data,
+                    "index_membership_unavailable",
+                    "The strategy index could not be read in full, so whether "
+                    "this list is the whole of it was not checked.",
+                )
+            if fence_before != membership:
+                # The index moved under the read, so the page and this
+                # membership describe different states and comparing them
+                # would certify or accuse the wrong one.
+                return self._unchecked_recall(
+                    confirmation,
+                    data,
+                    "index_changed_during_read",
+                    "The strategy index was reprojected while this list was "
+                    "being read, so whether the list is the whole of it was "
+                    "not checked. Ask again.",
+                )
+        except Exception as e:  # noqa: BLE001
+            # The rows above are a real answer; only the check failed. Saying
+            # nothing here would let a silent failure read as agreement.
+            logger.debug(
+                "strategy index membership unavailable for %s: %s",
+                section.node_type,
+                e,
+            )
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "index_membership_unavailable",
+                "The strategy index could not be read in full, so whether "
+                "this list is the whole of it was not checked.",
+            )
+
+        if not membership_complete:
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "index_exceeds_membership_cap",
+                f"The strategy index holds at least {MEMBERSHIP_READ_CAP} "
+                f"{noun}, which is as far as one membership read can see, so "
+                "whether this list is the whole of it was not checked.",
+            )
+
+        ledger_data = self._ledger.data
+        # Membership is status-agnostic: whether a row is retired decides which
+        # PAGE it belongs on, not whether the index should hold a node for it.
+        all_ids = section.expected_row_id_list(ledger_data, include_retired=True)
+        ledger_all = set(all_ids)
+        ledger_active = section.expected_row_ids(ledger_data, include_retired=False)
+        indexed = set(membership)
+        # Rows, not ids: two canonical rows sharing an id are two rows, and
+        # counting the set would under-report the ledger to the caller.
+        data["canonical_expected"] = len(
+            section.expected_rows(ledger_data, include_retired=include_retired)
+        )
+        data["completeness_checked"] = True
+
+        missing = ledger_all - indexed
+        orphaned = indexed - ledger_all
+        # Two canonical rows on one id project to one node, so the second
+        # overwrites the first and one row is unreachable however healthy the
+        # projection is. Counted separately because reprojecting cannot fix it.
+        colliding = len(all_ids) - len(ledger_all)
+        # Membership is a strictly weaker question than agreement: an
+        # id-stable edit leaves the id and the status identical while the
+        # indexed row goes stale. What a healthy index would hold is asked of
+        # the projection's own carry-over rule rather than reconstructed here.
+        canonical_rows = {
+            section.row_id(row): row
+            for row in section.expected_rows(ledger_data, include_retired=True)
+        }
+        misfiled = set()
+        drifted = set()
+        for row_id, indexed in membership.items():
+            row = canonical_rows.get(row_id)
+            if row is None:
+                continue  # an orphan, already counted
+            expected = section.expected_properties(agent_id, row)
+            if str(expected.get("status") or "") != indexed.status:
+                misfiled.add(row_id)
+            elif (
+                expected != indexed.properties
+                or section.expected_label(row) != indexed.label
+            ):
+                drifted.add(row_id)
+
+        if not (missing or orphaned or misfiled or colliding or drifted):
             return ToolResult.ok(confirmation=confirmation, data=data)
 
-        # Zero rows from the index while the canonical file holds some is not
-        # an answer, it is the index being absent. Saying "0" here would
-        # reproduce exactly what #2851 was filed on: recall_decisions returning
-        # a truthful zero while STRATEGY.yaml held the real ones.
-        canonical = len(canonical_rows)
-        if canonical:
-            return ToolResult.partial(
-                confirmation=confirmation,
-                error=(
-                    f"The strategy index holds no {noun}, but "
-                    f"{LEDGER_FILENAME} holds {canonical} active row(s). The "
-                    "index is stale or was never built -- restart the agent to "
-                    "reproject, and use strategy_search to read the canonical "
-                    "file meanwhile."
-                ),
-                data={**data, "canonical_active": canonical, "index_stale": True},
+        data["index_stale"] = True
+        divergences = []
+        if missing:
+            data["missing_count"] = len(missing)
+            divergences.append(
+                f"{len(missing)} of the {len(ledger_all)} {noun} "
+                f"{LEDGER_FILENAME} holds are absent from it"
             )
-        return ToolResult.ok(confirmation=confirmation, data=data)
+        if orphaned:
+            data["orphaned_count"] = len(orphaned)
+            divergences.append(
+                f"it holds {len(orphaned)} row(s) {LEDGER_FILENAME} no longer "
+                "does"
+            )
+        if misfiled:
+            data["misfiled_count"] = len(misfiled)
+            divergences.append(
+                f"{len(misfiled)} row(s) whose current/retired state it "
+                f"disagrees with {LEDGER_FILENAME} on"
+            )
+        if drifted:
+            data["drifted_count"] = len(drifted)
+            divergences.append(
+                f"{len(drifted)} row(s) whose indexed content no longer "
+                f"matches {LEDGER_FILENAME}"
+            )
+        if colliding:
+            data["colliding_count"] = colliding
+            divergences.append(
+                f"{colliding} canonical row(s) share an id with another, so "
+                "the index can hold only one of each -- reprojecting cannot "
+                f"fix that, {LEDGER_FILENAME} needs the duplicate ids resolved"
+            )
+        fallback = "strategy_search"
+        if include_retired:
+            # The advice has to name a path that can actually return the rows
+            # it is about: strategy_search excludes retired rows unless told
+            # otherwise, so recommending it bare for a retired-mode recall
+            # promises a fallback that structurally cannot answer (#3064).
+            fallback = "strategy_search(..., include_retired=True)"
+        if missing or orphaned or misfiled or drifted:
+            remedy = (
+                "The index is stale or was never built -- restart the agent "
+                f"to reproject, and use {fallback} to read the canonical file "
+                "meanwhile."
+            )
+        else:
+            # Collisions are the ONLY divergence here, and a restart would
+            # reproduce the same overwrite. Telling the operator to reproject
+            # after saying reprojection cannot fix it is advice that
+            # contradicts itself.
+            remedy = (
+                f"Resolve the duplicate ids in {LEDGER_FILENAME}; until then "
+                f"use {fallback} to read the canonical rows."
+            )
+        return ToolResult.partial(
+            confirmation=confirmation,
+            error=(
+                f"The strategy index diverges from {LEDGER_FILENAME}: "
+                + ", and ".join(divergences)
+                + ". "
+                + remedy
+            ),
+            data=data,
+        )
 
     @tool(
         name="recall_patterns",
@@ -1129,12 +1360,9 @@ class StrategicMemoryFeature(Feature):
             include_superseded: Include patterns that have been retired
         """
         return await self._recall_ledger(
-            node_type=PATTERN_NODE_TYPE,
-            noun="patterns",
+            section=PATTERN_SECTION,
             limit=limit,
             include_retired=include_superseded,
-            include_flag_name="include_superseded",
-            canonical_rows=active_patterns(self._ledger.patterns),
         )
 
     @tool(
@@ -1158,12 +1386,9 @@ class StrategicMemoryFeature(Feature):
             include_resolved: Include blockers that have been resolved
         """
         return await self._recall_ledger(
-            node_type=BLOCKER_NODE_TYPE,
-            noun="blockers",
+            section=BLOCKER_SECTION,
             limit=limit,
             include_retired=include_resolved,
-            include_flag_name="include_resolved",
-            canonical_rows=active_blockers(self._ledger.blockers),
         )
 
     @tool(
