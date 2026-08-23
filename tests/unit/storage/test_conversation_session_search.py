@@ -734,3 +734,74 @@ class TestTheWalkIsOneProjection:
 
         assert fired, "the fixture never got between two pages"
         assert [s["session_id"] for s in found] == ["late"]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_projection_reads_no_history(self, store, monkeypatch):
+        """Nothing to search means nothing to attribute.
+
+        The map is the one unbounded read on this path, so the walk must not
+        take it to discover that there was never anything to search — which is
+        the state a brand-new agent is in on its first keystroke.
+        """
+        read: List[bool] = []
+        original = AsyncConversationStore._live_membership
+
+        async def counting(self):
+            read.append(True)
+            return await original(self)
+
+        monkeypatch.setattr(AsyncConversationStore, "_live_membership", counting)
+
+        assert await store.search_sessions("penguin") == []
+        assert not read, "an agent with no conversations read its whole history"
+
+    @pytest.mark.asyncio
+    async def test_the_rows_matched_are_the_rows_the_summary_counts(
+        self, store, monkeypatch
+    ):
+        """One result may not carry two snapshots (codex R2 P2).
+
+        Reproduced before the frontier bound existed: a message appended between
+        the projection page and the membership read was matched against, while
+        the summary beside it still came from the page — so the session came
+        back with ``message_count: 1`` and a snippet from its second message.
+        A count that does not count the thing it is shown next to is a worse
+        answer than a stale one, because nothing about it looks stale.
+
+        The consequence is that this search does not find the new message at
+        all, which is the projection's ordinary lag rather than a loss: the next
+        query repairs before it walks. The second half of this test is that
+        promise, because "consistent" is cheap to achieve by never updating.
+        """
+        await _seed(
+            store.db, store.agent_id, [("s1", "user", "nothing of interest", 0)]
+        )
+
+        original = AsyncConversationStore._live_membership
+        fired: List[bool] = []
+
+        async def racing(self, through):
+            if not fired:
+                fired.append(True)
+                await _seed(
+                    store.db,
+                    store.agent_id,
+                    [("s1", "user", "the launch codes are in the penguin folder", 1)],
+                )
+            return await original(self, through)
+
+        monkeypatch.setattr(AsyncConversationStore, "_live_membership", racing)
+        during = await store.search_sessions("penguin folder")
+        assert fired, "the fixture never raced the membership read"
+
+        # Nothing inconsistent came back: the row was above the frontier the
+        # summaries describe, so it was not matched against at all.
+        assert during == []
+
+        monkeypatch.setattr(AsyncConversationStore, "_live_membership", original)
+        after = await store.search_sessions("penguin folder")
+        assert [s["session_id"] for s in after] == ["s1"]
+        assert after[0]["message_count"] == 2, (
+            "the message the previous query could not see is now both counted "
+            "and matched — one snapshot, one answer"
+        )

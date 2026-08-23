@@ -2844,6 +2844,7 @@ class AsyncConversationStore:
 
         fence: Optional[Tuple[str, int]] = None
         membership: Optional[Dict[str, List[Any]]] = None
+
         results: List[Dict[str, Any]] = []
         after: Optional[Tuple[Any, ...]] = None
 
@@ -2855,12 +2856,16 @@ class AsyncConversationStore:
                 refresh=fence is None,
             )
             if fence is None:
-                fence = standing
-                membership = await self._live_membership()
-            elif standing != fence:
+                fence = standing.fence
+            elif standing.fence != fence:
                 return None
             if not page:
                 break
+            # After the page, not before it: an agent whose projection is empty
+            # has nothing to search, and reading its whole history to discover
+            # that would be the one cost this walk can avoid paying.
+            if membership is None:
+                membership = await self._live_membership(standing.target)
 
             matched: List[Tuple[Dict[str, Any], Optional[str], Dict[str, Any]]] = []
             for batch in _within_row_budget(
@@ -2920,14 +2925,31 @@ class AsyncConversationStore:
             after = session_cursor_values(self._as_listed_session(page[-1], {}))
         return results
 
-    async def _live_membership(self) -> Dict[str, List[Any]]:
-        """``{session_id: [row id, ...]}`` for this agent's whole live history.
+    async def _live_membership(self, through: int) -> Dict[str, List[Any]]:
+        """``{session_id: [row id, ...]}`` for this agent's live history.
 
-        Unbounded on purpose, and it has to be: a row carrying no ``session_id``
-        belongs to whichever cluster it falls next to, and that is decided by
-        the rows before it. A windowed read would attribute the rows at its edge
-        to sessions that merely look like theirs — which is the failure the
-        5,000-row scan this replaces had, silently.
+        ``through`` is the ``conversation_history.id`` frontier the projection
+        has accounted for, and this read stops there. **Not an optimization — a
+        correctness requirement.** The summaries come out of the projection and
+        the matching comes out of these rows, so if the two describe different
+        frontiers one result carries both: measured, a session returned with
+        ``message_count: 1`` and a snippet from the second message, because the
+        append landed between the page read and this one (codex R2 P2). Bounded
+        here, the rows a query is matched against are exactly the rows the count
+        beside it was computed from.
+
+        A message appended DURING a search is therefore not found by that
+        search. That is the same lag the list already has — the projection is a
+        cache and may be behind — and the next query repairs before it walks, so
+        it is one query wide.
+
+        Unbounded in the other direction on purpose, and it has to be: a row
+        carrying no ``session_id`` belongs to whichever cluster it falls next
+        to, and that is decided by the rows before it. A read windowed at the
+        RECENT end would attribute the rows at its edge to sessions that merely
+        look like theirs — which is the failure the 5,000-row scan this replaces
+        had, silently. A frontier is not that window: it is the same cut the
+        projection made, so both sides stop in the same place.
 
         The read is the light one — no ``content``, no decryption — and it is
         the same statement and the same derivation the projection's own
@@ -2941,7 +2963,8 @@ class AsyncConversationStore:
         )
 
         rows = await self.db.fetchall(
-            live_transcript_sql(self.db.backend_type), (self.agent_id,)
+            live_transcript_sql(self.db.backend_type, through=True),
+            (self.agent_id, through),
         )
         # Said out loud for the same reason the projection's transcript pass
         # says it, and against the same threshold — it is the same read over the
@@ -3769,15 +3792,21 @@ class AsyncConversationStore:
 
     async def _page_a_whole_projection(
         self, projection, *, limit: int, after, refresh: bool
-    ) -> Tuple[List[Dict[str, Any]], Tuple[str, int]]:
+    ) -> Tuple[List[Dict[str, Any]], Any]:
         """Read one page, having established the projection was whole THROUGHOUT.
 
-        Returns ``(rows, fence)`` — the page, and the projection revision it was
-        read under. The fence is returned rather than left inside because one
-        page being self-consistent does not make a SEQUENCE of pages one read:
-        a caller walking further than one page has to be able to require that
-        every page came from the same projection, and it cannot ask afterwards
-        without a gap in which the answer changes.
+        Returns ``(rows, watermark)`` — the page, and what the projection it came
+        out of had accounted for. The watermark is returned rather than left
+        inside because a page carries two things a caller cannot ask for
+        afterwards without a gap in which the answer changes:
+
+        * its ``fence``, so a caller walking further than one page can require
+          that every page came from the same projection — one page being
+          self-consistent does not make a SEQUENCE of pages one read;
+        * its ``target``, which is the ``conversation_history.id`` frontier
+          these summaries describe. A caller that then reads ROWS — search does
+          — has to read the same rows the summaries were computed from, or it
+          reports one snapshot's count beside another snapshot's content.
 
         The check and the read are one observation, not two. A repair started by
         another request between them clears the table and commits chunks as it
@@ -3822,7 +3851,7 @@ class AsyncConversationStore:
             # The revision only ever increases, so neither can hide.
             after_read = await self._whole_watermark(projection)
             if after_read is not None and after_read.fence == before.fence:
-                return rows, before.fence
+                return rows, before
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index was rebuilt underneath "
             f"{_PAGE_ATTEMPTS} attempts to read a page of it"
