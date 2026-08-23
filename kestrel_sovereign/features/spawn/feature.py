@@ -53,6 +53,15 @@ def _safe_retained_agent_name(error: object) -> str | None:
     return None
 
 
+def _safe_termination_agent_name(error: object) -> str | None:
+    """Return only a canonical child name from a termination outcome."""
+
+    candidate = getattr(error, "child_name", None)
+    if type(candidate) is str and _SAFE_AGENT_NAME_RE.fullmatch(candidate):
+        return candidate
+    return None
+
+
 def _termination_partial_result(
     *,
     child_name: str,
@@ -127,6 +136,15 @@ def _termination_partial_result(
     if not named_child_removed and not named_termination_not_performed:
         return None
 
+    surviving_subtree_agents: list[str] = []
+    for item in termination_not_performed:
+        agent_name = _safe_termination_agent_name(item)
+        if agent_name is None:
+            return None
+        if agent_name not in surviving_subtree_agents:
+            surviving_subtree_agents.append(agent_name)
+    surviving_subtree_agents.sort(key=str.casefold)
+
     retained_agents: list[str] = []
     for item in retained:
         agent_name = _safe_retained_agent_name(item)
@@ -193,10 +211,17 @@ def _termination_partial_result(
         cleanup_state = "retained"
 
     if offboard_runtime:
+        # A subtree which was never stopped has unknown custody: Core has not
+        # proved either deletion or retention of every requested namespace.
+        # Do not collapse that state into either top-level custody claim.
         runtime_retained = (
-            not named_child_removed
-            or bool(retained)
-            or "not_hosted" in no_op_states
+            False
+            if termination_not_performed
+            else (
+                not named_child_removed
+                or bool(retained)
+                or "not_hosted" in no_op_states
+            )
         )
         named_runtime_retained = not named_child_removed or named_child_retained or (
             named_child_not_performed and "not_hosted" in no_op_states
@@ -205,7 +230,9 @@ def _termination_partial_result(
             not named_child_retained and not named_child_not_performed
         )
         reported_cleanup_state = (
-            "not_performed"
+            "termination_not_performed"
+            if termination_not_performed
+            else "not_performed"
             if not named_child_removed
             else cleanup_state
             if retained
@@ -232,6 +259,7 @@ def _termination_partial_result(
             and named_child_removed
             and not retained
             and not not_performed
+            and not termination_not_performed
         ),
         "runtime_retained": runtime_retained,
         "runtime_retained_for_restart": not offboard_runtime,
@@ -259,6 +287,11 @@ def _termination_partial_result(
         data["termination_not_performed_outcome_count"] = len(
             termination_not_performed
         )
+        data["surviving_subtree_agents"] = surviving_subtree_agents
+        data["retry_descendant_termination"] = True
+        data["retry_descendant_agents"] = surviving_subtree_agents
+        if offboard_runtime:
+            data["runtime_custody_known"] = False
     if not_performed:
         data["not_performed_outcome_count"] = len(not_performed)
         data["not_performed_agents"] = not_performed_agents
@@ -266,7 +299,21 @@ def _termination_partial_result(
         data["runtime_already_absent"] = "already_absent" in no_op_states
         data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
 
-    if not named_child_removed:
+    if termination_not_performed:
+        survivors = ", ".join(surviving_subtree_agents)
+        if offboard_runtime:
+            custody_message = (
+                f"Termination was not performed for surviving subtree {survivors}. "
+                "Its runtime custody is unknown. Retry termination for the named "
+                "descendant subtree after operator reconciliation."
+            )
+        else:
+            custody_message = (
+                f"Termination was not performed for surviving subtree {survivors}; "
+                "runtime offboarding was not requested. Retry termination for the "
+                "named descendant subtree after operator reconciliation."
+            )
+    elif not named_child_removed:
         custody_message = (
             "Descendant cleanup had terminal outcomes, but the named child was "
             "not removed. Retry termination after operator reconciliation."

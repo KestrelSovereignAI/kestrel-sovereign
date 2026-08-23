@@ -27,6 +27,7 @@ def _make_mock_manager():
     manager = MagicMock()
     manager.terminate_child = AsyncMock(return_value=True)
     manager.get_children = MagicMock(return_value=[])
+    manager.get_agent = MagicMock(return_value=None)
     return manager
 
 
@@ -209,6 +210,51 @@ class TestTTLExpiration:
         assert ttl_task.exception() is None
         assert not lifecycle.is_tracked("ephemeral")
         assert lifecycle.get_result("ephemeral").status == SpawnStatus.TIMED_OUT
+
+    @pytest.mark.asyncio
+    async def test_refused_ttl_termination_rearms_and_publishes_only_on_retry(self):
+        manager = _make_mock_manager()
+        first_refused = asyncio.Event()
+        allow_retry = asyncio.Event()
+        attempts = 0
+
+        async def terminate_child(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_refused.set()
+                return False
+            await allow_retry.wait()
+            return True
+
+        manager.terminate_child.side_effect = terminate_child
+        lifecycle = SpawnedAgentLifecycle(manager)
+        await lifecycle.register(
+            child_name="retry-ttl",
+            child_did="did:child",
+            parent_did="did:parent",
+            ttl_seconds=0.01,
+        )
+        first_ttl = lifecycle._tracked["retry-ttl"].ttl_task
+
+        await asyncio.wait_for(first_refused.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert lifecycle.is_tracked("retry-ttl")
+        assert lifecycle.get_result("retry-ttl") is None
+        retry_ttl = lifecycle._tracked["retry-ttl"].ttl_task
+        assert retry_ttl is not first_ttl
+        assert retry_ttl is not None and not retry_ttl.done()
+
+        allow_retry.set()
+        for _ in range(100):
+            if not lifecycle.is_tracked("retry-ttl"):
+                break
+            await asyncio.sleep(0.01)
+
+        assert not lifecycle.is_tracked("retry-ttl")
+        assert manager.terminate_child.await_count == 2
+        assert lifecycle.get_result("retry-ttl").status is SpawnStatus.TIMED_OUT
 
 
 class TestResultCollection:
@@ -451,6 +497,35 @@ class TestCascadingShutdown:
         result = lifecycle.get_result("child1")
         assert result is not None
         assert result.status == SpawnStatus.TERMINATED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_refusal_keeps_tracking_ttl_and_no_terminal_result(self):
+        from kestrel_sovereign.multi_agent.agent_manager import (
+            ChildTerminationNotPerformedError,
+        )
+
+        manager = _make_mock_manager()
+        manager.terminate_child.return_value = False
+        lifecycle = SpawnedAgentLifecycle(manager)
+        await lifecycle.register(
+            child_name="refused",
+            child_did="did:refused",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        ttl_task = lifecycle._tracked["refused"].ttl_task
+        lifecycle._fire_hook = AsyncMock()
+
+        with pytest.raises(ChildTerminationNotPerformedError):
+            await lifecycle.shutdown()
+
+        assert lifecycle.is_tracked("refused")
+        assert lifecycle.get_result("refused") is None
+        assert lifecycle._tracked["refused"].ttl_task is ttl_task
+        assert ttl_task is not None and not ttl_task.done()
+        lifecycle._fire_hook.assert_not_awaited()
+        ttl_task.cancel()
+        await asyncio.gather(ttl_task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_shutdown_continues_after_retained_offboarding(self):

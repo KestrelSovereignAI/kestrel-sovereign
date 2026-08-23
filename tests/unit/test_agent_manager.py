@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.isolated_runtime import (
     IsolatedRuntimeNamespaceError,
+    RuntimeNamespaceCleanupOutcome,
     derive_isolated_runtime_namespace,
     prepare_isolated_runtime_namespace,
     resolve_isolated_runtime_namespace,
@@ -34,6 +35,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     ChildTerminationReconciliationError,
     RUNTIME_OFFBOARD_TIMEOUT_S,
+    RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
     _parse_runtime_offboard_timeout,
@@ -72,6 +74,30 @@ def _exception_leaves(error: BaseException) -> list[BaseException]:
             leaves.extend(_exception_leaves(item))
         return leaves
     return [error]
+
+
+def _admitted_offboarding_failure(error: BaseException) -> AsyncMock:
+    """Build a manager mock that marks the real cleanup-admission boundary."""
+
+    async def fail(_name, **kwargs):
+        admission = kwargs["offboarding_admission"]
+        assert isinstance(admission, RuntimeOffboardingAdmission)
+        admission.started = True
+        raise error
+
+    return AsyncMock(side_effect=fail)
+
+
+def _admitted_offboarding_success() -> AsyncMock:
+    """Build a manager mock which performs the typed admission handshake."""
+
+    async def succeed(_name, **kwargs):
+        admission = kwargs["offboarding_admission"]
+        assert isinstance(admission, RuntimeOffboardingAdmission)
+        admission.started = True
+        return True
+
+    return AsyncMock(side_effect=succeed)
 
 
 @pytest.mark.parametrize("value", ["30s", "nan", "inf", "0", "-1"])
@@ -1256,6 +1282,7 @@ class TestAgentManagerBasics:
         def slow_cleanup(_agent):
             started.set()
             release.wait(timeout=5)
+            return RuntimeNamespaceCleanupOutcome.REMOVED
 
         monkeypatch.setattr(
             "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
@@ -1293,6 +1320,65 @@ class TestAgentManagerBasics:
         assert all(record["failure"] is None for record in completed)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "failure_type"),
+        (
+            (
+                RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT,
+                "RuntimeOffboardingNotPerformedError",
+            ),
+            (None, "TypeError"),
+        ),
+        ids=("already-absent", "invalid-none"),
+    )
+    async def test_deferred_offboarding_records_non_removed_outcome_as_unsafe(
+        self,
+        monkeypatch,
+        outcome,
+        failure_type,
+    ):
+        """A timed-out worker's eventual return must resolve pending custody."""
+
+        manager = AgentManager()
+        agent = _make_mock_agent("did:pkh:deferred-non-removal")
+        manager._agents["Hosted"] = agent
+        manager._agent_names[agent.agent_id] = "Hosted"
+        started = threading.Event()
+        release = threading.Event()
+
+        def delayed_outcome(_agent):
+            started.set()
+            release.wait(timeout=5)
+            return outcome
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
+            delayed_outcome,
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.RUNTIME_OFFBOARD_TIMEOUT_S",
+            0.01,
+        )
+        removal = asyncio.create_task(
+            manager.remove_agent("Hosted", offboard_runtime=True)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            with pytest.raises(RuntimeOffboardingRetainedError):
+                await removal
+        finally:
+            release.set()
+
+        with pytest.raises(ExceptionGroup, match="quarantined shutdown reapers"):
+            await manager.drain_quarantined_shutdowns()
+
+        completed = list(manager.quarantined_shutdowns().values())
+        assert len(completed) == 1
+        assert completed[0]["pending"] is False
+        assert failure_type in completed[0]["failure"]
+        assert manager.get_agent("Hosted") is None
+
+    @pytest.mark.asyncio
     async def test_cancelled_runtime_offboarding_is_retained_and_does_not_wedge_peers(
         self, monkeypatch
     ):
@@ -1309,6 +1395,7 @@ class TestAgentManagerBasics:
         def slow_cleanup(_agent):
             started.set()
             release.wait(timeout=5)
+            return RuntimeNamespaceCleanupOutcome.REMOVED
 
         monkeypatch.setattr(
             "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
@@ -1445,7 +1532,7 @@ class TestAgentManagerBasics:
         config.save(config_path)
         manager = SimpleNamespace(
             resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
-            remove_agent=AsyncMock(return_value=True),
+            remove_agent=_admitted_offboarding_success(),
         )
         state = SimpleNamespace(
             agent_manager=manager,
@@ -1465,11 +1552,72 @@ class TestAgentManagerBasics:
             offboard_runtime=True,
             known_agent_id="did:test:hosted",
             known_agent_config=config.agents["Hosted"],
+            offboarding_admission=manager.remove_agent.await_args.kwargs[
+                "offboarding_admission"
+            ],
         )
+        admission = manager.remove_agent.await_args.kwargs["offboarding_admission"]
+        assert isinstance(admission, RuntimeOffboardingAdmission)
+        assert admission.started is True
         assert MultiAgentConfig.from_file(config_path).agents == {}
         assert state.multi_agent_config.agents == {}
         assert result["runtime_offboarded"] is True
         assert result["persisted_registration_removed"] is True
+
+    @pytest.mark.asyncio
+    async def test_cold_delete_restores_registration_when_offboarding_not_admitted(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Cold routing absence cannot suppress pre-admission compensation."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:test:cold-admission-compensation"
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data/cold"),
+            port=8801,
+            autostart=True,
+        )
+        local.resolve_data_dir(tmp_path).mkdir(parents=True)
+        manager._seed_scheduler_authority({did: ("Cold", local)})
+        manager.resolve_registered_agent_id = AsyncMock(return_value=did)
+        start_failure = OSError("private operator mount")
+        start = MagicMock(side_effect=start_failure)
+        monkeypatch.setattr(
+            manager,
+            "_start_agent_runtime_offboarding_identity",
+            start,
+        )
+        config = MultiAgentConfig(agents={"Cold": local})
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        state = SimpleNamespace(
+            agent_manager=manager,
+            multi_agent_config_path=config_path,
+            multi_agent_config=config,
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+        with pytest.raises(OSError) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Cold",
+                offboard_runtime=True,
+            )
+
+        assert raised.value is start_failure
+        assert "Cold" in MultiAgentConfig.from_file(config_path).agents
+        assert "Cold" in state.multi_agent_config.agents
+        assert manager.scheduler_authority_for(did) == ("Cold", local)
+        assert manager.is_scheduler_agent_authorized(did)
+        assert manager.get_agent("Cold") is None
+        assert manager._inflight_runtime_offboardings == {}
+        start.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_refuses_destructive_auto_discovery_deployment(self):
@@ -1526,7 +1674,7 @@ class TestAgentManagerBasics:
         )
         manager = SimpleNamespace(
             resolve_registered_agent_id=AsyncMock(return_value="did:test:no-delete"),
-            remove_agent=AsyncMock(side_effect=outcome),
+            remove_agent=_admitted_offboarding_failure(outcome),
         )
         request = SimpleNamespace(
             app=SimpleNamespace(
@@ -1578,7 +1726,7 @@ class TestAgentManagerBasics:
         )
         manager = SimpleNamespace(
             resolve_registered_agent_id=AsyncMock(return_value="did:test:pending"),
-            remove_agent=AsyncMock(side_effect=pending),
+            remove_agent=_admitted_offboarding_failure(pending),
         )
         request = SimpleNamespace(
             app=SimpleNamespace(

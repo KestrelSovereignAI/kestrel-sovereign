@@ -40,6 +40,54 @@ def _is_expected_termination_outcome(error: BaseException) -> bool:
     return False
 
 
+def _typed_termination_proves_removal(
+    manager: object,
+    child_name: str,
+    error: BaseException,
+) -> bool:
+    """Require Core typing plus authoritative routing absence before finalize."""
+
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        ChildTerminationNotPerformedError,
+        ChildTerminationReconciliationError,
+        RuntimeOffboardingNotPerformedError,
+        RuntimeOffboardingRetainedError,
+    )
+
+    leaves: list[BaseException] = []
+
+    def collect(candidate: BaseException) -> None:
+        if isinstance(candidate, BaseExceptionGroup):
+            for nested in candidate.exceptions:
+                collect(nested)
+            return
+        leaves.append(candidate)
+
+    collect(error)
+    supported = (
+        RuntimeOffboardingRetainedError,
+        RuntimeOffboardingNotPerformedError,
+        ChildTerminationReconciliationError,
+        ChildTerminationNotPerformedError,
+        asyncio.CancelledError,
+    )
+    if not leaves or any(not isinstance(item, supported) for item in leaves):
+        return False
+    if any(
+        isinstance(item, ChildTerminationNotPerformedError)
+        and item.child_name.casefold() == child_name.casefold()
+        for item in leaves
+    ):
+        return False
+    get_agent = getattr(manager, "get_agent", None)
+    if not callable(get_agent):
+        return False
+    try:
+        return get_agent(child_name) is None
+    except Exception:
+        return False
+
+
 class SpawnStatus(str, Enum):
     """Status of a spawned agent's lifecycle."""
 
@@ -241,17 +289,14 @@ class SpawnedAgentLifecycle:
                 parent_did=tracked.parent_did,
             )
 
-            tracked.result = result
-            self._results[child_name] = result
-
-            # Cancel TTL timer since the child is done
-            if tracked.ttl_task and not tracked.ttl_task.done():
-                tracked.ttl_task.cancel()
-
             # Terminate and clean up
-            await self._terminate_and_cleanup(child_name, status)
+            terminated = await self._terminate_and_cleanup(
+                child_name,
+                status,
+                result=result,
+            )
 
-            return result
+            return result if terminated else None
 
     def get_result(self, child_name: str) -> Optional[SpawnResult]:
         """Retrieve the result for a terminated child.
@@ -302,32 +347,31 @@ class SpawnedAgentLifecycle:
         Returns:
             SpawnResult if the child was tracked, None otherwise.
         """
-        tracked = self._tracked.get(child_name)
-        if tracked is None:
-            return None
+        # Serialize explicit termination with result reports and TTL expiry.
+        # A refused manager removal must leave the exact child and its timer
+        # available to a later retry instead of publishing a false terminal
+        # result.
+        async with self._lock:
+            tracked = self._tracked.get(child_name)
+            if tracked is None:
+                return None
 
-        # Cancel TTL timer
-        if tracked.ttl_task and not tracked.ttl_task.done():
-            tracked.ttl_task.cancel()
+            result = SpawnResult(
+                child_name=child_name,
+                child_did=tracked.child_did,
+                status=SpawnStatus.TERMINATED,
+                started_at=tracked.started_at,
+                parent_did=tracked.parent_did,
+            )
+            terminated = await self._terminate_and_cleanup(
+                child_name,
+                SpawnStatus.TERMINATED,
+                reason=reason,
+                offboard_runtime=offboard_runtime,
+                result=result,
+            )
 
-        result = SpawnResult(
-            child_name=child_name,
-            child_did=tracked.child_did,
-            status=SpawnStatus.TERMINATED,
-            started_at=tracked.started_at,
-            parent_did=tracked.parent_did,
-        )
-        tracked.result = result
-        self._results[child_name] = result
-
-        terminated = await self._terminate_and_cleanup(
-            child_name,
-            SpawnStatus.TERMINATED,
-            reason=reason,
-            offboard_runtime=offboard_runtime,
-        )
-
-        return result if terminated else None
+            return result if terminated else None
 
     async def shutdown(self) -> None:
         """Shut down all tracked children and clean up.
@@ -339,12 +383,19 @@ class SpawnedAgentLifecycle:
         terminal_outcomes: list[BaseException] = []
         for child_name in children:
             try:
-                await self.terminate(child_name, reason="parent shutdown")
+                result = await self.terminate(child_name, reason="parent shutdown")
+                if result is None and self.is_tracked(child_name):
+                    from kestrel_sovereign.multi_agent.agent_manager import (
+                        ChildTerminationNotPerformedError,
+                    )
+
+                    terminal_outcomes.append(
+                        ChildTerminationNotPerformedError(child_name=child_name)
+                    )
             except BaseException as exc:
                 if not _is_expected_termination_outcome(exc):
                     raise
                 terminal_outcomes.append(exc)
-        self._tracked.clear()
         if len(terminal_outcomes) == 1:
             raise terminal_outcomes[0]
         if terminal_outcomes:
@@ -376,13 +427,19 @@ class SpawnedAgentLifecycle:
                 started_at=tracked.started_at,
                 parent_did=tracked.parent_did,
             )
-            tracked.result = result
-            self._results[child_name] = result
-
             try:
-                await self._terminate_and_cleanup(
-                    child_name, SpawnStatus.TIMED_OUT, reason="TTL expired"
+                terminated = await self._terminate_and_cleanup(
+                    child_name,
+                    SpawnStatus.TIMED_OUT,
+                    reason="TTL expired",
+                    result=result,
                 )
+                if not terminated:
+                    logger.warning(
+                        "TTL termination was refused for child '%s'; tracking "
+                        "and periodic retry remain active",
+                        child_name,
+                    )
             except BaseException as exc:
                 if not _is_expected_termination_outcome(exc):
                     raise
@@ -402,6 +459,7 @@ class SpawnedAgentLifecycle:
         reason: str = "",
         *,
         offboard_runtime: bool = False,
+        result: Optional[SpawnResult] = None,
     ) -> bool:
         """Terminate the child in AgentManager and clean up ephemeral resources.
 
@@ -433,12 +491,48 @@ class SpawnedAgentLifecycle:
         except BaseException as exc:
             if not _is_expected_termination_outcome(exc):
                 raise
+            if not _typed_termination_proves_removal(
+                self._agent_manager,
+                child_name,
+                exc,
+            ):
+                raise
             termination_failure = exc
             logger.error(
                 "Failed to terminate child '%s' via AgentManager: %s",
                 child_name,
                 exc,
             )
+
+        if not terminated and termination_failure is None:
+            # A TTL attempt is itself the timer task and is about to finish.
+            # Rearm it for a bounded periodic retry; an explicit termination
+            # leaves the existing sleeping TTL task untouched.
+            if tracked.ttl_task is asyncio.current_task():
+                tracked.ttl_task = asyncio.create_task(
+                    self._ttl_monitor(child_name, tracked.ttl_seconds)
+                )
+            return False
+
+        # Only an authoritative manager success (or its typed terminal
+        # exception path, which is surfaced below) may disarm TTL and publish
+        # lifecycle completion. A bare False retains every retry handle.
+        if result is None:
+            result = SpawnResult(
+                child_name=child_name,
+                child_did=tracked.child_did,
+                status=status,
+                started_at=tracked.started_at,
+                parent_did=tracked.parent_did,
+            )
+        tracked.result = result
+        self._results[child_name] = result
+        if (
+            tracked.ttl_task
+            and tracked.ttl_task is not asyncio.current_task()
+            and not tracked.ttl_task.done()
+        ):
+            tracked.ttl_task.cancel()
 
         # Clean up ephemeral temp directory
         if tracked.mode == SpawnMode.EPHEMERAL and tracked.temp_dir:

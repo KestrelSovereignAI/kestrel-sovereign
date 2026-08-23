@@ -1535,6 +1535,67 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_type"),
+    (
+        ("not_hosted", "RuntimeOffboardingNotPerformedError"),
+        ("invalid", "TypeError"),
+    ),
+)
+async def test_terminal_drain_validates_inflight_runtime_cleanup_outcome(
+    monkeypatch,
+    outcome,
+    expected_type,
+) -> None:
+    """Joining an inflight worker cannot bless a non-removal or invalid return."""
+
+    from kestrel_sovereign.features import isolated_runtime
+
+    manager = AgentManager()
+    agent = SimpleNamespace(agent_id="did:test:terminal-inflight-outcome")
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_cleanup(_agent):
+        started.set()
+        release.wait(timeout=5)
+        if outcome == "not_hosted":
+            return isolated_runtime.RuntimeNamespaceCleanupOutcome.NOT_HOSTED
+        return None
+
+    monkeypatch.setattr(
+        isolated_runtime,
+        "remove_agent_runtime_namespace",
+        delayed_cleanup,
+    )
+    record = manager._start_agent_runtime_offboarding(
+        name="Hosted",
+        agent=agent,
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+        for _ in range(100):
+            if manager._quarantined_shutdown_handoffs_sealed:
+                break
+            await asyncio.sleep(0)
+        assert manager._quarantined_shutdown_handoffs_sealed
+        release.set()
+        with pytest.raises(ExceptionGroup) as raised:
+            await drain
+    finally:
+        release.set()
+
+    assert record.task.done()
+    assert any(
+        type(error).__name__ == expected_type
+        for error in raised.value.exceptions
+    )
+    assert manager._inflight_runtime_offboardings == {}
+    assert manager._quarantined_shutdown_handoffs_sealed is False
+
+
+@pytest.mark.asyncio
 async def test_terminal_quarantine_drain_reports_precompleted_reaper_failure() -> None:
     """Unsafe metadata from a precompleted reaper remains terminal evidence."""
 

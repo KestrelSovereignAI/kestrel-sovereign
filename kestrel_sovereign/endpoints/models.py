@@ -29,6 +29,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.multi_agent.agent_manager import (
+    RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
     public_exception_type_name,
@@ -519,22 +520,16 @@ def _restore_persisted_agent_registration(
     request.app.state.multi_agent_config = current
 
 
-def _restore_registration_if_agent_is_live(
+def _restore_registration_if_offboarding_not_admitted(
     request: Request,
-    agent_manager: object,
-    agent_name: str,
+    admission: Optional[RuntimeOffboardingAdmission],
     rollback: Optional[tuple[object, str, object]],
 ) -> None:
-    """Compensate config mutation only when routing still proves liveness."""
+    """Compensate desired state only when no destructive worker was started."""
 
     if rollback is None:
         return
-    get_agent = getattr(agent_manager, "get_agent", None)
-    # The production manager always provides this authority.  A nonconforming
-    # embedding cannot prove shutdown, so preserve restart registration rather
-    # than silently converting an arbitrary manager failure into deprovision.
-    live = True if not callable(get_agent) else get_agent(agent_name) is not None
-    if live:
+    if admission is None or not admission.started:
         _restore_persisted_agent_registration(request, rollback)
 
 
@@ -568,6 +563,7 @@ async def delete_agent(
 
     registration_rollback = None
     known_agent_id = None
+    offboarding_admission = None
     manager_agent_name = agent_name
     if offboard_runtime:
         registration = _read_persisted_agent_registration_for_offboarding(
@@ -594,6 +590,7 @@ async def delete_agent(
             request,
             registration,
         )
+        offboarding_admission = RuntimeOffboardingAdmission()
 
     try:
         if offboard_runtime:
@@ -602,6 +599,7 @@ async def delete_agent(
                 offboard_runtime=True,
                 known_agent_id=known_agent_id,
                 known_agent_config=registration[2],
+                offboarding_admission=offboarding_admission,
             )
         else:
             removed = await agent_manager.remove_agent(
@@ -612,24 +610,42 @@ async def delete_agent(
         # Shutdown/unpublication succeeded, so this is neither a missing agent
         # nor a generic server failure. Return an explicit custody outcome
         # (pending or retained) without inviting a retry against a dead route.
-        raise HTTPException(status_code=409, detail=exc.metadata)
+        _restore_registration_if_offboarding_not_admitted(
+            request,
+            offboarding_admission,
+            registration_rollback,
+        )
+        detail = dict(exc.metadata)
+        if registration_rollback is not None:
+            detail["persisted_registration_removed"] = bool(
+                registration_rollback[2] is not None
+                and offboarding_admission is not None
+                and offboarding_admission.started
+            )
+        raise HTTPException(status_code=409, detail=detail)
     except RuntimeOffboardingNotPerformedError as exc:
         # The agent is gone, but destructive intent did not remove a tree.
         # Preserve the precise no-op state instead of returning a false 200.
-        detail = dict(exc.metadata)
-        detail["persisted_registration_removed"] = bool(
-            registration_rollback is not None
-            and registration_rollback[2] is not None
+        _restore_registration_if_offboarding_not_admitted(
+            request,
+            offboarding_admission,
+            registration_rollback,
         )
+        detail = dict(exc.metadata)
+        if registration_rollback is not None:
+            detail["persisted_registration_removed"] = bool(
+                registration_rollback[2] is not None
+                and offboarding_admission is not None
+                and offboarding_admission.started
+            )
         raise HTTPException(status_code=409, detail=detail)
     except BaseExceptionGroup as exc:
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling():
             try:
-                _restore_registration_if_agent_is_live(
+                _restore_registration_if_offboarding_not_admitted(
                     request,
-                    agent_manager,
-                    manager_agent_name,
+                    offboarding_admission,
                     registration_rollback,
                 )
             except Exception as rollback_error:
@@ -641,13 +657,23 @@ async def delete_agent(
             raise
         detail = _grouped_runtime_retained_detail(exc)
         if detail is None:
-            _restore_registration_if_agent_is_live(
+            _restore_registration_if_offboarding_not_admitted(
                 request,
-                agent_manager,
-                manager_agent_name,
+                offboarding_admission,
                 registration_rollback,
             )
             raise
+        _restore_registration_if_offboarding_not_admitted(
+            request,
+            offboarding_admission,
+            registration_rollback,
+        )
+        if registration_rollback is not None:
+            detail["persisted_registration_removed"] = bool(
+                registration_rollback[2] is not None
+                and offboarding_admission is not None
+                and offboarding_admission.started
+            )
         logger.error(
             "Agent '%s' was removed with retained runtime and additional "
             "terminal outcomes",
@@ -659,7 +685,9 @@ async def delete_agent(
         # remove_agent refuses to delete an agent that still has budgeted child
         # agents (#2113) — that teardown must go through terminate_child. Surface
         # it as a controlled 409, not a 500.
-        if registration_rollback is not None:
+        if registration_rollback is not None and (
+            offboarding_admission is None or not offboarding_admission.started
+        ):
             try:
                 _restore_persisted_agent_registration(request, registration_rollback)
             except Exception as rollback_error:
@@ -679,10 +707,9 @@ async def delete_agent(
         raise HTTPException(status_code=409, detail=str(e))
     except asyncio.CancelledError as exc:
         try:
-            _restore_registration_if_agent_is_live(
+            _restore_registration_if_offboarding_not_admitted(
                 request,
-                agent_manager,
-                manager_agent_name,
+                offboarding_admission,
                 registration_rollback,
             )
         except Exception as rollback_error:
@@ -692,15 +719,16 @@ async def delete_agent(
             )
         raise
     except Exception:
-        _restore_registration_if_agent_is_live(
+        _restore_registration_if_offboarding_not_admitted(
             request,
-            agent_manager,
-            manager_agent_name,
+            offboarding_admission,
             registration_rollback,
         )
         raise
     if not removed:
-        if registration_rollback is not None:
+        if registration_rollback is not None and (
+            offboarding_admission is None or not offboarding_admission.started
+        ):
             try:
                 _restore_persisted_agent_registration(request, registration_rollback)
             except Exception as rollback_error:

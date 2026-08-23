@@ -319,6 +319,19 @@ class InflightRuntimeOffboarding:
     task: "asyncio.Task[object]"
 
 
+@dataclass
+class RuntimeOffboardingAdmission:
+    """Caller-visible witness that destructive filesystem work was started.
+
+    Administrative callers may mutate durable desired state before invoking
+    :meth:`AgentManager.remove_agent`.  A cold agent has no routing entry from
+    which those callers could infer whether runtime cleanup was admitted, so
+    the manager marks this witness at the actual task-admission boundary.
+    """
+
+    started: bool = False
+
+
 def _runtime_offboarding_outcome_error(
     *,
     agent_name: str,
@@ -383,6 +396,7 @@ class QuarantinedShutdownReaper:
     agent_id: str
     task: "asyncio.Future[object]"
     started_monotonic: float
+    runtime_outcome_required: bool = False
     completed_monotonic: Optional[float] = None
     failure: Optional[str] = None
 
@@ -2608,6 +2622,7 @@ class AgentManager:
         offboard_runtime: bool = False,
         known_agent_id: Optional[str] = None,
         known_agent_config: Optional[LocalAgentConfig] = None,
+        offboarding_admission: Optional[RuntimeOffboardingAdmission] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -2619,6 +2634,15 @@ class AgentManager:
         and reports cleanup as pending without restoring a stopped agent.
         """
 
+        if offboarding_admission is not None and (
+            not offboard_runtime
+            or not isinstance(offboarding_admission, RuntimeOffboardingAdmission)
+        ):
+            raise TypeError(
+                "offboarding_admission requires destructive offboarding and a "
+                "RuntimeOffboardingAdmission witness"
+            )
+
         pending_offboarding: list[InflightRuntimeOffboarding] = []
         removed = False
         primary_failure: BaseException | None = None
@@ -2629,9 +2653,17 @@ class AgentManager:
                 known_agent_id=known_agent_id,
                 known_agent_config=known_agent_config,
                 pending_offboarding=pending_offboarding,
+                offboarding_admission=offboarding_admission,
             )
         except BaseException as exc:
             primary_failure = exc
+
+        # A record enters ``pending_offboarding`` only after the cleanup task
+        # has been created and registered under the manager lock. Mark the
+        # witness even when later reconciliation/cancellation fails so a cold
+        # DELETE never restores autostart registration over admitted cleanup.
+        if pending_offboarding and offboarding_admission is not None:
+            offboarding_admission.started = True
 
         offboarding_cancelled = False
         offboarding_failure: BaseException | None = None
@@ -2673,6 +2705,7 @@ class AgentManager:
         known_agent_id: Optional[str],
         known_agent_config: Optional[LocalAgentConfig],
         pending_offboarding: list[InflightRuntimeOffboarding],
+        offboarding_admission: Optional[RuntimeOffboardingAdmission],
     ) -> bool:
         """Stop and unpublish an agent while serializing with cold wakes.
 
@@ -2749,6 +2782,7 @@ class AgentManager:
                     name,
                     offboard_runtime=offboard_runtime,
                     pending_offboarding=pending_offboarding,
+                    offboarding_admission=offboarding_admission,
                 )
 
         cold_identity_offboarding: Optional[
@@ -2838,6 +2872,7 @@ class AgentManager:
                             name,
                             offboard_runtime=offboard_runtime,
                             pending_offboarding=pending_offboarding,
+                            offboarding_admission=offboarding_admission,
                         )
                 else:
                     if current_did != agent_id:
@@ -2865,6 +2900,7 @@ class AgentManager:
                             name,
                             offboard_runtime=offboard_runtime,
                             pending_offboarding=pending_offboarding,
+                            offboarding_admission=offboarding_admission,
                         )
                     except BaseException:
                         if self._published_agent_binding(name)[1] is not None:
@@ -2931,7 +2967,7 @@ class AgentManager:
                 "agent shutdown reaper handoff must return an asyncio future"
             )
 
-        async def finish_shutdown_and_optional_offboarding() -> None:
+        async def finish_shutdown_and_optional_offboarding() -> object:
             await shutdown_reaper
             if offboard_runtime:
                 (
@@ -2947,6 +2983,12 @@ class AgentManager:
                     raise cleanup_failure
                 if cleanup_cancelled:
                     raise asyncio.CancelledError()
+                from kestrel_sovereign.features.isolated_runtime import (
+                    RuntimeNamespaceCleanupOutcome,
+                )
+
+                return RuntimeNamespaceCleanupOutcome.REMOVED
+            return None
 
         # The retained reaper always owns durable agent shutdown. It owns
         # tenant-tree deletion only when the original caller carried explicit
@@ -2965,6 +3007,7 @@ class AgentManager:
             name=name,
             agent_id=_loaded_agent_did(agent) or "<unknown>",
             task=reaper_task,
+            runtime_outcome_required=offboard_runtime,
         )
         logger.warning(
             "Handed agent %r to quarantined shutdown cleanup; routing is "
@@ -3177,6 +3220,7 @@ class AgentManager:
             name=record.agent_name,
             agent_id=record.agent_id,
             task=record.task,
+            runtime_outcome_required=True,
         )
 
     async def _finish_agent_runtime_offboarding(
@@ -3253,6 +3297,7 @@ class AgentManager:
         name: str,
         agent_id: str,
         task: "asyncio.Future[object]",
+        runtime_outcome_required: bool = False,
     ) -> str:
         """Keep one live cleanup task, then collapse it to bounded metadata."""
 
@@ -3281,6 +3326,7 @@ class AgentManager:
             agent_id=_bounded_shutdown_metadata(agent_id),
             task=task,
             started_monotonic=time.monotonic(),
+            runtime_outcome_required=runtime_outcome_required,
         )
         self._quarantined_shutdown_reapers[reaper_id] = record
 
@@ -3290,9 +3336,15 @@ class AgentManager:
                 record.failure = "shutdown reaper was cancelled"
             else:
                 failure = task.exception()
+                if failure is None and record.runtime_outcome_required:
+                    failure = _runtime_offboarding_outcome_error(
+                        agent_name=record.agent_name,
+                        agent_id=record.agent_id,
+                        result=task.result(),
+                    )
                 if failure is not None:
                     record.failure = _bounded_shutdown_metadata(
-                        f"{type(failure).__name__}: {failure}"
+                        f"{public_exception_type_name(failure)}: {failure}"
                     )
             # Do not keep a completed Task: it retains coroutine locals and,
             # on failure, the full traceback. Operators still receive a
@@ -3621,6 +3673,12 @@ class AgentManager:
                         record.task
                     )
                     cancelled = cancelled or join_cancelled
+                    if failure is None and record.runtime_outcome_required:
+                        failure = _runtime_offboarding_outcome_error(
+                            agent_name=record.agent_name,
+                            agent_id=record.agent_id,
+                            result=record.task.result(),
+                        )
                     if failure is not None:
                         detail = (
                             "was cancelled"
@@ -3644,13 +3702,14 @@ class AgentManager:
                         offboarding_failure,
                     ) = await await_lifecycle_task_completion(runtime_offboarding.task)
                     cancelled = cancelled or join_cancelled
-                    if offboarding_failure is not None:
-                        failures.append(
-                            RuntimeError(
-                                "Secure runtime offboarding failed for agent "
-                                f"{runtime_offboarding.agent_name!r}"
-                            )
+                    if offboarding_failure is None:
+                        offboarding_failure = _runtime_offboarding_outcome_error(
+                            agent_name=runtime_offboarding.agent_name,
+                            agent_id=runtime_offboarding.agent_id,
+                            result=runtime_offboarding.task.result(),
                         )
+                    if offboarding_failure is not None:
+                        failures.append(offboarding_failure)
 
                 # A normal DELETE waits for this exact task itself.  It is
                 # nevertheless removal-owned as soon as it is admitted, so a
@@ -3792,6 +3851,7 @@ class AgentManager:
         *,
         offboard_runtime: bool,
         pending_offboarding: list[InflightRuntimeOffboarding],
+        offboarding_admission: Optional[RuntimeOffboardingAdmission],
     ) -> bool:
         """Shutdown and remove an agent with an explicit state-retention policy.
 
@@ -3936,6 +3996,12 @@ class AgentManager:
                     shutdown_task=shutdown_task,
                     offboard_runtime=offboard_runtime,
                 )
+                if (
+                    shutdown_handed_off
+                    and offboard_runtime
+                    and offboarding_admission is not None
+                ):
+                    offboarding_admission.started = True
                 if shutdown_handed_off and offboard_runtime:
                     handoff_offboarding_pending = RuntimeOffboardingRetainedError(
                         agent_name=name,
@@ -3967,6 +4033,12 @@ class AgentManager:
                     shutdown_task=shutdown_task,
                     offboard_runtime=offboard_runtime,
                 )
+                if (
+                    shutdown_handed_off
+                    and offboard_runtime
+                    and offboarding_admission is not None
+                ):
+                    offboarding_admission.started = True
                 if shutdown_handed_off and offboard_runtime:
                     handoff_offboarding_pending = RuntimeOffboardingRetainedError(
                         agent_name=name,
@@ -4417,11 +4489,22 @@ class AgentManager:
                         "Delegated-budget rollback did not remove its child"
                     )
             except BaseException as rollback_failure:
+                not_hosted_cancellation = (
+                    _uncommitted_spawn_not_hosted_cancellation(rollback_failure)
+                )
+                if not_hosted_cancellation is not None:
+                    if not_hosted_cancellation:
+                        raise BaseExceptionGroup(
+                            "Delegated-budget allocation failed after cancelled "
+                            "storage-backed child rollback",
+                            [allocation_failure, asyncio.CancelledError()],
+                        )
+                    raise allocation_failure
                 raise BaseExceptionGroup(
                     "Delegated-budget allocation and child rollback both failed",
                     [allocation_failure, rollback_failure],
                 )
-            raise
+            raise allocation_failure
 
         # Provider I/O may have yielded to terminal shutdown or a direct DELETE.
         # Claim the exact hold *before* any post-provider await. A positive
