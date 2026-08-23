@@ -88,6 +88,11 @@ class RegistrationError(ValueError):
     """
 
 
+#: Marks the host as a holder of a source (issue #3053). The host outlives every
+#: feature, so this claim is never released — only `unregister` clears it.
+_HOST_CLAIM = "host"
+
+
 class RegistrationPolicy(enum.Enum):
     """Explicit policy for how a source registration resolves a name clash.
 
@@ -155,12 +160,28 @@ class SourceRegistry:
 
     def __init__(self) -> None:
         self._sources: dict[str, SourceRegistration] = {}
+        # Who holds each source, in registration order — THE ownership record
+        # (issue #3053).
+        #
+        # Ownership used to be kept by the callers instead, in two places that
+        # could not see each other: `Feature._owned_signal_source_names` for
+        # sources a feature registers itself, and
+        # `ActiveFeatureContributions.registered_sources` for ones it declares.
+        # Both applied the same rule — only a newly-created source is yours —
+        # and neither knew the other existed, so a feature that did both could
+        # tear down a source another feature was still dispatching against.
+        #
+        # It belongs here: "who registered this source" is a fact about the
+        # source, and this is what holds the sources. A claim is released by its
+        # holder; the source itself goes when the last claim does.
+        self._claims: dict[str, list[int]] = {}
+        self._claim_owners: dict[int, object] = {}
 
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
 
-    def register(self, registration: SourceRegistration) -> None:
+    def register(self, registration: SourceRegistration, *, owner=None) -> None:
         self._validate(registration)
         if registration.name in self._sources:
             raise RegistrationError(
@@ -168,6 +189,86 @@ class SourceRegistry:
                 "Re-registration is not supported; restart the process to change."
             )
         self._sources[registration.name] = registration
+        self._claim(registration.name, owner)
+
+    # ------------------------------------------------------------------
+    # Ownership (issue #3053)
+    # ------------------------------------------------------------------
+
+    def _claim(self, name: str, owner) -> None:
+        """Record *owner* as a holder of *name*. ``None`` means the host.
+
+        The host IS a holder — it just never lets go. Recording nothing for it
+        made a feature that claimed an equivalent host source the sole holder,
+        so that feature's teardown deleted the host's own source. Explicit
+        sentinel: `release` can never drop it, and `unregister` (the boot
+        rollback's unconditional removal) clears it outright.
+        """
+        holders = self._claims.setdefault(name, [])
+        if owner is None:
+            if _HOST_CLAIM not in holders:
+                holders.append(_HOST_CLAIM)
+            return
+        key = id(owner)
+        if key not in holders:
+            holders.append(key)
+            self._claim_owners[key] = owner
+
+    def owners_of(self, name: str) -> tuple:
+        """The objects currently holding *name*, in the order they claimed it."""
+        return tuple(
+            self._claim_owners[key]
+            for key in self._claims.get(name, ())
+            if key is not _HOST_CLAIM and key in self._claim_owners
+        )
+
+    def release(self, name: str, owner) -> bool:
+        """Drop *owner*'s claim on *name*; remove the source with the last one.
+
+        Returns True when the source itself was removed. This is what replaces
+        both private ledgers: a holder releases what it holds, and a source
+        another holder still needs simply does not go away — no transfer, no
+        reference count kept somewhere else, no second list to agree with.
+        """
+        holders = self._claims.get(name)
+        key = id(owner)
+        if not holders or key not in holders:
+            return False
+        holders.remove(key)
+        if not any(key in other for other in self._claims.values()):
+            self._claim_owners.pop(key, None)
+        if holders:
+            return False
+        self._claims.pop(name, None)
+        return self._sources.pop(name, None) is not None
+
+    def adopt(self, name: str, owner, *, created: bool) -> None:
+        """Record *owner* as a holder AFTER the fact.
+
+        For call sites that cannot pass ``owner=`` at registration — the
+        channels feature duck-types an embedder-supplied registry and cannot
+        assume the keyword exists. Same ledger, claimed a moment later.
+
+        *created* says whether this owner is the source's creator (a
+        ``REGISTERED`` outcome). A creator takes the host's place, so its
+        teardown removes the source; a caller that merely rode an equivalent
+        incumbent claims alongside the host, which keeps the source alive.
+        """
+        if name not in self._sources:
+            return
+        if created:
+            holders = self._claims.setdefault(name, [])
+            if _HOST_CLAIM in holders:
+                holders.remove(_HOST_CLAIM)
+        self._claim(name, owner)
+
+    def release_all(self, owner) -> tuple:
+        """Release every claim *owner* holds. Returns the names actually removed."""
+        removed = []
+        for name in [n for n, h in self._claims.items() if id(owner) in h]:
+            if self.release(name, owner):
+                removed.append(name)
+        return tuple(removed)
 
     def unregister(self, name: str) -> bool:
         """Remove a source by name. Returns True if one was present.
@@ -178,12 +279,15 @@ class SourceRegistry:
         the deliberate inverse for the teardown path, not a mutate-behind-a-
         running-dispatcher tool.
         """
+        self._claims.pop(name, None)
         return self._sources.pop(name, None) is not None
 
     def register_with_policy(
         self,
         registration: SourceRegistration,
         policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+        *,
+        owner=None,
     ) -> RegistrationOutcome:
         """Register a source under an explicit name-clash :class:`RegistrationPolicy`.
 
@@ -211,9 +315,15 @@ class SourceRegistry:
         existing = self._sources.get(registration.name)
         if existing is None:
             self._sources[registration.name] = registration
+            self._claim(registration.name, owner)
             return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
 
         if self.contract_equivalent(existing, registration):
+            # An equivalent re-registration is a no-op for the SOURCE and a real
+            # claim for the CALLER: it now depends on this source and must keep
+            # it alive until it lets go. Recording that is what stops the first
+            # holder's teardown pulling the source out from under the second.
+            self._claim(registration.name, owner)
             return RegistrationOutcome(
                 registration.name, RegistrationState.ALREADY_EQUIVALENT
             )
@@ -240,6 +350,8 @@ class SourceRegistry:
         self,
         registrations: Iterable[SourceRegistration],
         policy: RegistrationPolicy = RegistrationPolicy.MANDATORY,
+        *,
+        owner=None,
     ) -> list[RegistrationOutcome]:
         """Register several sources under one policy.
 
@@ -253,7 +365,9 @@ class SourceRegistry:
         newly_added: list[str] = []
         try:
             for registration in registrations:
-                outcome = self.register_with_policy(registration, policy)
+                outcome = self.register_with_policy(
+                    registration, policy, owner=owner
+                )
                 outcomes.append(outcome)
                 if outcome.state is RegistrationState.REGISTERED:
                     newly_added.append(outcome.name)

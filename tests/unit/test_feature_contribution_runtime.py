@@ -861,13 +861,12 @@ def test_tearing_down_one_feature_keeps_a_source_another_still_declares(tmp_path
     assert runtime.source_registry.get(first.source.name) is None
 
 
-def test_a_failed_teardown_does_not_hand_the_source_to_a_second_owner(tmp_path):
-    """A raise mid-teardown must leave exactly one owner, not two.
+def test_a_failed_teardown_leaves_the_holders_unchanged(tmp_path):
+    """A raise mid-teardown must not change who holds the source.
 
-    The transfer ran before the inverse validations, so an UNRELATED mismatch
-    raised with the heir already updated while the original feature stayed
-    active recording the same source — two owners, and one more copy appended
-    on every retry.
+    There is no ownership transfer to get wrong any more — the registry holds
+    the claims — but a teardown that raises must still leave the claim list
+    exactly as it was, and a retry must not accumulate anything.
     """
     agent = _agent(tmp_path)
     first = SDKFixtureFeature(agent)
@@ -881,8 +880,10 @@ def test_a_failed_teardown_does_not_hand_the_source_to_a_second_owner(tmp_path):
     runtime = agent._ensure_feature_contribution_runtime()
     runtime.activate(runtime.prepare_transition((first,)).only())
     runtime.activate(runtime.prepare_transition((second,)).only())
-    heir = runtime._active[id(second)]
-    assert heir.registered_sources == ()      # premise: the heir owns nothing yet
+
+    name = first.source.name
+    before = runtime.source_registry.owners_of(name)
+    assert set(before) == {first, second}   # premise: both hold it
 
     # Break an UNRELATED inverse so teardown validation raises.
     runtime.wait_registry.unregister(first.wait_provider.kind)
@@ -890,6 +891,54 @@ def test_a_failed_teardown_does_not_hand_the_source_to_a_second_owner(tmp_path):
     for _ in range(2):
         with pytest.raises(FeatureContributionRuntimeError, match="wait-provider"):
             runtime.deactivate(first)
-        # No ownership changed hands, and nothing accumulated on retry.
-        assert runtime._active[id(second)].registered_sources == ()
-        assert runtime._active[id(first)].registered_sources == (first.source,)
+        assert runtime.source_registry.owners_of(name) == before
+        assert runtime.source_registry.get(name) is first.source
+
+
+def test_the_registry_is_the_only_ownership_ledger(tmp_path):
+    """A feature that BOTH self-registers and declares a source, torn down
+    while another feature still holds it.
+
+    This is the shape neither ledger could see: `Feature._own_signal_sources`
+    recorded the imperative claim, the contribution runtime recorded the
+    declarative one, and each tore down against its own list. The first
+    feature's shutdown removed a source the second was still dispatching
+    against. One ledger in the registry makes it unrepresentable.
+    """
+    agent = _agent(tmp_path)
+    first = SDKFixtureFeature(agent)
+    second = _PeerFixtureFeature(agent)
+    second.workflow_registration = type(second.workflow_registration)(
+        owner=second.contribution_owner,
+        name=second.workflow_registration.name,
+        actor=second.actor,
+        sources=(first.source,),
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.signal_registry = runtime.source_registry
+
+    # `first` registers the source ITSELF, then records the claim — the two
+    # calls `Feature._own_signal_sources` makes (the fixture is not a Feature
+    # subclass, so the registry API it drives is exercised directly here; the
+    # Feature wiring itself is covered in test_feature_runtime_lifecycle.py).
+    runtime.source_registry.register_with_policy(first.source)
+    runtime.source_registry.adopt(first.source.name, first, created=True)
+    # ...and also declares it (the declarative path).
+    runtime.activate(runtime.prepare_transition((first,)).only())
+    runtime.activate(runtime.prepare_transition((second,)).only())
+
+    name = first.source.name
+    assert set(runtime.source_registry.owners_of(name)) == {first, second}
+
+    # Tear `first` down through BOTH paths, in the order a real disable uses.
+    runtime.deactivate(first)
+    runtime.source_registry.release_all(first)   # what shutdown() does
+
+    # `second` is still active, so the source is still there for it.
+    assert runtime.is_active(second)
+    assert runtime.source_registry.get(name) is first.source
+    assert runtime.source_registry.owners_of(name) == (second,)
+
+    # And when the last holder goes, so does the source.
+    runtime.deactivate(second)
+    assert runtime.source_registry.get(name) is None

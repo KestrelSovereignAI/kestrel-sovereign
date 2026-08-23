@@ -286,11 +286,6 @@ class ActiveFeatureContributions:
     operator_registrations: OperatorRegistrationSet
     permission_registration: PermissionDefaultRegistration | None
     execution_target_registrations: tuple[OperatorRegistrationSet, ...] = ()
-    #: The sources this lifecycle NEWLY added — not everything it declared.
-    #: An equivalent re-registration is a no-op success that keeps the
-    #: INCUMBENT (core's, typically), so tearing down by declaration would
-    #: unregister a source this feature never owned (#2951).
-    registered_sources: tuple = ()
 
 
 class FeatureContributionRuntime:
@@ -413,20 +408,13 @@ class FeatureContributionRuntime:
                 for source in workflow.sources
             )
             if sources:
-                outcomes = self.source_registry.register_batch(
-                    sources, RegistrationPolicy.MANDATORY
+                # The registry records the claim; this lifecycle keeps no list
+                # of its own. Ownership is a fact about the source, and there is
+                # exactly one place that knows it (#3053).
+                self.source_registry.register_batch(
+                    sources, RegistrationPolicy.MANDATORY, owner=prepared.feature,
                 )
-                # Only what was NEWLY added is ours to roll back or tear down.
-                # `ALREADY_EQUIVALENT` means the incumbent stayed, and it is not
-                # this feature's to remove (#2951).
-                newly = {
-                    outcome.name
-                    for outcome in outcomes
-                    if outcome.state is RegistrationState.REGISTERED
-                }
-                registered_sources.extend(
-                    source for source in sources if source.name in newly
-                )
+                registered_sources.extend(sources)
             if values.permission_defaults is not None:
                 candidate_permission_registration = PermissionDefaultRegistration(
                     owner=prepared.owner,
@@ -453,8 +441,10 @@ class FeatureContributionRuntime:
             if permission_registration is not None:
                 self.permission_defaults_registry.unregister(permission_registration)
             for source in reversed(registered_sources):
-                if self.source_registry.get(source.name) is source:
-                    self.source_registry.unregister(source.name)
+                # Release, not unregister: another holder may already depend on
+                # this source, and a failed activation is not a reason to take
+                # it from them (#3053).
+                self.source_registry.release(source.name, prepared.feature)
             for registration in reversed(registered_waits):
                 self.wait_registry.deregister(
                     registration.name, registration.provider
@@ -467,7 +457,6 @@ class FeatureContributionRuntime:
             prepared=prepared,
             operator_registrations=operator_set,
             permission_registration=permission_registration,
-            registered_sources=tuple(registered_sources),
         )
         self._active[id(prepared.feature)] = active
         return active
@@ -518,50 +507,13 @@ class FeatureContributionRuntime:
                 "active feature contribution identity does not match"
             )
         values = active.prepared.contributions
-        # What this lifecycle ADDED, not what it declared: an equivalent
-        # contribution left the incumbent in place, and unregistering that would
-        # delete core's own source on a feature teardown (#2951).
-        sources = active.registered_sources
-        # A registration another ACTIVE lifecycle still declares is still in
-        # use: feature B activating against an equivalent incumbent records no
-        # ownership, so tearing A down would remove the only registration while
-        # B's workflow is still dispatching against it.
-        #
-        # Ownership TRANSFERS rather than the teardown simply skipping it.
-        # Skipping leaks: B never registered the source, so when B later goes
-        # nothing removes it and the registration outlives every holder. Exactly
-        # one active lifecycle owns each feature-introduced registration, and
-        # here that owner changes hands (#2951).
-        #
-        # Matching by NAME is sufficient: a same-name source with a different
-        # contract is rejected at activation, so anything still active under
-        # this name is contract-equivalent by construction.
-        inherited = []
-        retained = []
-        for source in sources:
-            heir_id = next(
-                (
-                    other_id
-                    for other_id, other in self._active.items()
-                    if other_id != id(feature)
-                    and any(
-                        candidate.name == source.name
-                        for workflow in other.prepared.contributions.workflows
-                        for candidate in workflow.sources
-                    )
-                ),
-                None,
-            )
-            if heir_id is None:
-                retained.append(source)
-            else:
-                inherited.append((heir_id, source))
-        sources = tuple(retained)
-
+        # No per-lifecycle source list any more: the registry holds the claims,
+        # so teardown just lets go of what this feature held. A source another
+        # holder still needs simply stays (#3053).
         # Validate every exact inverse before mutating any registry — the
         # ownership transfer below included. Handing the source to the heir
         # before validation meant an UNRELATED mismatch (a missing wait
-        # provider, say) raised with the heir already updated while this
+        # provider, say) raised after a registry had already been mutated
         # feature stayed active recording the same source: two owners, and one
         # more copy appended on every retry (#2951).
         for registration in values.wait_providers:
@@ -571,8 +523,26 @@ class FeatureContributionRuntime:
                 raise FeatureContributionRuntimeError(
                     "active wait-provider registration identity does not match"
                 )
-        for source in sources:
-            if self.source_registry.get(source.name) is not source:
+        for source in (
+            source
+            for workflow in values.workflows
+            for source in workflow.sources
+        ):
+            # Only a source this feature actually holds is its to validate: an
+            # equivalent contribution rides an incumbent it never created, and
+            # demanding object identity there failed teardown for a feature that
+            # had done nothing wrong (#3053).
+            if feature not in self.source_registry.owners_of(source.name):
+                continue
+            current = self.source_registry.get(source.name)
+            # CONTRACT, not object identity. A feature holding a claim on an
+            # equivalent incumbent never registered that object, so demanding
+            # `is` rejected a teardown that was entirely correct. What the
+            # inverse actually needs to know is that the source still carries
+            # the contract this claim was granted against (#3053).
+            if current is None or not SourceRegistry.contract_equivalent(
+                current, source
+            ):
                 raise FeatureContributionRuntimeError(
                     "active signal-source registration identity does not match"
                 )
@@ -602,21 +572,15 @@ class FeatureContributionRuntime:
         self.operator_registry.unregister(active.operator_registrations)
         for registration in values.wait_providers:
             self.wait_registry.deregister(registration.name, registration.provider)
-        for source in sources:
-            self.source_registry.unregister(source.name)
         if active.permission_registration is not None:
             self.permission_defaults_registry.unregister(
                 active.permission_registration
             )
         self.setup_step_registry.unregister_batch(values.setup_steps)
-        # Ownership changes hands only now, past every validation and in the
-        # same mutating stretch as the unregistrations — so a teardown that
-        # raises leaves exactly one owner, and a retry does not append a second.
-        for heir_id, source in inherited:
-            heir = self._active[heir_id]
-            self._active[heir_id] = replace(
-                heir, registered_sources=heir.registered_sources + (source,)
-            )
+        # Past every validation, in the same mutating stretch as the other
+        # unregistrations: drop this feature's claims. The registry removes each
+        # source only when its last holder lets go.
+        self.source_registry.release_all(feature)
         del self._active[id(feature)]
         return True
 
