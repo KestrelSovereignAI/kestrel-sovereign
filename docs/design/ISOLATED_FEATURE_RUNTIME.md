@@ -87,7 +87,7 @@ its `pyproject.toml` (read from installed metadata, no import required):
 ```toml
 [tool.kestrel.feature]
 runtime = "isolated-venv"          # default: "in-process"
-service = "kestrel_whatsapp_web.service:main"   # entry point of the service
+service = "kestrel-whatsapp-service" # bare [project.scripts] executable name
 # Optional standalone-only mutable selection. Hosted declarations must use an
 # absolute, already-built immutable operator venv.
 venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
@@ -96,6 +96,14 @@ venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
 - `runtime = "in-process"` (default, omitted) → today's behavior, unchanged.
 - `runtime = "isolated-venv"` → the loader does **not** import the heavy
   package; it launches/connects the declared service in its own venv.
+
+`service` is constrained to one bare portable executable name: it starts with
+an ASCII letter or digit and may then contain ASCII letters, digits, `.`, `_`,
+and `-`. Separators, drive syntax, module-callable syntax, leading punctuation,
+trailing dots, and Windows device names are rejected. Core verifies and
+launches the same exact file below the venv's `bin/` (or `Scripts/` on Windows),
+so metadata cannot make verification inspect one wrapper while execution
+selects another.
 
 FeatureFeature's design/scaffold stage emits this table (and the `service/`
 sub-project layout) when a proposed feature declares conflicting deps.

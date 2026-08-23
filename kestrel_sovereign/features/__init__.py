@@ -936,6 +936,8 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         except isolated_runtime.IsolatedRuntimeNamespaceError:
             raise
         except Exception as e:
+            safe_exc_info = None
+            unexpected_type = None
             if isinstance(e, isolated_runtime.IsolatedRuntimeConfigurationError):
                 reason = type(e).safe_diagnostic(e)
             elif isinstance(e, isolated_runtime.IsolatedRuntimePreparationError):
@@ -944,10 +946,24 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
                 )
             else:
                 reason = "the isolated feature could not be prepared for discovery"
+                unexpected_type = (
+                    isolated_runtime.safe_isolated_runtime_exception_type_name(e)
+                )
+                safe_exc_info = (
+                    isolated_runtime.sanitized_isolated_runtime_preparation_exc_info(
+                        e
+                    )
+                )
             logger.error(
-                "Error loading isolated entry_point feature %s: %s",
+                "Error loading isolated entry_point feature %s: %s%s",
                 class_name,
                 reason,
+                (
+                    f" (unexpected exception type: {unexpected_type})"
+                    if unexpected_type is not None
+                    else ""
+                ),
+                exc_info=safe_exc_info,
             )
             recorder = getattr(agent, "record_feature_unavailable", None)
             if callable(recorder):

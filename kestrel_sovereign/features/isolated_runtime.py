@@ -4,14 +4,14 @@ A feature distribution opts into out-of-venv execution via its pyproject:
 
     [tool.kestrel.feature]
     runtime = "isolated-venv"
-    service = "kestrel-whatsapp-web"   # runnable: a console-script name, or "module:func"
+    service = "kestrel-whatsapp-web"   # runnable: a bare console-script name
     project = "service"                # install target for the venv (path/dist); defaults to the distribution
     # venv  = "/abs/path/.venv"        # optional explicit venv-path override
 
-`service` is the thing to RUN (resolved from the per-agent venv's bin/ as a
-console script, or executed as a "module:func" callable). `project` is the
-thing to INSTALL. They are deliberately distinct so the runnable is never
-mistaken for a pip target or a `python -m` module.
+`service` is the thing to RUN (a bare portable console-script name resolved
+from the per-agent venv's bin/). `project` is the thing to INSTALL. They are
+deliberately distinct so the runnable is never mistaken for a pip target or a
+`python -m` module, and the verified artifact is exactly the launched file.
 """
 
 import asyncio
@@ -2127,6 +2127,7 @@ _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
 _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
 _CONFIGURATION_FEATURE_IDENTITY = "feature-identity"
+_CONFIGURATION_SERVICE_EXECUTABLE = "service-executable"
 _HOSTED_RUNTIME_VENV_SETTING = "runtime.venv"
 _SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 
@@ -2194,6 +2195,11 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
             )
         if self.reason == _CONFIGURATION_FEATURE_IDENTITY:
             return "isolated feature class name is not a safe canonical identifier"
+        if self.reason == _CONFIGURATION_SERVICE_EXECUTABLE:
+            return (
+                "isolated feature service must be a bare portable console-script "
+                "executable name"
+            )
         return "the hosted isolated feature configuration is unsafe"
 
 
@@ -2306,12 +2312,41 @@ _VENV_RELOCATION_REPAIR_PAYLOAD = b"kestrel-venv-relocation-v1\n"
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+_ISOLATED_SERVICE_EXECUTABLE_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
 _HOSTED_FEATURE_RUNTIME_COMPONENT = re.compile(r"^feature-[0-9a-f]{64}$")
 _DERIVED_NAMESPACE_DIGEST_HEX_CHARS = 58
 
 
 def _is_windows_reserved_runtime_component(component: str) -> bool:
     return component.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_COMPONENTS
+
+
+def _validated_isolated_service_executable(service: object) -> str:
+    """Return one portable basename used identically for verify and launch."""
+
+    if (
+        type(service) is not str
+        or not service
+        or service != service.strip()
+        or _ISOLATED_SERVICE_EXECUTABLE_NAME.fullmatch(service) is None
+        or service.endswith(".")
+        or _is_windows_reserved_runtime_component(service)
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    return service
+
+
+def safe_isolated_runtime_exception_type_name(error: BaseException) -> str:
+    """Return a bounded identifier for sanitized server-side diagnostics."""
+
+    name = type(error).__name__
+    if _ISOLATED_FEATURE_CLASS_NAME.fullmatch(name) is not None:
+        return name
+    return "RuntimeError"
 
 
 def derive_isolated_runtime_namespace(*identifiers: str) -> str:
@@ -2648,7 +2683,7 @@ def _validate_operator_root_metadata(metadata: os.stat_result) -> None:
             "Hosted isolated feature runtime root must be owned by the service "
             "account."
         )
-    if stat.S_IMODE(metadata.st_mode) & 0o022:
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature runtime root must not be group- or "
             "world-writable."
@@ -2894,8 +2929,13 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
-        or (os.name == "posix" and metadata.st_uid != os.geteuid())
-        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or (
+            os.name == "posix"
+            and (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            )
+        )
     ):
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature relocation repair marker is unsafe."
@@ -2923,8 +2963,13 @@ def _read_venv_relocation_repair_marker_portable(directory: Path) -> bool:
             stat.S_ISLNK(metadata.st_mode)
             or not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or (os.name == "posix" and metadata.st_uid != os.geteuid())
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or (
+                os.name == "posix"
+                and (
+                    metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                )
+            )
         ):
             raise IsolatedRuntimeNamespaceError(
                 "Hosted isolated feature relocation repair marker has an unsafe "
@@ -3285,7 +3330,7 @@ def _validate_released_legacy_directory_metadata(
             "Hosted isolated feature released legacy runtime custody could not "
             "be proven; tenant state was retained."
         )
-    if stat.S_IMODE(metadata.st_mode) & 0o022:
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
         raise IsolatedRuntimePreparationError(
             "Hosted isolated feature released legacy runtime custody could not "
             "be proven; tenant state was retained."
@@ -4467,9 +4512,9 @@ def _venv_python(venv_path: Path) -> Path:
 def _console_script_path(venv_path: Path, service: str) -> Path:
     """Return the exact executable path used for a console entry point."""
 
-    executable = service
-    if os.name == "nt" and not service.casefold().endswith(".exe"):
-        executable = f"{service}.exe"
+    executable = _validated_isolated_service_executable(service)
+    if os.name == "nt" and not executable.casefold().endswith(".exe"):
+        executable = f"{executable}.exe"
     return _venv_bin_dir(venv_path) / executable
 
 
@@ -5198,6 +5243,9 @@ class ProxyFeature(Feature):
             raise IsolatedRuntimeConfigurationError(
                 reason=_CONFIGURATION_FEATURE_IDENTITY,
             )
+        self._service_executable = _validated_isolated_service_executable(
+            runtime.service
+        )
         self._runtime_directory_name = (
             _hosted_feature_runtime_component(runtime)
             if self._isolated_runtime_scope is not None
@@ -9809,18 +9857,14 @@ class ProxyFeature(Feature):
     def _console_script_location_state(self) -> str:
         """Return ``current``, ``relocated``, ``missing``, or ``not-applicable``.
 
-        A console entry point is the only launched artifact whose generated
-        wrapper normally embeds the venv's absolute path. Module callables use
-        the current venv interpreter directly and need no reinstall after a
-        directory rename. Only a positively observed foreign absolute shebang
-        proves relocation when no Core path stamp exists.
+        The configured console entry point normally embeds the venv's absolute
+        path. Only a positively observed foreign absolute shebang proves
+        relocation when no Core path stamp exists.
         """
 
         if self._bin_path is not None:
             return "not-applicable"
-        service = self.runtime.service
-        if type(service) is not str or not service or ":" in service:
-            return "not-applicable"
+        service = self._service_executable
         assert self._venv_path is not None
         script = _console_script_path(self._venv_path, service)
         executable_name = script.name
@@ -9880,11 +9924,13 @@ class ProxyFeature(Feature):
             return "current"
         first_line = prefix.splitlines()[0] if prefix else b""
         if first_line.startswith(b"#!"):
-            interpreter = first_line[2:].strip().split(maxsplit=1)[0]
-            if interpreter == b"/usr/bin/env":
-                return "current"
-            if interpreter.startswith(b"/"):
-                return "relocated"
+            interpreter_parts = first_line[2:].strip().split(maxsplit=1)
+            if interpreter_parts:
+                interpreter = interpreter_parts[0]
+                if interpreter == b"/usr/bin/env":
+                    return "current"
+                if interpreter.startswith(b"/"):
+                    return "relocated"
         # Windows launchers and nonstandard wrappers cannot be safely inferred
         # from an absent text path. A rename observed by Core below remains
         # sufficient evidence to repair them conservatively.
@@ -9909,18 +9955,12 @@ class ProxyFeature(Feature):
             or stamped_relocation
             or location_state == "relocated"
         )
-        # A hosted console wrapper that is absent or cannot be classified is
-        # not a launchable artifact.  Legacy issue-2716 attempts may have
-        # completed their rename before durable repair evidence existed, so an
-        # unstamped missing wrapper must also take the conservative repair path.
-        unstamped_hosted_console = (
-            self._isolated_runtime_scope is not None
-            and location_state == "missing"
-            and not (type(stamped_path) is str and bool(stamped_path))
-        )
-        return (
-            relocation_proven and location_state != "not-applicable"
-        ) or unstamped_hosted_console
+        # A missing or unclassifiable console wrapper is never fresh, even when
+        # every manifest field is current. Only ``--reinstall`` is sufficient
+        # to recreate an already-satisfied distribution's generated script.
+        if location_state == "missing":
+            return True
+        return relocation_proven and location_state != "not-applicable"
 
     def _provision_status(
         self,
@@ -10104,7 +10144,7 @@ class ProxyFeature(Feature):
         python_path = _venv_python(self._venv_path)
 
         # Install the PROJECT (path/dist), never the `service` runnable — the
-        # latter is a console-script name or "module:func", not a pip target.
+        # latter is a bare console-script name, not a pip target.
         install_target = self.runtime.project or self.runtime.distribution
         if not install_target:
             raise IsolatedRuntimePreparationError(
@@ -10318,7 +10358,7 @@ class ProxyFeature(Feature):
             child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
         kwargs = {
             "feature_name": self.name,
-            "service": self.runtime.service,
+            "service": self._service_executable,
             "venv_path": str(self._venv_path) if self._venv_path else None,
             "python": str(_venv_python(self._venv_path)) if self._venv_path else None,
             "executable": str(self._bin_path) if self._bin_path else None,
@@ -10410,28 +10450,13 @@ class ProxyFeature(Feature):
 
         Resolution order:
           1. explicit BIN override (``self._bin_path``);
-          2. ``service`` of the form ``module:func`` -> ``<venv-python> -c ...``;
-          3. ``service`` as a console-script name -> ``<venv>/bin/<script>``.
-        The ``service`` runnable is NEVER treated as a ``python -m`` module
-        (it may be a path/dist), which is what previously broke startup.
+          2. the validated bare console-script name in the venv bin directory.
+        The runnable is never treated as a path, module, or install target.
         """
         if self._bin_path is not None:
             return [str(self._bin_path)]
 
-        service = self.runtime.service
-        if not service:
-            raise RuntimeError(
-                f"Isolated feature {self.name} has no `service` runnable configured"
-            )
-
-        if ":" in service:  # module:func callable
-            module, _, func = service.partition(":")
-            python = (
-                str(_venv_python(self._venv_path)) if self._venv_path else "python"
-            )
-            return [python, "-c", f"from {module} import {func}; {func}()"]
-
-        # console-script installed into the venv's bin/Scripts dir
+        service = self._service_executable
         if self._venv_path is not None:
             return [str(_console_script_path(self._venv_path, service))]
         return [service]

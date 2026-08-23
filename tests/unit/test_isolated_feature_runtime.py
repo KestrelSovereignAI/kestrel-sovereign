@@ -507,7 +507,7 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
 
 
 def test_service_command_console_script(tmp_path):
-    """`service` resolves to a console-script in the venv bin/, not `python -m`."""
+    """Verification and launch resolve the same canonical console wrapper."""
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     runtime = InstalledFeatureRuntime(
@@ -520,8 +520,18 @@ def test_service_command_console_script(tmp_path):
     )
     feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    wrapper = isolated_runtime._console_script_path(
+        feature._venv_path,
+        runtime.service,
+    )
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        f"#!{isolated_runtime._venv_python(feature._venv_path)}\nexit 0\n"
+    )
     cmd = feature._service_command()
-    assert cmd == [str(feature._venv_path / "bin" / "kestrel-whatsapp-web")]
+    assert cmd == [str(wrapper)]
+    assert feature._console_script_location_state() == "current"
+    feature._verify_launch_artifact()
     # the install target is `project`, never the `service` runnable
     assert (runtime.project or runtime.distribution) == "service"
 
@@ -551,8 +561,34 @@ def test_windows_console_service_uses_and_verifies_exe_launcher(
     feature._verify_launch_artifact()
 
 
-def test_service_command_module_func(tmp_path):
-    """`service` of the form module:func runs via the venv python, not `-m`."""
+@pytest.mark.parametrize(
+    "service",
+    (
+        None,
+        "",
+        " service",
+        "service ",
+        ".hidden",
+        "_hidden",
+        "-option",
+        "service.",
+        "sub/service",
+        r"sub\service",
+        "../service",
+        "../../../../bin/sh",
+        "/bin/sh",
+        "C:service",
+        "svc_pkg.service:main",
+        "con",
+        "NUL.exe",
+    ),
+)
+def test_isolated_service_requires_bare_portable_executable_name(
+    service,
+    tmp_path,
+):
+    """Unsafe service metadata is quarantinable and never reflected."""
+
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
     runtime = InstalledFeatureRuntime(
@@ -560,15 +596,17 @@ def test_service_command_module_func(tmp_path):
         entry_point="svc.feature:SvcFeature",
         distribution="svc-pkg",
         runtime="isolated-venv",
-        service="svc_pkg.service:main",
+        service=service,
     )
-    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
-    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
-    cmd = feature._service_command()
-    assert cmd[0] == str(feature._venv_path / "bin" / "python")
-    assert cmd[1] == "-c"
-    assert "from svc_pkg.service import main" in cmd[2]
-    assert "-m" not in cmd  # never `python -m <install-target>`
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert diagnostic == (
+        "isolated feature service must be a bare portable console-script "
+        "executable name"
+    )
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1376,7 @@ def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
         entry_point="voice.feature:VoiceFeature",
         distribution="kestrel-feature-voice",
         runtime="isolated-venv",
+        service="kestrel-voice-service",
     )
 
     feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
@@ -1627,6 +1666,34 @@ def _materialize_fake_provisioned_venv(feature: ProxyFeature) -> Path:
     return python
 
 
+def _stamp_current_fake_venv(feature: ProxyFeature, monkeypatch) -> Path:
+    """Materialize and stamp one venv whose manifest is fully current."""
+
+    python = _materialize_fake_provisioned_venv(feature)
+    feature._probe_sdk_version = Mock(return_value="current-host-sdk")
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("1.0.0")
+    )
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_host_sdk_version",
+        lambda: "current-host-sdk",
+    )
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "1.0.0",
+    )
+    feature._write_provision_manifest(
+        feature.runtime.project or feature.runtime.distribution,
+        "current-host-sdk",
+        "current-host-sdk",
+        "1.0.0",
+        _child_distribution_probe("1.0.0"),
+    )
+    return python
+
+
 def _runtime_with_declared_venv(venv: str) -> InstalledFeatureRuntime:
     runtime = _isolated_runtime()
     return InstalledFeatureRuntime(
@@ -1871,14 +1938,14 @@ def test_hosted_feature_runtime_identity_ignores_module_and_service_refactors():
         entry_point="new_package.channel:WhatsAppFeature",
         distribution="kestrel-channel-whatsapp",
         runtime="isolated-venv",
-        service="new_package.service:main",
+        service="new-channel-service",
     )
     distinct = InstalledFeatureRuntime(
         class_name="TelegramFeature",
         entry_point="new_package.channel:TelegramFeature",
         distribution="kestrel-channel-whatsapp",
         runtime="isolated-venv",
-        service="new_package.service:main",
+        service="new-channel-service",
     )
 
     original_component = isolated_runtime._hosted_feature_runtime_component(original)
@@ -2203,83 +2270,6 @@ def test_locationless_manifest_adoption_refuses_non_location_staleness(
     assert refreshed["install_target"] == runtime.project
     assert refreshed["provisioned_against_host_sdk"] == "2.0.0"
     assert refreshed["feature_distribution_version"] == "4.5.6"
-
-
-def test_migrated_module_runtime_is_adopted_offline_without_reinstall(
-    monkeypatch,
-    tmp_path,
-):
-    """A moved venv with no generated console wrapper remains usable offline."""
-
-    runtime = InstalledFeatureRuntime(
-        class_name="ModuleFeature",
-        entry_point="module_feature.feature:ModuleFeature",
-        distribution="module-feature",
-        runtime="isolated-venv",
-        service="module_feature.service:main",
-        project="module-feature",
-    )
-    agent = _hosted_postgres_agent(
-        tmp_path / "runtime",
-        "agent-module-migration",
-        did="did:test:module-migration",
-    )
-    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
-    legacy_component = feature._legacy_runtime_directory_name
-    assert legacy_component is not None
-    isolated_runtime.prepare_isolated_runtime_namespace(
-        feature._isolated_runtime_scope,
-        agent.did,
-        relative_directories=(("feature_venvs", legacy_component),),
-    )
-    source_venv = (
-        feature._agent_runtime_dir
-        / "feature_venvs"
-        / legacy_component
-        / ".venv"
-    )
-    python = isolated_runtime._venv_python(source_venv)
-    python.parent.mkdir(parents=True, exist_ok=True)
-    python.write_text("#!/bin/sh\nexit 0\n")
-    python.chmod(0o700)
-    (source_venv / ".kestrel_provision.json").write_text(
-        json.dumps(
-            {
-                "install_target": runtime.project,
-                "provisioned_against_host_sdk": "1.2.3",
-                "child_sdk_version": "1.2.3",
-                "feature_distribution_version": "7.8.9",
-                "child_feature_distribution_state": "versioned",
-                "child_feature_distribution_version": "7.8.9",
-            }
-        )
-    )
-
-    feature._prepare_runtime_workspace()
-    assert feature._venv_relocated_this_startup is True
-    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
-    feature._run = Mock(side_effect=OSError("offline package index"))
-    feature._probe_feature_distribution = Mock(
-        return_value=_child_distribution_probe("7.8.9")
-    )
-    feature._probe_sdk_version = Mock(return_value="1.2.3")
-    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
-    monkeypatch.setattr(
-        isolated_runtime,
-        "_feature_distribution_version",
-        lambda _distribution, _target: "7.8.9",
-    )
-
-    feature.ensure_venv()
-
-    feature._run.assert_not_called()
-    manifest = json.loads(feature._provision_manifest_path().read_text())
-    assert manifest["venv_path"] == str(feature._venv_path.resolve())
-    assert manifest["feature_distribution_version"] == "7.8.9"
-    assert not (
-        feature._feature_runtime_dir()
-        / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
-    ).exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
@@ -3112,7 +3102,7 @@ def test_hosted_feature_runtime_adopts_legacy_hash_before_refactor(tmp_path):
         entry_point="refactored.channel:WhatsAppFeature",
         distribution=original.distribution,
         runtime=original.runtime,
-        service="refactored.service:main",
+        service="refactored-service",
     )
     restarted = ProxyFeature(agent, refactored, client_factory=FakeIsolatedClient)
     assert restarted._runtime_directory_name == feature._runtime_directory_name
@@ -3702,6 +3692,48 @@ def test_portable_relocation_marker_fsyncs_directory_before_return(
     isolated_runtime._ensure_venv_relocation_repair_marker_portable(runtime_dir)
 
     assert fsynced_directory is True
+    assert isolated_runtime._read_venv_relocation_repair_marker_portable(
+        runtime_dir
+    )
+
+
+def test_windows_portable_metadata_accepts_synthesized_permission_modes(
+    monkeypatch,
+    tmp_path,
+):
+    """Windows' synthetic 0777/0666 bits are not POSIX custody evidence."""
+
+    runtime_dir = tmp_path / "feature-runtime"
+    runtime_dir.mkdir()
+    marker = runtime_dir / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+    marker.write_bytes(isolated_runtime._VENV_RELOCATION_REPAIR_PAYLOAD)
+    real_path_stat = Path.stat
+
+    def windows_shaped_stat(path, *args, **kwargs):
+        metadata = real_path_stat(path, *args, **kwargs)
+        if path == marker:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o666,
+                st_uid=-1,
+                st_nlink=1,
+                st_dev=metadata.st_dev,
+                st_ino=metadata.st_ino,
+            )
+        return metadata
+
+    # Construct paths before changing the platform seam: pathlib selects its
+    # concrete path class from os.name at construction time.
+    monkeypatch.setattr(Path, "stat", windows_shaped_stat)
+    monkeypatch.setattr(isolated_runtime.os, "name", "nt")
+    directory_metadata = SimpleNamespace(
+        st_mode=stat.S_IFDIR | 0o777,
+        st_uid=-1,
+    )
+
+    isolated_runtime._validate_operator_root_metadata(directory_metadata)
+    isolated_runtime._validate_released_legacy_directory_metadata(
+        directory_metadata
+    )
     assert isolated_runtime._read_venv_relocation_repair_marker_portable(
         runtime_dir
     )
@@ -4596,6 +4628,135 @@ def test_every_provision_refuses_to_stamp_missing_console_service(
         assert manifest_path.read_bytes() == original_manifest
 
 
+def test_current_manifest_missing_console_forces_verified_reinstall(
+    tmp_path,
+    monkeypatch,
+):
+    """A deleted wrapper cannot make a manifest-current venv look fresh."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="CurrentMissingConsoleFeature",
+        entry_point="missing.feature:CurrentMissingConsoleFeature",
+        distribution="missing-console-package",
+        runtime="isolated-venv",
+        service="missing-console-service",
+        project="missing-console-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _stamp_current_fake_venv(feature, monkeypatch)
+    wrapper = isolated_runtime._console_script_path(
+        feature._venv_path,
+        runtime.service,
+    )
+    wrapper.unlink()
+    runs = []
+
+    def repair_console(command):
+        runs.append(command)
+        _materialize_fake_provisioned_venv(feature)
+
+    feature._run = repair_console
+    feature.ensure_venv()
+
+    assert len(runs) == 1
+    assert "--reinstall" in runs[0]
+    assert feature._console_script_location_state() == "current"
+    feature._verify_launch_artifact()
+
+    runs.clear()
+    feature.ensure_venv()
+    assert runs == []
+
+
+def test_current_manifest_missing_console_failed_repair_is_not_reblessed(
+    tmp_path,
+    monkeypatch,
+):
+    """Failed forced repair preserves the last truthful manifest."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="FailedConsoleRepairFeature",
+        entry_point="missing.feature:FailedConsoleRepairFeature",
+        distribution="missing-console-package",
+        runtime="isolated-venv",
+        service="missing-console-service",
+        project="missing-console-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _stamp_current_fake_venv(feature, monkeypatch)
+    manifest_path = feature._provision_manifest_path()
+    original_manifest = manifest_path.read_bytes()
+    isolated_runtime._console_script_path(
+        feature._venv_path,
+        runtime.service,
+    ).unlink()
+    runs = []
+    feature._run = lambda command: runs.append(command)
+
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="launch artifact could not be verified",
+    ):
+        feature.ensure_venv()
+
+    assert len(runs) == 1
+    assert "--reinstall" in runs[0]
+    assert manifest_path.read_bytes() == original_manifest
+
+
+def test_degenerate_console_shebang_is_typed_repair_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """An empty interpreter never escapes as IndexError or gets stamped."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="DegenerateShebangFeature",
+        entry_point="degenerate.feature:DegenerateShebangFeature",
+        distribution="degenerate-console-package",
+        runtime="isolated-venv",
+        service="degenerate-console-service",
+        project="degenerate-console-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _stamp_current_fake_venv(feature, monkeypatch)
+    manifest_path = feature._provision_manifest_path()
+    original_manifest = manifest_path.read_bytes()
+    wrapper = isolated_runtime._console_script_path(
+        feature._venv_path,
+        runtime.service,
+    )
+    wrapper.write_bytes(b"#! \t\nprint('never launched')\n")
+    runs = []
+    feature._run = lambda command: runs.append(command)
+
+    assert feature._console_script_location_state() == "missing"
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="launch artifact could not be verified",
+    ):
+        feature.ensure_venv()
+
+    assert len(runs) == 1
+    assert "--reinstall" in runs[0]
+    assert manifest_path.read_bytes() == original_manifest
+
+
 def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, monkeypatch):
     """An unversioned Telegram service target still follows its distribution release."""
     import kestrel_sovereign.features.isolated_runtime as ir
@@ -4672,9 +4833,7 @@ def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifes
         client_factory=FakeIsolatedClient,
     )
     feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
-    python = feature._venv_path / "bin" / "python"
-    python.parent.mkdir(parents=True, exist_ok=True)
-    python.touch()
+    _materialize_fake_provisioned_venv(feature)
     feature._write_provision_manifest(
         runtime.project,
         "0.35.1",

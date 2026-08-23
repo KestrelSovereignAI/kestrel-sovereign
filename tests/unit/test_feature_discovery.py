@@ -977,6 +977,66 @@ class TestEntryPointDiscovery:
         )
         assert entry_points[0].loaded is False
 
+    def test_unexpected_isolated_discovery_error_logs_sanitized_traceback(
+        self,
+        caplog,
+        tmp_path,
+    ):
+        runtime = InstalledFeatureRuntime(
+            class_name="UnexpectedIsolatedFeature",
+            entry_point="unexpected.feature:UnexpectedIsolatedFeature",
+            distribution="unexpected-isolated-package",
+            runtime="isolated-venv",
+            service="unexpected-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+            ]
+        )
+        secret = "child-package-secret-value"
+        agent = SimpleNamespace(
+            did="did:test:unexpected-isolated-discovery",
+            storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+            record_feature_unavailable=Mock(),
+        )
+
+        with (
+            caplog.at_level("ERROR"),
+            patch(
+                "kestrel_sovereign.features.importlib.metadata.entry_points",
+                return_value=entry_points,
+            ),
+            patch(
+                "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+                return_value={runtime.class_name: runtime},
+            ),
+            patch(
+                "kestrel_sovereign.features.isolated_runtime.ProxyFeature",
+                side_effect=RuntimeError(secret),
+            ),
+        ):
+            features = discover_features(
+                agent,
+                allowed_features={runtime.class_name},
+            )
+
+        assert runtime.class_name not in {feature.name for feature in features}
+        assert "isolated feature could not be prepared for discovery" in caplog.text
+        assert "unexpected exception type: RuntimeError" in caplog.text
+        assert "Traceback" in caplog.text
+        assert secret not in caplog.text
+        agent.record_feature_unavailable.assert_called_once_with(
+            feature=None,
+            feature_name=runtime.class_name,
+            reason="the isolated feature could not be prepared for discovery",
+        )
+        assert entry_points[0].loaded is False
+
     def test_malformed_optional_isolated_name_does_not_abort_other_features(
         self, caplog, tmp_path
     ):

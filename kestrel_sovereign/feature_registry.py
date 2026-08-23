@@ -150,8 +150,8 @@ class InstalledFeatureRuntime:
     entry_point: str
     distribution: str
     runtime: str = "in-process"
-    # `service`: the runnable in the isolated venv — a console-script name (from
-    # the service project's [project.scripts]) or a "module:func" callable.
+    # `service`: a bare portable console-script name from the service project's
+    # [project.scripts]. Core verifies and launches this exact venv-bin entry.
     service: Optional[str] = None
     # `project`: install target for the venv (path or distribution). Defaults to
     # `distribution` when unset. Kept distinct from `service` so the runnable is
