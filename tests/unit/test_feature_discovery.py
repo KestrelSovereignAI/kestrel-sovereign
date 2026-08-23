@@ -25,6 +25,7 @@ from kestrel_sovereign.features import (
 )
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeConfigurationError,
     IsolatedRuntimeNamespaceError,
     IsolatedRuntimePreparationError,
 )
@@ -256,9 +257,14 @@ service = "isolated_service"
         )
         real_import_module = importlib.import_module
 
+        class DependencySecretMetadata(ImportError):
+            pass
+
         def broken_optional_import(name, *args, **kwargs):
             if name == "kestrel_sovereign.features.isolated_runtime":
-                raise ImportError("isolated SDK is unavailable")
+                raise DependencySecretMetadata(
+                    "isolated SDK is unavailable: dependency-secret"
+                )
             return real_import_module(name, *args, **kwargs)
 
         with patch(
@@ -285,6 +291,11 @@ service = "isolated_service"
         )
         assert "ImportError" in caplog.text
         assert "isolated SDK is unavailable" not in caplog.text
+        assert "dependency-secret" not in caplog.text
+        assert "DependencySecretMetadata" not in caplog.text
+        assert "exception type: Exception" in caplog.text
+        assert "verify the installed Core and SDK dependencies" in caplog.text
+        assert "Traceback" in caplog.text
         mock_agent.record_feature_unavailable.assert_called_once_with(
             feature=None,
             feature_name=runtime.class_name,
@@ -958,7 +969,7 @@ class TestEntryPointDiscovery:
         ), patch(
             "kestrel_sovereign.features.isolated_runtime.agent_runtime_dir",
             side_effect=IsolatedRuntimePreparationError("synthetic ENOSPC"),
-        ):
+        ), caplog.at_level("ERROR"):
             features = discover_features(
                 agent,
                 allowed_features={runtime.class_name},
@@ -967,6 +978,7 @@ class TestEntryPointDiscovery:
         assert all(feature.name != runtime.class_name for feature in features)
         assert "agent-scoped runtime could not be prepared" in caplog.text
         assert "synthetic ENOSPC" not in caplog.text
+        assert "Traceback" in caplog.text
         agent.record_feature_unavailable.assert_called_once_with(
             feature=None,
             feature_name=runtime.class_name,
@@ -974,6 +986,91 @@ class TestEntryPointDiscovery:
                 "the agent-scoped runtime could not be prepared; inspect the "
                 "sanitized traceback and host filesystem health"
             ),
+        )
+        assert entry_points[0].loaded is False
+
+    @pytest.mark.parametrize("malformed", (False, True), ids=("override", "no-super"))
+    def test_untrusted_configuration_error_subclass_cannot_leak_or_abort_discovery(
+        self,
+        caplog,
+        tmp_path,
+        malformed,
+    ):
+        """Configuration diagnostics dispatch through Core's base implementation."""
+
+        secret = "third-party-configuration-secret"
+
+        class HostileConfigurationError(IsolatedRuntimeConfigurationError):
+            def safe_diagnostic(self):
+                if malformed:
+                    raise RuntimeError(secret)
+                return secret
+
+        if malformed:
+            error = HostileConfigurationError.__new__(HostileConfigurationError)
+            RuntimeError.__init__(error, secret)
+        else:
+            error = HostileConfigurationError(
+                secret,
+                reason="service-executable",
+            )
+        runtime = InstalledFeatureRuntime(
+            class_name="HostileDiagnosticFeature",
+            entry_point="hostile.feature:HostileDiagnosticFeature",
+            distribution="hostile-diagnostic-package",
+            runtime="isolated-venv",
+            service="hostile-service",
+        )
+        entry_points = _IsolatedEntryPoints(
+            [
+                _IsolatedEntryPoint(
+                    runtime.class_name,
+                    runtime.entry_point,
+                    SimpleNamespace(name=runtime.distribution),
+                )
+            ]
+        )
+        agent = SimpleNamespace(
+            did="did:test:hostile-diagnostic",
+            storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+            record_feature_unavailable=Mock(),
+        )
+
+        with (
+            caplog.at_level("ERROR"),
+            patch(
+                "kestrel_sovereign.features.importlib.metadata.entry_points",
+                return_value=entry_points,
+            ),
+            patch(
+                "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+                return_value={runtime.class_name: runtime},
+            ),
+            patch(
+                "kestrel_sovereign.features.isolated_runtime.ProxyFeature",
+                side_effect=error,
+            ),
+        ):
+            features = discover_features(
+                agent,
+                allowed_features={runtime.class_name},
+            )
+
+        assert runtime.class_name not in {feature.name for feature in features}
+        expected = (
+            "the hosted isolated feature configuration is unsafe"
+            if malformed
+            else (
+                "isolated feature service must be a bare portable console-script "
+                "executable name or a safe Python module:callable target"
+            )
+        )
+        assert expected in caplog.text
+        assert secret not in caplog.text
+        agent.record_feature_unavailable.assert_called_once_with(
+            feature=None,
+            feature_name=runtime.class_name,
+            reason=expected,
         )
         assert entry_points[0].loaded is False
 

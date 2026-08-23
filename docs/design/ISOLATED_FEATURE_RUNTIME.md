@@ -110,10 +110,19 @@ venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
   component and the callable must be a non-keyword ASCII Python identifier;
   separators, traversal, drive syntax, extra colons, and dotted or
   expression-like callable targets are rejected. Core launches this form
-  through the current venv's interpreter with Python safe-path mode (`-P`;
-  supported by Core's Python 3.11-3.14 range), keeping the mutable child working
-  directory out of `sys.path`. It has no console wrapper, so wrapper repair and
-  verification are intentionally not applicable.
+  through the current venv's interpreter in Python isolated mode (`-I`,
+  available since Python 3.4), keeping the mutable child working directory,
+  user site, and Python environment injection out of the import boundary. This
+  remains compatible with older operator-prebuilt feature interpreters that do
+  not implement Python 3.11's `-P`. Core also disables bytecode writes (`-B`),
+  so verification cannot mutate an immutable prebuilt venv. Before any Core
+  provisioning manifest is stamped, Core uses that same isolated interpreter
+  to import the module, resolve the attribute, and prove it is callable. It has
+  no console wrapper, so console-wrapper relocation repair is not applicable.
+
+Core's child distribution and SDK freshness probes use the same `-I` boundary.
+Neither service verification nor a freshness decision can import a same-named
+module from the host process working directory.
 
 The operator-level `KESTREL_FEATURE_<NAME>_BIN` setting is a complete executable
 override and preserves the historical ability to omit `service`. When BIN is

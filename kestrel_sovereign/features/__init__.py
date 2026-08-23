@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Type
 
 from kestrel_sovereign.features.base import Feature
@@ -35,6 +36,48 @@ DISABLED_FEATURES_ENV = "KESTREL_DISABLED_FEATURES"
 
 # Entry point group for external feature packages
 FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.features"
+
+
+def _safe_exception_type_name(error: BaseException) -> str:
+    """Return one Core-selected label without reflecting subclass metadata."""
+
+    if type(error) is ModuleNotFoundError:
+        return "ModuleNotFoundError"
+    if type(error) is ImportError:
+        return "ImportError"
+    return "Exception"
+
+
+def _sanitized_isolated_runtime_import_exc_info(
+    error: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """Keep Core import frames while replacing dependency-controlled text."""
+
+    core_frames = []
+    current = error.__traceback__
+    while current is not None:
+        module_name = current.tb_frame.f_globals.get("__name__")
+        if type(module_name) is str and module_name.startswith(
+            "kestrel_sovereign."
+        ):
+            core_frames.append(current)
+        current = current.tb_next
+    safe_traceback: TracebackType | None = None
+    for frame in reversed(core_frames):
+        safe_traceback = TracebackType(
+            safe_traceback,
+            frame.tb_frame,
+            frame.tb_lasti,
+            frame.tb_lineno,
+        )
+    safe_error = ImportError(
+        "the Core isolated-runtime module could not be imported; verify the "
+        "installed Core and SDK dependencies"
+    )
+    safe_error.__cause__ = None
+    safe_error.__context__ = None
+    safe_error.__suppress_context__ = True
+    return (ImportError, safe_error, safe_traceback)
 
 
 class DuplicateFeatureEntryPointError(RuntimeError):
@@ -914,10 +957,14 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
                 "kestrel_sovereign.features.isolated_runtime"
             )
         except Exception as e:
+            exception_type = _safe_exception_type_name(e)
             logger.error(
-                "Error loading isolated entry_point feature %s: %s",
+                "Error loading isolated entry_point feature %s: the Core "
+                "isolated-runtime module could not be imported; verify the "
+                "installed Core and SDK dependencies (exception type: %s)",
                 class_name,
-                type(e).__name__,
+                exception_type,
+                exc_info=_sanitized_isolated_runtime_import_exc_info(e),
             )
             recorder = getattr(agent, "record_feature_unavailable", None)
             if callable(recorder):
@@ -939,10 +986,19 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
             safe_exc_info = None
             unexpected_type = None
             if isinstance(e, isolated_runtime.IsolatedRuntimeConfigurationError):
-                reason = type(e).safe_diagnostic(e)
+                reason = (
+                    isolated_runtime.IsolatedRuntimeConfigurationError.safe_diagnostic(
+                        e
+                    )
+                )
             elif isinstance(e, isolated_runtime.IsolatedRuntimePreparationError):
                 reason = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
                     e
+                )
+                safe_exc_info = (
+                    isolated_runtime.sanitized_isolated_runtime_preparation_exc_info(
+                        e
+                    )
                 )
             else:
                 reason = "the isolated feature could not be prepared for discovery"

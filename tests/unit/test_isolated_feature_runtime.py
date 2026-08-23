@@ -569,7 +569,7 @@ def test_windows_console_service_uses_and_verifies_exe_launcher(
     ),
 )
 def test_service_command_module_callable(service, tmp_path):
-    """Safe module callables run through the venv and need no wrapper."""
+    """Safe module callables run through an isolated venv interpreter."""
 
     agent = Mock(did=_TEST_AGENT_DID)
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
@@ -587,14 +587,14 @@ def test_service_command_module_callable(service, tmp_path):
     command = feature._service_command()
 
     assert command[0] == str(isolated_runtime._venv_python(feature._venv_path))
-    assert command[1] == "-P"
-    assert command[2] == "-c"
-    assert command[3] == (
+    assert command[1] == "-I"
+    assert command[2] == "-B"
+    assert command[3] == "-c"
+    assert command[4] == (
         f"from {module} import {callable_name}; {callable_name}()"
     )
     assert "-m" not in command
     assert feature._console_script_location_state() == "not-applicable"
-    feature._verify_launch_artifact()
 
 
 def test_hosted_callable_safe_path_blocks_writable_cwd_module_shadowing(
@@ -629,7 +629,7 @@ def test_hosted_callable_safe_path_blocks_writable_cwd_module_shadowing(
         subprocess.run(
             [
                 str(python),
-                "-P",
+                "-I",
                 "-c",
                 "import sysconfig; print(sysconfig.get_path('purelib'))",
             ],
@@ -680,6 +680,48 @@ def test_hosted_callable_safe_path_blocks_writable_cwd_module_shadowing(
     assert completed.stdout.strip() == "trusted-target"
     assert completed.stderr == ""
     assert not shadow_marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="executable shim is POSIX-only")
+def test_callable_launch_uses_pre_311_compatible_isolated_mode(tmp_path):
+    """Feature interpreters need ``-I`` support, not Python 3.11's ``-P``."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="LegacyPythonFeature",
+        entry_point="legacy.feature:LegacyPythonFeature",
+        distribution="legacy-python-feature",
+        runtime="isolated-venv",
+        service="json.tool:main",
+    )
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    shim = isolated_runtime._venv_python(feature._venv_path)
+    shim.parent.mkdir(parents=True)
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "if sys.argv[1] == '-P':\n"
+        "    raise SystemExit(91)\n"
+        "if sys.argv[1] != '-I':\n"
+        "    raise SystemExit(92)\n"
+        f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    shim.chmod(0o700)
+
+    command = feature._service_command()
+    completed = subprocess.run(
+        command,
+        input='{"legacy": true}',
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert command[1] == "-I"
+    assert command[2] == "-B"
+    assert '"legacy": true' in completed.stdout
 
 
 @pytest.mark.parametrize("hosted", (False, True), ids=("standalone", "hosted"))
@@ -1885,12 +1927,57 @@ def test_hosted_process_override_must_already_exist(
         assert str(tmp_path) not in diagnostic
 
 
-def _write_prebuilt_venv_shape(venv: Path) -> Path:
+def _write_prebuilt_venv_shape(
+    venv: Path,
+    *,
+    console_service: str | None = None,
+) -> Path:
     python = isolated_runtime._venv_python(venv)
     python.parent.mkdir(parents=True)
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(0o700)
     (venv / "pyvenv.cfg").write_text("home = /operator/python\n")
+    if console_service is not None:
+        wrapper = isolated_runtime._console_script_path(venv, console_service)
+        wrapper.write_text(f"#!{python}\nexit 0\n")
+        wrapper.chmod(0o700)
+    return python
+
+
+def _write_real_venv_module(
+    venv: Path,
+    module: str,
+    source: str,
+) -> Path:
+    """Create a pip-free real venv and install one importable source module."""
+
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    python = isolated_runtime._venv_python(venv)
+    purelib = Path(
+        subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    components = module.split(".")
+    package = purelib
+    for component in components[:-1]:
+        package /= component
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").touch()
+    (package / f"{components[-1]}.py").write_text(source)
     return python
 
 
@@ -2014,7 +2101,10 @@ async def test_hosted_agents_share_only_immutable_prebuilt_venv_without_writes(
     tmp_path,
 ):
     prebuilt = tmp_path / "operator-prebuilt"
-    python = _write_prebuilt_venv_shape(prebuilt)
+    python = _write_prebuilt_venv_shape(
+        prebuilt,
+        console_service=_isolated_runtime().service,
+    )
     before = {
         path.relative_to(prebuilt): (path.read_bytes(), path.stat().st_mode)
         for path in prebuilt.rglob("*")
@@ -2058,7 +2148,10 @@ async def test_hosted_agents_share_declared_immutable_venv_without_writes(
     tmp_path,
 ):
     prebuilt = tmp_path / "declared-operator-prebuilt"
-    python = _write_prebuilt_venv_shape(prebuilt)
+    python = _write_prebuilt_venv_shape(
+        prebuilt,
+        console_service=_isolated_runtime().service,
+    )
     runtime = _runtime_with_declared_venv(str(prebuilt))
     before = {
         path.relative_to(prebuilt): (path.read_bytes(), path.stat().st_mode)
@@ -2552,10 +2645,11 @@ def test_migrated_callable_runtime_is_adopted_offline_without_reinstall(
         / legacy_component
         / ".venv"
     )
-    python = isolated_runtime._venv_python(source_venv)
-    python.parent.mkdir(parents=True, exist_ok=True)
-    python.write_text("#!/bin/sh\nexit 0\n")
-    python.chmod(0o700)
+    _write_real_venv_module(
+        source_venv,
+        "module_feature.service",
+        "def main():\n    return None\n",
+    )
     (source_venv / ".kestrel_provision.json").write_text(
         json.dumps(
             {
@@ -2595,6 +2689,126 @@ def test_migrated_callable_runtime_is_adopted_offline_without_reinstall(
         feature._feature_runtime_dir()
         / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
     ).exists()
+
+
+@pytest.mark.parametrize(
+    ("service", "installed_module", "source"),
+    (
+        (
+            "missing_callable_module:main",
+            "different_module",
+            "def main():\n    return None\n",
+        ),
+        (
+            "callable_fixture:main",
+            "callable_fixture",
+            "def other():\n    return None\n",
+        ),
+        (
+            "callable_fixture:main",
+            "callable_fixture",
+            "main = object()\n",
+        ),
+    ),
+    ids=("missing-module", "missing-attribute", "non-callable-attribute"),
+)
+def test_callable_target_must_resolve_before_fresh_manifest_stamp(
+    monkeypatch,
+    tmp_path,
+    service,
+    installed_module,
+    source,
+):
+    """A successful resolver cannot stamp an unlaunchable callable target."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="CallableFixtureFeature",
+        entry_point="callable_fixture.feature:CallableFixtureFeature",
+        distribution="callable-fixture",
+        runtime="isolated-venv",
+        service=service,
+        project="callable-fixture",
+    )
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _write_real_venv_module(feature._venv_path, installed_module, source)
+    feature._run = Mock()
+    feature._probe_sdk_version = Mock(return_value="1.2.3")
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("4.5.6")
+    )
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "4.5.6",
+    )
+
+    with pytest.raises(IsolatedRuntimePreparationError) as raised:
+        feature.ensure_venv()
+
+    diagnostic = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+        raised.value
+    )
+    assert "Python callable could not be resolved inside its selected venv" in (
+        diagnostic
+    )
+    assert service not in str(raised.value)
+    assert not feature._provision_manifest_path().exists()
+
+
+def test_hosted_prebuilt_callable_target_failure_is_actionable_and_read_only(
+    tmp_path,
+):
+    """An immutable venv stays untouched while callable failure is quarantinable."""
+
+    prebuilt = tmp_path / "operator-callable-venv"
+    _write_real_venv_module(
+        prebuilt,
+        "callable_fixture",
+        "def other():\n    return None\n",
+    )
+    before = {
+        path.relative_to(prebuilt): path.read_bytes()
+        for path in prebuilt.rglob("*")
+        if path.is_file()
+    }
+    runtime = InstalledFeatureRuntime(
+        class_name="CallableFixtureFeature",
+        entry_point="callable_fixture.feature:CallableFixtureFeature",
+        distribution="callable-fixture",
+        runtime="isolated-venv",
+        service="callable_fixture:main",
+        project="callable-fixture",
+        venv=str(prebuilt),
+    )
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "agent-prebuilt-callable"),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._prepare_runtime_workspace()
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._verify_prebuilt_feature_distribution = Mock()
+    feature._warn_on_sdk_mismatch = Mock()
+    feature._run = Mock(side_effect=AssertionError("prebuilt venv was mutated"))
+
+    with pytest.raises(IsolatedRuntimePreparationError) as raised:
+        feature.ensure_venv()
+
+    assert "Python callable could not be resolved inside its selected venv" in (
+        isolated_runtime.safe_isolated_runtime_preparation_diagnostic(raised.value)
+    )
+    assert feature._run.call_count == 0
+    assert not feature._provision_manifest_path().exists()
+    after = {
+        path.relative_to(prebuilt): path.read_bytes()
+        for path in prebuilt.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 @pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
@@ -5296,6 +5510,9 @@ def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatc
     py = override_venv / "bin" / "python"
     py.parent.mkdir(parents=True, exist_ok=True)
     py.touch()  # a venv that ALREADY exists (operator built it)
+    wrapper = override_venv / "bin" / "o"
+    wrapper.write_text(f"#!{py}\nexit 0\n")
+    wrapper.chmod(0o700)
 
     runtime = InstalledFeatureRuntime(
         class_name="OverrideFeature",
@@ -5348,6 +5565,9 @@ def test_prebuilt_override_refuses_stale_missing_or_unverifiable_distribution(
     python = override_venv / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.touch()
+    wrapper = override_venv / "bin" / "o"
+    wrapper.write_text(f"#!{python}\nexit 0\n")
+    wrapper.chmod(0o700)
     runtime = InstalledFeatureRuntime(
         class_name="OverrideFeature",
         entry_point="o.feature:OverrideFeature",
@@ -5395,6 +5615,9 @@ def test_prebuilt_editable_override_probes_source_release_without_mutation(tmp_p
     python = override_venv / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.touch()
+    wrapper = override_venv / "bin" / "o"
+    wrapper.write_text(f"#!{python}\nexit 0\n")
+    wrapper.chmod(0o700)
     runtime = InstalledFeatureRuntime(
         class_name="OverrideFeature",
         entry_point="o.feature:OverrideFeature",
@@ -5435,6 +5658,9 @@ def test_prebuilt_override_accepts_positively_present_versionless_child_for_unkn
     python = override_venv / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.touch()
+    wrapper = override_venv / "bin" / "o"
+    wrapper.write_text(f"#!{python}\nexit 0\n")
+    wrapper.chmod(0o700)
     runtime = InstalledFeatureRuntime(
         class_name="OverrideFeature",
         entry_point="o.feature:OverrideFeature",
@@ -5560,13 +5786,47 @@ def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
 
 
 def test_venv_feature_distribution_probe_executes_in_target_interpreter():
-    """The generated ``python -c`` probe contains executable newlines."""
+    """The generated isolated probe contains executable newlines."""
 
     assert isolated_runtime._venv_feature_distribution_probe(
         Path(sys.executable), "pytest"
     ) == isolated_runtime._FeatureDistributionProbe.versioned(
         importlib_metadata.version("pytest")
     )
+
+
+def test_venv_freshness_probes_ignore_hostile_cwd_modules(
+    monkeypatch,
+    tmp_path,
+):
+    """Cwd modules cannot forge feature or SDK freshness observations."""
+
+    hostile_cwd = tmp_path / "hostile-cwd"
+    hostile_cwd.mkdir()
+    json_marker = hostile_cwd / "json-shadow-imported"
+    sdk_marker = hostile_cwd / "sdk-shadow-imported"
+    (hostile_cwd / "json.py").write_text(
+        f"from pathlib import Path\nPath({str(json_marker)!r}).write_text('bad')\n"
+        "raise RuntimeError('cwd json shadow')\n"
+    )
+    (hostile_cwd / "kestrel_sdk.py").write_text(
+        f"from pathlib import Path\nPath({str(sdk_marker)!r}).write_text('bad')\n"
+        "__version__ = 'forged-sdk-version'\n"
+    )
+    monkeypatch.chdir(hostile_cwd)
+
+    feature_probe = isolated_runtime._venv_feature_distribution_probe(
+        Path(sys.executable),
+        "pytest",
+    )
+    sdk_version = isolated_runtime._venv_sdk_version(Path(sys.executable))
+
+    assert feature_probe == isolated_runtime._FeatureDistributionProbe.versioned(
+        importlib_metadata.version("pytest")
+    )
+    assert sdk_version == isolated_runtime._host_sdk_version()
+    assert not json_marker.exists()
+    assert not sdk_marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -5588,7 +5848,10 @@ def test_venv_feature_distribution_probe_preserves_distinct_positive_states(
 ):
     """The child probe never reduces missing and versionless to ``unknown``."""
 
-    def fake_run(*_args, **_kwargs):
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["command"] = command
         return subprocess.CompletedProcess([], 0, stdout=stdout)
 
     monkeypatch.setattr(isolated_runtime.subprocess, "run", fake_run)
@@ -5598,6 +5861,7 @@ def test_venv_feature_distribution_probe_preserves_distinct_positive_states(
         )
         == expected
     )
+    assert captured["command"][1:3] == ["-I", "-B"]
 
 
 def test_venv_feature_distribution_probe_marks_execution_failure_unverifiable(
@@ -5774,13 +6038,15 @@ def test_venv_sdk_version_uses_canonical_isolated_child_env(monkeypatch, tmp_pat
     monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
     captured = {}
 
-    def fake_run(*_args, **kwargs):
+    def fake_run(command, **kwargs):
+        captured["command"] = command
         captured.update(kwargs)
         return ir.subprocess.CompletedProcess([], 0, stdout="0.35.1\n")
 
     monkeypatch.setattr(ir.subprocess, "run", fake_run)
 
     assert ir._venv_sdk_version(python) == "0.35.1"
+    assert captured["command"][1:3] == ["-I", "-B"]
     env = captured["env"]
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
@@ -5803,7 +6069,7 @@ def test_hosted_venv_probes_receive_no_host_or_package_secrets(monkeypatch, tmp_
     captured = []
 
     def fake_run(cmd, **kwargs):
-        captured.append(kwargs["env"])
+        captured.append((cmd, kwargs["env"]))
         stdout = (
             '{"state": "versioned", "version": "1.2.3"}\n'
             if "distribution =" in cmd[-1]
@@ -5820,7 +6086,8 @@ def test_hosted_venv_probes_receive_no_host_or_package_secrets(monkeypatch, tmp_
         hosted=True,
     ) == ir._FeatureDistributionProbe.versioned("1.2.3")
     assert len(captured) == 2
-    for env in captured:
+    for command, env in captured:
+        assert command[1:3] == ["-I", "-B"]
         assert env["HTTP_PROXY"] == "http://proxy.example:8080"
         assert env["VIRTUAL_ENV"] == str(venv)
         assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin")

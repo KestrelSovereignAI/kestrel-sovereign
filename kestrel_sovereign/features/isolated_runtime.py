@@ -1977,6 +1977,26 @@ _CHILD_SDK_PROBE = (
     "    return 'unknown'\n"
     "print(v())\n"
 )
+_ISOLATED_PYTHON_MODE_FLAG = "-I"
+_NO_BYTECODE_FLAG = "-B"
+_CALLABLE_TARGET_VERIFIED_OUTPUT = "kestrel-callable-target-verified-v1"
+
+
+def _isolated_python_command(python_path: Path, source: str) -> list[str]:
+    """Run child Python without cwd/user injection or venv bytecode writes.
+
+    ``-I`` has been available since Python 3.4, predating every supported
+    kestrel-sdk interpreter. Unlike ``-P`` (3.11+), it is also compatible with
+    older operator prebuilt interpreters while providing safe-path behavior.
+    """
+
+    return [
+        str(python_path),
+        _ISOLATED_PYTHON_MODE_FLAG,
+        _NO_BYTECODE_FLAG,
+        "-c",
+        source,
+    ]
 
 
 @dataclass(frozen=True)
@@ -2052,7 +2072,7 @@ def _venv_feature_distribution_probe(
     )
     try:
         result = subprocess.run(
-            [str(python_path), "-c", probe],
+            _isolated_python_command(python_path, probe),
             check=True,
             capture_output=True,
             text=True,
@@ -2093,7 +2113,7 @@ def _venv_sdk_version(python_path: Path, *, hosted: bool = False) -> str:
     )
     try:
         res = subprocess.run(
-            [str(python_path), "-c", _CHILD_SDK_PROBE],
+            _isolated_python_command(python_path, _CHILD_SDK_PROBE),
             check=True,
             capture_output=True,
             text=True,
@@ -2126,6 +2146,12 @@ class IsolatedRuntimePreparationError(RuntimeError):
     """
 
 
+class _IsolatedRuntimeLaunchTargetPreparationError(
+    IsolatedRuntimePreparationError
+):
+    """Core verified that the selected child target cannot be resolved."""
+
+
 _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
 _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
@@ -2153,15 +2179,32 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
     ) -> None:
         self.reason = reason
         self.environment_keys = tuple(environment_keys)
-        super().__init__(message if message is not None else self.safe_diagnostic())
+        super().__init__(
+            message
+            if message is not None
+            else IsolatedRuntimeConfigurationError.safe_diagnostic(self)
+        )
 
     def safe_diagnostic(self) -> str:
         """Return a bounded diagnostic containing names, never env values."""
 
-        if self.reason == _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT:
+        try:
+            state = object.__getattribute__(self, "__dict__")
+        except BaseException:  # pragma: no cover - hostile object seam
+            state = {}
+        reason = state.get("reason") if type(state) is dict else None
+        if type(reason) is not str:
+            reason = None
+        environment_keys = (
+            state.get("environment_keys", ()) if type(state) is dict else ()
+        )
+        if type(environment_keys) is not tuple:
+            environment_keys = ()
+
+        if reason == _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT:
             safe_names = []
             invalid_name_seen = False
-            for key in self.environment_keys:
+            for key in environment_keys:
                 if type(key) is str and _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key):
                     safe_names.append(key)
                 else:
@@ -2174,16 +2217,16 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
                 f"({names}); move these keys into persisted per-agent feature "
                 "configuration"
             )
-        if self.reason == _CONFIGURATION_HOSTED_CLIENT_FACTORY:
+        if reason == _CONFIGURATION_HOSTED_CLIENT_FACTORY:
             return (
                 "the isolated client factory cannot guarantee tenant-scoped "
                 "env and cwd delivery; update it to accept both hosted launch "
                 "arguments"
             )
-        if self.reason == _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE:
+        if reason == _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE:
             safe_names = [
                 key
-                for key in self.environment_keys
+                for key in environment_keys
                 if type(key) is str
                 and (
                     _SAFE_ENVIRONMENT_KEY_NAME.fullmatch(key)
@@ -2196,9 +2239,9 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
                 "existing operator-owned executable or venv with no Core "
                 "provisioning manifest"
             )
-        if self.reason == _CONFIGURATION_FEATURE_IDENTITY:
+        if reason == _CONFIGURATION_FEATURE_IDENTITY:
             return "isolated feature class name is not a safe canonical identifier"
-        if self.reason == _CONFIGURATION_SERVICE_EXECUTABLE:
+        if reason == _CONFIGURATION_SERVICE_EXECUTABLE:
             return (
                 "isolated feature service must be a bare portable console-script "
                 "executable name or a safe Python module:callable target"
@@ -2216,6 +2259,13 @@ def safe_isolated_runtime_preparation_diagnostic(
     errno categories cross the startup log boundary; all messages and path
     attributes on the original exception remain private.
     """
+
+    if type(error) is _IsolatedRuntimeLaunchTargetPreparationError:
+        return (
+            "the isolated feature Python callable could not be resolved inside "
+            "its selected venv; verify the service metadata and installed "
+            "feature package"
+        )
 
     current: BaseException | None = error
     visited: set[int] = set()
@@ -2258,14 +2308,31 @@ def sanitized_isolated_runtime_preparation_exc_info(
 ) -> tuple[type[BaseException], BaseException, TracebackType | None]:
     """Return traceback evidence whose exception text and cause are sanitized."""
 
+    core_frames = []
+    current = error.__traceback__
+    while current is not None:
+        module_name = current.tb_frame.f_globals.get("__name__")
+        if type(module_name) is str and module_name.startswith(
+            "kestrel_sovereign."
+        ):
+            core_frames.append(current)
+        current = current.tb_next
+    safe_traceback: TracebackType | None = None
+    for frame in reversed(core_frames):
+        safe_traceback = TracebackType(
+            safe_traceback,
+            frame.tb_frame,
+            frame.tb_lasti,
+            frame.tb_lineno,
+        )
     safe_error = IsolatedRuntimePreparationError(
         safe_isolated_runtime_preparation_diagnostic(error)
     )
-    safe_error.__traceback__ = error.__traceback__
+    safe_error.__traceback__ = safe_traceback
     safe_error.__cause__ = None
     safe_error.__context__ = None
     safe_error.__suppress_context__ = True
-    return type(safe_error), safe_error, error.__traceback__
+    return type(safe_error), safe_error, safe_traceback
 
 
 class _RuntimeOwnerMarkerMissing(IsolatedRuntimeNamespaceError):
@@ -10134,6 +10201,9 @@ class ProxyFeature(Feature):
             host_sdk=host_sdk,
             child_sdk=child_sdk,
         )
+        # Adoption is still a freshness stamp. Prove that the configured
+        # launch target resolves in this exact venv before publishing it.
+        self._verify_launch_artifact()
         self._write_provision_manifest(
             install_target,
             host_sdk,
@@ -10144,13 +10214,74 @@ class ProxyFeature(Feature):
         return True
 
     def _verify_launch_artifact(self) -> None:
-        """Require the actual configured console wrapper to target this venv."""
+        """Require the configured launch target to resolve inside this venv."""
+
+        target = self._required_service_target()
+        if target.is_callable:
+            self._verify_python_callable_target(target)
+            return
 
         state = self._console_script_location_state()
         if state in {"relocated", "missing"}:
             raise IsolatedRuntimePreparationError(
                 "Isolated feature launch artifact could not be verified after "
                 "runtime provisioning."
+            )
+
+    def _verify_python_callable_target(
+        self,
+        target: _IsolatedServiceTarget,
+    ) -> None:
+        """Resolve a callable with the same isolated interpreter used to launch.
+
+        The child prints a fixed sentinel only after both module import and
+        attribute/callability checks succeed. Child stderr and exception text
+        are deliberately excluded from the host exception because feature
+        import hooks are untrusted and may reflect credentials or paths.
+        """
+
+        assert target.module is not None
+        assert target.callable_name is not None
+        assert self._venv_path is not None
+        source = (
+            "import importlib\n"
+            f"target = getattr(importlib.import_module({target.module!r}), "
+            f"{target.callable_name!r})\n"
+            "if not callable(target):\n"
+            "    raise TypeError('configured target is not callable')\n"
+            f"print({_CALLABLE_TARGET_VERIFIED_OUTPUT!r})\n"
+        )
+        runtime_dir = self._feature_runtime_dir()
+        hosted = self._runtime_is_hosted()
+        try:
+            completed = subprocess.run(
+                _isolated_python_command(
+                    _venv_python(self._venv_path),
+                    source,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+                env=_isolated_child_env(
+                    self._venv_path,
+                    runtime_dir=runtime_dir if hosted else None,
+                    hosted=hosted,
+                    feature_name=self.name,
+                    feature_distribution=self.runtime.distribution,
+                ),
+                cwd=str(runtime_dir / "work") if hosted else None,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise _IsolatedRuntimeLaunchTargetPreparationError(
+                "Isolated feature Python callable launch target could not be "
+                "verified."
+            ) from None
+        if completed.stdout.splitlines()[-1:] != [
+            _CALLABLE_TARGET_VERIFIED_OUTPUT
+        ]:
+            raise _IsolatedRuntimeLaunchTargetPreparationError(
+                "Isolated feature Python callable launch target could not be "
+                "verified."
             )
 
     def _provision_is_stale_from_manifest(
@@ -10267,7 +10398,11 @@ class ProxyFeature(Feature):
                     install_target,
                 )
                 self._warn_on_sdk_mismatch(python_path)
-            except IsolatedRuntimeConfigurationError:
+                self._verify_launch_artifact()
+            except (
+                IsolatedRuntimeConfigurationError,
+                _IsolatedRuntimeLaunchTargetPreparationError,
+            ):
                 raise
             except Exception as exc:
                 raise _hosted_prebuilt_override_error(
@@ -10294,6 +10429,7 @@ class ProxyFeature(Feature):
         ):
             self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
+            self._verify_launch_artifact()
             return
 
         # An operator-supplied (override) venv that already exists is NOT ours to
@@ -10316,15 +10452,13 @@ class ProxyFeature(Feature):
                 manifest,
             )
             if not stale:
-                if self._venv_relocation_repair_pending():
-                    self._verify_launch_artifact()
+                self._verify_launch_artifact()
                 self._clear_venv_relocation_repair_marker()
                 return
             if not force_reinstall and self._adopt_verified_unstamped_venv(
                 install_target,
                 manifest,
             ):
-                self._verify_launch_artifact()
                 self._clear_venv_relocation_repair_marker()
                 return
 
@@ -10566,18 +10700,17 @@ class ProxyFeature(Feature):
                 if self._venv_path is not None
                 else "python"
             )
-            return [
-                python,
-                # Python 3.11 is Core's minimum supported runtime. ``-P`` is
-                # available throughout the supported 3.11-3.14 range and keeps
-                # the writable child cwd out of the import search path.
-                "-P",
-                "-c",
+            # ``-I`` has been available since Python 3.4, so it also supports
+            # older operator prebuilt feature interpreters that predate
+            # Python 3.11's ``-P``. It supplies safe-path behavior and excludes
+            # user-site and Python environment injection as one boundary.
+            return _isolated_python_command(
+                Path(python),
                 (
                     f"from {service.module} import {service.callable_name}; "
                     f"{service.callable_name}()"
                 ),
-            ]
+            )
 
         assert service.console_executable is not None
         if self._venv_path is not None:
