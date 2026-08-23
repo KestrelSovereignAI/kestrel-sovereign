@@ -154,6 +154,7 @@ class InstalledFeatureRuntime:
     # project's [project.scripts], or a validated Python `module:callable`.
     # Core verifies and launches the exact venv-bin entry for console services;
     # callable services run through the venv interpreter without a wrapper.
+    # Optional only when KESTREL_FEATURE_<NAME>_BIN supplies the full runnable.
     service: Optional[str] = None
     # `project`: install target for the venv (path or distribution). Defaults to
     # `distribution` when unset. Kept distinct from `service` so the runnable is

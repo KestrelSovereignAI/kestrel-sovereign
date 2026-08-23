@@ -587,13 +587,211 @@ def test_service_command_module_callable(service, tmp_path):
     command = feature._service_command()
 
     assert command[0] == str(isolated_runtime._venv_python(feature._venv_path))
-    assert command[1] == "-c"
-    assert command[2] == (
+    assert command[1] == "-P"
+    assert command[2] == "-c"
+    assert command[3] == (
         f"from {module} import {callable_name}; {callable_name}()"
     )
     assert "-m" not in command
     assert feature._console_script_location_state() == "not-applicable"
     feature._verify_launch_artifact()
+
+
+def test_hosted_callable_safe_path_blocks_writable_cwd_module_shadowing(
+    tmp_path,
+):
+    """The real child interpreter imports its venv target, never hosted cwd."""
+
+    runtime_root = tmp_path / "hosted-runtime"
+    runtime_root.mkdir(mode=0o700)
+    runtime = InstalledFeatureRuntime(
+        class_name="SafePathFeature",
+        entry_point="safe_path.feature:SafePathFeature",
+        distribution="safe-path-fixture",
+        runtime="isolated-venv",
+        service="trusted_service.runner:main",
+    )
+    feature = ProxyFeature(
+        _hosted_postgres_agent(runtime_root, "agent-safe-path"),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    runtime_dir = feature._prepare_runtime_workspace()
+    test_venv = tmp_path / "trusted-venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(test_venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    python = isolated_runtime._venv_python(test_venv)
+    purelib = Path(
+        subprocess.run(
+            [
+                str(python),
+                "-P",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    trusted_package = purelib / "trusted_service"
+    trusted_package.mkdir()
+    (trusted_package / "__init__.py").write_text("")
+    (trusted_package / "runner.py").write_text(
+        "def main():\n"
+        "    print('trusted-target')\n"
+    )
+
+    hostile_cwd = runtime_dir / "work"
+    hostile_package = hostile_cwd / "trusted_service"
+    hostile_package.mkdir()
+    shadow_marker = hostile_cwd / "shadow-imported"
+    (hostile_package / "__init__.py").write_text(
+        "open('shadow-imported', 'w').write('cwd won')\n"
+    )
+    (hostile_package / "runner.py").write_text(
+        "def main():\n"
+        "    print('malicious-cwd-target')\n"
+    )
+    feature._venv_path = test_venv
+    feature._bin_path = None
+    command = feature._service_command()
+    env = isolated_runtime._isolated_child_env(
+        test_venv,
+        runtime_dir=runtime_dir,
+        hosted=True,
+        feature_name=feature.name,
+        feature_distribution=runtime.distribution,
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=hostile_cwd,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == "trusted-target"
+    assert completed.stderr == ""
+    assert not shadow_marker.exists()
+
+
+@pytest.mark.parametrize("hosted", (False, True), ids=("standalone", "hosted"))
+@pytest.mark.parametrize(
+    "service",
+    (None, "../../escape", "pkg.service:main()"),
+    ids=("missing", "path", "expression"),
+)
+def test_bin_override_is_authoritative_over_unused_service_metadata(
+    monkeypatch,
+    tmp_path,
+    hosted,
+    service,
+):
+    executable = tmp_path / "operator-service"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("KESTREL_FEATURE_BINONLYFEATURE_BIN", str(executable))
+    runtime = InstalledFeatureRuntime(
+        class_name="BinOnlyFeature",
+        entry_point="bin_only.feature:BinOnlyFeature",
+        distribution="bin-only-feature",
+        runtime="isolated-venv",
+        service=service,
+    )
+    if hosted:
+        runtime_root = tmp_path / "runtime"
+        runtime_root.mkdir(mode=0o700)
+        agent = _hosted_postgres_agent(runtime_root, "agent-bin-only")
+    else:
+        agent = Mock(
+            did=_TEST_AGENT_DID,
+            storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        )
+    captured = {}
+
+    def client_factory(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace()
+
+    feature = ProxyFeature(agent, runtime, client_factory=client_factory)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+
+    assert feature._service_command() == [str(executable.resolve())]
+    feature._build_client()
+    assert captured["command"] == [str(executable.resolve())]
+    assert captured["kwargs"]["executable"] == str(executable.resolve())
+    assert "service" not in captured["kwargs"]
+
+
+def test_removed_bin_override_revalidates_service_before_path_resolution(
+    monkeypatch,
+    tmp_path,
+):
+    executable = tmp_path / "operator-service"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    key = "KESTREL_FEATURE_BINONLYFEATURE_BIN"
+    monkeypatch.setenv(key, str(executable))
+    runtime = InstalledFeatureRuntime(
+        class_name="BinOnlyFeature",
+        entry_point="bin_only.feature:BinOnlyFeature",
+        distribution="bin-only-feature",
+        runtime="isolated-venv",
+        service="../../escape",
+    )
+    feature = ProxyFeature(
+        Mock(
+            did=_TEST_AGENT_DID,
+            storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        ),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+
+    monkeypatch.delenv(key)
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature.resolve_runtime_paths()
+    assert raised.value.safe_diagnostic() == (
+        "isolated feature service must be a bare portable console-script "
+        "executable name or a safe Python module:callable target"
+    )
+
+
+def test_hosted_bin_without_service_still_requires_immutable_executable(
+    monkeypatch,
+    tmp_path,
+):
+    key = "KESTREL_FEATURE_BINONLYFEATURE_BIN"
+    monkeypatch.setenv(key, str(tmp_path / "missing-operator-service"))
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    runtime = InstalledFeatureRuntime(
+        class_name="BinOnlyFeature",
+        entry_point="bin_only.feature:BinOnlyFeature",
+        distribution="bin-only-feature",
+        runtime="isolated-venv",
+        service=None,
+    )
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(
+            _hosted_postgres_agent(runtime_root, "agent-unsafe-bin"),
+            runtime,
+            client_factory=FakeIsolatedClient,
+        )
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert key in diagnostic
+    assert str(tmp_path) not in diagnostic
 
 
 @pytest.mark.parametrize(

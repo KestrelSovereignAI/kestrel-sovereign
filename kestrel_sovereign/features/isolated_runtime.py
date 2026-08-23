@@ -5311,7 +5311,10 @@ class ProxyFeature(Feature):
             raise IsolatedRuntimeConfigurationError(
                 reason=_CONFIGURATION_FEATURE_IDENTITY,
             )
-        self._service_target = _validated_isolated_service_target(runtime.service)
+        # An explicit BIN override is the complete runnable and historically
+        # does not require service metadata. Defer target validation until the
+        # constructor has validated any hosted process-wide override below.
+        self._service_target: _IsolatedServiceTarget | None = None
         self._runtime_directory_name = (
             _hosted_feature_runtime_component(runtime)
             if self._isolated_runtime_scope is not None
@@ -5418,6 +5421,10 @@ class ProxyFeature(Feature):
             _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
+            )
+        if not os.environ.get(_env_key(self.name, "BIN")):
+            self._service_target = _validated_isolated_service_target(
+                self.runtime.service
             )
         self._traffic_gate = _TrafficGate(before_reset=self._assert_child_start_allowed)
         # Event acknowledgement requests are intentionally detached from the
@@ -9520,7 +9527,17 @@ class ProxyFeature(Feature):
             )
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
         if bin_override:
+            # BIN is authoritative for this launch attempt. Do not reflect or
+            # forward unused service metadata to the child factory.
+            self._service_target = None
             return self._default_venv_path(), Path(bin_override).expanduser().resolve()
+
+        # Revalidate at the launch-path mutation boundary. In particular, a
+        # BIN override removed after discovery must not expose missing or
+        # malformed service metadata to `_service_command`.
+        self._service_target = _validated_isolated_service_target(
+            self.runtime.service
+        )
 
         venv_override = os.environ.get(_env_key(self.name, "VENV"))
         if venv_override:
@@ -9536,6 +9553,15 @@ class ProxyFeature(Feature):
             self._isolated_runtime_scope is not None
             or getattr(self.agent, "isolated_runtime_hosted", False) is True
         )
+
+    def _required_service_target(self) -> _IsolatedServiceTarget:
+        """Return service metadata only on a launch path without BIN."""
+
+        if self._service_target is None:
+            self._service_target = _validated_isolated_service_target(
+                self.runtime.service
+            )
+        return self._service_target
 
     def _probe_feature_distribution(
         self,
@@ -9929,12 +9955,12 @@ class ProxyFeature(Feature):
         shebang proves console relocation when no Core path stamp exists.
         """
 
-        if (
-            self._bin_path is not None
-            or self._service_target.console_executable is None
-        ):
+        if self._bin_path is not None:
             return "not-applicable"
-        service = self._service_target.console_executable
+        service_target = self._required_service_target()
+        if service_target.console_executable is None:
+            return "not-applicable"
+        service = service_target.console_executable
         assert self._venv_path is not None
         script = _console_script_path(self._venv_path, service)
         executable_name = script.name
@@ -10428,7 +10454,11 @@ class ProxyFeature(Feature):
             child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
         kwargs = {
             "feature_name": self.name,
-            "service": self._service_target.raw,
+            "service": (
+                self._service_target.raw
+                if self._service_target is not None
+                else None
+            ),
             "venv_path": str(self._venv_path) if self._venv_path else None,
             "python": str(_venv_python(self._venv_path)) if self._venv_path else None,
             "executable": str(self._bin_path) if self._bin_path else None,
@@ -10527,7 +10557,7 @@ class ProxyFeature(Feature):
         if self._bin_path is not None:
             return [str(self._bin_path)]
 
-        service = self._service_target
+        service = self._required_service_target()
         if service.is_callable:
             assert service.module is not None
             assert service.callable_name is not None
@@ -10538,6 +10568,10 @@ class ProxyFeature(Feature):
             )
             return [
                 python,
+                # Python 3.11 is Core's minimum supported runtime. ``-P`` is
+                # available throughout the supported 3.11-3.14 range and keeps
+                # the writable child cwd out of the import search path.
+                "-P",
                 "-c",
                 (
                     f"from {service.module} import {service.callable_name}; "

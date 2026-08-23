@@ -110,8 +110,17 @@ venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
   component and the callable must be a non-keyword ASCII Python identifier;
   separators, traversal, drive syntax, extra colons, and dotted or
   expression-like callable targets are rejected. Core launches this form
-  through the current venv's interpreter. It has no console wrapper, so wrapper
-  repair and verification are intentionally not applicable.
+  through the current venv's interpreter with Python safe-path mode (`-P`;
+  supported by Core's Python 3.11-3.14 range), keeping the mutable child working
+  directory out of `sys.path`. It has no console wrapper, so wrapper repair and
+  verification are intentionally not applicable.
+
+The operator-level `KESTREL_FEATURE_<NAME>_BIN` setting is a complete executable
+override and preserves the historical ability to omit `service`. When BIN is
+present, Core validates the hosted prebuilt executable but does not parse or
+forward unused service metadata. If BIN is absent when launch paths are
+resolved, `service` is required and the appropriate grammar above is enforced
+before any venv preparation or child start.
 
 FeatureFeature's design/scaffold stage emits this table (and the `service/`
 sub-project layout) when a proposed feature declares conflicting deps.
