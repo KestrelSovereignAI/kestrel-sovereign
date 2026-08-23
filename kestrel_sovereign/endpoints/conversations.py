@@ -157,7 +157,28 @@ async def list_conversations(
             search = getattr(storage, "search_conversations", None)
             sessions = []
             if search is not None:
-                sessions = await search(agent_id, search_query, limit=limit, view=view)
+                try:
+                    sessions = await search(
+                        agent_id, search_query, limit=limit, view=view
+                    )
+                except ProjectionNotReady as e:
+                    # Search walks the same session index the list pages
+                    # (#2961), so it refuses on the same condition and for the
+                    # same reason: a partial index holds the OLDEST sessions,
+                    # and answering from it would report "no matches" for a
+                    # conversation that matches. 503 clears itself — the next
+                    # request continues the walk.
+                    logger.warning(
+                        "Conversation search not ready for %s: %s", agent_id, e
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "The conversation index is still being built. "
+                            "Try again shortly."
+                        ),
+                        headers={"Retry-After": "5"},
+                    )
             # Matching necessarily decrypts server-side (SQL cannot see
             # encrypted content), but decrypt=false callers asked for no
             # plaintext in the RESPONSE — redact the decrypted snippet and
@@ -179,10 +200,14 @@ async def list_conversations(
                 "total": len(sessions),
                 "encrypted_at_rest": encrypted_at_rest,
                 "query": search_query,
-                # Search is not paged (Phase D, #2961) and says so rather than
-                # omitting the key: a caller that reads `next_cursor` off every
-                # response must be told "there is no next page", not left to
-                # read `undefined` and guess which it meant.
+                # Search returns its whole answer, up to `limit`, and says
+                # "no next page" rather than omitting the key: a caller that
+                # reads `next_cursor` off every response must be told there is
+                # none, not left to read `undefined` and guess which it meant.
+                # Since #2961 that answer is complete rather than merely
+                # unpaged — the walk behind it stops at `limit` matches, not at
+                # a row count, so raising `limit` reaches further back with no
+                # horizon past which nothing is findable.
                 "next_cursor": None,
             }
 

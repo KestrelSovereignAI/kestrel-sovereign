@@ -32,6 +32,7 @@ from .session_grouping import (
     coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
+    session_cursor_values,
     sort_sessions,
     summarize_sessions,
     timestamp_predicate,
@@ -404,28 +405,158 @@ def _build_match_snippet(text: str, query_lower: str, radius: int = _MATCH_SNIPP
     return ("…" if start > 0 else "") + stripped[start:end].strip() + ("…" if end < len(stripped) else "")
 
 
+@dataclass(frozen=True)
+class SearchTerms:
+    """A query compiled once, so every session is asked the same question.
+
+    Search reaches sessions two ways now (#2961) — the grouper, for the paths
+    with no table, and the #2959 projection for the active list — and both have
+    to apply *identical* matching rules or a session would be findable through
+    one and not the other. Compiling the query into a value both feed to
+    :func:`session_match_decoration` is what makes that structural instead of a
+    pair of loops that look alike.
+    """
+
+    #: The query as it is compared: stripped, lowercased.
+    query_lower: str
+    #: Its tokens with search wrappers removed, for the overlap fallback.
+    tokens: Tuple[str, ...]
+    #: Whether that fallback applies at all.
+    use_token_fallback: bool
+
+    @classmethod
+    def compile(cls, query: str) -> Optional["SearchTerms"]:
+        """``None`` for a query that can match nothing — an empty one.
+
+        A *wrapper-only* query is not that: it still matches by substring, and
+        only the tokenized fallback is withheld (#1554), because a query made
+        entirely of transport scaffolding would otherwise score ≥0.6 against
+        every sent-form row in the history.
+        """
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return None
+        query_tokens = _tokenize_for_search(query)
+        stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
+        query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
+        return cls(
+            query_lower=query_lower,
+            tokens=tuple(stripped_query_tokens),
+            use_token_fallback=(
+                not query_is_wrapper_only and len(stripped_query_tokens) >= 2
+            ),
+        )
+
+
+def session_match_decoration(
+    messages: Iterable[Dict[str, Any]],
+    name: Optional[str],
+    terms: SearchTerms,
+) -> Optional[Dict[str, Any]]:
+    """One session's ``match_*`` fields, or ``None`` when it does not match.
+
+    ``messages`` are that session's rows, **decrypted and canonicalized**;
+    ``name`` its user-assigned title, which is matched too so a renamed
+    conversation is findable by the name the user gave it even when nothing in
+    its text says so.
+
+    Matching reuses the exact semantics of ``search_history``: substring match
+    against the wrapper-stripped projection first (#1537/#1549), then the
+    tokenized ≥0.6-overlap fallback for multi-term queries.
+
+    The one function both search paths call. It is given rows rather than
+    finding them, because *which* rows a session is made of is the question the
+    two paths answer differently — the grouper computes it for a transcript it
+    holds, the active path reads it out of the membership map — and that is the
+    only part that should differ.
+    """
+    match_count = 0
+    first_hit: Optional[Dict[str, Any]] = None
+    best_token: Optional[Tuple[float, Dict[str, Any]]] = None
+    for msg in messages:
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            continue
+        content_lower = _strip_search_wrappers(content).lower()
+        if terms.query_lower in content_lower:
+            match_count += 1
+            if first_hit is None:
+                first_hit = msg
+        elif terms.use_token_fallback and match_count == 0:
+            score = _token_match_score(list(terms.tokens), content_lower)
+            if score >= _TOKEN_MATCH_THRESHOLD and (
+                best_token is None or score > best_token[0]
+            ):
+                best_token = (score, msg)
+
+    name_match = bool(name) and terms.query_lower in name.lower()
+    if match_count == 0 and first_hit is None and best_token is not None:
+        first_hit = best_token[1]
+        match_count = 1
+    if match_count == 0 and not name_match:
+        return None
+
+    if first_hit is None:
+        # Title-only hit: the name itself is the evidence.
+        return {"match_count": match_count, "match_role": None, "match_snippet": None}
+    return {
+        "match_count": match_count,
+        "match_role": first_hit.get("role"),
+        "match_snippet": _build_match_snippet(
+            first_hit.get("content") or "", terms.query_lower
+        ),
+    }
+
+
+def _within_row_budget(
+    page: Sequence[Dict[str, Any]],
+    membership: Dict[str, List[Any]],
+    budget: int,
+) -> Iterable[List[Dict[str, Any]]]:
+    """Split a page of sessions into groups whose rows fit one read.
+
+    A step of the search walk is bounded in *sessions*, and a session is not
+    bounded in anything — one long-running conversation can hold more rows than
+    the rest of the page together. Reading a step's rows in one go would
+    therefore be an unbounded read wearing a bounded number's clothes, so the
+    rows are what the batches are counted in.
+
+    A session larger than ``budget`` on its own is still read whole, in a batch
+    of one: its rows cannot be matched apart from each other, and splitting it
+    would report two partial answers where the session has one.
+    """
+    batch: List[Dict[str, Any]] = []
+    rows = 0
+    for session in page:
+        size = len(membership.get(session["session_id"], ()))
+        if batch and rows + size > budget:
+            yield batch
+            batch, rows = [], 0
+        batch.append(session)
+        rows += size
+    if batch:
+        yield batch
+
+
 def search_session_summaries(
     normalized_messages: List[Dict[str, Any]],
     query: str,
     names: Optional[Dict[str, str]] = None,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
-    """Full-text search over conversations, grouped into session summaries.
+    """Full-text search over a transcript this caller holds, grouped and matched.
 
-    The pure core behind conversation search: callers hand in **decrypted**,
-    oldest-first normalized message dicts (``id``/``role``/``content``/
-    ``metadata``/``created_at``) — the persistent store after
-    ``_decrypt_with_fallback`` + ``_resolve_canonical``, the privacy wrapper
-    its in-memory ISOLATED buffer — and get back newest-first session
-    summaries for the sessions whose content (or user-assigned title) matches
-    *query*.
+    **The path for a membership with no sessions table.** ISOLATED privacy mode
+    keeps its conversations in an in-memory buffer, and the archived view is
+    disjoint from what the #2959 projection describes (#3062) — neither has a
+    row to look a session up in, so both derive the sessions from the rows they
+    have. The active view does not come through here any more: it walks the
+    table, in :meth:`AsyncConversationStore._search_active_sessions`.
 
-    Matching reuses the exact semantics of ``search_history``: substring
-    match against the wrapper-stripped projection first (#1537/#1549), then
-    the tokenized ≥0.6-overlap fallback for multi-term queries, with
-    wrapper-only queries gated out entirely (#1554). Grouping reuses the
-    shared #2019 boundary algorithm, so a search hit is always a session the
-    list view (and the delete/archive lifecycle) agrees exists.
+    Callers hand in **decrypted**, oldest-first normalized message dicts
+    (``id``/``role``/``content``/``metadata``/``created_at``) and get back
+    newest-first session summaries for the sessions whose content — or
+    user-assigned title — matches *query*.
 
     Returns session dicts shaped like ``group_messages_into_sessions`` output
     (``preview_content``/``preview_metadata``/``preview_wake_source`` retained
@@ -434,16 +565,9 @@ def search_session_summaries(
     the first hit.
     """
     names = names or {}
-    query_lower = query.strip().lower()
-    if not query_lower:
+    terms = SearchTerms.compile(query)
+    if terms is None:
         return []
-
-    query_tokens = _tokenize_for_search(query)
-    stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
-    query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
-    use_token_fallback = (
-        not query_is_wrapper_only and len(stripped_query_tokens) >= 2
-    )
 
     # keep_empty_markers=True to mirror the UI list (#2222): a just-started,
     # renamed-but-still-empty conversation is list-visible, so its title must
@@ -463,42 +587,10 @@ def search_session_summaries(
         if name is not None:
             session["name"] = name
 
-        match_count = 0
-        first_hit: Optional[Dict[str, Any]] = None
-        best_token: Optional[Tuple[float, Dict[str, Any]]] = None
-        for msg in messages:
-            content = msg.get("content") or ""
-            if not isinstance(content, str):
-                continue
-            content_lower = _strip_search_wrappers(content).lower()
-            if query_lower in content_lower:
-                match_count += 1
-                if first_hit is None:
-                    first_hit = msg
-            elif use_token_fallback and match_count == 0:
-                score = _token_match_score(stripped_query_tokens, content_lower)
-                if score >= _TOKEN_MATCH_THRESHOLD and (
-                    best_token is None or score > best_token[0]
-                ):
-                    best_token = (score, msg)
-
-        name_match = bool(name) and query_lower in name.lower()
-        if match_count == 0 and first_hit is None and best_token is not None:
-            first_hit = best_token[1]
-            match_count = 1
-        if match_count == 0 and not name_match:
+        decoration = session_match_decoration(messages, name, terms)
+        if decoration is None:
             continue
-
-        session["match_count"] = match_count
-        if first_hit is not None:
-            session["match_role"] = first_hit.get("role")
-            session["match_snippet"] = _build_match_snippet(
-                first_hit.get("content") or "", query_lower
-            )
-        else:
-            # Title-only hit: the name itself is the evidence.
-            session["match_role"] = None
-            session["match_snippet"] = None
+        session.update(decoration)
         results.append(session)
 
     # The same order the list and the #2959 projection page by, not a third
@@ -507,7 +599,6 @@ def search_session_summaries(
     # WHICH session made the page (round-8/9 review).
     sort_sessions(results)
     return results[:limit]
-
 
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
@@ -2577,8 +2668,29 @@ class AsyncConversationStore:
 
         return exact_results
 
-    # Row budget for a session search scan — matches search_history's cap.
-    SEARCH_SESSIONS_SCAN_LIMIT = 5000
+    #: How many sessions one step of a search walk takes off the table.
+    #:
+    #: Not the caller's ``limit``: the walk stops when it has that many
+    #: *matching* sessions, and how many it must look at to find them is a
+    #: property of the query rather than of the request. This is only how far
+    #: ahead it reads while looking — big enough that an ordinary query is
+    #: answered from one step, small enough that a query matching nothing does
+    #: not have to materialize the whole table to discover that.
+    #:
+    #: It is not a horizon. What stood here was: ``SEARCH_SESSIONS_SCAN_LIMIT``
+    #: bounded the *rows* a search could see at 5,000, so a conversation whose
+    #: messages had all aged past that was findable by no query at any limit —
+    #: the same defect #2960 removed from the list, one control across. The walk
+    #: below has no such bound; it stops on an answer, not on a row count.
+    SEARCH_SESSION_STEP = 200
+
+    #: How many rows one content read pulls at a time.
+    #:
+    #: Matching has to decrypt, so the rows a search examines are held in memory
+    #: while it does. This bounds that to a batch rather than to "every row of
+    #: every session on this step", which nothing bounds — one conversation may
+    #: be arbitrarily long.
+    SEARCH_CONTENT_BATCH = 500
 
     async def search_sessions(
         self,
@@ -2586,68 +2698,284 @@ class AsyncConversationStore:
         view: str = "active",
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Full-text search across this agent's conversations (#2019 grouping).
+        """Full-text search across this agent's conversations (#2019, #2961).
 
-        Backs the conversations pane's server-side search: scans up to
-        ``SEARCH_SESSIONS_SCAN_LIMIT`` newest live rows (``view='archived'``
-        scans archived ones), decrypts client-side — SQL LIKE cannot see
-        encrypted content, same constraint as ``search_history`` — resolves
-        canonical content (#1402), and returns newest-first session summaries
-        whose content or title matches, via :func:`search_session_summaries`.
+        Backs the conversations pane's server-side search. Matching necessarily
+        decrypts client-side — SQL ``LIKE`` cannot see encrypted content, the
+        same constraint ``search_history`` works under — and resolves canonical
+        content (#1402) so a hit is against the raw user turn rather than the
+        transport bytes it was replayed as.
+
+        Returns newest-first session summaries, at most ``limit`` of them,
+        decorated with ``match_count`` / ``match_role`` / ``match_snippet``.
+
+        **Search is the list, filtered.** For the active view the sessions come
+        out of the #2959 projection in the order the list pages them, shaped by
+        the same function — so a session that search finds is one paging
+        reaches, and the counts and previews beside it are the list's own rather
+        than a second derivation's. Before this they were two derivations with
+        two different horizons, 1,000 rows and 5,000, neither a retention policy
+        anyone chose; a session outside either was simply absent from that
+        surface with nothing to say so.
+
+        The archived view has no table yet (#3062), so it still derives its
+        sessions by grouping — over *every* archived row, with no cap, exactly
+        as the archived list does.
         """
+        terms = SearchTerms.compile(query)
+        if terms is None:
+            return []
+        bounded = max(1, int(limit))
         if view == "archived":
-            archive_clause = "archived_at IS NOT NULL"
-        else:
-            archive_clause = "archived_at IS NULL"
+            return await self._search_archived_sessions(terms, query, bounded)
+        return await self._search_active_sessions(terms, bounded)
+
+    async def _search_archived_sessions(
+        self, terms: SearchTerms, query: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Search the archived view, by grouping — the membership with no table.
+
+        No row cap, and that is the point: the archived list reads its rows
+        uncapped for the same reason (#2960), so capping here would put a
+        conversation in the archive list that no query could find. The cost is
+        proportional to what the user chose to archive, which is a set they
+        control, rather than to history, which grows on its own.
+        """
+        from .conversation_sessions import archived_history_predicate, canonical_order
+
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, created_at, rendered_content "
             "FROM conversation_history "
-            f"WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause} "
-            "ORDER BY id DESC LIMIT ?",
-            (self.agent_id, self.SEARCH_SESSIONS_SCAN_LIMIT),
+            f"WHERE agent_id = ? AND {archived_history_predicate()} "
+            f"{canonical_order(self.db.backend_type)}",
+            (self.agent_id,),
+        )
+        normalized = [await self._normalized_search_row(row) for row in rows]
+        return search_session_summaries(
+            normalized, query, names=await self._search_names(), limit=limit
         )
 
-        normalized: List[Dict[str, Any]] = []
-        for row in reversed(rows):  # oldest-first for the shared grouper
-            row_id = row[0]
-            meta = json.loads(row[3]) if row[3] else None
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+    async def _search_active_sessions(
+        self, terms: SearchTerms, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Search the active view by walking the sessions table (#2961).
 
-            # Opportunistic per-agent key migration, as in search_history.
-            if needs_migration and self._migrate_on_read:
-                try:
-                    await self._migrate_message(row_id, content, meta)
-                except Exception as e:
-                    logger.warning(
-                        f"Migration failed for message {row_id} in search_sessions: {e}"
-                    )
+        Three reads, each answering the part it is the authority on:
 
-            # Canonical/transport split (#1402): match and snippet against the
-            # raw user turn, never the rendered transport bytes.
-            content, _ = await self._resolve_canonical(
-                row_id, row[1], meta, content, row[5]
+        * the **projection**, paged newest-first exactly as the list pages it,
+          which decides both which sessions exist and what order they come in;
+        * the **membership map**, which says which rows each of those sessions
+          is made of — the grouper's answer, because 473 of Emma's 1,522 live
+          rows carry no ``session_id`` and only gap arithmetic can place them;
+        * the **rows themselves**, decrypted, but only for the sessions the walk
+          actually reaches.
+
+        That last point is what makes this cheaper than the scan it replaces as
+        well as complete: the walk stops at ``limit`` matches, so an ordinary
+        query decrypts a step's worth of rows rather than 5,000. A query that
+        matches nothing does read everything, and that is the honest cost of
+        proving a negative over content no index can see.
+
+        The map is read AFTER the first page, which repairs. The projection is
+        then no newer than the map, so every session the walk can return has its
+        rows in it. The reverse order would leave a conversation written between
+        the two reads listed but unsearchable. A session the map has no entry
+        for — one appended under the walk, or one that exists only as its
+        ``new_session`` marker — can still match on its title, and matches on
+        nothing else; that is the ordinary consequence of reading live data, and
+        it is the same window the list documents.
+        """
+        from .conversation_sessions import (
+            ConversationSessionProjection,
+            live_history_predicate,
+        )
+
+        projection = ConversationSessionProjection(self.db, self.agent_id)
+        names = await self._search_names()
+        membership: Optional[Dict[str, List[Any]]] = None
+        results: List[Dict[str, Any]] = []
+        after: Optional[Tuple[Any, ...]] = None
+
+        while len(results) < limit:
+            page = await self._page_a_whole_projection(
+                projection,
+                limit=self.SEARCH_SESSION_STEP,
+                after=after,
+                refresh=membership is None,
             )
+            if not page:
+                break
+            if membership is None:
+                membership = await self._live_membership()
 
-            cleaned_meta = remove_enc_flag(meta)
-            if cleaned_meta:
-                cleaned_meta.pop('key_version', None)
+            matched: List[Tuple[Dict[str, Any], Optional[str], Dict[str, Any]]] = []
+            for batch in _within_row_budget(
+                page, membership, self.SEARCH_CONTENT_BATCH
+            ):
+                bodies = await self._search_rows(
+                    [
+                        row_id
+                        for row in batch
+                        for row_id in membership.get(row["session_id"], ())
+                    ]
+                )
+                for row in batch:
+                    name = names.get(row["session_id"])
+                    decoration = session_match_decoration(
+                        [
+                            bodies[row_id]
+                            for row_id in membership.get(row["session_id"], ())
+                            if row_id in bodies
+                        ],
+                        name,
+                        terms,
+                    )
+                    if decoration is not None:
+                        matched.append((row, name, decoration))
+                if len(results) + len(matched) >= limit:
+                    break
 
-            normalized.append({
-                "id": row_id,
-                "role": row[1],
-                "content": content,
-                "metadata": cleaned_meta if cleaned_meta else {},
-                "created_at": row[4],
-            })
+            # Previews for the matches only. The list resolves one per listed
+            # session; here most of what the walk looked at is not listed, and
+            # fetching a preview for it would pay the list's cost for rows
+            # nobody is going to see.
+            previews = await self._preview_rows(
+                [
+                    row["first_user_message_id"]
+                    for row, _, _ in matched
+                    if row["first_user_message_id"] is not None
+                ],
+                live_history_predicate(),
+            )
+            for row, name, decoration in matched:
+                session = self._as_listed_session(row, previews)
+                if name is not None:
+                    session["name"] = name
+                session.update(decoration)
+                results.append(session)
+                if len(results) >= limit:
+                    break
 
+            if len(page) < self.SEARCH_SESSION_STEP:
+                break
+            # No `sort_sessions` on the way out, and that is deliberate: these
+            # arrive in the projection's own order, which IS the list's order.
+            # Re-sorting would be a second spelling of it, and a second spelling
+            # is what let search and the list disagree about which session made
+            # the page before (round-8/9 review of #2960).
+            after = session_cursor_values(self._as_listed_session(page[-1], {}))
+        return results
+
+    async def _live_membership(self) -> Dict[str, List[Any]]:
+        """``{session_id: [row id, ...]}`` for this agent's whole live history.
+
+        Unbounded on purpose, and it has to be: a row carrying no ``session_id``
+        belongs to whichever cluster it falls next to, and that is decided by
+        the rows before it. A windowed read would attribute the rows at its edge
+        to sessions that merely look like theirs — which is the failure the
+        5,000-row scan this replaces had, silently.
+
+        The read is the light one — no ``content``, no decryption — and it is
+        the same statement and the same derivation the projection's own
+        transcript pass uses, so a row is in the session here that the
+        projection describes there.
+        """
+        from .conversation_sessions import (
+            TRANSCRIPT_PASS_NOISY_ROWS,
+            live_transcript_sql,
+            transcript_membership,
+        )
+
+        rows = await self.db.fetchall(
+            live_transcript_sql(self.db.backend_type), (self.agent_id,)
+        )
+        # Said out loud for the same reason the projection's transcript pass
+        # says it: a cost that grows with history is the shape this epic exists
+        # to remove, and an operator should hear about it from a log rather than
+        # from a slow pane. #3061 is the fix — stamp the legacy rows and this
+        # map can be read a session at a time from an index.
+        if len(rows) >= TRANSCRIPT_PASS_NOISY_ROWS:
+            logger.warning(
+                "search_sessions: attributing %s's rows to sessions read all "
+                "%d of its live rows, because rows carrying no session id can "
+                "only be placed by reading the transcript in order (#3061). "
+                "Search latency for this agent grows with its history.",
+                self.agent_id,
+                len(rows),
+            )
+        return transcript_membership(rows)
+
+    async def _search_rows(
+        self, message_ids: Sequence[Any]
+    ) -> Dict[Any, Dict[str, Any]]:
+        """``{id: normalized row}`` for the rows a search step has to read.
+
+        By primary key, in batches, scoped to this agent and to the membership
+        the projection describes — so a map entry pointing at a row that has
+        since been deleted or archived resolves to nothing rather than letting a
+        search match content the list no longer shows.
+        """
+        from .conversation_sessions import live_history_predicate
+
+        rows: Dict[Any, Dict[str, Any]] = {}
+        ids = list(message_ids)
+        for start in range(0, len(ids), self.SEARCH_CONTENT_BATCH):
+            batch = ids[start : start + self.SEARCH_CONTENT_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            raw = await self.db.fetchall(
+                "SELECT id, role, content, metadata, created_at, rendered_content "
+                "FROM conversation_history "
+                f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                f"AND {live_history_predicate()}",
+                (self.agent_id, *batch),
+            )
+            for row in raw:
+                rows[row[0]] = await self._normalized_search_row(row)
+        return rows
+
+    async def _normalized_search_row(self, row: Sequence[Any]) -> Dict[str, Any]:
+        """One history row decrypted and canonicalized, as search matches it.
+
+        ``row`` is ``(id, role, content, metadata, created_at,
+        rendered_content)``. Both search paths normalize through here, so the
+        text a query is compared against is the same text whichever path found
+        the row.
+        """
+        row_id, role = row[0], row[1]
+        meta = parse_message_metadata(row[3])
+        content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+
+        # Opportunistic per-agent key migration, as in search_history.
+        if needs_migration and self._migrate_on_read:
+            try:
+                await self._migrate_message(row_id, content, meta)
+            except Exception as e:
+                logger.warning(
+                    f"Migration failed for message {row_id} in search_sessions: {e}"
+                )
+
+        # Canonical/transport split (#1402): match and snippet against the
+        # raw user turn, never the rendered transport bytes.
+        content, _ = await self._resolve_canonical(row_id, role, meta, content, row[5])
+
+        cleaned_meta = remove_enc_flag(meta)
+        if cleaned_meta:
+            cleaned_meta.pop('key_version', None)
+        return {
+            "id": row_id,
+            "role": role,
+            "content": content,
+            "metadata": cleaned_meta if cleaned_meta else {},
+            "created_at": row[4],
+        }
+
+    async def _search_names(self) -> Dict[str, str]:
+        """User-assigned titles, best-effort — they decorate, they never gate."""
         try:
-            names = await self.get_conversation_names()
-        except Exception as e:  # titles are best-effort decoration
+            return await self.get_conversation_names()
+        except Exception as e:
             logger.warning(f"search_sessions: name lookup failed: {e}")
-            names = {}
-
-        return search_session_summaries(normalized, query, names=names, limit=limit)
-
+            return {}
     async def clear_history(self) -> None:
         """Soft-delete every live message for this agent (#763).
 
@@ -3212,6 +3540,24 @@ class AsyncConversationStore:
         :func:`group_messages_into_sessions`, so the agent's
         ``list_conversations`` tool and the UI never disagree on where one
         conversation ends and the next begins.
+
+        **Audited under #2961 and deliberately left on the grouper.** It has no
+        table to read, for two independent reasons, and neither is fixed by
+        pointing it at one:
+
+        * its membership is not the projection's. The read below excludes only
+          *deleted* rows, so an archived conversation is in this list and is not
+          in ``conversation_sessions`` — and with ``include_trashed`` the
+          membership is Trash, which nothing projects.
+        * it has no horizon to remove. The read is unbounded (``limit`` bounds
+          the sessions returned, not the rows examined), so the defect #2948 was
+          filed about — a fixed row window putting 34% of conversations out of
+          reach — was never present here.
+
+        That the agent's list mixes archived conversations in with active ones
+        while the UI's does not is a real difference between the two surfaces.
+        It is a question about what this tool should show, not about where it
+        should read from, so it is named here rather than changed in passing.
 
         Args:
             limit: maximum number of sessions to return, most-recent first.

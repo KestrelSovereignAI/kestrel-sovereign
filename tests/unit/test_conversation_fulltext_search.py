@@ -466,3 +466,37 @@ def test_conversations_endpoint_without_q_lists_normally():
         assert body["next_cursor"] is None
     finally:
         _restore_app(app, original)
+
+
+def test_conversations_endpoint_q_refuses_while_the_index_is_building():
+    """503, not 500 and not an empty result set (#2961).
+
+    Search walks the same session index the list pages, so it refuses on the
+    same condition. The failure mode this rules out is the quiet one: a partial
+    index holds the OLDEST sessions, so answering from it reports "no matches"
+    for a conversation that matches — a wrong answer wearing the shape of a
+    right one.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    async def not_ready(agent_id, query, limit=20, view="active"):
+        raise ProjectionNotReady("still walking")
+
+    storage = MagicMock()
+    storage.agent_id = "agent-1"
+    storage.encryption_enabled = False
+    storage.search_conversations = not_ready
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        client = TestClient(app)
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            resp = client.get(
+                "/api/conversations?q=penguin",
+                headers={"X-API-Key": "test-key"},
+            )
+        assert resp.status_code == 503
+        assert resp.headers["Retry-After"] == "5"
+    finally:
+        _restore_app(app, original)

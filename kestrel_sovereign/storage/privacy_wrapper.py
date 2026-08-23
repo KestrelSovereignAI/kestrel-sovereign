@@ -4324,13 +4324,13 @@ class PrivacyEnforcingStorage:
         Full-text search across conversations, respecting privacy mode.
 
         In EPHEMERAL mode, returns an empty list (no persistent data exposed).
-        In ISOLATED mode, searches the in-memory session buffer.
-        In other modes, delegates to the conversation store, which decrypts
-        client-side and groups hits into session summaries (#2019).
+        In ISOLATED mode, searches the in-memory session buffer. In other modes,
+        delegates to the conversation store, which decrypts client-side —
+        SQL cannot see encrypted content — and answers the active view out of
+        the #2959 projection, the archived one by grouping (#2961).
 
-        Returns newest-first session summary dicts as produced by
-        :func:`~kestrel_sovereign.storage.async_conversation_store.search_session_summaries`
-        (``match_count`` / ``match_role`` / ``match_snippet`` decorated).
+        Returns newest-first session summary dicts decorated with
+        ``match_count`` / ``match_role`` / ``match_snippet``.
         """
         bounded_limit = max(1, min(int(limit), 500))
         if view not in ("active", "archived"):
@@ -4373,9 +4373,24 @@ class PrivacyEnforcingStorage:
         conv_store = getattr(self._storage, "conversation", None)
         if conv_store is None:
             return []
-        return await conv_store.search_sessions(
-            query, view=view, limit=bounded_limit
-        )
+        # Leased for the same reason the list is (#2961): the active view's
+        # search walks the #2959 projection and REPAIRS it on its first step, so
+        # a mode transition landing mid-await would let that repair republish
+        # pre-EPHEMERAL state after the sweep had cleared it. The archived view
+        # writes nothing, but it is served by the same call, and a lease taken
+        # over both is one rule rather than a branch that has to be kept in step
+        # with which view repairs.
+        if not self._acquire_session_projection_lease():
+            logger.debug(
+                "search_conversations blocked: ephemeral mode returns no data"
+            )
+            return []
+        try:
+            return await conv_store.search_sessions(
+                query, view=view, limit=bounded_limit
+            )
+        finally:
+            self._release_session_projection_lease()
 
     async def query_conversation_start(
         self, message_id: str, agent_id: str
