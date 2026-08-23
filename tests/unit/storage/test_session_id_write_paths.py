@@ -159,6 +159,11 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
             (AGENT, "user", "one", None, None, "2026-01-02T03:04:05"),
             (AGENT, "user", "two", None, None, "2026-01-02T05:04:05Z"),
             (AGENT, "user", "three", None, None, "2026-01-02 07:04:05+01:00"),
+            # A spelling PYTHON reads and SQLite's `julianday` does not. It is
+            # here because ordering the restore in SQL filed it as undatable and
+            # renumbered it first, while the Python pass a moment later dated it
+            # perfectly well — two parsers, one column (#3049).
+            (AGENT, "user", "basic", None, None, "20260102T040405"),
             (AGENT, "user", "four", None, None, "an older kestrel's idea"),
         ],
     )
@@ -172,7 +177,7 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
     await target.initialize()
     try:
         stats = await target.restore_from_backup_blob(blob)
-        assert stats["messages_restored"] == 4
+        assert stats["messages_restored"] == 5
         assert stats.get("messages_with_unreadable_created_at", 0) == 1, (
             "the row nothing could date was not reported to the caller"
         )
@@ -192,19 +197,46 @@ async def test_a_restore_writes_one_timestamp_spelling_whatever_the_backup_held(
                 f"restored created_at {value!r} is not the canonical form"
             )
         # The offset is APPLIED, not discarded: 07:04:05+01:00 is 06:04:05 UTC.
-        # Asserted by membership rather than by position, because the restore
-        # SELECTs `ORDER BY created_at, id` over the source's raw TEXT — where a
-        # space sorts before `T`, so the offset row is re-numbered FIRST and the
-        # restored order is not the order it was written in. That is worth
-        # knowing on its own: the restore re-sorts on a column whose spelling it
-        # is in the middle of normalising.
         assert "2026-01-02 06:04:05" in restored, restored
-        # NOT asserted here: that `restored` is sorted. It is not, and the
-        # reason is the re-sort described above — `sorted(restored) ==
-        # restored` fails on this very corpus. Normalising before ordering
-        # would fix it, but that decides what a restore's ordering MEANS for a
-        # backup whose ids and stamps disagree, which is a question of its own
-        # and is filed as #3049 rather than settled in passing here.
+        # ...and it lands in the right PLACE, which is #3049. New ids are
+        # assigned in the order this SELECT returns and
+        # `get_conversation_history()` sorts by id, so that ordering IS the
+        # restored transcript's reading order. Ordering by the source's raw
+        # text put the 07:04+01:00 row first — a space sorts before `T` — so
+        # the transcript came back 06:04, 03:04, 05:04. Normalising the stamp
+        # before ordering is not a new decision about what a restore means: it
+        # is the order `canonical_order` already defines, applied to a file
+        # that has earned none of the guarantees the live column's CHECK gives.
+        assert restored == sorted(restored), (
+            f"the restored transcript is not in chronological order: {restored}"
+        )
+        # The undatable row sorts FIRST, which is the answer `canonical_order`
+        # gives — undatable means earliest, always.
+        #
+        # Asserted by WHICH ROW is first, not by the stamp at index 0: sorting
+        # it last is also chronological (it would take its PREDECESSOR's stamp
+        # instead, 06:04:05, and the list would still be ordered), so a stamp
+        # assertion passes either way and proves nothing. Placement is the
+        # claim, and the consequence is which neighbour it inherits from.
+        placed = [
+            row[0] for row in await target.db.fetchall(
+                "SELECT content FROM conversation_history WHERE agent_id = ? "
+                "ORDER BY id", (AGENT,),
+            )
+        ]
+        assert placed[0] == "four", (
+            f"the undatable row should sort first, got order {placed}"
+        )
+        assert restored[0] == "2026-01-02 03:04:05", (
+            "...having taken its SUCCESSOR's stamp, since a row ordered first "
+            "has no predecessor and never can acquire one"
+        )
+        # ...and the basic-ISO row is dated, not filed as undatable: it sits in
+        # its own place in the sequence rather than at the front.
+        assert "2026-01-02 04:04:05" in restored, restored
+        assert restored.index("2026-01-02 04:04:05") > restored.index(
+            "2026-01-02 03:04:05"
+        ), restored
     finally:
         await target.close()
 
