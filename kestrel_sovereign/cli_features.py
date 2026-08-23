@@ -81,9 +81,9 @@ NON_CONTINUABLE_CORE = {
         "run stale code. Resolve the checkout (or pass --allow-dirty)"
     ),
     CORE_UNRESOLVED: (
-        "core is the declared install, but its dependencies do not resolve, so "
-        "a restart would bring agents up on a core they cannot load. Fix the "
-        "version conflict and re-run"
+        "core is the declared install, but the pass that validates its "
+        "dependencies did not complete, so a restart could bring agents up on "
+        "a core they cannot load. Resolve what failed and re-run"
     ),
 }
 
@@ -1178,17 +1178,32 @@ class InstallSequenceResult(subprocess.CompletedProcess):
         self.total = total
 
     @property
-    def resolve_refused(self) -> bool:
-        """Did the CLOSING resolve of a multi-pass sequence refuse?
+    def resolve_incomplete(self) -> bool:
+        """Did a multi-pass sequence end without its closing resolve succeeding?
 
-        False for a single-command install (nothing had been written yet, so a
-        failure is an ordinary failed install) and for every earlier pass. A
-        killed process never reaches this class at all — the timeout path
+        Not "did the last pass refuse". The environment is in the SAME state
+        whether the closing resolve refused or an earlier pass stopped the
+        sequence before it ran: the ``--no-deps`` pass has written an artifact
+        and nothing has validated what it declares. Asking only about the last
+        pass missed the second case entirely.
+
+        Pass 1 is exempt — it fails before anything is written, so that is an
+        ordinary failed install over an environment still intact — and so is a
+        single-command sequence, which is pass 1 and nothing else.
+
+        Deliberately conservative where it cannot tell: a ``--no-deps`` pass
+        that fails after a pass 1 which really did resolve leaves a fine
+        environment, and this reports it anyway, because the exit code cannot
+        distinguish that from a pass 1 that no-oped. The costs are not
+        symmetric — a false positive costs a re-run, a false negative restarts
+        a fleet onto a core it cannot load.
+
+        A killed process never reaches this class at all — the timeout path
         builds a plain :class:`~subprocess.CompletedProcess`
         (:func:`_killed_process`) — which is how "a bound ended it" stays
-        distinct from "the resolver said no".
+        distinct from "the sequence did not finish".
         """
-        return self.returncode != 0 and self.total > 1 and self.index == self.total - 1
+        return self.returncode != 0 and self.total > 1 and self.index > 0
 
 
 def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedProcess:
@@ -1309,9 +1324,9 @@ class CoreGuardOutcome:
             # before that changes nothing and reads as the command being wrong.
             return (
                 f"RESTORED, DEPENDENCIES UNRESOLVED — {CORE_DISTRIBUTION} is "
-                "back from its declared source, but resolving its dependencies "
-                f"was refused. Fix the conflict below, then run `{self.command}`"
-                f"{where} by hand."
+                "back from its declared source, but the pass that validates "
+                "its dependencies did not complete. Resolve what failed below, "
+                f"then run `{self.command}`{where} by hand."
             )
         if not self.attempted:
             # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
@@ -1718,7 +1733,7 @@ class CoreInstallGuard:
         # final resolving pass refused leaves a host that is off neither its
         # declared source nor able to load — reporting it by core's location
         # alone downgrades the stronger fact to the weaker one.
-        unresolved = restored and getattr(result, "resolve_refused", False)
+        unresolved = restored and getattr(result, "resolve_incomplete", False)
         ok = restored and not unresolved
         if restored:
             # Core is where the policy wants it: that is the state this batch
@@ -2172,20 +2187,21 @@ def cmd_feature_sync(args) -> int:
             if (
                 is_core
                 and guard.conforms_now()
-                and getattr(result, "resolve_refused", False)
+                and getattr(result, "resolve_incomplete", False)
             ):
                 # Core reached its declared source and version — so
                 # `conforms_now()` is True and says nothing about whether the
-                # host can LOAD it. The pass that resolves core's dependencies
-                # refused, which is a core state a restart must not proceed
-                # over; leaving it as the generic package `1` let
-                # `--continue-on-error` restart the fleet onto it (#3047).
+                # host can LOAD it. The sequence ended without the pass that
+                # validates core's dependencies succeeding, which is a core
+                # state a restart must not proceed over; leaving it as the
+                # generic package `1` let `--continue-on-error` restart the
+                # fleet onto it (#3047).
                 core_state = _worst_rc(core_state, CORE_UNRESOLVED)
                 print(
-                    "      note: core is the declared install, but its "
-                    "dependencies do not resolve — the rest of this batch is "
-                    "skipped and a restart must not proceed. Fix the conflict "
-                    "above, then re-run."
+                    "      note: core is the declared install, but the pass "
+                    "that validates its dependencies did not complete — the "
+                    "rest of this batch is skipped and a restart must not "
+                    "proceed. Resolve what failed above, then re-run."
                 )
                 break
             if is_core and not guard.conforms_now():

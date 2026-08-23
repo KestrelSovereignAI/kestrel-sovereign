@@ -1271,36 +1271,47 @@ def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
 # AFTER core was already home.
 
 
-def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
+def test_a_repair_whose_write_pass_failed_is_not_a_failed_restore(
     monkeypatch, capsys
 ):
-    """pip's repair is two passes, and the first one can restore core.
+    """Core is home, so this is never RESTORE FAILED — but it is not clean either.
 
     `--upgrade` installs the declared wheel over the editable link; the
     `--no-deps` pass that follows only has to displace it. When THAT pass
     fails — a dropped connection, a build error — the installer exits nonzero
-    over a core that already conforms. Reading the exit code sends the
-    operator to run a restore that has happened, and fails the HTTP install of
-    a host that is fine.
+    over a core that already conforms. Reading the exit code sends the operator
+    to run a restore that has happened, and fails the HTTP install of a host
+    that is fine. That much is unchanged.
 
-    Core starts at 0.51.0, OUTSIDE the declared `>=0.52,<0.53`, because pass 1
-    is deliberately non-forcing (see `_install_commands`): it only writes when
-    the installed version does not already satisfy the spec. A same-version
-    source switch no-ops in pass 1 by design — that is the case pass 2 exists
-    for, and modelling it as a write would assert the opposite of what the
+    What changed with the closing resolve (#3047) is what the failure LEAVES:
+    the sequence stops at pass 2, so the pass that validates core's
+    dependencies never runs. Pass 1 may have resolved them — here it did, core
+    starts at 0.51.0 so it genuinely wrote — but on a same-version switch pass
+    1 no-ops and an exit code cannot tell the two apart. So this reports
+    CORE_UNRESOLVED rather than a continuable 1: a false positive costs a
+    re-run, a false negative restarts a fleet onto a core it cannot load.
+
+    Core starts OUTSIDE the declared `>=0.52,<0.53` because pass 1 is
+    deliberately non-forcing (see `_install_commands`): it only writes when the
+    installed version does not already satisfy the spec. Modelling a
+    same-version switch as a write would assert the opposite of what the
     production code documents.
     """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
     venv, guard = _pypi_core_guard(
-        monkeypatch, repair_last_pass_fails=True, core_version="0.51.0",
+        monkeypatch, core_write_pass_fails=True, core_version="0.51.0",
     )
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
 
-    assert guard.verify() == 1  # the swap happened, so it is still reported...
+    assert guard.verify() == CORE_UNRESOLVED
 
     err = capsys.readouterr().err
-    assert "restored:" in err  # ...but as one that was put back
+    # Never RESTORE FAILED: that tells the operator to re-run a restore that
+    # has already happened, which is the mistake this test was written for.
     assert "RESTORE FAILED" not in err
-    assert len(venv.commands) == 2  # both passes ran...
+    assert "RESTORED, DEPENDENCIES UNRESOLVED" in err
+    assert len(venv.commands) == 2  # the sequence stopped at the write pass...
     assert venv.editable.get(CORE) is None  # ...and core is the declared wheel
     assert venv.installed[CORE] == "0.52.0"
     assert guard.verify() == 0  # nothing left to report on a second look
@@ -1401,18 +1412,23 @@ def test_a_core_switch_whose_dependencies_do_not_resolve_is_not_continuable(
     assert rc == CORE_UNRESOLVED
     # Non-continuable, and it says which of the three core states it is.
     assert core_state_refusal(rc) is not None
-    assert "dependencies do not resolve" in out
+    assert "validates its dependencies did not complete" in out
     # The rest of the batch did not run against it.
     assert "kestrel-feature-voice" not in venv.installed
 
 
-def test_only_the_closing_pass_of_a_multi_pass_install_is_a_refused_resolve():
+def test_an_install_sequence_that_stops_after_writing_is_unresolved():
     """Position, not argv shape — asserted on every axis it turns on.
 
     The closing pass of a pip source switch and the only pass of an ordinary
     install are the SAME command, so reading the argv called every failed
-    install a refused resolve. What separates them is that one ran after two
-    passes had already changed the environment.
+    install a refused resolve. What separates them is that one ran after a pass
+    had already changed the environment.
+
+    And the question is whether the closing resolve SUCCEEDED, not whether the
+    last pass refused: a `--no-deps` pass that writes the artifact and then
+    fails stops the sequence before the resolve runs, leaving exactly the state
+    this exists to catch.
     """
     import subprocess as sp
 
@@ -1427,16 +1443,17 @@ def test_only_the_closing_pass_of_a_multi_pass_install_is_a_refused_resolve():
 
     # The pip switch's third pass: the artifact is already written, and this is
     # the pass that resolves what it declares.
-    assert result(1, 2, 3).resolve_refused is True
-    # The `--no-deps` pass: it resolves nothing, so its failure says nothing.
-    assert result(1, 1, 3).resolve_refused is False
+    assert result(1, 2, 3).resolve_incomplete is True
+    # The `--no-deps` pass: it WROTE the artifact and then stopped the
+    # sequence, so the resolve that validates it never ran.
+    assert result(1, 1, 3).resolve_incomplete is True
     # The opening resolve: it failed before anything moved — an ordinary
     # failure over an environment still intact.
-    assert result(1, 0, 3).resolve_refused is False
+    assert result(1, 0, 3).resolve_incomplete is False
     # A single-command install (uv's scoped switch, or any ordinary install).
-    assert result(1, 0, 1).resolve_refused is False
-    # Success is not a refusal.
-    assert result(0, 2, 3).resolve_refused is False
+    assert result(1, 0, 1).resolve_incomplete is False
+    # The whole sequence succeeded.
+    assert result(0, 2, 3).resolve_incomplete is False
 
 
 @pytest.mark.parametrize("core_rc", sorted(cli_features.NON_CONTINUABLE_CORE))
@@ -1460,6 +1477,40 @@ def test_every_gate_returns_a_core_state_verbatim(
     )
 
     assert cli.cmd_feature_sync(_args(manifest)) == core_rc
+
+
+def test_a_core_switch_that_stops_at_the_write_pass_is_not_continuable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The sequence can end BEFORE the closing resolve, and it is the same state.
+
+    Asking only whether the LAST pass refused missed this entirely: the
+    `--no-deps` pass writes the artifact and then fails, so the pass that
+    validates what it declares never runs. Core conforms, nothing reported a
+    dependency problem, and `--continue-on-error` would restart the fleet onto
+    an artifact nothing had resolved.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(
+        core_write_pass_fails=True, core_version="0.51.0", feature_requires=">=0.52",
+    )
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert venv.installed[CORE] == "0.52.0"      # pass 1 landed the declared core
+    assert len(venv.commands) == 2               # ...and pass 2 stopped the run
+    assert rc == CORE_UNRESOLVED
+    assert "validates its dependencies did not complete" in out
+    assert "kestrel-feature-voice" not in venv.installed
 
 
 def test_an_ordinary_failed_feature_install_stays_continuable(
