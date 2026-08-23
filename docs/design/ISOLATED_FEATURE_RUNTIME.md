@@ -433,8 +433,13 @@ Tool results and spawn-history records finalized from routing absence carry
 
 For cascade results, `runtime_already_absent` and
 `hosted_runtime_configured` describe the named child when its no-op state is
-known. Core omits both fields when mixed descendant outcomes cannot be scoped
-unambiguously to that child.
+known. Descendant-only no-op outcomes never populate those named-child fields;
+Core omits both when the named child has no independently scoped no-op state.
+For a removed named child, `runtime_cleanup_state` likewise uses only its own
+no-op outcome and otherwise reports `removed`, regardless of descendant state.
+When retained and no-op outcomes coexist, the backward-compatible
+`runtime_custody_code` names the stronger retained outcome and
+`runtime_custody_codes` lists both facts for operator reconciliation.
 
 Core-created standalone feature, workspace, and channel-artifact directories
 are private `0700`; a pre-existing storage parent (including process CWD) is

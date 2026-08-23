@@ -215,12 +215,6 @@ def _termination_partial_result(
         for item in not_performed
         if isinstance(getattr(item, "metadata", None), dict)
     }
-    if len(no_op_states) > 1:
-        no_op_cleanup_state = "mixed"
-    elif no_op_states:
-        no_op_cleanup_state = next(iter(no_op_states))
-    else:
-        no_op_cleanup_state = None
     named_child_no_op_states = {
         str(item.metadata.get("runtime_cleanup_state"))
         for item in not_performed
@@ -230,8 +224,6 @@ def _termination_partial_result(
     }
     if len(named_child_no_op_states) == 1:
         scoped_no_op_state = next(iter(named_child_no_op_states))
-    elif not named_child_no_op_states and len(no_op_states) == 1:
-        scoped_no_op_state = next(iter(no_op_states))
     else:
         scoped_no_op_state = None
     custody_unknown = any(
@@ -299,7 +291,7 @@ def _termination_partial_result(
             if not named_child_removed
             else cleanup_state
             if retained
-            else no_op_cleanup_state or "removed"
+            else scoped_no_op_state or "removed"
         )
     else:
         # This is the compatibility stop contract: no runtime cleanup was
@@ -366,7 +358,14 @@ def _termination_partial_result(
     if not_performed:
         data["not_performed_outcome_count"] = len(not_performed)
         data["not_performed_agents"] = not_performed_agents
-        data["runtime_custody_code"] = "runtime_offboarding_not_performed"
+        not_performed_code = "runtime_offboarding_not_performed"
+        if retained:
+            data["runtime_custody_codes"] = [
+                "runtime_offboarding_retained",
+                not_performed_code,
+            ]
+        else:
+            data["runtime_custody_code"] = not_performed_code
         if scoped_no_op_state is not None:
             data["runtime_already_absent"] = (
                 scoped_no_op_state == "already_absent"
@@ -424,6 +423,17 @@ def _termination_partial_result(
             "performed no secure runtime offboarding. Runtime retention and "
             "deletion are unknown until operator reconciliation confirms "
             "custody. Do not retry termination."
+        )
+    elif retained and not_performed:
+        retained_state = (
+            "is still pending for" if cleanup_pending else "was retained for"
+        )
+        custody_message = (
+            f"Secure runtime custody {retained_state} "
+            f"{', '.join(retained_agents)}, and runtime cleanup was not "
+            f"performed for {', '.join(not_performed_agents)}. Do not retry "
+            "termination; an operator must reconcile the retained tree and "
+            "the remaining no-op custody outcomes."
         )
     elif not_performed and scoped_no_op_state == "already_absent":
         custody_message = (
