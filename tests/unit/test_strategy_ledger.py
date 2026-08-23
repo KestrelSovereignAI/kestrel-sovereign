@@ -1688,6 +1688,44 @@ class TestTheIndexHasAConsumer:
         assert result.status.value == "ok"
 
     @pytest.mark.asyncio
+    async def test_a_failed_label_repair_stays_visible(self, tmp_path):
+        """The repair can fail, and then the stale label is still out there.
+
+        /api/memories serves GraphNode.label directly, so a repair that did
+        not land leaves that consumer on obsolete text. Comparing only the
+        properties would certify the index clean over it. This is reportable
+        precisely because the projection can now fix it -- a reproject clears
+        it, so it is a divergence rather than a permanent alarm.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the original wording")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        # A pre-patch projection: properties moved on, the label did not.
+        node.properties["text"] = "the corrected wording"
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["pattern"] = "the corrected wording"
+        feature._ledger.save()
+        # ...and the repair cannot land.
+        graph._fail_on = PATTERN_NODE_TYPE
+        await feature._reindex_ledger()
+        assert graph.nodes[node.node_id].label == "the original wording"
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial", (
+            "a consumer is still being served the old wording"
+        )
+        assert result.data["drifted_count"] == 1
+
+        # And a successful reprojection clears it -- not a permanent alarm.
+        graph._fail_on = None
+        await feature._reindex_ledger()
+        assert (await feature.recall_patterns()).status.value == "ok"
+
+    @pytest.mark.asyncio
     async def test_the_common_path_still_refuses_to_clobber(self, tmp_path):
         """The label refresh must not become the ordinary write.
 

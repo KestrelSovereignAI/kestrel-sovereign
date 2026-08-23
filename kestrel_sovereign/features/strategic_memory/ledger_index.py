@@ -168,6 +168,10 @@ class LedgerSection:
     def row_id(self, row: Dict[str, Any]) -> str:
         return _row_id(row, self.minter)
 
+    def expected_label(self, row: Dict[str, Any]) -> str:
+        """The label the projection writes for this row."""
+        return _label(row.get(self.text_key))
+
     def node_properties(self, agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
         """The node's properties, with ``row_id`` normalized to the node's own.
 
@@ -384,7 +388,7 @@ async def _project_section(
         node = GraphNode(
             node_id=node_id,
             node_type=section.node_type,
-            label=_label(row.get(section.text_key)),
+            label=section.expected_label(row),
             properties=properties,
         )
         label_is_stale = existing is not None and existing.label != node.label
@@ -479,6 +483,7 @@ class IndexedRow:
     """What the index actually holds for one projected row."""
 
     status: str
+    label: str
     properties: Dict[str, Any]
 
 
@@ -514,6 +519,14 @@ async def index_membership(
     membership = {
         str((node.properties or {}).get("row_id") or ""): IndexedRow(
             status=str((node.properties or {}).get("status") or ""),
+            # The STORED label, not a derived one. /api/memories serves this
+            # column directly, so a repair that failed leaves that consumer on
+            # obsolete text while the properties match -- and a check reading
+            # only the properties would certify it (#3064). Reporting it is
+            # honest now precisely because the projection can fix it: before
+            # add_node was used for a moved label, this would have been a
+            # permanent alarm no restart could clear.
+            label=str(node.label or ""),
             properties=dict(node.properties or {}),
         )
         for node in nodes

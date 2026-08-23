@@ -1264,7 +1264,10 @@ class StrategicMemoryFeature(Feature):
             expected = section.expected_properties(agent_id, row)
             if str(expected.get("status") or "") != indexed.status:
                 misfiled.add(row_id)
-            elif expected != indexed.properties:
+            elif (
+                expected != indexed.properties
+                or section.expected_label(row) != indexed.label
+            ):
                 drifted.add(row_id)
 
         if not (missing or orphaned or misfiled or colliding or drifted):
