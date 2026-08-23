@@ -37,7 +37,7 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
-from .conversation_created_at import created_at_bind, fill_undatable
+from .conversation_created_at import canonical_sql, created_at_bind, fill_undatable
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
@@ -2686,12 +2686,32 @@ class AsyncStorage:
                         + ", created_at"
                         + (", deleted_at" if has_deleted_at else ", NULL AS deleted_at")
                         + " FROM conversation_history"
+                        # Ordered by the stamp NORMALISED, not by the text the
+                        # backup happens to hold (#3049). New ids are assigned
+                        # in this order and `get_conversation_history()` sorts
+                        # by id, so this ordering IS the restored transcript's
+                        # reading order.
+                        #
+                        # #3009 dropped `julianday` from the live read paths
+                        # because the column's CHECK guarantees one spelling
+                        # there. A BACKUP has earned no such guarantee: it is a
+                        # file, written by some older kestrel or an import, and
+                        # a space (0x20) sorts before `T` (0x54) — so
+                        # `'2026-01-02 07:04:05+01:00'` compared LESS than
+                        # `'2026-01-02T03:04:05'` and an hour-later row was
+                        # renumbered first. Measured on exactly that corpus:
+                        # the transcript came back 06:04, 03:04, 05:04.
+                        #
+                        # A row nothing can date sorts FIRST, which is the same
+                        # answer `canonical_order` gives — undatable means
+                        # earliest, always — and it is deterministic rather
+                        # than left to whatever the raw text did.
+                        #
                         # Tie-break on the original row id: created_at is often
                         # second-granularity, so same-second turns must keep
-                        # their original order — new ids are assigned in this
-                        # order and get_conversation_history() sorts by id, so a
-                        # tie here would swap user/assistant turns (codex P2).
-                        + " ORDER BY created_at, id"
+                        # their original order, and a tie here would swap
+                        # user/assistant turns (codex P2).
+                        + f" ORDER BY {canonical_sql('sqlite', 'created_at')}, id"
                     )
                     conversations = await cursor.fetchall()
 
