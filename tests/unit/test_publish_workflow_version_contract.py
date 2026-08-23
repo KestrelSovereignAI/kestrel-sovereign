@@ -15,14 +15,22 @@ ROOT = Path(__file__).resolve().parents[2]
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
 
 
-def _version_check_script() -> str:
+def _build_job() -> dict[str, object]:
     workflow = yaml.safe_load(PUBLISH_WORKFLOW.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["build"]["steps"]
+    return workflow["jobs"]["build"]
+
+
+def _version_check_step() -> dict[str, object]:
+    steps = _build_job()["steps"]
     return next(
-        step["run"]
+        step
         for step in steps
         if step.get("name") == "Verify the version metadata matches the tag"
     )
+
+
+def _version_check_script() -> str:
+    return _version_check_step()["run"]
 
 
 def _run_version_check(release_ref: str) -> subprocess.CompletedProcess[str]:
@@ -72,3 +80,20 @@ def test_manual_publish_input_is_described_as_a_release_tag() -> None:
 
     assert "Release tag to publish" in workflow_text
     assert "Tag or commit to publish" not in workflow_text
+
+
+def test_version_check_runs_for_tag_pushes_and_manual_dispatches() -> None:
+    step = _version_check_step()
+
+    assert "if" not in step
+    assert step["env"]["RELEASE_REF"] == "${{ inputs.ref || github.ref_name }}"
+
+
+def test_build_checks_out_the_same_release_ref_that_is_verified() -> None:
+    checkout = next(
+        step
+        for step in _build_job()["steps"]
+        if step.get("name") == "Checkout"
+    )
+
+    assert checkout["with"]["ref"] == "${{ inputs.ref || github.ref }}"
