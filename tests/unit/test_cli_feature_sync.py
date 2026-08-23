@@ -1439,6 +1439,29 @@ def test_only_the_closing_pass_of_a_multi_pass_install_is_a_refused_resolve():
     assert result(0, 2, 3).resolve_refused is False
 
 
+@pytest.mark.parametrize("core_rc", sorted(cli_features.NON_CONTINUABLE_CORE))
+def test_every_gate_returns_a_core_state_verbatim(
+    monkeypatch, fake_registry, tmp_path, capsys, core_rc
+):
+    """A gate that hand-compares one code is a hole the next code falls through.
+
+    Every place that asks "may I continue past this" must reach the same
+    answer, so each is driven with EVERY non-continuable code rather than with
+    the one it was written for. That is what a table buys: adding a code and
+    adding a gate are caught by the same check. `feature upgrade`'s gate has
+    the same test in test_cli_feature_upgrade.py, where its fixtures live.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = FakeUv(feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        cli_features.CoreInstallGuard, "verify", lambda self: core_rc,
+    )
+
+    assert cli.cmd_feature_sync(_args(manifest)) == core_rc
+
+
 def test_an_ordinary_failed_feature_install_stays_continuable(
     monkeypatch, fake_registry, tmp_path, capsys
 ):

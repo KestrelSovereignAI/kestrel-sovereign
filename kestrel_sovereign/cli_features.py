@@ -714,11 +714,12 @@ def cmd_feature_upgrade(args) -> int:
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
         # Detection half: an upgrade that bypassed the pin can't leave the
-        # command reporting success over a replaced core. CORE_UNSAFE is
-        # returned verbatim rather than folded into rc — see verify().
+        # command reporting success over a replaced core. A core state is
+        # returned verbatim rather than folded into rc — see verify() — and the
+        # set of them lives in `core_state_refusal`, not in a comparison here.
         core_rc = guard.verify()
-        if core_rc == CORE_UNSAFE:
-            return CORE_UNSAFE
+        if core_state_refusal(core_rc):
+            return core_rc
         if core_rc:
             rc = 1
     return rc
@@ -2218,16 +2219,17 @@ def cmd_feature_sync(args) -> int:
         # Constraints prevent the common swap; this catches every other path
         # (a feature's own build step, a direct pip call) so sync can never
         # report success over a core that was replaced (issue #2949).
-        # CORE_UNSAFE is returned verbatim — `kestrel update` gates its restart
-        # on this rc under --continue-on-error exactly as reconcile does, so
-        # collapsing it into 1 would reopen the same hole one step earlier.
-        #
         # `verify()` is a second reading of CORE state, so it is RANKED against
         # the first rather than assigned over it — a repaired-core `1` must not
         # erase a CORE_STALE recorded by the pull above.
         core_state = _worst_rc(core_state, guard.verify())
-        if core_state == CORE_UNSAFE:
-            return CORE_UNSAFE
+    # No gate here, deliberately: `_RC_SEVERITY` already ranks every core state
+    # above a package failure, so the fold below returns the core state
+    # verbatim and `kestrel update` gates its restart on it exactly as
+    # reconcile does. An `if core_state == ...: return core_state` in front of
+    # this is dead — it was, and a mutation test that could not kill it is what
+    # said so. The ranking is the mechanism; a comparison beside it is a second
+    # place to forget a code.
     return _worst_rc(core_state, package_rc)
 
 
