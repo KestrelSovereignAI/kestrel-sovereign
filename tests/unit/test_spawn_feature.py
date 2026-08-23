@@ -1921,22 +1921,6 @@ class TestSpawnFeatureWithManager:
         assert len(feature._child_results) == 0
 
 
-class TestSpawnFeatureDefaultPermissions:
-    """Verify default permission levels."""
-
-    def test_spawn_agent_requires_ask(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["spawn_agent"] == "ask"
-
-    def test_delegate_task_defaults_to_allow(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["delegate_task"] == "allow"
-
-    def test_terminate_child_requires_approval_for_destructive_variant(self):
-        feature = _make_spawn_feature()
-        assert feature.default_permissions["terminate_child"] == "always_ask"
-
-
 class TestAgentManagerSpawn:
     """Test AgentManager spawn extensions."""
 

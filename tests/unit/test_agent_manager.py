@@ -1782,6 +1782,127 @@ class TestAgentManagerBasics:
         assert str(tmp_path) not in str(raised.value.detail)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome_kind", "expected_code", "expected_cleanup_state"),
+        (
+            (
+                "retained",
+                "runtime_offboarding_retained",
+                "retained",
+            ),
+            (
+                "not-performed",
+                "runtime_offboarding_not_performed",
+                "already_absent",
+            ),
+            (
+                "grouped-retained",
+                "runtime_offboarding_retained",
+                "retained",
+            ),
+        ),
+    )
+    async def test_delete_endpoint_preserves_custody_409_on_restore_conflict(
+        self,
+        tmp_path,
+        caplog,
+        outcome_kind,
+        expected_code,
+        expected_cleanup_state,
+    ):
+        """A concurrent config writer cannot replace typed custody with 500."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/original"),
+            port=8801,
+            autostart=True,
+        )
+        replacement = LocalAgentConfig(
+            data_dir=Path("agent_data/concurrent-private-registration"),
+            port=8899,
+            autostart=False,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        private_path = tmp_path / "private-runtime" / "credential.json"
+        retained = RuntimeOffboardingRetainedError(
+            agent_name="Hosted",
+            agent_id="did:test:restore-conflict",
+            runtime_path=private_path.parent,
+            cause=OSError(f"private cleanup failure at {private_path}"),
+        )
+        if outcome_kind == "retained":
+            outcome: BaseException = retained
+        elif outcome_kind == "not-performed":
+            outcome = RuntimeOffboardingNotPerformedError(
+                agent_name="Hosted",
+                agent_id="did:test:restore-conflict",
+                cleanup_state="already_absent",
+            )
+        else:
+            outcome = ExceptionGroup(
+                "compound offboarding result",
+                [
+                    retained,
+                    RuntimeError(f"private refund failure at {private_path}"),
+                ],
+            )
+
+        async def conflict_then_fail(_name, **kwargs):
+            admission = kwargs["offboarding_admission"]
+            assert isinstance(admission, RuntimeOffboardingAdmission)
+            assert admission.started is False
+            # A concurrent writer legitimately wins after the endpoint's CAS
+            # removal. Compensation must refuse to overwrite this new row.
+            MultiAgentConfig(agents={"Hosted": replacement}).save(config_path)
+            raise outcome
+
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(
+                return_value="did:test:restore-conflict"
+            ),
+            remove_agent=AsyncMock(side_effect=conflict_then_fail),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+        caplog.set_level(
+            "ERROR",
+            logger="kestrel_sovereign.endpoints.models",
+        )
+
+        with pytest.raises(HTTPException) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value.status_code == 409
+        detail = raised.value.detail
+        assert detail["code"] == expected_code
+        assert detail["runtime_cleanup_state"] == expected_cleanup_state
+        assert detail["persisted_registration_removed"] is False
+        assert detail["persisted_registration_requires_reconciliation"] is True
+        assert str(private_path) not in str(detail)
+        assert "private cleanup failure" not in str(detail)
+        assert "private refund failure" not in str(detail)
+        assert (
+            MultiAgentConfig.from_file(config_path).agents["Hosted"]
+            == replacement
+        )
+        assert "operator reconciliation is required" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_delete_endpoint_restores_registration_when_removal_is_refused(
         self,
         tmp_path,

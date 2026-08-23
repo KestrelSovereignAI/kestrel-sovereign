@@ -533,6 +533,43 @@ def _restore_registration_if_offboarding_not_admitted(
         _restore_persisted_agent_registration(request, rollback)
 
 
+def _restore_registration_for_custody_response(
+    request: Request,
+    admission: Optional[RuntimeOffboardingAdmission],
+    rollback: Optional[tuple[object, str, object]],
+    *,
+    agent_name: str,
+) -> bool:
+    """Best-effort config compensation without replacing a custody response.
+
+    Once the manager has produced a typed runtime-custody outcome, that 409 is
+    the authoritative lifecycle result. A concurrent persisted-config writer
+    can still make the narrow CAS restore unsafe. Preserve the custody result
+    in that case, log the compensation failure for the operator, and mark the
+    response as requiring desired-state reconciliation.
+
+    Only ordinary ``Exception`` failures are converted. Cancellation and
+    other process-control ``BaseException`` outcomes retain their existing
+    propagation semantics.
+    """
+
+    try:
+        _restore_registration_if_offboarding_not_admitted(
+            request,
+            admission,
+            rollback,
+        )
+    except Exception:
+        logger.error(
+            "Could not restore persisted registration after runtime-custody "
+            "outcome for agent %r; operator reconciliation is required",
+            agent_name,
+            exc_info=True,
+        )
+        return True
+    return False
+
+
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
 async def delete_agent(
@@ -610,12 +647,17 @@ async def delete_agent(
         # Shutdown/unpublication succeeded, so this is neither a missing agent
         # nor a generic server failure. Return an explicit custody outcome
         # (pending or retained) without inviting a retry against a dead route.
-        _restore_registration_if_offboarding_not_admitted(
-            request,
-            offboarding_admission,
-            registration_rollback,
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=agent_name,
+            )
         )
         detail = dict(exc.metadata)
+        if registration_requires_reconciliation:
+            detail["persisted_registration_requires_reconciliation"] = True
         if registration_rollback is not None:
             detail["persisted_registration_removed"] = bool(
                 registration_rollback[2] is not None
@@ -626,12 +668,17 @@ async def delete_agent(
     except RuntimeOffboardingNotPerformedError as exc:
         # The agent is gone, but destructive intent did not remove a tree.
         # Preserve the precise no-op state instead of returning a false 200.
-        _restore_registration_if_offboarding_not_admitted(
-            request,
-            offboarding_admission,
-            registration_rollback,
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=agent_name,
+            )
         )
         detail = dict(exc.metadata)
+        if registration_requires_reconciliation:
+            detail["persisted_registration_requires_reconciliation"] = True
         if registration_rollback is not None:
             detail["persisted_registration_removed"] = bool(
                 registration_rollback[2] is not None
@@ -663,11 +710,16 @@ async def delete_agent(
                 registration_rollback,
             )
             raise
-        _restore_registration_if_offboarding_not_admitted(
-            request,
-            offboarding_admission,
-            registration_rollback,
+        registration_requires_reconciliation = (
+            _restore_registration_for_custody_response(
+                request,
+                offboarding_admission,
+                registration_rollback,
+                agent_name=agent_name,
+            )
         )
+        if registration_requires_reconciliation:
+            detail["persisted_registration_requires_reconciliation"] = True
         if registration_rollback is not None:
             detail["persisted_registration_removed"] = bool(
                 registration_rollback[2] is not None

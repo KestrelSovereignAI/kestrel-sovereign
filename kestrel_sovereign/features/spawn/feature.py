@@ -1170,21 +1170,3 @@ class SpawnFeature(Feature):
                 task.cancel()
         self._child_tasks.clear()
         self._child_results.clear()
-
-    @property
-    def default_permissions(self) -> Dict[str, str]:
-        """Default permission levels for spawn tools.
-
-        spawn_agent requires explicit approval (ASK) since it creates new agents.
-        Read/delegation tools default to ALLOW. ``terminate_child`` is
-        ALWAYS_ASK because its explicit ``offboard_runtime`` mode irreversibly
-        deletes tenant state; permission policy is tool-scoped rather than
-        argument-scoped, so auto/demo policy must never promote this gate.
-        """
-        return {
-            "spawn_agent": "ask",
-            "list_children": "allow",
-            "delegate_task": "allow",
-            "get_child_result": "allow",
-            "terminate_child": "always_ask",
-        }

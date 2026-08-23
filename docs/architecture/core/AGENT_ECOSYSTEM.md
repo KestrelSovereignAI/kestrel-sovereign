@@ -152,8 +152,14 @@ Spawn tools use the existing `PermissionLevel` system (`ALLOW/DENY/ASK/ALWAYS_AS
 | Tool | Default | Description |
 |------|---------|-------------|
 | `spawn_agent` | `ASK` | Create ephemeral/persistent child |
-| `delegate_task` | `ALLOW` | Send task to existing child |
+| `delegate_task` | `ASK` | Send task to existing child |
 | `terminate_child` | `ALWAYS_ASK` | Stop a child (runtime retained by default); explicit offboarding is destructive and cannot be auto-promoted |
+
+`terminate_child` is a Core-owned static per-tool rail applied by
+`SecurityFeature` during production tool registration. Registration migrates
+persisted weaker legacy permissions to `ALWAYS_ASK`, and neither global auto
+mode nor the demo-server baseline can downgrade it. The default does not come
+from an instance property on `SpawnFeature`.
 
 ### Implementation
 
