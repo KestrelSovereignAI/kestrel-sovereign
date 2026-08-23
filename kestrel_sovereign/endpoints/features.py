@@ -90,9 +90,21 @@ def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
 
-    for detail in unmet:
-        if f" {CORE_DISTRIBUTION}" in detail:
-            return detail
+    for requirement in unmet:
+        # Canonical identity, not the rendered text: a metadata name keeps
+        # whatever spelling it was written with, so matching on the sentence
+        # misses `Kestrel_Sovereign` and hits `kestrel-sovereign-sdk`.
+        #
+        # `certain` is the documented rule of this surface — "cannot tell" must
+        # not become "cannot load" — and is deliberately not exercised
+        # end-to-end here: an uncertain CORE record needs core's own installed
+        # version to be unparseable, and the guard's shape check fails on that
+        # long before this is asked. The record's contract is pinned at the
+        # helper instead. The manifest gate makes the opposite call on the same
+        # field, and both are right for their consequences.
+        if requirement.name != CORE_DISTRIBUTION or not requirement.certain:
+            continue
+        return requirement.detail
     return None
 
 

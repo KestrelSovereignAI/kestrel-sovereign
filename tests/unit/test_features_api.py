@@ -1625,6 +1625,63 @@ class TestPostRepairRevalidation:
         assert resp.json()["status"] == "installed_with_core_drift"
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_legal_alternate_spelling_of_core_is_still_core(
+        self, mock_registry, monkeypatch,
+    ):
+        """`Requirement.name` keeps whatever spelling the metadata used.
+
+        `Kestrel_Sovereign` and `kestrel-sovereign` are the same distribution
+        to every installer, so a check that reads the rendered sentence misses
+        this one and returns 200 over a core the package cannot accept.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+        monkeypatch.setattr(
+            cli, "_installed_requirements", lambda name: ("Kestrel_Sovereign>=0.53",),
+        )
+
+        with TestClient(
+            _make_app(_make_agent()), raise_server_exceptions=False,
+        ) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500, resp.json()
+        assert "cannot load" in resp.json()["detail"]
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_different_distribution_that_starts_with_cores_name_is_not_core(
+        self, mock_registry, monkeypatch,
+    ):
+        """The mirror image: `kestrel-sovereign-sdk` is not `kestrel-sovereign`.
+
+        Matching on the sentence makes an unmet SDK requirement read as an
+        unmet CORE requirement, and the response then blames the repair for a
+        conflict the repair had nothing to do with.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = FakeUv(
+            feature="kestrel-feature-test", core_checkout="/src/core",
+            honours_constraints=False,
+        )
+        use_fake_uv(monkeypatch, venv)
+        monkeypatch.setattr(
+            cli,
+            "_installed_requirements",
+            lambda name: ("kestrel-sovereign-sdk>=0.99",),
+        )
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        # The core drift is still reported; it is just not blamed for this.
+        assert resp.status_code == 200, resp.json()
+        assert resp.json()["status"] == "installed_with_core_drift"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_core_revalidation_runs_while_the_install_lock_is_held(
         self, mock_registry, monkeypatch,
     ):

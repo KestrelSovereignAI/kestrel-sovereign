@@ -562,9 +562,32 @@ def requirement_applies(req, extras: Tuple[str, ...]) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class UnmetRequirement:
+    """One requirement of a distribution that this venv does not satisfy.
+
+    Carries the requirement's CANONICAL name rather than leaving callers to
+    read it back out of ``detail``: a name in metadata keeps whatever spelling
+    it was written with, so ``Kestrel_Sovereign>=0.53`` and
+    ``kestrel-sovereign-sdk`` are a miss and a false match respectively for
+    anything matching on the rendered text.
+
+    ``certain`` is False when the comparison could not actually be made — a
+    malformed installed version, or a specifier that will not parse. That is a
+    different fact from "this requirement is unmet", and the two callers want
+    opposite things from it: the manifest gate retries (a needless reinstall
+    costs a run), while the install endpoint does not upgrade a successful
+    response to an error over metadata it could not read.
+    """
+
+    name: str
+    detail: str
+    certain: bool = True
+
+
 def unsatisfied_requirements(
     dist_name: str, extras: Tuple[str, ...], requires, installed_version,
-) -> Tuple[str, ...]:
+) -> Tuple[UnmetRequirement, ...]:
     """Every ACTIVE requirement of *dist_name* this venv does not satisfy.
 
     The other half of the question ``present`` has to answer. "Is it the
@@ -589,7 +612,7 @@ def unsatisfied_requirements(
     """
     from packaging.requirements import Requirement
 
-    unmet: List[str] = []
+    unmet: List[UnmetRequirement] = []
     for raw in requires(dist_name) or ():
         try:
             req = Requirement(raw)
@@ -597,18 +620,37 @@ def unsatisfied_requirements(
             continue
         if not requirement_applies(req, extras):
             continue
+        name = canonical_package(req.name)
         have = installed_version(req.name)
         if have is None:
-            unmet.append(
+            unmet.append(UnmetRequirement(
+                name,
                 f"{dist_name} requires {req.name}{req.specifier}, which is "
-                "not installed"
-            )
+                "not installed",
+            ))
             continue
         spec = str(req.specifier)
-        if spec and not version_satisfies(have, spec):
-            unmet.append(
-                f"{dist_name} requires {req.name}{spec}, but {have} is installed"
-            )
+        if not spec:
+            continue
+        # `version_satisfies` fails OPEN by design — it was written for
+        # reporting, where an unevaluable comparison must not manufacture
+        # drift. A gate reading that as "satisfied" is the same failure one
+        # layer up, so the two sides are asked separately and an unevaluable
+        # comparison is reported as unmet-but-uncertain.
+        evaluable = version_is_valid(have) and spec_is_valid(spec)
+        if not evaluable:
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{spec}, and the installed "
+                f"{have!r} cannot be compared against it",
+                certain=False,
+            ))
+            continue
+        if not version_satisfies(have, spec):
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{spec}, but {have} is installed",
+            ))
     return tuple(unmet)
 
 

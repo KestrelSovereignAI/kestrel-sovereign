@@ -2789,6 +2789,81 @@ def test_an_extra_gated_requirement_counts_only_under_that_extra(monkeypatch):
 
     # The unmarked-in-practice one is active either way; the extra-gated one
     # only when the extra is asked for.
-    assert [r for r in without_extras if "sounddevice" in r] == []
-    assert [r for r in without_extras if "anyio" in r] != []
-    assert [r for r in with_extras if "sounddevice" in r] != []
+    assert [r for r in without_extras if r.name == "sounddevice"] == []
+    assert [r for r in without_extras if r.name == "anyio"] != []
+    assert [r for r in with_extras if r.name == "sounddevice"] != []
+
+
+def test_a_requirement_is_matched_by_canonical_identity_not_by_its_spelling(
+    monkeypatch
+):
+    """A metadata name keeps whatever spelling it was written with.
+
+    `Requirement.name` preserves it, so anything matching on the rendered
+    sentence misses `Kestrel_Sovereign>=0.53` and hits `kestrel-sovereign-sdk`
+    — a miss and a false match from the same line of code.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "Kestrel_Sovereign>=0.53",       # legal spelling of core
+        "kestrel-sovereign-sdk>=0.99",   # a DIFFERENT distribution
+    ]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    by_name = {r.name for r in unmet}
+
+    assert "kestrel-sovereign" in by_name        # the odd spelling still counts
+    assert "kestrel-sovereign-sdk" in by_name    # ...as its own distribution
+    # The double declares core's requirement too, so both spellings resolve to
+    # the same distribution — which is the point.
+    core = [r for r in unmet if r.name == "kestrel-sovereign"]
+    assert core and all(r.certain for r in core)
+    assert any("Kestrel_Sovereign" in r.detail for r in core)
+
+
+def test_an_uncomparable_installed_version_is_unmet_but_uncertain(monkeypatch):
+    """`version_satisfies` fails OPEN, and a gate must not inherit that.
+
+    It was written for reporting, where an unevaluable comparison must not
+    manufacture drift. Reading its `True` as "satisfied" makes damaged metadata
+    look fine — the same failure one layer up. The two callers then want
+    opposite things from "cannot tell", which is why it is a field and not a
+    silently-chosen answer.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["anyio>=4"]
+    venv.installed["anyio"] = "not-a-version"
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    anyio = [r for r in unmet if r.name == "anyio"]
+
+    assert len(anyio) == 1
+    assert anyio[0].certain is False
+    assert "cannot be compared" in anyio[0].detail
+
+
+def test_damaged_dependency_metadata_is_retried_rather_than_called_present(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The manifest gate retries what it cannot evaluate; a reinstall is cheap.
+
+    The install endpoint makes the opposite call on the same record, and both
+    are right: there, "cannot tell" must not become an error over a package
+    that may be fine.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(">=0.52")   # core itself is satisfied
+    venv.installed_requires["kestrel-feature-voice"] = ["anyio>=4"]
+    venv.installed["anyio"] = "not-a-version"
+    use_fake_uv(monkeypatch, venv)
+
+    cli.cmd_feature_sync(_args(manifest))
+
+    assert "present" not in capsys.readouterr().out
+    assert venv.commands  # it was retried
