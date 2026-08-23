@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+import traceback
 import types
 import weakref
 import zipfile
@@ -109,7 +110,7 @@ def _clear_process_wide_channel_credentials(monkeypatch):
             if os.environ.get(key) in placeholders:
                 hidden[key] = os.environ.pop(key)
         try:
-            validate_overrides(feature_name, runtime_venv=runtime_venv)
+            return validate_overrides(feature_name, runtime_venv=runtime_venv)
         finally:
             os.environ.update(hidden)
 
@@ -587,7 +588,7 @@ def test_service_command_module_callable(service, tmp_path):
     command = feature._service_command()
 
     assert command[0] == str(isolated_runtime._venv_python(feature._venv_path))
-    assert command[1] == "-I"
+    assert command[1] == "-P"
     assert command[2] == "-B"
     assert command[3] == "-c"
     assert command[4] == (
@@ -682,9 +683,90 @@ def test_hosted_callable_safe_path_blocks_writable_cwd_module_shadowing(
     assert not shadow_marker.exists()
 
 
+def test_hosted_callable_preserves_python_stdio_encoding_contract(
+    monkeypatch,
+    tmp_path,
+):
+    """Safe-path launch must still honor the hosted JSON-RPC encoding knobs."""
+
+    monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    runtime = InstalledFeatureRuntime(
+        class_name="EncodingFeature",
+        entry_point="encoding.feature:EncodingFeature",
+        distribution="encoding-fixture",
+        runtime="isolated-venv",
+        service="encoding_service:main",
+    )
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "agent-encoding"),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    runtime_dir = feature._prepare_runtime_workspace()
+    test_venv = tmp_path / "encoding-venv"
+    _write_real_venv_module(
+        test_venv,
+        "encoding_service",
+        "import sys\ndef main():\n    sys.stdout.write('é')\n",
+    )
+    feature._venv_path = test_venv
+    feature._bin_path = None
+    command = feature._service_command()
+    env = isolated_runtime._isolated_child_env(
+        test_venv,
+        runtime_dir=runtime_dir,
+        hosted=True,
+        feature_name=feature.name,
+        feature_distribution=runtime.distribution,
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=runtime_dir / "work",
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+
+    assert command[1:3] == ["-P", "-B"]
+    assert completed.stdout == b"\xe9"
+    assert completed.stderr == b""
+
+
+def test_hosted_callable_preserves_python_utf8_mode(
+    monkeypatch,
+    tmp_path,
+):
+    """``-P`` must not imply ``-E`` and suppress hosted ``PYTHONUTF8``."""
+
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    venv = Path(sys.executable).parent.parent
+    env = isolated_runtime._isolated_child_env(
+        venv,
+        runtime_dir=tmp_path,
+        hosted=True,
+        feature_name="EncodingFeature",
+        feature_distribution="encoding-fixture",
+    )
+    completed = subprocess.run(
+        isolated_runtime._isolated_python_command(
+            Path(sys.executable),
+            "import sys; print(sys.flags.utf8_mode)",
+        ),
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == "1"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="executable shim is POSIX-only")
-def test_callable_launch_uses_pre_311_compatible_isolated_mode(tmp_path):
-    """Feature interpreters need ``-I`` support, not Python 3.11's ``-P``."""
+def test_callable_launch_uses_sdk_python_safe_path_contract(tmp_path):
+    """The SDK's Python 3.11 contract launches with ``-P`` safe-path mode."""
 
     runtime = InstalledFeatureRuntime(
         class_name="LegacyPythonFeature",
@@ -702,9 +784,9 @@ def test_callable_launch_uses_pre_311_compatible_isolated_mode(tmp_path):
     shim.write_text(
         f"#!{sys.executable}\n"
         "import os, sys\n"
-        "if sys.argv[1] == '-P':\n"
+        "if sys.argv[1] == '-I':\n"
         "    raise SystemExit(91)\n"
-        "if sys.argv[1] != '-I':\n"
+        "if sys.argv[1] != '-P':\n"
         "    raise SystemExit(92)\n"
         f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
     )
@@ -719,9 +801,52 @@ def test_callable_launch_uses_pre_311_compatible_isolated_mode(tmp_path):
         text=True,
     )
 
-    assert command[1] == "-I"
+    assert command[1] == "-P"
     assert command[2] == "-B"
     assert '"legacy": true' in completed.stdout
+
+
+@pytest.mark.asyncio
+async def test_venv_preparation_does_not_block_event_loop(tmp_path):
+    """Fresh callable verification runs in an owned worker, not the host loop."""
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    runtime = InstalledFeatureRuntime(
+        class_name="WorkerFeature",
+        entry_point="worker.feature:WorkerFeature",
+        distribution="worker-feature",
+        runtime="isolated-venv",
+        service="safe.module:main",
+    )
+    feature = ProxyFeature(
+        agent,
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    worker_thread = []
+
+    def blocking_prepare():
+        worker_thread.append(threading.get_ident())
+        started.set()
+        assert release.wait(timeout=2)
+
+    feature.ensure_venv = blocking_prepare
+    preparation = asyncio.create_task(
+        feature._ensure_venv_without_blocking_event_loop()
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
+        assert not preparation.done()
+        assert worker_thread != [threading.get_ident()]
+    finally:
+        release.set()
+        await preparation
 
 
 @pytest.mark.parametrize("hosted", (False, True), ids=("standalone", "hosted"))
@@ -2265,6 +2390,61 @@ def test_hosted_agents_accept_existing_regular_prebuilt_bin_without_venv(
     assert executable.read_text() == "#!/bin/sh\nexit 0\n"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink custody contract")
+def test_hosted_prebuilt_bin_symlink_is_pinned_to_validated_target(
+    monkeypatch,
+    tmp_path,
+):
+    operator_bin = tmp_path / "operator-bin"
+    operator_bin.mkdir()
+    first_target = operator_bin / "whatsapp-service-v1"
+    second_target = operator_bin / "whatsapp-service-v2"
+    for target in (first_target, second_target):
+        target.write_text("#!/bin/sh\nexit 0\n")
+        target.chmod(0o700)
+    public_link = operator_bin / "whatsapp-service"
+    public_link.symlink_to(first_target.name)
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", str(public_link))
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "agent-bin-symlink"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._bin_path == first_target.resolve()
+    public_link.unlink()
+    public_link.symlink_to(second_target.name)
+
+    assert feature._service_command() == [str(first_target.resolve())]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink custody contract")
+def test_hosted_prebuilt_bin_symlink_rejects_mutable_target(
+    monkeypatch,
+    tmp_path,
+):
+    target = tmp_path / "operator-bin" / "mutable-service"
+    target.parent.mkdir()
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o777)
+    public_link = target.with_name("whatsapp-service")
+    public_link.symlink_to(target.name)
+    key = "KESTREL_FEATURE_WHATSAPPFEATURE_BIN"
+    monkeypatch.setenv(key, str(public_link))
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        ProxyFeature(
+            _hosted_postgres_agent(tmp_path / "runtime", "agent-unsafe-bin"),
+            _isolated_runtime(),
+            client_factory=FakeIsolatedClient,
+        )
+
+    diagnostic = raised.value.safe_diagnostic()
+    assert key in diagnostic
+    assert str(tmp_path) not in diagnostic
+
+
 def test_hosted_feature_runtime_identity_ignores_module_and_service_refactors():
     original = InstalledFeatureRuntime(
         class_name="WhatsAppFeature",
@@ -2692,25 +2872,40 @@ def test_migrated_callable_runtime_is_adopted_offline_without_reinstall(
 
 
 @pytest.mark.parametrize(
-    ("service", "installed_module", "source"),
+    ("service", "installed_module", "source", "diagnostic_fragment"),
     (
         (
             "missing_callable_module:main",
             "different_module",
             "def main():\n    return None\n",
+            "callable module is absent",
         ),
         (
             "callable_fixture:main",
             "callable_fixture",
             "def other():\n    return None\n",
+            "callable attribute is absent",
         ),
         (
             "callable_fixture:main",
             "callable_fixture",
             "main = object()\n",
+            "resolves to a non-callable object",
+        ),
+        (
+            "callable_fixture:main",
+            "callable_fixture",
+            "import dependency_that_is_not_installed\n"
+            "def main():\n    return None\n",
+            "host could not complete isolated feature callable verification",
         ),
     ),
-    ids=("missing-module", "missing-attribute", "non-callable-attribute"),
+    ids=(
+        "missing-module",
+        "missing-attribute",
+        "non-callable-attribute",
+        "transitive-import-failure",
+    ),
 )
 def test_callable_target_must_resolve_before_fresh_manifest_stamp(
     monkeypatch,
@@ -2718,6 +2913,7 @@ def test_callable_target_must_resolve_before_fresh_manifest_stamp(
     service,
     installed_module,
     source,
+    diagnostic_fragment,
 ):
     """A successful resolver cannot stamp an unlaunchable callable target."""
 
@@ -2752,11 +2948,64 @@ def test_callable_target_must_resolve_before_fresh_manifest_stamp(
     diagnostic = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
         raised.value
     )
-    assert "Python callable could not be resolved inside its selected venv" in (
-        diagnostic
-    )
+    assert diagnostic_fragment in diagnostic
     assert service not in str(raised.value)
     assert not feature._provision_manifest_path().exists()
+
+
+def test_current_callable_manifest_reverifies_removed_target_without_reinstall(
+    monkeypatch,
+    tmp_path,
+):
+    """A matching fresh stamp cannot hide a callable removed after stamping."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="FreshCallableFeature",
+        entry_point="fresh_callable.feature:FreshCallableFeature",
+        distribution="fresh-callable",
+        runtime="isolated-venv",
+        service="fresh_callable:main",
+        project="fresh-callable",
+    )
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    _write_real_venv_module(
+        feature._venv_path,
+        "fresh_callable",
+        "def main():\n    return None\n",
+    )
+    child_distribution = _child_distribution_probe("4.5.6")
+    feature._probe_sdk_version = Mock(return_value="1.2.3")
+    feature._probe_feature_distribution = Mock(return_value=child_distribution)
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "4.5.6",
+    )
+    feature._write_provision_manifest(
+        runtime.project,
+        "1.2.3",
+        "1.2.3",
+        "4.5.6",
+        child_distribution,
+    )
+    manifest_before = feature._provision_manifest_path().read_bytes()
+    module_path = next(feature._venv_path.rglob("fresh_callable.py"))
+    module_path.unlink()
+    feature._run = Mock(side_effect=AssertionError("fresh venv reinstalled"))
+
+    with pytest.raises(IsolatedRuntimePreparationError) as raised:
+        feature.ensure_venv()
+
+    diagnostic = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+        raised.value
+    )
+    assert "callable module is absent" in diagnostic
+    assert feature._provision_manifest_path().read_bytes() == manifest_before
+    feature._run.assert_not_called()
 
 
 def test_hosted_prebuilt_callable_target_failure_is_actionable_and_read_only(
@@ -2798,7 +3047,7 @@ def test_hosted_prebuilt_callable_target_failure_is_actionable_and_read_only(
     with pytest.raises(IsolatedRuntimePreparationError) as raised:
         feature.ensure_venv()
 
-    assert "Python callable could not be resolved inside its selected venv" in (
+    assert "callable attribute is absent" in (
         isolated_runtime.safe_isolated_runtime_preparation_diagnostic(raised.value)
     )
     assert feature._run.call_count == 0
@@ -2809,6 +3058,94 @@ def test_hosted_prebuilt_callable_target_failure_is_actionable_and_read_only(
         if path.is_file()
     }
     assert after == before
+
+
+def _callable_verification_feature(tmp_path: Path) -> ProxyFeature:
+    runtime = InstalledFeatureRuntime(
+        class_name="CallableVerificationFeature",
+        entry_point="callable_verification.feature:CallableVerificationFeature",
+        distribution="callable-verification",
+        runtime="isolated-venv",
+        service="callable_verification:main",
+    )
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    return feature
+
+
+def test_callable_target_verification_timeout_is_bounded_infrastructure_failure(
+    monkeypatch,
+    tmp_path,
+):
+    feature = _callable_verification_feature(tmp_path)
+    captured = {}
+
+    def timeout(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", timeout)
+
+    with pytest.raises(IsolatedRuntimePreparationError) as raised:
+        feature._verify_launch_artifact()
+
+    diagnostic = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+        raised.value
+    )
+    assert captured["timeout"] == (
+        isolated_runtime._CALLABLE_TARGET_VERIFICATION_TIMEOUT_S
+    )
+    assert 0 < captured["timeout"] <= 30
+    assert captured["stdout"] == subprocess.DEVNULL
+    assert captured["stderr"] == subprocess.DEVNULL
+    assert "bounded startup timeout" in diagnostic
+    assert "absent" not in diagnostic
+    assert "callable_verification" not in diagnostic
+
+
+def test_callable_target_verification_spawn_failure_preserves_host_diagnostic(
+    monkeypatch,
+    tmp_path,
+):
+    feature = _callable_verification_feature(tmp_path)
+
+    def fail_spawn(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, "/private/tenant/secret-python")
+
+    monkeypatch.setattr(isolated_runtime.subprocess, "run", fail_spawn)
+
+    with pytest.raises(IsolatedRuntimePreparationError) as raised:
+        feature._verify_launch_artifact()
+
+    diagnostic = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+        raised.value
+    )
+    assert "file-descriptor capacity" in diagnostic
+    assert "absent" not in diagnostic
+    assert "secret-python" not in diagnostic
+
+
+def test_callable_target_requires_supported_safe_path_interpreter(
+    monkeypatch,
+    tmp_path,
+):
+    feature = _callable_verification_feature(tmp_path)
+    monkeypatch.setattr(
+        isolated_runtime.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 2),
+    )
+
+    with pytest.raises(IsolatedRuntimeConfigurationError) as raised:
+        feature._verify_launch_artifact()
+
+    assert raised.value.safe_diagnostic() == (
+        "isolated Python callable services require a feature interpreter that "
+        "supports the SDK's Python 3.11 safe-path contract"
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")
@@ -3297,6 +3634,39 @@ async def test_optional_preparation_log_is_actionable_with_sanitized_traceback(
     assert len(records) == 1
     assert isinstance(records[0].exc_info[1], IsolatedRuntimePreparationError)
     assert records[0].exc_info[1].__cause__ is None
+
+
+def test_preparation_traceback_filter_rejects_forged_core_module_name(tmp_path):
+    """A dependency cannot retain its source frame by forging ``__name__``."""
+
+    secret = "dependency-source-secret"
+    dependency_path = tmp_path / "forged_dependency.py"
+    source = (
+        "def fail():\n"
+        f"    raise IsolatedRuntimePreparationError({secret!r})\n"
+    )
+    dependency_path.write_text(source)
+    namespace = {
+        "__name__": "kestrel_sovereign.forged_dependency",
+        "IsolatedRuntimePreparationError": IsolatedRuntimePreparationError,
+    }
+    exec(compile(source, str(dependency_path), "exec"), namespace)
+    try:
+        namespace["fail"]()
+    except IsolatedRuntimePreparationError as error:
+        exc_info = (
+            isolated_runtime.sanitized_isolated_runtime_preparation_exc_info(
+                error
+            )
+        )
+    else:  # pragma: no cover - mutation guard
+        pytest.fail("forged dependency did not raise")
+
+    rendered = "".join(traceback.format_exception(*exc_info))
+    assert "agent-scoped runtime could not be prepared" in rendered
+    assert secret not in rendered
+    assert str(dependency_path) not in rendered
+    assert "raise IsolatedRuntimePreparationError" not in rendered
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX custody mode contract")
@@ -5861,7 +6231,7 @@ def test_venv_feature_distribution_probe_preserves_distinct_positive_states(
         )
         == expected
     )
-    assert captured["command"][1:3] == ["-I", "-B"]
+    assert captured["command"][1:3] == ["-P", "-B"]
 
 
 def test_venv_feature_distribution_probe_marks_execution_failure_unverifiable(
@@ -6046,7 +6416,7 @@ def test_venv_sdk_version_uses_canonical_isolated_child_env(monkeypatch, tmp_pat
     monkeypatch.setattr(ir.subprocess, "run", fake_run)
 
     assert ir._venv_sdk_version(python) == "0.35.1"
-    assert captured["command"][1:3] == ["-I", "-B"]
+    assert captured["command"][1:3] == ["-P", "-B"]
     env = captured["env"]
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
@@ -6087,7 +6457,7 @@ def test_hosted_venv_probes_receive_no_host_or_package_secrets(monkeypatch, tmp_
     ) == ir._FeatureDistributionProbe.versioned("1.2.3")
     assert len(captured) == 2
     for command, env in captured:
-        assert command[1:3] == ["-I", "-B"]
+        assert command[1:3] == ["-P", "-B"]
         assert env["HTTP_PROXY"] == "http://proxy.example:8080"
         assert env["VIRTUAL_ENV"] == str(venv)
         assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin")

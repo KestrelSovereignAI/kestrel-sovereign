@@ -68,6 +68,7 @@ from kestrel_sovereign.features.channels.route_ownership import (
 )
 
 logger = logging.getLogger(__name__)
+_CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def canonical_telegram_bot_id(value: object) -> str:
@@ -1977,22 +1978,29 @@ _CHILD_SDK_PROBE = (
     "    return 'unknown'\n"
     "print(v())\n"
 )
-_ISOLATED_PYTHON_MODE_FLAG = "-I"
+_ISOLATED_PYTHON_SAFE_PATH_FLAG = "-P"
 _NO_BYTECODE_FLAG = "-B"
-_CALLABLE_TARGET_VERIFIED_OUTPUT = "kestrel-callable-target-verified-v1"
+_CALLABLE_TARGET_VERIFICATION_TIMEOUT_S = 10.0
+_CALLABLE_TARGET_MISSING_MODULE_EXIT = 40
+_CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT = 41
+_CALLABLE_TARGET_NOT_CALLABLE_EXIT = 42
+_CALLABLE_TARGET_UNVERIFIABLE_EXIT = 43
+_CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT = 44
 
 
 def _isolated_python_command(python_path: Path, source: str) -> list[str]:
-    """Run child Python without cwd/user injection or venv bytecode writes.
+    """Run supported feature Python without cwd injection or bytecode writes.
 
-    ``-I`` has been available since Python 3.4, predating every supported
-    kestrel-sdk interpreter. Unlike ``-P`` (3.11+), it is also compatible with
-    older operator prebuilt interpreters while providing safe-path behavior.
+    The installed SDK requires Python 3.11+, where ``-P`` provides safe-path
+    behavior without implying ``-E``. Hosted ``PYTHONUTF8`` and
+    ``PYTHONIOENCODING`` therefore retain their documented stdio semantics.
+    The caller supplies an environment with ``PYTHONPATH`` and the other
+    interpreter-shadowing variables removed.
     """
 
     return [
         str(python_path),
-        _ISOLATED_PYTHON_MODE_FLAG,
+        _ISOLATED_PYTHON_SAFE_PATH_FLAG,
         _NO_BYTECODE_FLAG,
         "-c",
         source,
@@ -2152,11 +2160,42 @@ class _IsolatedRuntimeLaunchTargetPreparationError(
     """Core verified that the selected child target cannot be resolved."""
 
 
+class _IsolatedRuntimeLaunchTargetMissingModuleError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable module is absent from the selected venv."""
+
+
+class _IsolatedRuntimeLaunchTargetMissingAttributeError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable attribute is absent from its module."""
+
+
+class _IsolatedRuntimeLaunchTargetNotCallableError(
+    _IsolatedRuntimeLaunchTargetPreparationError
+):
+    """The declared callable attribute resolves to a non-callable object."""
+
+
+class _IsolatedRuntimeLaunchVerificationTimeoutError(
+    IsolatedRuntimePreparationError
+):
+    """Callable verification exceeded Core's bounded startup budget."""
+
+
+class _IsolatedRuntimeLaunchVerificationInfrastructureError(
+    IsolatedRuntimePreparationError
+):
+    """The host could not obtain a trustworthy callable verification result."""
+
+
 _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
 _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
 _CONFIGURATION_FEATURE_IDENTITY = "feature-identity"
 _CONFIGURATION_SERVICE_EXECUTABLE = "service-executable"
+_CONFIGURATION_FEATURE_INTERPRETER = "feature-interpreter"
 _HOSTED_RUNTIME_VENV_SETTING = "runtime.venv"
 _SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 
@@ -2246,6 +2285,11 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
                 "isolated feature service must be a bare portable console-script "
                 "executable name or a safe Python module:callable target"
             )
+        if reason == _CONFIGURATION_FEATURE_INTERPRETER:
+            return (
+                "isolated Python callable services require a feature interpreter "
+                "that supports the SDK's Python 3.11 safe-path contract"
+            )
         return "the hosted isolated feature configuration is unsafe"
 
 
@@ -2260,11 +2304,30 @@ def safe_isolated_runtime_preparation_diagnostic(
     attributes on the original exception remain private.
     """
 
-    if type(error) is _IsolatedRuntimeLaunchTargetPreparationError:
+    if type(error) is _IsolatedRuntimeLaunchTargetMissingModuleError:
         return (
-            "the isolated feature Python callable could not be resolved inside "
-            "its selected venv; verify the service metadata and installed "
-            "feature package"
+            "the isolated feature Python callable module is absent from its "
+            "selected venv; verify the installed feature package"
+        )
+    if type(error) is _IsolatedRuntimeLaunchTargetMissingAttributeError:
+        return (
+            "the isolated feature Python callable attribute is absent from its "
+            "module; verify the service metadata and installed feature package"
+        )
+    if type(error) is _IsolatedRuntimeLaunchTargetNotCallableError:
+        return (
+            "the isolated feature Python callable target resolves to a "
+            "non-callable object; verify the service metadata"
+        )
+    if type(error) is _IsolatedRuntimeLaunchVerificationTimeoutError:
+        return (
+            "isolated feature callable verification exceeded the bounded "
+            "startup timeout; inspect feature import side effects and host health"
+        )
+    if type(error) is _IsolatedRuntimeLaunchVerificationInfrastructureError:
+        return (
+            "the host could not complete isolated feature callable verification; "
+            "inspect the sanitized traceback and host process health"
         )
 
     current: BaseException | None = error
@@ -2311,9 +2374,15 @@ def sanitized_isolated_runtime_preparation_exc_info(
     core_frames = []
     current = error.__traceback__
     while current is not None:
-        module_name = current.tb_frame.f_globals.get("__name__")
-        if type(module_name) is str and module_name.startswith(
-            "kestrel_sovereign."
+        try:
+            frame_path = Path(current.tb_frame.f_code.co_filename).resolve(
+                strict=False
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            frame_path = None
+        if frame_path is not None and (
+            frame_path == _CORE_PACKAGE_ROOT
+            or _CORE_PACKAGE_ROOT in frame_path.parents
         ):
             core_frames.append(current)
         current = current.tb_next
@@ -4919,11 +4988,38 @@ def _validate_hosted_prebuilt_venv(
     return venv_path
 
 
+def _validate_hosted_prebuilt_bin(value: str, *, setting: str) -> Path:
+    """Pin one hosted BIN symlink chain to its validated immutable target.
+
+    The returned canonical target is the only path the caller may publish or
+    launch. A later replacement of the operator-facing symlink therefore
+    cannot redirect an already-resolved feature to a file Core did not inspect.
+    Root-owned system artifacts and service-uid-owned artifacts are accepted;
+    mutable group/world-writable targets are not.
+    """
+
+    try:
+        candidate = Path(value).expanduser()
+        absolute = Path(os.path.abspath(candidate))
+        resolved = absolute.resolve(strict=True)
+        metadata = resolved.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise _hosted_prebuilt_override_error(setting) from None
+    unsafe_posix_custody = os.name == "posix" and (
+        metadata.st_uid not in {0, os.geteuid()}
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o022)
+        or not os.access(resolved, os.X_OK)
+    )
+    if not stat.S_ISREG(metadata.st_mode) or unsafe_posix_custody:
+        raise _hosted_prebuilt_override_error(setting)
+    return resolved
+
+
 def _validate_hosted_process_prebuilt_overrides(
     feature_name: str,
     *,
     runtime_venv: Optional[str] = None,
-) -> None:
+) -> Optional[Path]:
     """Accept only existing immutable-shape hosted launch overrides.
 
     Process variables and installed ``runtime.venv`` metadata are host
@@ -4954,15 +5050,8 @@ def _validate_hosted_process_prebuilt_overrides(
     bin_key = _env_key(feature_name, "BIN")
     bin_value = os.environ.get(bin_key)
     if bin_value:
-        try:
-            bin_path = Path(os.path.abspath(Path(bin_value).expanduser()))
-            bin_metadata = bin_path.stat(follow_symlinks=False)
-        except (OSError, RuntimeError, ValueError):
-            raise _hosted_prebuilt_override_error(bin_key) from None
-        if not stat.S_ISREG(bin_metadata.st_mode) or (
-            os.name == "posix" and not os.access(bin_path, os.X_OK)
-        ):
-            raise _hosted_prebuilt_override_error(bin_key)
+        return _validate_hosted_prebuilt_bin(bin_value, setting=bin_key)
+    return None
 
 
 def _isolated_child_env(
@@ -6095,7 +6184,7 @@ class ProxyFeature(Feature):
             self._prepare_runtime_workspace()
             self._venv_path, self._bin_path = self.resolve_runtime_paths()
             if self._bin_path is None:
-                self.ensure_venv()
+                await self._ensure_venv_without_blocking_event_loop()
             # Resolve persisted/UI host config BEFORE building the client so it can be
             # forwarded to the isolated service through the initialize handshake (the
             # service is otherwise launched bare, with only env vars).
@@ -6110,6 +6199,22 @@ class ProxyFeature(Feature):
             await self._reset_traffic_gate_after_initialize()
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
+
+    async def _ensure_venv_without_blocking_event_loop(self) -> None:
+        """Own synchronous preparation in a worker without orphaning it.
+
+        Fresh callable verification executes feature import code with a finite
+        subprocess timeout. Running the surrounding synchronous preparation in
+        a worker keeps that budget from blocking every agent on the host loop.
+        A cancellation is observed only after the shielded worker settles, so
+        venv mutation cannot continue after lifecycle ownership is released.
+        """
+
+        task = asyncio.create_task(
+            asyncio.to_thread(self.ensure_venv),
+            name=f"isolated-venv-prepare:{self.name}",
+        )
+        await _await_task_until_complete(task, preserve_cancellation=False)
 
     def _latch_terminal_lifecycle(self) -> int:
         """Record one terminal intent and revoke queued initialization permits.
@@ -9583,12 +9688,13 @@ class ProxyFeature(Feature):
             logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
+        validated_hosted_bin: Optional[Path] = None
         if self._runtime_is_hosted():
             # Revalidate here as well as at construction: tests, embedders, and
             # long-lived hosts can mutate ``os.environ`` between discovery and
             # enable.  A late process-wide path must never acquire provisioning
             # authority merely because the ProxyFeature already exists.
-            _validate_hosted_process_prebuilt_overrides(
+            validated_hosted_bin = _validate_hosted_process_prebuilt_overrides(
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
@@ -9597,7 +9703,12 @@ class ProxyFeature(Feature):
             # BIN is authoritative for this launch attempt. Do not reflect or
             # forward unused service metadata to the child factory.
             self._service_target = None
-            return self._default_venv_path(), Path(bin_override).expanduser().resolve()
+            if validated_hosted_bin is not None:
+                return self._default_venv_path(), validated_hosted_bin
+            return (
+                self._default_venv_path(),
+                Path(bin_override).expanduser().resolve(),
+            )
 
         # Revalidate at the launch-path mutation boundary. In particular, a
         # BIN override removed after discovery must not expose missing or
@@ -10234,22 +10345,42 @@ class ProxyFeature(Feature):
     ) -> None:
         """Resolve a callable with the same isolated interpreter used to launch.
 
-        The child prints a fixed sentinel only after both module import and
-        attribute/callability checks succeed. Child stderr and exception text
-        are deliberately excluded from the host exception because feature
-        import hooks are untrusted and may reflect credentials or paths.
+        Closed exit codes distinguish an absent module, absent attribute, and
+        non-callable object from timeout/spawn/import infrastructure failures.
+        Child stdout, stderr, and exception text are deliberately discarded
+        because feature import hooks are untrusted and may reflect credentials
+        or paths.
         """
 
         assert target.module is not None
         assert target.callable_name is not None
         assert self._venv_path is not None
         source = (
-            "import importlib\n"
-            f"target = getattr(importlib.import_module({target.module!r}), "
-            f"{target.callable_name!r})\n"
-            "if not callable(target):\n"
-            "    raise TypeError('configured target is not callable')\n"
-            f"print({_CALLABLE_TARGET_VERIFIED_OUTPUT!r})\n"
+            "import importlib, os, sys\n"
+            "finish = os._exit\n"
+            f"module_name = {target.module!r}\n"
+            "if sys.version_info < (3, 11) or not sys.flags.safe_path:\n"
+            f"    finish({_CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT})\n"
+            "try:\n"
+            "    module = importlib.import_module(module_name)\n"
+            "except ModuleNotFoundError as error:\n"
+            "    missing_name = error.name if type(error) is ModuleNotFoundError "
+            "and type(error.name) is str else None\n"
+            "    target_missing = missing_name is not None and "
+            "(module_name == missing_name or "
+            "module_name.startswith(missing_name + '.'))\n"
+            f"    finish({_CALLABLE_TARGET_MISSING_MODULE_EXIT} if target_missing "
+            f"else {_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            "except BaseException:\n"
+            f"    finish({_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            "try:\n"
+            f"    resolved = getattr(module, {target.callable_name!r})\n"
+            "except AttributeError:\n"
+            f"    finish({_CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT})\n"
+            "except BaseException:\n"
+            f"    finish({_CALLABLE_TARGET_UNVERIFIABLE_EXIT})\n"
+            f"finish(0 if callable(resolved) else "
+            f"{_CALLABLE_TARGET_NOT_CALLABLE_EXIT})\n"
         )
         runtime_dir = self._feature_runtime_dir()
         hosted = self._runtime_is_hosted()
@@ -10259,9 +10390,9 @@ class ProxyFeature(Feature):
                     _venv_python(self._venv_path),
                     source,
                 ),
-                check=True,
-                capture_output=True,
-                text=True,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 env=_isolated_child_env(
                     self._venv_path,
                     runtime_dir=runtime_dir if hosted else None,
@@ -10270,18 +10401,47 @@ class ProxyFeature(Feature):
                     feature_distribution=self.runtime.distribution,
                 ),
                 cwd=str(runtime_dir / "work") if hosted else None,
+                timeout=_CALLABLE_TARGET_VERIFICATION_TIMEOUT_S,
             )
-        except (OSError, subprocess.SubprocessError):
-            raise _IsolatedRuntimeLaunchTargetPreparationError(
-                "Isolated feature Python callable launch target could not be "
-                "verified."
+        except subprocess.TimeoutExpired:
+            raise _IsolatedRuntimeLaunchVerificationTimeoutError(
+                "Isolated feature Python callable verification timed out."
             ) from None
-        if completed.stdout.splitlines()[-1:] != [
-            _CALLABLE_TARGET_VERIFIED_OUTPUT
-        ]:
-            raise _IsolatedRuntimeLaunchTargetPreparationError(
-                "Isolated feature Python callable launch target could not be "
-                "verified."
+        except OSError as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature Python callable verification could not start."
+            ) from exc
+        except subprocess.SubprocessError:
+            raise _IsolatedRuntimeLaunchVerificationInfrastructureError(
+                "Isolated feature Python callable verification failed."
+            ) from None
+
+        target_failures: dict[int, type[_IsolatedRuntimeLaunchTargetPreparationError]] = {
+            _CALLABLE_TARGET_MISSING_MODULE_EXIT: (
+                _IsolatedRuntimeLaunchTargetMissingModuleError
+            ),
+            _CALLABLE_TARGET_MISSING_ATTRIBUTE_EXIT: (
+                _IsolatedRuntimeLaunchTargetMissingAttributeError
+            ),
+            _CALLABLE_TARGET_NOT_CALLABLE_EXIT: (
+                _IsolatedRuntimeLaunchTargetNotCallableError
+            ),
+        }
+        failure_type = target_failures.get(completed.returncode)
+        if failure_type is not None:
+            raise failure_type(
+                "Isolated feature Python callable target is unavailable."
+            )
+        if completed.returncode in {
+            2,
+            _CALLABLE_TARGET_UNSUPPORTED_INTERPRETER_EXIT,
+        }:
+            raise IsolatedRuntimeConfigurationError(
+                reason=_CONFIGURATION_FEATURE_INTERPRETER,
+            )
+        if completed.returncode != 0:
+            raise _IsolatedRuntimeLaunchVerificationInfrastructureError(
+                "Isolated feature Python callable verification was inconclusive."
             )
 
     def _provision_is_stale_from_manifest(
@@ -10392,17 +10552,17 @@ class ProxyFeature(Feature):
                 self.name,
                 runtime_venv=self.runtime.venv,
             )
+            # For callable services, establish the interpreter capability and
+            # target outcome before distribution probing can collapse an
+            # unsupported ``-P`` interpreter into an opaque missing package.
+            self._verify_launch_artifact()
             try:
                 self._verify_prebuilt_feature_distribution(
                     python_path,
                     install_target,
                 )
                 self._warn_on_sdk_mismatch(python_path)
-                self._verify_launch_artifact()
-            except (
-                IsolatedRuntimeConfigurationError,
-                _IsolatedRuntimeLaunchTargetPreparationError,
-            ):
+            except IsolatedRuntimeConfigurationError:
                 raise
             except Exception as exc:
                 raise _hosted_prebuilt_override_error(
@@ -10427,9 +10587,9 @@ class ProxyFeature(Feature):
             and self._venv_is_overridden()
             and not self._provision_manifest_path().exists()
         ):
+            self._verify_launch_artifact()
             self._verify_prebuilt_feature_distribution(python_path, install_target)
             self._warn_on_sdk_mismatch(python_path)
-            self._verify_launch_artifact()
             return
 
         # An operator-supplied (override) venv that already exists is NOT ours to
@@ -10700,10 +10860,10 @@ class ProxyFeature(Feature):
                 if self._venv_path is not None
                 else "python"
             )
-            # ``-I`` has been available since Python 3.4, so it also supports
-            # older operator prebuilt feature interpreters that predate
-            # Python 3.11's ``-P``. It supplies safe-path behavior and excludes
-            # user-site and Python environment injection as one boundary.
+            # The installed SDK requires Python 3.11+, so ``-P`` is the
+            # compatible safe-path boundary. Unlike ``-I``, it preserves the
+            # hosted stdio encoding variables required by the JSON-RPC pipe;
+            # the child environment separately removes Python path injection.
             return _isolated_python_command(
                 Path(python),
                 (

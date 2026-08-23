@@ -110,26 +110,35 @@ venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
   component and the callable must be a non-keyword ASCII Python identifier;
   separators, traversal, drive syntax, extra colons, and dotted or
   expression-like callable targets are rejected. Core launches this form
-  through the current venv's interpreter in Python isolated mode (`-I`,
-  available since Python 3.4), keeping the mutable child working directory,
-  user site, and Python environment injection out of the import boundary. This
-  remains compatible with older operator-prebuilt feature interpreters that do
-  not implement Python 3.11's `-P`. Core also disables bytecode writes (`-B`),
-  so verification cannot mutate an immutable prebuilt venv. Before any Core
-  provisioning manifest is stamped, Core uses that same isolated interpreter
-  to import the module, resolve the attribute, and prove it is callable. It has
-  no console wrapper, so console-wrapper relocation repair is not applicable.
+  through the current venv's interpreter with Python safe-path mode (`-P`) and
+  bytecode writes disabled (`-B`). The installed Kestrel SDK requires Python
+  3.11 or newer; an incompatible operator-prebuilt interpreter is quarantined
+  with a bounded configuration diagnostic. `-P` keeps the mutable child
+  working directory out of the import boundary without implying `-E`, so the
+  hosted `PYTHONUTF8` and `PYTHONIOENCODING` settings retain the same stdio
+  semantics as console-script services. Core separately strips `PYTHONPATH`,
+  `PYTHONHOME`, `PYTHONSTARTUP`, and inherited `VIRTUAL_ENV`. Before any Core
+  provisioning manifest is stamped, Core uses that same safe-path interpreter
+  to import the module, resolve the attribute, and prove it is callable. The
+  verification subprocess has a finite ten-second timeout, runs off the host
+  event loop, discards untrusted output, and distinguishes missing targets from
+  host execution failures. A callable has no console wrapper, so
+  console-wrapper relocation repair is not applicable.
 
-Core's child distribution and SDK freshness probes use the same `-I` boundary.
+Core's child distribution and SDK freshness probes use the same `-P -B` boundary.
 Neither service verification nor a freshness decision can import a same-named
 module from the host process working directory.
 
 The operator-level `KESTREL_FEATURE_<NAME>_BIN` setting is a complete executable
 override and preserves the historical ability to omit `service`. When BIN is
 present, Core validates the hosted prebuilt executable but does not parse or
-forward unused service metadata. If BIN is absent when launch paths are
-resolved, `service` is required and the appropriate grammar above is enforced
-before any venv preparation or child start.
+forward unused service metadata. Operator symlinks (including Homebrew, Nix,
+`update-alternatives`, and `uv tool` layouts) are supported: Core resolves the
+chain once, requires the resolved target to be a regular executable with safe
+POSIX owner/mode custody, and launches that exact pinned target. A later link
+replacement cannot redirect the already-resolved proxy. If BIN is absent when
+launch paths are resolved, `service` is required and the appropriate grammar
+above is enforced before any venv preparation or child start.
 
 FeatureFeature's design/scaffold stage emits this table (and the `service/`
 sub-project layout) when a proposed feature declares conflicting deps.

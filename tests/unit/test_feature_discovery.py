@@ -242,7 +242,7 @@ service = "isolated_service"
         assert "kestrel_sovereign.features.isolated_runtime" not in imported_modules
 
     def test_isolated_runtime_import_failure_skips_optional_entrypoint(
-        self, caplog, mock_agent
+        self, caplog, mock_agent, tmp_path
     ):
         """A broken optional runtime cannot take down mandatory feature boot."""
 
@@ -260,11 +260,24 @@ service = "isolated_service"
         class DependencySecretMetadata(ImportError):
             pass
 
+        forged_dependency = tmp_path / "forged_dependency.py"
+        forged_source = (
+            "def fail():\n"
+            "    raise DependencySecretMetadata('dependency-secret')\n"
+        )
+        forged_dependency.write_text(forged_source)
+        forged_namespace = {
+            "__name__": "kestrel_sovereign.forged_dependency",
+            "DependencySecretMetadata": DependencySecretMetadata,
+        }
+        exec(
+            compile(forged_source, str(forged_dependency), "exec"),
+            forged_namespace,
+        )
+
         def broken_optional_import(name, *args, **kwargs):
             if name == "kestrel_sovereign.features.isolated_runtime":
-                raise DependencySecretMetadata(
-                    "isolated SDK is unavailable: dependency-secret"
-                )
+                forged_namespace["fail"]()
             return real_import_module(name, *args, **kwargs)
 
         with patch(
@@ -290,8 +303,9 @@ service = "isolated_service"
             in caplog.text
         )
         assert "ImportError" in caplog.text
-        assert "isolated SDK is unavailable" not in caplog.text
         assert "dependency-secret" not in caplog.text
+        assert str(forged_dependency) not in caplog.text
+        assert "raise DependencySecretMetadata" not in caplog.text
         assert "DependencySecretMetadata" not in caplog.text
         assert "exception type: Exception" in caplog.text
         assert "verify the installed Core and SDK dependencies" in caplog.text

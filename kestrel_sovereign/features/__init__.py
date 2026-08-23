@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Features directory location
 FEATURES_DIR = Path(__file__).parent
+_CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 # Environment variable for disabling features
 DISABLED_FEATURES_ENV = "KESTREL_DISABLED_FEATURES"
@@ -56,9 +57,15 @@ def _sanitized_isolated_runtime_import_exc_info(
     core_frames = []
     current = error.__traceback__
     while current is not None:
-        module_name = current.tb_frame.f_globals.get("__name__")
-        if type(module_name) is str and module_name.startswith(
-            "kestrel_sovereign."
+        try:
+            frame_path = Path(current.tb_frame.f_code.co_filename).resolve(
+                strict=False
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            frame_path = None
+        if frame_path is not None and (
+            frame_path == _CORE_PACKAGE_ROOT
+            or _CORE_PACKAGE_ROOT in frame_path.parents
         ):
             core_frames.append(current)
         current = current.tb_next
