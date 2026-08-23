@@ -2094,9 +2094,15 @@ class AsyncDatabase:
         # raises. That failure is swallowed by `build_host_context` into
         # `db=None`, and a host then boots with its whole operator run plane
         # missing while /health reports ok (#3058).
-        changes_predates_slot = await self.table_exists(
-            "conversation_history_changes"
-        ) and not await self._column_exists(
+        # Existence comes from the probe above rather than a second query of
+        # its own: this method runs on every from_pool(), so a duplicate
+        # `SELECT to_regclass` here is a round trip on every request. Only the
+        # column probe is new work, and the re-probe under the lock still
+        # settles any race.
+        changes_present = not any(
+            name == "conversation_history_changes" for name, _ in missing_tables
+        )
+        changes_predates_slot = changes_present and not await self._column_exists(
             "conversation_history_changes", CHANGES_SLOT_COLUMN
         )
         # Set equality, not "are the ones I want present". The names carry the
