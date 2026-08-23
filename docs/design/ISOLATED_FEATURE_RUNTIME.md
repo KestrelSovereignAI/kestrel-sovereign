@@ -87,7 +87,8 @@ its `pyproject.toml` (read from installed metadata, no import required):
 ```toml
 [tool.kestrel.feature]
 runtime = "isolated-venv"          # default: "in-process"
-service = "kestrel-whatsapp-service" # bare [project.scripts] executable name
+service = "kestrel_whatsapp_web.service:main" # Python module:callable
+# A bare [project.scripts] name such as "kestrel-whatsapp-service" is also valid.
 # Optional standalone-only mutable selection. Hosted declarations must use an
 # absolute, already-built immutable operator venv.
 venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
@@ -97,13 +98,20 @@ venv = "/opt/kestrel/prebuilt/whatsapp-service-venv"
 - `runtime = "isolated-venv"` → the loader does **not** import the heavy
   package; it launches/connects the declared service in its own venv.
 
-`service` is constrained to one bare portable executable name: it starts with
-an ASCII letter or digit and may then contain ASCII letters, digits, `.`, `_`,
-and `-`. Separators, drive syntax, module-callable syntax, leading punctuation,
-trailing dots, and Windows device names are rejected. Core verifies and
-launches the same exact file below the venv's `bin/` (or `Scripts/` on Windows),
-so metadata cannot make verification inspect one wrapper while execution
-selects another.
+`service` accepts two deliberately separate forms:
+
+- A bare portable console executable starts with an ASCII letter or digit and
+  may then contain ASCII letters, digits, `.`, `_`, and `-`. Separators, drive
+  syntax, leading punctuation, trailing dots, and Windows device names are
+  rejected. Core verifies and launches the same exact file below the venv's
+  `bin/` (or `Scripts/` on Windows), so metadata cannot make verification
+  inspect one wrapper while execution selects another.
+- A Python callable uses exactly `module:callable`. Every dotted module
+  component and the callable must be a non-keyword ASCII Python identifier;
+  separators, traversal, drive syntax, extra colons, and dotted or
+  expression-like callable targets are rejected. Core launches this form
+  through the current venv's interpreter. It has no console wrapper, so wrapper
+  repair and verification are intentionally not applicable.
 
 FeatureFeature's design/scaffold stage emits this table (and the `service/`
 sub-project layout) when a proposed feature declares conflicting deps.

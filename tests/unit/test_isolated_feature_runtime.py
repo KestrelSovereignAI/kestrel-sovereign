@@ -564,6 +564,41 @@ def test_windows_console_service_uses_and_verifies_exe_launcher(
 @pytest.mark.parametrize(
     "service",
     (
+        "svc_pkg.service:main",
+        "_private.pkg_2:_main",
+    ),
+)
+def test_service_command_module_callable(service, tmp_path):
+    """Safe module callables run through the venv and need no wrapper."""
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    runtime = InstalledFeatureRuntime(
+        class_name="SvcFeature",
+        entry_point="svc.feature:SvcFeature",
+        distribution="svc-pkg",
+        runtime="isolated-venv",
+        service=service,
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    module, callable_name = service.split(":", 1)
+
+    command = feature._service_command()
+
+    assert command[0] == str(isolated_runtime._venv_python(feature._venv_path))
+    assert command[1] == "-c"
+    assert command[2] == (
+        f"from {module} import {callable_name}; {callable_name}()"
+    )
+    assert "-m" not in command
+    assert feature._console_script_location_state() == "not-applicable"
+    feature._verify_launch_artifact()
+
+
+@pytest.mark.parametrize(
+    "service",
+    (
         None,
         "",
         " service",
@@ -578,12 +613,26 @@ def test_windows_console_service_uses_and_verifies_exe_launcher(
         "../../../../bin/sh",
         "/bin/sh",
         "C:service",
-        "svc_pkg.service:main",
+        "pkg/service:main",
+        r"pkg\service:main",
+        "../pkg.service:main",
+        ".pkg.service:main",
+        "pkg..service:main",
+        "pkg.service.:main",
+        "pkg-service:main",
+        "pkg.service:",
+        ":main",
+        "pkg.service:main.extra",
+        "pkg.service:main:again",
+        "pkg.service:main()",
+        "pkg.service:main;raise_error",
+        "class.service:main",
+        "pkg.service:class",
         "con",
         "NUL.exe",
     ),
 )
-def test_isolated_service_requires_bare_portable_executable_name(
+def test_isolated_service_requires_safe_console_or_callable_target(
     service,
     tmp_path,
 ):
@@ -605,7 +654,7 @@ def test_isolated_service_requires_bare_portable_executable_name(
     diagnostic = raised.value.safe_diagnostic()
     assert diagnostic == (
         "isolated feature service must be a bare portable console-script "
-        "executable name"
+        "executable name or a safe Python module:callable target"
     )
 
 
@@ -2270,6 +2319,84 @@ def test_locationless_manifest_adoption_refuses_non_location_staleness(
     assert refreshed["install_target"] == runtime.project
     assert refreshed["provisioned_against_host_sdk"] == "2.0.0"
     assert refreshed["feature_distribution_version"] == "4.5.6"
+
+
+def test_migrated_callable_runtime_is_adopted_offline_without_reinstall(
+    monkeypatch,
+    tmp_path,
+):
+    """A moved callable venv has no console wrapper to rewrite."""
+
+    runtime = InstalledFeatureRuntime(
+        class_name="ModuleFeature",
+        entry_point="module_feature.feature:ModuleFeature",
+        distribution="module-feature",
+        runtime="isolated-venv",
+        service="module_feature.service:main",
+        project="module-feature",
+    )
+    agent = _hosted_postgres_agent(
+        tmp_path / "runtime",
+        "agent-module-migration",
+        did="did:test:module-migration",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    legacy_component = feature._legacy_runtime_directory_name
+    assert legacy_component is not None
+    isolated_runtime.prepare_isolated_runtime_namespace(
+        feature._isolated_runtime_scope,
+        agent.did,
+        relative_directories=(("feature_venvs", legacy_component),),
+    )
+    source_venv = (
+        feature._agent_runtime_dir
+        / "feature_venvs"
+        / legacy_component
+        / ".venv"
+    )
+    python = isolated_runtime._venv_python(source_venv)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o700)
+    (source_venv / ".kestrel_provision.json").write_text(
+        json.dumps(
+            {
+                "install_target": runtime.project,
+                "provisioned_against_host_sdk": "1.2.3",
+                "child_sdk_version": "1.2.3",
+                "feature_distribution_version": "7.8.9",
+                "child_feature_distribution_state": "versioned",
+                "child_feature_distribution_version": "7.8.9",
+            }
+        )
+    )
+
+    feature._prepare_runtime_workspace()
+    assert feature._venv_relocated_this_startup is True
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    feature._run = Mock(side_effect=OSError("offline package index"))
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("7.8.9")
+    )
+    feature._probe_sdk_version = Mock(return_value="1.2.3")
+    monkeypatch.setattr(isolated_runtime, "_host_sdk_version", lambda: "1.2.3")
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "7.8.9",
+    )
+
+    feature.ensure_venv()
+
+    feature._run.assert_not_called()
+    assert feature._console_script_location_state() == "not-applicable"
+    manifest = json.loads(feature._provision_manifest_path().read_text())
+    assert manifest["venv_path"] == str(feature._venv_path.resolve())
+    assert manifest["feature_distribution_version"] == "7.8.9"
+    assert not (
+        feature._feature_runtime_dir()
+        / isolated_runtime._VENV_RELOCATION_REPAIR_MARKER
+    ).exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="console shebangs are POSIX paths")

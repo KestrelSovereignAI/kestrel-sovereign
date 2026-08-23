@@ -4,14 +4,16 @@ A feature distribution opts into out-of-venv execution via its pyproject:
 
     [tool.kestrel.feature]
     runtime = "isolated-venv"
-    service = "kestrel-whatsapp-web"   # runnable: a bare console-script name
+    service = "kestrel_whatsapp.service:main" # console name or module:callable
     project = "service"                # install target for the venv (path/dist); defaults to the distribution
     # venv  = "/abs/path/.venv"        # optional explicit venv-path override
 
-`service` is the thing to RUN (a bare portable console-script name resolved
-from the per-agent venv's bin/). `project` is the thing to INSTALL. They are
-deliberately distinct so the runnable is never mistaken for a pip target or a
-`python -m` module, and the verified artifact is exactly the launched file.
+`service` is the thing to RUN: either a bare portable console-script name
+resolved from the per-agent venv's bin/, or a validated Python
+``module:callable`` target launched through that venv's interpreter. `project`
+is the thing to INSTALL. They are deliberately distinct so the runnable is
+never mistaken for a pip target or a ``python -m`` module. Console artifacts
+are verified at the exact path later launched; callables do not use a wrapper.
 """
 
 import asyncio
@@ -21,6 +23,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import keyword
 import logging
 import math
 import os
@@ -2198,7 +2201,7 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
         if self.reason == _CONFIGURATION_SERVICE_EXECUTABLE:
             return (
                 "isolated feature service must be a bare portable console-script "
-                "executable name"
+                "executable name or a safe Python module:callable target"
             )
         return "the hosted isolated feature configuration is unsafe"
 
@@ -2315,6 +2318,10 @@ _ISOLATED_FEATURE_CLASS_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _ISOLATED_SERVICE_EXECUTABLE_NAME = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 )
+_ISOLATED_SERVICE_PYTHON_IDENTIFIER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+)
+_ISOLATED_SERVICE_CALLABLE_MAX_LENGTH = 512
 _HOSTED_FEATURE_RUNTIME_COMPONENT = re.compile(r"^feature-[0-9a-f]{64}$")
 _DERIVED_NAMESPACE_DIGEST_HEX_CHARS = 58
 
@@ -2338,6 +2345,67 @@ def _validated_isolated_service_executable(service: object) -> str:
             reason=_CONFIGURATION_SERVICE_EXECUTABLE,
         )
     return service
+
+
+@dataclass(frozen=True)
+class _IsolatedServiceTarget:
+    """One validated console executable or Python callable launch target."""
+
+    raw: str
+    console_executable: str | None = None
+    module: str | None = None
+    callable_name: str | None = None
+
+    @property
+    def is_callable(self) -> bool:
+        return self.module is not None
+
+
+def _is_safe_service_python_identifier(value: str) -> bool:
+    return (
+        _ISOLATED_SERVICE_PYTHON_IDENTIFIER.fullmatch(value) is not None
+        and not keyword.iskeyword(value)
+    )
+
+
+def _validated_isolated_service_target(service: object) -> _IsolatedServiceTarget:
+    """Classify one non-reflective, code-injection-safe service declaration."""
+
+    if type(service) is not str or not service or service != service.strip():
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    if ":" not in service:
+        return _IsolatedServiceTarget(
+            raw=service,
+            console_executable=_validated_isolated_service_executable(service),
+        )
+    if (
+        len(service) > _ISOLATED_SERVICE_CALLABLE_MAX_LENGTH
+        or service.count(":") != 1
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    module, callable_name = service.split(":", 1)
+    module_components = module.split(".")
+    if (
+        not module_components
+        or (len(module) == 1 and module.isascii() and module.isalpha())
+        or any(
+            not _is_safe_service_python_identifier(component)
+            for component in module_components
+        )
+        or not _is_safe_service_python_identifier(callable_name)
+    ):
+        raise IsolatedRuntimeConfigurationError(
+            reason=_CONFIGURATION_SERVICE_EXECUTABLE,
+        )
+    return _IsolatedServiceTarget(
+        raw=service,
+        module=module,
+        callable_name=callable_name,
+    )
 
 
 def safe_isolated_runtime_exception_type_name(error: BaseException) -> str:
@@ -5243,9 +5311,7 @@ class ProxyFeature(Feature):
             raise IsolatedRuntimeConfigurationError(
                 reason=_CONFIGURATION_FEATURE_IDENTITY,
             )
-        self._service_executable = _validated_isolated_service_executable(
-            runtime.service
-        )
+        self._service_target = _validated_isolated_service_target(runtime.service)
         self._runtime_directory_name = (
             _hosted_feature_runtime_component(runtime)
             if self._isolated_runtime_scope is not None
@@ -9857,14 +9923,18 @@ class ProxyFeature(Feature):
     def _console_script_location_state(self) -> str:
         """Return ``current``, ``relocated``, ``missing``, or ``not-applicable``.
 
-        The configured console entry point normally embeds the venv's absolute
-        path. Only a positively observed foreign absolute shebang proves
-        relocation when no Core path stamp exists.
+        A configured console entry point normally embeds the venv's absolute
+        path. Python callables launch through the current venv interpreter and
+        have no wrapper to verify. Only a positively observed foreign absolute
+        shebang proves console relocation when no Core path stamp exists.
         """
 
-        if self._bin_path is not None:
+        if (
+            self._bin_path is not None
+            or self._service_target.console_executable is None
+        ):
             return "not-applicable"
-        service = self._service_executable
+        service = self._service_target.console_executable
         assert self._venv_path is not None
         script = _console_script_path(self._venv_path, service)
         executable_name = script.name
@@ -10144,7 +10214,7 @@ class ProxyFeature(Feature):
         python_path = _venv_python(self._venv_path)
 
         # Install the PROJECT (path/dist), never the `service` runnable — the
-        # latter is a bare console-script name, not a pip target.
+        # latter is a console-script name or module:callable, not a pip target.
         install_target = self.runtime.project or self.runtime.distribution
         if not install_target:
             raise IsolatedRuntimePreparationError(
@@ -10358,7 +10428,7 @@ class ProxyFeature(Feature):
             child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
         kwargs = {
             "feature_name": self.name,
-            "service": self._service_executable,
+            "service": self._service_target.raw,
             "venv_path": str(self._venv_path) if self._venv_path else None,
             "python": str(_venv_python(self._venv_path)) if self._venv_path else None,
             "executable": str(self._bin_path) if self._bin_path else None,
@@ -10450,16 +10520,42 @@ class ProxyFeature(Feature):
 
         Resolution order:
           1. explicit BIN override (``self._bin_path``);
-          2. the validated bare console-script name in the venv bin directory.
-        The runnable is never treated as a path, module, or install target.
+          2. a validated ``module:callable`` through the venv interpreter;
+          3. the validated bare console-script name in the venv bin directory.
+        Console runnables are never treated as paths or install targets.
         """
         if self._bin_path is not None:
             return [str(self._bin_path)]
 
-        service = self._service_executable
+        service = self._service_target
+        if service.is_callable:
+            assert service.module is not None
+            assert service.callable_name is not None
+            python = (
+                str(_venv_python(self._venv_path))
+                if self._venv_path is not None
+                else "python"
+            )
+            return [
+                python,
+                "-c",
+                (
+                    f"from {service.module} import {service.callable_name}; "
+                    f"{service.callable_name}()"
+                ),
+            ]
+
+        assert service.console_executable is not None
         if self._venv_path is not None:
-            return [str(_console_script_path(self._venv_path, service))]
-        return [service]
+            return [
+                str(
+                    _console_script_path(
+                        self._venv_path,
+                        service.console_executable,
+                    )
+                )
+            ]
+        return [service.console_executable]
 
     async def _register_event_handler(self, client: Any = None) -> None:
         """Attach the host event handler to a published client.
