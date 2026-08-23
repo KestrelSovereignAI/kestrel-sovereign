@@ -943,7 +943,11 @@ class StrategicMemoryFeature(Feature):
         command_prefix="!strategy-search",
     )
     async def strategy_search(
-        self, query: str, kind: str = "all", limit: int = 10
+        self,
+        query: str,
+        kind: str = "all",
+        limit: int = 10,
+        include_retired: bool = False,
     ) -> ToolResult:
         """
         Search learned patterns and blockers.
@@ -952,7 +956,17 @@ class StrategicMemoryFeature(Feature):
             query: Words to match against the ledger rows
             kind: Which rows to search -- all, patterns, blockers (default all)
             limit: Maximum matches to return (default 10)
+            include_retired: Include superseded patterns and resolved blockers
         """
+        # search_rows has always taken this; not exposing it made this tool
+        # unable to answer for retired rows, while recall_patterns/
+        # recall_blockers named it as the canonical fallback when their
+        # retired-mode index came back stale (#3064).
+        if not isinstance(include_retired, bool):
+            return ToolResult.failed(
+                "include_retired must be a boolean, got "
+                f"{type(include_retired).__name__}={include_retired!r}"
+            )
         kind = (kind or "all").strip().lower()
         if kind not in ("all", "patterns", "pattern", "blockers", "blocker"):
             return ToolResult.failed(
@@ -977,7 +991,13 @@ class StrategicMemoryFeature(Feature):
                 {"query": query, "kind": kind, "matches": [], "count": 0}
             )
 
-        matches = search_rows(self._ledger.data, query, kind=kind, limit=limit)
+        matches = search_rows(
+            self._ledger.data,
+            query,
+            kind=kind,
+            limit=limit,
+            include_retired=include_retired,
+        )
         if not matches:
             return ToolResult.ok(
                 confirmation=f"No ledger matches for {query!r}.",
@@ -1108,18 +1128,29 @@ class StrategicMemoryFeature(Feature):
         )
         returned_ids = {str(row.get("row_id") or "") for row in rows}
         missing = expected_ids - returned_ids
+        # Divergence runs BOTH ways. Projection is best-effort, so a failed
+        # write after a supersession leaves the old node marked active while
+        # the canonical active set no longer holds it -- and a one-way check
+        # sees nothing missing and certifies retired guidance as current. That
+        # is a worse lie than the one this ticket was filed on, because the
+        # answer is confidently wrong rather than merely short.
+        unexpected = returned_ids - expected_ids
         data["canonical_expected"] = len(expected_ids)
 
-        if not missing:
-            data["completeness_checked"] = True
-            return ToolResult.ok(confirmation=confirmation, data=data)
-
-        if len(rows) >= limit_val:
-            # A full page. Rows the ledger holds may be past the limit rather
-            # than absent from the index, and this check cannot tell those
-            # apart -- so it reports that it did not run instead of passing.
-            data["completeness_checked"] = False
+        # An extra row is conclusive at any limit: truncation can hide a
+        # canonical row, it cannot manufacture one the ledger does not hold.
+        # A missing row is only conclusive when the page was not full.
+        missing_is_conclusive = bool(missing) and len(rows) < limit_val
+        # Two separate facts, deliberately not one flag: "a divergence was
+        # proven" and "the absence question could be answered" can differ, and
+        # collapsing them would let the weaker one hide the stronger.
+        data["completeness_checked"] = not (missing and len(rows) >= limit_val)
+        if not data["completeness_checked"]:
             data["completeness_unchecked_reason"] = "result_truncated_at_limit"
+
+        if not (unexpected or missing_is_conclusive):
+            if data["completeness_checked"]:
+                return ToolResult.ok(confirmation=confirmation, data=data)
             return ToolResult.ok(
                 confirmation=(
                     f"{confirmation}; the limit was reached, so whether the "
@@ -1128,21 +1159,36 @@ class StrategicMemoryFeature(Feature):
                 data=data,
             )
 
-        # Fewer rows than the canonical file holds, on a page that was not
-        # full. That is the index being incomplete, and reporting the short
-        # list as an answer is what #2851 was filed on: recall_decisions
-        # returning a truthful zero while STRATEGY.yaml held the real ones.
-        data["completeness_checked"] = True
         data["index_stale"] = True
-        data["missing_count"] = len(missing)
+        divergences = []
+        if missing_is_conclusive:
+            data["missing_count"] = len(missing)
+            divergences.append(
+                f"missing {len(missing)} of the {len(expected_ids)} "
+                f"{noun} {LEDGER_FILENAME} holds"
+            )
+        if unexpected:
+            data["unexpected_count"] = len(unexpected)
+            divergences.append(
+                f"returning {len(unexpected)} row(s) {LEDGER_FILENAME} does "
+                "not hold in this mode -- a retired row still answering as "
+                "current, or one deleted from the canonical file"
+            )
+        fallback = "strategy_search"
+        if include_retired:
+            # The advice has to name a path that can actually return the rows
+            # it is about: strategy_search excludes retired rows unless told
+            # otherwise, so recommending it bare for a retired-mode recall
+            # promises a fallback that structurally cannot answer (#3064).
+            fallback = "strategy_search(..., include_retired=True)"
         return ToolResult.partial(
             confirmation=confirmation,
             error=(
-                f"The strategy index is missing {len(missing)} of the "
-                f"{len(expected_ids)} {noun} {LEDGER_FILENAME} holds. The "
-                "index is stale or was never built -- restart the agent to "
-                "reproject, and use strategy_search to read the canonical "
-                "file meanwhile."
+                f"The strategy index diverges from {LEDGER_FILENAME}: "
+                + ", and ".join(divergences)
+                + ". The index is stale or was never built -- restart the "
+                f"agent to reproject, and use {fallback} to read the "
+                "canonical file meanwhile."
             ),
             data=data,
         )

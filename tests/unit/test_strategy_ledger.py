@@ -992,6 +992,11 @@ class TestTheIndexHasAConsumer:
         result = await feature.recall_patterns()
         assert result.data["count"] == 1
         assert result.data["patterns"][0]["text"] == "a durable observation"
+        # The row still comes back -- that is the claim here. It is also now
+        # reported as a divergence, because an in-memory ledger holding none
+        # of it and an index holding one of it do disagree.
+        assert result.status.value == "partial"
+        assert result.data["unexpected_count"] == 1
         # Count the pattern nodes specifically. ``len(graph.nodes)`` would also
         # count decision and blocker nodes, which is a different claim than the
         # one this test is making.
@@ -1162,6 +1167,94 @@ class TestTheIndexHasAConsumer:
         assert result.data["count"] == 1
         assert result.status.value == "partial"
         assert result.data["missing_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_retired_row_still_answering_as_current_is_a_divergence(
+        self, tmp_path
+    ):
+        """One-directional membership certified retired guidance as current.
+
+        Projection is best-effort, so a write that fails after a supersession
+        leaves the old node marked active while the canonical active set no
+        longer holds it. Nothing is *missing*, so a check that only asks
+        "did I get everything?" returns ok with completeness_checked True --
+        confidently wrong rather than merely short.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="old guidance")
+        graph = feature.agent.storage.graph
+        # The projection of the supersession fails. The canonical file records
+        # it; the index still answers with the active row.
+        graph._fail_on = PATTERN_NODE_TYPE
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="retired"
+        )
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1, "the stale node is still returned"
+        assert result.data["canonical_expected"] == 0
+        assert result.status.value == "partial", (
+            "an index answering with a row the ledger retired is not ok"
+        )
+        assert result.data["index_stale"] is True
+        assert result.data["unexpected_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_extra_row_is_conclusive_even_on_a_full_page(self, tmp_path):
+        """Truncation hides canonical rows; it cannot manufacture strangers.
+
+        So the limit excuses an unanswered "is anything missing?" without
+        excusing a row the ledger does not hold.
+        """
+        feature = await _feature(tmp_path)
+        for n in range(3):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        node.properties = {**node.properties, "row_id": "pat_stranger"}
+
+        result = await feature.recall_patterns(limit=2)
+
+        assert result.status.value == "partial"
+        assert result.data["index_stale"] is True
+        assert result.data["unexpected_count"] == 1
+        # The stronger fact does not erase the weaker one: whether rows are
+        # missing genuinely was not answered on a full page.
+        assert result.data["completeness_checked"] is False
+        assert "missing_count" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_a_stale_retired_recall_names_a_fallback_that_can_answer(
+        self, tmp_path
+    ):
+        """strategy_search excludes retired rows unless told otherwise.
+
+        Recommending it bare for a retired-mode recall promises a fallback
+        that structurally cannot return the rows the error is about.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="a retired observation")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="no longer holds"
+        )
+        feature.agent.storage.graph.nodes.clear()
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.status.value == "partial"
+        assert "include_retired=True" in (result.error or "")
+
+        # And the named path actually returns it.
+        found = await feature.strategy_search(
+            query="retired observation", include_retired=True
+        )
+        assert found.data["count"] == 1
+        assert (await feature.strategy_search(query="retired observation")).data[
+            "count"
+        ] == 0
 
     @pytest.mark.asyncio
     async def test_superseded_recall_is_measured_against_superseded_rows(
