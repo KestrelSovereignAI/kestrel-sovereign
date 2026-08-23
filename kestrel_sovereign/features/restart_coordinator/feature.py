@@ -407,13 +407,12 @@ class RestartCoordinatorFeature(Feature):
             # OPTIONAL policy (#2522): idempotent on a second initialize(); an
             # existing restart.completed with a DIFFERENT contract is reported
             # rather than swallowed by a broad except. Never raises.
-            # Own the source we newly registered so the base-class shutdown /
-            # boot rollback unregisters it (#2522 P2).
-            self._own_signal_sources(
-                registry.register_with_policy(
-                    build_restart_completed_registration(),
-                    RegistrationPolicy.OPTIONAL,
-                )
+            # Registered AS THIS FEATURE, so the base-class shutdown / boot
+            # rollback releases it (#2522 P2, #3074).
+            self._register_signal_sources(
+                build_restart_completed_registration(),
+                RegistrationPolicy.OPTIONAL,
+                registry,
             )
 
         # A successful restart orphans its child's stderr file (this process

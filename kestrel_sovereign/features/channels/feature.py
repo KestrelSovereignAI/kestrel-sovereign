@@ -500,7 +500,14 @@ class ChannelFeature(Feature):
         # than silently accepted by a precheck-by-name skip. Never raises.
         required = build_channel_message_registration()
         try:
-            outcome = register(required, RegistrationPolicy.OPTIONAL)
+            # Claimed AS THIS FEATURE at registration, because ownership is
+            # stated rather than inferred now (#3074). The verification below
+            # can still reject it — and then the claim is handed back, which is
+            # what `_disown_signal_sources` is for.
+            outcome = self._register_signal_sources(
+                required, RegistrationPolicy.OPTIONAL, signal_registry
+            )
+            outcome = outcome[0] if outcome else None
             # A host which merely claims registration succeeded is insufficient
             # for cursor-owned ingress. Verify the installed source itself so
             # an older/embedder registry cannot ACK an unknown contract.
@@ -526,6 +533,11 @@ class ChannelFeature(Feature):
             # Core cannot safely process.  Preserve the provider cursor until
             # this feature can start against its intended contract.
             self._durable_cognition_registration_failed = True
+            # Give the claim back: this feature is not a holder of a source it
+            # just refused, and a source whose last holder refused it should not
+            # linger. Deliberately keyed on VERIFYING the installed registration
+            # rather than trusting an embedder's return value.
+            self._disown_signal_sources(outcome, signal_registry)
             logger.error(
                 "Channel signal source registration is not verifiably usable for "
                 "durable cognition (state=%s): %s; ACK-bearing ingress will "
@@ -534,10 +546,6 @@ class ChannelFeature(Feature):
                 getattr(outcome, "detail", "required contract missing or mismatched"),
             )
             return
-        # Own the source we newly registered so shutdown / boot rollback
-        # unregisters it (#2522 P2). This is deliberately after verifying the
-        # actual registration rather than trusting an embedder's return value.
-        self._own_signal_sources(outcome)
 
     async def _register_durable_cognition_consumer(self) -> None:
         """Register the restart-safe delivery behind ACK-bearing channels.

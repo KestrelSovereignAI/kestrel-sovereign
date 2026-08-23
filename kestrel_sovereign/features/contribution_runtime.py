@@ -29,6 +29,7 @@ from kestrel_sovereign.operator import (
     OperatorRuntimeRegistry,
 )
 from kestrel_sovereign.signals import (
+    CLAIM_CONTRIBUTION,
     RegistrationPolicy,
     RegistrationState,
     SourceRegistry,
@@ -419,6 +420,7 @@ class FeatureContributionRuntime:
                         sources,
                         RegistrationPolicy.MANDATORY,
                         owner=prepared.feature,
+                        role=CLAIM_CONTRIBUTION,
                     )
                 registered_sources.extend(acquired)
             if values.permission_defaults is not None:

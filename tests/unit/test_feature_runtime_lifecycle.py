@@ -21,6 +21,7 @@ or test-only shims — and pin the three P1 contracts the GPT-5.6 Terra review f
 from __future__ import annotations
 
 import asyncio
+import types
 
 import pytest
 from fastapi import FastAPI
@@ -118,11 +119,10 @@ class _FullFeature(Feature):
         registry = getattr(self.agent, "signal_registry", None)
         if registry is not None:
             # OPTIONAL policy is idempotent on a second initialize().
-            self._own_signal_sources(
-                registry.register_with_policy(
-                    _fake_source_registration(self.SOURCE),
-                    RegistrationPolicy.OPTIONAL,
-                )
+            self._register_signal_sources(
+                _fake_source_registration(self.SOURCE),
+                RegistrationPolicy.OPTIONAL,
+                registry,
             )
 
     def get_hooks(self):
@@ -966,3 +966,151 @@ async def test_register_feature_a2a_failure_strands_nothing(tmp_path):
         "exercise the post-registration strand"
     )
     _no_registration_survives(agent, feature)
+
+
+# --- the ONE door a feature registers signal sources through (#3074) --------
+#
+# Ownership is stated at registration now, so `owner=None` means the host and
+# nothing infers a holder from the policy. These pin the two halves the
+# registry cannot see: what a feature does with a registry that predates the
+# claims ledger, and what it does when it registers a source and then refuses
+# it.
+
+
+class _NoClaimsRegistry:
+    """An embedder-supplied registry from before the claims ledger.
+
+    No ``release_all``, so :meth:`Feature._registry_holds_claims` is False and
+    the base class must track names itself — otherwise this feature's sources
+    are never torn down at all, which is worse than the ledger it replaced.
+    Deliberately REJECTS ``owner=``: a registry that cannot hold claims has no
+    parameter for one, and passing it anyway is the failure this branch exists
+    to avoid.
+    """
+
+    def __init__(self):
+        self.sources = {}
+        self.unregistered = []
+
+    def register_with_policy(self, registration, policy):
+        from kestrel_sovereign.signals import RegistrationOutcome, RegistrationState
+
+        if registration.name in self.sources:
+            return RegistrationOutcome(
+                registration.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+        self.sources[registration.name] = registration
+        return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
+
+    def unregister(self, name):
+        self.unregistered.append(name)
+        return self.sources.pop(name, None) is not None
+
+
+class _MinimalFeature(Feature):
+    tool_name = "minimal_owner"
+    tool_description = "feature used to exercise the registration seam"
+
+    async def initialize(self):
+        # The seam is driven directly by these tests, so boot does nothing.
+        return None
+
+
+def _seam_feature(registry):
+    return _MinimalFeature(types.SimpleNamespace(signal_registry=registry))
+
+
+async def test_a_registry_without_the_claims_api_is_torn_down_by_name():
+    """A registry that cannot hold a claim still has to be cleaned up.
+
+    The names are tracked on the feature for THIS case only. It is not the
+    second ledger #3053 removed: there is one record per registry, and which
+    one is decided by what the registry can actually do.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    feature._register_signal_sources(
+        _fake_source_registration("seam.byname"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.byname" in registry.sources
+
+    await feature._unregister_owned_signal_sources()
+
+    assert registry.unregistered == ["seam.byname"]
+    assert "seam.byname" not in registry.sources
+
+
+async def test_a_registry_without_the_claims_api_keeps_what_it_did_not_create():
+    """Riding an incumbent is not owning it.
+
+    This path has no claims to express shared use, so a source it merely found
+    already registered must not be removed by its teardown — the peer that
+    created it is still dispatching on it.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _NoClaimsRegistry()
+    incumbent = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.shared"), RegistrationPolicy.OPTIONAL,
+    )
+    rider = _seam_feature(registry)
+    rider._register_signal_sources(
+        _fake_source_registration("seam.shared"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await rider._unregister_owned_signal_sources()
+
+    assert registry.unregistered == []
+    assert "seam.shared" in registry.sources
+
+
+async def test_a_feature_that_registers_a_source_and_refuses_it_hands_the_claim_back():
+    """Registering and declining are two halves of one door.
+
+    The claim is taken AT registration now, so a feature that verifies the
+    installed contract afterwards and rejects it has to give the claim back —
+    and giving back the last claim removes the source, which is the right
+    answer: nothing needs a source its only holder refused.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = _seam_feature(registry)
+
+    outcomes = feature._register_signal_sources(
+        _fake_source_registration("seam.refused"), RegistrationPolicy.OPTIONAL,
+    )
+    assert registry.get("seam.refused") is not None
+
+    feature._disown_signal_sources(outcomes)
+
+    assert registry.get("seam.refused") is None
+    assert registry.owners_of("seam.refused") == ()
+
+
+async def test_disowning_a_source_a_peer_still_holds_leaves_it_registered():
+    """The invariant is per-holder, not per-name.
+
+    A feature that rode an equivalent incumbent and then refused it drops its
+    own claim only; the peer that created it keeps the source alive.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    incumbent = _seam_feature(registry)
+    rider = _seam_feature(registry)
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.peer"), RegistrationPolicy.OPTIONAL,
+    )
+    outcomes = rider._register_signal_sources(
+        _fake_source_registration("seam.peer"), RegistrationPolicy.OPTIONAL,
+    )
+
+    rider._disown_signal_sources(outcomes)
+
+    assert registry.get("seam.peer") is not None
+    assert registry.owners_of("seam.peer") == (incumbent,)

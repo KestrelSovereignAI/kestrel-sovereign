@@ -228,12 +228,12 @@ class SchedulerFeature(Feature):
             # contract is reported (logged loudly) rather than silently skipped
             # by the old ``name not in registry`` precheck. Never raises, so
             # scheduler init is not aborted by one bad source.
-            cron_outcomes = registry.register_batch(
-                cron_registrations, RegistrationPolicy.OPTIONAL
+            # Registered AS THIS FEATURE, so shutdown / boot rollback releases
+            # exactly these (#2522 P2) and the registry never has to infer who
+            # the holder is (#3074).
+            self._register_signal_sources(
+                cron_registrations, RegistrationPolicy.OPTIONAL, registry
             )
-            # Own the cron sources we newly registered so shutdown / boot
-            # rollback unregisters exactly them (#2522 P2).
-            self._own_signal_sources(cron_outcomes)
 
             # github_pr_watch (#1618) is an ACTION cron task that, on a
             # relevant change, enqueues a COGNITION github.pr_activity
@@ -245,22 +245,20 @@ class SchedulerFeature(Feature):
                 build_github_pr_activity_registration,
             )
 
-            self._own_signal_sources(
-                registry.register_with_policy(
-                    build_github_pr_activity_registration(),
-                    RegistrationPolicy.OPTIONAL,
-                )
+            self._register_signal_sources(
+                build_github_pr_activity_registration(),
+                RegistrationPolicy.OPTIONAL,
+                registry,
             )
 
             from kestrel_sovereign.signals.sources.ecosystem_discovery import (
                 build_ecosystem_discovery_registration,
             )
 
-            self._own_signal_sources(
-                registry.register_with_policy(
-                    build_ecosystem_discovery_registration(),
-                    RegistrationPolicy.OPTIONAL,
-                )
+            self._register_signal_sources(
+                build_ecosystem_discovery_registration(),
+                RegistrationPolicy.OPTIONAL,
+                registry,
             )
         else:
             logger.warning(

@@ -899,8 +899,8 @@ def test_the_registry_is_the_only_ownership_ledger(tmp_path):
     """A feature that BOTH self-registers and declares a source, torn down
     while another feature still holds it.
 
-    This is the shape neither ledger could see: `Feature._own_signal_sources`
-    recorded the imperative claim, the contribution runtime recorded the
+    This is the shape neither ledger could see: the feature base recorded the
+    imperative claim, the contribution runtime recorded the
     declarative one, and each tore down against its own list. The first
     feature's shutdown removed a source the second was still dispatching
     against. One ledger in the registry makes it unrepresentable.
@@ -917,12 +917,16 @@ def test_the_registry_is_the_only_ownership_ledger(tmp_path):
     runtime = agent._ensure_feature_contribution_runtime()
     agent.signal_registry = runtime.source_registry
 
-    # `first` registers the source ITSELF, then records the claim — the two
-    # calls `Feature._own_signal_sources` makes (the fixture is not a Feature
-    # subclass, so the registry API it drives is exercised directly here; the
-    # Feature wiring itself is covered in test_feature_runtime_lifecycle.py).
-    runtime.source_registry.register_with_policy(first.source)
-    runtime.source_registry.adopt(first.source.name, first, created=True)
+    # `first` registers the source ITSELF, stating its ownership in the same
+    # call — the one call `Feature._register_signal_sources` makes now (#3074).
+    # The fixture is not a Feature subclass, so the registry API it drives is
+    # exercised directly here; the Feature wiring itself is covered in
+    # test_feature_runtime_lifecycle.py.
+    from kestrel_sovereign.signals import CLAIM_IMPERATIVE
+
+    runtime.source_registry.register_with_policy(
+        first.source, owner=first, role=CLAIM_IMPERATIVE,
+    )
     # ...and also declares it (the declarative path).
     runtime.activate(runtime.prepare_transition((first,)).only())
     runtime.activate(runtime.prepare_transition((second,)).only())
