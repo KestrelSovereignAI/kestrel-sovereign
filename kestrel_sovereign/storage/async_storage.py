@@ -37,12 +37,28 @@ from .agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from .semantic_binding import SemanticAssertionBinding
-from .conversation_created_at import created_at_bind, fill_undatable
+from .conversation_created_at import (
+    created_at_bind,
+    fill_undatable,
+    parse_stored_timestamp,
+)
 from .session_id_column import column_session_id
 from kestrel_sovereign.knowledge import Visibility
 from .db import ConnectionError, DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
+
+#: Filler for the sort key of a row nothing can date (#3049).
+#:
+#: Its VALUE decides nothing, and saying so is the point: the key is
+#: ``(parsed is not None, parsed or this)``, and ``False`` sorts before ``True``,
+#: so the boolean is what puts undatable rows first — which is the answer
+#: ``canonical_order`` gives, undatable means earliest, always. This exists only
+#: because a tuple's second element has to be comparable with the datetimes in
+#: the other rows' keys, and two undatable rows both land on it and fall through
+#: to the sort's stability. A mutation changing it to ``datetime.max`` survives,
+#: correctly.
+_UNDATABLE_SORT_FILLER = datetime.min.replace(tzinfo=UTC)
 
 # Bind-parameter ceiling for a single ``id IN (...)`` DELETE. SQLite's default
 # SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; stay well under it (and it
@@ -719,6 +735,20 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.list_conversation_sessions(
             limit=limit, include_trashed=include_trashed
+        )
+
+    async def list_session_page(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One page of the active conversation list — facade delegator (#2960)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.list_session_page(
+            agent_id=agent_id, limit=limit, cursor=cursor
         )
 
     async def count_session_messages(
@@ -2672,14 +2702,47 @@ class AsyncStorage:
                         + ", created_at"
                         + (", deleted_at" if has_deleted_at else ", NULL AS deleted_at")
                         + " FROM conversation_history"
-                        # Tie-break on the original row id: created_at is often
-                        # second-granularity, so same-second turns must keep
-                        # their original order — new ids are assigned in this
-                        # order and get_conversation_history() sorts by id, so a
-                        # tie here would swap user/assistant turns (codex P2).
-                        + " ORDER BY created_at, id"
+                        # SOURCE order, deterministic and nothing more. The
+                        # chronological ordering is done in Python below,
+                        # because it has to be done by the same parser that
+                        # normalises the value (#3049).
+                        + " ORDER BY id"
                     )
                     conversations = await cursor.fetchall()
+
+                    # Ordered chronologically HERE, not in SQL, and by the same
+                    # parser that canonicalises the value a few lines down.
+                    #
+                    # New ids are assigned in this order and
+                    # `get_conversation_history()` sorts by id, so this ordering
+                    # IS the restored transcript's reading order. Ordering by
+                    # the backup's raw TEXT got it wrong — a space (0x20) sorts
+                    # before `T` (0x54), so `'2026-01-02 07:04:05+01:00'`
+                    # compared LESS than `'2026-01-02T03:04:05'` and an
+                    # hour-later row was renumbered first (#3049).
+                    #
+                    # SQLite's own `julianday` is not the answer either, and
+                    # this is the trap `_derived_from` in `conversation_sessions`
+                    # already documents: the two parsers DISAGREE. Measured,
+                    # `parse_stored_timestamp('20260102T050405')` dates it while
+                    # `julianday` returns NULL — so a SQL ordering would file
+                    # that row as undatable and put it first, while the Python
+                    # pass a moment later dates it perfectly well. One rule, one
+                    # parser, or the restore sorts by one answer and stores
+                    # another.
+                    #
+                    # A row nothing can date sorts FIRST, which is the answer
+                    # `canonical_order` gives — undatable means earliest,
+                    # always. Python's sort is stable, so rows sharing an
+                    # instant keep the source id order this SELECT returned:
+                    # `created_at` is often second-granularity, and a tie that
+                    # reordered would swap user/assistant turns (codex P2).
+                    conversations.sort(
+                        key=lambda row: (
+                            (parsed := parse_stored_timestamp(row[5])) is not None,
+                            parsed or _UNDATABLE_SORT_FILLER,
+                        )
+                    )
 
                     # created_at/deleted_at come out of the SQLite backup as
                     # TEXT strings. Binding a string to a Postgres TIMESTAMP

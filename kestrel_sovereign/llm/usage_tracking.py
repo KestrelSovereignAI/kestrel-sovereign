@@ -139,13 +139,13 @@ class UsageTrackingMixin:
             # Use abstract data layer - queries are backend-agnostic
             # Note: Column references in ON CONFLICT must be qualified for PostgreSQL
             await self._usage_db.execute("""
-                INSERT INTO model_usage (model_id, provider, last_used, use_count, total_tokens)
-                VALUES (?, ?, ?, 1, ?)
+                INSERT INTO model_usage (model_id, provider, last_used, use_count, total_tokens, created_at)
+                VALUES (?, ?, ?, 1, ?, ?)
                 ON CONFLICT(model_id) DO UPDATE SET
                     last_used = ?,
                     use_count = model_usage.use_count + 1,
                     total_tokens = model_usage.total_tokens + ?
-            """, (model_id, provider, now, tokens, now, tokens))
+            """, (model_id, provider, now, tokens, now, now, tokens))
         except Exception as e:
             logger.warning(f"Failed to track usage for {model_id}: {e}")
 

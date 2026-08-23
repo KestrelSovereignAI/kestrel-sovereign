@@ -20,6 +20,11 @@ from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 AGENT_ID = "did:test:soft-delete-round-trip"
 
 
+
+def _listed(page):
+    """The session ids one page of the conversation list carries (#2960)."""
+    return [session["session_id"] for session in page["sessions"]]
+
 @pytest.mark.asyncio
 async def test_soft_delete_filters_from_default_reads(tmp_path):
     """delete_message stamps deleted_at; live reads stop returning it."""
@@ -201,8 +206,7 @@ async def test_session_round_trip_through_privacy_wrapper(tmp_path):
         assert deleted == 3
 
         # Live reads return nothing
-        live = await wrapper.query_conversations(AGENT_ID)
-        assert live == []
+        assert _listed(await wrapper.list_session_page(AGENT_ID)) == []
 
         # Trash listing finds all three rows
         trash = await wrapper.list_trashed_conversations()
@@ -214,8 +218,9 @@ async def test_session_round_trip_through_privacy_wrapper(tmp_path):
         )
         assert restored == 3
 
-        live = await wrapper.query_conversations(AGENT_ID)
-        assert len(live) == 3
+        page = await wrapper.list_session_page(AGENT_ID)
+        assert _listed(page) == [session_id]
+        assert page["sessions"][0]["message_count"] == 3
 
         # Final hard purge — gone forever, audit reason recorded
         purged = await wrapper.purge_conversation_session(
@@ -223,7 +228,6 @@ async def test_session_round_trip_through_privacy_wrapper(tmp_path):
         )
         assert purged == 3
 
-        live = await wrapper.query_conversations(AGENT_ID)
         trash = await wrapper.list_trashed_conversations()
-        assert live == []
+        assert _listed(await wrapper.list_session_page(AGENT_ID)) == []
         assert trash == []

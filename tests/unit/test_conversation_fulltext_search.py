@@ -443,13 +443,13 @@ def test_conversations_endpoint_q_redacts_snippets_when_decrypt_false():
 
 
 def test_conversations_endpoint_without_q_lists_normally():
-    async def fake_query_conversations(agent_id, limit=50, view="active"):
-        return []
+    async def fake_list_session_page(agent_id, *, limit=50, view="active", cursor=None):
+        return {"sessions": [], "next_cursor": None}
 
     storage = MagicMock()
     storage.agent_id = "agent-1"
     storage.encryption_enabled = False
-    storage.query_conversations = fake_query_conversations
+    storage.list_session_page = fake_list_session_page
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -461,5 +461,8 @@ def test_conversations_endpoint_without_q_lists_normally():
         body = resp.json()
         assert body["conversations"] == []
         assert "query" not in body
+        # Both shapes carry the key; search says "no next page" rather than
+        # omitting it, so a caller reading it never has to guess (#2960).
+        assert body["next_cursor"] is None
     finally:
         _restore_app(app, original)

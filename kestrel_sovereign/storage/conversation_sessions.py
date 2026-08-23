@@ -26,32 +26,32 @@ session, so long-lived autonomous agents accumulate large message counts in
 comparatively few sessions. Only the projection is bounded in every
 distribution.
 
-Left for Phase C (#2960), stated here so it is not rediscovered
---------------------------------------------------------------
+What Phase C (#2960) settled
+----------------------------
 
-Nothing in production calls :meth:`repair` yet, so ``conversation_sessions``
-and ``conversation_session_watermarks`` hold nothing outside tests. That is
-what makes the EPHEMERAL sweep in ``privacy_wrapper`` as narrow as it is: the
-change ledger is the only table a trigger can fill on its own.
-
-The moment Phase C maintains the projection, two things become live that are
-dormant here, and both were found by review against this design rather than
-guessed at:
+:meth:`repair` now runs in production: ``list_session_page`` calls it before
+serving the first page of the active conversation list. Two things this design
+named as dormant became live with it, and the answer to both was the one this
+section originally guessed at — **stop projecting**, rather than purge harder.
 
 * **A repair can republish purged state.** :meth:`_rebuild_from_transcript`
   reads history OUTSIDE its transaction, deliberately, because that read is
-  unbounded. A pass that began before an EPHEMERAL purge can therefore take the
-  lock afterwards and write a pre-purge snapshot — restoring leaked counts,
-  timestamps and pointers after the purge reported success. Publishing needs to
-  revalidate under the lock that the change stamp it read still stands.
-* **The sweep grows back to three tables**, and with it the questions this
-  revision could answer by narrowing: what evidence a retry uses, and whether
-  the deletes need to be atomic with each other.
+  unbounded. A pass that began before an EPHEMERAL purge could therefore take
+  the lock afterwards and write a pre-purge snapshot, restoring leaked counts,
+  timestamps and pointers after the purge reported success.
+* **The sweep would grow back to three tables**, with the questions that come
+  with it: what evidence a retry uses, and whether the deletes must be atomic
+  with each other.
 
-The cleanest answer to both is probably not to purge harder but to stop
-projecting: a projection not maintained while EPHEMERAL is in force has nothing
-to erase. That is a cross-cutting privacy change touching the trigger layer,
-which is why it is named here rather than attempted in this phase.
+Neither is reachable now, because ``PrivacyEnforcingStorage.list_session_page``
+returns before any repair while EPHEMERAL is in force. A projection that is
+never maintained under that mode has nothing to erase and nothing to republish,
+so the sweep stays as narrow as it is — the change ledger, which is the only
+table a trigger can fill on its own.
+
+The mode is read per request rather than latched at boot, so a mode that is
+turned on mid-life stops the projection at the next read; what an earlier,
+non-EPHEMERAL life projected is what the sweep already erases.
 
 The contract: a rebuildable cache, repaired in bounded chunks
 =============================================================
@@ -313,6 +313,7 @@ entirely: a repair never reads ciphertext, at any size of session.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -322,14 +323,25 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .session_grouping import (
+    SESSION_ORDER,
+    SESSION_ORDER_TEXT_COLUMNS,
     canonical_timestamp_sql,
     coalesce_sessions_by_session_id,
     coerce_session_timestamp,
     group_messages_into_sessions,
+    session_cursor_clause,
+    parse_message_metadata,
+    session_cursor_values,
     session_order_sql,
     timestamp_query_param,
 )
-from .session_id_column import SESSION_ID_KEY, is_stampable_session_id
+from .conversation_ids import coerce_persistent_message_id
+from .session_id_column import (
+    SESSION_ID_KEY,
+    SESSION_ID_MAX_LENGTH,
+    is_stampable_session_id,
+    is_storable_session_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +360,40 @@ PROJECTION_COLUMNS: Tuple[str, ...] = (
 #: What a watermark claims, in :class:`SessionWatermark` field order. All four
 #: are written by one statement, in the same transaction as the rows they
 #: describe — which is this module's entire concurrency mechanism.
+#: How many times this agent's watermark has been written, ever.
+#:
+#: Not one of :data:`WATERMARK_COLUMNS`, because those are what a WALK decided
+#: and this is how many decisions there have been. It is the one column
+#: ``_record`` does not take from the value it is given.
+#:
+#: It exists because the watermark's own fields can return to a previous value.
+#: ``rebuild()`` invalidates, discards every row, and walks again — and over an
+#: unchanged history it arrives at a watermark identical to the one it replaced,
+#: field for field. A page read during that walk sees a partial table, and a
+#: before/after comparison of the watermark alone then certifies it: same
+#: generation, same stamp, same target, so the truncated page is returned with
+#: ``next_cursor: null``. ABA, in a cache whose whole contract is "may be silent,
+#: may never disagree".
+#:
+#: Monotonic per agent and bumped by the same statement that writes the
+#: watermark, so no pass can move one without the other.
+WATERMARK_REVISION_COLUMN = "accounted_revision"
+
+#: Which INCARNATION of this agent's watermark row the counter belongs to.
+#:
+#: The counter alone is monotonic only while the ROW lives, and the row does not
+#: always live: ``purge_session_projection`` deletes it, and so does the
+#: empty-history branch of the transcript pass. The next repair then INSERTs a
+#: fresh one starting from the default, so two different incarnations can show
+#: the same count — measured: revision 0, delete, repair, revision 0, with the
+#: ledger generation unchanged because the ledger was never touched. A page read
+#: straddling that would compare equal and be certified.
+#:
+#: Set when the row is created and never updated, exactly as the ledger's own
+#: ``generation`` is, and for the same reason: counters restart, so something
+#: has to say which run of them you are looking at.
+WATERMARK_EPOCH_COLUMN = "accounted_epoch"
+
 WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_generation",
     "accounted_valid",
@@ -356,6 +402,14 @@ WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_through",
     "accounted_target",
 )
+
+#: How large a whole-transcript derivation has to get before it is worth saying.
+#:
+#: Below this the pass is a few milliseconds and happens on databases that have
+#: barely any history; above it the cost is user-visible on a read path, and
+#: the operator should hear about it from a log rather than from a slow pane.
+#: Measured at roughly 8.5 microseconds a live row, so this is the ~100 ms mark.
+TRANSCRIPT_PASS_NOISY_ROWS = 10_000
 
 #: How many of an agent's live rows one chunk folds.
 #:
@@ -693,6 +747,206 @@ def _canonical_key(backend_type: str, column: str) -> str:
 
 
 
+#: The longest token :func:`encode_session_cursor` can produce, in characters.
+#:
+#: Derived, not chosen. The endpoint has to accept every token it hands out —
+#: a `next_cursor` its own parameter then refuses makes every session after
+#: that page boundary unreachable, which is this ticket's bug wearing a 422 —
+#: so the bound is computed from what a token can contain rather than set to a
+#: round number that looked large enough.
+#:
+#: Worst case, in bytes of JSON before base64:
+#:
+#: * the fixed envelope and the timestamp key: under 96 bytes, generously.
+#: * the session id: up to ``SESSION_ID_MAX_LENGTH`` bytes, and JSON escaping
+#:   is what makes that not the answer. A quote or a backslash doubles, and an
+#:   ASCII control character becomes ``\u00XX`` — six bytes for one. Six is
+#:   therefore the multiplier, and it is reachable: the storability rule admits
+#:   any text PostgreSQL can hold, which includes control characters.
+#:
+#: base64 is 4 characters per 3 bytes, and the padding is stripped.
+_CURSOR_ENVELOPE_BYTES = 96
+_JSON_WORST_ESCAPE = 6
+SESSION_CURSOR_MAX_LENGTH = (
+    ((_CURSOR_ENVELOPE_BYTES + _JSON_WORST_ESCAPE * SESSION_ID_MAX_LENGTH) + 2)
+    // 3
+) * 4
+
+#: The wire format of a page cursor. Stamped into every token and checked on
+#: the way back in, so a token minted by an older shape is refused rather than
+#: read as though its fields meant what they mean now.
+_CURSOR_VERSION = 1
+
+
+class SessionCursorError(ValueError):
+    """A page cursor that this build cannot read.
+
+    Its own type rather than a bare ``ValueError`` because the caller has to
+    tell "the client sent nonsense" (answerable with a 400) from "the database
+    failed" (a 500). A cursor is client-supplied text, so this is reachable by
+    anyone with the endpoint, and the two must not be confused.
+    """
+
+
+#: How a cursor names a position, and there are two because there are two ways
+#: a page is produced.
+#:
+#: ``keyset`` carries the ordering's keys and is what the projection pages by:
+#: it has an index and a stable key, and an offset there would count rows that
+#: move between two requests.
+#:
+#: ``offset`` carries a count, and is what the grouped paths page by — the
+#: archived view and ISOLATED's in-memory buffer. Those have no table: they
+#: derive and order the WHOLE set inside one request and then slice it, so a
+#: position in that slice is exactly what an offset is. A keyset there would
+#: have to carry the boundary session's id, which nothing bounds — a 4,000
+#: character id mints a 5,408 character token, past the length the endpoint's
+#: own parameter accepts, so the server would hand back a `next_cursor` it then
+#: refuses with 422 and every later session would be unreachable. Measured.
+#:
+#: An offset re-derives against a set that may have changed between requests,
+#: which a keyset would not. That is the honest trade for these paths and no
+#: worse than what they already are: the set is re-derived per request either
+#: way, so it has always been a snapshot.
+_CURSOR_KEYSET = "keyset"
+_CURSOR_OFFSET = "offset"
+
+
+def encode_offset_cursor(offset: int, view: str) -> str:
+    """A position in a materialized, re-derived page sequence (#2960)."""
+    return _encode_cursor(_CURSOR_OFFSET, view, int(offset))
+
+
+def decode_offset_cursor(token: str, view: str) -> int:
+    """An offset token back into a count, refusing anything else."""
+    value = _decode_cursor(_CURSOR_OFFSET, token, view)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SessionCursorError("cursor's offset is not a count")
+    return value
+
+
+def _encode_cursor(kind: str, view: str, keys: Any) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps(
+            {"v": _CURSOR_VERSION, "kind": kind, "view": view, "k": keys},
+            separators=(",", ":"),
+            # UTF-8 rather than ASCII escapes. A size choice, not a guard —
+            # what keeps a token inside the parameter that takes it is
+            # `SESSION_CURSOR_MAX_LENGTH`, which is derived from the escaped
+            # worst case and holds either way. This just stops an ordinary
+            # non-ASCII session id from costing twelve characters per emoji.
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(kind: str, token: str, view: str) -> Any:
+    """The shared envelope checks: readable, this version, this kind, this view.
+
+    ``kind`` is checked rather than dispatched on, so a token minted for one
+    paging model can never be read by the other — the two mean different things
+    by the same field, and a caller silently accepting the wrong one resumes at
+    a position that was never its own.
+    """
+    if not isinstance(token, str) or not token:
+        raise SessionCursorError("cursor is empty")
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception as exc:
+        raise SessionCursorError("cursor is not readable") from exc
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise SessionCursorError("cursor was minted by a different version")
+    if payload.get("kind") != kind:
+        raise SessionCursorError(
+            f"cursor names a {payload.get('kind')!r} position, not {kind!r}"
+        )
+    if payload.get("view") != view:
+        raise SessionCursorError(
+            f"cursor belongs to the {payload.get('view')!r} view, not {view!r}"
+        )
+    return payload.get("k")
+
+
+def encode_session_cursor(session: Dict[str, Any], view: str) -> str:
+    """One page's last row, spelled so the next request can resume from it.
+
+    Opaque on purpose: the fields inside are :data:`SESSION_ORDER`'s keys, which
+    is an ordering decision this epic has already changed twice. A client that
+    could read the token would come to depend on that shape, and the tie-break
+    is exactly the part a caller must not pin.
+
+    ``view`` travels with it because the views are served by different
+    machinery — the active list pages the #2959 projection in SQL, the archived
+    one pages the grouper's output in Python — and a token minted by one and
+    replayed against the other would resume from a key the other never ordered
+    by. Refusing that is a 400; silently serving page one for it is a list that
+    lies about where the user was.
+
+    The keys go through :func:`session_cursor_values`, which is the same
+    spelling the Python-side continuation compares in, so a cursor means one
+    thing on every path that can honour it.
+    """
+    return _encode_cursor(
+        _CURSOR_KEYSET, view, list(session_cursor_values(session))
+    )
+
+
+def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
+    """A token back into :data:`SESSION_ORDER` values, comparably spelled.
+
+    Every failure is one exception type. A client can put anything in this
+    parameter, and the two alternatives are the ones that hurt: returning
+    ``None`` for an unreadable token silently serves page one to a caller that
+    asked for page nine, and letting a ``binascii`` error escape reports a
+    client's typo as a server fault.
+
+    Backend-free by construction. What comes back is text (or ``None``), and the
+    caller that runs a SQL page binds it for its own engine — so this codec
+    stays the one thing both the SQL and the Python continuation can share.
+    """
+    values = _decode_cursor(_CURSOR_KEYSET, token, view)
+    if not isinstance(values, list) or len(values) != len(SESSION_ORDER):
+        raise SessionCursorError("cursor does not carry this ordering's keys")
+    for (column, _), value in zip(SESSION_ORDER, values):
+        # NULL is not a value this ordering can hold. Both keys are NOT NULL in
+        # the projection's schema and the grouper substitutes a stamp rather
+        # than omitting one, so a null key is a token no server minted — and
+        # letting it through is worse than refusing on every path: the Python
+        # continuation compares a string against ``None`` and raises
+        # ``TypeError`` (a 500), while the SQL one compares against NULL and
+        # quietly serves an empty page.
+        # Each key against what its COLUMN is, and that is the whole check:
+        # both of these refuse every non-string, ``None`` included, so a
+        # separate "is it text" guard ahead of them decided nothing. Verified
+        # rather than assumed — a mutation removing it survived, which is what
+        # that always means.
+        #
+        # Text alone would not be enough for the id either: a NUL or a lone
+        # surrogate is a string Python holds happily and the drivers refuse,
+        # and the refusal comes out of the QUERY rather than out of the cursor
+        # check — a 500 for client-supplied input. So it is asked the same
+        # bound the projection stores keys under.
+        if column in SESSION_ORDER_TEXT_COLUMNS and not is_storable_session_id(value):
+            raise SessionCursorError(
+                f"cursor's {column} is not a value this store can hold"
+            )
+        # Each key is checked against what its COLUMN is, not merely against
+        # being a string. A token is client-supplied, and a timestamp key that
+        # cannot be read is not a cursor this build cannot honour — it is one
+        # that reaches asyncpg as a ``TIMESTAMP`` parameter and raises out of
+        # the query, past the handler that turns a bad cursor into a 400 and
+        # into the one that reports a server fault. On SQLite it is worse than
+        # an error: ``'not-a-date'`` compares as text against canonical stamps
+        # and simply selects the wrong page.
+        if (
+            column not in SESSION_ORDER_TEXT_COLUMNS
+            and coerce_session_timestamp(value) is None
+        ):
+            raise SessionCursorError(f"cursor's {column} is not a timestamp")
+    return tuple(values)
+
+
 #: What one chunk selects: this agent's next live rows, and only those. The rows
 #: a step reads and the rows it folds are the same rows, which is what makes the
 #: chunk a bound on work rather than only on ids. Seeded by
@@ -764,12 +1018,30 @@ REBUILT = "rebuilt"
 # every ``from_pool()`` — frinz calls it per request — so a post-upgrade request
 # burst is exactly the parallel case.
 
+#: The projection columns that may never hold NULL, and the reason is the
+#: PAGE (#2960) rather than tidiness.
+#:
+#: Every writer already guarantees it: the grouper produces ``isoformat()`` text
+#: for both stamps — substituting the preceding row's instant for an undatable
+#: row rather than leaving one out — and ``timestamp_query_param`` never returns
+#: ``None``. The column merely failed to say so, and what that cost was
+#: measured: a keyset predicate has to admit NULL to keep a NULL-stamped session
+#: reachable at all, and that ``OR ... IS NULL`` is what stops the engine
+#: seeking. On 200,000 sessions, SQLite: 0.11 ms with a seekable predicate,
+#: 20.7 ms without — the same ``O(rows above the cursor)`` walk this epic exists
+#: to remove, arriving back on the continuation instead of on the first page.
+#:
+#: So the choice was between a slow page and a column that states the invariant.
+#: An invariant a writer keeps and a schema does not is one an ``UPDATE`` run by
+#: hand can break, and the failure is silent: the session simply stops appearing.
+NON_NULL_PROJECTION_COLUMNS: Tuple[str, ...] = ("started_at", "last_message_at")
+
 _CONVERSATION_SESSIONS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_sessions (
     agent_id              TEXT NOT NULL,
     session_id            TEXT NOT NULL,
-    started_at            TIMESTAMP,
-    last_message_at       TIMESTAMP,
+    started_at            TIMESTAMP NOT NULL,
+    last_message_at       TIMESTAMP NOT NULL,
     message_count         INTEGER NOT NULL DEFAULT 0,
     user_message_count    INTEGER NOT NULL DEFAULT 0,
     first_user_message_id INTEGER,
@@ -781,6 +1053,8 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
 _WATERMARKS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
     agent_id             TEXT PRIMARY KEY,
+    accounted_epoch      TEXT NOT NULL DEFAULT '',
+    accounted_revision   BIGINT NOT NULL DEFAULT 0,
     accounted_generation TEXT NOT NULL DEFAULT '',
     accounted_valid   INTEGER NOT NULL DEFAULT 0,
     accounted_stamp   BIGINT NOT NULL DEFAULT 0,
@@ -1489,6 +1763,30 @@ def shape_change_invalidation(backend_type: str) -> str:
     )
 
 
+def emptied_cache_invalidation() -> str:
+    """SQL retiring every watermark, for when the CACHE has been emptied.
+
+    The companion to :func:`shape_change_invalidation`, and it is needed because
+    that one can update nothing. Rotating the generation retires the counters a
+    watermark was compared against — but only if a counter row exists. An agent
+    whose projection was built before the triggers were installed, or restored
+    without its ledger, has a watermark and no slot-0 row: its generation is the
+    empty string and its stamp is zero, which is exactly what a MISSING ledger
+    reads back as. The numbers agree, ``is_stale()`` answers false, and the
+    freshly emptied cache is served for ever beside intact history.
+
+    So the claim is made where it is true. The cache is empty, therefore nothing
+    is accounted for, therefore no watermark is valid — which is a statement
+    about the watermarks and is written to them.
+
+    Both are run, not one: this catches the missing-ledger case, and the
+    generation rotation catches a repair already IN FLIGHT, whose publish fence
+    re-reads the generation and would otherwise commit a walk it decided on
+    before the table went.
+    """
+    return "UPDATE conversation_session_watermarks SET accounted_valid = 0"
+
+
 def mutation_trigger(backend_type: str, role: str) -> Tuple[str, str]:
     """One trigger's ``(name, DDL)`` by role — ``insert``/``update``/``delete``.
 
@@ -1529,6 +1827,24 @@ class SessionWatermark:
     appends: int = 0
     through: int = 0
     target: int = 0
+    #: See :data:`WATERMARK_REVISION_COLUMN`. Read back, never supplied: the
+    #: writer increments it, so a value constructed in Python carries 0 and
+    #: only what came from the database carries the real count.
+    revision: int = 0
+    #: See :data:`WATERMARK_EPOCH_COLUMN`. Read back, never supplied.
+    epoch: str = ""
+
+    @property
+    def fence(self) -> Tuple[str, int]:
+        """What a reader compares before and after to know nothing moved.
+
+        The pair, never either half. The revision cannot repeat while the row
+        lives; the epoch cannot repeat across rows. Alone, each has a case it
+        cannot see — a rebuild landing where it started, and a watermark
+        deleted and recreated — and both of those return a page read from a
+        half-built cache as the end of the list.
+        """
+        return (self.epoch, self.revision)
 
     @property
     def complete(self) -> bool:
@@ -1650,19 +1966,6 @@ class SessionProjection:
     wake_source: Optional[str]
 
 
-def _parse_metadata(raw: Any) -> Dict[str, Any]:
-    """Metadata as the grouper wants it: a dict, or an empty one."""
-    if isinstance(raw, dict):
-        return raw
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def project_transcript(
     rows: Sequence[Sequence[Any]], expect: Optional[str] = None
 ) -> List[SessionProjection]:
@@ -1712,7 +2015,7 @@ def project_transcript(
                 # picker answers WHICH row rather than what it said. See the
                 # module docstring for why that is faithful.
                 "content": str(row_id),
-                "metadata": _parse_metadata(metadata),
+                "metadata": parse_message_metadata(metadata),
                 "created_at": created_at,
             }
         )
@@ -1749,35 +2052,94 @@ def project_transcript(
         )
         return []
 
-    # Every value the `session_id` COLUMN actually holds in this transcript.
+    # Every value this transcript's METADATA files a row under, which is what
+    # decides whether a reader can open a session — not the indexed column.
+    # ``AsyncConversationStore._get_session_messages`` resolves a session two
+    # ways and neither of them is the column: as a row id, or by matching
+    # ``metadata LIKE '%"session_id": "<value>"%'``. Phase A's column is a
+    # derived duplicate for INDEXING, and asking it "can this be opened" was a
+    # proxy for a question it does not answer.
+    #
+    # Collected with the grouper's own acceptance rule, because this has to be
+    # the set of keys the grouper could have produced from metadata: it files a
+    # row under ``metadata.session_id`` when that value is truthy and not
+    # ``str(...).isdigit()``, and a value it would ignore is not a key it can
+    # have chosen.
+    #
     # Taken across all rows rather than per session, because a session
     # established by a `new_session` marker alone (#2222) carries no messages —
     # the marker is structural and excluded from them — while its own row does
-    # carry the column. A per-session test would have silently stopped
-    # projecting exactly the just-started conversations `keep_empty_markers`
-    # exists to keep.
-    columns_seen = {str(value) for value in stamped.values() if value is not None}
+    # carry the id. A per-session test would have silently stopped projecting
+    # exactly the just-started conversations `keep_empty_markers` exists to keep.
+    metadata_keys_seen = set()
+    for message in messages:
+        candidate = message["metadata"].get(SESSION_ID_KEY)
+        if candidate and not str(candidate).isdigit():
+            metadata_keys_seen.add(str(candidate))
 
     projections: List[SessionProjection] = []
     for session in grouped:
         session_id = str(session["session_id"])
-        # Two questions, and they are not the same one. `is_stampable_session_id`
-        # asks whether the COLUMN could hold this value; the second asks whether
-        # this key came FROM that column at all.
+        # The requirement is that a READER CAN OPEN this key. The grouper mints
+        # a key exactly two ways, and each is opened by a different half of the
+        # resolver:
         #
-        # The second used to be inferred from the first, because a key the
-        # grouper invented is a row id and a row id is all digits. That is a
-        # proxy, and #3001 broke it by making negative ids supported: `"-1"`
-        # contains a hyphen, so it is not all digits and sails through — and the
-        # projection then lists a session `coerce_persistent_message_id`
-        # refuses, which no reader can open and no lifecycle tool can delete.
-        # The rows carry their own `session_id`, so the question is asked of
-        # that instead of reconstructed from the key's shape.
-        if not is_stampable_session_id(session_id):
+        # 1. From ``metadata.session_id``, which the resolver matches on
+        #    directly. Charset does not enter into it — ``rasa_shim`` files
+        #    every SMS turn under ``sms:{sender}``, which Phase A's column may
+        #    not hold and the resolver opens without difficulty.
+        # 2. Invented from the first row's id, for a legacy cluster carrying no
+        #    session id anywhere (#2012), which the row-id half opens — and
+        #    only if it is a usable row id, which is what #3001's ``"-1"`` case
+        #    was about: SQLite allows a negative rowid, and a key of ``"-1"``
+        #    is refused by ``coerce_persistent_message_id``, so neither half of
+        #    the resolver would find it.
+        #
+        # Phase B asked ``is_stampable_session_id`` here instead, and that was a
+        # proxy twice over: it is a question about the COLUMN, and the column
+        # resolves nothing. It dropped both the row-id keys and every metadata
+        # key outside the column's charset. That cost nothing while nothing read
+        # this table; #2960 makes it THE conversation list, so a dropped session
+        # is a conversation that has vanished — this ticket's own bug, arriving
+        # by another route. Measured: an `sms:` session listed as absent, and
+        # 473 of Emma's 1,522 live rows carry no session id at all.
+        #
+        # Storing them is sound because the two derivations cannot meet over
+        # one. A key outside the column's charset is a key no row's column can
+        # hold, so every row of that session is unstamped, so
+        # `_has_unstamped_rows()` is true and every step takes the transcript
+        # pass — the chunked fold, which is keyed on the column and could not
+        # maintain such a row, never runs while one can exist. Leaving that
+        # state cannot be reached by appends alone (removing an unstamped row is
+        # a delete, an archive or a rewrite), so `_plan` answers REBUILT and the
+        # discard clears anything left behind.
+        if (
+            session_id not in metadata_keys_seen
+            and coerce_persistent_message_id(session_id) is None
+        ):
             continue
-
-        if session_id not in columns_seen:
+        # ...and this table's own primary key has to be able to hold it, which
+        # is a second question and not the same one. Openable says a reader can
+        # find the session; storable says PostgreSQL can put the key in a
+        # composite B-tree — no NUL, encodable, within the length bound. A key
+        # past one of those does not lose a session quietly: `_store` raises,
+        # inside the repair that runs on the first page of every conversation
+        # list, so the WHOLE list fails for that agent until the row is edited
+        # by hand. Refusing one session and saying so is the smaller harm, and
+        # it is said out loud because a dropped session is now a conversation
+        # missing from the UI.
+        if not is_storable_session_id(session_id):
+            logger.warning(
+                "conversation_sessions: session %r cannot be stored as a "
+                "projection key (%d bytes, NUL or unencodable); it will not "
+                "appear in the conversation list",
+                session_id[:64],
+                len(session_id.encode("utf-8", errors="replace")),
+            )
             continue
+        # Asked of every session, whichever way its key was arrived at: a row
+        # whose column names a different session is in the wrong place under
+        # either derivation, and for an invented key ANY non-NULL column is that.
         divergent = [
             message["id"]
             for message in session.get("messages", ())
@@ -1928,7 +2290,8 @@ class ConversationSessionProjection:
         *invalid* is the honest name for that — it must derive, not compare.
         """
         row = await self.db.fetchone(
-            f"SELECT {', '.join(WATERMARK_COLUMNS)} "
+            f"SELECT {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_REVISION_COLUMN}, "
+            f"{WATERMARK_EPOCH_COLUMN} "
             "FROM conversation_session_watermarks WHERE agent_id = ?",
             (self.agent_id,),
         )
@@ -1936,7 +2299,7 @@ class ConversationSessionProjection:
             return INVALID
         return SessionWatermark(
             str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
-            int(row[5]),
+            int(row[5]), int(row[6]), str(row[7] or ""),
         )
 
     async def is_stale(self) -> bool:
@@ -2095,6 +2458,58 @@ class ConversationSessionProjection:
             (self.agent_id,),
         )
         return [_as_dict(row) for row in rows]
+
+    async def page(
+        self, *, limit: int, after: Optional[Sequence[Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """One page of this agent's sessions, newest activity first (#2960).
+
+        ``after`` is the previous page's last row in :data:`SESSION_ORDER`, as
+        :func:`decode_session_cursor` returns it; ``None`` starts at the top.
+
+        This is the read the epic exists for. The list it replaces fetched a
+        fixed window of ``conversation_history`` and hoped the sessions it
+        wanted fell inside — measured on Emma, 34% of her conversations did not,
+        and no ``limit`` could reach them because the window was a constant. Here
+        the bound is the page, the continuation is a key rather than an offset,
+        and every session is reachable by asking again.
+
+        ``limit`` is applied in SQL, not in Python. Trimming a longer read would
+        make the cost of page one a function of how much history exists, which
+        is the property this table was measured into existence to remove.
+        """
+        where = ["agent_id = ?"]
+        params: List[Any] = [self.agent_id]
+        if after is not None:
+            clause, cursor_params = session_cursor_clause(
+                self.db.backend_type, self._bound_cursor(after)
+            )
+            where.append(clause)
+            params.extend(cursor_params)
+        rows = await self.db.fetchall(
+            f"SELECT session_id, {', '.join(PROJECTION_COLUMNS)} "
+            "FROM conversation_sessions "
+            f"WHERE {' AND '.join(where)} "
+            f"{session_order_sql(self.db.backend_type)} LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [_as_dict(row) for row in rows]
+
+    def _bound_cursor(self, after: Sequence[Any]) -> Tuple[Any, ...]:
+        """A decoded cursor's keys, typed for the engine holding the columns.
+
+        The codec is backend-free — it hands back text — and the timestamp
+        column is a real ``timestamp`` on PostgreSQL and canonical text on
+        SQLite. Binding through the same adapter :meth:`_store` wrote the column
+        with is what makes the comparison one the index can use, rather than a
+        text-to-timestamp coercion the planner performs per row.
+        """
+        return tuple(
+            value
+            if column in SESSION_ORDER_TEXT_COLUMNS or value is None
+            else timestamp_query_param(self.db.backend_type, value)
+            for (column, _), value in zip(SESSION_ORDER, after)
+        )
 
     # ── one chunk ────────────────────────────────────────────────────────
 
@@ -2440,12 +2855,32 @@ class ConversationSessionProjection:
         # result current. The read is the unbounded work, but "unbounded" is
         # about how MANY rows, never about which: a snapshot must describe one
         # frontier and say which one.
-        projections = project_transcript(
-            await self.db.fetchall(
-                _live_rows_through(self.db.backend_type),
-                (self.agent_id, target),
-            )
+        transcript = await self.db.fetchall(
+            _live_rows_through(self.db.backend_type),
+            (self.agent_id, target),
         )
+        # Said out loud, because #2960 put this pass on the conversation list's
+        # read path and its cost is the agent's whole live history. One live row
+        # with a NULL `session_id` is enough to choose it, and legacy history is
+        # full of them (Emma: 473 of 1,522), so for such an agent EVERY repair
+        # after a turn re-derives everything. Measured, SQLite, one session in
+        # three legacy: 143 ms at 15,000 live rows, 524 ms at 60,000, 1,020 ms
+        # at 120,000 — linear, about 8.5 microseconds a row.
+        #
+        # A silent cost that grows with history is the shape this epic exists to
+        # remove, so it is logged rather than left to be discovered from a slow
+        # pane. #3061 is the fix: stamp the legacy rows once and this pass
+        # stops being chosen at all.
+        if len(transcript) >= TRANSCRIPT_PASS_NOISY_ROWS:
+            logger.warning(
+                "conversation_sessions: %s has live rows carrying no session id, "
+                "so this repair re-derived all %d of its live rows rather than "
+                "folding a chunk (#3061). List latency for this agent grows "
+                "with its history.",
+                self.agent_id,
+                len(transcript),
+            )
+        projections = project_transcript(transcript)
 
         written = 0
         async with self.db.transaction(immediate=True):
@@ -2859,17 +3294,42 @@ class ConversationSessionProjection:
         """
         await self.db.execute(
             "INSERT INTO conversation_session_watermarks "
-            f"(agent_id, {', '.join(WATERMARK_COLUMNS)}) "
+            f"(agent_id, {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_EPOCH_COLUMN}) "
             # Placeholders counted from the column list, not written out. A
             # literal run of "?" is a second statement of how many columns a
             # watermark has, and adding one to WATERMARK_COLUMNS then fails at
             # runtime rather than being carried along — which is how adding
             # `accounted_appends` announced itself.
-            f"VALUES ({', '.join('?' * (len(WATERMARK_COLUMNS) + 1))}) "
+            f"VALUES ({', '.join('?' * (len(WATERMARK_COLUMNS) + 1))}, "
+            f"{_new_generation(self.db.backend_type)}) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             + ", ".join(
                 f"{column} = excluded.{column}" for column in WATERMARK_COLUMNS
-            ),
+            )
+            # ...and the revision, which is the one column not taken from the
+            # value being written. Its own clause because it counts WRITES
+            # rather than recording a decision, and it is incremented by this
+            # statement so nothing can move the watermark without moving it.
+            + f", {WATERMARK_REVISION_COLUMN} = "
+            f"conversation_session_watermarks.{WATERMARK_REVISION_COLUMN} + 1"
+            # ...and the epoch, SET ONCE. Written on the conflict path as well
+            # as the insert path, because on PostgreSQL the insert path is not
+            # the one that runs: `_claim()` has already created the row as a
+            # thing to lock, so this statement always conflicts and an
+            # insert-only epoch stayed empty for every agent — the fence then
+            # quietly degenerated to the revision alone, on the backend that
+            # matters most. Measured, after a SQLite-only check said otherwise.
+            #
+            # A CASE rather than a plain assignment: the epoch names an
+            # INCARNATION, so it must not change while the row lives, and
+            # rewriting it on every write would make it a second revision
+            # counter answering the question the first one already answers.
+            # Set-once also gives the migrated rows their first value — they
+            # arrive from the ALTER with the empty default.
+            + f", {WATERMARK_EPOCH_COLUMN} = CASE WHEN "
+            f"conversation_session_watermarks.{WATERMARK_EPOCH_COLUMN} = '' "
+            f"THEN {_new_generation(self.db.backend_type)} ELSE "
+            f"conversation_session_watermarks.{WATERMARK_EPOCH_COLUMN} END",
             (self.agent_id, *watermark.as_params()),
         )
 
