@@ -12,6 +12,30 @@ The function is pure (no I/O, no decryption, no privacy concerns): each caller
 fetches rows however it must — the endpoint through the privacy-wrapped
 storage, the store method through the conversation store — normalizes them into
 plain dicts, and hands them here.
+
+Where it stands after #2948
+===========================
+
+This is no longer the primary read path. The active conversation list and the
+search behind it read ``conversation_sessions`` — the #2959 projection — which
+is *this* algorithm's output, cached and maintained by triggers. What remains
+here is the answer for rows no table describes:
+
+* **the memberships with no table.** ISOLATED privacy mode keeps its
+  conversations in an in-memory buffer, and the archived view (#3062) is
+  disjoint from what the projection covers. Both derive their sessions per
+  request, from the rows they hold.
+* **the rows no column can key.** 473 of Emma's 1,522 live rows carry no
+  ``session_id`` at all. Their session is decided by the gap arithmetic below
+  and by nothing else, which is why the projection's transcript pass and
+  search's membership map both come back through here rather than reading the
+  indexed column.
+
+So: still the single source of truth for *where a session begins and ends*, and
+no longer the thing a reader calls to find out what sessions exist. A caller
+reaching for :func:`group_messages_into_sessions` on the active view is
+re-deriving something the table already holds, and the two will drift — that is
+the shape #2948 was filed about.
 """
 from __future__ import annotations
 

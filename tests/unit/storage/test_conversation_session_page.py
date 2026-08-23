@@ -900,10 +900,17 @@ async def test_a_watermark_from_a_retired_generation_does_not_serve_a_page(tmp_p
 
         assert await store._whole_watermark(projection) is None
         # A continuation repairs rather than refusing for ever, so it recovers.
-        rows = await store._page_a_whole_projection(
+        # ``(rows, watermark)`` since #2961: search walks more than one page,
+        # so it has to be able to require they all came from the same
+        # projection revision AND to read rows from the frontier those
+        # summaries describe.
+        rows, watermark = await store._page_a_whole_projection(
             projection, limit=10, after=None, refresh=False
         )
         assert [r["session_id"] for r in rows] == ["1"]
+        standing = await store._whole_watermark(projection)
+        assert watermark.fence == standing.fence
+        assert watermark.target == standing.target
     finally:
         await db.close()
 
