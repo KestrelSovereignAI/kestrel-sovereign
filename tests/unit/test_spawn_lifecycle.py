@@ -12,6 +12,7 @@ from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.multi_agent.agent_manager import (
+    AgentManager,
     RuntimeOffboardingRetainedError,
 )
 from kestrel_sovereign.spawn.lifecycle import (
@@ -214,6 +215,8 @@ class TestTTLExpiration:
     @pytest.mark.asyncio
     async def test_refused_ttl_termination_rearms_and_publishes_only_on_retry(self):
         manager = _make_mock_manager()
+        manager.get_agent.return_value = object()
+        manager.get_children.return_value = ["retry-ttl"]
         first_refused = asyncio.Event()
         allow_retry = asyncio.Event()
         attempts = 0
@@ -255,6 +258,101 @@ class TestTTLExpiration:
         assert not lifecycle.is_tracked("retry-ttl")
         assert manager.terminate_child.await_count == 2
         assert lifecycle.get_result("retry-ttl").status is SpawnStatus.TIMED_OUT
+
+    @pytest.mark.asyncio
+    async def test_ttl_finalizes_child_already_removed_by_real_manager(self, tmp_path):
+        """A pruned parent edge is already-gone evidence, not a refusal."""
+
+        manager = AgentManager()
+        child = MagicMock()
+        child.agent_id = "did:child:already-gone"
+        child.shutdown = AsyncMock()
+        manager._agents["already-gone"] = child
+        manager._agent_names[child.agent_id] = "already-gone"
+        manager._parent_children["did:parent"] = ["already-gone"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        ephemeral_dir = tmp_path / "already-gone"
+        ephemeral_dir.mkdir()
+        (ephemeral_dir / "artifact").write_text("temporary")
+
+        await lifecycle.register(
+            child_name="already-gone",
+            child_did=child.agent_id,
+            parent_did="did:parent",
+            ttl_seconds=0.05,
+            mode=SpawnMode.EPHEMERAL,
+            temp_dir=str(ephemeral_dir),
+        )
+        lifecycle._fire_hook = AsyncMock()
+        assert await manager.remove_agent("already-gone") is True
+        assert manager.get_agent("already-gone") is None
+        assert manager.get_children("did:parent") == []
+
+        for _ in range(100):
+            if not lifecycle.is_tracked("already-gone"):
+                break
+            await asyncio.sleep(0.01)
+
+        assert not lifecycle.is_tracked("already-gone")
+        assert lifecycle.get_result("already-gone").status is SpawnStatus.TIMED_OUT
+        assert not ephemeral_dir.exists()
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ttl_refusal_retries_are_bounded_and_explicitly_retryable(
+        self, tmp_path
+    ):
+        """A live refused child stops auto-looping but remains operator-retryable."""
+
+        manager = _make_mock_manager()
+        manager.get_agent.return_value = object()
+        manager.get_children.return_value = ["bounded-refusal"]
+        manager.terminate_child.return_value = False
+        lifecycle = SpawnedAgentLifecycle(manager)
+        ephemeral_dir = tmp_path / "bounded-refusal"
+        ephemeral_dir.mkdir()
+
+        await lifecycle.register(
+            child_name="bounded-refusal",
+            child_did="did:child:bounded-refusal",
+            parent_did="did:parent",
+            ttl_seconds=0.01,
+            mode=SpawnMode.EPHEMERAL,
+            temp_dir=str(ephemeral_dir),
+        )
+        lifecycle._fire_hook = AsyncMock()
+        for _ in range(100):
+            result = lifecycle.get_result("bounded-refusal")
+            if result is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        result = lifecycle.get_result("bounded-refusal")
+        assert result is not None
+        assert result.status is SpawnStatus.FAILED
+        assert result.output_artifacts == {
+            "termination_not_performed": True,
+            "automatic_termination_attempts": 3,
+            "operator_action_required": True,
+            "retry_termination": True,
+            "requested_status": "timed_out",
+        }
+        assert manager.terminate_child.await_count == 3
+        await asyncio.sleep(0.05)
+        assert manager.terminate_child.await_count == 3
+        assert lifecycle.is_tracked("bounded-refusal")
+        assert ephemeral_dir.exists()
+        lifecycle._fire_hook.assert_not_awaited()
+
+        manager.terminate_child.return_value = True
+        retried = await lifecycle.terminate("bounded-refusal")
+
+        assert retried is not None
+        assert retried.status is SpawnStatus.TERMINATED
+        assert manager.terminate_child.await_count == 4
+        assert not lifecycle.is_tracked("bounded-refusal")
+        assert not ephemeral_dir.exists()
+        lifecycle._fire_hook.assert_awaited_once()
 
 
 class TestResultCollection:
@@ -451,6 +549,26 @@ class TestExplicitTermination:
         result = await lifecycle.terminate("ghost")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_terminate_finalizes_authoritatively_already_gone_child(self):
+        manager = _make_mock_manager()
+        manager.terminate_child.return_value = False
+        lifecycle = SpawnedAgentLifecycle(manager)
+        await lifecycle.register(
+            child_name="already-gone",
+            child_did="did:child:already-gone",
+            parent_did="did:parent",
+            ttl_seconds=3600,
+        )
+        lifecycle._fire_hook = AsyncMock()
+
+        result = await lifecycle.terminate("already-gone")
+
+        assert result is not None
+        assert result.status is SpawnStatus.TERMINATED
+        assert not lifecycle.is_tracked("already-gone")
+        lifecycle._fire_hook.assert_awaited_once()
+
 
 class TestCascadingShutdown:
     """Parent termination terminates all children."""
@@ -506,6 +624,8 @@ class TestCascadingShutdown:
 
         manager = _make_mock_manager()
         manager.terminate_child.return_value = False
+        manager.get_agent.return_value = object()
+        manager.get_children.return_value = ["refused"]
         lifecycle = SpawnedAgentLifecycle(manager)
         await lifecycle.register(
             child_name="refused",

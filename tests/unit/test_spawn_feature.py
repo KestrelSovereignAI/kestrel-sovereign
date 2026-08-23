@@ -767,7 +767,7 @@ class TestSpawnFeatureWithManager:
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["terminated"] is True
         assert envelope.data["runtime_offboarded"] is False
-        assert envelope.data["runtime_retained"] is False
+        assert envelope.data["runtime_retained"] is True
         assert envelope.data["runtime_custody_known"] is False
         assert envelope.data["runtime_cleanup_state"] == (
             "termination_not_performed"
@@ -1163,13 +1163,20 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["runtime_cleanup_state"] == (
             "termination_not_performed"
         )
-        assert envelope.data["runtime_retained"] is False
+        assert envelope.data["runtime_retained"] is True
         assert envelope.data["runtime_custody_known"] is False
         assert envelope.data["retry_termination"] is True
+        assert envelope.data["named_child_termination_not_performed"] is True
+        assert envelope.data["retry_named_child_termination"] is True
+        assert envelope.data["surviving_subtree_agents"] == []
+        assert envelope.data["retry_descendant_termination"] is False
+        assert envelope.data["retry_descendant_agents"] == []
         assert envelope.data["additional_outcome_types"] == [
             "ChildTerminationNotPerformedError",
             "ChildTerminationReconciliationError",
         ]
+        assert "named child" in envelope.error
+        assert "named descendant" not in envelope.error
         assert "private descendant path" not in str(envelope.to_dict())
 
     @pytest.mark.asyncio

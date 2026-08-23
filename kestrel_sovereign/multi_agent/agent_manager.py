@@ -3637,14 +3637,37 @@ class AgentManager:
             else reported_budget_release_failures
         )
 
-        def record_reaper_failure(reaper_id: str, detail: str) -> None:
-            failures.append(
-                RuntimeError(f"Quarantined shutdown reaper {reaper_id!r} {detail}")
+        def sanitized_terminal_failure(
+            *, owner: str, owner_id: str, failure: BaseException
+        ) -> RuntimeError:
+            """Describe terminal cleanup without reflecting exception text."""
+
+            failure_type = public_exception_type_name(failure)
+            return RuntimeError(
+                f"{owner} {owner_id!r} failed ({failure_type}); inspect "
+                "server-side lifecycle diagnostics"
             )
 
-        def record_budget_release_failure(release_id: str, detail: str) -> None:
+        def record_reaper_failure(
+            reaper_id: str, failure: BaseException
+        ) -> None:
             failures.append(
-                RuntimeError(f"Ordinary child budget release {release_id!r} {detail}")
+                sanitized_terminal_failure(
+                    owner="Quarantined shutdown reaper",
+                    owner_id=reaper_id,
+                    failure=failure,
+                )
+            )
+
+        def record_budget_release_failure(
+            release_id: str, failure: BaseException
+        ) -> None:
+            failures.append(
+                sanitized_terminal_failure(
+                    owner="Ordinary child budget release",
+                    owner_id=release_id,
+                    failure=failure,
+                )
             )
 
         sealed = False
@@ -3673,19 +3696,19 @@ class AgentManager:
                         record.task
                     )
                     cancelled = cancelled or join_cancelled
+                    classified_outcome = False
                     if failure is None and record.runtime_outcome_required:
                         failure = _runtime_offboarding_outcome_error(
                             agent_name=record.agent_name,
                             agent_id=record.agent_id,
                             result=record.task.result(),
                         )
+                        classified_outcome = failure is not None
                     if failure is not None:
-                        detail = (
-                            "was cancelled"
-                            if isinstance(failure, asyncio.CancelledError)
-                            else f"failed: {failure}"
-                        )
-                        record_reaper_failure(record.reaper_id, detail)
+                        if classified_outcome and isinstance(failure, Exception):
+                            failures.append(failure)
+                        else:
+                            record_reaper_failure(record.reaper_id, failure)
 
                 runtime_offboardings = tuple(
                     self._inflight_runtime_offboardings.items()
@@ -3702,14 +3725,27 @@ class AgentManager:
                         offboarding_failure,
                     ) = await await_lifecycle_task_completion(runtime_offboarding.task)
                     cancelled = cancelled or join_cancelled
+                    classified_outcome = False
                     if offboarding_failure is None:
                         offboarding_failure = _runtime_offboarding_outcome_error(
                             agent_name=runtime_offboarding.agent_name,
                             agent_id=runtime_offboarding.agent_id,
                             result=runtime_offboarding.task.result(),
                         )
+                        classified_outcome = offboarding_failure is not None
                     if offboarding_failure is not None:
-                        failures.append(offboarding_failure)
+                        if classified_outcome and isinstance(
+                            offboarding_failure, Exception
+                        ):
+                            failures.append(offboarding_failure)
+                        else:
+                            failures.append(
+                                sanitized_terminal_failure(
+                                    owner="Secure runtime offboarding",
+                                    owner_id=runtime_offboarding.agent_name,
+                                    failure=offboarding_failure,
+                                )
+                            )
 
                 # A normal DELETE waits for this exact task itself.  It is
                 # nevertheless removal-owned as soon as it is admitted, so a
@@ -3733,14 +3769,9 @@ class AgentManager:
                         and budget_release.release_id
                         not in reported_budget_release_failures
                     ):
-                        detail = (
-                            "was cancelled"
-                            if isinstance(release_failure, asyncio.CancelledError)
-                            else f"failed: {release_failure}"
-                        )
                         record_budget_release_failure(
                             budget_release.release_id,
-                            detail,
+                            release_failure,
                         )
 
                 # A terminal task's done callback is responsible for dropping its
@@ -3765,7 +3796,10 @@ class AgentManager:
             # unacknowledged failure exactly once alongside failures observed live.
             for reaper_id, record in self._unsafe_quarantined_shutdown_failures.items():
                 if reaper_id not in observed_reapers:
-                    record_reaper_failure(reaper_id, f"failed: {record.failure}")
+                    record_reaper_failure(
+                        reaper_id,
+                        RuntimeError("retained cleanup failure"),
+                    )
 
             # An ordinary release may fail before this drain acquires the
             # manager lock. Its completion callback then drops the live task,
@@ -3780,7 +3814,8 @@ class AgentManager:
                     and release_id not in reported_budget_release_failures
                 ):
                     record_budget_release_failure(
-                        release_id, f"failed: {record.failure}"
+                        release_id,
+                        RuntimeError("retained budget release failure"),
                     )
 
             # A direct ``terminate_child`` retains its parent edge while a
@@ -3831,12 +3866,17 @@ class AgentManager:
                     await self._set_quarantined_shutdown_handoffs_sealed(False)
                 ) or cancelled
 
-        # Lifecycle cancellation always has precedence over a terminal cleanup
-        # failure after owned work has settled.  A successful join retains the
-        # established ``True`` return value so callers can choose when to
-        # re-raise cancellation themselves.
+        # Preserve both cancellation and every sanitized cleanup failure after
+        # all owned work has settled. A BaseExceptionGroup is required because
+        # asyncio cancellation is a BaseException; putting it in an
+        # ExceptionGroup raises TypeError and loses the failures already
+        # collected. A successful join retains the established ``True`` return
+        # value so callers can choose when to re-raise cancellation themselves.
         if cancelled and failures:
-            raise asyncio.CancelledError()
+            raise BaseExceptionGroup(
+                "Quarantined shutdown drain observed cancellation and failures",
+                [asyncio.CancelledError(), *failures],
+            )
         if failures:
             raise ExceptionGroup(
                 "One or more quarantined shutdown reapers or ordinary budget "
@@ -5718,6 +5758,23 @@ class AgentManager:
                     reported_budget_release_failures=reported_budget_release_failures
                 )
             ) or cancelled
+        except BaseExceptionGroup as exc:
+            drain_failures, non_failures = exc.split(Exception)
+            cancellation_group: BaseExceptionGroup | None = None
+            if non_failures is not None:
+                cancellation_group, unexpected = non_failures.split(
+                    asyncio.CancelledError
+                )
+                if unexpected is not None:
+                    raise unexpected
+            cancelled = cancelled or cancellation_group is not None
+            if drain_failures is not None:
+                failures.append(drain_failures)
+            logger.warning(
+                "Quarantined agent shutdown cleanup retained cancellation or "
+                "failure outcomes",
+                exc_info=True,
+            )
         except asyncio.CancelledError:
             cancelled = True
         except Exception as exc:
@@ -5763,6 +5820,11 @@ class AgentManager:
         else:
             logger.info("All agents shut down")
 
+        if cancelled and failures:
+            raise BaseExceptionGroup(
+                "Fleet shutdown observed cancellation and agent failures",
+                [asyncio.CancelledError(), *failures],
+            )
         if cancelled:
             raise asyncio.CancelledError()
         if failures:

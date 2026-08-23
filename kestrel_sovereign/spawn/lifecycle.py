@@ -29,6 +29,8 @@ from kestrel_sovereign.hooks.manager import HooksManager
 
 logger = logging.getLogger(__name__)
 
+_MAX_AUTOMATIC_TERMINATION_ATTEMPTS = 3
+
 
 def _is_expected_termination_outcome(error: BaseException) -> bool:
     """Accept lifecycle failures/cancellation, never process-control signals."""
@@ -86,6 +88,33 @@ def _typed_termination_proves_removal(
         return get_agent(child_name) is None
     except Exception:
         return False
+
+
+def _manager_proves_child_absent(
+    manager: object,
+    *,
+    parent_did: str,
+    child_name: str,
+) -> bool:
+    """Require both routing and parent-edge absence before local finalization."""
+
+    get_agent = getattr(manager, "get_agent", None)
+    get_children = getattr(manager, "get_children", None)
+    if not callable(get_agent) or not callable(get_children):
+        return False
+    try:
+        if get_agent(child_name) is not None:
+            return False
+        children = get_children(parent_did)
+    except Exception:
+        return False
+    if not isinstance(children, (list, tuple, set, frozenset)):
+        return False
+    return not any(
+        isinstance(candidate, str)
+        and candidate.casefold() == child_name.casefold()
+        for candidate in children
+    )
 
 
 class SpawnStatus(str, Enum):
@@ -153,6 +182,7 @@ class _TrackedChild:
     )
     ttl_task: Optional[asyncio.Task] = None
     result: Optional[SpawnResult] = None
+    automatic_termination_attempts: int = 0
 
 
 class SpawnedAgentLifecycle:
@@ -505,14 +535,54 @@ class SpawnedAgentLifecycle:
             )
 
         if not terminated and termination_failure is None:
-            # A TTL attempt is itself the timer task and is about to finish.
-            # Rearm it for a bounded periodic retry; an explicit termination
-            # leaves the existing sleeping TTL task untouched.
-            if tracked.ttl_task is asyncio.current_task():
-                tracked.ttl_task = asyncio.create_task(
-                    self._ttl_monitor(child_name, tracked.ttl_seconds)
-                )
-            return False
+            if _manager_proves_child_absent(
+                self._agent_manager,
+                parent_did=tracked.parent_did,
+                child_name=child_name,
+            ):
+                # A concurrent ordinary DELETE may already have shut down and
+                # unpublished the child and pruned its parent edge.  The
+                # manager's False then means this caller performed no second
+                # removal, not that the child survived.  Finalize local
+                # lifecycle custody exactly once.
+                terminated = True
+            else:
+                # A TTL attempt is itself the timer task and is about to
+                # finish. Bound automatic retries so a genuine refusal cannot
+                # leak one task and one warning per TTL forever. Explicit
+                # retries remain available while the live child stays tracked.
+                if tracked.ttl_task is asyncio.current_task():
+                    tracked.automatic_termination_attempts += 1
+                    attempts = tracked.automatic_termination_attempts
+                    if attempts < _MAX_AUTOMATIC_TERMINATION_ATTEMPTS:
+                        tracked.ttl_task = asyncio.create_task(
+                            self._ttl_monitor(child_name, tracked.ttl_seconds)
+                        )
+                    else:
+                        refused_result = SpawnResult(
+                            child_name=child_name,
+                            child_did=tracked.child_did,
+                            status=SpawnStatus.FAILED,
+                            output_artifacts={
+                                "termination_not_performed": True,
+                                "automatic_termination_attempts": attempts,
+                                "operator_action_required": True,
+                                "retry_termination": True,
+                                "requested_status": status.value,
+                            },
+                            started_at=tracked.started_at,
+                            parent_did=tracked.parent_did,
+                        )
+                        tracked.result = refused_result
+                        self._results[child_name] = refused_result
+                        logger.error(
+                            "Automatic termination was refused %d times for "
+                            "child %r; automatic retries stopped and explicit "
+                            "operator termination remains available",
+                            attempts,
+                            child_name,
+                        )
+                return False
 
         # Only an authoritative manager success (or its typed terminal
         # exception path, which is surfaced below) may disarm TTL and publish

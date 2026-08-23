@@ -24,6 +24,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
+    InflightRuntimeOffboarding,
     RuntimeOffboardingRetainedError,
 )
 from kestrel_sovereign.spawn.delegated_wallet import (
@@ -1647,7 +1648,7 @@ async def test_quarantined_shutdown_drain_finishes_cleanup_after_cancellation() 
 
 @pytest.mark.asyncio
 async def test_quarantine_drain_preserves_cancellation_after_reaper_failure() -> None:
-    """Caller cancellation wins only after the failing reaper has settled."""
+    """Caller cancellation and the settled failure are both preserved."""
 
     manager = AgentManager()
     cleanup_entered = asyncio.Event()
@@ -1668,10 +1669,99 @@ async def test_quarantine_drain_preserves_cancellation_after_reaper_failure() ->
     drain.cancel()
     allow_failure.set()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(BaseExceptionGroup) as exc_info:
         await asyncio.wait_for(drain, timeout=1.0)
+    leaves: list[BaseException] = []
+
+    def collect(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for nested in error.exceptions:
+                collect(nested)
+        else:
+            leaves.append(error)
+
+    collect(exc_info.value)
+    assert any(isinstance(error, asyncio.CancelledError) for error in leaves)
+    assert any(isinstance(error, RuntimeError) for error in leaves)
     assert manager._quarantined_shutdown_reapers == {}
     assert reaper_id in manager._unsafe_quarantined_shutdown_failures
+
+
+@pytest.mark.asyncio
+async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
+    monkeypatch,
+) -> None:
+    """A cancellation race cannot discard failures or reflect host paths."""
+
+    manager = AgentManager()
+    private_path = "/private/tenant/runtime/credential"
+
+    async def fail_with_private_path() -> None:
+        raise OSError(private_path)
+
+    failed_task = asyncio.create_task(fail_with_private_path())
+    manager._retain_quarantined_cleanup(
+        name="unsafe",
+        agent_id="did:test:unsafe",
+        task=failed_task,
+    )
+    with pytest.raises(OSError):
+        await failed_task
+    await asyncio.sleep(0)
+
+    cleanup_task = asyncio.create_task(asyncio.Event().wait())
+    record_key = id(cleanup_task)
+    manager._inflight_runtime_offboardings[record_key] = (
+        InflightRuntimeOffboarding(
+            agent_name="Hosted",
+            agent_id="did:test:hosted",
+            runtime_path=Path(private_path),
+            task=cleanup_task,
+        )
+    )
+    cleanup_task.add_done_callback(
+        lambda _task: manager._inflight_runtime_offboardings.pop(record_key, None)
+    )
+
+    from kestrel_sovereign.multi_agent import agent_manager as manager_module
+
+    real_join = manager_module.await_lifecycle_task_completion
+    cleanup_join_started = asyncio.Event()
+
+    async def observe_join(task):
+        if task is cleanup_task:
+            cleanup_join_started.set()
+        return await real_join(task)
+
+    monkeypatch.setattr(
+        manager_module,
+        "await_lifecycle_task_completion",
+        observe_join,
+    )
+    drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
+    await asyncio.wait_for(cleanup_join_started.wait(), timeout=1.0)
+    cleanup_task.cancel()
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await asyncio.wait_for(drain, timeout=1.0)
+
+    leaves: list[BaseException] = []
+
+    def collect(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for nested in error.exceptions:
+                collect(nested)
+        else:
+            leaves.append(error)
+
+    collect(exc_info.value)
+    assert len(leaves) == 2
+    assert all(isinstance(error, Exception) for error in leaves)
+    assert any("CancelledError" in str(error) for error in leaves)
+    rendered = " | ".join(str(error) for error in leaves)
+    assert private_path not in rendered
+    assert "Cannot nest BaseExceptions" not in rendered
+    assert manager._inflight_runtime_offboardings == {}
 
 
 @pytest.mark.asyncio
@@ -2222,8 +2312,11 @@ async def test_terminal_drain_retains_prelinearization_ordinary_release_failure(
 
     with pytest.raises(ExceptionGroup, match="ordinary budget releases") as first:
         await asyncio.wait_for(drain, timeout=1.0)
-    assert "ordinary refund failed before drain linearization" in str(
-        first.value.exceptions[0]
+    rendered_failure = str(first.value.exceptions[0])
+    assert "ordinary-budget-release:1" in rendered_failure
+    assert "RuntimeError" in rendered_failure
+    assert "ordinary refund failed before drain linearization" not in (
+        rendered_failure
     )
 
     failures = manager.unsafe_removal_budget_release_failures()
