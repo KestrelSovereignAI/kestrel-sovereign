@@ -51,36 +51,6 @@ router = APIRouter(tags=["features"])
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
 
-def _requested_extras(package_spec: str) -> Tuple[str, ...]:
-    """The extras named in a spec like ``pkg[voice,web]>=1.2``."""
-    if "[" not in package_spec or "]" not in package_spec:
-        return ()
-    inside = package_spec.split("[", 1)[1].split("]", 1)[0]
-    return tuple(part.strip() for part in inside.split(",") if part.strip())
-
-
-def _requirement_applies(req, extras: Tuple[str, ...]) -> bool:
-    """Whether *req* is active for this interpreter and these extras.
-
-    An unmarked requirement always applies. A marked one applies if it
-    evaluates true in the base environment or under any extra the caller
-    requested — `packaging` evaluates ``extra == "x"`` to False when no extra is
-    supplied, so the base environment alone would silently drop every
-    extra-gated requirement.
-    """
-    if req.marker is None:
-        return True
-    for env in ({}, *({"extra": extra} for extra in extras)):
-        try:
-            if req.marker.evaluate(env):
-                return True
-        except Exception:  # noqa: BLE001
-            # An undefined marker name tells us nothing either way; a later
-            # environment may still resolve it.
-            continue
-    return False
-
-
 def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
     """Describe *package_spec*'s unmet requirement on core, or None.
 
@@ -89,54 +59,52 @@ def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
     than the install command, because the requirement that matters is the one
     the artifact on disk actually declares.
 
-    Only requirements whose environment marker is ACTIVE are considered. A
-    conditional core dependency (``kestrel-sovereign>=0.60; python_version <
-    "3.10"``) is not a requirement of THIS interpreter, and reporting it as
-    unmet turned a healthy install into a 500. Markers gated on an extra are
-    evaluated against the extras the caller actually asked for, since that is
-    what decides whether such a requirement applies at all.
+    A NARROWING of the general question — which of this package's own
+    requirements does the venv not satisfy — kept narrow because this decides
+    only whether to upgrade an otherwise-successful response to an error, and
+    the only requirement a just-repaired core can have broken is the one ON
+    core. The marker rule and the reading itself are shared, so "is this
+    requirement active for this interpreter and these extras" has one answer
+    everywhere it is asked (#3080).
 
-    Any lookup failure returns None — a diagnostic that cannot read the
-    metadata must not manufacture a failure for a package that may be fine.
-    This does not weaken the fail-closed rule that governs the install guard:
-    core's conformance to its declared source is verified independently and has
+    Any lookup failure yields None — a diagnostic that cannot read the metadata
+    must not manufacture a failure for a package that may be fine. This does
+    not weaken the fail-closed rule that governs the install guard: core's
+    conformance to its declared source is verified independently and has
     already passed by the time this is asked. This only decides whether to
-    upgrade an otherwise-successful response to an error, so "cannot tell"
-    must not become "cannot load".
+    upgrade an otherwise-successful response to an error, so "cannot tell" must
+    not become "cannot load".
     """
-    import importlib.metadata as md
-
+    from kestrel_sovereign import cli_features
     from kestrel_sovereign.feature_reconcile import (
         CORE_DISTRIBUTION,
         canonical_package,
-        version_satisfies,
+        requested_extras,
     )
 
     try:
-        from packaging.requirements import Requirement
-
         name = canonical_package(package_spec.split("[")[0].split("=")[0].strip())
-        extras = _requested_extras(package_spec)
-        requires = md.metadata(name).get_all("Requires-Dist") or []
-        core_version = md.version(CORE_DISTRIBUTION)
+        unmet = cli_features._unsatisfied_requirements(
+            name, requested_extras(package_spec),
+        )
     except Exception:  # noqa: BLE001
         return None
 
-    for raw in requires:
-        try:
-            req = Requirement(raw)
-        except Exception:  # noqa: BLE001
+    for requirement in unmet:
+        # Canonical identity, not the rendered text: a metadata name keeps
+        # whatever spelling it was written with, so matching on the sentence
+        # misses `Kestrel_Sovereign` and hits `kestrel-sovereign-sdk`.
+        #
+        # `certain` is the documented rule of this surface — "cannot tell" must
+        # not become "cannot load" — and is deliberately not exercised
+        # end-to-end here: an uncertain CORE record needs core's own installed
+        # version to be unparseable, and the guard's shape check fails on that
+        # long before this is asked. The record's contract is pinned at the
+        # helper instead. The manifest gate makes the opposite call on the same
+        # field, and both are right for their consequences.
+        if requirement.name != CORE_DISTRIBUTION or not requirement.certain:
             continue
-        if canonical_package(req.name) != CORE_DISTRIBUTION:
-            continue
-        if not _requirement_applies(req, extras):
-            continue
-        spec = str(req.specifier)
-        if spec and not version_satisfies(core_version, spec):
-            return (
-                f"{name} requiring {CORE_DISTRIBUTION}{spec} against the "
-                f"restored {core_version}"
-            )
+        return requirement.detail
     return None
 
 

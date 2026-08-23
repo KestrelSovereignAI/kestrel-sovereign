@@ -1726,6 +1726,7 @@ from kestrel_sovereign.cli_features import (  # noqa: E402
     _load_host_manifest,
     _host_manifest_path,
     _installed_version,
+    _installed_requirements,
     _pip_spec,
     _toml_basic_string,
 )

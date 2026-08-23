@@ -585,6 +585,41 @@ def _installed_extension_distributions() -> list:
     return sorted(by_dist.values(), key=lambda e: e["dist"])
 
 
+def _installed_requirements(dist_name: str) -> tuple:
+    """The raw ``Requires-Dist`` lines of the copy of *dist_name* ON DISK.
+
+    A seam of its own, like :func:`_installed_version`, because the question it
+    answers is about the artifact in the venv and not about what any install
+    command asked for. Returns ``()`` for anything not installed or whose
+    metadata will not read — an absent answer is not an unmet requirement.
+    """
+    import importlib.metadata as md
+
+    try:
+        return tuple(md.metadata(canonical_package(dist_name)).get_all(
+            "Requires-Dist"
+        ) or ())
+    except Exception:  # noqa: BLE001 - absent or unreadable metadata
+        return ()
+
+
+def _unsatisfied_requirements(dist_name: str, extras=()) -> tuple:
+    """Every active requirement of *dist_name* this venv does not satisfy.
+
+    The venv-reading half of :func:`feature_reconcile.unsatisfied_requirements`,
+    wired to the same seams the rest of this module reads through so the double
+    that models a venv models this too.
+    """
+    import kestrel_sovereign.feature_reconcile as fr
+
+    return fr.unsatisfied_requirements(
+        dist_name,
+        tuple(extras or ()),
+        cli._installed_requirements,
+        cli._installed_version,
+    )
+
+
 def _installed_version(dist_name: str) -> Optional[str]:
     """The version of *dist_name* installed in THIS venv, right now.
 
@@ -1998,6 +2033,22 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         action = "ensure"
     else:
         action = "present"
+    if action == "present" and _unsatisfied_requirements(target, extras):
+        # `present` is a claim about the VENV, and source+version answers only
+        # half of it: this copy is the declared version from the declared
+        # source AND cannot load, because something it declares is missing or
+        # too old. Left as `present`, sync converges on nothing and reports
+        # success — the state a half-completed install leaves behind, never
+        # retried even after the operator fixes the conflict (issue #3080).
+        #
+        # `ensure`, not `reinstall`: the artifact is the right one, so nothing
+        # needs forcing. What is missing is a resolve, and an ordinary install
+        # is exactly that.
+        action = "ensure"
+    # The demotion is not reported back. The caller that needs to know whether
+    # a package's dependencies resolve asks at the moment it needs the answer
+    # — installers are not transactional, so an answer taken here has already
+    # gone stale by the time an install has failed (#3080).
     return target, current, action
 
 
@@ -2220,10 +2271,20 @@ def cmd_feature_sync(args) -> int:
             # optional extra says nothing about core's source — treating it as a
             # failed transition skipped every remaining manifest entry, so
             # `--continue-on-error` restarted with packages still pruned.
-            if (
-                is_core
-                and guard.conforms_now()
-                and getattr(result, "resolve_incomplete", False)
+            if is_core and guard.conforms_now() and (
+                getattr(result, "resolve_incomplete", False)
+                # A single-command install has no incomplete SEQUENCE — but
+                # when core's dependencies were already unmet, a failed resolve
+                # here is the same state by a different route, and
+                # `resolve_incomplete` was derived for the three-pass switch
+                # alone (#3080).
+                #
+                # RE-READ rather than reusing the pre-install answer: installers
+                # are not transactional, so this run may have installed the
+                # missing dependency and then failed on something else. Blocking
+                # a restart over a closure that now conforms is the false
+                # refusal this check was scoped to avoid.
+                or bool(_unsatisfied_requirements(target, extras))
             ):
                 # Core reached its declared source and version — so
                 # `conforms_now()` is True and says nothing about whether the

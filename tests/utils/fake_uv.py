@@ -101,6 +101,7 @@ class FakeUv:
         feature_version="0.4.0",
         feature_requires=">=0.53",
         feature_installed_requires=None,
+        installed_requires=None,
         core_index=("0.52.0", "0.53.0"),
         honours_constraints=True,
         repair_fails=False,
@@ -137,6 +138,10 @@ class FakeUv:
         #: is the case in issue #3047: a checkout build and the wheel published
         #: at the same version are not obliged to declare the same dependencies.
         self.feature_installed_requires = feature_installed_requires or feature_requires
+        #: Extra ``Requires-Dist`` lines per dist, for the closure questions
+        #: `present` now has to answer (#3080). The modelled default is the one
+        #: dependency this double has always had: the feature requires core.
+        self.installed_requires = {k: list(v) for k, v in (installed_requires or {}).items()}
         self.core_index = list(core_index)
         self.honours_constraints = honours_constraints
         self.repair_fails = repair_fails
@@ -171,6 +176,18 @@ class FakeUv:
 
     def editable_path(self, dist):
         return self.editable.get(dist)
+
+    def requires(self, dist):
+        """The ``Requires-Dist`` lines of the copy of *dist* on disk.
+
+        Modelled from the same fact the resolver reads: the feature's core
+        requirement is whatever the artifact CURRENTLY INSTALLED declares, so a
+        source switch changes this exactly when it changes the metadata.
+        """
+        declared = list(self.installed_requires.get(dist, ()))
+        if dist == self.feature and dist in self.installed:
+            declared.append(f"{CORE}{self.feature_installed_requires}")
+        return tuple(declared)
 
     def direct_url_provenance(self, dist):
         """PEP 610 provenance for *dist* — a ``Provenance``.
@@ -529,6 +546,7 @@ def use_fake_uv(monkeypatch, venv):
 
     monkeypatch.setattr(md, "version", venv.version)
     monkeypatch.setattr(cli, "_editable_install_path", venv.editable_path)
+    monkeypatch.setattr(cli, "_installed_requirements", venv.requires)
     monkeypatch.setattr(cli, "_direct_url_provenance", venv.direct_url_provenance)
     # The modelled host's declared checkouts EXIST — that is what makes them
     # declared. Without this the real `_editable_git_pull` runs against paths

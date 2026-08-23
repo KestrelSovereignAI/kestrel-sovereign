@@ -91,6 +91,12 @@ def _versions(monkeypatch, mapping):
         raise md.PackageNotFoundError(name)
 
     monkeypatch.setattr(md, "version", fake_version)
+    # A stubbed venv has to answer every question the code asks of a venv, and
+    # `present` now asks whether a package's own requirements are satisfied
+    # (#3080). Left unstubbed, this reads the REAL metadata of the interpreter
+    # running the tests and checks it against `mapping`, so every package looks
+    # unsatisfiable. A mapping that declares no requirements declares none.
+    monkeypatch.setattr(cli, "_installed_requirements", lambda name: ())
 
 
 def _args(manifest, capture=False, dry_run=False, allow_dirty=False):
@@ -2639,3 +2645,470 @@ def test_a_broken_stderr_cannot_replace_the_interrupt(
     # KeyboardInterrupt, NOT BrokenPipeError.
     with pytest.raises(KeyboardInterrupt):
         cli.cmd_feature_sync(_args(manifest))
+
+
+# --- `present` is a claim about the VENV, and source+version is half of it ---
+# --- (#3080) -----------------------------------------------------------------
+#
+# A package can be exactly the declared version from the declared source and
+# still be unloadable, because something it declares is missing or too old.
+# That is the state a half-completed install leaves behind: the artifact
+# landed, the resolve that validates it did not. Left as `present`, sync
+# converges on nothing and reports success, for ever.
+
+
+def _installed_voice_requiring(core_spec, **kw):
+    """`voice` present from the index, declaring `core_spec` on disk."""
+    venv = FakeUv(
+        feature_version="0.4.0",
+        feature_requires=">=0.53",
+        feature_installed_requires=core_spec,
+        **kw,
+    )
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    return venv
+
+
+def test_a_package_whose_own_requirement_is_unmet_is_not_present(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The second run after a refused switch must not report success.
+
+    The artifact is from the declared index at a satisfying version — every
+    question `present` used to ask says yes — and it declares a core this host
+    does not have. Reported `present`, `kestrel update` exits 0 and restarts
+    every agent onto a package that cannot load (#3080).
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(">=0.53")   # installed core is 0.52.0
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert "present" not in out          # ...it is retried instead
+    assert rc != 0                       # ...and the retry reports the conflict
+    assert venv.commands                 # an install really was attempted
+
+
+def test_a_package_converges_once_the_conflict_is_fixed(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Retrying is the point: converge without `--force`, and then stop.
+
+    Detection alone would leave the operator re-running a command that reports
+    the same failure for ever. Once core moves to a version the package
+    accepts, the very next sync is a no-op again.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(">=0.53")
+    use_fake_uv(monkeypatch, venv)
+
+    assert cli.cmd_feature_sync(_args(manifest)) != 0
+    capsys.readouterr()
+
+    # The operator fixes the conflict: core moves to a version voice accepts.
+    venv.installed[CORE] = "0.53.0"
+    before = len(venv.commands)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "present" in out
+    assert len(venv.commands) == before   # converged: nothing left to install
+
+
+def test_a_satisfied_package_is_still_present_and_installs_nothing(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Fidelity: the check must not turn every sync into a reinstall."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(">=0.52")   # installed core satisfies it
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert "present" in capsys.readouterr().out
+    assert venv.commands == []
+
+
+def test_a_conflict_among_packages_the_manifest_never_names_is_not_its_business(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Scoped to the packages under management, deliberately.
+
+    `feature sync`'s claim is that the venv matches the manifest, so it has no
+    authority over a conflict between packages the manifest never mentions.
+    Measured on a live host, an environment-wide check reports seven such
+    conflicts among observability transitives — a gate that refuses to update a
+    working host is worse than the bug it closes.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(
+        ">=0.52",
+        installed_requires={"opentelemetry-exporter-otlp": ["opentelemetry-proto==1.44.0"]},
+    )
+    venv.installed["opentelemetry-exporter-otlp"] = "1.44.0"
+    venv.installed["opentelemetry-proto"] = "1.38.0"   # the real conflict
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert "present" in capsys.readouterr().out
+    assert venv.commands == []
+
+
+def test_an_extra_gated_requirement_counts_only_under_that_extra(monkeypatch):
+    """`packaging` evaluates `extra == "x"` to False when no extra is supplied.
+
+    So the base environment alone silently drops every extra-gated requirement
+    — and treating them all as active does the opposite, demoting a package
+    over a dependency of an extra nobody asked for. Asserted in both directions
+    because a rule that only ever says "no" passes half of them.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        'sounddevice>=0.5; extra == "local"',
+        'anyio>=4; python_version >= "3.10"',
+    ]
+    use_fake_uv(monkeypatch, venv)
+
+    # `sounddevice` and `anyio` are both absent from the modelled venv.
+    without_extras = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    with_extras = cli_features._unsatisfied_requirements(
+        "kestrel-feature-voice", ("local",),
+    )
+
+    # The unmarked-in-practice one is active either way; the extra-gated one
+    # only when the extra is asked for.
+    assert [r for r in without_extras if r.name == "sounddevice"] == []
+    assert [r for r in without_extras if r.name == "anyio"] != []
+    assert [r for r in with_extras if r.name == "sounddevice"] != []
+
+
+def test_a_requirement_is_matched_by_canonical_identity_not_by_its_spelling(
+    monkeypatch
+):
+    """A metadata name keeps whatever spelling it was written with.
+
+    `Requirement.name` preserves it, so anything matching on the rendered
+    sentence misses `Kestrel_Sovereign>=0.53` and hits `kestrel-sovereign-sdk`
+    — a miss and a false match from the same line of code.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "Kestrel_Sovereign>=0.53",       # legal spelling of core
+        "kestrel-sovereign-sdk>=0.99",   # a DIFFERENT distribution
+    ]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    by_name = {r.name for r in unmet}
+
+    assert "kestrel-sovereign" in by_name        # the odd spelling still counts
+    assert "kestrel-sovereign-sdk" in by_name    # ...as its own distribution
+    # The double declares core's requirement too, so both spellings resolve to
+    # the same distribution — which is the point.
+    core = [r for r in unmet if r.name == "kestrel-sovereign"]
+    assert core and all(r.certain for r in core)
+    assert any("Kestrel_Sovereign" in r.detail for r in core)
+
+
+def test_an_uncomparable_installed_version_is_unmet_but_uncertain(monkeypatch):
+    """`version_satisfies` fails OPEN, and a gate must not inherit that.
+
+    It was written for reporting, where an unevaluable comparison must not
+    manufacture drift. Reading its `True` as "satisfied" makes damaged metadata
+    look fine — the same failure one layer up. The two callers then want
+    opposite things from "cannot tell", which is why it is a field and not a
+    silently-chosen answer.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["anyio>=4"]
+    venv.installed["anyio"] = "not-a-version"
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    anyio = [r for r in unmet if r.name == "anyio"]
+
+    assert len(anyio) == 1
+    assert anyio[0].certain is False
+    assert "cannot be compared" in anyio[0].detail
+
+
+def test_damaged_dependency_metadata_is_retried_rather_than_called_present(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The manifest gate retries what it cannot evaluate; a reinstall is cheap.
+
+    The install endpoint makes the opposite call on the same record, and both
+    are right: there, "cannot tell" must not become an error over a package
+    that may be fine.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n')
+    venv = _installed_voice_requiring(">=0.52")   # core itself is satisfied
+    venv.installed_requires["kestrel-feature-voice"] = ["anyio>=4"]
+    venv.installed["anyio"] = "not-a-version"
+    use_fake_uv(monkeypatch, venv)
+
+    cli.cmd_feature_sync(_args(manifest))
+
+    assert "present" not in capsys.readouterr().out
+    assert venv.commands  # it was retried
+
+
+def test_a_demoted_core_whose_resolve_fails_is_not_continuable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The single-pass route to the same state, which was continuable.
+
+    Core matches its declared source and version, so `conforms_now()` says yes;
+    what the demotion found is that its dependencies do not resolve. The
+    install that follows is ONE command, so there is no incomplete sequence to
+    read — and left as the generic `1`, `--continue-on-error` restarts every
+    agent onto the core this very check found unloadable.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    # Core is already the declared index wheel at a satisfying version...
+    venv.editable.pop(CORE, None)
+    # ...and declares a dependency this venv does not have.
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc == CORE_UNRESOLVED
+    assert "validates its dependencies did not complete" in out
+    assert "kestrel-feature-voice" not in venv.installed
+
+
+def test_one_unreadable_dependency_does_not_hide_the_rest(monkeypatch):
+    """A corrupted distribution is not a verdict about the others.
+
+    Aborting the scan on the first raise hides every requirement after it —
+    and the HTTP caller swallows that exception, so a package reports as fine
+    because nothing got as far as looking at the requirement that matters.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "brokenpkg>=1",
+        "kestrel-sovereign>=0.99",
+    ]
+    use_fake_uv(monkeypatch, venv)
+    real_version = venv.version
+
+    def version(dist):
+        if dist == "brokenpkg":
+            raise ValueError("metadata is not readable")
+        return real_version(dist)
+
+    monkeypatch.setattr(cli, "_installed_version", version)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    by_name = {r.name: r for r in unmet}
+
+    assert by_name["brokenpkg"].certain is False
+    assert "could not be read" in by_name["brokenpkg"].detail
+    # The requirement AFTER it was still evaluated.
+    assert by_name["kestrel-sovereign"].certain is True
+
+
+def test_a_requirement_that_asks_for_extras_carries_their_requirements_too(
+    monkeypatch
+):
+    """`pyjwt[crypto]` is not satisfied by pyjwt alone.
+
+    Core declares dependencies with extras, and checking only that the base
+    wheel is present at a satisfying version calls an environment complete
+    while the thing the extra exists to install is missing.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["pyjwt[crypto]>=2"]
+    venv.installed["pyjwt"] = "2.9.0"                       # the base IS present
+    venv.installed_requires["pyjwt"] = ['cryptography>=3; extra == "crypto"']
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    names = {r.name for r in unmet}
+
+    assert "pyjwt" not in names          # the base requirement is satisfied...
+    assert "cryptography" in names       # ...and the extra's is not
+
+
+def test_following_extras_does_not_loop_on_a_cycle(monkeypatch):
+    """Two packages asking for each other's extras must terminate."""
+    venv = FakeUv(feature_requires=">=0.52")   # core itself is satisfied
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["alpha[x]>=1"]
+    venv.installed["alpha"] = "1.0"
+    venv.installed["beta"] = "1.0"
+    venv.installed_requires["alpha"] = ['beta[y]>=1; extra == "x"']
+    venv.installed_requires["beta"] = ['alpha[x]>=1; extra == "y"']
+    use_fake_uv(monkeypatch, venv)
+
+    # Terminating at all is the assertion; nothing here is unsatisfied.
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_arbitrary_equality_is_honoured_rather_than_called_uncomparable(
+    monkeypatch
+):
+    """`===` exists to match a version string that is NOT PEP 440.
+
+    Demanding a parseable installed version first rejects the case the operator
+    was added for, and then reports permanent uncertain drift over an
+    environment that is satisfied — `ensure` for ever.
+    """
+    venv = FakeUv(feature_requires=">=0.52")   # core itself is satisfied
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===vendor-1"]
+    venv.installed["legacypkg"] = "vendor-1"
+    use_fake_uv(monkeypatch, venv)
+
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_arbitrary_equality_that_does_not_match_is_unmet(monkeypatch):
+    """The exemption must not hand back the blindness it removed.
+
+    `version_satisfies` fails open on an unparseable version, so routing
+    arbitrary equality through it turns every mismatch into a pass. The
+    specifier compares the raw string, which is the whole point of `===`.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===vendor-2"]
+    venv.installed["legacypkg"] = "vendor-1"   # a DIFFERENT legacy version
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+
+    assert [r.name for r in unmet] == ["legacypkg"]
+    assert unmet[0].certain is True
+    assert "vendor-1 is installed" in unmet[0].detail
+
+
+def test_arbitrary_equality_matches_a_parseable_but_noncanonical_version(
+    monkeypatch
+):
+    """`v1.0` parses AND normalises to something else.
+
+    Gating the raw comparison on "the version does not parse" was a proxy for
+    "use arbitrary equality's own comparison". A parseable-but-noncanonical
+    version took the normalising path and came back unmet against itself —
+    `ensure` for ever, over an environment that is satisfied.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===v1.0"]
+    venv.installed["legacypkg"] = "v1.0"
+    use_fake_uv(monkeypatch, venv)
+
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_a_core_with_extras_still_has_its_closure_checked(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Declared extras already chose `ensure`, and that hid the question.
+
+    Asking only under `present` meant a core entry with extras never computed
+    its unmet closure — so a failed install of an unloadable core came back as
+    an ordinary package failure, which `--continue-on-error` waves through.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\nextras = ["local"]\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    venv.editable.pop(CORE, None)                 # core is the declared wheel
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    assert cli.cmd_feature_sync(_args(manifest)) == CORE_UNRESOLVED
+
+
+def test_a_requirement_line_that_cannot_be_parsed_is_uncertain_not_absent(
+    monkeypatch
+):
+    """"Unknown" is not "satisfied".
+
+    A partially written METADATA has a closure nobody can evaluate, and
+    skipping the line converts that into a clean bill of health for a package
+    whose version and source still read fine.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["this is not a requirement"]
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+
+    assert len(unmet) == 1
+    assert unmet[0].certain is False
+    assert "cannot be read" in unmet[0].detail
+
+
+def test_a_closure_the_failed_install_repaired_does_not_block_the_restart(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Installers are not transactional, so the pre-install answer goes stale.
+
+    The run can install the missing dependency and then fail on something else.
+    Classifying that from the answer taken BEFORE the install blocks a restart
+    over a closure that now conforms — the false refusal this check was scoped
+    to avoid.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    venv.editable.pop(CORE, None)
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    real_install_core = cli_features.CoreInstallGuard.install_core
+
+    def install_core(self, pip_args, **kw):
+        # The install fixes the dependency and then fails for its own reason.
+        venv.installed["kestrel-sovereign-sdk"] = "0.99.0"
+        return real_install_core(self, pip_args, **kw)
+
+    monkeypatch.setattr(cli_features.CoreInstallGuard, "install_core", install_core)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    # Still an error — the install failed — but a CONTINUABLE one, because the
+    # thing this check exists to refuse is no longer true.
+    assert rc == 1

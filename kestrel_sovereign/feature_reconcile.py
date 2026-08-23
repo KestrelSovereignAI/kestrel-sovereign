@@ -532,6 +532,211 @@ def version_is_valid(version: Optional[str]) -> bool:
         return False
 
 
+def requested_extras(package_spec: str) -> Tuple[str, ...]:
+    """The extras named in a spec like ``pkg[voice,web]>=1.2``."""
+    if "[" not in package_spec or "]" not in package_spec:
+        return ()
+    inside = package_spec.split("[", 1)[1].split("]", 1)[0]
+    return tuple(part.strip() for part in inside.split(",") if part.strip())
+
+
+def requirement_applies(req, extras: Tuple[str, ...]) -> bool:
+    """Whether *req* is active for this interpreter and these extras.
+
+    An unmarked requirement always applies. A marked one applies if it
+    evaluates true in the base environment or under any extra the caller
+    requested — `packaging` evaluates ``extra == "x"`` to False when no extra is
+    supplied, so the base environment alone would silently drop every
+    extra-gated requirement.
+    """
+    if req.marker is None:
+        return True
+    for env in ({}, *({"extra": extra} for extra in extras)):
+        try:
+            if req.marker.evaluate(env):
+                return True
+        except Exception:  # noqa: BLE001
+            # An undefined marker name tells us nothing either way; a later
+            # environment may still resolve it.
+            continue
+    return False
+
+
+@dataclass(frozen=True)
+class UnmetRequirement:
+    """One requirement of a distribution that this venv does not satisfy.
+
+    Carries the requirement's CANONICAL name rather than leaving callers to
+    read it back out of ``detail``: a name in metadata keeps whatever spelling
+    it was written with, so ``Kestrel_Sovereign>=0.53`` and
+    ``kestrel-sovereign-sdk`` are a miss and a false match respectively for
+    anything matching on the rendered text.
+
+    ``certain`` is False when the comparison could not actually be made — a
+    malformed installed version, or a specifier that will not parse. That is a
+    different fact from "this requirement is unmet", and the two callers want
+    opposite things from it: the manifest gate retries (a needless reinstall
+    costs a run), while the install endpoint does not upgrade a successful
+    response to an error over metadata it could not read.
+    """
+
+    name: str
+    detail: str
+    certain: bool = True
+
+
+def unsatisfied_requirements(
+    dist_name: str,
+    extras: Tuple[str, ...],
+    requires,
+    installed_version,
+    _seen=None,
+) -> Tuple[UnmetRequirement, ...]:
+    """Every ACTIVE requirement of *dist_name* this venv does not satisfy.
+
+    The other half of the question ``present`` has to answer. "Is it the
+    declared version from the declared source" says where a distribution came
+    from; this says whether the venv can actually load it. A package can be
+    exactly what the manifest asked for and still be unusable because something
+    it declares is missing or too old (issue #3080).
+
+    Read from the INSTALLED metadata, because the requirement that matters is
+    the one the artifact on disk declares — not the one the install command
+    asked for, and not the index's idea of that version.
+
+    Scoped deliberately to ONE distribution's own requirements rather than to
+    the environment. ``feature sync``'s claim is that the venv matches the
+    manifest, so it has no authority over a conflict between packages the
+    manifest never names — and measured on a live host, an environment-wide
+    check reports seven such conflicts among observability transitives and
+    would refuse every update on a host that is working perfectly well.
+
+    A requirement that asks for EXTRAS carries that dependency's extra-gated
+    requirements too, so those are followed: core declares
+    ``kestrel-sovereign-sdk[tracing]`` and ``pyjwt[crypto]``, and checking only
+    that the base wheel is present at a satisfying version calls an environment
+    complete while the thing the extra exists to install is missing. Only
+    extra-bearing requirements are followed — this is not a walk of the whole
+    dependency graph, which is the environment-wide question this deliberately
+    is not — and ``_seen`` stops a cycle between two packages that ask for each
+    other's extras.
+
+    *requires* and *installed_version* are the venv readers, passed in so this
+    stays a pure function of what they report.
+    """
+    from packaging.requirements import Requirement
+
+    seen = _seen if _seen is not None else set()
+    key = (canonical_package(dist_name), tuple(sorted(extras)))
+    if key in seen:
+        return ()
+    seen.add(key)
+
+    unmet: List[UnmetRequirement] = []
+    for raw in requires(dist_name) or ():
+        try:
+            req = Requirement(raw)
+        except Exception as exc:  # noqa: BLE001 - unparseable, not absent
+            # "Unknown" is not "satisfied". A partially written METADATA has a
+            # closure nobody can evaluate, and skipping the line converts that
+            # into a clean bill of health for a package whose version and
+            # source still read fine.
+            unmet.append(UnmetRequirement(
+                "",
+                f"{dist_name} declares a requirement that cannot be read "
+                f"({raw!r}: {exc})",
+                certain=False,
+            ))
+            continue
+        if not requirement_applies(req, extras):
+            continue
+        name = canonical_package(req.name)
+        try:
+            have = installed_version(req.name)
+        except Exception as exc:  # noqa: BLE001 - one unreadable dist is not a verdict
+            # Per requirement, not per scan: a single corrupted distribution
+            # aborting the whole loop hides every requirement after it, and the
+            # caller that swallows the exception then reports a package as fine
+            # because nothing got as far as looking at it.
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{req.specifier}, and that "
+                f"distribution could not be read ({exc})",
+                certain=False,
+            ))
+            continue
+        if have is None:
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{req.specifier}, which is "
+                "not installed",
+            ))
+            continue
+        spec = str(req.specifier)
+        if not spec:
+            if req.extras:
+                unmet.extend(unsatisfied_requirements(
+                    name, tuple(req.extras), requires, installed_version, seen,
+                ))
+            continue
+        # `version_satisfies` fails OPEN by design — it was written for
+        # reporting, where an unevaluable comparison must not manufacture
+        # drift. A gate reading that as "satisfied" is the same failure one
+        # layer up, so the two sides are asked separately and an unevaluable
+        # comparison is reported as unmet-but-uncertain.
+        # `===` is PEP 440's ARBITRARY equality: it exists precisely to match a
+        # version string that is not PEP 440, so demanding a parseable version
+        # first rejects the case the operator was added for — and then reports
+        # permanent uncertain drift over an environment that is satisfied.
+        #
+        # It also has to be COMPARED differently. `version_satisfies` fails open
+        # on an unparseable version, so routing arbitrary equality through it
+        # turns every mismatch into a pass — the exemption handing back the same
+        # blindness it was added to remove. `SpecifierSet` compares the raw
+        # string, which is the whole point of the operator.
+        arbitrary = bool(spec) and all(
+            item.operator == "===" for item in req.specifier
+        )
+        if arbitrary:
+            # ALWAYS, not just when the version fails to parse. `v1.0` and
+            # `1.0-1` parse fine and normalise to something else, so routing a
+            # parseable one through the normalising path reports `dep===v1.0`
+            # unmet against an installed `v1.0` — permanent drift over an
+            # environment that is satisfied. Arbitrary equality has one
+            # comparison, and it is the raw one.
+            if not req.specifier.contains(have):
+                unmet.append(UnmetRequirement(
+                    name,
+                    f"{dist_name} requires {req.name}{spec}, but {have} is "
+                    "installed",
+                ))
+            elif req.extras:
+                unmet.extend(unsatisfied_requirements(
+                    name, tuple(req.extras), requires, installed_version, seen,
+                ))
+            continue
+        evaluable = spec_is_valid(spec) and version_is_valid(have)
+        if not evaluable:
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{spec}, and the installed "
+                f"{have!r} cannot be compared against it",
+                certain=False,
+            ))
+            continue
+        if not version_satisfies(have, spec):
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{spec}, but {have} is installed",
+            ))
+            continue
+        if req.extras:
+            unmet.extend(unsatisfied_requirements(
+                name, tuple(req.extras), requires, installed_version, seen,
+            ))
+    return tuple(unmet)
+
+
 def spec_is_valid(spec: Optional[str]) -> bool:
     """Is *spec* a USABLE PEP 440 specifier? Empty counts as valid ("any").
 
