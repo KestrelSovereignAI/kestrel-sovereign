@@ -1349,6 +1349,90 @@ class TestTheIndexHasAConsumer:
         assert "index_stale" not in result.data
 
     @pytest.mark.asyncio
+    async def test_an_id_stable_edit_that_never_projected_is_reported(
+        self, tmp_path
+    ):
+        """Membership is weaker than agreement.
+
+        Changing a blocker's repo or severity leaves its id and its status
+        untouched, so a membership-only check certified the index clean while
+        the recalled row still carried the OLD repository -- the very
+        ambiguity the repo field was added to remove.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_blocker(
+            issue="#42", title="wedged", severity="high", repo="owner/repo"
+        )
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
+        for row in feature._ledger.data[BLOCKERS_KEY]:
+            row["repo"] = "someone-else/other"
+            row["severity"] = "critical"
+        feature._ledger.save()
+
+        result = await feature.recall_blockers()
+
+        assert result.data["blockers"][0]["repo"] == "owner/repo", (
+            "the index really is handing back the stale repository"
+        )
+        assert result.status.value == "partial"
+        assert result.data["drifted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_id_with_whitespace_is_not_a_false_alarm(
+        self, tmp_path
+    ):
+        """One rule for the row id, computed once.
+
+        The properties function read row["id"] verbatim while _row_id stripped
+        it, so a freshly and healthily rebuilt node advertised one spelling and
+        was addressed by another -- reported missing AND orphaned, forever,
+        with no restart able to clear it.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a hand-edited row")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["id"] = "  " + rows[0]["id"] + "  "
+        feature._ledger.save()
+        feature.agent.storage.graph.nodes.clear()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "ok", (
+            "a healthy rebuild is not a divergence"
+        )
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_graph_owned_supersession_is_outside_the_content_digest(
+        self, tmp_path
+    ):
+        """The digest covers what the LEDGER owns, and nothing else.
+
+        Including the graph-owned keys would make every legitimately
+        graph-retired pattern report content drift forever -- the same
+        permanent false alarm, arriving through a different door.
+        """
+        feature = await _feature(tmp_path)
+        first = await feature.strategy_add_pattern(pattern="graph retires me")
+        graph = feature.agent.storage.graph
+        node = next(
+            n
+            for n in graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+            and n.properties["row_id"] == first.data["pattern_id"]
+        )
+        node.properties["superseded_by"] = "pat_replacement"
+        await feature._reindex_ledger()
+        assert node.properties["status"] == "superseded"
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.status.value == "ok"
+        assert "drifted_count" not in result.data
+
+    @pytest.mark.asyncio
     async def test_a_blocker_reopened_by_hand_is_not_a_clean_zero(self, tmp_path):
         """Whether the INDEX may retire a row is a property of the section.
 

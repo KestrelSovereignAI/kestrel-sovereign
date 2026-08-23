@@ -1169,22 +1169,32 @@ class StrategicMemoryFeature(Feature):
         # overwrites the first and one row is unreachable however healthy the
         # projection is. Counted separately because reprojecting cannot fix it.
         colliding = len(all_ids) - len(ledger_all)
+        # What the ledger says each row's node should contain. Membership is a
+        # strictly weaker question than agreement: an id-stable edit leaves the
+        # id and the status identical while the indexed row goes stale.
+        expected_digests = {
+            section.row_id(row): section.content_digest(agent_id, row)
+            for row in section.expected_rows(ledger_data, include_retired=True)
+        }
         misfiled = set()
-        for row_id, status in membership.items():
+        drifted = set()
+        for row_id, indexed in membership.items():
             if row_id not in ledger_all:
                 continue  # an orphan, already counted
-            indexed_current = status == ACTIVE_STATUS
+            indexed_current = indexed.status == ACTIVE_STATUS
             ledger_current = row_id in ledger_active
-            if indexed_current == ledger_current:
-                continue
-            if not indexed_current and ledger_current and section.graph_may_retire:
-                # The projection's documented graph-owned supersession, which
-                # reprojection deliberately preserves. Calling it a divergence
-                # would report a staleness no restart could ever clear.
-                continue
-            misfiled.add(row_id)
+            if indexed_current != ledger_current and not (
+                not indexed_current and ledger_current and section.graph_may_retire
+            ):
+                # The excused case is the projection's documented graph-owned
+                # supersession, which reprojection deliberately preserves --
+                # calling it a divergence would report a staleness no restart
+                # could ever clear.
+                misfiled.add(row_id)
+            if indexed.digest != expected_digests.get(row_id):
+                drifted.add(row_id)
 
-        if not (missing or orphaned or misfiled or colliding):
+        if not (missing or orphaned or misfiled or colliding or drifted):
             return ToolResult.ok(confirmation=confirmation, data=data)
 
         data["index_stale"] = True
@@ -1206,6 +1216,12 @@ class StrategicMemoryFeature(Feature):
             divergences.append(
                 f"{len(misfiled)} row(s) whose current/retired state it "
                 f"disagrees with {LEDGER_FILENAME} on"
+            )
+        if drifted:
+            data["drifted_count"] = len(drifted)
+            divergences.append(
+                f"{len(drifted)} row(s) whose indexed content no longer "
+                f"matches {LEDGER_FILENAME}"
             )
         if colliding:
             data["colliding_count"] = colliding

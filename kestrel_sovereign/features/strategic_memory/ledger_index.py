@@ -22,6 +22,8 @@ pattern in YAML could never take effect in the index.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Mapping
@@ -125,6 +127,36 @@ def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str
     return str(row.get("id") or "").strip() or minter(row)
 
 
+#: Properties the digest below must ignore, because the graph may legitimately
+#: hold a value for them that the ledger does not -- see
+#: :data:`_GRAPH_OWNED_PROPERTIES` and the ``status`` they imply.
+_DIGEST_EXCLUDED = frozenset(_GRAPH_OWNED_PROPERTIES) | {"status"}
+
+
+def properties_digest(properties: Mapping[str, Any]) -> str:
+    """Fingerprint of the ledger-owned half of a projected node.
+
+    Membership answers "is there a node for this row?", which is a strictly
+    weaker question than "does the index still say what the file says". An
+    id-stable edit -- a blocker's repo or severity, a pattern's implication --
+    leaves membership and status identical while the indexed row goes stale,
+    and a check that stopped at membership certified that as clean (#3064).
+
+    A node written before a property was ADDED to the projection digests
+    differently from one written after, which is the intended answer: such a
+    node is stale until the next reprojection, and saying so is what makes the
+    upgrade visible instead of silent.
+    """
+    material = {
+        str(key): str(value)
+        for key, value in (properties or {}).items()
+        if key not in _DIGEST_EXCLUDED
+    }
+    return hashlib.blake2s(
+        json.dumps(material, sort_keys=True).encode("utf-8"), digest_size=8
+    ).hexdigest()
+
+
 
 @dataclass(frozen=True)
 class LedgerSection:
@@ -170,6 +202,24 @@ class LedgerSection:
 
     def row_id(self, row: Dict[str, Any]) -> str:
         return _row_id(row, self.minter)
+
+    def node_properties(self, agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        """The node's properties, with ``row_id`` normalized to the node's own.
+
+        The properties functions read ``row["id"]`` verbatim while
+        :func:`_row_id` strips it, so a hand-edited id carrying whitespace
+        addressed the node under one spelling and advertised another. The
+        membership check reads the property, so a freshly and healthily
+        rebuilt node came back reported as missing AND orphaned, forever, and
+        no restart could clear it. One rule, computed once (#3064).
+        """
+        properties = self.properties(agent_id, row)
+        properties["row_id"] = self.row_id(row)
+        return properties
+
+    def content_digest(self, agent_id: str, row: Dict[str, Any]) -> str:
+        """Digest of the properties the LEDGER owns for this row."""
+        return properties_digest(self.node_properties(agent_id, row))
 
     def node_id(self, agent_id: str, row: Dict[str, Any]) -> str:
         return ledger_node_id(self.node_type, agent_id, self.row_id(row))
@@ -342,7 +392,7 @@ async def _project_section(
             continue
 
         node_id = section.node_id(agent_id, row)
-        properties = section.properties(agent_id, row)
+        properties = section.node_properties(agent_id, row)
 
         try:
             existing = await graph_store.get_node(node_id)
@@ -445,9 +495,17 @@ ACTIVE_STATUS = "active"
 MEMBERSHIP_READ_CAP = 10000
 
 
+@dataclass(frozen=True)
+class IndexedRow:
+    """What the index says about one projected row."""
+
+    status: str
+    digest: str
+
+
 async def index_membership(
     graph_store: Any, agent_id: str, node_type: str
-) -> tuple[Dict[str, str], bool]:
+) -> tuple[Dict[str, IndexedRow], bool]:
     """Every row this projection wrote for one agent: ``row_id -> status``.
 
     Deliberately status-agnostic and deliberately NOT the caller's page.
@@ -456,6 +514,10 @@ async def index_membership(
     that sorts behind every canonical row is invisible to the page and present
     in the database, so the page certifies a clean index and a larger limit
     then returns deleted guidance (#3064).
+
+    Each entry carries the node's status AND a digest of its ledger-owned
+    properties, because "there is a node for this row" is a strictly weaker
+    claim than "the index still says what the file says".
 
     Returns ``(membership, complete)``. ``complete`` is False when the read
     saturated :data:`MEMBERSHIP_READ_CAP`, which the caller must surface as a
@@ -470,8 +532,9 @@ async def index_membership(
         limit=MEMBERSHIP_READ_CAP,
     ) or []
     membership = {
-        str((node.properties or {}).get("row_id") or ""): str(
-            (node.properties or {}).get("status") or ""
+        str((node.properties or {}).get("row_id") or ""): IndexedRow(
+            status=str((node.properties or {}).get("status") or ""),
+            digest=properties_digest(node.properties or {}),
         )
         for node in nodes
     }
