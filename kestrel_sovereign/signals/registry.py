@@ -99,6 +99,33 @@ CLAIM_CONTRIBUTION = "contribution"
 #: feature, so this claim is never released — only `unregister` clears it.
 _HOST_CLAIM = "host"
 
+#: The only two roles a claim can be held in. A third value is a claim nothing
+#: releases: `Feature.shutdown()` releases CLAIM_IMPERATIVE and the contribution
+#: runtime releases CLAIM_CONTRIBUTION, and neither would recognise it.
+_CLAIM_ROLES = (CLAIM_IMPERATIVE, CLAIM_CONTRIBUTION)
+
+
+def _claim_role_for(owner, role):
+    """The role a claim is recorded under — validated, never defaulted.
+
+    A HOST claim (``owner is None``) has no role: it is one sentinel that
+    `release` can never drop, so nothing reads a role for it.
+
+    An OWNED claim must name one of :data:`_CLAIM_ROLES`, because the two are
+    released by different code paths. A value neither path knows retains the
+    source and the owner object forever, and an empty string quietly becoming
+    the contribution role is exactly the silent downgrade that requiring a
+    stated role exists to stop — so membership is checked, not truthiness.
+    """
+    if owner is None:
+        return CLAIM_CONTRIBUTION  # unused: the host claim is keyed by sentinel
+    if role not in _CLAIM_ROLES:
+        raise TypeError(
+            "an owned registration must state its claim role as one of "
+            f"{_CLAIM_ROLES}; got {role!r}"
+        )
+    return role
+
 
 class RegistrationPolicy(enum.Enum):
     """Explicit policy for how a source registration resolves a name clash.
@@ -366,11 +393,7 @@ class SourceRegistry:
         contribution claim that ``shutdown()`` never releases, which is the
         silent-downgrade shape a default is always at risk of.
         """
-        if owner is not None and role is None:
-            raise TypeError(
-                "an owned registration must state its claim role "
-                "(CLAIM_IMPERATIVE or CLAIM_CONTRIBUTION)"
-            )
+        role = _claim_role_for(owner, role)
         try:
             self._validate(registration)
         except RegistrationError as exc:
@@ -389,7 +412,7 @@ class SourceRegistry:
         existing = self._sources.get(registration.name)
         if existing is None:
             self._sources[registration.name] = registration
-            self._claim(registration.name, owner, role or CLAIM_CONTRIBUTION)
+            self._claim(registration.name, owner, role)
             return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
 
         if self.contract_equivalent(existing, registration):
@@ -407,7 +430,7 @@ class SourceRegistry:
             # (issue #3074). Features state their ownership at registration
             # (:meth:`KestrelFeature._register_signal_sources`), so ownerless
             # means the host and only the host.
-            self._claim(registration.name, owner, role or CLAIM_CONTRIBUTION)
+            self._claim(registration.name, owner, role)
             return RegistrationOutcome(
                 registration.name, RegistrationState.ALREADY_EQUIVALENT
             )
@@ -446,6 +469,11 @@ class SourceRegistry:
         leaves a partial source set behind (kestrel-sovereign#2522 partial-set
         defect). Under ``OPTIONAL`` each source is independent and reported.
         """
+        # Validated HERE as well as per-registration, because the rollback below
+        # has to release under the same role the batch claimed under — reading
+        # it off a default there left a failed owner attached to every incumbent
+        # the batch had ridden.
+        role = _claim_role_for(owner, role)
         outcomes: list[RegistrationOutcome] = []
         newly_added: list[str] = []
         # Atomic means the CLAIMS unwind too: exactly the ones this batch took,
@@ -460,7 +488,7 @@ class SourceRegistry:
                     if outcome.state is RegistrationState.REGISTERED:
                         newly_added.append(outcome.name)
             except RegistrationError:
-                self.release_acquired(acquired, owner)
+                self.release_acquired(acquired, owner, role)
                 for name in newly_added:
                     self._sources.pop(name, None)
                     self._claims.pop(name, None)

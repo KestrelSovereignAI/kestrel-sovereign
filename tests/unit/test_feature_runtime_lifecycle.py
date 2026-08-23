@@ -1114,3 +1114,69 @@ async def test_disowning_a_source_a_peer_still_holds_leaves_it_registered():
 
     assert registry.get("seam.peer") is not None
     assert registry.owners_of("seam.peer") == (incumbent,)
+
+
+class _RolelessClaimsRegistry:
+    """A registry from the generation BETWEEN the two: claims, but no role.
+
+    `release_all` and `owner=` shipped together; `role=` came a commit later.
+    An embedder written against that first shape passes the "can it hold
+    claims" question and then raises `TypeError` on the keyword, mid
+    `initialize()` — which is why the capability question has to ask about the
+    whole contract, not the half that happens to be older.
+    """
+
+    def __init__(self):
+        self.sources = {}
+        self.claims = {}
+        self.unregistered = []
+
+    def register_with_policy(self, registration, policy, *, owner=None):
+        from kestrel_sovereign.signals import RegistrationOutcome, RegistrationState
+
+        if registration.name in self.sources:
+            return RegistrationOutcome(
+                registration.name, RegistrationState.ALREADY_EQUIVALENT
+            )
+        self.sources[registration.name] = registration
+        self.claims.setdefault(registration.name, []).append(owner)
+        return RegistrationOutcome(registration.name, RegistrationState.REGISTERED)
+
+    def release_all(self, owner, role=None):
+        raise AssertionError(
+            "teardown must not reach a registry the register call could not "
+            "claim through"
+        )
+
+    def unregister(self, name):
+        self.unregistered.append(name)
+        return self.sources.pop(name, None) is not None
+
+
+async def test_a_claims_registry_without_the_role_keyword_falls_back_by_name():
+    """Having `release_all` is not having the contract a claim needs.
+
+    Passing `role=` to a registry that predates it is a TypeError inside
+    `initialize()` — Channels would degrade ingress permanently and Scheduler
+    and Restart Coordinator would fail to start. Such a registry gets the
+    name-tracking path: no claims, but correct teardown, which is the half that
+    cannot be skipped.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    registry = _RolelessClaimsRegistry()
+    feature = _seam_feature(registry)
+
+    assert feature._registry_holds_claims(registry) is False
+
+    feature._register_signal_sources(
+        _fake_source_registration("seam.roleless"), RegistrationPolicy.OPTIONAL,
+    )
+    assert "seam.roleless" in registry.sources
+    # Registered WITHOUT an owner, because this registry has no role to put it
+    # in — the fallback is a name list, not a half-stated claim.
+    assert registry.claims["seam.roleless"] == [None]
+
+    await feature._unregister_owned_signal_sources()
+
+    assert registry.unregistered == ["seam.roleless"]

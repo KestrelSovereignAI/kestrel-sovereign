@@ -366,17 +366,35 @@ class Feature(_SdkFeature):
     # ------------------------------------------------------------------
     @staticmethod
     def _registry_holds_claims(registry) -> bool:
-        """Can *registry* record who holds a source?
+        """Can *registry* record who holds a source, in a stated role?
 
-        The ONE capability question asked about a signal registry. It used to be
+        The ONE capability question asked about a signal registry, and it asks
+        about the WHOLE contract a claim needs: state the owner and the role at
+        registration, and release by owner and role at teardown. It used to be
         asked twice with two different markers — ``adopt`` when registering,
         ``release_all`` when tearing down — and two questions about one
         capability is how the ledgers this replaced came to disagree (#3053).
-        ``release_all`` is the marker because teardown is the half that cannot
-        be skipped: a registry that cannot be released from must be tracked by
-        name instead, or its sources are never removed at all.
+
+        Both halves are checked because they arrived at different times: a
+        registry written against the ledger as it first shipped has
+        ``release_all`` and takes ``owner=`` but not ``role=``, and calling it
+        with the keyword is a ``TypeError`` mid-``initialize()``. Such a
+        registry takes the name-tracking path instead — no claims, but correct
+        teardown, which is the half that cannot be skipped.
+
+        The role parameter is looked for BY NAME. A registry that swallows
+        ``**kwargs`` would accept the keyword and ignore it, taking a claim in
+        a role its teardown never releases; falling back is the conservative
+        answer and always safe.
         """
-        return hasattr(registry, "release_all")
+        register = getattr(registry, "register_with_policy", None)
+        if not callable(register) or not hasattr(registry, "release_all"):
+            return False
+        try:
+            parameters = inspect.signature(register).parameters
+        except (TypeError, ValueError):  # a C callable, or an odd wrapper
+            return False
+        return "role" in parameters
 
     def _register_signal_sources(self, registrations, policy, registry=None):
         """Register signal sources AS THIS FEATURE; return the outcomes.

@@ -722,3 +722,66 @@ def test_activation_rollback_keeps_a_claim_the_feature_already_held():
     # The claim that predated the activation is intact.
     assert registry.owners_of("preexisting.claim") == (feature,)
     assert registry.get("preexisting.claim") is source
+
+
+def test_a_failed_batch_unwinds_the_role_it_claimed_under():
+    """The rollback releases under the SAME role the batch claimed under.
+
+    `release_acquired` defaults to the contribution role, so a batch that
+    claimed imperatively and then failed released a key that was never there:
+    the incumbents it had ridden kept the failed owner as a holder forever, and
+    `_claim_owners` kept the owner object with them.
+    """
+    import dataclasses
+
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        CLAIM_IMPERATIVE,
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    owner = object()
+
+    shared = _owner_test_source("role.rollback.shared")
+    registry.register(shared)
+    clash_incumbent = _owner_test_source("role.rollback.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing],
+            RegistrationPolicy.MANDATORY,
+            owner=owner,
+            role=CLAIM_IMPERATIVE,
+        )
+
+    assert registry.get("role.rollback.shared") is shared
+    assert owner not in registry.owners_of("role.rollback.shared")
+
+
+@pytest.mark.parametrize("bad_role", ["", "imperitive", None, "host"])
+def test_an_owned_registration_rejects_a_role_nothing_releases(bad_role):
+    """Membership, not truthiness — both ways of getting it wrong are fatal.
+
+    An empty string is falsy, so a ``role or CLAIM_CONTRIBUTION`` default made
+    it the contribution role silently: the exact downgrade that requiring a
+    stated role exists to stop. A misspelling is worse — it creates a third
+    role that neither `shutdown()` nor the contribution teardown releases, so
+    the source and the owner object are retained for the registry's lifetime.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+
+    with pytest.raises(TypeError, match="claim role"):
+        registry.register_with_policy(
+            _owner_test_source(f"bad.role.{bad_role!r}"),
+            RegistrationPolicy.OPTIONAL,
+            owner=object(),
+            role=bad_role,
+        )
