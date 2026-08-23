@@ -62,6 +62,45 @@ def _safe_termination_agent_name(error: object) -> str | None:
     return None
 
 
+def _absence_finalization_partial_result(
+    *,
+    child_name: str,
+    offboard_runtime: bool,
+) -> ToolResult:
+    """Report routing finalization without inventing runtime-tree custody.
+
+    A concurrent lifecycle operation may remove manager routing and the parent
+    edge before this request receives an authoritative termination result.
+    That is enough to finalize local tracking, but proves neither that runtime
+    state was retained nor that a destructive request removed it.
+    """
+
+    return ToolResult.partial(
+        f"Terminated child '{child_name}'.",
+        (
+            "The child was already absent from manager routing when this "
+            "request reconciled local lifecycle tracking. Runtime retention "
+            "and offboarding are unknown; reconcile runtime custody before "
+            "restart or deprovisioning. Do not retry termination."
+        ),
+        data={
+            "terminated": True,
+            "child_name": child_name,
+            "agent_removed": True,
+            "finalized_from_absence": True,
+            "runtime_offboard_requested": offboard_runtime,
+            "runtime_offboarded": False,
+            "runtime_cleanup_pending": False,
+            "runtime_cleanup_state": "custody_unknown",
+            "runtime_already_absent": False,
+            "runtime_custody_known": False,
+            "runtime_retention_unknown": True,
+            "operator_action_required": True,
+            "retry_termination": False,
+        },
+    )
+
+
 def _termination_partial_result(
     *,
     child_name: str,
@@ -1019,6 +1058,14 @@ class SpawnFeature(Feature):
                 raise
             return partial
         if removed:
+            if (
+                lifecycle is not None
+                and getattr(result, "finalized_from_absence", False) is True
+            ):
+                return _absence_finalization_partial_result(
+                    child_name=child_name,
+                    offboard_runtime=offboard_runtime,
+                )
             return ToolResult.ok(
                 f"Terminated child '{child_name}'.",
                 data={

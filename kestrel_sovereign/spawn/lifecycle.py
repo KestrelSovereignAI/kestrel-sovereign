@@ -170,6 +170,9 @@ class SpawnResult:
         budget_consumed: Total amount spent from delegated budget.
         started_at: ISO timestamp of when the child was registered.
         ended_at: ISO timestamp of when the child completed/terminated.
+        finalized_from_absence: True only when local lifecycle finalization used
+            manager routing and parent-edge absence after a termination call
+            returned False. This is not evidence about runtime-tree custody.
     """
 
     child_name: str
@@ -188,6 +191,7 @@ class SpawnResult:
     # other parents' history). Defaulted to "" for back-compat with
     # any existing serialized SpawnResult dataclasses.
     parent_did: str = ""
+    finalized_from_absence: bool = False
 
 
 @dataclass
@@ -333,11 +337,6 @@ class SpawnedAgentLifecycle:
                 return None
             if tracked.result is not None:
                 return tracked.result  # already finalized (e.g. by TTL)
-            # A bounded automatic-refusal record describes a still-live child,
-            # not its work result. A real report supersedes that operator state
-            # and must retain its artifacts and budget through finalization.
-            tracked.termination_refusal = None
-
             result = SpawnResult(
                 child_name=child_name,
                 child_did=tracked.child_did,
@@ -550,6 +549,7 @@ class SpawnedAgentLifecycle:
         # Terminate via AgentManager (handles cascading grandchildren)
         termination_failure: BaseException | None = None
         terminated = False
+        finalized_from_absence = False
         try:
             if offboard_runtime:
                 terminated = await self._agent_manager.terminate_child(
@@ -589,6 +589,7 @@ class SpawnedAgentLifecycle:
                 # local lifecycle custody exactly once. Routing absence alone
                 # does not prove that destructive runtime offboarding ran.
                 terminated = True
+                finalized_from_absence = True
                 if offboard_runtime:
                     from kestrel_sovereign.multi_agent.agent_manager import (
                         RuntimeOffboardingNotPerformedError,
@@ -637,6 +638,7 @@ class SpawnedAgentLifecycle:
                 started_at=tracked.started_at,
                 parent_did=tracked.parent_did,
             )
+        result.finalized_from_absence = finalized_from_absence
         tracked.termination_refusal = None
         tracked.result = result
         self._results[child_name] = result

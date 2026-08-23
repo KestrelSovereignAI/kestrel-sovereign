@@ -182,6 +182,7 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
         if custody_unknown:
             self.metadata.update(
                 {
+                    "runtime_cleanup_state": "custody_unknown",
                     "runtime_already_absent": False,
                     "runtime_custody_known": False,
                     "runtime_retention_unknown": True,

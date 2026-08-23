@@ -1230,11 +1230,92 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["named_child_runtime_removed"] is False
         assert envelope.data["runtime_custody_known"] is False
         assert envelope.data["runtime_retention_unknown"] is True
+        assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
+        assert envelope.data["runtime_already_absent"] is False
         assert envelope.data["operator_action_required"] is True
         assert "operator reconciliation" in envelope.error
         assert credential.read_text() == "retain-on-ordinary-delete"
         assert not lifecycle.is_tracked("worker")
-        assert lifecycle.get_result("worker").status.value == "terminated"
+        stored_result = lifecycle.get_result("worker")
+        assert stored_result.status.value == "terminated"
+        assert stored_result.finalized_from_absence is True
+        lifecycle._fire_hook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_nondestructive_terminate_losing_to_offboard_has_unknown_custody(
+        self, tmp_path
+    ):
+        """Routing absence cannot be promoted to a restart-retention claim."""
+
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child:destructive-delete-race")
+        manager = AgentManager(base_data_dir=tmp_path)
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(child.agent_id),
+        )
+        prepare_isolated_runtime_namespace(
+            scope,
+            child.agent_id,
+            relative_directories=(("feature_venvs", "feature-safe"),),
+        )
+        credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
+        credential.write_text("deleted-by-concurrent-offboard")
+        child.isolated_runtime_scope = scope
+        manager._agents["worker"] = child
+        manager._agent_names[child.agent_id] = "worker"
+        manager._parent_children[parent.agent_id] = ["worker"]
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            child_name="worker",
+            child_did=child.agent_id,
+            parent_did=parent.agent_id,
+            ttl_seconds=3600,
+            mode=SpawnMode.EPHEMERAL,
+        )
+        lifecycle._fire_hook = AsyncMock()
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        await lifecycle._lock.acquire()
+        tool_task = asyncio.create_task(feature.terminate_child("worker"))
+        try:
+            for _ in range(100):
+                if getattr(lifecycle._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(lifecycle._lock, "_waiters", None)
+            assert (
+                await manager.remove_agent("worker", offboard_runtime=True) is True
+            )
+            assert manager.get_agent("worker") is None
+            assert manager.get_children(parent.agent_id) == []
+            assert not scope.path.exists()
+        finally:
+            lifecycle._lock.release()
+
+        envelope = await tool_task
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is True
+        assert envelope.data["finalized_from_absence"] is True
+        assert envelope.data["runtime_offboard_requested"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
+        assert envelope.data["runtime_already_absent"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["runtime_retention_unknown"] is True
+        assert "runtime_retained" not in envelope.data
+        assert "runtime_retained_for_restart" not in envelope.data
+        assert "named_child_runtime_retained" not in envelope.data
+        assert "named_child_runtime_removed" not in envelope.data
+        assert envelope.data["retry_termination"] is False
+        assert "reconcile runtime custody" in envelope.error
+        assert not credential.exists()
+        assert not lifecycle.is_tracked("worker")
+        stored_result = lifecycle.get_result("worker")
+        assert stored_result.status.value == "terminated"
+        assert stored_result.finalized_from_absence is True
         lifecycle._fire_hook.assert_awaited_once()
 
     @pytest.mark.asyncio

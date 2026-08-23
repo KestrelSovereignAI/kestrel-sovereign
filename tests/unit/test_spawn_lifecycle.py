@@ -46,6 +46,7 @@ class TestSpawnResult:
         assert result.output_artifacts == {}
         assert result.budget_consumed == Decimal("0")
         assert result.ended_at  # non-empty
+        assert result.finalized_from_absence is False
 
     def test_with_artifacts(self):
         result = SpawnResult(
@@ -412,6 +413,54 @@ class TestTTLExpiration:
         assert not ephemeral_dir.exists()
         lifecycle._fire_hook.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_refused_result_report_preserves_operator_state(self, tmp_path):
+        """A work result cannot erase a still-live child's refusal witness."""
+
+        manager = _make_mock_manager()
+        manager.get_agent.return_value = object()
+        manager.get_children.return_value = ["completed-but-live"]
+        manager.terminate_child.return_value = False
+        lifecycle = SpawnedAgentLifecycle(manager)
+        ephemeral_dir = tmp_path / "completed-but-live"
+        ephemeral_dir.mkdir()
+        await lifecycle.register(
+            child_name="completed-but-live",
+            child_did="did:child:completed-but-live",
+            parent_did="did:parent",
+            ttl_seconds=0.01,
+            mode=SpawnMode.EPHEMERAL,
+            temp_dir=str(ephemeral_dir),
+        )
+        lifecycle._fire_hook = AsyncMock()
+        for _ in range(100):
+            refusal = lifecycle.get_termination_refusal("completed-but-live")
+            if refusal is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        refusal = lifecycle.get_termination_refusal("completed-but-live")
+        assert refusal is not None
+        assert refusal["automatic_retries_exhausted"] is True
+
+        result = await lifecycle.report_result(
+            "completed-but-live",
+            output_artifacts={"answer": "not-finalized"},
+            budget_consumed=Decimal("2.25"),
+        )
+
+        assert result is None
+        assert lifecycle.get_termination_refusal("completed-but-live") == refusal
+        assert lifecycle.get_result("completed-but-live") is None
+        assert lifecycle.is_tracked("completed-but-live")
+        assert ephemeral_dir.exists()
+        lifecycle._fire_hook.assert_not_awaited()
+
+        manager.terminate_child.return_value = True
+        finalized = await lifecycle.terminate("completed-but-live")
+        assert finalized is not None
+        assert lifecycle.get_termination_refusal("completed-but-live") is None
+
 
 class TestResultCollection:
     """Result reporting from child to parent."""
@@ -624,6 +673,7 @@ class TestExplicitTermination:
 
         assert result is not None
         assert result.status is SpawnStatus.TERMINATED
+        assert result.finalized_from_absence is True
         assert not lifecycle.is_tracked("already-gone")
         lifecycle._fire_hook.assert_awaited_once()
 

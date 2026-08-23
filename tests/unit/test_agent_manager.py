@@ -88,6 +88,34 @@ def _admitted_offboarding_failure(error: BaseException) -> AsyncMock:
     return AsyncMock(side_effect=fail)
 
 
+def test_runtime_offboarding_not_performed_custody_state_is_narrow() -> None:
+    ordinary = RuntimeOffboardingNotPerformedError(
+        agent_name="Hosted",
+        agent_id="did:test:hosted",
+        cleanup_state="already_absent",
+    )
+    unknown = RuntimeOffboardingNotPerformedError(
+        agent_name="Hosted",
+        agent_id="did:test:hosted",
+        cleanup_state="already_absent",
+        custody_unknown=True,
+    )
+
+    assert ordinary.metadata["runtime_cleanup_state"] == "already_absent"
+    assert ordinary.metadata["runtime_already_absent"] is True
+    assert "runtime_retention_unknown" not in ordinary.metadata
+    assert unknown.metadata["runtime_cleanup_state"] == "custody_unknown"
+    assert unknown.metadata["runtime_already_absent"] is False
+    assert unknown.metadata["runtime_custody_known"] is False
+    assert unknown.metadata["runtime_retention_unknown"] is True
+    with pytest.raises(ValueError, match="invalid runtime offboarding no-op state"):
+        RuntimeOffboardingNotPerformedError(
+            agent_name="Hosted",
+            agent_id="did:test:hosted",
+            cleanup_state="custody_unknown",
+        )
+
+
 def _admitted_offboarding_success() -> AsyncMock:
     """Build a manager mock which performs the typed admission handshake."""
 
