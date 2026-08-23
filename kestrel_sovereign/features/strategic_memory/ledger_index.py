@@ -387,16 +387,31 @@ async def _project_section(
             label=_label(row.get(section.text_key)),
             properties=properties,
         )
+        label_is_stale = existing is not None and existing.label != node.label
         try:
-            # Conditional, not a clobber. add_node is a whole-row upsert, so a
-            # concurrent write landing between the read above and this one
-            # would be overwritten by the stale snapshot we just read. CAS
-            # makes the check and the write one serialized unit; a lost race
-            # means someone else changed the node, and the next reindex
-            # projects the newer state.
-            outcome = await graph_store.compare_and_swap_node(
-                node_id, expected, node
-            )
+            if label_is_stale:
+                # compare_and_swap_node is deliberately properties-only: a
+                # node's label is written once at creation and a swap never
+                # touches it. Editing a pattern's text under an id the row
+                # carries explicitly therefore left the stored label holding
+                # the OLD wording indefinitely -- and /api/memories reads
+                # ``label`` directly, so a second consumer served text the
+                # ledger no longer contains (#3064). add_node is a whole-row
+                # upsert and does update it. That reopens the clobber window
+                # CAS exists to close, so it is used ONLY on the rare edit that
+                # actually moves the label, and never on the common path.
+                await graph_store.add_node(node)
+                outcome = NodeSwapResult.SWAPPED
+            else:
+                # Conditional, not a clobber. add_node is a whole-row upsert,
+                # so a concurrent write landing between the read above and this
+                # one would be overwritten by the stale snapshot we just read.
+                # CAS makes the check and the write one serialized unit; a lost
+                # race means someone else changed the node, and the next
+                # reindex projects the newer state.
+                outcome = await graph_store.compare_and_swap_node(
+                    node_id, expected, node
+                )
         except Exception as e:  # noqa: BLE001
             logger.debug("ledger projection failed for %s: %s", node_id, e)
             report["failed"] += 1

@@ -1178,7 +1178,18 @@ class StrategicMemoryFeature(Feature):
             membership, membership_complete = await index_membership(
                 graph_store, agent_id, section.node_type
             )
-            if fence_before is None or fence_before != membership:
+            if fence_before is None:
+                # The FIRST read failed, which is not the same as the index
+                # moving -- reporting a reprojection that was never observed
+                # sends an operator looking for the wrong thing.
+                return self._unchecked_recall(
+                    confirmation,
+                    data,
+                    "index_membership_unavailable",
+                    "The strategy index could not be read in full, so whether "
+                    "this list is the whole of it was not checked.",
+                )
+            if fence_before != membership:
                 # The index moved under the read, so the page and this
                 # membership describe different states and comparing them
                 # would certify or accuse the wrong one.

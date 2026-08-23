@@ -75,6 +75,20 @@ class _FakeGraph:
     async def get_nodes_by_type(self, node_type):
         return [n for n in self.nodes.values() if n.node_type == node_type]
 
+    async def add_node(self, node):
+        """Whole-row upsert, label included -- what AsyncGraphStore does.
+
+        Absent from this double until #3064, which is why a projection change
+        that called it looked like it worked: the call raised AttributeError,
+        the projection's ``except Exception`` counted it as a failed write,
+        and the assertions still passed. A double cannot test what it does
+        not implement.
+        """
+        if self._fail_on and self._fail_on in node.node_id:
+            raise RuntimeError("graph write refused")
+        self.writes += 1
+        self.nodes[node.node_id] = node
+
     async def delete_node(self, node_id):
         self.deleted.append(node_id)
         self.nodes.pop(node_id, None)
@@ -1637,13 +1651,17 @@ class TestTheIndexHasAConsumer:
         )
 
     @pytest.mark.asyncio
-    async def test_a_stale_stored_label_is_not_handed_back(self, tmp_path):
-        """compare_and_swap_node is properties-only, by design.
+    async def test_an_edited_text_updates_the_stored_label_too(self, tmp_path):
+        """Every reader of the node, not just this one.
 
-        A node's label is written once at creation and a swap never touches
-        it, so editing a pattern's text under a preserved id leaves the stored
-        label holding the OLD text. Surfacing it would hand a caller a stale
-        field out of an index the health check had just certified current.
+        compare_and_swap_node is deliberately properties-only, so editing a
+        pattern's text under an id the row carries explicitly used to leave
+        GraphNode.label holding the old wording forever. /api/memories reads
+        ``label`` directly, so a second consumer served text the ledger no
+        longer contained. Deriving a fresh label in recall_nodes alone would
+        have made ONE surface honest and left the other lying -- so the
+        projection updates the stored label, and the recall's derived value
+        agrees with it rather than covering for it.
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="the original wording")
@@ -1651,21 +1669,104 @@ class TestTheIndexHasAConsumer:
         rows[0]["pattern"] = "the corrected wording"
         feature._ledger.save()
         await feature._reindex_ledger()
+
         node = next(
             n
             for n in feature.agent.storage.graph.nodes.values()
             if n.node_type == PATTERN_NODE_TYPE
         )
-        assert node.label == "the original wording", (
-            "the stored label really is stale -- that is the premise"
+        assert node.label == "the corrected wording", (
+            "the stored label is what /api/memories serves"
         )
 
         result = await feature.recall_patterns()
-
         row = result.data["patterns"][0]
         assert row["text"] == "the corrected wording"
         assert row["label"] == "the corrected wording"
         assert result.status.value == "ok"
+
+        assert result.status.value == "ok"
+
+    @pytest.mark.asyncio
+    async def test_the_common_path_still_refuses_to_clobber(self, tmp_path):
+        """The label refresh must not become the ordinary write.
+
+        add_node is a whole-row upsert, so routing every projection through it
+        would silently retire the compare-and-swap that stops a concurrent
+        write being overwritten by the snapshot the projection read a moment
+        earlier. It is for the rare edit that moves the label, and nothing
+        else -- which needs pinning, because nothing pinned the CAS path
+        before this branch existed.
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="unchanged wording")
+        graph = feature.agent.storage.graph
+        node = next(
+            n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
+        )
+        original_get = graph.get_node
+
+        async def _stale_snapshot(node_id):
+            got = await original_get(node_id)
+            if got is None:
+                return got
+            # What the projection reads. A concurrent writer then moves the
+            # stored row on, so this snapshot is out of date by the time the
+            # write lands -- exactly what CAS exists to catch.
+            stale = GraphNode(
+                node_id=got.node_id,
+                node_type=got.node_type,
+                label=got.label,
+                properties=dict(got.properties or {}),
+            )
+            got.properties["origin"] = "a concurrent writer"
+            return stale
+
+        graph.get_node = _stale_snapshot
+
+        await feature._reindex_ledger()
+
+        # Read the STORE, not the reference captured above: add_node replaces
+        # the row with a new object, so a stale handle would still show the
+        # concurrent value and the assertion would pass either way.
+        stored = graph.nodes[node.node_id]
+        assert stored.properties.get("origin") == "a concurrent writer", (
+            "the concurrent value survived, so the write was conditional"
+        )
+        assert stored.properties["text"] == "unchanged wording"
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_fence_read_failing_names_that_cause(
+        self, tmp_path
+    ):
+        """A first-read failure is not a reprojection.
+
+        Reporting index_changed_during_read for a query that simply failed
+        sends an operator looking for a concurrent write that never happened.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+        state = {"membership_reads": 0}
+
+        async def _fail_first_membership(node_type, filters=None, **kwargs):
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                state["membership_reads"] += 1
+                if state["membership_reads"] == 1:
+                    raise RuntimeError("graph query refused")
+            return await original(node_type, filters=filters, **kwargs)
+
+        graph.query_nodes_by_type_and_property = _fail_first_membership
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_membership_unavailable"
+        ), "the first read failed; nothing observed a reprojection"
 
     @pytest.mark.asyncio
     async def test_a_saturated_membership_read_is_not_a_complete_one(
@@ -2249,6 +2350,44 @@ class TestRecallLimitIsNotUnderReported:
             assert all(
                 r["text"].startswith("still true") for r in result.data["patterns"]
             )
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
+    async def test_the_label_really_is_updated_by_the_real_store(self, tmp_path):
+        """The double was missing add_node entirely until #3064.
+
+        Its absence made a projection change that called it look like it
+        worked: the call raised AttributeError, the projection's broad except
+        counted a failed write, and the assertions still passed. So this one
+        runs against AsyncGraphStore, where the whole-row upsert is the real
+        one and the label column is really rewritten.
+        """
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
+        try:
+            feature = await _feature(
+                tmp_path, graph=AsyncGraphStore(database)
+            )
+            await feature.strategy_add_pattern(pattern="the original wording")
+            rows = feature._ledger.data[PATTERNS_KEY]
+            row_id = rows[0]["id"]
+            rows[0]["pattern"] = "the corrected wording"
+            feature._ledger.save()
+            await feature._reindex_ledger()
+
+            node = await feature.agent.storage.graph.get_node(
+                ledger_node_id(PATTERN_NODE_TYPE, AGENT, row_id)
+            )
+            assert node is not None
+            assert node.label == "the corrected wording"
+            assert node.properties["text"] == "the corrected wording"
+
+            result = await feature.recall_patterns()
+            assert result.data["patterns"][0]["text"] == "the corrected wording"
+            assert result.status.value == "ok"
         finally:
             await database.close()
 
