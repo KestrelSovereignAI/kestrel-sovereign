@@ -1227,3 +1227,99 @@ async def test_declining_on_the_fallback_path_keeps_a_peers_source():
 
     assert registry.unregistered == []
     assert "seam.declined.peer" in registry.sources
+
+
+class _HalfRoleAwareRegistry(_RolelessClaimsRegistry):
+    """Role-aware for one source, pre-role for a batch.
+
+    The shape a subclass takes when it inherits the new single-source method
+    and keeps its own `register_batch` override. Checking either method alone
+    passed it, and Scheduler — which registers its cron sources as a BATCH —
+    then raised TypeError inside `initialize()`.
+    """
+
+    def register_with_policy(self, registration, policy, *, owner=None, role=None):
+        return super().register_with_policy(registration, policy)
+
+    def register_batch(self, registrations, policy, *, owner=None):
+        return [self.register_with_policy(r, policy) for r in registrations]
+
+
+class _ForwardingProxyRegistry:
+    """An embedder proxy that forwards everything to a real registry.
+
+    `(*args, **kwargs)` cannot be inspected for a `role` parameter, and
+    refusing it would push a proxy onto the name path — whose teardown removes
+    by name and cannot see a peer's claim in the registry behind it. A leak is
+    the better failure than deleting a source something else dispatches on.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def register_with_policy(self, *args, **kwargs):
+        return self._inner.register_with_policy(*args, **kwargs)
+
+    def register_batch(self, *args, **kwargs):
+        return self._inner.register_batch(*args, **kwargs)
+
+    def release_all(self, *args, **kwargs):
+        return self._inner.release_all(*args, **kwargs)
+
+    def release(self, *args, **kwargs):
+        return self._inner.release(*args, **kwargs)
+
+
+async def test_a_registry_role_aware_in_only_one_method_falls_back():
+    """The question covers BOTH registering calls, because both get used.
+
+    A single source goes through `register_with_policy` and several go through
+    `register_batch`. A registry that is role-aware in one and not the other
+    passed a check of either alone and then raised inside `initialize()`.
+    """
+    registry = _HalfRoleAwareRegistry()
+    feature = _seam_feature(registry)
+
+    assert feature._registry_holds_claims(registry) is False
+
+    from kestrel_sovereign.signals import RegistrationPolicy
+
+    # The batch call is the one that used to raise. It must simply work.
+    feature._register_signal_sources(
+        [
+            _fake_source_registration("seam.half.one"),
+            _fake_source_registration("seam.half.two"),
+        ],
+        RegistrationPolicy.OPTIONAL,
+    )
+    assert set(registry.sources) == {"seam.half.one", "seam.half.two"}
+
+
+async def test_a_forwarding_proxy_keeps_the_claims_path():
+    """`**kwargs` counts: a proxy must not lose shared-claim safety.
+
+    On the name path a rider's teardown removes by name, so it would delete a
+    source the peer behind the proxy still holds. The claims path keeps that
+    peer's claim visible.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    inner = SourceRegistry()
+    proxy = _ForwardingProxyRegistry(inner)
+    incumbent = _seam_feature(proxy)
+    rider = _seam_feature(proxy)
+
+    assert rider._registry_holds_claims(proxy) is True
+
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.proxy"), RegistrationPolicy.OPTIONAL,
+    )
+    rider._register_signal_sources(
+        _fake_source_registration("seam.proxy"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await rider._unregister_owned_signal_sources()
+
+    # The peer still holds it, so it survives the rider going away.
+    assert inner.get("seam.proxy") is not None
+    assert inner.owners_of("seam.proxy") == (incumbent,)

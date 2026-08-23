@@ -382,10 +382,20 @@ class Feature(_SdkFeature):
         registry takes the name-tracking path instead — no claims, but correct
         teardown, which is the half that cannot be skipped.
 
-        The role parameter is looked for BY NAME. A registry that swallows
-        ``**kwargs`` would accept the keyword and ignore it, taking a claim in
-        a role its teardown never releases; falling back is the conservative
-        answer and always safe.
+        BOTH registering methods are checked, because both are used: a single
+        source goes through ``register_with_policy`` and several go through
+        ``register_batch`` (atomically). A registry that inherits one and
+        overrides the other passed a check of either alone, and then raised
+        ``TypeError`` on the call it had not been checked for — inside
+        ``initialize()``.
+
+        A method taking ``**kwargs`` counts. That is the forwarding-proxy
+        shape, and refusing it would push a proxy onto the name path, whose
+        teardown removes by name and cannot see a peer's claim in the registry
+        behind it. The other way round — a registry that accepts the keyword
+        and ignores it — leaks a claim its teardown never releases. A leak is
+        the better failure than deleting a source something else is dispatching
+        on, so that is the way this errs.
 
         No compatibility path for the shape in between, deliberately. The claims
         ledger's first form — ``adopt`` / ``release_all`` / ``owner=`` without
@@ -394,14 +404,22 @@ class Feature(_SdkFeature):
         against it. Keeping a path for it would mean keeping ``adopt``'s
         ``created=`` flag, which is the guess this change exists to delete.
         """
-        register = getattr(registry, "register_with_policy", None)
-        if not callable(register) or not hasattr(registry, "release_all"):
+        if not hasattr(registry, "release_all"):
             return False
-        try:
-            parameters = inspect.signature(register).parameters
-        except (TypeError, ValueError):  # a C callable, or an odd wrapper
-            return False
-        return "role" in parameters
+        for name in ("register_with_policy", "register_batch"):
+            method = getattr(registry, name, None)
+            if not callable(method):
+                return False
+            try:
+                parameters = inspect.signature(method).parameters
+            except (TypeError, ValueError):  # a C callable, or an odd wrapper
+                return False
+            takes_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+            )
+            if "role" not in parameters and not takes_kwargs:
+                return False
+        return True
 
     def _register_signal_sources(self, registrations, policy):
         """Register signal sources AS THIS FEATURE; return the outcomes.
