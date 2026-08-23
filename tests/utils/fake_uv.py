@@ -107,6 +107,7 @@ class FakeUv:
         repair_noops=False,
         repair_hangs=False,
         core_write_pass_fails=False,
+        core_write_pass_hangs=False,
         core_resolve_refused=False,
         repair_hangs_after_restore=False,
         feature_install_fails=False,
@@ -142,6 +143,7 @@ class FakeUv:
         self.repair_noops = repair_noops
         self.repair_hangs = repair_hangs
         self.core_write_pass_fails = core_write_pass_fails
+        self.core_write_pass_hangs = core_write_pass_hangs
         self.core_resolve_refused = core_resolve_refused
         self.repair_hangs_after_restore = repair_hangs_after_restore
         self.feature_install_fails = feature_install_fails
@@ -427,6 +429,11 @@ class FakeUv:
                 f"{CORE}=={self.installed[CORE]} depends on "
                 f"{SDK}>=0.99, but you require {SDK}==0.36.0.",
             )
+        if self.core_write_pass_hangs and "--no-deps" in cmd:
+            # Killed IN the write pass, after pass 1 has already landed core.
+            # The exit code is a kill, not a refusal — but the sequence still
+            # stopped before the pass that validates dependencies (#3047).
+            self._never_returns(cmd, target, timeout)
         if self.core_write_pass_fails and "--no-deps" in cmd:
             # pip's destructive pass fails — but the resolve pass before it has
             # already put core back (it ran this same branch and wrote), so this

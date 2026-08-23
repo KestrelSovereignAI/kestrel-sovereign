@@ -1479,6 +1479,37 @@ def test_every_gate_returns_a_core_state_verbatim(
     assert cli.cmd_feature_sync(_args(manifest)) == core_rc
 
 
+def test_a_repair_killed_in_the_write_pass_is_unresolved_not_repaired(
+    monkeypatch, capsys
+):
+    """A bound that lands mid-sequence loses the same thing a failure does.
+
+    `subprocess.run` raises before the result exists, so the pass position was
+    thrown away and a kill in the write pass looked like a clean repair over a
+    conforming core. The raise carries the position now
+    (`InstallSequenceTimeout`), so the state is read the same way whether the
+    sequence was stopped by a refusal or by a kill.
+
+    A kill in the FIRST pass keeps the documented answer — judge by where core
+    is — and the test above pins that, because that pass is the resolve and a
+    bound ending it is not a resolver saying no.
+    """
+    venv, guard = _pypi_core_guard(
+        monkeypatch, core_write_pass_hangs=True, core_version="0.51.0",
+    )
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    outcome = guard.resolve(timeout=5)
+
+    assert outcome.unresolved is True
+    assert outcome.repaired is False
+    instruction = outcome.restore_instruction
+    assert "RESTORED, DEPENDENCIES UNRESOLVED" in instruction
+    assert "RESTORE FAILED" not in instruction
+    assert venv.installed[CORE] == "0.52.0"  # pass 1 landed the declared core
+    assert venv.editable.get(CORE) is None
+
+
 def test_a_core_switch_that_stops_at_the_write_pass_is_not_continuable(
     monkeypatch, fake_registry, tmp_path, capsys
 ):

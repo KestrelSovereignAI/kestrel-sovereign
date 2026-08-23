@@ -1137,9 +1137,17 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
         result = None
         commands = _install_commands(pip_args, extra_args, reinstall)
         for index, cmd in enumerate(commands):
-            completed = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
-            )
+            try:
+                completed = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as expired:
+                # A bound raises before the result exists, so the position
+                # would be lost — and with it the only way to know that a kill
+                # in the WRITE pass left an artifact nothing has validated.
+                raise InstallSequenceTimeout(
+                    expired, index=index, total=len(commands),
+                ) from expired
             result = InstallSequenceResult(
                 completed, index=index, total=len(commands),
             )
@@ -1152,6 +1160,22 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
                 os.unlink(constraint_file)
             except OSError:
                 pass
+
+
+class InstallSequenceTimeout(subprocess.TimeoutExpired):
+    """A timed-out install that still knows WHICH pass it was in.
+
+    A subclass so every existing ``except subprocess.TimeoutExpired`` keeps
+    catching it, and so :func:`_killed_process` can rebuild the position the
+    raise would otherwise have thrown away.
+    """
+
+    def __init__(self, expired: subprocess.TimeoutExpired, *, index: int, total: int):
+        super().__init__(
+            expired.cmd, expired.timeout, output=expired.output, stderr=expired.stderr,
+        )
+        self.index = index
+        self.total = total
 
 
 class InstallSequenceResult(subprocess.CompletedProcess):
@@ -1214,18 +1238,30 @@ def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedP
     before the kill, and the only extra fact is WHY that output stops where it
     does. Folding it into a failed :class:`~subprocess.CompletedProcess` with
     that fact in ``stderr`` keeps one shape flowing to the operator.
+
+    The pass POSITION survives when the raise carried it
+    (:class:`InstallSequenceTimeout`), so a kill in the write pass is still
+    read as an artifact nothing has validated. A kill in the FIRST pass keeps
+    the documented answer — judge by where core is — because that pass is the
+    resolve, and this is the one place a killed installer and a refused one
+    differ: the bound ended a process, it did not make a resolver say no.
     """
     def text(stream) -> str:
         if stream is None:
             return ""
         return stream if isinstance(stream, str) else stream.decode(errors="replace")
 
-    return subprocess.CompletedProcess(
+    killed = subprocess.CompletedProcess(
         expired.cmd,
         returncode=1,
         stdout=text(expired.stdout),
         stderr=f"timed out after {expired.timeout}s\n{text(expired.stderr)}".strip(),
     )
+    if isinstance(expired, InstallSequenceTimeout):
+        return InstallSequenceResult(
+            killed, index=expired.index, total=expired.total,
+        )
+    return killed
 
 
 def _core_install_shape():
