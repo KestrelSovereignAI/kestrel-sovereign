@@ -175,8 +175,8 @@ class WaitSignalStore:
         rowcount = await self._db.execute(
             """
             INSERT OR IGNORE INTO wait_signal_state
-                (agent_id, kind, handle, last_signaled_outcome)
-            VALUES (?, ?, ?, ?)
+                (agent_id, kind, handle, last_signaled_outcome, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (self._agent_id, kind, handle, outcome),
         )
@@ -231,8 +231,8 @@ class WaitSignalStore:
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_delivery_attempts,
                      last_delivery_attempt_at, pending_signal_id,
-                     pending_signaled_target, pending_signal_enqueued_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     pending_signaled_target, pending_signal_enqueued_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     self._agent_id,
@@ -336,8 +336,8 @@ class WaitSignalStore:
                 INSERT INTO wait_signal_state
                     (agent_id, kind, handle, last_signaled_outcome,
                      last_delivery_status, last_surface_status,
-                     last_delivery_error, last_delivery_attempt_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     last_delivery_error, last_delivery_attempt_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     self._agent_id,
@@ -393,8 +393,8 @@ class WaitSignalStore:
             await self._db.execute(
                 """
                 INSERT INTO wait_signal_state
-                    (agent_id, kind, handle, watching)
-                VALUES (?, ?, ?, 1)
+                    (agent_id, kind, handle, watching, updated_at)
+                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
                 """,
                 (self._agent_id, kind, handle),
             )
