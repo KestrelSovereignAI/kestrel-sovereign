@@ -1208,13 +1208,14 @@ def test_core_repair_does_not_drag_editable_dependencies_off_their_checkouts(
     )
 
 
-def test_core_repair_recovery_command_carries_both_pip_passes(monkeypatch, capsys):
-    """A pip host's repair is two commands, and the operator gets both.
+def test_core_repair_recovery_command_carries_every_pip_pass(monkeypatch, capsys):
+    """A pip host's repair is three commands, and the operator gets all of them.
 
     pip cannot scope a reinstall, so the repair splits (see
-    `_install_commands`). Printing only the first pass advertises a restore
-    that resolves dependencies and never replaces the link — half a repair,
-    handed over as the whole one.
+    `_install_commands`). Printing a prefix of the passes advertises a restore
+    that stops somewhere in the middle: after pass 1 it resolves dependencies
+    and never replaces the link; after pass 2 it replaces the link and leaves
+    the dependencies of what it just installed unresolved (#3047).
     """
     venv, guard = _pypi_core_guard(monkeypatch, repair_fails=True)
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
@@ -1225,7 +1226,8 @@ def test_core_repair_recovery_command_carries_both_pip_passes(monkeypatch, capsy
     assert (
         f"RESTORE FAILED — run `{py} -m pip install --upgrade "
         f"'{CORE}>=0.52,<0.53' && {py} -m pip install --force-reinstall "
-        f"--no-deps '{CORE}>=0.52,<0.53'` by hand."
+        f"--no-deps '{CORE}>=0.52,<0.53' && {py} -m pip install "
+        f"'{CORE}>=0.52,<0.53'` by hand."
     ) in capsys.readouterr().err
 
 
@@ -1238,8 +1240,9 @@ def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
     resolve has succeeded (`_install_commands`). PowerShell 5.1 has no `&&`,
     but joining with a bare `;` runs pass 2 regardless — so the command handed
     to a Windows operator would install a core whose dependencies the pass
-    before it just refused to resolve. That is the hazard the two-pass split
-    exists to prevent, re-entered through the printed fix.
+    before it just refused to resolve. That is the hazard the split exists to
+    prevent, re-entered through the printed fix. Every following pass is
+    nested, so pass 3 is conditional on pass 2 as well.
     """
     venv, guard = _pypi_core_guard(monkeypatch, repair_fails=True)
     monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
@@ -1254,7 +1257,8 @@ def test_windows_recovery_command_keeps_the_destructive_pass_conditional(
     assert (
         f"RESTORE FAILED — run `{py} -m pip install --upgrade "
         f"'{CORE}>=0.52,<0.53'; if ($?) {{ {py} -m pip install "
-        f"--force-reinstall --no-deps '{CORE}>=0.52,<0.53' }}` in PowerShell "
+        f"--force-reinstall --no-deps '{CORE}>=0.52,<0.53'; if ($?) {{ "
+        f"{py} -m pip install '{CORE}>=0.52,<0.53' }} }}` in PowerShell "
         "by hand."
     ) in capsys.readouterr().err
 
@@ -1500,10 +1504,11 @@ def test_sync_source_switch_keeps_core_on_a_host_without_uv(
 ):
     """pip has no `--reinstall-package`, and the protection is not dropped there.
 
-    The switch becomes two passes, in this order: a non-forcing `--upgrade`
+    The switch becomes three passes, in this order: a non-forcing `--upgrade`
     that resolves the requested version's dependencies (so an editable core it
-    still satisfies keeps its link), then a `--no-deps` force that replaces the
-    package itself and can reach no dependency at all.
+    still satisfies keeps its link), a `--no-deps` force that replaces the
+    package itself and can reach no dependency at all, then a plain install
+    that resolves around the artifact which actually landed (#3047).
     """
     venv = _editable_voice()
     use_fake_uv(monkeypatch, venv)
@@ -1519,15 +1524,127 @@ def test_sync_source_switch_keeps_core_on_a_host_without_uv(
     assert [c[:4] for c in venv.commands] == [
         [sys.executable, "-m", "pip", "install"],
         [sys.executable, "-m", "pip", "install"],
+        [sys.executable, "-m", "pip", "install"],
     ]
     # Resolve first, and it forces nothing...
     assert "--upgrade" in venv.commands[0]
     assert "--force-reinstall" not in venv.commands[0]
-    # ...then replace, reaching nothing but the package itself.
+    # ...then replace, reaching nothing but the package itself...
     assert "--force-reinstall" in venv.commands[1] and "--no-deps" in venv.commands[1]
-    # The pin still travels on both passes — bounding the version is still the
+    # ...then resolve again, forcing nothing and excluding nothing, so the
+    # dependencies of the artifact just installed are the ones checked.
+    assert "--force-reinstall" not in venv.commands[2]
+    assert "--no-deps" not in venv.commands[2]
+    assert "--upgrade" not in venv.commands[2]
+    # The pin still travels on every pass — bounding the version is still the
     # other half of the guard.
-    assert venv.pins == ["==0.52.0", "==0.52.0"]
+    assert venv.pins == ["==0.52.0", "==0.52.0", "==0.52.0"]
+
+
+# --- a switch must resolve the artifact it installs, not the one it replaces
+# --- (#3047)
+#
+# pip builds its candidate for a name requirement from the INSTALLED
+# distribution whenever that distribution already satisfies the spec. So on a
+# same-version switch — the case the `--no-deps` pass exists for — pass 1 reads
+# the checkout build's metadata and pass 2 writes the index wheel without
+# resolving anything. Two artifacts at one version may declare different
+# dependencies, and then nothing has checked the ones that landed.
+
+def _same_version_switch(**kw):
+    """An editable `voice` whose index wheel is the SAME version, and stricter.
+
+    `feature_installed_requires` is what the checkout build on disk declares
+    (satisfied by the installed core, so pass 1 has nothing to complain about);
+    `feature_requires` is what the wheel the switch installs declares, and the
+    core pin forbids it. The version pin is what makes the two visible as
+    different artifacts rather than as an upgrade.
+    """
+    venv = FakeUv(
+        feature_version="0.3.1",
+        feature_installed_requires=">=0.52",
+        **{"feature_requires": ">=0.53", **kw},
+    )
+    venv.installed["kestrel-feature-voice"] = "0.3.1"
+    venv.editable["kestrel-feature-voice"] = "/src/voice"
+    return venv
+
+
+def test_pip_switch_reports_a_requirement_only_the_new_artifact_declares(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The wheel's own dependencies are resolved, and refused when they cannot be.
+
+    Without the third pass this install exits 0: pass 1 reads `>=0.52` off the
+    checkout build and is satisfied, pass 2 writes the wheel with `--no-deps`,
+    and the wheel's `>=0.53` is never asked of anything. The host is then
+    holding a feature whose core requirement its core does not meet, reported
+    as a clean install.
+    """
+    venv = _same_version_switch()
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "FAILED" in captured.out
+    # The refusal names the requirement that could not be met, not a generic
+    # install error — an operator has to be able to see WHICH pin bit.
+    assert f"{CORE}>=0.53" in captured.out + captured.err
+    # All three passes ran, and it is the third that refused: the first two
+    # cannot see this at all.
+    assert len(venv.commands) == 3
+    assert "--no-deps" not in venv.commands[2]
+    # Core is untouched throughout — this is a dependency refusal, not a swap.
+    assert venv.editable[CORE] == CHECKOUT
+    assert venv.installed[CORE] == "0.52.0"
+
+
+def test_pip_switch_still_succeeds_when_the_new_artifact_is_satisfiable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Fidelity check: the third pass refuses a real skew, not every switch.
+
+    Same shape as the test above with one thing changed — the wheel's
+    requirement is one the installed core meets — so a failure there cannot be
+    the third pass simply rejecting whatever it is handed.
+    """
+    venv = _same_version_switch(feature_requires=">=0.52")
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 0
+    assert len(venv.commands) == 3
+    assert "kestrel-feature-voice" not in venv.editable  # the switch happened
+    assert venv.editable[CORE] == CHECKOUT
+    assert "FAILED" not in capsys.readouterr().out
+
+
+def test_uv_switch_resolves_the_new_artifact_in_its_single_command(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """uv never had this gap, and must not be made to pay for pip's.
+
+    `--reinstall-package` scopes the reinstall WITHOUT giving up resolution, so
+    the one command uv runs already builds its candidate from the index
+    artifact. The same skew is refused in a single pass — and, unlike pip's,
+    refused before anything is written.
+    """
+    venv = _same_version_switch()
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_args(_switch_voice_to_pypi(tmp_path)))
+
+    assert rc == 1
+    assert len(venv.commands) == 1
+    assert venv.commands[0][:3] == ["uv", "pip", "install"]
+    assert f"{CORE}>=0.53" in capsys.readouterr().out
+    assert venv.editable["kestrel-feature-voice"] == "/src/voice"  # nothing moved
+    assert venv.editable[CORE] == CHECKOUT
 
 
 def test_sync_pip_source_switch_fails_before_replacing_the_feature(

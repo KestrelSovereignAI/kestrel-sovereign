@@ -875,14 +875,37 @@ def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
          one that was working. Non-forcing, so a satisfying editable core keeps
          its link.
       2. ``--force-reinstall --no-deps`` replaces the package itself and only
-         it. This is the destructive pass, and it runs last: after the resolve
-         it depends on has already succeeded. It is needed because pass 1 is a
+         it. This is the destructive pass, and it runs after the resolve it
+         depends on has already succeeded. It is needed because pass 1 is a
          no-op when the index publishes the same version the checkout builds —
          the case that motivated all of this.
+      3. A plain install — the very command a non-switch install runs — so the
+         environment is resolved around the artifact that ACTUALLY landed.
 
-      Running those two the other way round is a bug, not a style choice: the
+      Running 1 and 2 the other way round is a bug, not a style choice: the
       wheel lands, the dependency resolve then fails, and the caller reports a
       failure over an environment it has already changed.
+
+    Pass 3 is there because pass 1 does not resolve the artifact pass 2
+    installs. pip builds its candidate for a *name* requirement from the
+    installed distribution whenever that distribution already satisfies the
+    spec, so in the no-op case pass 1 reads the metadata of the copy on disk —
+    the checkout build — and pass 2 then writes the index artifact with
+    ``--no-deps``. Two artifacts at one version are not obliged to declare the
+    same dependencies (an extra, a raised floor, a dependency added after the
+    tag), so without pass 3 the environment is left holding a distribution
+    whose dependency set was validated by NEITHER pass (issue #3047).
+
+    Pass 3 resolves because by then the index artifact IS the installed one, so
+    the candidate pip builds carries its metadata. It can only run after pass 2,
+    and that is the honest cost: a requirement only the new artifact declares is
+    refused with the switch already made. Moving that check ahead of pass 2
+    would mean resolving the index artifact without installing it — which needs
+    the resolver to ignore what is installed, and then core has to come from the
+    index too. An editable core builds a version the index may never have
+    published, so that resolve would refuse every install on a dev host. A late
+    honest failure beats an early false one; the earlier check is still there in
+    pass 1 for every case where pip can make it.
     """
     extra = list(extra_args)
     if not reinstall:
@@ -894,6 +917,7 @@ def _install_commands(pip_args: list, extra_args=(), reinstall=None) -> list:
     return [
         _install_backend_argv(pip_args, [*extra, "--upgrade"]),
         _install_backend_argv(pip_args, [*extra, "--force-reinstall", "--no-deps"]),
+        _install_backend_argv(pip_args, extra),
     ]
 
 
@@ -961,9 +985,9 @@ def _render_commands(argvs: list) -> str:
     """Render a whole install SEQUENCE as one line the operator's shell runs.
 
     A single command renders exactly as :func:`_render_command` — the common
-    case, and the only one on a uv host. A pip source switch is two passes
-    (see :func:`_install_commands`) and both have to reach the operator:
-    printing only the first advertises a repair that does half the job.
+    case, and the only one on a uv host. A pip source switch is three passes
+    (see :func:`_install_commands`) and every one has to reach the operator:
+    printing a prefix of them advertises a repair that does part of the job.
 
     The ORDER is the protection (:func:`_install_commands`), so the rendered
     line has to carry it: pass 2 replaces the package with ``--no-deps`` and is
