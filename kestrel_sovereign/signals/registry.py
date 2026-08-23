@@ -323,7 +323,14 @@ class SourceRegistry:
             # claim for the CALLER: it now depends on this source and must keep
             # it alive until it lets go. Recording that is what stops the first
             # holder's teardown pulling the source out from under the second.
-            self._claim(registration.name, owner)
+            #
+            # Only for a NAMED owner. "No owner supplied" is not "the host owns
+            # this" — the imperative path registers ownerless and claims a
+            # moment later, so a repeated `initialize()` would otherwise staple
+            # a permanent host claim onto a feature's own source and strand its
+            # handlers forever.
+            if owner is not None:
+                self._claim(registration.name, owner)
             return RegistrationOutcome(
                 registration.name, RegistrationState.ALREADY_EQUIVALENT
             )
@@ -363,6 +370,7 @@ class SourceRegistry:
         """
         outcomes: list[RegistrationOutcome] = []
         newly_added: list[str] = []
+        claimed: list[str] = []
         try:
             for registration in registrations:
                 outcome = self.register_with_policy(
@@ -371,9 +379,17 @@ class SourceRegistry:
                 outcomes.append(outcome)
                 if outcome.state is RegistrationState.REGISTERED:
                     newly_added.append(outcome.name)
+                if owner is not None and outcome.ok:
+                    claimed.append(outcome.name)
         except RegistrationError:
+            for name in claimed:
+                self.release(name, owner)
+            # Atomic means the CLAIMS unwind too. Leaving them behind kept a
+            # failed owner referenced, and its stale claim could later hold an
+            # incumbent alive that nothing was using.
             for name in newly_added:
                 self._sources.pop(name, None)
+                self._claims.pop(name, None)
             raise
         return outcomes
 

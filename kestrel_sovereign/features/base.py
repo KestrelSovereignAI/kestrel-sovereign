@@ -395,11 +395,20 @@ class Feature(_SdkFeature):
             RegistrationState = None  # type: ignore[assignment]
 
         registry = getattr(getattr(self, "agent", None), "signal_registry", None)
-        if registry is None or not hasattr(registry, "adopt"):
-            # An embedder registry without the ownership API: nothing to record,
-            # and inventing a private list here is what created the second
-            # ledger in the first place (#3053).
+        if registry is None:
             return
+        # A registry that cannot hold claims still has to be cleaned up, and
+        # nothing else can know what this feature created — so for that case
+        # ONLY, the names are tracked here. This is not the second ledger #3053
+        # removed: there is still exactly one record per registry, and which one
+        # is decided by what the registry can actually do.
+        fallback = not hasattr(registry, "adopt")
+        owned = None
+        if fallback:
+            owned = getattr(self, "_owned_signal_source_names", None)
+            if owned is None:
+                owned = []
+                self._owned_signal_source_names = owned
 
         items = result if isinstance(result, (list, tuple, set)) else [result]
         for item in items:
@@ -420,7 +429,15 @@ class Feature(_SdkFeature):
                     # feature's to remove — it claims ALONGSIDE the holder.
                     name = item.name
                     created = False
-            if name:
+            if not name:
+                continue
+            if fallback:
+                # Only what this feature CREATED: an equivalent incumbent is a
+                # host's or a peer's, and this path has no claims to express
+                # shared use, so it must not remove it.
+                if created and name not in owned:
+                    owned.append(name)
+            else:
                 registry.adopt(name, self, created=created)
 
     async def _unregister_owned_signal_sources(self) -> None:
@@ -430,7 +447,23 @@ class Feature(_SdkFeature):
         benign no-op, so repeated shutdowns are safe.
         """
         registry = getattr(getattr(self, "agent", None), "signal_registry", None)
-        if registry is None or not hasattr(registry, "release_all"):
+        if registry is None:
+            return
+        if not hasattr(registry, "release_all"):
+            # Registry without the ownership API: fall back to removing exactly
+            # the names recorded for it. Best-effort and idempotent.
+            for name in getattr(self, "_owned_signal_source_names", None) or ():
+                try:
+                    registry.unregister(name)
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        "feature '%s': could not unregister signal source "
+                        "'%s': %s",
+                        getattr(self, "name", type(self).__name__),
+                        name,
+                        exc,
+                    )
+            self._owned_signal_source_names = []
             return
         try:
             # Release what this feature HOLDS. The registry removes each source

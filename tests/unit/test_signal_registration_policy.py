@@ -413,3 +413,84 @@ def test_workflow_rescue_helper_is_idempotent_when_equivalent():
     reg = SourceRegistry()
     assert set(register_workflow_rescue_sources(reg)) == set(RESCUE_SOURCE_NAMES)
     assert register_workflow_rescue_sources(reg) == []
+
+
+# ---------------------------------------------------------------------------
+# Ownership claims (issue #3053)
+# ---------------------------------------------------------------------------
+
+
+def _owner_test_source(name="own.test"):
+    from kestrel_sdk.signals import RedactionPolicy, SignalMode, SourceRegistration, Trust
+
+    async def handle(payload):
+        return payload
+
+    return SourceRegistration(
+        name=name, schema=dict, default_mode=SignalMode.ACTION,
+        allowed_modes=frozenset({SignalMode.ACTION}), handler=handle,
+        trust=Trust.TRUSTED, log_redaction=RedactionPolicy(summarize=lambda p: ""),
+    )
+
+
+def test_an_ownerless_re_registration_does_not_pin_a_feature_owned_source():
+    """"No owner supplied" is not "the host owns this".
+
+    The imperative path registers ownerless and claims a moment later, so a
+    repeated `initialize()` would staple a permanent host claim onto a
+    feature's own source — releasing every real owner would then never remove
+    it and the disabled feature's handler stayed registered forever.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source()
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    # A second, ownerless idempotent registration — the repeated initialize().
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL)
+
+    assert registry.owners_of(source.name) == (feature,)
+    assert registry.release(source.name, feature) is True
+    assert registry.get(source.name) is None
+
+
+def test_a_failed_owner_scoped_batch_unwinds_its_claims():
+    """Atomic means the CLAIMS unwind too, not just the newly-added sources.
+
+    The case that matters is a claim on an INCUMBENT: an equivalent
+    registration claims a source the batch did not create, so the
+    newly-added rollback cannot reach it. A failed owner left holding it
+    would keep that source alive forever.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    owner = object()
+
+    # An incumbent the batch will ride (equivalent), and a clash that raises.
+    shared = _owner_test_source("batch.shared")
+    registry.register(shared)
+    clash_incumbent = _owner_test_source("batch.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY, owner=owner
+        )
+
+    # The incumbent survives and the failed owner does NOT hold it.
+    assert registry.get("batch.shared") is shared
+    assert owner not in registry.owners_of("batch.shared")
+    assert registry.get("batch.clash") is clash_incumbent
