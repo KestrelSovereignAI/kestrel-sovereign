@@ -5,6 +5,7 @@ belongs to an independently installed coding feature or another orchestrator.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.strategic_memory.github_integration import (
@@ -13,6 +14,10 @@ from kestrel_sovereign.features.strategic_memory.github_integration import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``owner/name`` in GitHub's allowed character set. A reference prefix that
+#: does not match this is prose, not a repository.
+_REPO_SHAPE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
 
 def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
@@ -35,7 +40,13 @@ def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
     if "#" in text:
         head, _, tail = text.partition("#")
         head = head.strip().strip("/")
-        if head:
+        # Only an owner/repo shape names a repository. Treating ANY non-empty
+        # prefix as one turned "Issue #123" and "see FIXME #7" into the repos
+        # "Issue" and "see FIXME", which pick_top_issue would then dispatch
+        # against — and, because it returns on the first candidate, a
+        # handwritten reference like that masked every valid blocker behind it.
+        # This closed one wrong-repository path by opening another.
+        if _REPO_SHAPE.fullmatch(head):
             repo = head
         text = tail.strip()
     text = text.lstrip("#").strip()
