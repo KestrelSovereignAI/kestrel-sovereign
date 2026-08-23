@@ -109,8 +109,8 @@ class PendingA2AQuestionStore:
             """
             INSERT OR IGNORE INTO pending_a2a_questions
                 (agent_id, task_id, recipient, recipient_agent_id, original_question,
-                 origin_turn_id, origin_session_id, deadline, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WAITING')
+                 origin_turn_id, origin_session_id, deadline, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WAITING', CURRENT_TIMESTAMP)
             """,
             (
                 self._agent_id,

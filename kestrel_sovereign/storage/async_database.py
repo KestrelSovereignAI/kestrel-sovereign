@@ -1755,13 +1755,14 @@ class AsyncDatabase:
         """Record that the named one-time backfill has completed. Idempotent."""
         if self.backend_type == "postgres":
             await self._backend.execute(
-                "INSERT INTO schema_backfills (name) VALUES (?) "
-                "ON CONFLICT DO NOTHING",
+                "INSERT INTO schema_backfills (name, completed_at) "
+                "VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING",
                 (name,),
             )
         else:
             await self._backend.execute(
-                "INSERT OR IGNORE INTO schema_backfills (name) VALUES (?)",
+                "INSERT OR IGNORE INTO schema_backfills (name, completed_at) "
+                "VALUES (?, CURRENT_TIMESTAMP)",
                 (name,),
             )
 
