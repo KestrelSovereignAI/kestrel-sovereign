@@ -3029,3 +3029,86 @@ def test_arbitrary_equality_matches_a_parseable_but_noncanonical_version(
     use_fake_uv(monkeypatch, venv)
 
     assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_a_core_with_extras_still_has_its_closure_checked(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Declared extras already chose `ensure`, and that hid the question.
+
+    Asking only under `present` meant a core entry with extras never computed
+    its unmet closure — so a failed install of an unloadable core came back as
+    an ordinary package failure, which `--continue-on-error` waves through.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\nextras = ["local"]\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    venv.editable.pop(CORE, None)                 # core is the declared wheel
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    assert cli.cmd_feature_sync(_args(manifest)) == CORE_UNRESOLVED
+
+
+def test_a_requirement_line_that_cannot_be_parsed_is_uncertain_not_absent(
+    monkeypatch
+):
+    """"Unknown" is not "satisfied".
+
+    A partially written METADATA has a closure nobody can evaluate, and
+    skipping the line converts that into a clean bill of health for a package
+    whose version and source still read fine.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["this is not a requirement"]
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+
+    assert len(unmet) == 1
+    assert unmet[0].certain is False
+    assert "cannot be read" in unmet[0].detail
+
+
+def test_a_closure_the_failed_install_repaired_does_not_block_the_restart(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """Installers are not transactional, so the pre-install answer goes stale.
+
+    The run can install the missing dependency and then fail on something else.
+    Classifying that from the answer taken BEFORE the install blocks a restart
+    over a closure that now conforms — the false refusal this check was scoped
+    to avoid.
+    """
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    venv.editable.pop(CORE, None)
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    real_install_core = cli_features.CoreInstallGuard.install_core
+
+    def install_core(self, pip_args, **kw):
+        # The install fixes the dependency and then fails for its own reason.
+        venv.installed["kestrel-sovereign-sdk"] = "0.99.0"
+        return real_install_core(self, pip_args, **kw)
+
+    monkeypatch.setattr(cli_features.CoreInstallGuard, "install_core", install_core)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    # Still an error — the install failed — but a CONTINUABLE one, because the
+    # thing this check exists to refuse is no longer true.
+    assert rc == 1

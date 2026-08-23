@@ -636,7 +636,17 @@ def unsatisfied_requirements(
     for raw in requires(dist_name) or ():
         try:
             req = Requirement(raw)
-        except Exception:  # noqa: BLE001 - unparseable metadata tells us nothing
+        except Exception as exc:  # noqa: BLE001 - unparseable, not absent
+            # "Unknown" is not "satisfied". A partially written METADATA has a
+            # closure nobody can evaluate, and skipping the line converts that
+            # into a clean bill of health for a package whose version and
+            # source still read fine.
+            unmet.append(UnmetRequirement(
+                "",
+                f"{dist_name} declares a requirement that cannot be read "
+                f"({raw!r}: {exc})",
+                certain=False,
+            ))
             continue
         if not requirement_applies(req, extras):
             continue

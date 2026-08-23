@@ -1976,7 +1976,7 @@ def _version_satisfies(version: str, spec: str) -> bool:
 
 
 def _resolve_manifest_action(entry: dict, registry: dict):
-    """Resolve a manifest entry to ``(target, current, action, unmet)``.
+    """Resolve a manifest entry to ``(target_package, current_version, action)``.
 
     ``action`` is exactly what ``kestrel feature sync`` would do:
     ``install`` (not present), ``reinstall`` (editable path mismatch, or a
@@ -2033,8 +2033,7 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         action = "ensure"
     else:
         action = "present"
-    unmet = _unsatisfied_requirements(target, extras) if action == "present" else ()
-    if unmet:
+    if action == "present" and _unsatisfied_requirements(target, extras):
         # `present` is a claim about the VENV, and source+version answers only
         # half of it: this copy is the declared version from the declared
         # source AND cannot load, because something it declares is missing or
@@ -2046,11 +2045,11 @@ def _resolve_manifest_action(entry: dict, registry: dict):
         # needs forcing. What is missing is a resolve, and an ordinary install
         # is exactly that.
         action = "ensure"
-    # WHY it was demoted travels with the action. The caller has to tell a
-    # failed resolve of a package whose dependencies were already known unmet
-    # from an ordinary failed install — for core they are different exit codes,
-    # and only one of them may be continued past (#3080).
-    return target, current, action, unmet
+    # The demotion is not reported back. The caller that needs to know whether
+    # a package's dependencies resolve asks at the moment it needs the answer
+    # — installers are not transactional, so an answer taken here has already
+    # gone stale by the time an install has failed (#3080).
+    return target, current, action
 
 
 def _core_entry_first(entries: list, registry: dict) -> list:
@@ -2131,7 +2130,7 @@ def cmd_feature_sync(args) -> int:
     core_state = 0
     installed = 0
     for entry in entries:
-        target, current, action, unmet = _resolve_manifest_action(entry, registry)
+        target, current, action = _resolve_manifest_action(entry, registry)
         extras = entry["extras"]
         editable_want = entry["editable"]
         pypi_want = entry.get("pypi")
@@ -2275,11 +2274,17 @@ def cmd_feature_sync(args) -> int:
             if is_core and guard.conforms_now() and (
                 getattr(result, "resolve_incomplete", False)
                 # A single-command install has no incomplete SEQUENCE — but
-                # when this entry was demoted out of `present` because core's
-                # dependencies were already unmet, a failed resolve here is the
-                # same state by a different route, and `resolve_incomplete`
-                # was derived for the three-pass switch alone (#3080).
-                or bool(unmet)
+                # when core's dependencies were already unmet, a failed resolve
+                # here is the same state by a different route, and
+                # `resolve_incomplete` was derived for the three-pass switch
+                # alone (#3080).
+                #
+                # RE-READ rather than reusing the pre-install answer: installers
+                # are not transactional, so this run may have installed the
+                # missing dependency and then failed on something else. Blocking
+                # a restart over a closure that now conforms is the false
+                # refusal this check was scoped to avoid.
+                or bool(_unsatisfied_requirements(target, extras))
             ):
                 # Core reached its declared source and version — so
                 # `conforms_now()` is True and says nothing about whether the
@@ -2418,7 +2423,7 @@ def cmd_feature_status(args) -> int:
     targets = []
     for entry in entries:
         info = _registry_info_for(entry["name"], registry)
-        target, current, action, unmet = _resolve_manifest_action(entry, registry)
+        target, current, action = _resolve_manifest_action(entry, registry)
         if target == CORE_DISTRIBUTION:
             # A `kestrel-sovereign` manifest entry (written by `sync --capture`
             # since #2949) declares where CORE comes from. It is a source
