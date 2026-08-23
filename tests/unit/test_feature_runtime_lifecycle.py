@@ -1233,16 +1233,26 @@ class _HalfRoleAwareRegistry(_RolelessClaimsRegistry):
     """Role-aware for one source, pre-role for a batch.
 
     The shape a subclass takes when it inherits the new single-source method
-    and keeps its own `register_batch` override. Checking either method alone
-    passed it, and Scheduler — which registers its cron sources as a BATCH —
-    then raised TypeError inside `initialize()`.
+    and keeps its own `register_batch` override. Scheduler registers its cron
+    sources as a BATCH, so passing `role=` to it raises TypeError inside
+    `initialize()` — and refusing the whole registry over that pushes it onto
+    the name path it does not need. It keeps its claims and registers one at a
+    time instead.
     """
 
+    def __init__(self):
+        super().__init__()
+        self.claimed = []
+
     def register_with_policy(self, registration, policy, *, owner=None, role=None):
-        return super().register_with_policy(registration, policy)
+        outcome = super().register_with_policy(registration, policy)
+        self.claimed.append((registration.name, owner, role))
+        return outcome
 
     def register_batch(self, registrations, policy, *, owner=None):
-        return [self.register_with_policy(r, policy) for r in registrations]
+        raise AssertionError(
+            "a batch that cannot take the role must not be used for a claim"
+        )
 
 
 class _ForwardingProxyRegistry:
@@ -1270,21 +1280,25 @@ class _ForwardingProxyRegistry:
         return self._inner.release(*args, **kwargs)
 
 
-async def test_a_registry_role_aware_in_only_one_method_falls_back():
-    """The question covers BOTH registering calls, because both get used.
+async def test_a_batch_that_cannot_take_the_role_is_not_used_for_a_claim():
+    """The batch is an optimisation, not a capability.
 
-    A single source goes through `register_with_policy` and several go through
-    `register_batch`. A registry that is role-aware in one and not the other
-    passed a check of either alone and then raised inside `initialize()`.
+    A registry whose batch predates the role can still hold claims one source
+    at a time. Passing `role=` to that batch raises inside `initialize()`;
+    refusing the registry over it pushes a claims-capable registry onto the
+    name path, whose teardown removes by name and cannot see a peer's claim.
+    Neither is necessary — register one at a time and keep the claims.
+
+    Atomicity is what that costs, and it costs nothing here: every imperative
+    site registers OPTIONAL, where each source is independent by definition.
     """
+    from kestrel_sovereign.signals import CLAIM_IMPERATIVE, RegistrationPolicy
+
     registry = _HalfRoleAwareRegistry()
     feature = _seam_feature(registry)
 
-    assert feature._registry_holds_claims(registry) is False
+    assert feature._registry_holds_claims(registry) is True
 
-    from kestrel_sovereign.signals import RegistrationPolicy
-
-    # The batch call is the one that used to raise. It must simply work.
     feature._register_signal_sources(
         [
             _fake_source_registration("seam.half.one"),
@@ -1292,7 +1306,13 @@ async def test_a_registry_role_aware_in_only_one_method_falls_back():
         ],
         RegistrationPolicy.OPTIONAL,
     )
+
     assert set(registry.sources) == {"seam.half.one", "seam.half.two"}
+    # Claimed as this feature, in the imperative role, one call each.
+    assert registry.claimed == [
+        ("seam.half.one", feature, CLAIM_IMPERATIVE),
+        ("seam.half.two", feature, CLAIM_IMPERATIVE),
+    ]
 
 
 async def test_a_forwarding_proxy_keeps_the_claims_path():
@@ -1323,3 +1343,56 @@ async def test_a_forwarding_proxy_keeps_the_claims_path():
     # The peer still holds it, so it survives the rider going away.
     assert inner.get("seam.proxy") is not None
     assert inner.owners_of("seam.proxy") == (incumbent,)
+
+
+class _NoBatchClaimsRegistry(_RolelessClaimsRegistry):
+    """Role-aware, with release APIs, and no `register_batch` at all.
+
+    A valid embedder shape for a feature that registers one source at a time.
+    Requiring a batch method refused it over a call it never makes.
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self._inner = inner
+
+    def register_with_policy(self, registration, policy, *, owner=None, role=None):
+        return self._inner.register_with_policy(
+            registration, policy, owner=owner, role=role,
+        )
+
+    def release_all(self, owner, role=None):
+        return self._inner.release_all(owner, role)
+
+    def release(self, name, owner, role=None):
+        return self._inner.release(name, owner, role)
+
+
+async def test_a_registry_without_a_batch_method_still_holds_claims():
+    """No batch is not "no claims".
+
+    Refusing such a registry pushed it onto the name path, where the creator's
+    shutdown removes by name — deleting a source a peer that rode it is still
+    dispatching on.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    inner = SourceRegistry()
+    registry = _NoBatchClaimsRegistry(inner)
+    incumbent = _seam_feature(registry)
+    rider = _seam_feature(registry)
+
+    assert rider._registry_holds_claims(registry) is True
+
+    incumbent._register_signal_sources(
+        _fake_source_registration("seam.nobatch"), RegistrationPolicy.OPTIONAL,
+    )
+    rider._register_signal_sources(
+        _fake_source_registration("seam.nobatch"), RegistrationPolicy.OPTIONAL,
+    )
+
+    await incumbent._unregister_owned_signal_sources()
+
+    # The rider still holds it, so the creator's teardown does not take it.
+    assert inner.get("seam.nobatch") is not None
+    assert inner.owners_of("seam.nobatch") == (rider,)

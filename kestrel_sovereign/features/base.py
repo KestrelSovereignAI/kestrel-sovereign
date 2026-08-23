@@ -382,12 +382,14 @@ class Feature(_SdkFeature):
         registry takes the name-tracking path instead — no claims, but correct
         teardown, which is the half that cannot be skipped.
 
-        BOTH registering methods are checked, because both are used: a single
-        source goes through ``register_with_policy`` and several go through
-        ``register_batch`` (atomically). A registry that inherits one and
-        overrides the other passed a check of either alone, and then raised
-        ``TypeError`` on the call it had not been checked for — inside
-        ``initialize()``.
+        Asked about ``register_with_policy``, the call every registration can
+        be expressed as. ``register_batch`` is asked about SEPARATELY, at the
+        point of use (:meth:`_register_signal_sources`), because it is an
+        optimisation rather than a capability: a registry that cannot take the
+        role in its batch — or has no batch at all — can still hold claims
+        perfectly well one source at a time. Requiring both here refused a
+        registry over a method it did not need, and pushed it onto the name
+        path, whose teardown removes by name and cannot see a peer's claim.
 
         A method taking ``**kwargs`` counts. That is the forwarding-proxy
         shape, and refusing it would push a proxy onto the name path, whose
@@ -406,20 +408,28 @@ class Feature(_SdkFeature):
         """
         if not hasattr(registry, "release_all"):
             return False
-        for name in ("register_with_policy", "register_batch"):
-            method = getattr(registry, name, None)
-            if not callable(method):
-                return False
-            try:
-                parameters = inspect.signature(method).parameters
-            except (TypeError, ValueError):  # a C callable, or an odd wrapper
-                return False
-            takes_kwargs = any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-            )
-            if "role" not in parameters and not takes_kwargs:
-                return False
-        return True
+        return Feature._takes_claim_role(
+            getattr(registry, "register_with_policy", None)
+        )
+
+    @staticmethod
+    def _takes_claim_role(method) -> bool:
+        """Can *method* be told which role a claim is held in?
+
+        ``**kwargs`` counts — see :meth:`_registry_holds_claims` for why that
+        is the direction to err in.
+        """
+        if not callable(method):
+            return False
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):  # a C callable, or an odd wrapper
+            return False
+        if "role" in parameters:
+            return True
+        return any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
 
     def _register_signal_sources(self, registrations, policy):
         """Register signal sources AS THIS FEATURE; return the outcomes.
@@ -468,7 +478,16 @@ class Feature(_SdkFeature):
             owner_kw = {"owner": self, "role": CLAIM_IMPERATIVE}
         batch = getattr(registry, "register_batch", None)
         register = getattr(registry, "register_with_policy", None)
-        if len(items) > 1 and callable(batch):
+        # The batch is asked about HERE, not in the capability question, because
+        # it is an optimisation and not a capability: a registry with no batch,
+        # or one that cannot take the role in it, still holds claims perfectly
+        # well one source at a time. What it costs is atomicity, which matters
+        # only under the raising policies — every imperative site registers
+        # OPTIONAL, where each source is independent by definition.
+        usable_batch = callable(batch) and (
+            not claims or self._takes_claim_role(batch)
+        )
+        if len(items) > 1 and usable_batch:
             # Several sources go through `register_batch` because it is ATOMIC
             # under the raising policies: registering them one at a time would
             # leave a half-registered set behind on the failure the batch exists
