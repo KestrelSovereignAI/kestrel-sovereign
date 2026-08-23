@@ -1104,6 +1104,26 @@ def _extension_install_run(pip_args: list, *, constraints, reinstall=None, timeo
                 pass
 
 
+def _resolve_was_refused(result) -> bool:
+    """Did a pass that RESOLVES dependencies run and refuse?
+
+    A different question from "did the installer exit nonzero", and the reason
+    it has to be asked separately: a pip install sequence ends with a resolving
+    pass (:func:`_install_commands`), so its exit code now carries a fact that
+    re-reading core cannot see — whether the dependencies of what landed have a
+    solution.
+
+    ``--no-deps`` passes resolve nothing, so their exit code says nothing about
+    dependencies; that is the pass whose late failure re-reading core was
+    always the right answer for. A pass that was KILLED reached no verdict
+    either, and callers must not pass a killed process here — a bound ends a
+    process, it does not make the resolver say no.
+    """
+    if result is None or result.returncode == 0:
+        return False
+    return "--no-deps" not in (result.args or ())
+
+
 def _killed_process(expired: subprocess.TimeoutExpired) -> subprocess.CompletedProcess:
     """A timed-out install, shaped like the result its callers already read.
 
@@ -1164,6 +1184,12 @@ class CoreGuardOutcome:
     # and "we did not try" are different facts and must not print the same
     # sentence (issue #2962).
     attempted: bool = True
+    # Core IS back from its declared source, but the pass that resolves its
+    # dependencies refused. Not a failed restore — saying so would send the
+    # operator to redo an install that happened — and not a success either: the
+    # host cannot load what it just installed. A third sentence, because it is
+    # a third fact (issue #3047).
+    unresolved: bool = False
     command: Optional[str] = None
     # Which shell ``command`` is quoted for, captured with it (see
     # :func:`_render_shell`). ``None`` where the platform has only one answer.
@@ -1210,6 +1236,16 @@ class CoreGuardOutcome:
                 "no command that could put it back. See the detail above."
             )
         where = f" in {self.shell}" if self.shell else ""
+        if self.unresolved:
+            # The restore worked. What failed is the resolve after it, so the
+            # operator has to fix the conflict FIRST — re-running the command
+            # before that changes nothing and reads as the command being wrong.
+            return (
+                f"RESTORED, DEPENDENCIES UNRESOLVED — {CORE_DISTRIBUTION} is "
+                "back from its declared source, but resolving its dependencies "
+                f"was refused. Fix the conflict below, then run `{self.command}`"
+                f"{where} by hand."
+            )
         if not self.attempted:
             # Nothing was tried, so nothing failed. Saying RESTORE FAILED here
             # would report an attempt that never happened, and an operator who
@@ -1608,12 +1644,23 @@ class CoreInstallGuard:
             )
         except subprocess.TimeoutExpired as expired:
             result = _killed_process(expired)
-        ok = self._check() is None
-        if ok:
+            killed = True
+        else:
+            killed = False
+        restored = self._check() is None
+        # Two independent facts, so two variables: WHERE core is, and whether
+        # the dependencies of what landed have a solution. Re-reading core
+        # answers the first and cannot answer the second, and a repair whose
+        # final resolving pass refused leaves a host that is off neither its
+        # declared source nor able to load — reporting it by core's location
+        # alone downgrades the stronger fact to the weaker one.
+        unresolved = restored and not killed and _resolve_was_refused(result)
+        ok = restored and not unresolved
+        if restored:
             # Core is where the policy wants it: that is the state this batch
             # now measures later drift against.
             self.refresh()
-        return ok, rendered, shell, result
+        return ok, rendered, shell, result, unresolved
 
     def resolve(self, *, timeout=None) -> CoreGuardOutcome:
         """Check core against the policy, and repair it if it drifted.
@@ -1654,11 +1701,12 @@ class CoreInstallGuard:
         if not self.policy.source_is_verifiable:
             return self._unrestorable(drift, replaced)
 
-        repaired, rendered, shell, result = self._repair(timeout=timeout)
+        repaired, rendered, shell, result, unresolved = self._repair(timeout=timeout)
         return CoreGuardOutcome(
             drift=drift,
             replaced=replaced,
             repaired=repaired,
+            unresolved=unresolved,
             command=rendered,
             shell=shell,
             output="" if repaired else (result.stderr or result.stdout or "").strip(),

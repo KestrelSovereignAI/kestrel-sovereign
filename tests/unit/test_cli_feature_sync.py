@@ -1302,6 +1302,66 @@ def test_a_repair_whose_last_pass_failed_is_still_judged_by_where_core_is(
     assert "RESTORE FAILED" not in err
     assert len(venv.commands) == 2  # both passes ran...
     assert venv.editable.get(CORE) is None  # ...and core is the declared wheel
+
+
+def test_a_repair_whose_dependency_resolve_refused_is_not_reported_as_clean(
+    monkeypatch, capsys
+):
+    """The mirror of the test above: core home, and still not a finished repair.
+
+    The last pass of a pip install is now the one that RESOLVES the
+    dependencies of the artifact the `--no-deps` pass installed (#3047), so its
+    exit code carries a fact re-reading core cannot see. Judging this repair by
+    core's location alone reports success over a host that cannot load the core
+    it just restored — the stronger fact silently downgraded to the weaker one.
+
+    The operator gets a different sentence for it, because it is a different
+    instruction: RESTORE FAILED tells them to re-run the command, and re-running
+    it before the conflict is fixed changes nothing.
+    """
+    venv, guard = _pypi_core_guard(
+        monkeypatch, repair_resolve_refused=True, core_version="0.51.0",
+    )
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    outcome = guard.resolve()
+
+    # Core IS back from its declared source...
+    assert venv.installed[CORE] == "0.52.0"
+    assert venv.editable.get(CORE) is None
+    assert len(venv.commands) == 3  # all three passes ran
+    # ...and the repair is still not clean, so nothing may report success.
+    assert outcome.unresolved is True
+    assert outcome.repaired is False
+    assert outcome.conforming is False
+    instruction = outcome.restore_instruction
+    assert "RESTORED, DEPENDENCIES UNRESOLVED" in instruction
+    assert "RESTORE FAILED" not in instruction
+    # The refusal itself reaches the operator — the conflict is the thing they
+    # have to fix before the command is worth running.
+    assert "No solution found" in outcome.output
+
+
+def test_a_repair_killed_by_its_bound_is_still_judged_by_where_core_is(
+    monkeypatch, capsys
+):
+    """A killed resolve reached no verdict, so it is not a refusal.
+
+    `_resolve_was_refused` must not read a timeout as the resolver saying no:
+    a bound ends a process, it does not make a resolve fail. Pinned separately
+    because the killed process is shaped exactly like a failed one — same
+    nonzero code, same argv — and telling them apart is the whole point.
+    """
+    venv, guard = _pypi_core_guard(
+        monkeypatch, repair_hangs_after_restore=True, core_version="0.51.0",
+    )
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    outcome = guard.resolve(timeout=5)
+
+    assert venv.editable.get(CORE) is None  # the write landed before the kill
+    assert outcome.repaired is True
+    assert outcome.unresolved is False
     assert venv.installed[CORE] == "0.52.0"
     assert guard.verify() == 0  # nothing left to report on a second look
 
