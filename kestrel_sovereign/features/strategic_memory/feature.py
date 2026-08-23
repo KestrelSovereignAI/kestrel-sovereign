@@ -1096,6 +1096,30 @@ class StrategicMemoryFeature(Feature):
             )
         storage = getattr(self.agent, "storage", None)
         graph_store = getattr(storage, "graph", None) if storage else None
+        # The page and the membership are two queries, so a reprojection
+        # landing between them can leave the page describing the old index and
+        # the membership the new one -- and in that interleaving every
+        # divergence set comes out empty, so a just-resolved blocker is
+        # returned and certified current. Reading membership on BOTH sides of
+        # the page and requiring the two to be identical makes the check one
+        # observation rather than two, the same fence #2960 puts around its
+        # projection reads. A reprojection during the read is not a
+        # divergence, so it is reported as a check that did not run.
+        fence_before: Optional[Dict[str, Any]] = None
+        try:
+            # Only the membership matters here; whether THIS read saturated is
+            # not carried forward, because a saturated pair that compares equal
+            # is caught by the second read's own completeness flag below, and a
+            # pair that stopped saturating cannot compare equal.
+            fence_before, _ = await index_membership(
+                graph_store, agent_id, section.node_type
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "strategy index membership unavailable for %s: %s",
+                section.node_type,
+                e,
+            )
         try:
             rows = await recall_nodes(
                 graph_store,
@@ -1154,6 +1178,18 @@ class StrategicMemoryFeature(Feature):
             membership, membership_complete = await index_membership(
                 graph_store, agent_id, section.node_type
             )
+            if fence_before is None or fence_before != membership:
+                # The index moved under the read, so the page and this
+                # membership describe different states and comparing them
+                # would certify or accuse the wrong one.
+                return self._unchecked_recall(
+                    confirmation,
+                    data,
+                    "index_changed_during_read",
+                    "The strategy index was reprojected while this list was "
+                    "being read, so whether the list is the whole of it was "
+                    "not checked. Ask again.",
+                )
         except Exception as e:  # noqa: BLE001
             # The rows above are a real answer; only the check failed. Saying
             # nothing here would let a silent failure read as agreement.
@@ -1175,8 +1211,8 @@ class StrategicMemoryFeature(Feature):
                 confirmation,
                 data,
                 "index_exceeds_membership_cap",
-                f"The strategy index holds more than {MEMBERSHIP_READ_CAP} "
-                f"{noun}, which is past what one membership read can see, so "
+                f"The strategy index holds at least {MEMBERSHIP_READ_CAP} "
+                f"{noun}, which is as far as one membership read can see, so "
                 "whether this list is the whole of it was not checked.",
             )
 

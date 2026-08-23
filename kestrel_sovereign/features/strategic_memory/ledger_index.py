@@ -555,7 +555,18 @@ async def recall_nodes(
         limit=max(1, int(limit)),
     )
     return [
-        {"node_id": node.node_id, "label": node.label, **(node.properties or {})}
+        # ``label`` is derived from the properties, not read off the row.
+        # compare_and_swap_node is deliberately properties-only -- a node's
+        # label is written once at creation and a swap never touches it -- so
+        # editing a pattern's text under a preserved id leaves GraphNode.label
+        # holding the OLD text while ``text`` holds the new one. Surfacing the
+        # stored label would hand a caller a stale field out of an index the
+        # health check had just certified as current (#3064).
+        {
+            "node_id": node.node_id,
+            **(node.properties or {}),
+            "label": _label((node.properties or {}).get("text")),
+        }
         for node in (nodes or [])
     ]
 

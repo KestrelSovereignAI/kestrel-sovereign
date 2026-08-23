@@ -1598,6 +1598,76 @@ class TestTheIndexHasAConsumer:
         assert "duplicate ids" in (result.error or "")
 
     @pytest.mark.asyncio
+    async def test_a_reprojection_mid_read_is_a_check_that_did_not_run(
+        self, tmp_path
+    ):
+        """The page and the membership are two queries.
+
+        A reprojection landing between them leaves the page describing the old
+        index and the membership the new one -- and in that interleaving every
+        divergence set comes out empty, so a just-resolved blocker is returned
+        and certified current. The fence makes the two one observation.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+        state = {"reads": 0}
+
+        async def _mutate_between(node_type, filters=None, **kwargs):
+            result = await original(node_type, filters=filters, **kwargs)
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                state["reads"] += 1
+                if state["reads"] == 1:
+                    # A scheduled mutation reprojects while the page is read.
+                    await feature.strategy_add_pattern(pattern="landed midway")
+            return result
+
+        graph.query_nodes_by_type_and_property = _mutate_between
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_changed_during_read"
+        )
+        assert "index_stale" not in result.data, (
+            "a reprojection is not a divergence, and must not be accused as one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stale_stored_label_is_not_handed_back(self, tmp_path):
+        """compare_and_swap_node is properties-only, by design.
+
+        A node's label is written once at creation and a swap never touches
+        it, so editing a pattern's text under a preserved id leaves the stored
+        label holding the OLD text. Surfacing it would hand a caller a stale
+        field out of an index the health check had just certified current.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the original wording")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        rows[0]["pattern"] = "the corrected wording"
+        feature._ledger.save()
+        await feature._reindex_ledger()
+        node = next(
+            n
+            for n in feature.agent.storage.graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        assert node.label == "the original wording", (
+            "the stored label really is stale -- that is the premise"
+        )
+
+        result = await feature.recall_patterns()
+
+        row = result.data["patterns"][0]
+        assert row["text"] == "the corrected wording"
+        assert row["label"] == "the corrected wording"
+        assert result.status.value == "ok"
+
+    @pytest.mark.asyncio
     async def test_a_saturated_membership_read_is_not_a_complete_one(
         self, tmp_path, monkeypatch
     ):
