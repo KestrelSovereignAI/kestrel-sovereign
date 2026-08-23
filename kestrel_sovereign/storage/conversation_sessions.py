@@ -1265,12 +1265,63 @@ def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
     Every existing row belongs at slot 0: it is where the generation lives, and
     SQLite has one writer by construction so it is the only slot it ever uses.
 
-    Runs inside ``migration_lock``, which is one transaction, so the rename,
-    the copy and the drop are atomic together — an interrupted migration leaves
-    the original table under its own name, not a half-copied one.
+    The two engines get different statements, because ``migration_lock`` means
+    different things on them. On SQLite it is ``BEGIN IMMEDIATE`` -- one writer
+    by construction, so no increment can land mid-migration and a rebuild is
+    safe. On PostgreSQL it is a transaction-scoped ADVISORY lock, which
+    excludes other initializers and no ordinary writer at all; there the table
+    is altered in place, because a copy would discard the increments those
+    writers commit between the SELECT and the DROP. Each branch carries its
+    own argument.
+
+    Either way it runs inside one transaction, so an interrupted migration
+    leaves the original table under its own name, not a half-copied one.
     """
-    new_shape = normalize_schema(
-        _CHANGES_DDL_TEMPLATE.format(table=CHANGES_PRE_SLOT_TABLE).strip(),
+    if backend_type == "postgres":
+        return (
+            # In place, because PostgreSQL can be. A rebuild here would be
+            # unsafe: `migration_lock` takes a transaction-scoped ADVISORY
+            # lock, which excludes other initializers and nothing else, so an
+            # ordinary history writer goes on incrementing the old ledger
+            # through its triggers. The copy would read ACCESS SHARE --
+            # compatible with the writers' ROW EXCLUSIVE -- and the DROP would
+            # then wait for those writers and discard the increments they had
+            # just committed. The watermark would still equal the copied
+            # counter, so the projection would report itself current while the
+            # history it never walked stayed permanently unlisted.
+            #
+            # ALTER TABLE takes ACCESS EXCLUSIVE itself, so each statement is
+            # already serialized against those writers and no row is copied at
+            # all. The lock order also matches theirs -- history first through
+            # the trigger, then this table -- because nothing here touches
+            # conversation_history.
+            "ALTER TABLE conversation_history_changes "
+            "ADD COLUMN IF NOT EXISTS slot BIGINT NOT NULL DEFAULT 0",
+            # The constraint is found rather than named. It was minted by an
+            # inline PRIMARY KEY so it is almost certainly
+            # `conversation_history_changes_pkey`, and "almost certainly" is
+            # not a thing to hinge a boot on.
+            """
+            DO $$
+            DECLARE existing_pkey text;
+            BEGIN
+                SELECT conname INTO existing_pkey
+                  FROM pg_constraint
+                 WHERE conrelid = 'conversation_history_changes'::regclass
+                   AND contype = 'p';
+                IF existing_pkey IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE conversation_history_changes '
+                        'DROP CONSTRAINT %I', existing_pkey
+                    );
+                END IF;
+                ALTER TABLE conversation_history_changes
+                    ADD PRIMARY KEY (agent_id, slot);
+            END $$;
+            """.strip(),
+        )
+
+    new_shape = normalize_schema(        _CHANGES_DDL_TEMPLATE.format(table=CHANGES_PRE_SLOT_TABLE).strip(),
         backend_type,
     )
     return (

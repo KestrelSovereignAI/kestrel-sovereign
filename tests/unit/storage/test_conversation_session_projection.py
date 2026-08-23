@@ -3637,3 +3637,56 @@ async def test_a_pre_slot_ledger_is_migrated_even_when_nothing_else_moved(
         assert _ledger_rows(path) == [("did:a", 0, 11, 4)]
     finally:
         await reopened.close()
+
+
+def test_the_postgres_migration_never_copies_the_ledger():
+    """A copy on PostgreSQL would discard concurrent increments.
+
+    ``migration_lock`` is a transaction-scoped ADVISORY lock there: it excludes
+    other initializers and no ordinary writer at all. A history write commits
+    through its trigger against the old table, the copy's ACCESS SHARE does not
+    exclude it, and the DROP then waits for that writer and throws away what it
+    just wrote — leaving the watermark equal to the copied counter while the
+    newer history stays permanently unlisted.
+
+    Asserted on the statements because this repository has no PostgreSQL to run
+    against; the behaviour itself is exercised by the dual-backend case in
+    tests/integration, which runs in CI.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        CHANGES_TABLE,
+    )
+
+    statements = changes_slot_migration("postgres")
+
+    assert not any(
+        f"DROP TABLE {CHANGES_TABLE}" in statement for statement in statements
+    ), "the live ledger is never dropped on PostgreSQL"
+    assert not any("INSERT INTO" in statement for statement in statements), (
+        "and no row is copied, so none can be lost"
+    )
+    assert any("ADD COLUMN IF NOT EXISTS slot" in s for s in statements)
+    assert any("ADD PRIMARY KEY (agent_id, slot)" in s for s in statements)
+
+
+def test_the_sqlite_migration_rebuilds_because_it_safely_can():
+    """SQLite's migration_lock is BEGIN IMMEDIATE: one writer, by construction.
+
+    So no increment can land mid-migration and the rebuild is safe — which is
+    the only reason the two engines are allowed to differ here.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+        CHANGES_PRE_SLOT_TABLE,
+        CHANGES_TABLE,
+    )
+
+    statements = changes_slot_migration("sqlite")
+
+    assert any(f"DROP TABLE {CHANGES_TABLE}" in s for s in statements)
+    assert any(f"DROP TABLE {CHANGES_PRE_SLOT_TABLE}" in s for s in statements)
+    assert not any("ALTER TABLE" in s for s in statements), (
+        "SQLite reparses triggers on rename, against the schema before it "
+        "lands, so no ordering of an ALTER-based migration can work here"
+    )
