@@ -594,3 +594,63 @@ def test_an_optional_ownerless_re_registration_still_does_not_pin():
     assert registry.owners_of("optional.retry") == (feature,)
     registry.release_all(feature)
     assert registry.get("optional.retry") is None
+
+
+def test_a_failed_ownerless_batch_unwinds_its_host_claim():
+    """Host claims unwind with a failed batch too.
+
+    An ownerless MANDATORY batch meeting an equivalent feature-owned source
+    takes a host claim. Leaving it behind after a failure meant the feature
+    could never release its own source again.
+    """
+    import dataclasses
+
+    import pytest as _pytest
+    from kestrel_sdk.signals import Trust
+
+    from kestrel_sovereign.signals import (
+        RegistrationError,
+        RegistrationPolicy,
+        SourceRegistry,
+    )
+
+    registry = SourceRegistry()
+    feature = object()
+    shared = _owner_test_source("hostclaim.shared")
+    registry.register_with_policy(shared, RegistrationPolicy.OPTIONAL, owner=feature)
+
+    clash_incumbent = _owner_test_source("hostclaim.clash")
+    registry.register(clash_incumbent)
+    clashing = dataclasses.replace(clash_incumbent, trust=Trust.UNTRUSTED)
+
+    with _pytest.raises(RegistrationError):
+        registry.register_batch(
+            [shared, clashing], RegistrationPolicy.MANDATORY,
+        )
+
+    # The host claim the failed batch took is gone, so the feature is once
+    # again the last holder and can release its own source.
+    registry.release_all(feature)
+    assert registry.get("hostclaim.shared") is None
+
+
+def test_activation_rollback_keeps_a_claim_the_feature_already_held():
+    """A pre-existing imperative claim survives a failed activation."""
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("preexisting.claim")
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+
+    # An activation that acquires nothing new, then rolls back.
+    with registry.claims_acquired(feature) as acquired:
+        registry.register_batch(
+            [source], RegistrationPolicy.MANDATORY, owner=feature
+        )
+    assert acquired == []          # nothing NEW was taken
+    registry.release_acquired(acquired, feature)
+
+    # The claim that predated the activation is intact.
+    assert registry.owners_of("preexisting.claim") == (feature,)
+    assert registry.get("preexisting.claim") is source

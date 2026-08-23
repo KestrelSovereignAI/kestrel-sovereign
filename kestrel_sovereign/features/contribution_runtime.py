@@ -408,13 +408,19 @@ class FeatureContributionRuntime:
                 for source in workflow.sources
             )
             if sources:
-                # The registry records the claim; this lifecycle keeps no list
-                # of its own. Ownership is a fact about the source, and there is
-                # exactly one place that knows it (#3053).
-                self.source_registry.register_batch(
-                    sources, RegistrationPolicy.MANDATORY, owner=prepared.feature,
-                )
-                registered_sources.extend(sources)
+                # The registry records the claim AND reports what this
+                # activation acquired, so the rollback below releases exactly
+                # that — not a claim the feature already held from registering
+                # the same source imperatively (#3053).
+                with self.source_registry.claims_acquired(
+                    prepared.feature
+                ) as acquired:
+                    self.source_registry.register_batch(
+                        sources,
+                        RegistrationPolicy.MANDATORY,
+                        owner=prepared.feature,
+                    )
+                registered_sources.extend(acquired)
             if values.permission_defaults is not None:
                 candidate_permission_registration = PermissionDefaultRegistration(
                     owner=prepared.owner,
@@ -440,11 +446,12 @@ class FeatureContributionRuntime:
                 self.setup_step_registry.unregister_batch(values.setup_steps)
             if permission_registration is not None:
                 self.permission_defaults_registry.unregister(permission_registration)
-            for source in reversed(registered_sources):
-                # Release, not unregister: another holder may already depend on
-                # this source, and a failed activation is not a reason to take
-                # it from them (#3053).
-                self.source_registry.release(source.name, prepared.feature)
+            # Release exactly what THIS activation acquired: another holder may
+            # already depend on the source, and a claim the feature held before
+            # this activation is not this rollback's to drop (#3053).
+            self.source_registry.release_acquired(
+                list(reversed(registered_sources)), prepared.feature
+            )
             for registration in reversed(registered_waits):
                 self.wait_registry.deregister(
                     registration.name, registration.provider

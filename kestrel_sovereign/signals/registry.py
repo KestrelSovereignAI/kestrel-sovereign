@@ -35,6 +35,7 @@ additions"):
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import inspect
@@ -174,8 +175,10 @@ class SourceRegistry:
         # It belongs here: "who registered this source" is a fact about the
         # source, and this is what holds the sources. A claim is released by its
         # holder; the source itself goes when the last claim does.
-        self._claims: dict[str, list[int]] = {}
+        self._claims: dict[str, list] = {}
         self._claim_owners: dict[int, object] = {}
+        #: Active `claims_acquired` scopes, innermost last.
+        self._acquisition_logs: list = []
 
     # ------------------------------------------------------------------
     # Registration
@@ -195,6 +198,49 @@ class SourceRegistry:
     # Ownership (issue #3053)
     # ------------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def claims_acquired(self, owner):
+        """Record exactly the claims ACQUIRED inside the block.
+
+        Callers with a rollback path kept deriving "what did I just take?" by
+        hand, and three separate sites got it wrong three different ways: a host
+        claim retained so a feature could never release its source; a claim that
+        PREDATED the operation released, deleting a live source; and owners
+        compared by equality, so a distinct-but-equal instance's claim went
+        untracked.
+
+        Only the registry knows whether a claim was actually added, so it
+        reports it. Yields the list of names acquired; unwind with
+        :meth:`release_acquired` (issue #3053).
+        """
+        acquired: list = []
+        self._acquisition_logs.append(acquired)
+        try:
+            yield acquired
+        finally:
+            self._acquisition_logs.pop()
+
+    def release_acquired(self, acquired, owner) -> None:
+        """Release exactly the claims recorded by :meth:`claims_acquired`."""
+        key = _HOST_CLAIM if owner is None else id(owner)
+        for name in acquired:
+            holders = self._claims.get(name)
+            if not holders or key not in holders:
+                continue
+            holders.remove(key)
+            self._forget_owner_if_unreferenced(key)
+            if not holders:
+                self._claims.pop(name, None)
+                self._sources.pop(name, None)
+
+    def _record_acquisition(self, name: str) -> None:
+        # EVERY active scope, not just the innermost: `register_batch` opens
+        # its own scope inside a caller's, and an acquisition made there
+        # happened inside both. Recording only the innermost left the outer
+        # rollback believing it had taken nothing.
+        for log in self._acquisition_logs:
+            log.append(name)
+
     def _claim(self, name: str, owner) -> None:
         """Record *owner* as a holder of *name*. ``None`` means the host.
 
@@ -208,11 +254,13 @@ class SourceRegistry:
         if owner is None:
             if _HOST_CLAIM not in holders:
                 holders.append(_HOST_CLAIM)
+                self._record_acquisition(name)
             return
         key = id(owner)
         if key not in holders:
             holders.append(key)
             self._claim_owners[key] = owner
+            self._record_acquisition(name)
 
     def _forget_owner_if_unreferenced(self, key) -> None:
         """Drop the owner object once no claim list mentions it.
@@ -392,34 +440,23 @@ class SourceRegistry:
         """
         outcomes: list[RegistrationOutcome] = []
         newly_added: list[str] = []
-        claimed: list[str] = []
-        try:
-            for registration in registrations:
-                # Only a claim this batch ACQUIRES is this batch's to unwind.
-                # An owner that already held the source — a feature that
-                # registered it imperatively and also declares it — keeps that
-                # claim, or the rollback would delete a source it is running on.
-                held_before = owner is not None and owner in self.owners_of(
-                    registration.name
-                )
-                outcome = self.register_with_policy(
-                    registration, policy, owner=owner
-                )
-                outcomes.append(outcome)
-                if outcome.state is RegistrationState.REGISTERED:
-                    newly_added.append(outcome.name)
-                if owner is not None and outcome.ok and not held_before:
-                    claimed.append(outcome.name)
-        except RegistrationError:
-            for name in claimed:
-                self.release(name, owner)
-            # Atomic means the CLAIMS unwind too. Leaving them behind kept a
-            # failed owner referenced, and its stale claim could later hold an
-            # incumbent alive that nothing was using.
-            for name in newly_added:
-                self._sources.pop(name, None)
-                self._claims.pop(name, None)
-            raise
+        # Atomic means the CLAIMS unwind too: exactly the ones this batch took,
+        # host claims included, and nothing that predated it.
+        with self.claims_acquired(owner) as acquired:
+            try:
+                for registration in registrations:
+                    outcome = self.register_with_policy(
+                        registration, policy, owner=owner
+                    )
+                    outcomes.append(outcome)
+                    if outcome.state is RegistrationState.REGISTERED:
+                        newly_added.append(outcome.name)
+            except RegistrationError:
+                self.release_acquired(acquired, owner)
+                for name in newly_added:
+                    self._sources.pop(name, None)
+                    self._claims.pop(name, None)
+                raise
         return outcomes
 
     @staticmethod
