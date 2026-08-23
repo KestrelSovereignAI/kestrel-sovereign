@@ -2867,3 +2867,70 @@ def test_damaged_dependency_metadata_is_retried_rather_than_called_present(
 
     assert "present" not in capsys.readouterr().out
     assert venv.commands  # it was retried
+
+
+def test_a_demoted_core_whose_resolve_fails_is_not_continuable(
+    monkeypatch, fake_registry, tmp_path, capsys
+):
+    """The single-pass route to the same state, which was continuable.
+
+    Core matches its declared source and version, so `conforms_now()` says yes;
+    what the demotion found is that its dependencies do not resolve. The
+    install that follows is ONE command, so there is no incomplete sequence to
+    read — and left as the generic `1`, `--continue-on-error` restarts every
+    agent onto the core this very check found unloadable.
+    """
+    from kestrel_sovereign.cli_features import CORE_UNRESOLVED
+
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52,<0.53"\n'
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.5"\n'
+    )
+    venv = FakeUv(feature_requires=">=0.52", repair_fails=True)
+    # Core is already the declared index wheel at a satisfying version...
+    venv.editable.pop(CORE, None)
+    # ...and declares a dependency this venv does not have.
+    venv.installed_requires[CORE] = ["kestrel-sovereign-sdk>=0.99"]
+    venv.installed["kestrel-sovereign-sdk"] = "0.36.0"
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no uv on PATH
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    out = capsys.readouterr().out
+    assert rc == CORE_UNRESOLVED
+    assert "validates its dependencies did not complete" in out
+    assert "kestrel-feature-voice" not in venv.installed
+
+
+def test_one_unreadable_dependency_does_not_hide_the_rest(monkeypatch):
+    """A corrupted distribution is not a verdict about the others.
+
+    Aborting the scan on the first raise hides every requirement after it —
+    and the HTTP caller swallows that exception, so a package reports as fine
+    because nothing got as far as looking at the requirement that matters.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = [
+        "brokenpkg>=1",
+        "kestrel-sovereign>=0.99",
+    ]
+    use_fake_uv(monkeypatch, venv)
+    real_version = venv.version
+
+    def version(dist):
+        if dist == "brokenpkg":
+            raise ValueError("metadata is not readable")
+        return real_version(dist)
+
+    monkeypatch.setattr(cli, "_installed_version", version)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    by_name = {r.name: r for r in unmet}
+
+    assert by_name["brokenpkg"].certain is False
+    assert "could not be read" in by_name["brokenpkg"].detail
+    # The requirement AFTER it was still evaluated.
+    assert by_name["kestrel-sovereign"].certain is True

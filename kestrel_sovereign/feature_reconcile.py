@@ -621,7 +621,20 @@ def unsatisfied_requirements(
         if not requirement_applies(req, extras):
             continue
         name = canonical_package(req.name)
-        have = installed_version(req.name)
+        try:
+            have = installed_version(req.name)
+        except Exception as exc:  # noqa: BLE001 - one unreadable dist is not a verdict
+            # Per requirement, not per scan: a single corrupted distribution
+            # aborting the whole loop hides every requirement after it, and the
+            # caller that swallows the exception then reports a package as fine
+            # because nothing got as far as looking at it.
+            unmet.append(UnmetRequirement(
+                name,
+                f"{dist_name} requires {req.name}{req.specifier}, and that "
+                f"distribution could not be read ({exc})",
+                certain=False,
+            ))
+            continue
         if have is None:
             unmet.append(UnmetRequirement(
                 name,
