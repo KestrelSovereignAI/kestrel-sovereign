@@ -2126,6 +2126,7 @@ class IsolatedRuntimePreparationError(RuntimeError):
 _CONFIGURATION_UNSAFE_PROCESS_ENVIRONMENT = "unsafe-process-environment"
 _CONFIGURATION_HOSTED_CLIENT_FACTORY = "hosted-client-factory"
 _CONFIGURATION_HOSTED_PREBUILT_OVERRIDE = "hosted-prebuilt-override"
+_CONFIGURATION_FEATURE_IDENTITY = "feature-identity"
 _HOSTED_RUNTIME_VENV_SETTING = "runtime.venv"
 _SAFE_ENVIRONMENT_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 
@@ -2191,6 +2192,8 @@ class IsolatedRuntimeConfigurationError(RuntimeError):
                 "existing operator-owned executable or venv with no Core "
                 "provisioning manifest"
             )
+        if self.reason == _CONFIGURATION_FEATURE_IDENTITY:
+            return "isolated feature class name is not a safe canonical identifier"
         return "the hosted isolated feature configuration is unsafe"
 
 
@@ -2866,7 +2869,11 @@ def _ensure_venv_relocation_repair_marker_at(directory_fd: int) -> None:
         except FileNotFoundError:
             pass
         os.fsync(directory_fd)
-        _read_venv_relocation_repair_marker_at(directory_fd)
+        if not _read_venv_relocation_repair_marker_at(directory_fd):
+            raise IsolatedRuntimePreparationError(
+                "Hosted isolated feature relocation repair state could not be "
+                "recorded."
+            )
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
@@ -2964,6 +2971,12 @@ def _ensure_venv_relocation_repair_marker_portable(directory: Path) -> None:
                 "Hosted isolated feature relocation repair state could not be "
                 "recorded."
             )
+        if os.name == "posix":
+            directory_fd = os.open(directory, _directory_open_flags())
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -4304,11 +4317,111 @@ def agent_runtime_dir(agent: Any) -> Path:
     return resolve_agent_runtime_dir(agent)
 
 
+def remove_released_legacy_runtime_root(
+    legacy_root: Path,
+) -> RuntimeNamespaceCleanupOutcome:
+    """Securely remove the released per-agent ``feature_venvs`` tree.
+
+    The released layout has no ownership marker, so custody is intentionally
+    narrower than migration: the factory-provided path must be the canonical
+    ``feature_venvs`` leaf, its parent and leaf must remain descriptor-bound,
+    and the populated leaf must be service-owned and non-writable by group or
+    world.  Ambiguous custody is retained and reported; it is never mistaken
+    for successful deprovisioning of the new namespace.
+    """
+
+    if (
+        not isinstance(legacy_root, Path)
+        or not legacy_root.is_absolute()
+        or legacy_root.name != "feature_venvs"
+    ):
+        raise IsolatedRuntimeNamespaceError(
+            "Hosted released runtime cleanup path is not canonical."
+        )
+    if not _secure_dirfd_supported():  # pragma: no cover - non-POSIX policy
+        if legacy_root.exists() or legacy_root.is_symlink():
+            raise IsolatedRuntimePreparationError(
+                "Secure released-runtime offboarding is unavailable on this "
+                "platform; tenant state was retained."
+            )
+        return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+
+    parent_fd: Optional[int] = None
+    legacy_fd: Optional[int] = None
+    try:
+        parent_fd = os.open(legacy_root.parent, _directory_open_flags())
+        lexical_parent = os.stat(legacy_root.parent, follow_symlinks=False)
+        if not stat.S_ISDIR(lexical_parent.st_mode) or not _same_file_identity(
+            lexical_parent,
+            os.fstat(parent_fd),
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup parent changed during validation."
+            )
+        try:
+            lexical_root = os.stat(
+                legacy_root.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
+        legacy_fd = os.open(
+            legacy_root.name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        opened_root = os.fstat(legacy_fd)
+        if not stat.S_ISDIR(lexical_root.st_mode) or not _same_file_identity(
+            lexical_root,
+            opened_root,
+        ):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup root changed during validation."
+            )
+        _validate_released_legacy_root_custody(opened_root)
+        _assert_no_nested_runtime_owners_at(
+            legacy_fd,
+            allow_owner_marker=False,
+        )
+        _remove_directory_contents_at(
+            legacy_fd,
+            allow_owner_marker=False,
+        )
+        if not _same_file_identity(opened_root, os.fstat(legacy_fd)):
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup root changed during removal."
+            )
+        try:
+            os.rmdir(legacy_root.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(parent_fd)
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    except (IsolatedRuntimeNamespaceError, IsolatedRuntimePreparationError):
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise IsolatedRuntimeNamespaceError(
+                "Hosted released runtime cleanup encountered an unsafe path entry."
+            ) from exc
+        raise IsolatedRuntimePreparationError(
+            "Hosted released runtime cleanup could not complete; tenant state "
+            "was retained."
+        ) from exc
+    finally:
+        if legacy_fd is not None:
+            os.close(legacy_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
 def remove_runtime_namespace(
     scope: Optional[IsolatedRuntimeNamespace],
     owner: Optional[str],
+    released_legacy_root: Optional[Path] = None,
 ) -> RuntimeNamespaceCleanupOutcome:
-    """Delete an explicit hosted scope while preserving exact custody state."""
+    """Delete all known hosted runtime layouts with exact custody semantics."""
 
     if scope is None:
         return RuntimeNamespaceCleanupOutcome.NOT_HOSTED
@@ -4316,15 +4429,29 @@ def remove_runtime_namespace(
         raise IsolatedRuntimeNamespaceError(
             "Hosted isolated feature runtime cleanup requires an agent identity."
         )
-    return remove_isolated_runtime_namespace(scope, owner)
+    current_outcome = remove_isolated_runtime_namespace(scope, owner)
+    if released_legacy_root is None:
+        return current_outcome
+    legacy_outcome = remove_released_legacy_runtime_root(released_legacy_root)
+    if RuntimeNamespaceCleanupOutcome.REMOVED in {
+        current_outcome,
+        legacy_outcome,
+    }:
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+    return RuntimeNamespaceCleanupOutcome.ALREADY_ABSENT
 
 
 def remove_agent_runtime_namespace(agent: Any) -> RuntimeNamespaceCleanupOutcome:
-    """Remove an explicit hosted scope, or report storage-backed custody."""
+    """Remove current and released hosted state, or report storage custody."""
 
     runtime_scope = _agent_runtime_scope(agent)
     owner = _agent_runtime_owner(agent) if runtime_scope is not None else None
-    return remove_runtime_namespace(runtime_scope, owner)
+    legacy_root = (
+        _agent_released_legacy_runtime_root(agent)
+        if runtime_scope is not None
+        else None
+    )
+    return remove_runtime_namespace(runtime_scope, owner, legacy_root)
 
 
 def _venv_bin_dir(venv_path: Path) -> Path:
@@ -4335,6 +4462,15 @@ def _venv_python(venv_path: Path) -> Path:
     if os.name == "nt":
         return venv_path / "Scripts" / "python.exe"
     return venv_path / "bin" / "python"
+
+
+def _console_script_path(venv_path: Path, service: str) -> Path:
+    """Return the exact executable path used for a console entry point."""
+
+    executable = service
+    if os.name == "nt" and not service.casefold().endswith(".exe"):
+        executable = f"{service}.exe"
+    return _venv_bin_dir(venv_path) / executable
 
 
 # Interpreter-behavior env vars that would let the HOST Python installation
@@ -5060,7 +5196,7 @@ class ProxyFeature(Feature):
             resolve_agent_runtime_dir(agent)
         if _ISOLATED_FEATURE_CLASS_NAME.fullmatch(self.name) is None:
             raise IsolatedRuntimeConfigurationError(
-                "Isolated feature class name is not a safe canonical identifier."
+                reason=_CONFIGURATION_FEATURE_IDENTITY,
             )
         self._runtime_directory_name = (
             _hosted_feature_runtime_component(runtime)
@@ -5920,7 +6056,7 @@ class ProxyFeature(Feature):
         )
         try:
             await self._register_event_handler(client)
-        except BaseException:
+        except BaseException as exc:
             # A client whose event registration failed must not remain
             # reachable through host tools while its caller unwinds.  Shutdown
             # may already have unpublished and retired this exact client while
@@ -5929,6 +6065,25 @@ class ProxyFeature(Feature):
             unpublished_client = self._unpublish_client(client)
             if unpublished_client is client:
                 await self._retire_detached_client(unpublished_client)
+            if isinstance(
+                exc,
+                (
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimeConfigurationError,
+                    IsolatedRuntimePreparationError,
+                    _TerminalLifecyclePermitRevoked,
+                    asyncio.CancelledError,
+                ),
+            ):
+                raise
+            if isinstance(
+                exc,
+                (OSError, subprocess.SubprocessError, RuntimeError, ProtocolError),
+            ):
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature child event registration could not be "
+                    "prepared."
+                ) from exc
             raise
         # Registration is an awaited post-publication operation.  Shutdown may
         # have latched while it was in flight and be waiting for this lifecycle
@@ -5968,12 +6123,43 @@ class ProxyFeature(Feature):
         """
 
         child_config = self._host_config if config is None else config
-        client = self._build_client(config=child_config)
+        try:
+            client = self._build_client(config=child_config)
+        except (
+            IsolatedRuntimeNamespaceError,
+            IsolatedRuntimeConfigurationError,
+            IsolatedRuntimePreparationError,
+            _TerminalLifecyclePermitRevoked,
+        ):
+            raise
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child process could not be prepared."
+            ) from exc
         try:
             await _maybe_await(client.start())
             advertised_tools = await _maybe_await(client.list_tools())
-        except BaseException:
+        except BaseException as exc:
             await self._retire_detached_client(client)
+            if isinstance(
+                exc,
+                (
+                    IsolatedRuntimeNamespaceError,
+                    IsolatedRuntimeConfigurationError,
+                    IsolatedRuntimePreparationError,
+                    _TerminalLifecyclePermitRevoked,
+                    asyncio.CancelledError,
+                ),
+            ):
+                raise
+            if isinstance(
+                exc,
+                (OSError, subprocess.SubprocessError, RuntimeError, ProtocolError),
+            ):
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature child process could not start or advertise "
+                    "its runtime contract."
+                ) from exc
             raise
         return client, [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
 
@@ -9636,7 +9822,8 @@ class ProxyFeature(Feature):
         if type(service) is not str or not service or ":" in service:
             return "not-applicable"
         assert self._venv_path is not None
-        script = _venv_bin_dir(self._venv_path) / service
+        script = _console_script_path(self._venv_path, service)
+        executable_name = script.name
         if _secure_dirfd_supported():
             bin_fd: Optional[int] = None
             script_fd: Optional[int] = None
@@ -9645,11 +9832,15 @@ class ProxyFeature(Feature):
                     _venv_bin_dir(self._venv_path),
                     _directory_open_flags(),
                 )
-                metadata = os.stat(service, dir_fd=bin_fd, follow_symlinks=False)
+                metadata = os.stat(
+                    executable_name,
+                    dir_fd=bin_fd,
+                    follow_symlinks=False,
+                )
                 if not stat.S_ISREG(metadata.st_mode):
                     return "missing"
                 script_fd = os.open(
-                    service,
+                    executable_name,
                     os.O_RDONLY
                     | getattr(os, "O_NOFOLLOW", 0)
                     | getattr(os, "O_CLOEXEC", 0),
@@ -9674,6 +9865,12 @@ class ProxyFeature(Feature):
                     prefix = stream.read(8192)
             except OSError:
                 return "missing"
+        if os.name == "nt":  # pragma: no cover - exercised by platform seam tests
+            # distlib's Windows console launcher is binary and does not expose
+            # a reliably parseable interpreter path. Presence of the exact
+            # regular ``.exe`` launch artifact is verifiable; durable rename
+            # evidence still forces its reinstall before this check.
+            return "current"
         # Console generators embed the lexical venv interpreter path even when
         # ``bin/python`` is itself a symlink to a base interpreter. Resolving
         # that final symlink would falsely classify every repaired uv venv as
@@ -9722,7 +9919,7 @@ class ProxyFeature(Feature):
             and not (type(stamped_path) is str and bool(stamped_path))
         )
         return (
-            relocation_proven and location_state in {"relocated", "missing"}
+            relocation_proven and location_state != "not-applicable"
         ) or unstamped_hosted_console
 
     def _provision_status(
@@ -9820,16 +10017,6 @@ class ProxyFeature(Feature):
                 "runtime provisioning."
             )
 
-    def _provision_is_stale(self, install_target: str) -> bool:
-        """Return whether this host-owned venv must be reprovisioned.
-
-        The stamp covers the exact project target, the host SDK wire contract,
-        and the feature distribution release.  An unavailable distribution
-        version does not become a moving stale marker: it is stamped as
-        ``unknown`` and remains fresh until a concrete version is observable.
-        """
-        return self._provision_status(install_target)[0]
-
     def _provision_is_stale_from_manifest(
         self,
         install_target: str,
@@ -9893,7 +10080,7 @@ class ProxyFeature(Feature):
         child = self._probe_feature_distribution(python_path)
         if not child.is_present:
             observed = "missing" if child.state == "missing" else "unverifiable"
-            raise RuntimeError(
+            raise IsolatedRuntimePreparationError(
                 f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
                 f"version {observed}, but host requires {desired!r}; refusing to run "
                 "an unverifiable override venv"
@@ -9906,7 +10093,7 @@ class ProxyFeature(Feature):
                 if child.state == "present-unversioned"
                 else repr(child.version)
             )
-            raise RuntimeError(
+            raise IsolatedRuntimePreparationError(
                 f"Prebuilt isolated feature {self.name} has {self.runtime.distribution!r} "
                 f"version {observed}, but host requires {desired!r}; refusing to run "
                 "an unverifiable override venv"
@@ -9920,8 +10107,8 @@ class ProxyFeature(Feature):
         # latter is a console-script name or "module:func", not a pip target.
         install_target = self.runtime.project or self.runtime.distribution
         if not install_target:
-            raise RuntimeError(
-                f"Isolated feature {self.name} has no project/distribution to install"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature provisioning metadata has no install target."
             )
 
         hosted_immutable_setting = (
@@ -9995,10 +10182,6 @@ class ProxyFeature(Feature):
             if not stale:
                 if self._venv_relocation_repair_pending():
                     self._verify_launch_artifact()
-                if manifest.get("venv_path") != str(self._venv_path.resolve()):
-                    updated = dict(manifest)
-                    updated["venv_path"] = str(self._venv_path.resolve())
-                    self._write_provision_manifest_payload(updated)
                 self._clear_venv_relocation_repair_marker()
                 return
             if not force_reinstall and self._adopt_verified_unstamped_venv(
@@ -10035,21 +10218,20 @@ class ProxyFeature(Feature):
             child_feature_distribution.state != "versioned"
             or child_feature_distribution.version != desired_feature_version
         ):
-            raise RuntimeError(
-                f"Isolated feature {self.name} installed "
-                f"{self.runtime.distribution!r} version "
-                f"{child_feature_distribution.version!r}, "
-                f"but host requires {desired_feature_version!r}; refusing to "
-                "stamp the venv fresh"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child distribution did not match the host "
+                "release after provisioning; the venv was not stamped fresh."
             )
         if not child_feature_distribution.is_present:
-            raise RuntimeError(
-                f"Isolated feature {self.name} installed "
-                f"{self.runtime.distribution!r} but its child distribution probe "
-                "was not positively present; refusing to stamp the venv fresh"
+            raise IsolatedRuntimePreparationError(
+                "Isolated feature child distribution could not be verified after "
+                "provisioning; the venv was not stamped fresh."
             )
-        if force_reinstall or self._venv_relocation_repair_pending():
-            self._verify_launch_artifact()
+        # Every install or upgrade must prove the configured launch artifact,
+        # not only relocation repairs. Otherwise a resolver can succeed without
+        # installing the declared console entry point and Core would stamp that
+        # permanently unlaunchable venv as fresh.
+        self._verify_launch_artifact()
         self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
         self._write_provision_manifest(
             install_target,
@@ -10251,7 +10433,7 @@ class ProxyFeature(Feature):
 
         # console-script installed into the venv's bin/Scripts dir
         if self._venv_path is not None:
-            return [str(_venv_bin_dir(self._venv_path) / service)]
+            return [str(_console_script_path(self._venv_path, service))]
         return [service]
 
     async def _register_event_handler(self, client: Any = None) -> None:

@@ -1000,6 +1000,68 @@ class TestSpawnFeatureWithManager:
         manager.terminate_child.assert_awaited_once_with("did:parent", "helper")
 
     @pytest.mark.asyncio
+    async def test_real_lifecycle_preserves_manager_false_as_tool_error(self):
+        """Lifecycle tracking cannot turn a pruned manager edge into success."""
+
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager.terminate_child = AsyncMock(return_value=False)
+        lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle = lifecycle
+        await lifecycle.register(
+            "helper",
+            "did:helper",
+            parent.agent_id,
+            ttl_seconds=3600,
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(child_name="helper")
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert envelope.error == "Failed to terminate 'helper'"
+        assert not lifecycle.is_tracked("helper")
+        manager.terminate_child.assert_awaited_once_with(parent.agent_id, "helper")
+
+    @pytest.mark.asyncio
+    async def test_descendant_failure_never_claims_named_child_removed(self):
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = AgentManager()
+        manager._agents["Child"] = child
+        manager._agent_names[child.agent_id] = "Child"
+        manager._parent_children[parent.agent_id] = ["Child"]
+        manager.terminate_children = AsyncMock(
+            side_effect=ChildTerminationReconciliationError(
+                child_name="Grandchild",
+                cause=OSError("private descendant path"),
+            )
+        )
+        manager.remove_agent = AsyncMock(return_value=False)
+        manager._lifecycle = None
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["terminated"] is False
+        assert envelope.data["agent_removed"] is False
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_runtime_retained"] is True
+        assert envelope.data["runtime_cleanup_state"] == "not_performed"
+        assert envelope.data["retry_termination"] is True
+        assert envelope.data["additional_outcome_types"] == [
+            "ChildTerminationNotPerformedError",
+            "ChildTerminationReconciliationError",
+        ]
+        assert "private descendant path" not in str(envelope.to_dict())
+
+    @pytest.mark.asyncio
     async def test_terminate_child_not_ours(self):
         parent = _make_mock_agent("did:parent")
 
@@ -1042,7 +1104,7 @@ class TestSpawnFeatureDefaultPermissions:
 
     def test_terminate_child_requires_approval_for_destructive_variant(self):
         feature = _make_spawn_feature()
-        assert feature.default_permissions["terminate_child"] == "ask"
+        assert feature.default_permissions["terminate_child"] == "always_ask"
 
 
 class TestAgentManagerSpawn:

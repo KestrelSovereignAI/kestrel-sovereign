@@ -1062,6 +1062,136 @@ class TestAgentManagerBasics:
         assert (outside / "keep").read_text() == "unrelated"
 
     @pytest.mark.asyncio
+    async def test_offboard_removes_unadopted_released_feature_credentials(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:released-offboarding"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        legacy_root = tmp_path / "agent_data" / "hosted" / "feature_venvs"
+        legacy_feature = legacy_root / "NeverLoadedWhatsAppFeature"
+        legacy_feature.mkdir(parents=True)
+        legacy_root.chmod(0o700)
+        legacy_feature.chmod(0o700)
+        credential = legacy_feature / "auth" / "credentials.json"
+        credential.parent.mkdir()
+        credential.write_text("legacy-tenant-secret")
+        agent = _make_mock_agent(did)
+        agent.did = did
+        agent.isolated_runtime_scope = scope
+        agent.isolated_runtime_legacy_root = legacy_root
+        manager._agents["Hosted"] = agent
+        manager._agent_names[did] = "Hosted"
+
+        assert await manager.remove_agent("Hosted", offboard_runtime=True)
+
+        assert not scope.path.exists()
+        assert not legacy_root.exists()
+
+    @pytest.mark.asyncio
+    async def test_offboard_never_reports_removed_while_legacy_custody_remains(
+        self,
+        tmp_path,
+    ):
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:ambiguous-released-offboarding"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        legacy_root = tmp_path / "agent_data" / "hosted" / "feature_venvs"
+        legacy_feature = legacy_root / "NeverLoadedWhatsAppFeature"
+        legacy_feature.mkdir(parents=True)
+        legacy_root.chmod(0o775)
+        credential = legacy_feature / "credentials.json"
+        credential.write_text("ambiguous-custody")
+        agent = _make_mock_agent(did)
+        agent.did = did
+        agent.isolated_runtime_scope = scope
+        agent.isolated_runtime_legacy_root = legacy_root
+        manager._agents["Hosted"] = agent
+        manager._agent_names[did] = "Hosted"
+
+        with pytest.raises(RuntimeOffboardingRetainedError) as raised:
+            await manager.remove_agent("Hosted", offboard_runtime=True)
+
+        assert raised.value.metadata["runtime_cleanup_state"] == "retained"
+        assert manager.get_agent("Hosted") is None
+        assert credential.read_text() == "ambiguous-custody"
+
+    @pytest.mark.asyncio
+    async def test_unpublished_budget_hold_still_admits_runtime_offboarding(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A late hold cannot turn destructive rollback into refund-only success."""
+
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:late-budget-hold"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        credential = scope.path / "credential"
+        credential.write_text("must-be-offboarded")
+        config = LocalAgentConfig(data_dir="agent_data/Kid", port=8801)
+        config.resolve_data_dir(tmp_path).mkdir(parents=True)
+        manager._created_configs["Kid"] = config
+        delegated = SimpleNamespace(
+            allocation=SimpleNamespace(child_did=did),
+        )
+        manager._child_budgets["Kid"] = (delegated, object())
+
+        async def release_late_hold(child_name: str) -> None:
+            assert child_name == "Kid"
+            manager._child_budgets.pop(child_name)
+
+        manager._release_child_budget_cancellation_safe = release_late_hold
+
+        assert await manager.remove_agent("Kid", offboard_runtime=True)
+
+        assert not scope.path.exists()
+        assert "Kid" not in manager._child_budgets
+
+    @pytest.mark.asyncio
+    async def test_cold_budgeted_descendant_blocks_identity_offboarding(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+        monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+        manager = AgentManager(base_data_dir=tmp_path)
+        did = "did:pkh:cold-parent-with-budget"
+        scope = resolve_isolated_runtime_namespace(
+            manager._isolated_runtime_root,
+            derive_isolated_runtime_namespace(did),
+        )
+        prepare_isolated_runtime_namespace(scope, did)
+        manager._parent_children[did] = ["Grandchild"]
+        manager._child_budgets["Grandchild"] = (object(), object())
+
+        with pytest.raises(ValueError, match="budgeted child agents"):
+            await manager.remove_agent(
+                "ColdParent",
+                offboard_runtime=True,
+                known_agent_id=did,
+            )
+
+        assert scope.path.exists()
+        assert "Grandchild" in manager._child_budgets
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("hosted_scope", "cleanup_state", "runtime_retained"),
         (
@@ -1334,6 +1464,7 @@ class TestAgentManagerBasics:
             "Hosted",
             offboard_runtime=True,
             known_agent_id="did:test:hosted",
+            known_agent_config=config.agents["Hosted"],
         )
         assert MultiAgentConfig.from_file(config_path).agents == {}
         assert state.multi_agent_config.agents == {}
@@ -1510,6 +1641,108 @@ class TestAgentManagerBasics:
         assert raised.value.status_code == 404
         restored = MultiAgentConfig.from_file(config_path)
         assert restored.agents["Hosted"] == original
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        (
+            RuntimeError("manager failed before shutdown"),
+            TimeoutError("manager timed out before shutdown"),
+            asyncio.CancelledError(),
+        ),
+        ids=("runtime-error", "timeout", "cancelled"),
+    )
+    async def test_delete_endpoint_restores_registration_when_agent_remains_live(
+        self,
+        tmp_path,
+        failure,
+    ):
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(side_effect=failure),
+            get_agent=MagicMock(return_value=object()),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with pytest.raises(type(failure)):
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        restored = MultiAgentConfig.from_file(config_path)
+        assert restored.agents["Hosted"] == original
+        assert request.app.state.multi_agent_config.agents["Hosted"] == original
+
+    @pytest.mark.asyncio
+    async def test_delete_endpoint_active_grouped_cancellation_restores_live_registration(
+        self,
+        tmp_path,
+    ):
+        """Cancellation precedence cannot skip synchronous config compensation."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        original = LocalAgentConfig(
+            data_dir=Path("agent_data/hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": original})
+        config.save(config_path)
+        grouped = BaseExceptionGroup(
+            "manager cancellation and failure",
+            [asyncio.CancelledError(), RuntimeError("shutdown not completed")],
+        )
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=AsyncMock(side_effect=grouped),
+            get_agent=MagicMock(return_value=object()),
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agent_manager=manager,
+                    multi_agent_config_path=config_path,
+                    multi_agent_config=config,
+                )
+            )
+        )
+
+        with patch(
+            "kestrel_sovereign.endpoints.models.asyncio.current_task",
+            return_value=SimpleNamespace(cancelling=lambda: 1),
+        ), pytest.raises(BaseExceptionGroup) as raised:
+            await delete_agent.__wrapped__(
+                request,
+                "Hosted",
+                offboard_runtime=True,
+            )
+
+        assert raised.value is grouped
+        restored = MultiAgentConfig.from_file(config_path)
+        assert restored.agents["Hosted"] == original
+        assert request.app.state.multi_agent_config.agents["Hosted"] == original
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_reports_unpublished_agent_with_retained_runtime(
@@ -1859,14 +2092,25 @@ class TestAgentManagerBasics:
             count_cleanup,
         )
 
+        config = LocalAgentConfig(data_dir="agent_data/cold", port=8801)
+        legacy_root = config.resolve_data_dir(tmp_path) / "feature_venvs"
+        legacy_feature = legacy_root / "NeverLoadedWhatsAppFeature"
+        legacy_feature.mkdir(parents=True)
+        legacy_root.chmod(0o700)
+        legacy_feature.chmod(0o700)
+        legacy_credential = legacy_feature / "auth" / "credentials.json"
+        legacy_credential.parent.mkdir()
+        legacy_credential.write_text("cold-legacy-credential")
         assert await manager.remove_agent(
             "Cold",
             offboard_runtime=True,
             known_agent_id=did,
+            known_agent_config=config,
         )
 
         assert cleanup_calls == 1
         assert not scope.path.exists()
+        assert not legacy_root.exists()
         assert manager.get_agent("Cold") is None
         assert not manager.is_scheduler_agent_authorized(did)
 
@@ -1895,6 +2139,8 @@ class TestAgentManagerBasics:
             monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
         manager = AgentManager(base_data_dir=tmp_path)
         did = f"did:pkh:cold-custody-{expected_state}"
+        config = LocalAgentConfig(data_dir="agent_data/cold", port=8801)
+        config.resolve_data_dir(tmp_path).mkdir(parents=True)
         # A stale tree at the DID-derived location is not authority to delete it
         # when this manager's factory is storage-backed.
         scope = resolve_isolated_runtime_namespace(
@@ -1911,6 +2157,7 @@ class TestAgentManagerBasics:
                 "Cold",
                 offboard_runtime=True,
                 known_agent_id=did,
+                known_agent_config=config,
             )
 
         assert raised.value.metadata["runtime_cleanup_state"] == expected_state

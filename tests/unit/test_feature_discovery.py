@@ -283,7 +283,13 @@ service = "isolated_service"
             "Error loading isolated entry_point feature BrokenIsolatedFeature"
             in caplog.text
         )
-        assert "isolated SDK is unavailable" in caplog.text
+        assert "ImportError" in caplog.text
+        assert "isolated SDK is unavailable" not in caplog.text
+        mock_agent.record_feature_unavailable.assert_called_once_with(
+            feature=None,
+            feature_name=runtime.class_name,
+            reason="the optional isolated runtime could not be imported",
+        )
 
 
 class TestGetFeatureByName:
@@ -901,6 +907,7 @@ class TestEntryPointDiscovery:
             did="did:test:hosted-without-scope",
             storage_path=None,
             isolated_runtime_hosted=True,
+            record_feature_unavailable=Mock(),
         )
 
         with patch(
@@ -939,6 +946,7 @@ class TestEntryPointDiscovery:
             isolated_runtime_root=tmp_path / "runtime",
             isolated_runtime_namespace="agent-optional",
             isolated_runtime_hosted=True,
+            record_feature_unavailable=Mock(),
         )
 
         with patch(
@@ -957,7 +965,16 @@ class TestEntryPointDiscovery:
             )
 
         assert all(feature.name != runtime.class_name for feature in features)
-        assert "synthetic ENOSPC" in caplog.text
+        assert "agent-scoped runtime could not be prepared" in caplog.text
+        assert "synthetic ENOSPC" not in caplog.text
+        agent.record_feature_unavailable.assert_called_once_with(
+            feature=None,
+            feature_name=runtime.class_name,
+            reason=(
+                "the agent-scoped runtime could not be prepared; inspect the "
+                "sanitized traceback and host filesystem health"
+            ),
+        )
         assert entry_points[0].loaded is False
 
     def test_malformed_optional_isolated_name_does_not_abort_other_features(
@@ -995,6 +1012,7 @@ class TestEntryPointDiscovery:
             did="did:test:optional-metadata",
             storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
             features={},
+            record_feature_unavailable=Mock(),
         )
 
         with (
@@ -1018,6 +1036,13 @@ class TestEntryPointDiscovery:
         assert malformed.class_name not in {feature.name for feature in features}
         assert healthy.class_name in {feature.name for feature in features}
         assert "safe canonical identifier" in caplog.text
+        agent.record_feature_unavailable.assert_called_once_with(
+            feature=None,
+            feature_name=malformed.class_name,
+            reason=(
+                "isolated feature class name is not a safe canonical identifier"
+            ),
+        )
         assert all(entry_point.loaded is False for entry_point in entry_points)
 
     def test_malformed_optional_name_cannot_mask_missing_hosted_scope(self):

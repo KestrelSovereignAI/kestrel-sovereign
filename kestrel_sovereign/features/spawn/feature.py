@@ -62,6 +62,7 @@ def _termination_partial_result(
     retained_error_type: type[BaseException],
     not_performed_error_type: type[BaseException],
     reconciliation_error_type: type[BaseException],
+    termination_not_performed_error_type: type[BaseException],
     public_exception_type_name: Callable[[BaseException], str],
 ) -> ToolResult | None:
     """Build a safe terminal tool outcome, or decline unsupported failures.
@@ -80,10 +81,16 @@ def _termination_partial_result(
     reconciliation = [
         item for item in leaves if isinstance(item, reconciliation_error_type)
     ]
+    termination_not_performed = [
+        item
+        for item in leaves
+        if isinstance(item, termination_not_performed_error_type)
+    ]
     supported = (
         retained_error_type,
         not_performed_error_type,
         reconciliation_error_type,
+        termination_not_performed_error_type,
         asyncio.CancelledError,
     )
     if any(not isinstance(item, supported) for item in leaves):
@@ -96,19 +103,28 @@ def _termination_partial_result(
     # Cancellation alone must retain normal task-cancellation semantics. A
     # typed reconciliation error is independently sufficient proof of removal;
     # otherwise this helper is specifically the retained-custody contract.
-    if not retained and not not_performed and (
+    if not retained and not not_performed and not termination_not_performed and (
         not reconciliation or len(reconciliation) != len(leaves)
     ):
+        return None
+    if termination_not_performed and len(termination_not_performed) == len(leaves):
         return None
 
     get_agent = getattr(manager, "get_agent", None)
     if not callable(get_agent):
         return None
+    named_termination_not_performed = any(
+        getattr(item, "child_name", None).casefold() == child_name.casefold()
+        for item in termination_not_performed
+        if isinstance(getattr(item, "child_name", None), str)
+    )
     try:
-        named_child_removed = get_agent(child_name) is None
+        named_child_removed = (
+            not named_termination_not_performed and get_agent(child_name) is None
+        )
     except Exception:
         return None
-    if not named_child_removed:
+    if not named_child_removed and not named_termination_not_performed:
         return None
 
     retained_agents: list[str] = []
@@ -177,15 +193,21 @@ def _termination_partial_result(
         cleanup_state = "retained"
 
     if offboard_runtime:
-        runtime_retained = bool(retained) or "not_hosted" in no_op_states
-        named_runtime_retained = named_child_retained or (
+        runtime_retained = (
+            not named_child_removed
+            or bool(retained)
+            or "not_hosted" in no_op_states
+        )
+        named_runtime_retained = not named_child_removed or named_child_retained or (
             named_child_not_performed and "not_hosted" in no_op_states
         )
-        named_runtime_removed = (
+        named_runtime_removed = named_child_removed and (
             not named_child_retained and not named_child_not_performed
         )
         reported_cleanup_state = (
-            cleanup_state
+            "not_performed"
+            if not named_child_removed
+            else cleanup_state
             if retained
             else no_op_cleanup_state or "removed"
         )
@@ -201,11 +223,16 @@ def _termination_partial_result(
         reported_cleanup_state = "not_requested"
 
     data: Dict[str, Any] = {
-        "terminated": True,
+        "terminated": named_child_removed,
         "child_name": child_name,
-        "agent_removed": True,
+        "agent_removed": named_child_removed,
         "runtime_offboard_requested": offboard_runtime,
-        "runtime_offboarded": offboard_runtime and not retained and not not_performed,
+        "runtime_offboarded": (
+            offboard_runtime
+            and named_child_removed
+            and not retained
+            and not not_performed
+        ),
         "runtime_retained": runtime_retained,
         "runtime_retained_for_restart": not offboard_runtime,
         "named_child_runtime_retained": named_runtime_retained,
@@ -213,7 +240,7 @@ def _termination_partial_result(
         "runtime_cleanup_pending": cleanup_pending,
         "runtime_cleanup_state": reported_cleanup_state,
         "operator_action_required": True,
-        "retry_termination": False,
+        "retry_termination": not named_child_removed,
         "retained_outcome_count": len(retained),
         "retained_agents": retained_agents,
         "additional_outcome_count": len(additional),
@@ -228,6 +255,10 @@ def _termination_partial_result(
             data["retained_cause_type"] = cause_types[0]
     if reconciliation:
         data["tracking_reconciled"] = False
+    if termination_not_performed:
+        data["termination_not_performed_outcome_count"] = len(
+            termination_not_performed
+        )
     if not_performed:
         data["not_performed_outcome_count"] = len(not_performed)
         data["not_performed_agents"] = not_performed_agents
@@ -235,7 +266,12 @@ def _termination_partial_result(
         data["runtime_already_absent"] = "already_absent" in no_op_states
         data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
 
-    if not offboard_runtime:
+    if not named_child_removed:
+        custody_message = (
+            "Descendant cleanup had terminal outcomes, but the named child was "
+            "not removed. Retry termination after operator reconciliation."
+        )
+    elif not offboard_runtime:
         custody_message = (
             "The child was stopped and its runtime state was retained for "
             "restart, but lifecycle bookkeeping requires operator "
@@ -271,7 +307,11 @@ def _termination_partial_result(
             "operator reconciliation. Do not retry termination."
         )
     return ToolResult.partial(
-        f"Terminated child '{child_name}'.",
+        (
+            f"Terminated child '{child_name}'."
+            if named_child_removed
+            else f"Child '{child_name}' was not terminated."
+        ),
         custody_message,
         data=data,
     )
@@ -835,6 +875,7 @@ class SpawnFeature(Feature):
 
         # Remove from manager (handles shutdown + cascading child termination)
         from kestrel_sovereign.multi_agent.agent_manager import (
+            ChildTerminationNotPerformedError,
             ChildTerminationReconciliationError,
             RuntimeOffboardingNotPerformedError,
             RuntimeOffboardingRetainedError,
@@ -879,6 +920,9 @@ class SpawnFeature(Feature):
                 retained_error_type=RuntimeOffboardingRetainedError,
                 not_performed_error_type=RuntimeOffboardingNotPerformedError,
                 reconciliation_error_type=ChildTerminationReconciliationError,
+                termination_not_performed_error_type=(
+                    ChildTerminationNotPerformedError
+                ),
                 public_exception_type_name=public_exception_type_name,
             )
             if partial is None:
@@ -910,15 +954,15 @@ class SpawnFeature(Feature):
         """Default permission levels for spawn tools.
 
         spawn_agent requires explicit approval (ASK) since it creates new agents.
-        Read/delegation tools default to ALLOW. ``terminate_child`` is ASK
-        because its explicit ``offboard_runtime`` mode irreversibly deletes
-        tenant state; permission policy is tool-scoped rather than argument-
-        scoped, so the safe default must cover the destructive variant.
+        Read/delegation tools default to ALLOW. ``terminate_child`` is
+        ALWAYS_ASK because its explicit ``offboard_runtime`` mode irreversibly
+        deletes tenant state; permission policy is tool-scoped rather than
+        argument-scoped, so auto/demo policy must never promote this gate.
         """
         return {
             "spawn_agent": "ask",
             "list_children": "allow",
             "delegate_task": "allow",
             "get_child_result": "allow",
-            "terminate_child": "ask",
+            "terminate_child": "always_ask",
         }

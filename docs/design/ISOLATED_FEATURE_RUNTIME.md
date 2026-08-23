@@ -230,6 +230,12 @@ namespace. A cross-device move, unsafe owner/mode, path race, or both-old-and-
 new collision retains the old tree (and both trees for a collision) and
 quarantines the optional feature for operator reconciliation; Core never
 copies, merges, overwrites, or deletes ambiguous credentials.
+Explicit agent offboarding checks this released per-agent root independently
+of feature discovery, so state for a feature that was never loaded/adopted is
+not orphaned while the new namespace is reported removed. A service-owned,
+non-writable released tree is securely swept without following symlinks;
+ambiguous custody or a nested namespace marker retains it and makes the whole
+offboarding outcome visibly retained.
 
 Moving a venv changes the absolute interpreter path embedded in console-script
 shebangs. Core therefore records the canonical absolute venv path in its
@@ -240,7 +246,10 @@ a stale wrapper, Core performs one full package reinstall at the adopted
 destination before child launch; an ordinary `--upgrade` is not accepted as
 repair because already-satisfied packages may retain stale scripts. If repair
 cannot complete, Core quarantines the optional feature rather than launch the
-unusable wrapper. A missing path stamp alone is not relocation evidence:
+unusable wrapper. Import, configuration, and preparation quarantines are also
+retained in the agent's rejected-contribution inventory, so detailed health is
+degraded and names the unavailable feature instead of reporting a silent
+healthy boot. A missing path stamp alone is not relocation evidence:
 unchanged pre-upgrade venvs are positively probed and their path is atomically
 backfilled without contacting an index. A migrated module-callable runtime (or
 an already-repaired console wrapper) is similarly verified and adopted without
@@ -338,8 +347,9 @@ reaper deletes only when the original caller carried that explicit intent and
 durable shutdown later succeeds. The initiating DELETE/tool call immediately
 receives a typed pending-custody outcome rather than claiming deletion; the
 reaper remains the sole owner of eventual deletion. The `terminate_child` tool
-defaults to state retention and is permission-gated `ASK` because its explicit
-`offboard_runtime=true` variant is irreversible. For that destructive variant,
+defaults to state retention and is permission-gated `ALWAYS_ASK` because its
+explicit `offboard_runtime=true` variant is irreversible and ordinary ASK can
+be promoted by auto/demo policy. For that destructive variant,
 the tool reports pending/retained cleanup as partial success: the named child is
 stopped and must not be retried, while any named child or descendant with
 pending/retained runtime custody is identified separately for operator

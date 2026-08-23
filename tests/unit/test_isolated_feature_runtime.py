@@ -526,6 +526,31 @@ def test_service_command_console_script(tmp_path):
     assert (runtime.project or runtime.distribution) == "service"
 
 
+def test_windows_console_service_uses_and_verifies_exe_launcher(
+    monkeypatch,
+    tmp_path,
+):
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    runtime = InstalledFeatureRuntime(
+        class_name="WindowsServiceFeature",
+        entry_point="svc.feature:WindowsServiceFeature",
+        distribution="windows-service",
+        runtime="isolated-venv",
+        service="windows-service",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    monkeypatch.setattr(isolated_runtime.os, "name", "nt")
+    launcher = feature._venv_path / "Scripts" / "windows-service.exe"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(b"MZ\x00binary-console-launcher")
+
+    assert feature._service_command() == [str(launcher)]
+    assert feature._console_script_location_state() == "current"
+    feature._verify_launch_artifact()
+
+
 def test_service_command_module_func(tmp_path):
     """`service` of the form module:func runs via the venv python, not `-m`."""
     agent = Mock(did=_TEST_AGENT_DID)
@@ -1583,6 +1608,25 @@ def _write_prebuilt_venv_shape(venv: Path) -> Path:
     return python
 
 
+def _materialize_fake_provisioned_venv(feature: ProxyFeature) -> Path:
+    """Create the launch artifacts a successful uv install must provide."""
+
+    assert feature._venv_path is not None
+    python = isolated_runtime._venv_python(feature._venv_path)
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o700)
+    service = feature.runtime.service
+    if isinstance(service, str) and service and ":" not in service:
+        console = isolated_runtime._console_script_path(
+            feature._venv_path,
+            service,
+        )
+        console.write_text(f"#!{python}\nexit 0\n")
+        console.chmod(0o700)
+    return python
+
+
 def _runtime_with_declared_venv(venv: str) -> InstalledFeatureRuntime:
     runtime = _isolated_runtime()
     return InstalledFeatureRuntime(
@@ -2524,8 +2568,11 @@ def test_relocated_venv_failed_repair_retains_stale_stamp_for_retry(
 
     successful_runs.clear()
     feature.ensure_venv()
-    assert "--upgrade" in successful_runs[-1]
-    assert "--reinstall" not in successful_runs[-1]
+    # The old-path stamp remains durable evidence of relocation after the
+    # prior manifest publish failed. A restart must keep forcing console-script
+    # repair until the new canonical stamp is atomically durable.
+    assert "--reinstall" in successful_runs[-1]
+    assert "--upgrade" not in successful_runs[-1]
     repaired = json.loads(stale_manifest.read_text())
     assert repaired["venv_path"] == str(feature._venv_path.resolve())
 
@@ -3566,6 +3613,24 @@ def test_runtime_cleanup_primitive_reports_exact_absent_and_unhosted_custody(
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="released cleanup uses POSIX dirfds")
+def test_released_cleanup_refuses_nested_runtime_owner_without_mutation(tmp_path):
+    legacy_root = tmp_path / "agent" / "feature_venvs"
+    nested = legacy_root / "LegacyFeature" / "nested-agent"
+    nested.mkdir(parents=True, mode=0o700)
+    legacy_root.chmod(0o700)
+    (legacy_root / "LegacyFeature").chmod(0o700)
+    credential = legacy_root / "LegacyFeature" / "credential"
+    credential.write_text("retain-me")
+    (nested / isolated_runtime._RUNTIME_OWNER_MARKER).write_text("foreign-owner")
+
+    with pytest.raises(IsolatedRuntimeNamespaceError, match="nested ownership marker"):
+        isolated_runtime.remove_released_legacy_runtime_root(legacy_root)
+
+    assert credential.read_text() == "retain-me"
+    assert (nested / isolated_runtime._RUNTIME_OWNER_MARKER).is_file()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
 def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_path):
     runtime_dir = tmp_path / "feature-runtime"
@@ -3590,6 +3655,56 @@ def test_relocation_repair_marker_recovers_only_its_interrupted_temp_link(tmp_pa
         assert external.is_file()
     finally:
         os.close(directory_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="repair marker uses POSIX dirfds")
+def test_relocation_marker_publisher_refuses_missing_post_link_witness(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_dir = tmp_path / "feature-runtime"
+    runtime_dir.mkdir(mode=0o700)
+    directory_fd = os.open(runtime_dir, isolated_runtime._directory_open_flags())
+    reads = iter((False, False))
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_read_venv_relocation_repair_marker_at",
+        lambda _fd: next(reads),
+    )
+    try:
+        with pytest.raises(
+            IsolatedRuntimePreparationError,
+            match="could not be recorded",
+        ):
+            isolated_runtime._ensure_venv_relocation_repair_marker_at(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory fsync is POSIX")
+def test_portable_relocation_marker_fsyncs_directory_before_return(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_dir = tmp_path / "feature-runtime"
+    runtime_dir.mkdir(mode=0o700)
+    real_fsync = os.fsync
+    fsynced_directory = False
+
+    def observe_fsync(descriptor):
+        nonlocal fsynced_directory
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            fsynced_directory = True
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(isolated_runtime.os, "fsync", observe_fsync)
+
+    isolated_runtime._ensure_venv_relocation_repair_marker_portable(runtime_dir)
+
+    assert fsynced_directory is True
+    assert isolated_runtime._read_venv_relocation_repair_marker_portable(
+        runtime_dir
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="secure cleanup is POSIX-only")
@@ -4215,7 +4330,14 @@ async def test_hosted_workspace_survives_failed_start_and_restarts_in_same_scope
 ):
     """Cleanup retires the failed child without deleting durable agent state."""
 
-    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    executable = tmp_path / "operator" / "wa-service"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv(
+        "KESTREL_FEATURE_WHATSAPPFEATURE_BIN",
+        str(executable),
+    )
     agent = _hosted_postgres_agent(
         tmp_path / "hosted-runtime",
         "tenant/agent",
@@ -4233,9 +4355,11 @@ async def test_hosted_workspace_survives_failed_start_and_restarts_in_same_scope
 
     failed = ProxyFeature(agent, _isolated_runtime(), client_factory=failing_factory)
     workspace = failed._feature_runtime_dir()
-    with pytest.raises(RuntimeError, match="synthetic start failure"):
+    with pytest.raises(IsolatedRuntimePreparationError) as failure:
         await failed.initialize()
 
+    assert "synthetic start failure" not in str(failure.value)
+    assert isinstance(failure.value.__cause__, RuntimeError)
     assert failed._client is None
     assert failed_clients[0].stopped is True
     assert workspace.is_dir()
@@ -4349,10 +4473,7 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
 
     def fake_run(cmd):
         runs.append(cmd)
-        # Materialize the venv python so the "exists" branch is taken next time.
-        py = feature._venv_path / "bin" / "python"
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.touch()
+        _materialize_fake_provisioned_venv(feature)
 
     monkeypatch.setattr(feature, "_run", fake_run)
     # Child venv python is a stub (empty file) — report a concrete SDK version
@@ -4406,6 +4527,75 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert runs == []
 
 
+@pytest.mark.parametrize("existing", (False, True), ids=("fresh", "upgrade"))
+def test_every_provision_refuses_to_stamp_missing_console_service(
+    tmp_path,
+    monkeypatch,
+    existing,
+):
+    runtime = InstalledFeatureRuntime(
+        class_name="MissingConsoleFeature",
+        entry_point="missing.feature:MissingConsoleFeature",
+        distribution="missing-console-package",
+        runtime="isolated-venv",
+        service="missing-console-service",
+        project="missing-console-package",
+    )
+    feature = ProxyFeature(
+        Mock(storage_path=str(tmp_path / "agent" / "kestrel_prime.db")),
+        runtime,
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    manifest_path = feature._provision_manifest_path()
+    if existing:
+        python = isolated_runtime._venv_python(feature._venv_path)
+        python.parent.mkdir(parents=True)
+        python.touch()
+        feature._write_provision_manifest(
+            runtime.project,
+            "old-host-sdk",
+            "old-host-sdk",
+            "1.0.0",
+            _child_distribution_probe("1.0.0"),
+        )
+        original_manifest = manifest_path.read_bytes()
+    else:
+        original_manifest = None
+
+    def provision_without_console(_command):
+        python = isolated_runtime._venv_python(feature._venv_path)
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.touch()
+
+    feature._run = provision_without_console
+    feature._probe_sdk_version = Mock(return_value="current-host-sdk")
+    feature._probe_feature_distribution = Mock(
+        return_value=_child_distribution_probe("1.0.0")
+    )
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_host_sdk_version",
+        lambda: "current-host-sdk",
+    )
+    monkeypatch.setattr(
+        isolated_runtime,
+        "_feature_distribution_version",
+        lambda _distribution, _target: "1.0.0",
+    )
+
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="launch artifact could not be verified",
+    ):
+        feature.ensure_venv()
+
+    if original_manifest is None:
+        assert not manifest_path.exists()
+    else:
+        assert manifest_path.read_bytes() == original_manifest
+
+
 def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, monkeypatch):
     """An unversioned Telegram service target still follows its distribution release."""
     import kestrel_sovereign.features.isolated_runtime as ir
@@ -4428,9 +4618,7 @@ def test_ensure_venv_reprovisions_when_telegram_distribution_upgrades(tmp_path, 
 
     def fake_run(cmd):
         runs.append(cmd)
-        python = feature._venv_path / "bin" / "python"
-        python.parent.mkdir(parents=True, exist_ok=True)
-        python.touch()
+        _materialize_fake_provisioned_venv(feature)
 
     version = {"value": "0.1.1"}
     monkeypatch.setattr(feature, "_run", fake_run)
@@ -4501,6 +4689,7 @@ def test_ensure_venv_reprovisions_when_installed_child_no_longer_matches_manifes
         runs.append(cmd)
         if "pip" in cmd and "install" in cmd:
             child_version["value"] = "0.1.2"
+            _materialize_fake_provisioned_venv(feature)
 
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
@@ -4576,9 +4765,7 @@ def test_ensure_venv_local_editable_version_stamp_converges(tmp_path, monkeypatc
 
     def fake_run(cmd):
         runs.append(cmd)
-        python = feature._venv_path / "bin" / "python"
-        python.parent.mkdir(parents=True, exist_ok=True)
-        python.touch()
+        _materialize_fake_provisioned_venv(feature)
         if "pip" in cmd and "install" in cmd:
             child_version["value"] = tomllib.loads(pyproject.read_text())["project"][
                 "version"
@@ -4815,9 +5002,7 @@ def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypat
 
     def fake_run(cmd):
         runs.append(cmd)
-        py = feature._venv_path / "bin" / "python"
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.touch()
+        _materialize_fake_provisioned_venv(feature)
 
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
@@ -4869,9 +5054,7 @@ def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
 
     def fake_run(cmd):
         runs.append(cmd)
-        python = feature._venv_path / "bin" / "python"
-        python.parent.mkdir(parents=True, exist_ok=True)
-        python.touch()
+        _materialize_fake_provisioned_venv(feature)
 
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
@@ -4881,7 +5064,10 @@ def test_ensure_venv_refuses_to_stamp_an_older_child_feature_distribution(
         ir, "_venv_feature_distribution_probe", lambda _path, _distribution: _child_distribution_probe("0.1.9")
     )
 
-    with pytest.raises(RuntimeError, match="refusing to stamp the venv fresh"):
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="did not match the host release",
+    ):
         feature.ensure_venv()
 
     assert not (feature._venv_path / ".kestrel_provision.json").exists()
@@ -4972,9 +5158,7 @@ def test_ensure_venv_unknown_feature_versions_stamp_once_without_reinstall_loop(
 
     def fake_run(cmd):
         runs.append(cmd)
-        python = feature._venv_path / "bin" / "python"
-        python.parent.mkdir(parents=True, exist_ok=True)
-        python.touch()
+        _materialize_fake_provisioned_venv(feature)
 
     monkeypatch.setattr(feature, "_run", fake_run)
     monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.35.1")
@@ -5889,8 +6073,10 @@ async def test_post_promotion_start_failure_rebuilds_active_child_before_traffic
         await feature.persist_config(old_config)
         await feature.initialize()
 
-        with pytest.raises(RuntimeError, match="promoted candidate could not start"):
+        with pytest.raises(IsolatedRuntimePreparationError) as failure:
             await feature.set_config(next_config)
+        assert "promoted candidate could not start" not in str(failure.value)
+        assert isinstance(failure.value.__cause__, RuntimeError)
 
         assert clients[0].stopped is True
         assert clients[1].stopped is True
@@ -5947,8 +6133,10 @@ async def test_post_promotion_recovery_start_failure_seals_traffic(monkeypatch, 
         await feature.persist_config(old_config)
         await feature.initialize()
 
-        with pytest.raises(RuntimeError, match="replacement child could not start"):
+        with pytest.raises(IsolatedRuntimePreparationError) as failure:
             await feature.set_config(next_config)
+        assert "replacement child could not start" not in str(failure.value)
+        assert isinstance(failure.value.__cause__, RuntimeError)
 
         # The first failed child was the post-promotion candidate and the
         # second was the forced durable recovery. Neither is publishable.
@@ -7619,8 +7807,10 @@ async def test_fenced_promotion_recovery_quarantines_when_old_child_cannot_resta
         await feature.persist_config(old_config)
         await feature.initialize()
 
-        with pytest.raises(RuntimeError, match="old-config child could not start"):
+        with pytest.raises(IsolatedRuntimePreparationError) as failure:
             await feature.set_config(next_config)
+        assert "old-config child could not start" not in str(failure.value)
+        assert isinstance(failure.value.__cause__, RuntimeError)
 
         # No pending next-config candidate starts. The sole attempted recovery
         # child uses durable old config, fails, and remains detached; the
@@ -9727,8 +9917,10 @@ async def test_registration_failure_after_shutdown_retirement_does_not_stop_twic
         assert not shutdown_task.done()
 
         release_registration.set()
-        with pytest.raises(RuntimeError, match="event registration failed"):
+        with pytest.raises(IsolatedRuntimePreparationError) as failure:
             await asyncio.wait_for(initialize_task, timeout=1)
+        assert "event registration failed" not in str(failure.value)
+        assert isinstance(failure.value.__cause__, RuntimeError)
         await asyncio.wait_for(shutdown_task, timeout=1)
 
         assert client.stop_calls == 1
@@ -9836,8 +10028,10 @@ async def test_reload_candidate_start_failure_quarantines_stopped_old_child(
         old_client = clients[0]
         assert channel_feature.registry.get("whatsapp") is not None
 
-        with pytest.raises(RuntimeError, match="candidate start failed"):
+        with pytest.raises(IsolatedRuntimePreparationError) as failure:
             await feature.reload()
+        assert "candidate start failed" not in str(failure.value)
+        assert isinstance(failure.value.__cause__, RuntimeError)
 
         assert old_client.stopped is True
         assert clients[1].stopped is True

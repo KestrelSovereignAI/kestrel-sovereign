@@ -917,8 +917,15 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
             logger.error(
                 "Error loading isolated entry_point feature %s: %s",
                 class_name,
-                e,
+                type(e).__name__,
             )
+            recorder = getattr(agent, "record_feature_unavailable", None)
+            if callable(recorder):
+                recorder(
+                    feature=None,
+                    feature_name=class_name,
+                    reason="the optional isolated runtime could not be imported",
+                )
             continue
 
         try:
@@ -929,11 +936,26 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         except isolated_runtime.IsolatedRuntimeNamespaceError:
             raise
         except Exception as e:
+            if isinstance(e, isolated_runtime.IsolatedRuntimeConfigurationError):
+                reason = type(e).safe_diagnostic(e)
+            elif isinstance(e, isolated_runtime.IsolatedRuntimePreparationError):
+                reason = isolated_runtime.safe_isolated_runtime_preparation_diagnostic(
+                    e
+                )
+            else:
+                reason = "the isolated feature could not be prepared for discovery"
             logger.error(
                 "Error loading isolated entry_point feature %s: %s",
                 class_name,
-                e,
+                reason,
             )
+            recorder = getattr(agent, "record_feature_unavailable", None)
+            if callable(recorder):
+                recorder(
+                    feature=None,
+                    feature_name=class_name,
+                    reason=reason,
+                )
             continue
 
         features.append(feature)

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -3279,29 +3280,48 @@ class TestInitialize:
                         await _shutdown_feature_init_test_agent(agent)
 
     @pytest.mark.asyncio
-    async def test_core_feature_registration_never_imports_isolated_runtime(self):
-        """The startup wrapper has no isolated-runtime dependency on success."""
+    async def test_core_feature_failure_never_imports_isolated_runtime(
+        self,
+        monkeypatch,
+    ):
+        """The real optional-core failure path has no isolated dependency."""
 
         agent = KestrelAgent(did="did:test:core-registration")
-        feature = _mandatory_feature_double(sorted(MANDATORY_FEATURES)[0])
-        register = AsyncMock()
+        module_name = "kestrel_sovereign.features.isolated_runtime"
+        # This test module imports ProxyFeature for separate hosted tests. Make
+        # the production classifier face a genuinely absent optional module,
+        # then drive a real Feature.initialize failure through _register_feature
+        # rather than mocking the exact seam under test.
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+        class OrdinaryCoreFeature(Feature):
+            @property
+            def tool_description(self):
+                return "ordinary core test feature"
+
+            async def initialize(self):
+                raise RuntimeError("ordinary core initialization failed")
+
+        feature = OrdinaryCoreFeature(agent)
         real_import = __import__
 
         def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "kestrel_sovereign.features.isolated_runtime":
+            if name == module_name:
                 raise AssertionError("core registration imported isolated runtime")
             return real_import(name, globals, locals, fromlist, level)
 
-        with patch.object(agent, "_register_feature", register), patch(
+        with patch(
             "builtins.__import__",
             side_effect=guarded_import,
         ):
-            assert await agent._register_startup_feature(feature) is True
+            with pytest.raises(
+                RuntimeError,
+                match="ordinary core initialization failed",
+            ):
+                await agent._register_startup_feature(feature)
 
-        register.assert_awaited_once_with(
-            feature,
-            prepared_contributions=None,
-        )
+        assert module_name not in sys.modules
+        assert feature.name not in agent.features
 
     @pytest.mark.asyncio
     async def test_hosted_boot_quarantines_late_optional_environment_config(
@@ -3366,6 +3386,92 @@ class TestInitialize:
             assert "persisted per-agent feature configuration" in caplog.text
             assert "runtime could not be prepared" not in caplog.text
             assert secret not in caplog.text
+            rejections = agent.rejected_feature_contributions
+            assert [item.feature_name for item in rejections] == [optional.name]
+            assert unsafe_key in rejections[0].reason
+            from kestrel_sovereign.server import _with_contribution_rejections
+
+            health = _with_contribution_rejections(
+                agent,
+                {"status": "healthy", "checks": {}},
+            )
+            assert health["status"] == "degraded"
+            assert health["features_not_loaded"] == [
+                {
+                    "feature": optional.name,
+                    "reason": rejections[0].reason,
+                }
+            ]
+        finally:
+            await _shutdown_feature_init_test_agent(agent)
+
+    @pytest.mark.asyncio
+    async def test_hosted_boot_quarantines_operational_child_start_failure(
+        self,
+        caplog,
+        monkeypatch,
+        tmp_path,
+    ):
+        """An optional subprocess failure degrades health, not agent identity."""
+
+        agent = KestrelAgent(
+            did="did:test:optional-child-start",
+            storage_path=str(tmp_path / "agent" / "test.db"),
+            isolated_runtime_root=tmp_path / "hosted-runtime",
+            isolated_runtime_namespace="tenant/agent",
+            isolated_runtime_hosted=True,
+        )
+        runtime = InstalledFeatureRuntime(
+            class_name="StartFailureFeature",
+            entry_point="test.feature:StartFailureFeature",
+            distribution="start-failure-feature",
+            runtime="isolated-venv",
+            service="start-failure-service",
+        )
+        monkeypatch.setenv(
+            "KESTREL_FEATURE_STARTFAILUREFEATURE_BIN",
+            "/usr/bin/true",
+        )
+
+        class FailingClient:
+            async def start(self):
+                raise RuntimeError("third-party-secret-start-detail")
+
+            async def stop(self):
+                return None
+
+        def client_factory(command, *, env, cwd, **_kwargs):
+            assert env is not None
+            assert cwd is not None
+            return FailingClient()
+
+        optional = ProxyFeature(
+            agent,
+            runtime,
+            client_factory=client_factory,
+        )
+        mandatory_features = [
+            _mandatory_feature_double(name)
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
+
+        try:
+            with caplog.at_level("ERROR"):
+                await _initialize_with_features(
+                    agent,
+                    [*mandatory_features, optional],
+                )
+
+            assert set(MANDATORY_FEATURES).issubset(agent.features)
+            assert optional.name not in agent.features
+            assert [
+                item.feature_name
+                for item in agent.rejected_feature_contributions
+            ] == [optional.name]
+            assert "agent-scoped runtime could not be prepared" in caplog.text
+            assert "third-party-secret-start-detail" not in caplog.text
         finally:
             await _shutdown_feature_init_test_agent(agent)
 

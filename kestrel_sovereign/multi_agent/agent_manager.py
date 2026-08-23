@@ -14,6 +14,7 @@ import inspect
 import logging
 import math
 import os
+import stat
 import sys
 import time
 from collections import deque
@@ -209,6 +210,25 @@ class ChildTerminationReconciliationError(RuntimeError):
             f"Child {child_name!r} was removed, but lifecycle bookkeeping "
             "requires operator reconciliation."
         )
+
+
+class ChildTerminationNotPerformedError(RuntimeError):
+    """The named child was not removed after descendant teardown was attempted.
+
+    Descendant terminal outcomes still need to reach the tool caller, but none
+    of them proves that the requested child was stopped.  This leaf makes that
+    negative result explicit so a grouped descendant failure cannot be
+    misreported as successful termination of the named child.
+    """
+
+    def __init__(self, *, child_name: str) -> None:
+        self.child_name = child_name
+        self.metadata = {
+            "code": "child_termination_not_performed",
+            "child_name": child_name,
+            "agent_removed": False,
+        }
+        super().__init__(f"Child {child_name!r} was not removed.")
 
 
 def _agent_runtime_path(agent: object) -> Optional[Path]:
@@ -2587,6 +2607,7 @@ class AgentManager:
         *,
         offboard_runtime: bool = False,
         known_agent_id: Optional[str] = None,
+        known_agent_config: Optional[LocalAgentConfig] = None,
     ) -> bool:
         """Stop/unpublish an agent and optionally offboard its runtime tree.
 
@@ -2606,6 +2627,7 @@ class AgentManager:
                 name,
                 offboard_runtime=offboard_runtime,
                 known_agent_id=known_agent_id,
+                known_agent_config=known_agent_config,
                 pending_offboarding=pending_offboarding,
             )
         except BaseException as exc:
@@ -2649,6 +2671,7 @@ class AgentManager:
         *,
         offboard_runtime: bool,
         known_agent_id: Optional[str],
+        known_agent_config: Optional[LocalAgentConfig],
         pending_offboarding: list[InflightRuntimeOffboarding],
     ) -> bool:
         """Stop and unpublish an agent while serializing with cold wakes.
@@ -2676,6 +2699,15 @@ class AgentManager:
         ):
             raise TypeError(
                 "known_agent_id requires destructive offboarding and a non-empty DID"
+            )
+        if known_agent_config is not None and (
+            known_agent_id is None
+            or not offboard_runtime
+            or not isinstance(known_agent_config, LocalAgentConfig)
+        ):
+            raise TypeError(
+                "known_agent_config requires destructive offboarding, a known DID, "
+                "and a LocalAgentConfig"
             )
 
         async with self._lock:
@@ -2720,7 +2752,11 @@ class AgentManager:
                 )
 
         cold_identity_offboarding: Optional[
-            tuple[str, Optional[tuple[str, LocalAgentConfig]]]
+            tuple[
+                str,
+                Optional[tuple[str, LocalAgentConfig]],
+                Optional[LocalAgentConfig],
+            ]
         ] = None
         async with self.scheduler_lifecycle_lock(agent_id):
             async with self._a2a_lifecycle_lock:
@@ -2746,7 +2782,11 @@ class AgentManager:
                         name = authority[0]
                         revoked = self._revoke_scheduler_authority(name, agent_id)
                         if offboard_runtime:
-                            cold_identity_offboarding = (name, revoked)
+                            cold_identity_offboarding = (
+                                name,
+                                revoked,
+                                revoked[1] if revoked is not None else known_agent_config,
+                            )
                         else:
                             logger.info(
                                 "Revoked cold scheduler authority for agent %r",
@@ -2764,14 +2804,35 @@ class AgentManager:
                                 "Registered agent DID belongs to a different routing "
                                 "name; offboarding was refused."
                             )
-                        if self._has_budgeted_descendants(name):
+                        if self._has_budgeted_descendants(
+                            name,
+                            known_agent_id=agent_id,
+                        ):
                             raise ValueError(
                                 f"Cannot remove '{name}' directly: it has budgeted "
                                 "child agents. Use terminate_child, which cascades "
                                 "and releases nested budgets leaf-first (#2113)."
                             )
+                        identity_config = (
+                            known_agent_config or self._created_configs.get(name)
+                        )
+                        if (
+                            self._hosted_agent_runtime_factory_configured(
+                                os.environ.get("KESTREL_DB_BACKEND", "sqlite"),
+                                os.environ.get("KESTREL_DATABASE_URL"),
+                            )
+                            and identity_config is None
+                        ):
+                            raise ValueError(
+                                "Registered hosted agent configuration is unavailable; "
+                                "offboarding was refused before filesystem cleanup."
+                            )
                         revoked = self._revoke_scheduler_authority(name, agent_id)
-                        cold_identity_offboarding = (name, revoked)
+                        cold_identity_offboarding = (
+                            name,
+                            revoked,
+                            identity_config,
+                        )
                     else:
                         return await self._remove_agent_without_scheduler_lifecycle(
                             name,
@@ -2814,11 +2875,12 @@ class AgentManager:
                     return removed
 
         assert cold_identity_offboarding is not None
-        cold_name, revoked = cold_identity_offboarding
+        cold_name, revoked, cold_config = cold_identity_offboarding
         admitted, admission_cancelled = (
             await self._admit_agent_runtime_offboarding_identity(
                 name=cold_name,
                 agent_id=agent_id,
+                config=cold_config,
                 revoked=revoked,
                 pending_offboarding=pending_offboarding,
             )
@@ -2981,6 +3043,7 @@ class AgentManager:
         *,
         name: str,
         agent_id: str,
+        config: Optional[LocalAgentConfig],
         revoked: Optional[tuple[str, LocalAgentConfig]],
         pending_offboarding: list[InflightRuntimeOffboarding],
     ) -> tuple[bool, bool]:
@@ -3016,6 +3079,7 @@ class AgentManager:
                 record = self._start_agent_runtime_offboarding_identity(
                     name=name,
                     agent_id=agent_id,
+                    config=config,
                 )
             except BaseException:
                 if revoked is not None:
@@ -3034,11 +3098,13 @@ class AgentManager:
         *,
         name: str,
         agent_id: str,
+        config: Optional[LocalAgentConfig] = None,
     ) -> InflightRuntimeOffboarding:
         """Register deletion for a cold agent while the caller owns ``_lock``."""
 
         from kestrel_sovereign.features.isolated_runtime import (
             remove_runtime_namespace,
+            resolve_legacy_isolated_runtime_root,
             resolve_isolated_runtime_namespace,
         )
 
@@ -3049,11 +3115,36 @@ class AgentManager:
         ):
             root, namespace = self._isolated_runtime_scope(agent_id)
             scope = resolve_isolated_runtime_namespace(root, namespace)
+        legacy_root = None
+        if scope is not None and config is not None:
+            resolved_data_dir = config.resolve_data_dir(self._base_data_dir)
+            try:
+                data_dir_metadata = resolved_data_dir.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                data_dir_metadata = None
+            if data_dir_metadata is not None:
+                if not stat.S_ISDIR(data_dir_metadata.st_mode):
+                    raise ValueError(
+                        "Registered agent data directory is unsafe; offboarding "
+                        "was refused."
+                    )
+                legacy_root = resolve_legacy_isolated_runtime_root(
+                    resolved_data_dir / "feature_venvs",
+                    scope,
+                )
+
+        # A concurrent destructive owner may already have admitted this DID
+        # before routing disappeared.  Join that exact worker instead of
+        # launching two recursive deletions against the same tenant tree.
+        for existing in self._inflight_runtime_offboardings.values():
+            if existing.agent_id == agent_id:
+                return existing
         cleanup_task = asyncio.create_task(
             asyncio.to_thread(
                 remove_runtime_namespace,
                 scope,
                 agent_id,
+                legacy_root,
             ),
             name=f"isolated_runtime_namespace_offboard:{name}",
         )
@@ -3742,6 +3833,9 @@ class AgentManager:
         handoff_offboarding_pending: Optional[
             RuntimeOffboardingRetainedError
         ] = None
+        unpublished_offboarding_failure: Optional[
+            RuntimeOffboardingRetainedError
+        ] = None
         async with self._lock:
             if self._quarantined_shutdown_handoffs_sealed:
                 logger.warning(
@@ -3752,6 +3846,34 @@ class AgentManager:
                 return False
             unpublished_hold = name not in self._agents and name in self._child_budgets
             if unpublished_hold:
+                unpublished_agent_id = self._budgeted_child_agent_id(name)
+                if offboard_runtime:
+                    unpublished_config = self._created_configs.get(name)
+                    hosted_factory = self._hosted_agent_runtime_factory_configured(
+                        os.environ.get("KESTREL_DB_BACKEND", "sqlite"),
+                        os.environ.get("KESTREL_DATABASE_URL"),
+                    )
+                    if unpublished_agent_id is None or (
+                        hosted_factory and unpublished_config is None
+                    ):
+                        unpublished_offboarding_failure = (
+                            RuntimeOffboardingRetainedError(
+                                agent_name=name,
+                                agent_id="<unknown>",
+                                runtime_path=None,
+                                cause=RuntimeError(
+                                    "unpublished child identity is unavailable"
+                                ),
+                            )
+                        )
+                    else:
+                        pending_offboarding.append(
+                            self._start_agent_runtime_offboarding_identity(
+                                name=name,
+                                agent_id=unpublished_agent_id,
+                                config=unpublished_config,
+                            )
+                        )
                 ordinary_budget_release = self._start_child_budget_release(name)
         if unpublished_hold:
             assert ordinary_budget_release is not None
@@ -3771,6 +3893,8 @@ class AgentManager:
             )
             if release_cancelled or reconciliation_cancelled:
                 raise asyncio.CancelledError()
+            if unpublished_offboarding_failure is not None:
+                raise unpublished_offboarding_failure
             return True
 
         async with self._lock:
@@ -4324,7 +4448,29 @@ class AgentManager:
             budget, name,
         )
 
-    def _has_budgeted_descendants(self, name: str) -> bool:
+    def _budgeted_child_agent_id(self, child_name: str) -> Optional[str]:
+        """Resolve one held child's durable DID without requiring publication."""
+
+        agent = self._agents.get(child_name)
+        agent_id = _loaded_agent_did(agent) if agent is not None else None
+        if isinstance(agent_id, str) and agent_id:
+            return agent_id
+        mandate = self._child_mandates.get(child_name)
+        mandate_id = getattr(mandate, "child_did", None)
+        if isinstance(mandate_id, str) and mandate_id:
+            return mandate_id
+        entry = self._child_budgets.get(child_name)
+        delegated = entry[0] if isinstance(entry, tuple) and entry else None
+        allocation = getattr(delegated, "allocation", None)
+        allocation_id = getattr(allocation, "child_did", None)
+        return allocation_id if isinstance(allocation_id, str) and allocation_id else None
+
+    def _has_budgeted_descendants(
+        self,
+        name: str,
+        *,
+        known_agent_id: Optional[str] = None,
+    ) -> bool:
         """True if any descendant of ``name`` still holds a budget (#2113).
 
         Keys on ``_child_budgets`` membership (not just the parent-child graph),
@@ -4333,9 +4479,8 @@ class AgentManager:
         """
         seen: set = set()
 
-        def visit(n: str) -> bool:
-            agent = self._agents.get(n)
-            did = getattr(agent, "agent_id", None) if agent is not None else None
+        def visit(n: str, did: Optional[str] = None) -> bool:
+            did = did or self._budgeted_child_agent_id(n)
             if not did:
                 return False
             for child in self._parent_children.get(did, []):
@@ -4348,7 +4493,7 @@ class AgentManager:
                     return True
             return False
 
-        return visit(name)
+        return visit(name, known_agent_id)
 
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).
@@ -5208,6 +5353,10 @@ class AgentManager:
                 terminal_outcomes,
             )
         if not removed:
+            if terminal_outcomes:
+                terminal_outcomes.append(
+                    ChildTerminationNotPerformedError(child_name=child_name)
+                )
             _raise_lifecycle_outcomes(
                 f"Child {child_name!r} descendant termination failed",
                 terminal_outcomes,

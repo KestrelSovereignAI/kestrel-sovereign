@@ -147,13 +147,13 @@ Uses a hold/release pattern, not a transfer:
 
 ### Permission Integration
 
-Spawn tools use the existing `PermissionLevel` system (`ALLOW/DENY/ASK/SESSION`) from `features/security/permissions.py`. The sovereign configures spawn permissions like any other tool — no special approval mechanism needed.
+Spawn tools use the existing `PermissionLevel` system (`ALLOW/DENY/ASK/ALWAYS_ASK/SESSION`) from `features/security/permissions.py`. The sovereign configures spawn permissions like any other tool — no special approval mechanism needed.
 
 | Tool | Default | Description |
 |------|---------|-------------|
 | `spawn_agent` | `ASK` | Create ephemeral/persistent child |
 | `delegate_task` | `ALLOW` | Send task to existing child |
-| `terminate_child` | `ASK` | Stop a child (runtime retained by default); explicit offboarding is destructive |
+| `terminate_child` | `ALWAYS_ASK` | Stop a child (runtime retained by default); explicit offboarding is destructive and cannot be auto-promoted |
 
 ### Implementation
 

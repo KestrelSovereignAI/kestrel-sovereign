@@ -1498,11 +1498,19 @@ async def test_terminal_drain_seal_atomically_refuses_cold_identity_offboarding(
     drain = asyncio.create_task(manager.drain_quarantined_shutdowns())
     try:
         await asyncio.wait_for(seal_visible.wait(), timeout=1.0)
-        kwargs = (
-            {"known_agent_id": did}
-            if identity_kind == "registered"
-            else {}
-        )
+        if identity_kind == "registered":
+            registered_config = LocalAgentConfig(
+                data_dir=f"agent_data/{identity_kind}",
+                port=8801,
+                autostart=False,
+            )
+            registered_config.resolve_data_dir(tmp_path).mkdir(parents=True)
+            kwargs = {
+                "known_agent_id": did,
+                "known_agent_config": registered_config,
+            }
+        else:
+            kwargs = {}
         assert await asyncio.wait_for(
             manager.remove_agent(name, offboard_runtime=True, **kwargs),
             timeout=1.0,

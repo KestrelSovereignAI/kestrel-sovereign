@@ -1348,6 +1348,7 @@ class KestrelAgent(
 
         # Features will be initialized after storage
         self.features: Dict[str, Feature] = {}
+        self.rejected_feature_contributions = ()
 
         # Hooks manager for security and middleware
         self.hooks_manager = HooksManager()
@@ -4279,7 +4280,15 @@ class KestrelAgent(
         indistinguishable from one that loaded and had nothing to do. This is
         what ``/health/detailed`` reports (issue #2951).
         """
-        self.rejected_feature_contributions = tuple(transition.rejected)
+        existing = tuple(self.rejected_feature_contributions)
+        self.rejected_feature_contributions = existing + tuple(
+            rejection
+            for rejection in transition.rejected
+            if not any(
+                prior.feature_name == rejection.feature_name
+                for prior in existing
+            )
+        )
         for rejection in transition.rejected:
             logging.error(
                 "Feature '%s' did not load — %s. The agent is running WITHOUT "
@@ -4287,6 +4296,33 @@ class KestrelAgent(
                 rejection.feature_name,
                 rejection.reason,
             )
+
+    def record_feature_unavailable(
+        self,
+        *,
+        feature: object,
+        feature_name: str,
+        reason: str,
+    ) -> None:
+        """Retain one safely described optional-feature quarantine for health."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            ContributionRejection,
+        )
+
+        if any(
+            rejection.feature_name == feature_name
+            for rejection in self.rejected_feature_contributions
+        ):
+            return
+        self.rejected_feature_contributions = (
+            *self.rejected_feature_contributions,
+            ContributionRejection(
+                feature=feature,
+                feature_name=feature_name,
+                reason=reason,
+            ),
+        )
 
     def _prepare_feature_contribution_transition(self, features):
         """Collect and prevalidate one complete feature activation transition."""
@@ -4524,6 +4560,15 @@ class KestrelAgent(
                     getattr(feature, "name", type(feature).__name__),
                     diagnostic,
                 )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
+                )
                 return False
             if isinstance(preparation_error, type) and isinstance(
                 exc, preparation_error
@@ -4557,6 +4602,15 @@ class KestrelAgent(
                     getattr(feature, "name", type(feature).__name__),
                     diagnostic,
                     exc_info=safe_exc_info,
+                )
+                self.record_feature_unavailable(
+                    feature=feature,
+                    feature_name=getattr(
+                        feature,
+                        "name",
+                        type(feature).__name__,
+                    ),
+                    reason=diagnostic,
                 )
                 return False
             raise

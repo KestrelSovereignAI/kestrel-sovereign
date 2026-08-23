@@ -320,14 +320,14 @@ class SpawnedAgentLifecycle:
         tracked.result = result
         self._results[child_name] = result
 
-        await self._terminate_and_cleanup(
+        terminated = await self._terminate_and_cleanup(
             child_name,
             SpawnStatus.TERMINATED,
             reason=reason,
             offboard_runtime=offboard_runtime,
         )
 
-        return result
+        return result if terminated else None
 
     async def shutdown(self) -> None:
         """Shut down all tracked children and clean up.
@@ -402,7 +402,7 @@ class SpawnedAgentLifecycle:
         reason: str = "",
         *,
         offboard_runtime: bool = False,
-    ) -> None:
+    ) -> bool:
         """Terminate the child in AgentManager and clean up ephemeral resources.
 
         Args:
@@ -413,19 +413,20 @@ class SpawnedAgentLifecycle:
         """
         tracked = self._tracked.get(child_name)
         if tracked is None:
-            return
+            return False
 
         # Terminate via AgentManager (handles cascading grandchildren)
         termination_failure: BaseException | None = None
+        terminated = False
         try:
             if offboard_runtime:
-                await self._agent_manager.terminate_child(
+                terminated = await self._agent_manager.terminate_child(
                     tracked.parent_did,
                     child_name,
                     offboard_runtime=True,
                 )
             else:
-                await self._agent_manager.terminate_child(
+                terminated = await self._agent_manager.terminate_child(
                     tracked.parent_did,
                     child_name,
                 )
@@ -476,6 +477,7 @@ class SpawnedAgentLifecycle:
         )
         if termination_failure is not None:
             raise termination_failure
+        return terminated
 
     async def _fire_hook(
         self,

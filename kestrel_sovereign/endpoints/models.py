@@ -519,6 +519,25 @@ def _restore_persisted_agent_registration(
     request.app.state.multi_agent_config = current
 
 
+def _restore_registration_if_agent_is_live(
+    request: Request,
+    agent_manager: object,
+    agent_name: str,
+    rollback: Optional[tuple[object, str, object]],
+) -> None:
+    """Compensate config mutation only when routing still proves liveness."""
+
+    if rollback is None:
+        return
+    get_agent = getattr(agent_manager, "get_agent", None)
+    # The production manager always provides this authority.  A nonconforming
+    # embedding cannot prove shutdown, so preserve restart registration rather
+    # than silently converting an arbitrary manager failure into deprovision.
+    live = True if not callable(get_agent) else get_agent(agent_name) is not None
+    if live:
+        _restore_persisted_agent_registration(request, rollback)
+
+
 @router.delete("/api/agents/{agent_name}")
 @limiter.limit("10/minute")
 async def delete_agent(
@@ -582,6 +601,7 @@ async def delete_agent(
                 manager_agent_name,
                 offboard_runtime=True,
                 known_agent_id=known_agent_id,
+                known_agent_config=registration[2],
             )
         else:
             removed = await agent_manager.remove_agent(
@@ -605,9 +625,28 @@ async def delete_agent(
     except BaseExceptionGroup as exc:
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling():
+            try:
+                _restore_registration_if_agent_is_live(
+                    request,
+                    agent_manager,
+                    manager_agent_name,
+                    registration_rollback,
+                )
+            except Exception as rollback_error:
+                raise BaseExceptionGroup(
+                    "Agent deletion cancellation and registration compensation "
+                    "failed",
+                    [exc, rollback_error],
+                )
             raise
         detail = _grouped_runtime_retained_detail(exc)
         if detail is None:
+            _restore_registration_if_agent_is_live(
+                request,
+                agent_manager,
+                manager_agent_name,
+                registration_rollback,
+            )
             raise
         logger.error(
             "Agent '%s' was removed with retained runtime and additional "
@@ -638,6 +677,28 @@ async def delete_agent(
                     ),
                 ) from rollback_error
         raise HTTPException(status_code=409, detail=str(e))
+    except asyncio.CancelledError as exc:
+        try:
+            _restore_registration_if_agent_is_live(
+                request,
+                agent_manager,
+                manager_agent_name,
+                registration_rollback,
+            )
+        except Exception as rollback_error:
+            raise BaseExceptionGroup(
+                "Agent deletion cancellation and registration compensation failed",
+                [exc, rollback_error],
+            )
+        raise
+    except Exception:
+        _restore_registration_if_agent_is_live(
+            request,
+            agent_manager,
+            manager_agent_name,
+            registration_rollback,
+        )
+        raise
     if not removed:
         if registration_rollback is not None:
             try:
