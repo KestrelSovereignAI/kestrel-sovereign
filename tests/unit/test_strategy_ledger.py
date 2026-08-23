@@ -1405,6 +1405,90 @@ class TestTheIndexHasAConsumer:
         assert "index_stale" not in result.data
 
     @pytest.mark.asyncio
+    async def test_an_edit_to_a_canonical_supersession_reason_is_content(
+        self, tmp_path
+    ):
+        """Graph-ownership is per key, and only where the ledger is silent.
+
+        When the canonical file sets superseded_reason itself, that value
+        wins, so an edit to it is an ordinary content change. Excusing the
+        supersession fields wholesale hid exactly that edit.
+        """
+        feature = await _feature(tmp_path)
+        added = await feature.strategy_add_pattern(pattern="retired in the file")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="original reason"
+        )
+        feature.agent.storage.graph._fail_on = PATTERN_NODE_TYPE
+        for row in feature._ledger.data[PATTERNS_KEY]:
+            row["superseded_reason"] = "a corrected reason"
+        feature._ledger.save()
+
+        result = await feature.recall_patterns(include_superseded=True)
+
+        assert result.status.value == "partial"
+        assert result.data["drifted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_node_retired_without_evidence_is_not_excused(self, tmp_path):
+        """The excuse needs the carry-over that produces it, not a status.
+
+        A legacy or mangled node carrying no graph-owned supersession at all
+        was still read as intentionally retired, so recall returned zero rows
+        over an active pattern and called the check complete.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an active row")
+        node = next(
+            n
+            for n in feature.agent.storage.graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+        )
+        node.properties["status"] = "mangled"
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 0
+        assert result.status.value == "partial"
+        assert result.data["misfiled_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_collision_only_divergence_does_not_advise_a_restart(
+        self, tmp_path
+    ):
+        """Advice that contradicts itself is worse than none.
+
+        The message says reprojection cannot fix a collision, so it must not
+        then tell the operator to restart and reproject.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="the first")
+        rows = feature._ledger.data[PATTERNS_KEY]
+        duplicate = dict(rows[0])
+        duplicate["pattern"] = "a different observation"
+        rows.append(duplicate)
+        feature._ledger.save()
+        await feature._reindex_ledger()
+
+        result = await feature.recall_patterns()
+
+        assert result.data["colliding_count"] == 1
+        assert "restart" not in (result.error or "").lower()
+        assert "Resolve the duplicate ids" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_repairable_divergence_still_advises_a_restart(self, tmp_path):
+        """And the advice must not disappear for the case a restart fixes."""
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="canonical but unindexed")
+        feature.agent.storage.graph.nodes.clear()
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "partial"
+        assert "restart the agent to reproject" in (result.error or "")
+
+    @pytest.mark.asyncio
     async def test_graph_owned_supersession_is_outside_the_content_digest(
         self, tmp_path
     ):

@@ -1169,29 +1169,24 @@ class StrategicMemoryFeature(Feature):
         # overwrites the first and one row is unreachable however healthy the
         # projection is. Counted separately because reprojecting cannot fix it.
         colliding = len(all_ids) - len(ledger_all)
-        # What the ledger says each row's node should contain. Membership is a
-        # strictly weaker question than agreement: an id-stable edit leaves the
-        # id and the status identical while the indexed row goes stale.
-        expected_digests = {
-            section.row_id(row): section.content_digest(agent_id, row)
+        # Membership is a strictly weaker question than agreement: an
+        # id-stable edit leaves the id and the status identical while the
+        # indexed row goes stale. What a healthy index would hold is asked of
+        # the projection's own carry-over rule rather than reconstructed here.
+        canonical_rows = {
+            section.row_id(row): row
             for row in section.expected_rows(ledger_data, include_retired=True)
         }
         misfiled = set()
         drifted = set()
         for row_id, indexed in membership.items():
-            if row_id not in ledger_all:
+            row = canonical_rows.get(row_id)
+            if row is None:
                 continue  # an orphan, already counted
-            indexed_current = indexed.status == ACTIVE_STATUS
-            ledger_current = row_id in ledger_active
-            if indexed_current != ledger_current and not (
-                not indexed_current and ledger_current and section.graph_may_retire
-            ):
-                # The excused case is the projection's documented graph-owned
-                # supersession, which reprojection deliberately preserves --
-                # calling it a divergence would report a staleness no restart
-                # could ever clear.
+            expected = section.expected_properties(agent_id, row, indexed.properties)
+            if str(expected.get("status") or "") != indexed.status:
                 misfiled.add(row_id)
-            if indexed.digest != expected_digests.get(row_id):
+            elif expected != indexed.properties:
                 drifted.add(row_id)
 
         if not (missing or orphaned or misfiled or colliding or drifted):
@@ -1237,14 +1232,28 @@ class StrategicMemoryFeature(Feature):
             # otherwise, so recommending it bare for a retired-mode recall
             # promises a fallback that structurally cannot answer (#3064).
             fallback = "strategy_search(..., include_retired=True)"
+        if missing or orphaned or misfiled or drifted:
+            remedy = (
+                "The index is stale or was never built -- restart the agent "
+                f"to reproject, and use {fallback} to read the canonical file "
+                "meanwhile."
+            )
+        else:
+            # Collisions are the ONLY divergence here, and a restart would
+            # reproduce the same overwrite. Telling the operator to reproject
+            # after saying reprojection cannot fix it is advice that
+            # contradicts itself.
+            remedy = (
+                f"Resolve the duplicate ids in {LEDGER_FILENAME}; until then "
+                f"use {fallback} to read the canonical rows."
+            )
         return ToolResult.partial(
             confirmation=confirmation,
             error=(
                 f"The strategy index diverges from {LEDGER_FILENAME}: "
                 + ", and ".join(divergences)
-                + ". The index is stale or was never built -- restart the "
-                f"agent to reproject, and use {fallback} to read the "
-                "canonical file meanwhile."
+                + ". "
+                + remedy
             ),
             data=data,
         )

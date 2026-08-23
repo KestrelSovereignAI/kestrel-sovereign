@@ -22,8 +22,6 @@ pattern in YAML could never take effect in the index.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Mapping
@@ -127,34 +125,32 @@ def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str
     return str(row.get("id") or "").strip() or minter(row)
 
 
-#: Properties the digest below must ignore, because the graph may legitimately
-#: hold a value for them that the ledger does not -- see
-#: :data:`_GRAPH_OWNED_PROPERTIES` and the ``status`` they imply.
-_DIGEST_EXCLUDED = frozenset(_GRAPH_OWNED_PROPERTIES) | {"status"}
+def apply_graph_owned(
+    properties: Dict[str, Any], existing: Optional[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    """Carry graph-owned values across, per key, where the ledger is silent.
 
+    THE rule for what a projected node should hold, and the only copy of it.
+    The projection applies it when writing; the recall's divergence check
+    applies it to work out what the node ought to contain. #3064 went five
+    review rounds because the check re-derived this instead of using it, and
+    each round found the derivation wrong one field further in: first the
+    text-less rows, then the retirement, then which keys were graph-owned. A
+    second copy of a rule is a rule that will disagree with itself.
 
-def properties_digest(properties: Mapping[str, Any]) -> str:
-    """Fingerprint of the ledger-owned half of a projected node.
-
-    Membership answers "is there a node for this row?", which is a strictly
-    weaker question than "does the index still say what the file says". An
-    id-stable edit -- a blocker's repo or severity, a pattern's implication --
-    leaves membership and status identical while the indexed row goes stale,
-    and a check that stopped at membership certified that as clean (#3064).
-
-    A node written before a property was ADDED to the projection digests
-    differently from one written after, which is the intended answer: such a
-    node is stale until the next reprojection, and saying so is what makes the
-    upgrade visible instead of silent.
+    Note the condition is PER KEY and only where the ledger says nothing. When
+    the canonical file sets ``superseded_reason`` itself, that value wins and
+    an edit to it is an ordinary content change like any other.
     """
-    material = {
-        str(key): str(value)
-        for key, value in (properties or {}).items()
-        if key not in _DIGEST_EXCLUDED
-    }
-    return hashlib.blake2s(
-        json.dumps(material, sort_keys=True).encode("utf-8"), digest_size=8
-    ).hexdigest()
+    existing_props = existing or {}
+    for key in _GRAPH_OWNED_PROPERTIES:
+        if properties.get(key):
+            # The canonical file wins whenever it says anything.
+            continue
+        if existing_props.get(key):
+            properties[key] = existing_props[key]
+            properties["status"] = "superseded"
+    return properties
 
 
 
@@ -178,16 +174,6 @@ class LedgerSection:
     minter: Callable[[Dict[str, Any]], str]
     is_active: Callable[[Dict[str, Any]], bool]
     properties: Callable[[str, Dict[str, Any]], Dict[str, Any]]
-    #: Whether the INDEX may hold a retirement the ledger does not.
-    #:
-    #: True for patterns: :data:`_GRAPH_OWNED_PROPERTIES` is carried across for
-    #: rows the ledger is silent about, so a node marked superseded beside an
-    #: unsuperseded YAML row is the documented design and reprojection keeps it
-    #: that way. False for blockers, whose ``status`` is a pure function of the
-    #: ledger's ``resolved_at`` -- there, the same shape is a projection that
-    #: has not landed, and an operator reopening a blocker by hand would
-    #: otherwise get a certified-clean empty recall (#3064).
-    graph_may_retire: bool
 
     def rows(self, ledger_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return _dict_rows(ledger_data, self.ledger_key)
@@ -217,9 +203,23 @@ class LedgerSection:
         properties["row_id"] = self.row_id(row)
         return properties
 
-    def content_digest(self, agent_id: str, row: Dict[str, Any]) -> str:
-        """Digest of the properties the LEDGER owns for this row."""
-        return properties_digest(self.node_properties(agent_id, row))
+    def expected_properties(
+        self,
+        agent_id: str,
+        row: Dict[str, Any],
+        indexed: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """What a healthy index would hold for this row, given what it holds.
+
+        Runs the row through the SAME carry-over the projection applies, so
+        the check compares against the projection's own answer rather than a
+        reconstruction of its rules. That is what makes a graph-owned
+        supersession not a divergence, a blocker's resolved status not
+        excusable, and an edit to a canonical ``superseded_reason`` an
+        ordinary content change -- three questions that needed three separate
+        special cases while the rule was being re-derived.
+        """
+        return apply_graph_owned(self.node_properties(agent_id, row), indexed)
 
     def node_id(self, agent_id: str, row: Dict[str, Any]) -> str:
         return ledger_node_id(self.node_type, agent_id, self.row_id(row))
@@ -275,7 +275,6 @@ PATTERN_SECTION = LedgerSection(
     minter=pattern_row_id,
     is_active=is_active_pattern,
     properties=_pattern_properties,
-    graph_may_retire=True,
 )
 
 BLOCKER_SECTION = LedgerSection(
@@ -287,7 +286,6 @@ BLOCKER_SECTION = LedgerSection(
     minter=blocker_row_id,
     is_active=is_active_blocker,
     properties=_blocker_properties,
-    graph_may_retire=False,
 )
 
 
@@ -407,15 +405,7 @@ async def _project_section(
 
         expected = existing.properties if existing is not None else None
         if existing is not None:
-            existing_props = existing.properties or {}
-            for key in _GRAPH_OWNED_PROPERTIES:
-                # The canonical file wins when it says anything; the graph's
-                # value survives only where the ledger is silent.
-                if properties.get(key):
-                    continue
-                if existing_props.get(key):
-                    properties[key] = existing_props[key]
-                    properties["status"] = "superseded"
+            apply_graph_owned(properties, existing.properties)
 
         node = GraphNode(
             node_id=node_id,
@@ -497,10 +487,10 @@ MEMBERSHIP_READ_CAP = 10000
 
 @dataclass(frozen=True)
 class IndexedRow:
-    """What the index says about one projected row."""
+    """What the index actually holds for one projected row."""
 
     status: str
-    digest: str
+    properties: Dict[str, Any]
 
 
 async def index_membership(
@@ -515,9 +505,10 @@ async def index_membership(
     in the database, so the page certifies a clean index and a larger limit
     then returns deleted guidance (#3064).
 
-    Each entry carries the node's status AND a digest of its ledger-owned
-    properties, because "there is a node for this row" is a strictly weaker
-    claim than "the index still says what the file says".
+    Each entry carries the node's whole property bag, not a summary of it,
+    because "there is a node for this row" is a strictly weaker claim than
+    "the index still says what the file says" -- and deciding which of the two
+    a caller gets is not this function's business.
 
     Returns ``(membership, complete)``. ``complete`` is False when the read
     saturated :data:`MEMBERSHIP_READ_CAP`, which the caller must surface as a
@@ -534,7 +525,7 @@ async def index_membership(
     membership = {
         str((node.properties or {}).get("row_id") or ""): IndexedRow(
             status=str((node.properties or {}).get("status") or ""),
-            digest=properties_digest(node.properties or {}),
+            properties=dict(node.properties or {}),
         )
         for node in nodes
     }
