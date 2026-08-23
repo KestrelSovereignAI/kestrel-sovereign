@@ -421,3 +421,37 @@ async def test_a_host_that_opened_its_backend_reports_no_error(tmp_path):
     finally:
         if ctx.db is not None:
             await ctx.db.close()
+
+
+def test_the_boolean_and_the_string_cannot_disagree():
+    """`overall_healthy` is what monitors read; `status` is what humans read.
+
+    Downgrading one and leaving the other is the silent-healthy report this
+    diagnostic exists to end, arriving through whichever field the consumer
+    happened to pick.
+    """
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = SovereignHostContext(backend_error="boom")
+
+    payload = _with_host_feature_rejections(
+        _State(), {"status": "healthy", "overall_healthy": True}
+    )
+
+    assert payload["status"] == "degraded"
+    assert payload["overall_healthy"] is False
+
+
+def test_a_healthy_payload_keeps_its_boolean():
+    """And the fold does not invent a downgrade where there is none."""
+    from kestrel_sovereign.server import _with_host_feature_rejections
+
+    class _State:
+        host_context = SovereignHostContext()
+
+    payload = _with_host_feature_rejections(
+        _State(), {"status": "healthy", "overall_healthy": True}
+    )
+
+    assert payload["overall_healthy"] is True

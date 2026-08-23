@@ -3670,6 +3670,34 @@ def test_the_postgres_migration_never_copies_the_ledger():
     assert any("ADD PRIMARY KEY (agent_id, slot)" in s for s in statements)
 
 
+def test_the_postgres_migration_locks_history_before_the_ledger():
+    """Writers reach the ledger THROUGH a trigger on conversation_history.
+
+    So they hold history and then want the ledger. This transaction goes on to
+    create and drop triggers on history after the ALTERs, which takes ACCESS
+    EXCLUSIVE on it — taking the ledger first would be the opposite order and
+    PostgreSQL would abort one side of the cycle. Asserted on the statements
+    and on their ORDER, because a deadlock needs a server to observe and this
+    repository has none.
+    """
+    from kestrel_sovereign.storage.conversation_sessions import (
+        changes_slot_migration,
+    )
+
+    statements = changes_slot_migration("postgres")
+    lock_at = next(
+        i for i, s in enumerate(statements)
+        if "LOCK TABLE conversation_history IN ACCESS EXCLUSIVE MODE" in s
+    )
+    ledger_at = next(
+        i for i, s in enumerate(statements)
+        if "ALTER TABLE conversation_history_changes" in s
+    )
+    assert lock_at < ledger_at, (
+        "history first, in the writers' own order"
+    )
+
+
 def test_the_sqlite_migration_rebuilds_because_it_safely_can():
     """SQLite's migration_lock is BEGIN IMMEDIATE: one writer, by construction.
 

@@ -1292,11 +1292,28 @@ def changes_slot_migration(backend_type: str) -> Tuple[str, ...]:
             #
             # ALTER TABLE takes ACCESS EXCLUSIVE itself, so each statement is
             # already serialized against those writers and no row is copied at
-            # all. The lock order also matches theirs -- history first through
-            # the trigger, then this table -- because nothing here touches
-            # conversation_history.
+            # all.
+            #
+            # conversation_history is locked FIRST, in the writers' own order.
+            # They reach the ledger THROUGH a trigger on history, so they hold
+            # history and then want the ledger. This transaction goes on to
+            # create and drop triggers on history after these statements, which
+            # takes ACCESS EXCLUSIVE on it -- so taking the ledger first would
+            # be the opposite order and PostgreSQL would abort one side of the
+            # cycle. The window is no wider than the trigger DDL already opens
+            # a moment later; it just opens sooner.
+            "LOCK TABLE conversation_history IN ACCESS EXCLUSIVE MODE",
             "ALTER TABLE conversation_history_changes "
             "ADD COLUMN IF NOT EXISTS slot BIGINT NOT NULL DEFAULT 0",
+            # NOTE (#3078): swapping this key makes the schema incompatible
+            # with a pre-#3005 revision still holding a connection -- its
+            # trigger functions upsert ON CONFLICT (agent_id), which no longer
+            # has a matching unique constraint. There is no schema that
+            # satisfies both, because sharding exists precisely to allow the
+            # second row UNIQUE (agent_id) forbids. This codebase has no
+            # revision fence to refuse the migration while such a process is
+            # live, so on PostgreSQL this upgrade must not overlap revisions.
+            #
             # The constraint is found rather than named. It was minted by an
             # inline PRIMARY KEY so it is almost certainly
             # `conversation_history_changes_pkey`, and "almost certainly" is

@@ -3404,6 +3404,12 @@ def _with_host_feature_rejections(app_state, payload: dict) -> dict:
         merged["host_backend_unavailable"] = backend_error
     if merged.get("status") == "healthy":
         merged["status"] = "degraded"
+    if "overall_healthy" in merged:
+        # Two fields, one fact. A monitor reading the boolean and a human
+        # reading the string must not get different answers -- leaving
+        # overall_healthy true beside a degraded status reproduces exactly the
+        # silent-healthy report this fold exists to end (#3058).
+        merged["overall_healthy"] = merged.get("status") == "healthy"
     return merged
 
 
