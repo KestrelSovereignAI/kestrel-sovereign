@@ -2047,6 +2047,7 @@ class AsyncDatabase:
             mutation_trigger_functions,
             mutation_triggers,
             NON_NULL_PROJECTION_COLUMNS,
+            WATERMARK_EPOCH_COLUMN,
             WATERMARK_REVISION_COLUMN,
             projection_tables,
             shape_change_invalidation,
@@ -2253,7 +2254,10 @@ class AsyncDatabase:
         # a value that never moves.
         await self.migrate_columns_once(
             "conversation_session_watermarks",
-            ((WATERMARK_REVISION_COLUMN, "BIGINT NOT NULL DEFAULT 0"),),
+            (
+                (WATERMARK_REVISION_COLUMN, "BIGINT NOT NULL DEFAULT 0"),
+                (WATERMARK_EPOCH_COLUMN, "TEXT NOT NULL DEFAULT ''"),
+            ),
         )
         await self.ensure_index(
             *_SESSION_PROJECTION_INDEX,

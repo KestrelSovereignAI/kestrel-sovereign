@@ -757,6 +757,12 @@ export function mountConversations(containerEl, config = {}) {
                     ? 'Nothing in trash.'
                     : (view === 'archived' ? 'No archived conversations.' : 'No conversations yet.'));
             listEl.appendChild(empty);
+            // ...and the paging affordance, which the empty state used to
+            // swallow. A client-side filter that matches nothing on the pages
+            // loaded so far is exactly when the user needs the next page: with
+            // the button gone, a conversation that matches only on a later page
+            // cannot be reached at all when server search is unavailable.
+            renderLoadMore();
             return;
         }
         const activeId = currentActiveId();

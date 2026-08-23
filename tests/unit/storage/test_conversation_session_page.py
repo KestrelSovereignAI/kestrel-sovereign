@@ -603,6 +603,88 @@ async def test_a_rebuild_that_lands_where_it_started_still_invalidates_the_page(
 
 
 @pytest.mark.asyncio
+async def test_a_watermark_deleted_and_recreated_under_the_read_invalidates_it(
+    tmp_path,
+):
+    """The write counter is monotonic only while its ROW lives.
+
+    ``purge_session_projection`` deletes that row, and so does the
+    empty-history branch of the transcript pass. The next repair INSERTs a
+    fresh one from the default, so two incarnations show the same count with
+    the ledger generation unchanged — measured: revision 0, delete, repair,
+    revision 0. A page read straddling that would compare equal and be
+    certified over a cache that had been emptied and rebuilt underneath it.
+
+    The epoch is what makes the pair unable to repeat.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import ProjectionNotReady
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "recreated-watermark.db"))
+    try:
+        await db.execute(
+            "INSERT INTO conversation_history "
+            "(agent_id, role, content, metadata, created_at) "
+            "VALUES (?, 'user', 'hello', '{}', '2026-05-01 09:00:00')",
+            (AGENT,),
+        )
+        store = await _store_with(db)
+        projection = ConversationSessionProjection(db, AGENT)
+        await projection.repair()
+        before = await projection.accounted()
+
+        real_page = projection.page
+        cycles = {"count": 0}
+
+        async def page_then_recreate(*args, **kwargs):
+            rows = await real_page(*args, **kwargs)
+            cycles["count"] += 1
+            await db.execute(
+                "DELETE FROM conversation_session_watermarks WHERE agent_id = ?",
+                (AGENT,),
+            )
+            await ConversationSessionProjection(db, AGENT).repair()
+            return rows
+
+        projection.page = page_then_recreate
+        with pytest.raises(ProjectionNotReady):
+            await store._page_a_whole_projection(
+                projection, limit=10, after=None, refresh=False
+            )
+
+        after = await ConversationSessionProjection(db, AGENT).accounted()
+        assert after.revision == before.revision, (
+            "the case only means something while the COUNTER comes back the same"
+        )
+        assert after.generation == before.generation, (
+            "...and while the ledger generation is untouched, which it is: the "
+            "watermark row went, the ledger did not"
+        )
+        assert after.epoch != before.epoch
+        assert cycles["count"] > 1, "the read must be retried, not abandoned"
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("session_id", ["a\x00b", "\ud800"])
+def test_a_cursor_key_the_store_cannot_hold_is_refused(session_id):
+    """A cursor key is client-supplied text, and text is not enough.
+
+    A NUL or a lone surrogate is a string Python holds happily and the drivers
+    refuse — and the refusal comes out of the QUERY, past the handler that
+    turns a bad cursor into a 400 and into the one that reports a server fault.
+    """
+    token = base64.urlsafe_b64encode(
+        json.dumps(
+            {"v": 1, "kind": "keyset", "view": "active",
+             "k": ["2026-05-01 09:00:00", session_id]},
+            ensure_ascii=False,
+        ).encode("utf-8", errors="surrogatepass")
+    ).decode().rstrip("=")
+    with pytest.raises(SessionCursorError):
+        decode_session_cursor(token, "active")
+
+
+@pytest.mark.asyncio
 async def test_a_generation_rotated_under_the_read_invalidates_the_page(tmp_path):
     """The fence asks the same question at both ends, generation included.
 

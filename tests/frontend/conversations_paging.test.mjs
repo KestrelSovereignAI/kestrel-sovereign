@@ -162,6 +162,30 @@ test('a continuation still in flight does not disable the next view\'s button', 
     handle.destroy();
 });
 
+test('a client filter matching nothing still offers the next page', async () => {
+    // The empty state used to swallow the paging control. That is precisely
+    // when it is needed: a term matching nothing on the pages loaded so far,
+    // with server search unavailable, leaves later matches unreachable.
+    const el = makeContainer();
+    const api = pagingApi([['alpha'], ['beta']]);
+    const handle = mountConversations(el, { api, agentName: 'Emma', showSearch: true });
+    await settle();
+
+    const search = el.querySelector('.conversations-search');
+    search.value = 'beta';
+    search.dispatchEvent(new dom.window.Event('input'));
+    await settle();
+
+    assert.equal(rows(el).length, 0, 'the loaded page holds no match');
+    assert.ok(el.querySelector('.empty-state'), 'the empty state still renders');
+    const more = moreBtn(el);
+    assert.ok(more, 'the next page must still be reachable');
+    more.click();
+    await settle();
+    assert.deepEqual(rows(el).map((r) => r.dataset.sessionId), ['beta']);
+    handle.destroy();
+});
+
 test('a same-view refresh clears a superseded continuation\'s lock', async () => {
     // Not only view/agent changes take a new generation: an ordinary reload
     // after a rename, an archive, a trash, a New conversation or a host-driven

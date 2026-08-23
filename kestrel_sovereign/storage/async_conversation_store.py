@@ -3408,7 +3408,7 @@ class AsyncConversationStore:
             #
             # The revision only ever increases, so neither can hide.
             after_read = await self._whole_watermark(projection)
-            if after_read is not None and after_read.revision == before.revision:
+            if after_read is not None and after_read.fence == before.fence:
                 return rows
         raise ProjectionNotReady(
             f"{projection.agent_id}'s conversation index was rebuilt underneath "

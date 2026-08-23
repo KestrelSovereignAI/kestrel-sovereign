@@ -379,6 +379,21 @@ PROJECTION_COLUMNS: Tuple[str, ...] = (
 #: watermark, so no pass can move one without the other.
 WATERMARK_REVISION_COLUMN = "accounted_revision"
 
+#: Which INCARNATION of this agent's watermark row the counter belongs to.
+#:
+#: The counter alone is monotonic only while the ROW lives, and the row does not
+#: always live: ``purge_session_projection`` deletes it, and so does the
+#: empty-history branch of the transcript pass. The next repair then INSERTs a
+#: fresh one starting from the default, so two different incarnations can show
+#: the same count — measured: revision 0, delete, repair, revision 0, with the
+#: ledger generation unchanged because the ledger was never touched. A page read
+#: straddling that would compare equal and be certified.
+#:
+#: Set when the row is created and never updated, exactly as the ledger's own
+#: ``generation`` is, and for the same reason: counters restart, so something
+#: has to say which run of them you are looking at.
+WATERMARK_EPOCH_COLUMN = "accounted_epoch"
+
 WATERMARK_COLUMNS: Tuple[str, ...] = (
     "accounted_generation",
     "accounted_valid",
@@ -893,8 +908,21 @@ def decode_session_cursor(token: str, view: str) -> Tuple[Any, ...]:
         # continuation compares a string against ``None`` and raises
         # ``TypeError`` (a 500), while the SQL one compares against NULL and
         # quietly serves an empty page.
-        if not isinstance(value, str):
-            raise SessionCursorError(f"cursor's {column} is missing or not text")
+        # Each key against what its COLUMN is, and that is the whole check:
+        # both of these refuse every non-string, ``None`` included, so a
+        # separate "is it text" guard ahead of them decided nothing. Verified
+        # rather than assumed — a mutation removing it survived, which is what
+        # that always means.
+        #
+        # Text alone would not be enough for the id either: a NUL or a lone
+        # surrogate is a string Python holds happily and the drivers refuse,
+        # and the refusal comes out of the QUERY rather than out of the cursor
+        # check — a 500 for client-supplied input. So it is asked the same
+        # bound the projection stores keys under.
+        if column in SESSION_ORDER_TEXT_COLUMNS and not is_storable_session_id(value):
+            raise SessionCursorError(
+                f"cursor's {column} is not a value this store can hold"
+            )
         # Each key is checked against what its COLUMN is, not merely against
         # being a string. A token is client-supplied, and a timestamp key that
         # cannot be read is not a cursor this build cannot honour — it is one
@@ -1017,6 +1045,7 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
 _WATERMARKS_DDL = """
 CREATE TABLE IF NOT EXISTS conversation_session_watermarks (
     agent_id             TEXT PRIMARY KEY,
+    accounted_epoch      TEXT NOT NULL DEFAULT '',
     accounted_revision   BIGINT NOT NULL DEFAULT 0,
     accounted_generation TEXT NOT NULL DEFAULT '',
     accounted_valid   INTEGER NOT NULL DEFAULT 0,
@@ -1770,6 +1799,20 @@ class SessionWatermark:
     #: writer increments it, so a value constructed in Python carries 0 and
     #: only what came from the database carries the real count.
     revision: int = 0
+    #: See :data:`WATERMARK_EPOCH_COLUMN`. Read back, never supplied.
+    epoch: str = ""
+
+    @property
+    def fence(self) -> Tuple[str, int]:
+        """What a reader compares before and after to know nothing moved.
+
+        The pair, never either half. The revision cannot repeat while the row
+        lives; the epoch cannot repeat across rows. Alone, each has a case it
+        cannot see — a rebuild landing where it started, and a watermark
+        deleted and recreated — and both of those return a page read from a
+        half-built cache as the end of the list.
+        """
+        return (self.epoch, self.revision)
 
     @property
     def complete(self) -> bool:
@@ -2215,7 +2258,8 @@ class ConversationSessionProjection:
         *invalid* is the honest name for that — it must derive, not compare.
         """
         row = await self.db.fetchone(
-            f"SELECT {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_REVISION_COLUMN} "
+            f"SELECT {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_REVISION_COLUMN}, "
+            f"{WATERMARK_EPOCH_COLUMN} "
             "FROM conversation_session_watermarks WHERE agent_id = ?",
             (self.agent_id,),
         )
@@ -2223,7 +2267,7 @@ class ConversationSessionProjection:
             return INVALID
         return SessionWatermark(
             str(row[0]), bool(row[1]), int(row[2]), int(row[3]), int(row[4]),
-            int(row[5]), int(row[6]),
+            int(row[5]), int(row[6]), str(row[7] or ""),
         )
 
     async def is_stale(self) -> bool:
@@ -3198,13 +3242,18 @@ class ConversationSessionProjection:
         """
         await self.db.execute(
             "INSERT INTO conversation_session_watermarks "
-            f"(agent_id, {', '.join(WATERMARK_COLUMNS)}) "
+            f"(agent_id, {', '.join(WATERMARK_COLUMNS)}, {WATERMARK_EPOCH_COLUMN}) "
             # Placeholders counted from the column list, not written out. A
             # literal run of "?" is a second statement of how many columns a
             # watermark has, and adding one to WATERMARK_COLUMNS then fails at
             # runtime rather than being carried along — which is how adding
             # `accounted_appends` announced itself.
-            f"VALUES ({', '.join('?' * (len(WATERMARK_COLUMNS) + 1))}) "
+            f"VALUES ({', '.join('?' * (len(WATERMARK_COLUMNS) + 1))}, "
+            # The epoch is generated by the ENGINE, on the insert path only, so
+            # it names this row's incarnation and no other. Never in the update
+            # clause: a value that changed on every write would be a second
+            # revision counter, and the question it answers is the other one.
+            f"{_new_generation(self.db.backend_type)}) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             + ", ".join(
                 f"{column} = excluded.{column}" for column in WATERMARK_COLUMNS
