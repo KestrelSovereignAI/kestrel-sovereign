@@ -420,8 +420,13 @@ such an agent therefore reports `runtime_cleanup_state=not_hosted`; it never
 claims the storage-backed tree was removed. If the exact owned hosted namespace
 is already absent, Core reports `runtime_cleanup_state=already_absent`. Both are
 typed no-op custody outcomes (`runtime_offboarded=false`) rather than a false
-deprovisioning success; routing withdrawal and persisted-registration removal
-remain truthful separate fields.
+deprovisioning success. When a concurrent lifecycle operation leaves only
+routing and parent-edge absence as evidence, Core instead reports
+`runtime_cleanup_state=custody_unknown`: neither runtime deletion nor retention
+was observed, so positive runtime-retention fields are omitted unless another
+typed outcome independently proves retention. These three custody states keep
+routing withdrawal and persisted-registration removal truthful and separate
+from filesystem custody.
 Core-created standalone feature, workspace, and channel-artifact directories
 are private `0700`; a pre-existing storage parent (including process CWD) is
 operator-owned and its mode is never changed.

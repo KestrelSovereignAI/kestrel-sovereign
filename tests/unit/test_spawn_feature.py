@@ -57,6 +57,11 @@ def test_uncommitted_spawn_not_hosted_classifier_is_narrow() -> None:
         agent_id="did:test:kid",
         cleanup_state="already_absent",
     )
+    custody_unknown = RuntimeOffboardingNotPerformedError(
+        agent_name="Kid",
+        agent_id="did:test:kid",
+        cleanup_state="custody_unknown",
+    )
 
     assert _uncommitted_spawn_not_hosted_cancellation(not_hosted) is False
     assert (
@@ -69,6 +74,7 @@ def test_uncommitted_spawn_not_hosted_classifier_is_narrow() -> None:
         is True
     )
     assert _uncommitted_spawn_not_hosted_cancellation(already_absent) is None
+    assert _uncommitted_spawn_not_hosted_cancellation(custody_unknown) is None
     assert (
         _uncommitted_spawn_not_hosted_cancellation(
             ExceptionGroup(
@@ -1169,13 +1175,13 @@ class TestSpawnFeatureWithManager:
         lifecycle._fire_hook.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_destructive_terminate_racing_ordinary_delete_is_partial(
-        self, tmp_path
+    async def test_destructive_terminate_losing_to_offboard_has_unknown_custody(
+        self, tmp_path, caplog
     ):
-        """Routing absence cannot be promoted to destructive offboarding proof."""
+        """A destructive winner is not retention proof for the losing request."""
 
         parent = _make_mock_agent("did:parent")
-        child = _make_mock_agent("did:child:ordinary-delete-race")
+        child = _make_mock_agent("did:child:destructive-request-race")
         manager = AgentManager(base_data_dir=tmp_path)
         scope = resolve_isolated_runtime_namespace(
             manager._isolated_runtime_root,
@@ -1187,7 +1193,7 @@ class TestSpawnFeatureWithManager:
             relative_directories=(("feature_venvs", "feature-safe"),),
         )
         credential = scope.path / "feature_venvs" / "feature-safe" / "credential"
-        credential.write_text("retain-on-ordinary-delete")
+        credential.write_text("deleted-by-concurrent-offboard")
         child.isolated_runtime_scope = scope
         manager._agents["worker"] = child
         manager._agent_names[child.agent_id] = "worker"
@@ -1203,6 +1209,7 @@ class TestSpawnFeatureWithManager:
         )
         lifecycle._fire_hook = AsyncMock()
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        caplog.set_level("WARNING", logger="kestrel_sovereign.spawn.lifecycle")
 
         await lifecycle._lock.acquire()
         tool_task = asyncio.create_task(
@@ -1214,9 +1221,12 @@ class TestSpawnFeatureWithManager:
                     break
                 await asyncio.sleep(0)
             assert getattr(lifecycle._lock, "_waiters", None)
-            assert await manager.remove_agent("worker") is True
+            assert (
+                await manager.remove_agent("worker", offboard_runtime=True) is True
+            )
             assert manager.get_agent("worker") is None
             assert manager.get_children(parent.agent_id) == []
+            assert not scope.path.exists()
         finally:
             lifecycle._lock.release()
 
@@ -1225,25 +1235,30 @@ class TestSpawnFeatureWithManager:
         assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["terminated"] is True
         assert envelope.data["runtime_offboarded"] is False
-        assert envelope.data["runtime_retained"] is True
-        assert envelope.data["named_child_runtime_retained"] is True
+        assert "runtime_retained" not in envelope.data
+        assert "named_child_runtime_retained" not in envelope.data
         assert envelope.data["named_child_runtime_removed"] is False
         assert envelope.data["runtime_custody_known"] is False
         assert envelope.data["runtime_retention_unknown"] is True
         assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
         assert envelope.data["runtime_already_absent"] is False
+        assert "hosted_runtime_configured" not in envelope.data
         assert envelope.data["operator_action_required"] is True
         assert "operator reconciliation" in envelope.error
-        assert credential.read_text() == "retain-on-ordinary-delete"
+        assert not credential.exists()
         assert not lifecycle.is_tracked("worker")
         stored_result = lifecycle.get_result("worker")
         assert stored_result.status.value == "terminated"
         assert stored_result.finalized_from_absence is True
+        assert "Finalizing child 'worker' from routing absence" in caplog.text
+        assert "offboard_runtime=True" in caplog.text
+        assert "runtime custody is unknown" in caplog.text
+        assert str(scope.path) not in caplog.text
         lifecycle._fire_hook.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_nondestructive_terminate_losing_to_offboard_has_unknown_custody(
-        self, tmp_path
+        self, tmp_path, caplog
     ):
         """Routing absence cannot be promoted to a restart-retention claim."""
 
@@ -1276,6 +1291,7 @@ class TestSpawnFeatureWithManager:
         )
         lifecycle._fire_hook = AsyncMock()
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        caplog.set_level("WARNING", logger="kestrel_sovereign.spawn.lifecycle")
 
         await lifecycle._lock.acquire()
         tool_task = asyncio.create_task(feature.terminate_child("worker"))
@@ -1316,6 +1332,10 @@ class TestSpawnFeatureWithManager:
         stored_result = lifecycle.get_result("worker")
         assert stored_result.status.value == "terminated"
         assert stored_result.finalized_from_absence is True
+        assert "Finalizing child 'worker' from routing absence" in caplog.text
+        assert "offboard_runtime=False" in caplog.text
+        assert "runtime custody is unknown" in caplog.text
+        assert str(scope.path) not in caplog.text
         lifecycle._fire_hook.assert_awaited_once()
 
     @pytest.mark.asyncio

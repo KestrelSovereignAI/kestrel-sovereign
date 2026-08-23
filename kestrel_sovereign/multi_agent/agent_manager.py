@@ -157,15 +157,17 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
         agent_name: str,
         agent_id: str,
         cleanup_state: str,
-        custody_unknown: bool = False,
     ) -> None:
-        if cleanup_state not in {"already_absent", "not_hosted"}:
+        if cleanup_state not in {
+            "already_absent",
+            "not_hosted",
+            "custody_unknown",
+        }:
             raise ValueError("invalid runtime offboarding no-op state")
         self.agent_name = agent_name
         self.agent_id = agent_id
         self.cleanup_state = cleanup_state
-        self.custody_unknown = custody_unknown
-        runtime_retained = cleanup_state == "not_hosted" or custody_unknown
+        self.custody_unknown = cleanup_state == "custody_unknown"
         self.metadata = {
             "code": "runtime_offboarding_not_performed",
             "agent": agent_name,
@@ -173,16 +175,13 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
             "agent_removed": True,
             "runtime_offboard_requested": True,
             "runtime_offboarded": False,
-            "runtime_retained": runtime_retained,
             "runtime_cleanup_pending": False,
             "runtime_cleanup_state": cleanup_state,
             "runtime_already_absent": cleanup_state == "already_absent",
-            "hosted_runtime_configured": cleanup_state != "not_hosted",
         }
-        if custody_unknown:
+        if self.custody_unknown:
             self.metadata.update(
                 {
-                    "runtime_cleanup_state": "custody_unknown",
                     "runtime_already_absent": False,
                     "runtime_custody_known": False,
                     "runtime_retention_unknown": True,
@@ -194,11 +193,23 @@ class RuntimeOffboardingNotPerformedError(RuntimeError):
                 "runtime custody requires operator reconciliation."
             )
         elif cleanup_state == "already_absent":
+            self.metadata.update(
+                {
+                    "runtime_retained": False,
+                    "hosted_runtime_configured": True,
+                }
+            )
             message = (
                 f"Agent {agent_name!r} was shut down and unpublished; its hosted "
                 "runtime namespace was already absent, so no tree was deleted."
             )
         else:
+            self.metadata.update(
+                {
+                    "runtime_retained": True,
+                    "hosted_runtime_configured": False,
+                }
+            )
             message = (
                 f"Agent {agent_name!r} was shut down and unpublished; it has no "
                 "hosted runtime namespace for secure offboarding."

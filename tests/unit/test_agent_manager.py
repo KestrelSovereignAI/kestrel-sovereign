@@ -97,22 +97,25 @@ def test_runtime_offboarding_not_performed_custody_state_is_narrow() -> None:
     unknown = RuntimeOffboardingNotPerformedError(
         agent_name="Hosted",
         agent_id="did:test:hosted",
-        cleanup_state="already_absent",
-        custody_unknown=True,
+        cleanup_state="custody_unknown",
     )
 
+    assert ordinary.cleanup_state == ordinary.metadata["runtime_cleanup_state"]
     assert ordinary.metadata["runtime_cleanup_state"] == "already_absent"
     assert ordinary.metadata["runtime_already_absent"] is True
     assert "runtime_retention_unknown" not in ordinary.metadata
+    assert unknown.cleanup_state == unknown.metadata["runtime_cleanup_state"]
     assert unknown.metadata["runtime_cleanup_state"] == "custody_unknown"
     assert unknown.metadata["runtime_already_absent"] is False
     assert unknown.metadata["runtime_custody_known"] is False
     assert unknown.metadata["runtime_retention_unknown"] is True
+    assert "runtime_retained" not in unknown.metadata
+    assert "hosted_runtime_configured" not in unknown.metadata
     with pytest.raises(ValueError, match="invalid runtime offboarding no-op state"):
         RuntimeOffboardingNotPerformedError(
             agent_name="Hosted",
             agent_id="did:test:hosted",
-            cleanup_state="custody_unknown",
+            cleanup_state="removed",
         )
 
 

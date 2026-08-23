@@ -590,6 +590,12 @@ class SpawnedAgentLifecycle:
                 # does not prove that destructive runtime offboarding ran.
                 terminated = True
                 finalized_from_absence = True
+                logger.warning(
+                    "Finalizing child %r from routing absence; "
+                    "offboard_runtime=%s and runtime custody is unknown",
+                    child_name,
+                    offboard_runtime,
+                )
                 if offboard_runtime:
                     from kestrel_sovereign.multi_agent.agent_manager import (
                         RuntimeOffboardingNotPerformedError,
@@ -598,8 +604,7 @@ class SpawnedAgentLifecycle:
                     termination_failure = RuntimeOffboardingNotPerformedError(
                         agent_name=child_name,
                         agent_id=tracked.child_did,
-                        cleanup_state="already_absent",
-                        custody_unknown=True,
+                        cleanup_state="custody_unknown",
                     )
             else:
                 # A TTL attempt is itself the timer task and is about to

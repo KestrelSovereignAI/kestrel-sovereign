@@ -226,6 +226,13 @@ def _termination_partial_result(
         for item in not_performed
         if isinstance(getattr(item, "metadata", None), dict)
     )
+    named_child_not_hosted = any(
+        isinstance(getattr(item, "metadata", None), dict)
+        and item.metadata.get("runtime_cleanup_state") == "not_hosted"
+        and isinstance(getattr(item, "agent_name", None), str)
+        and item.agent_name.casefold() == child_name.casefold()
+        for item in not_performed
+    )
 
     additional = [
         item
@@ -256,22 +263,25 @@ def _termination_partial_result(
     else:
         cleanup_state = "retained"
 
+    retention_witness = False
+    named_retention_witness = False
     if offboard_runtime:
-        # A subtree which was never stopped is a positive retention witness:
-        # Core did not admit deletion for that live subtree.  Custody remains
-        # incomplete because deletion was not proved for the whole request,
-        # but it must never be reported as ``runtime_retained=False``.
-        runtime_retained = (
-            not named_child_removed
-            or bool(retained)
+        # Only a retained cleanup, a subtree which was never stopped, or an
+        # explicitly storage-backed agent is a positive retention witness.
+        # Routing absence alone is not evidence for either retention or
+        # deletion and therefore cannot produce a retention field.
+        retention_witness = (
+            bool(retained)
             or bool(termination_not_performed)
             or "not_hosted" in no_op_states
-            or custody_unknown
         )
-        named_runtime_retained = not named_child_removed or named_child_retained or (
-            named_child_not_performed
-            and ("not_hosted" in no_op_states or custody_unknown)
+        named_retention_witness = (
+            named_child_retained
+            or named_termination_not_performed
+            or named_child_not_hosted
         )
+        runtime_retained = retention_witness
+        named_runtime_retained = named_retention_witness
         named_runtime_removed = named_child_removed and (
             not named_child_retained and not named_child_not_performed
         )
@@ -320,6 +330,10 @@ def _termination_partial_result(
         "additional_outcome_count": len(additional),
         "additional_outcome_types": additional_types,
     }
+    if custody_unknown and not retention_witness:
+        data.pop("runtime_retained")
+    if custody_unknown and not named_retention_witness:
+        data.pop("named_child_runtime_retained")
     if len(retained_agents) == 1:
         data["retained_agent"] = retained_agents[0]
     if retained:
@@ -349,7 +363,8 @@ def _termination_partial_result(
         data["runtime_already_absent"] = (
             "already_absent" in no_op_states and not custody_unknown
         )
-        data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
+        if not custody_unknown or "not_hosted" in no_op_states:
+            data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
         if custody_unknown:
             data["runtime_custody_known"] = False
             data["runtime_retention_unknown"] = True
@@ -395,9 +410,9 @@ def _termination_partial_result(
     elif custody_unknown:
         custody_message = (
             "The child was already stopped and unpublished, but this request "
-            "performed no secure runtime offboarding. Treat its runtime as "
-            "retained until operator reconciliation confirms custody. Do not "
-            "retry termination."
+            "performed no secure runtime offboarding. Runtime retention and "
+            "deletion are unknown until operator reconciliation confirms "
+            "custody. Do not retry termination."
         )
     elif not_performed and "already_absent" in no_op_states:
         custody_message = (
@@ -976,7 +991,9 @@ class SpawnFeature(Feature):
             ToolResult.ok when the child was actually terminated.
             ToolResult.partial when the child was stopped/unpublished but its
             isolated runtime cleanup is pending/retained or its manager
-            bookkeeping needs operator reconciliation.
+            bookkeeping needs operator reconciliation. It is also partial for
+            either offboard value when local finalization observes only routing
+            absence, because that proves neither runtime deletion nor retention.
             ERROR when there's no AgentManager, the named agent is
             not a child of this parent, or the underlying terminate
             call returned False.
