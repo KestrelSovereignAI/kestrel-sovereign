@@ -47,9 +47,11 @@ from .ledger import (
     strip_ledger_sections,
 )
 from .ledger_index import (
+    ACTIVE_STATUS,
     BLOCKER_SECTION,
     PATTERN_SECTION,
     LedgerSection,
+    index_membership,
     project_ledger,
     recall_nodes,
     search_rows,
@@ -1121,58 +1123,80 @@ class StrategicMemoryFeature(Feature):
 
         # Membership, not a count: an index holding one row the ledger dropped
         # and missing one it still holds has the right total and the wrong
-        # contents. The baseline follows the query's own mode, so asking for
-        # superseded rows is measured against superseded rows (#3064).
-        expected_ids = section.expected_row_ids(
-            self._ledger.data, include_retired=include_retired
-        )
-        returned_ids = {str(row.get("row_id") or "") for row in rows}
-        missing = expected_ids - returned_ids
-        # Divergence runs BOTH ways. Projection is best-effort, so a failed
-        # write after a supersession leaves the old node marked active while
-        # the canonical active set no longer holds it -- and a one-way check
-        # sees nothing missing and certifies retired guidance as current. That
-        # is a worse lie than the one this ticket was filed on, because the
-        # answer is confidently wrong rather than merely short.
-        unexpected = returned_ids - expected_ids
-        data["canonical_expected"] = len(expected_ids)
-
-        # An extra row is conclusive at any limit: truncation can hide a
-        # canonical row, it cannot manufacture one the ledger does not hold.
-        # A missing row is only conclusive when the page was not full.
-        missing_is_conclusive = bool(missing) and len(rows) < limit_val
-        # Two separate facts, deliberately not one flag: "a divergence was
-        # proven" and "the absence question could be answered" can differ, and
-        # collapsing them would let the weaker one hide the stronger.
-        data["completeness_checked"] = not (missing and len(rows) >= limit_val)
-        if not data["completeness_checked"]:
-            data["completeness_unchecked_reason"] = "result_truncated_at_limit"
-
-        if not (unexpected or missing_is_conclusive):
-            if data["completeness_checked"]:
-                return ToolResult.ok(confirmation=confirmation, data=data)
-            return ToolResult.ok(
-                confirmation=(
-                    f"{confirmation}; the limit was reached, so whether the "
-                    "index holds every canonical row was not checked"
-                ),
-                data=data,
+        # contents. Read from the WHOLE scoped projection rather than from the
+        # page, because a divergence that sorts behind every canonical row is
+        # invisible to a LIMIT and present in the database -- the page would
+        # certify a clean index and a larger limit would then return deleted
+        # guidance (#3064).
+        try:
+            membership, membership_complete = await index_membership(
+                graph_store, agent_id, section.node_type
             )
+        except Exception as e:  # noqa: BLE001
+            # The rows above are a real answer; only the check failed. Saying
+            # nothing here would let a silent failure read as agreement.
+            logger.debug(
+                "strategy index membership unavailable for %s: %s",
+                section.node_type,
+                e,
+            )
+            data["completeness_checked"] = False
+            data["completeness_unchecked_reason"] = "index_membership_unavailable"
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        if not membership_complete:
+            data["completeness_checked"] = False
+            data["completeness_unchecked_reason"] = "index_exceeds_membership_cap"
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        ledger_data = self._ledger.data
+        # Membership is status-agnostic: whether a row is retired decides which
+        # PAGE it belongs on, not whether the index should hold a node for it.
+        ledger_all = section.expected_row_ids(ledger_data, include_retired=True)
+        ledger_active = section.expected_row_ids(ledger_data, include_retired=False)
+        indexed = set(membership)
+        data["canonical_expected"] = len(
+            section.expected_row_ids(ledger_data, include_retired=include_retired)
+        )
+        data["completeness_checked"] = True
+
+        missing = ledger_all - indexed
+        orphaned = indexed - ledger_all
+        # Active in the index while the canonical file has retired it. The
+        # REVERSE -- retired in the index while the ledger is silent -- is the
+        # projection's documented graph-owned supersession, which reprojection
+        # deliberately preserves. Calling that a divergence would report a
+        # permanent staleness no restart could ever clear.
+        misfiled = {
+            row_id
+            for row_id, status in membership.items()
+            if status == ACTIVE_STATUS
+            and row_id in ledger_all
+            and row_id not in ledger_active
+        }
+
+        if not (missing or orphaned or misfiled):
+            return ToolResult.ok(confirmation=confirmation, data=data)
 
         data["index_stale"] = True
         divergences = []
-        if missing_is_conclusive:
+        if missing:
             data["missing_count"] = len(missing)
             divergences.append(
-                f"missing {len(missing)} of the {len(expected_ids)} "
-                f"{noun} {LEDGER_FILENAME} holds"
+                f"{len(missing)} of the {len(ledger_all)} {noun} "
+                f"{LEDGER_FILENAME} holds are absent from it"
             )
-        if unexpected:
-            data["unexpected_count"] = len(unexpected)
+        if orphaned:
+            data["orphaned_count"] = len(orphaned)
             divergences.append(
-                f"returning {len(unexpected)} row(s) {LEDGER_FILENAME} does "
-                "not hold in this mode -- a retired row still answering as "
-                "current, or one deleted from the canonical file"
+                f"it holds {len(orphaned)} row(s) {LEDGER_FILENAME} no longer "
+                "does"
+            )
+        if misfiled:
+            data["misfiled_count"] = len(misfiled)
+            divergences.append(
+                f"{len(misfiled)} row(s) it still marks current were retired "
+                f"in {LEDGER_FILENAME}"
             )
         fallback = "strategy_search"
         if include_retired:

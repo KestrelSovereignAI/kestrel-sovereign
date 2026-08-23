@@ -410,6 +410,45 @@ async def _remove_orphans(
 ACTIVE_STATUS = "active"
 
 
+#: Ceiling on the membership read below. ``query_nodes_by_type_and_property``
+#: clamps its limit to 10000, so a saturated read is indistinguishable from a
+#: complete one -- the caller reports an unrun check rather than guessing.
+MEMBERSHIP_READ_CAP = 10000
+
+
+async def index_membership(
+    graph_store: Any, agent_id: str, node_type: str
+) -> tuple[Dict[str, str], bool]:
+    """Every row this projection wrote for one agent: ``row_id -> status``.
+
+    Deliberately status-agnostic and deliberately NOT the caller's page.
+    Membership is a property of the index, and answering it from a ``LIMIT``-ed
+    result is how a divergence older than the page goes unreported: an orphan
+    that sorts behind every canonical row is invisible to the page and present
+    in the database, so the page certifies a clean index and a larger limit
+    then returns deleted guidance (#3064).
+
+    Returns ``(membership, complete)``. ``complete`` is False when the read
+    saturated :data:`MEMBERSHIP_READ_CAP`, which the caller must surface as a
+    check that did not run.
+    """
+    if graph_store is None:
+        raise RuntimeError("Graph store not available")
+    nodes = await graph_store.query_nodes_by_type_and_property(
+        node_type,
+        filters={"agent_id": agent_id, "source": _PROJECTION_SOURCE},
+        order_by_created=False,
+        limit=MEMBERSHIP_READ_CAP,
+    ) or []
+    membership = {
+        str((node.properties or {}).get("row_id") or ""): str(
+            (node.properties or {}).get("status") or ""
+        )
+        for node in nodes
+    }
+    return membership, len(nodes) < MEMBERSHIP_READ_CAP
+
+
 async def recall_nodes(
     graph_store: Any,
     agent_id: str,

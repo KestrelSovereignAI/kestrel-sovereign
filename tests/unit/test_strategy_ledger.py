@@ -39,6 +39,7 @@ from kestrel_sovereign.features.strategic_memory.ledger import (
 )
 from kestrel_sovereign.features.strategic_memory.ledger_index import (
     BLOCKER_NODE_TYPE,
+    MEMBERSHIP_READ_CAP,
     PATTERN_NODE_TYPE,
     ledger_node_id,
     project_ledger,
@@ -996,7 +997,7 @@ class TestTheIndexHasAConsumer:
         # reported as a divergence, because an in-memory ledger holding none
         # of it and an index holding one of it do disagree.
         assert result.status.value == "partial"
-        assert result.data["unexpected_count"] == 1
+        assert result.data["orphaned_count"] == 1
         # Count the pattern nodes specifically. ``len(graph.nodes)`` would also
         # count decision and blocker nodes, which is a different claim than the
         # one this test is making.
@@ -1198,14 +1199,49 @@ class TestTheIndexHasAConsumer:
             "an index answering with a row the ledger retired is not ok"
         )
         assert result.data["index_stale"] is True
-        assert result.data["unexpected_count"] == 1
+        assert result.data["misfiled_count"] == 1, (
+            "the ledger retired it and the index still marks it current"
+        )
 
     @pytest.mark.asyncio
-    async def test_an_extra_row_is_conclusive_even_on_a_full_page(self, tmp_path):
-        """Truncation hides canonical rows; it cannot manufacture strangers.
+    async def test_a_graph_retired_row_is_not_reported_as_missing(self, tmp_path):
+        """The projection preserves graph-owned supersession by design.
 
-        So the limit excuses an unanswered "is anything missing?" without
-        excusing a row the ledger does not hold.
+        A node carrying superseded_by while the ledger is silent is retired on
+        purpose, and reprojection keeps it that way -- so calling its absence
+        from the active page a divergence would report a permanent staleness
+        no restart could ever clear. Only the reverse (current in the index,
+        retired in the ledger) is a divergence.
+        """
+        feature = await _feature(tmp_path)
+        first = await feature.strategy_add_pattern(pattern="graph retires me")
+        await feature.strategy_add_pattern(pattern="still active")
+        graph = feature.agent.storage.graph
+        node = next(
+            n
+            for n in graph.nodes.values()
+            if n.node_type == PATTERN_NODE_TYPE
+            and n.properties["row_id"] == first.data["pattern_id"]
+        )
+        node.properties["superseded_by"] = "pat_replacement"
+        await feature._reindex_ledger()
+        assert node.properties["status"] == "superseded"
+
+        result = await feature.recall_patterns()
+
+        assert result.data["count"] == 1
+        assert result.status.value == "ok", (
+            "a row the index retired on its own is present, not missing"
+        )
+        assert result.data["completeness_checked"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_divergence_behind_the_page_is_still_reported(self, tmp_path):
+        """The check reads the whole scoped projection, not the caller's page.
+
+        An orphan that sorts behind every canonical row is invisible to a
+        LIMIT and present in the database, so a page-derived check certifies a
+        clean index while a larger limit returns deleted guidance.
         """
         feature = await _feature(tmp_path)
         for n in range(3):
@@ -1218,13 +1254,14 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns(limit=2)
 
+        assert result.data["count"] == 2, "the page itself is still bounded"
         assert result.status.value == "partial"
         assert result.data["index_stale"] is True
-        assert result.data["unexpected_count"] == 1
-        # The stronger fact does not erase the weaker one: whether rows are
-        # missing genuinely was not answered on a full page.
-        assert result.data["completeness_checked"] is False
-        assert "missing_count" not in result.data
+        assert result.data["completeness_checked"] is True, (
+            "the limit no longer defeats the check"
+        )
+        assert result.data["orphaned_count"] == 1
+        assert result.data["missing_count"] == 1
 
     @pytest.mark.asyncio
     async def test_a_stale_retired_recall_names_a_fallback_that_can_answer(
@@ -1275,10 +1312,14 @@ class TestTheIndexHasAConsumer:
         feature.agent.storage.graph.nodes.clear()
 
         active = await feature.recall_patterns()
-        assert active.status.value == "ok", (
-            "no active rows are expected, so an empty index is the right answer"
+        assert active.data["canonical_expected"] == 0, (
+            "no ACTIVE rows are expected, so the empty page is the right answer"
         )
-        assert active.data["canonical_expected"] == 0
+        assert active.status.value == "partial", (
+            "but membership is status-agnostic: the index is missing a row the "
+            "ledger holds, and that is true whichever page was asked for"
+        )
+        assert active.data["missing_count"] == 1
 
         everything = await feature.recall_patterns(include_superseded=True)
 
@@ -1290,13 +1331,11 @@ class TestTheIndexHasAConsumer:
         assert everything.data["index_stale"] is True
 
     @pytest.mark.asyncio
-    async def test_a_full_page_reports_that_completeness_was_not_checked(
-        self, tmp_path
-    ):
-        """The limit truncates, so absence from the page is not absence.
+    async def test_a_bounded_page_over_a_healthy_index_is_clean(self, tmp_path):
+        """The limit bounds the answer without weakening the claim about it.
 
-        Claiming completeness here would be a claim the check did not make;
-        claiming staleness would be a false alarm on a healthy index.
+        Reading membership from the whole scoped projection means a short page
+        is just a short page -- neither a false alarm nor an unrun check.
         """
         feature = await _feature(tmp_path)
         for n in range(4):
@@ -1306,11 +1345,104 @@ class TestTheIndexHasAConsumer:
 
         assert result.status.value == "ok"
         assert result.data["count"] == 2
+        assert result.data["completeness_checked"] is True
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_membership_read_is_not_a_complete_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A capped read cannot be told apart from a whole one.
+
+        query_nodes_by_type_and_property clamps its limit, so a projection
+        larger than the cap comes back looking exactly like a small complete
+        one -- and every row past the cap would read as missing.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_index
+
+        feature = await _feature(tmp_path)
+        for n in range(2):
+            await feature.strategy_add_pattern(pattern=f"observation {n}")
+        monkeypatch.setattr(ledger_index, "MEMBERSHIP_READ_CAP", 1)
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok", (
+            "the rows are still a real answer; only the check could not run"
+        )
         assert result.data["completeness_checked"] is False
         assert result.data["completeness_unchecked_reason"] == (
-            "result_truncated_at_limit"
+            "index_exceeds_membership_cap"
         )
-        assert "not checked" in result.confirmation
+        assert "index_stale" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_a_hand_written_node_is_not_this_projections_orphan(
+        self, tmp_path
+    ):
+        """Membership describes what THIS projection wrote, nothing else.
+
+        recall_nodes already filters on source so a hand-written node of the
+        same type stays out of an answer claiming to describe the ledger. The
+        membership read has to apply the same boundary, or someone else's node
+        becomes a permanent orphan this feature reports and cannot fix.
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="a real observation")
+        graph = feature.agent.storage.graph
+        node_id = f"{PATTERN_NODE_TYPE}:{AGENT}:hand_written"
+        graph.nodes[node_id] = GraphNode(
+            node_id=node_id,
+            node_type=PATTERN_NODE_TYPE,
+            label="not ours",
+            properties={
+                "agent_id": AGENT,
+                "row_id": "hand_written",
+                "status": "active",
+                "source": "some_other_writer",
+            },
+        )
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1, "and it is not in the answer either"
+        assert "orphaned_count" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_membership_query_names_the_unrun_check(
+        self, tmp_path
+    ):
+        """A failed membership read is not agreement, and not a failed recall.
+
+        The rows already returned are a real answer; only the check could not
+        run, and it says which.
+        """
+        feature = await _feature(tmp_path)
+        await feature.strategy_add_pattern(pattern="an indexed observation")
+        graph = feature.agent.storage.graph
+        original = graph.query_nodes_by_type_and_property
+
+        async def _refuse_membership(node_type, filters=None, **kwargs):
+            # Discriminate on the cap, not on the absence of a status filter:
+            # include_superseded=True also omits status, so that reading would
+            # make the double refuse the page read as well.
+            if kwargs.get("limit") == MEMBERSHIP_READ_CAP:
+                raise RuntimeError("graph query refused")
+            return await original(node_type, filters=filters, **kwargs)
+
+        graph.query_nodes_by_type_and_property = _refuse_membership
+
+        result = await feature.recall_patterns()
+
+        assert result.status.value == "ok"
+        assert result.data["count"] == 1
+        assert result.data["completeness_checked"] is False
+        assert result.data["completeness_unchecked_reason"] == (
+            "index_membership_unavailable"
+        )
 
     @pytest.mark.asyncio
     async def test_an_unreadable_ledger_names_the_unrun_check(self, tmp_path):
