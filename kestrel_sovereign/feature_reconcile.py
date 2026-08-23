@@ -586,7 +586,11 @@ class UnmetRequirement:
 
 
 def unsatisfied_requirements(
-    dist_name: str, extras: Tuple[str, ...], requires, installed_version,
+    dist_name: str,
+    extras: Tuple[str, ...],
+    requires,
+    installed_version,
+    _seen=None,
 ) -> Tuple[UnmetRequirement, ...]:
     """Every ACTIVE requirement of *dist_name* this venv does not satisfy.
 
@@ -607,10 +611,26 @@ def unsatisfied_requirements(
     check reports seven such conflicts among observability transitives and
     would refuse every update on a host that is working perfectly well.
 
+    A requirement that asks for EXTRAS carries that dependency's extra-gated
+    requirements too, so those are followed: core declares
+    ``kestrel-sovereign-sdk[tracing]`` and ``pyjwt[crypto]``, and checking only
+    that the base wheel is present at a satisfying version calls an environment
+    complete while the thing the extra exists to install is missing. Only
+    extra-bearing requirements are followed — this is not a walk of the whole
+    dependency graph, which is the environment-wide question this deliberately
+    is not — and ``_seen`` stops a cycle between two packages that ask for each
+    other's extras.
+
     *requires* and *installed_version* are the venv readers, passed in so this
     stays a pure function of what they report.
     """
     from packaging.requirements import Requirement
+
+    seen = _seen if _seen is not None else set()
+    key = (canonical_package(dist_name), tuple(sorted(extras)))
+    if key in seen:
+        return ()
+    seen.add(key)
 
     unmet: List[UnmetRequirement] = []
     for raw in requires(dist_name) or ():
@@ -644,13 +664,22 @@ def unsatisfied_requirements(
             continue
         spec = str(req.specifier)
         if not spec:
+            if req.extras:
+                unmet.extend(unsatisfied_requirements(
+                    name, tuple(req.extras), requires, installed_version, seen,
+                ))
             continue
         # `version_satisfies` fails OPEN by design — it was written for
         # reporting, where an unevaluable comparison must not manufacture
         # drift. A gate reading that as "satisfied" is the same failure one
         # layer up, so the two sides are asked separately and an unevaluable
         # comparison is reported as unmet-but-uncertain.
-        evaluable = version_is_valid(have) and spec_is_valid(spec)
+        # `===` is PEP 440's ARBITRARY equality: it exists precisely to match a
+        # version string that is not PEP 440, so demanding a parseable version
+        # first rejects the case the operator was added for — and then reports
+        # permanent uncertain drift over an environment that is satisfied.
+        arbitrary = all(item.operator == "===" for item in req.specifier)
+        evaluable = spec_is_valid(spec) and (arbitrary or version_is_valid(have))
         if not evaluable:
             unmet.append(UnmetRequirement(
                 name,
@@ -663,6 +692,11 @@ def unsatisfied_requirements(
             unmet.append(UnmetRequirement(
                 name,
                 f"{dist_name} requires {req.name}{spec}, but {have} is installed",
+            ))
+            continue
+        if req.extras:
+            unmet.extend(unsatisfied_requirements(
+                name, tuple(req.extras), requires, installed_version, seen,
             ))
     return tuple(unmet)
 

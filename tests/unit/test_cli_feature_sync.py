@@ -2934,3 +2934,59 @@ def test_one_unreadable_dependency_does_not_hide_the_rest(monkeypatch):
     assert "could not be read" in by_name["brokenpkg"].detail
     # The requirement AFTER it was still evaluated.
     assert by_name["kestrel-sovereign"].certain is True
+
+
+def test_a_requirement_that_asks_for_extras_carries_their_requirements_too(
+    monkeypatch
+):
+    """`pyjwt[crypto]` is not satisfied by pyjwt alone.
+
+    Core declares dependencies with extras, and checking only that the base
+    wheel is present at a satisfying version calls an environment complete
+    while the thing the extra exists to install is missing.
+    """
+    venv = FakeUv()
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["pyjwt[crypto]>=2"]
+    venv.installed["pyjwt"] = "2.9.0"                       # the base IS present
+    venv.installed_requires["pyjwt"] = ['cryptography>=3; extra == "crypto"']
+    use_fake_uv(monkeypatch, venv)
+
+    unmet = cli_features._unsatisfied_requirements("kestrel-feature-voice")
+    names = {r.name for r in unmet}
+
+    assert "pyjwt" not in names          # the base requirement is satisfied...
+    assert "cryptography" in names       # ...and the extra's is not
+
+
+def test_following_extras_does_not_loop_on_a_cycle(monkeypatch):
+    """Two packages asking for each other's extras must terminate."""
+    venv = FakeUv(feature_requires=">=0.52")   # core itself is satisfied
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["alpha[x]>=1"]
+    venv.installed["alpha"] = "1.0"
+    venv.installed["beta"] = "1.0"
+    venv.installed_requires["alpha"] = ['beta[y]>=1; extra == "x"']
+    venv.installed_requires["beta"] = ['alpha[x]>=1; extra == "y"']
+    use_fake_uv(monkeypatch, venv)
+
+    # Terminating at all is the assertion; nothing here is unsatisfied.
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
+
+
+def test_arbitrary_equality_is_honoured_rather_than_called_uncomparable(
+    monkeypatch
+):
+    """`===` exists to match a version string that is NOT PEP 440.
+
+    Demanding a parseable installed version first rejects the case the operator
+    was added for, and then reports permanent uncertain drift over an
+    environment that is satisfied — `ensure` for ever.
+    """
+    venv = FakeUv(feature_requires=">=0.52")   # core itself is satisfied
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===vendor-1"]
+    venv.installed["legacypkg"] = "vendor-1"
+    use_fake_uv(monkeypatch, venv)
+
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
