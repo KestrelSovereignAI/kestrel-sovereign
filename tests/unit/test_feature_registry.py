@@ -422,7 +422,7 @@ class TestInstalledRuntimeMetadata:
             """
 [tool.kestrel.feature]
 runtime = "isolated-venv"
-service = "/srv/kestrel-feature-test"
+service = "kestrel-feature-test-service"
 venv = "/var/kestrel/test/.venv"
 description = "Test isolated surface"
 """.strip()
@@ -441,7 +441,7 @@ description = "Test isolated surface"
 
         assert runtime is not None
         assert runtime.runtime == "isolated-venv"
-        assert runtime.service == "/srv/kestrel-feature-test"
+        assert runtime.service == "kestrel-feature-test-service"
         assert runtime.venv == "/var/kestrel/test/.venv"
         assert runtime.description == "Test isolated surface"
 

@@ -75,6 +75,7 @@ from kestrel_sovereign.features.security.approval_queue import (
 )
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.feature import SecurityFeature
+from kestrel_sovereign.features.spawn.feature import SpawnFeature
 from kestrel_sdk.hooks.base import HookInput, HookEvent, PermissionDecision
 
 
@@ -1511,6 +1512,93 @@ class TestApprovalQueueScopePersistence:
 
 class TestSecurityFeature:
     """Tests for SecurityFeature command contracts."""
+
+    @staticmethod
+    def _spawn_feature() -> SpawnFeature:
+        """Return the real SpawnFeature shape used by tool registration."""
+
+        agent = MagicMock()
+        agent._agent_manager = None
+        agent.agent_manager = None
+        return SpawnFeature(agent)
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_registers_on_static_always_ask_rail(
+        self,
+        tmp_path,
+    ):
+        """Fresh production registration uses the destructive static rail."""
+
+        security = SecurityFeature(MagicMock())
+        security.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await security.permission_store.initialize()
+
+        await security.register_feature_tools(
+            "SpawnFeature",
+            self._spawn_feature(),
+        )
+
+        assert (
+            await security.permission_store.get_permission(
+                "SpawnFeature",
+                "terminate_child",
+            )
+            is PermissionLevel.ALWAYS_ASK
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_registration_migrates_stale_allow(
+        self,
+        tmp_path,
+    ):
+        """Upgrade registration hardens the legacy restart-only ALLOW row."""
+
+        security = SecurityFeature(MagicMock())
+        security.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await security.permission_store.initialize()
+        store = security.permission_store
+        await store.set_permission(
+            "SpawnFeature",
+            "terminate_child",
+            PermissionLevel.ALLOW,
+        )
+
+        await security.register_feature_tools(
+            "SpawnFeature",
+            self._spawn_feature(),
+        )
+
+        assert (
+            await store.get_permission("SpawnFeature", "terminate_child")
+            is PermissionLevel.ALWAYS_ASK
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminate_child_static_rail_survives_global_auto_mode(
+        self,
+        tmp_path,
+    ):
+        """Auto mode promotes ordinary ASK tools but not tenant deletion."""
+
+        security = SecurityFeature(MagicMock())
+        security.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await security.permission_store.initialize()
+        store = security.permission_store
+        await security.register_feature_tools(
+            "SpawnFeature",
+            self._spawn_feature(),
+        )
+
+        store.set_global_auto_mode(True)
+
+        assert (
+            await store.get_permission("SpawnFeature", "spawn_agent")
+            is PermissionLevel.AUTO
+        )
+        assert (
+            await store.get_permission("SpawnFeature", "terminate_child")
+            is PermissionLevel.ALWAYS_ASK
+        )
 
     @pytest.mark.asyncio
     async def test_register_all_tools_seeds_codex_native_as_always_ask(self, tmp_path):

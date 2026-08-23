@@ -9,8 +9,11 @@ image URIs. These tests drive the handler against a stub agent whose
 
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -58,6 +61,77 @@ def test_404_when_no_qr(tmp_path):
     with TestClient(_app_with_agent(agent)) as client:
         resp = client.get("/api/agent/channels/whatsapp/link-qr.png")
     assert resp.status_code == 404
+
+
+@pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW contract is POSIX-only")
+def test_hosted_qr_refuses_tenant_controlled_symlink(tmp_path):
+    runtime_root = tmp_path / "hosted-runtime"
+    agent = SimpleNamespace(
+        did="did:test:hosted-channel",
+        storage_path=None,
+        isolated_runtime_root=runtime_root,
+        isolated_runtime_namespace="agent-hosted-channel",
+        isolated_runtime_hosted=True,
+    )
+    artifacts = (
+        runtime_root / "agent-hosted-channel" / "channel_link_artifacts"
+    )
+    artifacts.mkdir(parents=True)
+    victim = tmp_path / "another-tenant-qr.png"
+    victim.write_bytes(b"another tenant's pairing secret")
+    (artifacts / "whatsapp_link_qr.png").symlink_to(victim)
+
+    with TestClient(_app_with_agent(agent)) as client:
+        resp = client.get("/api/agent/channels/whatsapp/link-qr.png")
+
+    assert resp.status_code == 404
+    assert victim.read_bytes() not in resp.content
+
+
+def test_serves_png_from_explicit_hosted_runtime_namespace(tmp_path):
+    runtime_root = tmp_path / "hosted-runtime"
+    agent = SimpleNamespace(
+        did="did:test:hosted-channel",
+        storage_path=None,
+        isolated_runtime_root=runtime_root,
+        isolated_runtime_namespace="agent-hosted-channel",
+        isolated_runtime_hosted=True,
+    )
+    artifact = (
+        runtime_root
+        / "agent-hosted-channel"
+        / "channel_link_artifacts"
+        / "whatsapp_link_qr.png"
+    )
+    artifact.parent.mkdir(parents=True)
+    png = b"\x89PNG\r\n\x1a\nhosted-qr"
+    artifact.write_bytes(png)
+
+    with TestClient(_app_with_agent(agent)) as client:
+        resp = client.get("/api/agent/channels/whatsapp/link-qr.png")
+
+    assert resp.status_code == 200
+    assert resp.content == png
+    assert not (
+        runtime_root / "agent-hosted-channel" / ".kestrel-runtime-owner"
+    ).exists()
+
+
+def test_hosted_get_does_not_materialize_missing_runtime_namespace(tmp_path):
+    runtime_root = tmp_path / "hosted-runtime"
+    agent = SimpleNamespace(
+        did="did:test:hosted-channel",
+        storage_path=None,
+        isolated_runtime_root=runtime_root,
+        isolated_runtime_namespace="agent-hosted-channel",
+        isolated_runtime_hosted=True,
+    )
+
+    with TestClient(_app_with_agent(agent)) as client:
+        resp = client.get("/api/agent/channels/whatsapp/link-qr.png")
+
+    assert resp.status_code == 404
+    assert not runtime_root.exists()
 
 
 def test_rejects_invalid_channel_type(tmp_path):

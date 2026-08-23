@@ -121,12 +121,12 @@ def default_permission_for_feature(
 #
 # This map overrides the per-feature default for specific ``(feature, tool)``
 # pairs, keyed by the registered ``Feature.name`` mapping to a ``{tool_name:
-# level}`` dict. The destructive memory tools register at ALWAYS_ASK so
-# ``SecurityHook`` routes them through the Sovereign approval queue and — being
-# ALWAYS_ASK, not ASK — they stay a hard rail that global auto-mode cannot
-# promote to AUTO, matching the ``codex_native`` commandExecution/fileChange
-# precedent below. They are also excluded from the demo-server ALLOW override
-# (see ``_register_all_tools``) so a demo/governed agent cannot purge either.
+# level}`` dict. Destructive tools register at ALWAYS_ASK so ``SecurityHook``
+# routes them through the Sovereign approval queue and — being ALWAYS_ASK, not
+# ASK — they stay a hard rail that global auto-mode cannot promote to AUTO,
+# matching the ``codex_native`` commandExecution/fileChange precedent below.
+# They are also excluded from the demo-server ALLOW override (see
+# ``_register_all_tools``).
 _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
     "MemoryFeature": {
         "purge_conversation": PermissionLevel.ALWAYS_ASK,
@@ -134,6 +134,14 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         "delete_messages": PermissionLevel.ALWAYS_ASK,
         "delete_conversation": PermissionLevel.ALWAYS_ASK,
         "delete_message_by_id": PermissionLevel.ALWAYS_ASK,
+    },
+    "SpawnFeature": {
+        # The optional ``offboard_runtime`` argument irreversibly removes the
+        # child and descendant hosted-runtime trees. Permissions are
+        # tool-scoped, so the whole tool must remain an unpromotable approval
+        # rail. Static registration also upgrades legacy persisted ALLOW rows
+        # from when termination only stopped a restartable child.
+        "terminate_child": PermissionLevel.ALWAYS_ASK,
     },
     "InferenceLeaseFeature": {
         # Acquisition starts billable infrastructure and remains a hard
