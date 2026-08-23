@@ -47,7 +47,7 @@ from .ledger import (
     strip_ledger_sections,
 )
 from .ledger_index import (
-    ACTIVE_STATUS,
+    MEMBERSHIP_READ_CAP,
     BLOCKER_SECTION,
     PATTERN_SECTION,
     LedgerSection,
@@ -1039,6 +1039,24 @@ class StrategicMemoryFeature(Feature):
     # Tools: reading the projected index back out of the graph
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _unchecked_recall(
+        confirmation: str, data: Dict[str, Any], reason: str, explanation: str
+    ) -> ToolResult:
+        """A recall whose completeness check could not run.
+
+        PARTIAL, not ok. The rows really were retrieved, so this is not a
+        failure -- but ToolResult carries its honesty in ``status`` and
+        ``error``, and a caveat parked in ``data`` is narrated to the caller
+        as the clean confirmation "Retrieved 0 patterns." That is the same
+        shape of quiet degradation this whole ticket is about (#3064).
+        """
+        data["completeness_checked"] = False
+        data["completeness_unchecked_reason"] = reason
+        return ToolResult.partial(
+            confirmation=confirmation, error=explanation, data=data
+        )
+
     async def _recall_ledger(
         self,
         section: LedgerSection,
@@ -1117,9 +1135,13 @@ class StrategicMemoryFeature(Feature):
             # An unreadable ledger gives no trustworthy membership to compare
             # against, so the check has nothing to say -- and says so rather
             # than letting silence read as agreement.
-            data["completeness_checked"] = False
-            data["completeness_unchecked_reason"] = "ledger_unreadable"
-            return ToolResult.ok(confirmation=confirmation, data=data)
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "ledger_unreadable",
+                f"{LEDGER_FILENAME} could not be read, so whether this list "
+                "is the whole of it was not checked.",
+            )
 
         # Membership, not a count: an index holding one row the ledger dropped
         # and missing one it still holds has the right total and the wrong
@@ -1140,14 +1162,23 @@ class StrategicMemoryFeature(Feature):
                 section.node_type,
                 e,
             )
-            data["completeness_checked"] = False
-            data["completeness_unchecked_reason"] = "index_membership_unavailable"
-            return ToolResult.ok(confirmation=confirmation, data=data)
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "index_membership_unavailable",
+                "The strategy index could not be read in full, so whether "
+                "this list is the whole of it was not checked.",
+            )
 
         if not membership_complete:
-            data["completeness_checked"] = False
-            data["completeness_unchecked_reason"] = "index_exceeds_membership_cap"
-            return ToolResult.ok(confirmation=confirmation, data=data)
+            return self._unchecked_recall(
+                confirmation,
+                data,
+                "index_exceeds_membership_cap",
+                f"The strategy index holds more than {MEMBERSHIP_READ_CAP} "
+                f"{noun}, which is past what one membership read can see, so "
+                "whether this list is the whole of it was not checked.",
+            )
 
         ledger_data = self._ledger.data
         # Membership is status-agnostic: whether a row is retired decides which
@@ -1183,7 +1214,7 @@ class StrategicMemoryFeature(Feature):
             row = canonical_rows.get(row_id)
             if row is None:
                 continue  # an orphan, already counted
-            expected = section.expected_properties(agent_id, row, indexed.properties)
+            expected = section.expected_properties(agent_id, row)
             if str(expected.get("status") or "") != indexed.status:
                 misfiled.add(row_id)
             elif expected != indexed.properties:

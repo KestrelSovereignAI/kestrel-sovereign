@@ -580,16 +580,44 @@ class TestProjection:
         assert props["status"] == "superseded"
 
     @pytest.mark.asyncio
-    async def test_graph_supersession_survives_where_the_ledger_is_silent(self):
+    async def test_clearing_supersession_in_the_file_takes_effect(self):
+        """The ledger owns a ledger row's retirement, alone.
+
+        This projection used to carry superseded_* across from the existing
+        node wherever the file was silent, so that a value a PREVIOUS
+        projection had written from YAML survived the field being cleared --
+        the outcome the module docstring said the carry-over existed to
+        avoid. The recall then reported the resulting empty active page as
+        healthy (#3064).
+
+        The theory was that the graph might own a retirement the file cannot
+        express. Nothing can write one: memory_supersede_claim refuses every
+        node type outside CLAIM_SHAPED_NODE_TYPES, update_action_item
+        type-guards, and no module outside strategic_memory names these node
+        types at all. So the mechanism had no reachable legitimate case and
+        one reachable harmful one, and the test that pinned it hand-wrote a
+        world production cannot produce.
+        """
         node_id = ledger_node_id(PATTERN_NODE_TYPE, AGENT, "pat_1")
         graph = _FakeGraph()
-        rows = {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x"}]}
-        await project_ledger(graph, AGENT, rows)
-        graph.nodes[node_id].properties["superseded_by"] = "pat_newer"
+        await project_ledger(
+            graph,
+            AGENT,
+            {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x",
+                             "superseded_by": "pat_older",
+                             "superseded_at": "2026-08-01"}]},
+        )
+        assert graph.nodes[node_id].properties["status"] == "superseded"
 
-        await project_ledger(graph, AGENT, rows)
+        # Reactivated by hand: the fields are gone from the canonical file.
+        await project_ledger(
+            graph, AGENT, {PATTERNS_KEY: [{"id": "pat_1", "pattern": "x"}]}
+        )
 
-        assert graph.nodes[node_id].properties["superseded_by"] == "pat_newer"
+        props = graph.nodes[node_id].properties
+        assert props["superseded_by"] == ""
+        assert props["superseded_at"] == ""
+        assert props["status"] == "active"
 
     @pytest.mark.asyncio
     async def test_missing_graph_store_is_not_an_error(self):
@@ -1204,35 +1232,35 @@ class TestTheIndexHasAConsumer:
         )
 
     @pytest.mark.asyncio
-    async def test_a_graph_retired_row_is_not_reported_as_missing(self, tmp_path):
-        """The projection preserves graph-owned supersession by design.
+    async def test_a_row_reactivated_in_the_file_comes_back(self, tmp_path):
+        """The recall reflects the canonical file, including a clearing.
 
-        A node carrying superseded_by while the ledger is silent is retired on
-        purpose, and reprojection keeps it that way -- so calling its absence
-        from the active page a divergence would report a permanent staleness
-        no restart could ever clear. Only the reverse (current in the index,
-        retired in the ledger) is a divergence.
+        This was the case that made the carry-over untenable: the node kept
+        superseded_* a previous YAML projection had written, reprojection
+        preserved them, and recall_patterns returned a certified-clean empty
+        page over a pattern the operator had reactivated (#3064).
         """
         feature = await _feature(tmp_path)
-        first = await feature.strategy_add_pattern(pattern="graph retires me")
-        await feature.strategy_add_pattern(pattern="still active")
-        graph = feature.agent.storage.graph
-        node = next(
-            n
-            for n in graph.nodes.values()
-            if n.node_type == PATTERN_NODE_TYPE
-            and n.properties["row_id"] == first.data["pattern_id"]
+        added = await feature.strategy_add_pattern(pattern="briefly retired")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="thought it was done"
         )
-        node.properties["superseded_by"] = "pat_replacement"
+        assert (await feature.recall_patterns()).data["count"] == 0
+
+        # Reactivated by hand in the canonical file.
+        for row in feature._ledger.data[PATTERNS_KEY]:
+            row.pop("superseded_at", None)
+            row.pop("superseded_by", None)
+            row.pop("superseded_reason", None)
+        feature._ledger.save()
         await feature._reindex_ledger()
-        assert node.properties["status"] == "superseded"
 
         result = await feature.recall_patterns()
 
         assert result.data["count"] == 1
-        assert result.status.value == "ok", (
-            "a row the index retired on its own is present, not missing"
-        )
+        assert result.status.value == "ok"
+        assert result.data["completeness_checked"] is True
+
         assert result.data["completeness_checked"] is True
 
     @pytest.mark.asyncio
@@ -1489,32 +1517,25 @@ class TestTheIndexHasAConsumer:
         assert "restart the agent to reproject" in (result.error or "")
 
     @pytest.mark.asyncio
-    async def test_graph_owned_supersession_is_outside_the_content_digest(
-        self, tmp_path
-    ):
-        """The digest covers what the LEDGER owns, and nothing else.
+    async def test_a_superseded_row_is_clean_when_the_index_agrees(self, tmp_path):
+        """The retired page is checked the same way the active one is.
 
-        Including the graph-owned keys would make every legitimately
-        graph-retired pattern report content drift forever -- the same
-        permanent false alarm, arriving through a different door.
+        Supersession recorded in the file and projected to the index is
+        agreement, not drift -- the comparison must not manufacture a
+        divergence out of a row's retirement.
         """
         feature = await _feature(tmp_path)
-        first = await feature.strategy_add_pattern(pattern="graph retires me")
-        graph = feature.agent.storage.graph
-        node = next(
-            n
-            for n in graph.nodes.values()
-            if n.node_type == PATTERN_NODE_TYPE
-            and n.properties["row_id"] == first.data["pattern_id"]
+        added = await feature.strategy_add_pattern(pattern="retired and indexed")
+        await feature.strategy_supersede_pattern(
+            pattern_id=added.data["pattern_id"], reason="superseded properly"
         )
-        node.properties["superseded_by"] = "pat_replacement"
-        await feature._reindex_ledger()
-        assert node.properties["status"] == "superseded"
 
         result = await feature.recall_patterns(include_superseded=True)
 
+        assert result.data["count"] == 1
         assert result.status.value == "ok"
         assert "drifted_count" not in result.data
+        assert "misfiled_count" not in result.data
 
     @pytest.mark.asyncio
     async def test_a_blocker_reopened_by_hand_is_not_a_clean_zero(self, tmp_path):
@@ -1595,9 +1616,11 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        assert result.status.value == "ok", (
-            "the rows are still a real answer; only the check could not run"
+        assert result.status.value == "partial", (
+            "the rows are a real answer, but the caveat belongs in status and "
+            "error -- parked in data it is narrated as a clean confirmation"
         )
+        assert "was not checked" in (result.error or "")
         assert result.data["completeness_checked"] is False
         assert result.data["completeness_unchecked_reason"] == (
             "index_exceeds_membership_cap"
@@ -1665,7 +1688,8 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        assert result.status.value == "ok"
+        assert result.status.value == "partial"
+        assert "was not checked" in (result.error or "")
         assert result.data["count"] == 1
         assert result.data["completeness_checked"] is False
         assert result.data["completeness_unchecked_reason"] == (
@@ -1688,7 +1712,8 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        assert result.status.value == "ok"
+        assert result.status.value == "partial"
+        assert "was not checked" in (result.error or "")
         assert result.data["count"] == 1
         assert result.data["completeness_checked"] is False
         assert result.data["completeness_unchecked_reason"] == "ledger_unreadable"

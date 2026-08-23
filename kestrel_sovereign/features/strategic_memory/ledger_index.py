@@ -45,14 +45,22 @@ BLOCKER_NODE_TYPE = "strategy_blocker"
 #: our behalf.
 _PROJECTION_SOURCE = "strategic_memory"
 
-#: Properties the graph may own that the ledger has no field for. The ledger
-#: expresses supersession itself, so these are only preserved when the
-#: canonical row is silent — see the module docstring.
-_GRAPH_OWNED_PROPERTIES = (
-    "superseded_by",
-    "superseded_at",
-    "superseded_reason",
-)
+#: There are none for a ledger row, and that is the point.
+#:
+#: This projection used to carry ``superseded_by``/``superseded_at``/
+#: ``superseded_reason`` across from the existing node wherever the ledger was
+#: silent, on the theory that the graph might own a retirement the file has no
+#: field for. Nothing can write one: ``memory_supersede_claim`` refuses every
+#: node type outside ``CLAIM_SHAPED_NODE_TYPES`` (``decision``,
+#: ``action_item``), and ``StrategyLedger.supersede`` -- the file itself -- is
+#: the only other writer. So the carry-over could only ever preserve a value a
+#: PREVIOUS projection had written from YAML, which is exactly the outcome the
+#: module docstring said it existed to avoid: clearing the fields in the
+#: canonical file could never take effect in the index, and the recall then
+#: reported that as a healthy empty result (#3064).
+#:
+#: ``decision_index`` keeps its own carry-over deliberately -- decisions ARE
+#: claim-shaped, so there the graph really can own a supersession.
 
 
 def ledger_node_id(node_type: str, agent_id: str, row_id: str) -> str:
@@ -125,35 +133,6 @@ def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str
     return str(row.get("id") or "").strip() or minter(row)
 
 
-def apply_graph_owned(
-    properties: Dict[str, Any], existing: Optional[Mapping[str, Any]]
-) -> Dict[str, Any]:
-    """Carry graph-owned values across, per key, where the ledger is silent.
-
-    THE rule for what a projected node should hold, and the only copy of it.
-    The projection applies it when writing; the recall's divergence check
-    applies it to work out what the node ought to contain. #3064 went five
-    review rounds because the check re-derived this instead of using it, and
-    each round found the derivation wrong one field further in: first the
-    text-less rows, then the retirement, then which keys were graph-owned. A
-    second copy of a rule is a rule that will disagree with itself.
-
-    Note the condition is PER KEY and only where the ledger says nothing. When
-    the canonical file sets ``superseded_reason`` itself, that value wins and
-    an edit to it is an ordinary content change like any other.
-    """
-    existing_props = existing or {}
-    for key in _GRAPH_OWNED_PROPERTIES:
-        if properties.get(key):
-            # The canonical file wins whenever it says anything.
-            continue
-        if existing_props.get(key):
-            properties[key] = existing_props[key]
-            properties["status"] = "superseded"
-    return properties
-
-
-
 @dataclass(frozen=True)
 class LedgerSection:
     """One kind of ledger row, and everything both halves of the index need.
@@ -204,22 +183,19 @@ class LedgerSection:
         return properties
 
     def expected_properties(
-        self,
-        agent_id: str,
-        row: Dict[str, Any],
-        indexed: Optional[Mapping[str, Any]] = None,
+        self, agent_id: str, row: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """What a healthy index would hold for this row, given what it holds.
+        """What a healthy index holds for this row: what the projection writes.
 
-        Runs the row through the SAME carry-over the projection applies, so
-        the check compares against the projection's own answer rather than a
-        reconstruction of its rules. That is what makes a graph-owned
-        supersession not a divergence, a blocker's resolved status not
-        excusable, and an edit to a canonical ``superseded_reason`` an
-        ordinary content change -- three questions that needed three separate
-        special cases while the rule was being re-derived.
+        The same function the projection calls, so the check compares against
+        the projection's own answer rather than a reconstruction of its rules.
+        #3064 spent five review rounds on that reconstruction being wrong one
+        field further in each time, and the sixth found the rule being
+        reconstructed was itself unreachable. A second copy of a rule is a
+        rule that will disagree with itself; the fix was to delete the rule,
+        not to copy it more carefully.
         """
-        return apply_graph_owned(self.node_properties(agent_id, row), indexed)
+        return self.node_properties(agent_id, row)
 
     def node_id(self, agent_id: str, row: Dict[str, Any]) -> str:
         return ledger_node_id(self.node_type, agent_id, self.row_id(row))
@@ -404,8 +380,6 @@ async def _project_section(
             continue
 
         expected = existing.properties if existing is not None else None
-        if existing is not None:
-            apply_graph_owned(properties, existing.properties)
 
         node = GraphNode(
             node_id=node_id,
