@@ -187,13 +187,37 @@ def _termination_partial_result(
     surviving_subtree_agents.sort(key=str.casefold)
 
     retained_agents: list[str] = []
+    retained_states_by_agent: dict[str, set[str]] = {}
     for item in retained:
         agent_name = _safe_retained_agent_name(item)
         if agent_name is None:
             return None
         if agent_name not in retained_agents:
             retained_agents.append(agent_name)
+        metadata = getattr(item, "metadata", None)
+        retained_state = (
+            str(metadata.get("runtime_cleanup_state", "retained"))
+            if isinstance(metadata, dict)
+            else "retained"
+        )
+        retained_states_by_agent.setdefault(agent_name, set()).add(retained_state)
     retained_agents.sort(key=str.casefold)
+    pending_agents = sorted(
+        (
+            agent_name
+            for agent_name, states in retained_states_by_agent.items()
+            if states == {"pending"}
+        ),
+        key=str.casefold,
+    )
+    retained_only_agents = sorted(
+        (
+            agent_name
+            for agent_name, states in retained_states_by_agent.items()
+            if states != {"pending"}
+        ),
+        key=str.casefold,
+    )
     named_child_retained = any(
         name.casefold() == child_name.casefold() for name in retained_agents
     )
@@ -294,7 +318,7 @@ def _termination_partial_result(
         )
         reported_cleanup_state = (
             "termination_not_performed"
-            if termination_not_performed
+            if named_termination_not_performed
             else "not_performed"
             if not named_child_removed
             else named_child_retained_state
@@ -345,11 +369,26 @@ def _termination_partial_result(
         data["retained_agent"] = retained_agents[0]
     if retained:
         data["runtime_custody_code"] = "runtime_offboarding_retained"
+        data["pending_agents"] = pending_agents
+        data["retained_only_agents"] = retained_only_agents
         data["retained_cause_types"] = cause_types
         if len(cause_types) == 1:
             data["retained_cause_type"] = cause_types[0]
     if reconciliation:
         data["tracking_reconciled"] = False
+    retained_custody_messages: list[str] = []
+    if pending_agents:
+        retained_custody_messages.append(
+            "Secure runtime cleanup is still pending for "
+            f"{', '.join(pending_agents)} and may complete in manager-owned "
+            "cleanup."
+        )
+    if retained_only_agents:
+        retained_custody_messages.append(
+            "Secure runtime custody was retained for "
+            f"{', '.join(retained_only_agents)}."
+        )
+
     if termination_not_performed:
         data["termination_not_performed_outcome_count"] = len(
             termination_not_performed
@@ -414,6 +453,12 @@ def _termination_partial_result(
                 "runtime offboarding was not requested. Retry termination for the "
                 "named descendant subtree after operator reconciliation."
             )
+        if retained_custody_messages:
+            custody_message = (
+                f"{custody_message} {' '.join(retained_custody_messages)} "
+                "An operator must also reconcile each retained tree and pending "
+                "cleanup."
+            )
     elif not named_child_removed:
         custody_message = (
             "Descendant cleanup had terminal outcomes, but the named child was "
@@ -433,15 +478,11 @@ def _termination_partial_result(
             "custody. Do not retry termination."
         )
     elif retained and not_performed:
-        retained_state = (
-            "is still pending for" if cleanup_pending else "was retained for"
-        )
         custody_message = (
-            f"Secure runtime custody {retained_state} "
-            f"{', '.join(retained_agents)}, and runtime cleanup was not "
+            f"{' '.join(retained_custody_messages)} Runtime cleanup was not "
             f"performed for {', '.join(not_performed_agents)}. Do not retry "
-            "termination; an operator must reconcile the retained tree and "
-            "the remaining no-op custody outcomes."
+            "termination; an operator must reconcile each retained tree, "
+            "pending cleanup, and the remaining no-op custody outcomes."
         )
     elif not_performed and scoped_no_op_state == "already_absent":
         custody_message = (
@@ -460,18 +501,10 @@ def _termination_partial_result(
             "custody outcomes. Do not retry termination; an operator must "
             "reconcile the named child and descendant custody states."
         )
-    elif cleanup_pending:
-        custody_message = (
-            "Secure runtime cleanup is still pending for "
-            f"{', '.join(retained_agents)} and may complete in manager-owned "
-            "cleanup. Do not retry termination; an operator must reconcile "
-            "the final custody state."
-        )
     elif retained:
         custody_message = (
-            "Secure runtime custody was retained for "
-            f"{', '.join(retained_agents)}. Do not retry termination; an "
-            "operator must reconcile the retained tree."
+            f"{' '.join(retained_custody_messages)} Do not retry termination; "
+            "an operator must reconcile each retained tree and pending cleanup."
         )
     else:
         custody_message = (

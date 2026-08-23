@@ -510,6 +510,8 @@ class TestSpawnFeatureWithManager:
             "retained_outcome_count": 1,
             "retained_agents": ["helper"],
             "retained_agent": "helper",
+            "pending_agents": [],
+            "retained_only_agents": ["helper"],
             "additional_outcome_count": 0,
             "additional_outcome_types": [],
             "runtime_custody_code": "runtime_offboarding_retained",
@@ -731,6 +733,8 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["named_child_runtime_retained"] is True
         assert envelope.data["named_child_runtime_removed"] is False
         assert envelope.data["retained_agents"] == ["Child"]
+        assert envelope.data["pending_agents"] == []
+        assert envelope.data["retained_only_agents"] == ["Child"]
         assert envelope.data["not_performed_agents"] == ["Grandchild"]
         assert envelope.data["runtime_custody_code"] == (
             "runtime_offboarding_retained"
@@ -744,6 +748,8 @@ class TestSpawnFeatureWithManager:
         assert "Child" in envelope.error
         assert "Grandchild" in envelope.error
         assert "retained tree" in envelope.error
+        assert "was retained for Child" in envelope.error
+        assert "may complete" not in envelope.error
         serialized = str(envelope.to_dict())
         assert "/private/child-runtime" not in serialized
         assert "private-retained-detail" not in serialized
@@ -891,6 +897,82 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["named_child_runtime_removed"] is False
         assert envelope.data["named_child_runtime_retained"] is True
         assert envelope.data["retained_agents"] == ["Child", "Grandchild"]
+        pending_agent = "Child" if named_pending else "Grandchild"
+        retained_agent = "Grandchild" if named_pending else "Child"
+        assert envelope.data["pending_agents"] == [pending_agent]
+        assert envelope.data["retained_only_agents"] == [retained_agent]
+        assert f"still pending for {pending_agent}" in envelope.error
+        assert f"was retained for {retained_agent}" in envelope.error
+        assert f"still pending for {retained_agent}" not in envelope.error
+        assert f"{retained_agent} and may complete" not in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "/private/grandchild-runtime" not in serialized
+        assert "private-child-detail" not in serialized
+        assert "private-grandchild-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_pending", "descendant_pending", "named_cleanup_state"),
+        ((True, False, "pending"), (False, True, "retained")),
+    )
+    async def test_mixed_retained_and_noop_messages_scope_pending_agents(
+        self,
+        named_pending,
+        descendant_pending,
+        named_cleanup_state,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "mixed retained states and no-op custody",
+                [
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        runtime_path=Path("/private/child-runtime"),
+                        cause=OSError("private-child-detail"),
+                        cleanup_pending=named_pending,
+                    ),
+                    RuntimeOffboardingRetainedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        runtime_path=Path("/private/grandchild-runtime"),
+                        cause=OSError("private-grandchild-detail"),
+                        cleanup_pending=descendant_pending,
+                    ),
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="StorageGrandchild",
+                        agent_id="did:storage-grandchild",
+                        cleanup_state="not_hosted",
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        pending_agent = "Child" if named_pending else "Grandchild"
+        retained_agent = "Grandchild" if named_pending else "Child"
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_cleanup_state
+        assert envelope.data["runtime_cleanup_pending"] is True
+        assert envelope.data["pending_agents"] == [pending_agent]
+        assert envelope.data["retained_only_agents"] == [retained_agent]
+        assert envelope.data["not_performed_agents"] == ["StorageGrandchild"]
+        assert f"still pending for {pending_agent}" in envelope.error
+        assert f"was retained for {retained_agent}" in envelope.error
+        assert f"still pending for {retained_agent}" not in envelope.error
+        assert f"{retained_agent} and may complete" not in envelope.error
+        assert "not performed for StorageGrandchild" in envelope.error
         serialized = str(envelope.to_dict())
         assert "/private/child-runtime" not in serialized
         assert "/private/grandchild-runtime" not in serialized
@@ -1131,9 +1213,7 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["runtime_offboarded"] is False
         assert envelope.data["runtime_retained"] is True
         assert envelope.data["runtime_custody_known"] is False
-        assert envelope.data["runtime_cleanup_state"] == (
-            "termination_not_performed"
-        )
+        assert envelope.data["runtime_cleanup_state"] == "removed"
         assert envelope.data["named_child_runtime_removed"] is True
         assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
         assert envelope.data["retry_termination"] is False
@@ -1150,6 +1230,111 @@ class TestSpawnFeatureWithManager:
             offboard_runtime=True,
         )
         assert manager.get_agent("Grandchild") is grandchild
+
+    @pytest.mark.asyncio
+    async def test_descendant_tnp_and_retention_leave_named_removed_state(self):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "descendant termination and custody outcomes",
+                [
+                    ChildTerminationNotPerformedError(child_name="Grandchild"),
+                    RuntimeOffboardingRetainedError(
+                        agent_name="OtherGrandchild",
+                        agent_id="did:other-grandchild",
+                        runtime_path=Path("/private/other-grandchild"),
+                        cause=OSError("private-retained-detail"),
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == "removed"
+        assert envelope.data["named_child_runtime_removed"] is True
+        assert envelope.data["named_child_runtime_retained"] is False
+        assert envelope.data["named_child_termination_not_performed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
+        assert envelope.data["retained_agents"] == ["OtherGrandchild"]
+        assert envelope.data["retained_only_agents"] == ["OtherGrandchild"]
+        assert envelope.data["pending_agents"] == []
+        assert "OtherGrandchild" in envelope.error
+        serialized = str(envelope.to_dict())
+        assert "/private/other-grandchild" not in serialized
+        assert "private-retained-detail" not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("named_outcome", "named_cleanup_state", "named_runtime_retained"),
+        (
+            ("already_absent", "already_absent", False),
+            ("retained", "retained", True),
+        ),
+    )
+    async def test_descendant_tnp_preserves_named_child_custody_state(
+        self,
+        named_outcome,
+        named_cleanup_state,
+        named_runtime_retained,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        if named_outcome == "retained":
+            named_error = RuntimeOffboardingRetainedError(
+                agent_name="Child",
+                agent_id="did:child",
+                runtime_path=Path("/private/child-runtime"),
+                cause=OSError("private-child-detail"),
+            )
+        else:
+            named_error = RuntimeOffboardingNotPerformedError(
+                agent_name="Child",
+                agent_id="did:child",
+                cleanup_state=named_outcome,
+            )
+        manager.terminate_child = AsyncMock(
+            side_effect=BaseExceptionGroup(
+                "descendant termination and named custody outcomes",
+                [
+                    ChildTerminationNotPerformedError(child_name="Grandchild"),
+                    named_error,
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == named_cleanup_state
+        assert (
+            envelope.data["named_child_runtime_retained"]
+            is named_runtime_retained
+        )
+        assert envelope.data["named_child_runtime_removed"] is False
+        assert envelope.data["named_child_termination_not_performed"] is False
+        assert envelope.data["runtime_custody_known"] is False
+        assert envelope.data["surviving_subtree_agents"] == ["Grandchild"]
+        serialized = str(envelope.to_dict())
+        assert "/private/child-runtime" not in serialized
+        assert "private-child-detail" not in serialized
 
     @pytest.mark.asyncio
     async def test_descendant_not_performed_rejects_unsafe_name_metadata(self):

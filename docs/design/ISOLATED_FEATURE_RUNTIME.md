@@ -439,7 +439,13 @@ For a removed named child, `runtime_cleanup_state` likewise uses only its own
 no-op outcome and otherwise reports `removed`, regardless of descendant state.
 For retained cascades it uses the named child's own `pending` or `retained`
 outcome; aggregate descendant work remains visible through
-`runtime_cleanup_pending` and `retained_agents`.
+`runtime_cleanup_pending` and `retained_agents`. The additive `pending_agents`
+and `retained_only_agents` fields preserve each retained agent's state so only
+pending cleanup is described as potentially completing.
+Descendant `termination_not_performed` outcomes remain visible through
+`surviving_subtree_agents`, retry fields, and `runtime_custody_known=false`; the
+named child's `runtime_cleanup_state` changes to `termination_not_performed`
+only when termination was not performed for that named child itself.
 When retained and no-op outcomes coexist, the backward-compatible
 `runtime_custody_code` names the stronger retained outcome and
 `runtime_custody_codes` lists both facts for operator reconciliation.
