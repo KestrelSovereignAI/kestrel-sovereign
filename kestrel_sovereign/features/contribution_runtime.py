@@ -528,12 +528,15 @@ class FeatureContributionRuntime:
             for workflow in values.workflows
             for source in workflow.sources
         ):
-            # Only a source this feature actually holds is its to validate: an
-            # equivalent contribution rides an incumbent it never created, and
-            # demanding object identity there failed teardown for a feature that
-            # had done nothing wrong (#3053).
+            # Every successful owner-scoped activation claims each declared
+            # source, equivalent incumbents included — so a MISSING claim is not
+            # "not ours", it is drift. Skipping silently let deactivate() strip
+            # the other capabilities and erase `_active` as though the exact
+            # inverse had succeeded (#3053).
             if feature not in self.source_registry.owners_of(source.name):
-                continue
+                raise FeatureContributionRuntimeError(
+                    "active signal-source registration identity does not match"
+                )
             current = self.source_registry.get(source.name)
             # CONTRACT, not object identity. A feature holding a claim on an
             # equivalent incumbent never registered that object, so demanding

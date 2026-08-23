@@ -549,3 +549,48 @@ def test_unregister_does_not_retain_the_owner_object():
 
     assert registry.owners_of("leak.test") == ()
     assert id(owner) not in registry._claim_owners
+
+
+def test_core_requiring_a_source_a_feature_created_first_is_a_holder():
+    """Phase ordering: a feature can create a source core registers later.
+
+    Heartbeat is the live case — a feature contributes the equivalent
+    registration in phase 4, core registers it MANDATORY in phase 6. Recording
+    no claim for core meant disabling that feature deleted a source
+    `HeartbeatRunner` was still dispatching on.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("phase.ordered")
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    # Core, later, ownerless and MANDATORY: it REQUIRES this source.
+    registry.register_with_policy(source, RegistrationPolicy.MANDATORY)
+
+    registry.release_all(feature)
+
+    # Core still holds it, so it survives the feature going away.
+    assert registry.get("phase.ordered") is source
+
+
+def test_an_optional_ownerless_re_registration_still_does_not_pin():
+    """The other half of the same rule — OPTIONAL is "nice to have".
+
+    Every imperative feature site registers OPTIONAL and ownerless, then claims
+    a moment later. Treating that as a host claim strands the feature's
+    handlers forever.
+    """
+    from kestrel_sovereign.signals import RegistrationPolicy, SourceRegistry
+
+    registry = SourceRegistry()
+    feature = object()
+    source = _owner_test_source("optional.retry")
+
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL, owner=feature)
+    registry.register_with_policy(source, RegistrationPolicy.OPTIONAL)
+
+    assert registry.owners_of("optional.retry") == (feature,)
+    registry.release_all(feature)
+    assert registry.get("optional.retry") is None

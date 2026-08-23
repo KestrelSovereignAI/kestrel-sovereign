@@ -336,12 +336,22 @@ class SourceRegistry:
             # it alive until it lets go. Recording that is what stops the first
             # holder's teardown pulling the source out from under the second.
             #
-            # Only for a NAMED owner. "No owner supplied" is not "the host owns
-            # this" — the imperative path registers ownerless and claims a
-            # moment later, so a repeated `initialize()` would otherwise staple
-            # a permanent host claim onto a feature's own source and strand its
+            # An ownerless re-registration is ambiguous on its face: it is
+            # either core saying "I need this source" or the imperative feature
+            # path, which registers ownerless and claims a moment later. The
+            # POLICY already says which.
+            #
+            # MANDATORY / IDEMPOTENT — the caller requires the source, so it is
+            # a holder. Without this, core registering an equivalent source a
+            # feature happened to create first (heartbeat: feature in phase 4,
+            # core in phase 6) recorded no claim, and disabling that feature
+            # deleted a source core was still running on.
+            #
+            # OPTIONAL — "nice to have", and the path every imperative feature
+            # site uses. Claiming here would staple a permanent host claim onto
+            # a feature's own source on a repeated `initialize()` and strand its
             # handlers forever.
-            if owner is not None:
+            if owner is not None or policy is not RegistrationPolicy.OPTIONAL:
                 self._claim(registration.name, owner)
             return RegistrationOutcome(
                 registration.name, RegistrationState.ALREADY_EQUIVALENT
