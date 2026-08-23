@@ -687,7 +687,13 @@ def unsatisfied_requirements(
         arbitrary = bool(spec) and all(
             item.operator == "===" for item in req.specifier
         )
-        if arbitrary and not version_is_valid(have):
+        if arbitrary:
+            # ALWAYS, not just when the version fails to parse. `v1.0` and
+            # `1.0-1` parse fine and normalise to something else, so routing a
+            # parseable one through the normalising path reports `dep===v1.0`
+            # unmet against an installed `v1.0` — permanent drift over an
+            # environment that is satisfied. Arbitrary equality has one
+            # comparison, and it is the raw one.
             if not req.specifier.contains(have):
                 unmet.append(UnmetRequirement(
                     name,

@@ -3010,3 +3010,22 @@ def test_arbitrary_equality_that_does_not_match_is_unmet(monkeypatch):
     assert [r.name for r in unmet] == ["legacypkg"]
     assert unmet[0].certain is True
     assert "vendor-1 is installed" in unmet[0].detail
+
+
+def test_arbitrary_equality_matches_a_parseable_but_noncanonical_version(
+    monkeypatch
+):
+    """`v1.0` parses AND normalises to something else.
+
+    Gating the raw comparison on "the version does not parse" was a proxy for
+    "use arbitrary equality's own comparison". A parseable-but-noncanonical
+    version took the normalising path and came back unmet against itself —
+    `ensure` for ever, over an environment that is satisfied.
+    """
+    venv = FakeUv(feature_requires=">=0.52")
+    venv.installed["kestrel-feature-voice"] = "0.4.0"
+    venv.installed_requires["kestrel-feature-voice"] = ["legacypkg===v1.0"]
+    venv.installed["legacypkg"] = "v1.0"
+    use_fake_uv(monkeypatch, venv)
+
+    assert cli_features._unsatisfied_requirements("kestrel-feature-voice") == ()
