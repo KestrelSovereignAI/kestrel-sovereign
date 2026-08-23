@@ -412,7 +412,6 @@ class RestartCoordinatorFeature(Feature):
             self._register_signal_sources(
                 build_restart_completed_registration(),
                 RegistrationPolicy.OPTIONAL,
-                registry,
             )
 
         # A successful restart orphans its child's stderr file (this process

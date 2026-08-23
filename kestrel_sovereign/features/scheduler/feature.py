@@ -232,7 +232,7 @@ class SchedulerFeature(Feature):
             # exactly these (#2522 P2) and the registry never has to infer who
             # the holder is (#3074).
             self._register_signal_sources(
-                cron_registrations, RegistrationPolicy.OPTIONAL, registry
+                cron_registrations, RegistrationPolicy.OPTIONAL
             )
 
             # github_pr_watch (#1618) is an ACTION cron task that, on a
@@ -248,7 +248,6 @@ class SchedulerFeature(Feature):
             self._register_signal_sources(
                 build_github_pr_activity_registration(),
                 RegistrationPolicy.OPTIONAL,
-                registry,
             )
 
             from kestrel_sovereign.signals.sources.ecosystem_discovery import (
@@ -258,7 +257,6 @@ class SchedulerFeature(Feature):
             self._register_signal_sources(
                 build_ecosystem_discovery_registration(),
                 RegistrationPolicy.OPTIONAL,
-                registry,
             )
         else:
             logger.warning(

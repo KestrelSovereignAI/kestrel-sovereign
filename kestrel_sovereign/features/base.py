@@ -386,6 +386,13 @@ class Feature(_SdkFeature):
         ``**kwargs`` would accept the keyword and ignore it, taking a claim in
         a role its teardown never releases; falling back is the conservative
         answer and always safe.
+
+        No compatibility path for the shape in between, deliberately. The claims
+        ledger's first form — ``adopt`` / ``release_all`` / ``owner=`` without
+        ``role=`` — exists only in unreleased main (#3053 landed after v0.53.4
+        and ships in the same release as this), so nothing was ever built
+        against it. Keeping a path for it would mean keeping ``adopt``'s
+        ``created=`` flag, which is the guess this change exists to delete.
         """
         register = getattr(registry, "register_with_policy", None)
         if not callable(register) or not hasattr(registry, "release_all"):
@@ -396,7 +403,7 @@ class Feature(_SdkFeature):
             return False
         return "role" in parameters
 
-    def _register_signal_sources(self, registrations, policy, registry=None):
+    def _register_signal_sources(self, registrations, policy):
         """Register signal sources AS THIS FEATURE; return the outcomes.
 
         The one door imperative registration goes through. Ownership is stated
@@ -411,13 +418,17 @@ class Feature(_SdkFeature):
         removed: there is exactly one record per registry, and which one is
         decided by what the registry can actually do.
 
-        *registry* overrides the agent's, for a feature that resolved one
-        itself. A caller that then decides it cannot use what it registered
-        must hand the claim back (:meth:`_disown_signal_sources`) — taking it
-        at registration and declining afterwards are two halves of one door.
+        The registry is always the agent's. It used to be overridable, for a
+        feature that had resolved one itself — but teardown reads the agent's,
+        so an override could only ever be a way for the two halves to disagree
+        about which registry holds the claim. Every call site was passing the
+        agent's registry anyway.
+
+        A caller that decides it cannot use what it registered must hand the
+        claim back (:meth:`_disown_signal_sources`) — taking it at registration
+        and declining afterwards are two halves of one door.
         """
-        if registry is None:
-            registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
         if registry is None:
             return []
         items = (
@@ -503,16 +514,20 @@ class Feature(_SdkFeature):
             if name not in owned:
                 owned.append(name)
 
-    def _disown_signal_sources(self, outcomes, registry=None) -> None:
+    def _disown_signal_sources(self, outcomes) -> None:
         """Hand back claims :meth:`_register_signal_sources` took.
 
         For a feature that registers a source and then finds it cannot use it.
         The claim is taken at registration now, so declining has to give it
         back — and giving back the LAST claim on a source removes it, which is
         the right answer: nothing needs a source its only holder refused.
+
+        Reads the agent's registry, the same one
+        :meth:`_register_signal_sources` claimed through — releasing from a
+        different instance than the one holding the claim is the divergence
+        that removing the override closed.
         """
-        if registry is None:
-            registry = getattr(getattr(self, "agent", None), "signal_registry", None)
+        registry = getattr(getattr(self, "agent", None), "signal_registry", None)
         if registry is None:
             return
         names = self._signal_source_names(outcomes, created_only=False)

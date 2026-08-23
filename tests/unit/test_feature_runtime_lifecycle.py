@@ -122,7 +122,6 @@ class _FullFeature(Feature):
             self._register_signal_sources(
                 _fake_source_registration(self.SOURCE),
                 RegistrationPolicy.OPTIONAL,
-                registry,
             )
 
     def get_hooks(self):

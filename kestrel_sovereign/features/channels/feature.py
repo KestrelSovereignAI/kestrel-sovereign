@@ -505,7 +505,7 @@ class ChannelFeature(Feature):
             # can still reject it — and then the claim is handed back, which is
             # what `_disown_signal_sources` is for.
             outcome = self._register_signal_sources(
-                required, RegistrationPolicy.OPTIONAL, signal_registry
+                required, RegistrationPolicy.OPTIONAL
             )
             outcome = outcome[0] if outcome else None
             # A host which merely claims registration succeeded is insufficient
@@ -537,7 +537,7 @@ class ChannelFeature(Feature):
             # just refused, and a source whose last holder refused it should not
             # linger. Deliberately keyed on VERIFYING the installed registration
             # rather than trusting an embedder's return value.
-            self._disown_signal_sources(outcome, signal_registry)
+            self._disown_signal_sources(outcome)
             logger.error(
                 "Channel signal source registration is not verifiably usable for "
                 "durable cognition (state=%s): %s; ACK-bearing ingress will "
