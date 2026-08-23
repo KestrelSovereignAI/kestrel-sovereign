@@ -899,3 +899,105 @@ class TestTheWalkIsOneProjection:
 
         assert attempts == [0], f"the walk restarted {len(attempts)} times"
         assert [s["session_id"] for s in found] == ["s1"]
+
+    @pytest.mark.asyncio
+    async def test_a_commit_between_the_counter_reads_is_not_certified(self, store):
+        """Three numbers about one instant, or the arithmetic is not exact.
+
+        ``only_appends_above`` is exact — see #3001 — about counters that
+        describe the same moment. Read one at a time they do not: PostgreSQL
+        gives each STATEMENT its own snapshot, so a mutation below the frontier
+        can be counted by ``changes`` and an ordinary append can then supply the
+        matching ``appends`` and row count, and all three arrive as 1. The
+        movement below the frontier is then certified as an append above it
+        (codex R4 P2, reproduced end to end: ``message_count: 1`` beside
+        ``match_count: 2``).
+
+        The check asserted is therefore structural, and its contract is exactly
+        the fix: **one statement**, which is a snapshot under READ COMMITTED and
+        inside SQLite's implicit transaction alike. A behavioural test cannot
+        stand in for it — which interleaving is fatal depends on the ORDER the
+        counters happen to be read in, so a test that wedges a commit at one
+        seam passes against a version that simply reads them in another order
+        (measured: a four-read mutant survived exactly that test). What has to
+        be true is that there is no seam.
+
+        The second assertion is the behavioural half: the commit wedged after
+        that single read lands too late to be mistaken for the movement below
+        the frontier, which is still refused.
+        """
+        from kestrel_sovereign.storage.conversation_sessions import (
+            ConversationSessionProjection,
+        )
+
+        await _seed(
+            store.db,
+            store.agent_id,
+            [
+                ("s1", "user", "the launch codes are in the penguin folder", 0),
+                ("s1", "user", "more about the penguin folder", 1),
+            ],
+        )
+        await store.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = CURRENT_TIMESTAMP "
+            "WHERE agent_id = ? AND content LIKE 'more about%'",
+            (store.agent_id,),
+        )
+        projection = ConversationSessionProjection(store.db, store.agent_id)
+        await projection.repair()
+        accounted = await projection.accounted()
+
+        # A row BELOW the frontier moves...
+        await store.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = NULL "
+            "WHERE agent_id = ? AND content LIKE 'more about%'",
+            (store.agent_id,),
+        )
+
+        reads: List[str] = []
+        fired: List[bool] = []
+
+        async def append_once():
+            if fired:
+                return
+            fired.append(True)
+            await _seed(
+                store.db,
+                store.agent_id,
+                [("s2", "user", "an unrelated new conversation", 900)],
+            )
+
+        class _CommitsAfterTheFirstRead:
+            """The real database, with one commit wedged after its first read."""
+
+            def __init__(self, db):
+                self._db = db
+
+            def __getattr__(self, name):
+                return getattr(self._db, name)
+
+            async def fetchval(self, *args, **kwargs):
+                reads.append(args[0])
+                value = await self._db.fetchval(*args, **kwargs)
+                await append_once()
+                return value
+
+            async def fetchone(self, *args, **kwargs):
+                reads.append(args[0])
+                row = await self._db.fetchone(*args, **kwargs)
+                await append_once()
+                return row
+
+        projection.db = _CommitsAfterTheFirstRead(store.db)
+
+        certified = await projection.unchanged_below(accounted)
+
+        assert len(reads) == 1, (
+            f"the check read the database {len(reads)} times, so its counters "
+            f"can describe {len(reads)} different histories: {reads}"
+        )
+        assert fired, "the fixture never wedged a commit after that read"
+        assert certified is False, (
+            "a row that moved below the frontier was certified as an append "
+            "above it"
+        )

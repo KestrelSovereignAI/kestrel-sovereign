@@ -2419,16 +2419,56 @@ class ConversationSessionProjection:
         """
         if not accounted.valid:
             return False
-        if accounted.generation != await self.observed_generation():
+        observed, appends, generation, above = await self._counters(accounted.target)
+        if accounted.generation != generation:
             return False
-        observed = await self.observed_changes()
         if observed == accounted.stamp:
             return True
         return only_appends_above(
-            observed - accounted.stamp,
-            await self.observed_appends() - accounted.appends,
-            await self._rows_above(accounted.target),
+            observed - accounted.stamp, appends - accounted.appends, above
         )
+
+    async def _counters(self, target: int) -> Tuple[int, int, str, int]:
+        """The four numbers a consistency test compares, from ONE snapshot.
+
+        ``(changes, appends, generation, rows above target)``.
+
+        Four awaits would be four snapshots. PostgreSQL's default isolation
+        gives each STATEMENT its own, so reads inside one transaction are not
+        one instant either — and :func:`only_appends_above` is exact only about
+        numbers that describe one. Measured interleaving: a mutation BELOW the
+        frontier commits and is counted by ``changes``; an ordinary append then
+        commits before ``appends`` and the row count are read, so all three
+        arrive as 1 and the movement below the frontier is certified as an
+        append above it (codex R4 P2, reproduced: ``message_count: 1`` beside
+        ``match_count: 2``).
+
+        One statement is what fixes it, rather than an isolation level: a single
+        SELECT is a snapshot under READ COMMITTED and inside SQLite's implicit
+        transaction alike, so the scalar subqueries below say "at the same
+        instant" without either engine being asked for something it does not
+        use here.
+
+        :meth:`_plan` and :meth:`_rebuild_from_transcript` read the same
+        counters one at a time and have the same exposure on PostgreSQL —
+        pre-existing, in the repair path rather than this read, and filed as
+        #3081 rather than restructured from here.
+        """
+        row = await self.db.fetchone(
+            "SELECT "
+            "(SELECT COALESCE(SUM(changes), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?), "
+            "(SELECT COALESCE(SUM(appends), 0) FROM conversation_history_changes "
+            "WHERE agent_id = ?), "
+            "(SELECT generation FROM conversation_history_changes "
+            "WHERE agent_id = ? AND slot = 0), "
+            "(SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND id > ?)",
+            (self.agent_id, self.agent_id, self.agent_id, self.agent_id, target),
+        )
+        if row is None:
+            return 0, 0, "", 0
+        return int(row[0] or 0), int(row[1] or 0), str(row[2] or ""), int(row[3] or 0)
 
     async def is_stale(self) -> bool:
         """Whether the projection disagrees with the rows it describes.
