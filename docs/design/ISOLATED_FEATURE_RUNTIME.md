@@ -427,6 +427,15 @@ was observed, so positive runtime-retention fields are omitted unless another
 typed outcome independently proves retention. These three custody states keep
 routing withdrawal and persisted-registration removal truthful and separate
 from filesystem custody.
+
+Tool results and spawn-history records finalized from routing absence carry
+`finalized_from_absence=true` so the operator-facing evidence remains durable.
+
+For cascade results, `runtime_already_absent` and
+`hosted_runtime_configured` describe the named child when its no-op state is
+known. Core omits both fields when mixed descendant outcomes cannot be scoped
+unambiguously to that child.
+
 Core-created standalone feature, workspace, and channel-artifact directories
 are private `0700`; a pre-existing storage parent (including process CWD) is
 operator-owned and its mode is never changed.

@@ -579,6 +579,78 @@ class TestSpawnFeatureWithManager:
         assert lifecycle.is_tracked("helper") is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "named_state",
+            "descendant_state",
+            "named_runtime_retained",
+            "hosted_runtime_configured",
+            "runtime_already_absent",
+        ),
+        (
+            ("already_absent", "not_hosted", False, True, True),
+            ("not_hosted", "already_absent", True, False, False),
+        ),
+    )
+    async def test_mixed_noop_cascade_fields_are_named_child_scoped(
+        self,
+        named_state,
+        descendant_state,
+        named_runtime_retained,
+        hosted_runtime_configured,
+        runtime_already_absent,
+    ):
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.get_children = MagicMock(return_value=["Child"])
+        manager.get_agent = MagicMock(return_value=None)
+        manager._lifecycle = None
+        manager.terminate_child = AsyncMock(
+            side_effect=ExceptionGroup(
+                "mixed no-op custody",
+                [
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Grandchild",
+                        agent_id="did:grandchild",
+                        cleanup_state=descendant_state,
+                    ),
+                    RuntimeOffboardingNotPerformedError(
+                        agent_name="Child",
+                        agent_id="did:child",
+                        cleanup_state=named_state,
+                    ),
+                ],
+            )
+        )
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+
+        envelope = await feature.terminate_child(
+            child_name="Child",
+            offboard_runtime=True,
+        )
+
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["runtime_cleanup_state"] == "mixed"
+        assert envelope.data["runtime_offboarded"] is False
+        assert envelope.data["runtime_retained"] is True
+        assert (
+            envelope.data["named_child_runtime_retained"]
+            is named_runtime_retained
+        )
+        assert (
+            envelope.data["hosted_runtime_configured"]
+            is hosted_runtime_configured
+        )
+        assert envelope.data["runtime_already_absent"] is runtime_already_absent
+        assert envelope.data["not_performed_agents"] == ["Child", "Grandchild"]
+        assert "finalized_from_absence" not in envelope.data
+        manager.terminate_child.assert_awaited_once_with(
+            parent.agent_id,
+            "Child",
+            offboard_runtime=True,
+        )
+
+    @pytest.mark.asyncio
     async def test_terminate_child_maps_real_shutdown_handoff_to_pending_partial(
         self,
         monkeypatch,
@@ -1242,6 +1314,7 @@ class TestSpawnFeatureWithManager:
         assert envelope.data["runtime_retention_unknown"] is True
         assert envelope.data["runtime_cleanup_state"] == "custody_unknown"
         assert envelope.data["runtime_already_absent"] is False
+        assert envelope.data["finalized_from_absence"] is True
         assert "hosted_runtime_configured" not in envelope.data
         assert envelope.data["operator_action_required"] is True
         assert "operator reconciliation" in envelope.error

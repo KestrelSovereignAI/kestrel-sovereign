@@ -221,18 +221,25 @@ def _termination_partial_result(
         no_op_cleanup_state = next(iter(no_op_states))
     else:
         no_op_cleanup_state = None
+    named_child_no_op_states = {
+        str(item.metadata.get("runtime_cleanup_state"))
+        for item in not_performed
+        if isinstance(getattr(item, "metadata", None), dict)
+        and isinstance(getattr(item, "agent_name", None), str)
+        and item.agent_name.casefold() == child_name.casefold()
+    }
+    if len(named_child_no_op_states) == 1:
+        scoped_no_op_state = next(iter(named_child_no_op_states))
+    elif not named_child_no_op_states and len(no_op_states) == 1:
+        scoped_no_op_state = next(iter(no_op_states))
+    else:
+        scoped_no_op_state = None
     custody_unknown = any(
         item.metadata.get("runtime_custody_known") is False
         for item in not_performed
         if isinstance(getattr(item, "metadata", None), dict)
     )
-    named_child_not_hosted = any(
-        isinstance(getattr(item, "metadata", None), dict)
-        and item.metadata.get("runtime_cleanup_state") == "not_hosted"
-        and isinstance(getattr(item, "agent_name", None), str)
-        and item.agent_name.casefold() == child_name.casefold()
-        for item in not_performed
-    )
+    named_child_not_hosted = "not_hosted" in named_child_no_op_states
 
     additional = [
         item
@@ -360,14 +367,18 @@ def _termination_partial_result(
         data["not_performed_outcome_count"] = len(not_performed)
         data["not_performed_agents"] = not_performed_agents
         data["runtime_custody_code"] = "runtime_offboarding_not_performed"
-        data["runtime_already_absent"] = (
-            "already_absent" in no_op_states and not custody_unknown
-        )
-        if not custody_unknown or "not_hosted" in no_op_states:
-            data["hosted_runtime_configured"] = "not_hosted" not in no_op_states
+        if scoped_no_op_state is not None:
+            data["runtime_already_absent"] = (
+                scoped_no_op_state == "already_absent"
+            )
+            if scoped_no_op_state != "custody_unknown":
+                data["hosted_runtime_configured"] = (
+                    scoped_no_op_state != "not_hosted"
+                )
         if custody_unknown:
             data["runtime_custody_known"] = False
             data["runtime_retention_unknown"] = True
+            data["finalized_from_absence"] = True
 
     if termination_not_performed:
         survivors = ", ".join(surviving_subtree_agents)
@@ -414,16 +425,22 @@ def _termination_partial_result(
             "deletion are unknown until operator reconciliation confirms "
             "custody. Do not retry termination."
         )
-    elif not_performed and "already_absent" in no_op_states:
+    elif not_performed and scoped_no_op_state == "already_absent":
         custody_message = (
             "The child was stopped, but its hosted runtime namespace was already "
             "absent and no tree was deleted. Do not retry termination."
         )
-    elif not_performed:
+    elif not_performed and scoped_no_op_state == "not_hosted":
         custody_message = (
             "The child was stopped, but it has no hosted runtime namespace that "
             "Core can securely offboard. Its storage-backed state was not deleted. "
             "Do not retry termination."
+        )
+    elif not_performed:
+        custody_message = (
+            "The child was stopped, but the cascade produced mixed runtime "
+            "custody outcomes. Do not retry termination; an operator must "
+            "reconcile the named child and descendant custody states."
         )
     elif cleanup_pending:
         custody_message = (
